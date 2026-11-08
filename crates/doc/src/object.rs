@@ -34,6 +34,8 @@ pub enum ObjectKind {
     Region,
     /// A fitted analytic primitive.
     Primitive,
+    /// A fitted freeform (NURBS) surface.
+    Surface,
 }
 
 /// Common face of every object.
@@ -186,6 +188,41 @@ impl PrimitiveObject {
 }
 object_common!(PrimitiveObject, ObjectKind::Primitive);
 
+/// A fitted freeform surface: a spline sheet body (record), with its fit statistics.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SurfaceObject {
+    /// Id.
+    pub id: ObjectId,
+    /// Display name.
+    pub name: String,
+    /// The sheet: one face on the spline surface.
+    pub sheet: Arc<Brep>,
+    /// Region it was fitted to, if any.
+    #[serde(default)]
+    pub region: Option<ObjectId>,
+    /// Control net size `[u, v]` and degree.
+    pub control: [usize; 2],
+    /// Degree.
+    pub degree: usize,
+    /// RMS deviation of the fitted points (mm).
+    pub rms: f64,
+    /// Largest deviation of the fitted points (mm).
+    pub max: f64,
+    /// Display mesh.
+    #[serde(with = "crate::format::mesh_b64")]
+    pub display: Arc<Mesh>,
+    /// Shown in the viewport.
+    #[serde(default = "yes")]
+    pub visible: bool,
+}
+
+impl SurfaceObject {
+    fn describe(&self) -> String {
+        format!("spline {}×{} deg {}, max {:.4} mm", self.control[0], self.control[1], self.degree, self.max)
+    }
+}
+object_common!(SurfaceObject, ObjectKind::Surface);
+
 fn yes() -> bool {
     true
 }
@@ -220,6 +257,9 @@ pub struct Document {
     /// Primitives.
     #[serde(default)]
     pub primitives: Vec<PrimitiveObject>,
+    /// Freeform surfaces (sheets).
+    #[serde(default)]
+    pub surfaces: Vec<SurfaceObject>,
     /// Next free id.
     #[serde(default)]
     pub next_id: u64,
@@ -244,6 +284,10 @@ macro_rules! stores {
             let $s = &$doc.primitives;
             $body;
         }
+        {
+            let $s = &$doc.surfaces;
+            $body;
+        }
     }};
     (mut $doc:expr, $s:ident => $body:expr) => {{
         {
@@ -260,6 +304,10 @@ macro_rules! stores {
         }
         {
             let $s = &mut $doc.primitives;
+            $body;
+        }
+        {
+            let $s = &mut $doc.surfaces;
             $body;
         }
     }};
@@ -353,6 +401,15 @@ impl Document {
         id
     }
 
+    /// Adds a surface and returns its id.
+    pub fn add_surface(&mut self, mut s: SurfaceObject) -> ObjectId {
+        s.id = self.fresh_id();
+        s.name = self.unique_name(&s.name);
+        let id = s.id;
+        self.surfaces.push(s);
+        id
+    }
+
     /// The mesh with `id`.
     #[must_use]
     pub fn mesh(&self, id: ObjectId) -> Option<&MeshObject> {
@@ -384,6 +441,12 @@ impl Document {
     /// Mutable region with `id`.
     pub fn region_mut(&mut self, id: ObjectId) -> Option<&mut RegionObject> {
         self.regions.iter_mut().find(|r| r.id == id)
+    }
+
+    /// The surface with `id`.
+    #[must_use]
+    pub fn surface(&self, id: ObjectId) -> Option<&SurfaceObject> {
+        self.surfaces.iter().find(|s| s.id == id)
     }
 
     /// The primitive with `id`.
@@ -421,6 +484,11 @@ impl Document {
         for p in &mut self.primitives {
             if p.region == Some(id) {
                 p.region = None;
+            }
+        }
+        for s in &mut self.surfaces {
+            if s.region == Some(id) {
+                s.region = None;
             }
         }
         before != self.summaries().len()
@@ -468,6 +536,9 @@ impl Document {
         };
         for m in self.meshes.iter().filter(|m| m.visible) {
             add(m.mesh.bbox());
+        }
+        for s in self.surfaces.iter().filter(|s| s.visible) {
+            add(s.display.bbox());
         }
         for p in self.primitives.iter().filter(|p| p.visible) {
             add(p.patch.bbox());

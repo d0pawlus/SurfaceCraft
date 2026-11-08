@@ -135,6 +135,9 @@ fn target_mesh(s: &mut Session, r: &ObjRef) -> CmdResult<Arc<Mesh>> {
         ObjectKind::Primitive => {
             s.doc.primitive(id).map(|p| p.patch.clone()).ok_or_else(|| CmdError::Params(format!("no primitive {id}")))
         }
+        ObjectKind::Surface => {
+            s.doc.surface(id).map(|o| o.display.clone()).ok_or_else(|| CmdError::Params(format!("no surface {id}")))
+        }
         ObjectKind::Region => Err(CmdError::Params(format!("{id} is a region; align to a mesh, body or primitive"))),
     }
 }

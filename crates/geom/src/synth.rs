@@ -129,6 +129,21 @@ pub fn add_outliers(mesh: &mut Mesh, fraction: f64, magnitude: f64, rng: &mut Rn
     }
 }
 
+/// The freeform test surface `z = a·sin(x/12)·cos(y/9)` over `[0, w] × [0, h]`.
+#[must_use]
+pub fn wave_height(a: f64, x: f64, y: f64) -> f64 {
+    a * (x / 12.0).sin() * (y / 9.0).cos()
+}
+
+/// A freeform patch (height field [`wave_height`]) of `w × h`, amplitude `a`, offset to `origin`.
+#[must_use]
+pub fn wave(origin: Point3, w: f64, h: f64, a: f64, nu: usize, nv: usize) -> Mesh {
+    grid(nu, nv, false, |s, t| {
+        let (x, y) = (s * w, t * h);
+        origin + Vec3::new(x, y, wave_height(a, x, y))
+    })
+}
+
 /// A test part for alignment: a 60 × 40 × 20 block with a cylindrical boss on top, so no
 /// symmetry makes the registration ambiguous.
 #[must_use]

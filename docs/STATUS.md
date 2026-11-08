@@ -11,7 +11,7 @@
 | M0 | szkielet, konwencje, import, viewport, rejestr komend, CLI, smoke kernela | **zamknięty** | [plan](superpowers/plans/2026-11-08-m0-skeleton.md) |
 | M1 | wyrównanie: 3-2-1, N-point, ICP, world-axis | **zamknięty** | [plan](superpowers/plans/2026-11-08-m1-alignment.md) |
 | M2 | prymitywy, auto-typ, symetria, deviation, Region | **zamknięty** | [plan](superpowers/plans/2026-11-08-m2-primitives.md) |
-| M3 | Fit Surface (NURBS), mapa odchyłek, STEP powierzchni | do zrobienia | — |
+| M3 | Fit Surface (NURBS), mapa odchyłek, STEP powierzchni | **zamknięty** | [plan](superpowers/plans/2026-11-08-m3-fit-surface.md) |
 | M4 | Freeform/AutoSurface, thicken | do zrobienia | — |
 | M5 | szkic + solver, cechy, DAG, STEP brył, IGES | do zrobienia | — |
 | M6 | web (wasm), MCP, asystent AI | do zrobienia | — |
@@ -46,6 +46,8 @@ cargo run -p surfacecraft
 | M2: auto-segmentacja bracketu (σ = 0,05) | 6 płaszczyzn + walec + sfera, RMS regionów 0,038–0,052 mm, ≥ 90 % trójkątów przypisanych | `gate_m2_auto_segment_bracket`, `gate_m2_segment_and_fit_through_commands` |
 | M2: walec bossa r = 6 mm | błąd promienia < 0,02 mm | `engine/tests/primitives.rs` |
 | M2: estymacja szumu | płaszczyzna σ=0,05 → 0,03–0,08; bracket σ=0,05 → 0,078 (krawędzie i krzywizna zawyżają) | `deviation::tests` |
+| M3: Fit Surface, fala 60×40, A = 3 mm | bez szumu: siatka 6×6, RMS 0,020, max 0,067 mm; σ = 0,02: RMS 0,029, max 0,108 mm (próg 0,2) | `gate_m3_fit_surface_max_deviation` |
+| M3: STEP arkusza, round-trip przez importer solidcore | 1 ściana, odległość powierzchni 1,7e-11 mm; odchyłka skanu zgodna < 0,02 mm | `gate_m3_sheet_step_roundtrip`, `gate_m3_surface_step_roundtrip_through_commands` |
 
 ## Decyzje buildera (z uzasadnieniem)
 
@@ -58,15 +60,19 @@ Szczegóły w planach milestone'ów.
 - Solver nieliniowy (§10): własny Levenberg–Marquardt w `fit::lm` (≤ 7 parametrów; bez zależności).
 - Auto-typ: najprostszy rodzaj z RMS ≤ 1,2 × najlepszego (+ odrzucanie wyników zdegenerowanych).
 - Segmentacja: deterministyczny fit-and-grow na spójności meshu (wariant Efficient RANSAC).
+- Fit do punktów rozproszonych (§10): resampling regionu do siatki (MLS nad płaszczyzną PCA) → `lst_sq_approx` w kernelu; `app-geometry` pusta.
+- Arkusz z płata: rekord `Brep` z jedną ścianą `Spline` składany w `kernel::nurbs` (sprawdzany przez `validate` i `Body::from_record`).
 
 ## Dług techniczny
 
-- Adaptacje kodu rodziny: brak (pierwsza planowana w M3: zapis `SHELL_BASED_SURFACE_MODEL` z `solidcraft-step`).
+- **Adaptacja (dług):** `crates/io/src/step/{p21,mod}.rs` z `solidcraft-step` (zapis otwartych powłok STEP) — do wymiany na `step-export` solidcore, gdy zapisze `ShellModel` (PR upstream opcjonalny, tylko za zgodą użytkownika).
+- STEP arkuszy bez PCURVE (krawędzie tylko krzywą 3D); importer solidcore odtwarza je bez strat w testach.
 - `surfacecraft-web` to tylko runner eframe (bez wczytywania plików w przeglądarce) — pełny web w M6.
 - Brak osobnego repo `surfacecraft-corpus`: korpus w CI jest w całości syntetyczny (`geom::synth`).
 - Gizmo manipulatora w viewporcie (§6.1) — w M1 ruch ręczny tylko przez `mesh.transform`.
 - Regiony: brak resegment/insert/separate/enlarge/shrink (§8 dopuszcza później); zaznaczanie w GUI tylko przez wskazanie + `region.grow` (bez pędzla/lasso).
 - Estymator szumu zawyża przy ostrych krawędziach i dużej krzywiźnie względem gęstości siatki.
+- Fit Surface: jeden płat na region wysokościowy nad płaszczyzną (region zawinięty → odmowa, trzeba podzielić); brzeg płata = prostokąt w parametrach (bez przycinania do konturu regionu).
 
 ## Luki / ryzyka
 
@@ -75,8 +81,6 @@ Szczegóły w planach milestone'ów.
 
 ## Następny krok
 
-M3 — Fit Surface (plan `docs/superpowers/plans/…-m3-fit-surface.md`): płat NURBS na region (parametryzacja regionu,
-resampling do siatki → `srf_fit::lst_sq_approx` w kernelu, lub LSQ rozproszony na allowliście `app-geometry`),
-mapa odchyłek przez `surface_closest_point`, arkusz jako rekord `Brep` z jedną ścianą `Spline`, eksport STEP
-powierzchni przez adaptację zapisu `SHELL_BASED_SURFACE_MODEL` z `solidcraft-step` (z atrybucją, jako dług);
-bramka: max odchyłka ≤ 0,2 mm i round-trip STEP.
+M4 — Freeform/AutoSurface (plan `docs/superpowers/plans/…-m4-freeform.md`): retopologia quad (decyzja §10:
+port natywny vs proces), łaty NURBS na quadach zszyte G0/G1, snap/crease/merge, thicken → bryła
+(`ops::offset::thicken`); bramka: max odchyłka ≤ 0,2 mm.

@@ -107,3 +107,31 @@ fn picked_triangle_grows_a_region() {
     assert_eq!(app.session.doc.regions[0].kind, Some(surfacecraft_fit::PrimitiveKind::Plane));
     assert!(app.session.display_items().iter().any(|d| d.colors.is_some()));
 }
+
+/// Fit Surface from the GUI: the Surface menu reaches `surface.fit`, Run creates a sheet that
+/// the viewport draws.
+#[test]
+fn surface_menu_fits_a_patch() {
+    let mut h = harness();
+    let app = h.state_mut();
+    app.run_command("mesh.synth", json!({"shape": "wave", "resolution": 40, "name": "scan"})).unwrap();
+    let n = app.session.doc.meshes[0].mesh.triangle_count() as u32;
+    app.run_command(
+        "region.create",
+        json!({"mesh": "scan", "triangles": (0..n).collect::<Vec<u32>>(), "name": "free"}),
+    )
+    .unwrap();
+    h.run();
+    h.get_by_label("Surface").click();
+    h.run();
+    h.get_by_label("Fit surface").click();
+    h.run();
+    assert_eq!(h.state().palette_command, Some("surface.fit"));
+    h.state_mut().palette_params = json!({"region": "free"}).to_string();
+    h.run();
+    h.get_by_label("Run").click();
+    h.run();
+    let app = h.state_mut();
+    assert_eq!(app.session.doc.surfaces.len(), 1, "status {}", app.status);
+    assert!(app.session.display_items().iter().any(|d| d.kind == surfacecraft_doc::ObjectKind::Surface));
+}

@@ -91,7 +91,19 @@ fn compute(s: &mut Session, i: ComputeIn) -> CmdResult<ComputeOut> {
             let t = surfacecraft_kernel::tess::tessellate(&b.brep, Some(tol * 0.05))?;
             against_mesh(&pts, &Bvh::build(&t), maxd)
         }
-        ObjectKind::Region => return Err(CmdError::Params("compare against a primitive, mesh or body".into())),
+        ObjectKind::Surface => {
+            let o = s.doc.surface(rid).ok_or_else(|| CmdError::Params(format!("no surface {rid}")))?;
+            let face = o.sheet.faces.first().ok_or_else(|| CmdError::Failed("the surface has no face".into()))?;
+            let probe = surfacecraft_kernel::nurbs::SurfaceProbe::new(&face.surface)?;
+            let mut v = Vec::with_capacity(pts.len());
+            for (p, keep) in pts.iter().zip(&mask) {
+                v.push(if *keep { probe.closest([p.x, p.y, p.z]).map_or(f64::NAN, |r| r.0) } else { f64::NAN });
+            }
+            v
+        }
+        ObjectKind::Region => {
+            return Err(CmdError::Params("compare against a primitive, mesh, body or surface".into()));
+        }
     };
     for (v, keep) in values.iter_mut().zip(&mask) {
         if !keep {

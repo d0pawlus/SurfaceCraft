@@ -11,6 +11,7 @@ use surfacecraft_geom::{Bvh, Point3};
 const MESH_COLOR: [f32; 4] = [0.62, 0.66, 0.72, 1.0];
 const BODY_COLOR: [f32; 4] = [0.35, 0.55, 0.85, 1.0];
 const PRIMITIVE_COLOR: [f32; 4] = [0.95, 0.75, 0.2, 0.55];
+const SURFACE_COLOR: [f32; 4] = [0.55, 0.85, 0.95, 0.8];
 
 /// The SurfaceCraft UI.
 pub struct SurfaceCraftApp {
@@ -269,6 +270,22 @@ impl SurfaceCraftApp {
                         }
                         ui.close();
                     }
+                    if ui.button("Export selected as STEP…").clicked() {
+                        if let Some(id) = self.selected_object
+                            && let Some(p) = rfd::FileDialog::new().add_filter("STEP", &["step", "stp"]).save_file()
+                        {
+                            let _ = self
+                                .run_command("export.step", json!({"objects": [id.0], "path": p.to_string_lossy()}));
+                        }
+                        ui.close();
+                    }
+                    if ui.button("Import STEP…").clicked() {
+                        if let Some(p) = rfd::FileDialog::new().add_filter("STEP", &["step", "stp"]).pick_file() {
+                            let _ = self.run_command("import.step", json!({"path": p.to_string_lossy()}));
+                            self.fit_pending = true;
+                        }
+                        ui.close();
+                    }
                     if ui.button("Export selected mesh…").clicked() {
                         if let Some(id) = self.selected_object
                             && let Some(p) =
@@ -333,6 +350,7 @@ impl SurfaceCraftApp {
                         ObjectKind::Body => "body",
                         ObjectKind::Region => "region",
                         ObjectKind::Primitive => "primitive",
+                        ObjectKind::Surface => "surface",
                     };
                     let sel = self.selected_object == Some(s.id);
                     if ui
@@ -476,6 +494,7 @@ impl SurfaceCraftApp {
                 color: match d.kind {
                     ObjectKind::Body => BODY_COLOR,
                     ObjectKind::Primitive => PRIMITIVE_COLOR,
+                    ObjectKind::Surface => SURFACE_COLOR,
                     _ => MESH_COLOR,
                 },
                 mesh: d.mesh,

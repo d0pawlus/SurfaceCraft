@@ -250,6 +250,8 @@ pub enum SynthShape {
     Box,
     /// The alignment test part (block with a boss and a dome).
     Bracket,
+    /// Freeform patch `size[0] × size[1]`, amplitude `size[2]` (z = a·sin(x/12)·cos(y/9)).
+    Wave,
 }
 
 /// Synthetic scan parameters (ground truth known exactly; design doc §11.1 corpus level 1).
@@ -300,6 +302,7 @@ fn synth_mesh(i: &SynthIn) -> CmdResult<Mesh> {
         SynthShape::Torus => synth::torus(c, Vec3::z(), d(0, 20.0), d(1, 5.0), n, n / 2),
         SynthShape::Box => synth::cuboid(c, Vec3::new(d(0, 40.0), d(1, 30.0), d(2, 20.0)), n / 4),
         SynthShape::Bracket => synth::bracket().transformed(&Transform::translation(c.coords)),
+        SynthShape::Wave => synth::wave(c, d(0, 60.0), d(1, 40.0), d(2, 3.0), n, n * 2 / 3),
     })
 }
 

@@ -13,6 +13,7 @@
 )]
 
 pub mod mesh;
+pub mod step;
 
 pub use mesh::{Limits, MeshFormat, read_mesh, write_mesh};
 
