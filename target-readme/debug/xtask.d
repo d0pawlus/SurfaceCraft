@@ -1,0 +1,1 @@
+X:/rea-quicksurface/target-readme\debug\xtask.exe: X:\rea-quicksurface-readme\xtask\src\../../apps/surfacecraft-web/index.html X:\rea-quicksurface-readme\xtask\src\assets.rs X:\rea-quicksurface-readme\xtask\src\layers.rs X:\rea-quicksurface-readme\xtask\src\licences.rs X:\rea-quicksurface-readme\xtask\src\main.rs

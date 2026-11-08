@@ -97,13 +97,47 @@ pub fn grow_smooth(mesh: &Mesh, seeds: &[u32], max_angle_deg: f64) -> Vec<u32> {
     inside.iter().enumerate().filter(|(_, f)| **f).map(|(i, _)| i as u32).collect()
 }
 
-fn accepts(mesh: &Mesh, prim: &Primitive, t: usize, tol: f64, cos: f64) -> bool {
+fn accepts(mesh: &Mesh, fnorm: &[Option<Vec3>], prim: &Primitive, t: usize, tol: f64, cos: f64) -> bool {
     let Some(corners) = mesh.triangle(t) else { return false };
     if corners.iter().any(|c| prim.distance(c).abs() > tol) {
         return false;
     }
-    let (Some(n), Some(c)) = (mesh.face_normal(t), mesh.face_centroid(t)) else { return false };
+    let (Some(n), Some(c)) = (fnorm.get(t).copied().flatten(), mesh.face_centroid(t)) else { return false };
     prim.normal(&c).dot(&n).abs() >= cos
+}
+
+/// Vertex normals averaged over their one ring twice, only across neighbours within 35° (so
+/// scanner noise on dense meshes stops breaking regions up, while sharp edges stay sharp), and
+/// per-triangle normals from them.
+fn smoothed_normals(mesh: &Mesh) -> (Vec<Vec3>, Vec<Option<Vec3>>) {
+    let mut n = mesh.vertex_normals();
+    let cos = 35f64.to_radians().cos();
+    for _ in 0..2 {
+        let mut acc = n.clone();
+        for t in &mesh.triangles {
+            for k in 0..3 {
+                let (a, b) = (t[k] as usize, t[(k + 1) % 3] as usize);
+                let (Some(na), Some(nb)) = (n.get(a).copied(), n.get(b).copied()) else { continue };
+                if na.dot(&nb) >= cos {
+                    if let Some(x) = acc.get_mut(a) {
+                        *x += nb;
+                    }
+                    if let Some(x) = acc.get_mut(b) {
+                        *x += na;
+                    }
+                }
+            }
+        }
+        n = acc.into_iter().map(|v| surfacecraft_geom::normalize(v).unwrap_or_else(Vec3::zeros)).collect();
+    }
+    let f = surfacecraft_geom::par::map(mesh.triangle_count(), |t| {
+        let tri = mesh.triangles.get(t)?;
+        let raw = mesh.face_normal(t)?;
+        let s: Vec3 = tri.iter().filter_map(|&v| n.get(v as usize)).sum();
+        // keep the orientation of the triangle itself
+        surfacecraft_geom::normalize(s).map(|v| if v.dot(&raw) < 0.0 { raw } else { v })
+    });
+    (n, f)
 }
 
 /// Points used for one fit at most (evenly strided); the final RMS is over every point.
@@ -125,6 +159,21 @@ fn fit_tris(mesh: &Mesh, normals: &[Vec3], tris: &[u32]) -> Option<crate::primit
     Some(f)
 }
 
+/// Fit of one `kind` to a set of triangles on at most [`FIT_POINTS`] / 2 of their vertices; the
+/// RMS is over that subsample (it only steers the growth).
+fn fit_kind_tris(
+    mesh: &Mesh,
+    normals: &[Vec3],
+    tris: &[u32],
+    kind: PrimitiveKind,
+) -> Option<crate::primitive::PrimitiveFit> {
+    let (p, n) = region_points(mesh, normals, tris);
+    let stride = p.len().div_ceil(FIT_POINTS / 2).max(1);
+    let ps: Vec<Point3> = p.iter().step_by(stride).copied().collect();
+    let ns: Vec<Vec3> = n.iter().step_by(stride).copied().collect();
+    crate::primitive::fit(kind, &ps, &ns)
+}
+
 /// Segments `mesh` into primitive regions.
 ///
 /// Robust to real scans (P1): seed patches are grown to a fixed *area* (the median triangle area
@@ -140,9 +189,8 @@ pub fn segment(mesh: &Mesh, opts: &SegmentOptions) -> Vec<Segment> {
     let tol = if opts.tolerance.is_finite() && opts.tolerance > 0.0 { opts.tolerance } else { 0.2 };
     let cos = opts.max_angle_deg.clamp(1.0, 89.0).to_radians().cos();
     let nb = mesh.triangle_neighbours();
-    let normals = mesh.vertex_normals();
-    let fnorm: Vec<Option<Vec3>> = (0..nt).map(|t| mesh.face_normal(t)).collect();
-    let areas: Vec<f64> = (0..nt).map(|t| mesh.face_area(t)).collect();
+    let (normals, fnorm) = smoothed_normals(mesh);
+    let areas: Vec<f64> = surfacecraft_geom::par::map(nt, |t| mesh.face_area(t));
     let seed_tris = opts.seed_size.max(8);
     let seed_area = {
         let mut a: Vec<f64> = areas.iter().copied().filter(|x| *x > 0.0).collect();
@@ -151,19 +199,18 @@ pub fn segment(mesh: &Mesh, opts: &SegmentOptions) -> Vec<Segment> {
         med * seed_tris as f64
     };
     // flatness of each triangle: smallest = flattest neighbourhood (best seeds)
-    let mut order: Vec<(f64, u32)> = (0..nt)
-        .map(|t| {
-            let n = fnorm[t].unwrap_or_else(Vec3::z);
-            let worst = nb[t]
-                .iter()
-                .filter(|&&o| o != u32::MAX)
-                .filter_map(|&o| fnorm.get(o as usize).copied().flatten())
-                .map(|m| 1.0 - m.dot(&n))
-                .fold(0.0, f64::max);
-            (worst, t as u32)
-        })
-        .collect();
-    order.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mut order: Vec<(u64, u32)> = surfacecraft_geom::par::map(nt, |t| {
+        let n = fnorm[t].unwrap_or_else(Vec3::z);
+        let worst = nb[t]
+            .iter()
+            .filter(|&&o| o != u32::MAX)
+            .filter_map(|&o| fnorm.get(o as usize).copied().flatten())
+            .map(|m| 1.0 - m.dot(&n))
+            .fold(0.0, f64::max);
+        // non-negative floats order like their bits
+        (worst.max(0.0).to_bits(), t as u32)
+    });
+    surfacecraft_geom::par::sort_unstable(&mut order);
     let mut owner = vec![u32::MAX; nt];
     let mut out: Vec<Segment> = Vec::new();
     let mut tried = vec![false; nt];
@@ -227,7 +274,7 @@ pub fn segment(mesh: &Mesh, opts: &SegmentOptions) -> Vec<Segment> {
         let mut region: Vec<u32> = Vec::new();
         let mut q: VecDeque<u32> = VecDeque::new();
         for &t in &patch {
-            if accepts(mesh, &fit.primitive, t as usize, tol, cos) {
+            if accepts(mesh, &fnorm, &fit.primitive, t as usize, tol, cos) {
                 mark[t as usize] = g;
                 region.push(t);
                 q.push_back(t);
@@ -240,7 +287,7 @@ pub fn segment(mesh: &Mesh, opts: &SegmentOptions) -> Vec<Segment> {
                 if o == u32::MAX || mark[oi] == g || owner[oi] != u32::MAX {
                     continue;
                 }
-                if accepts(mesh, &fit.primitive, oi, tol, cos) {
+                if accepts(mesh, &fnorm, &fit.primitive, oi, tol, cos) {
                     mark[oi] = g;
                     region.push(o);
                     q.push_back(o);
@@ -248,7 +295,16 @@ pub fn segment(mesh: &Mesh, opts: &SegmentOptions) -> Vec<Segment> {
             }
             if region.len() >= next_refit {
                 next_refit *= 2;
-                if let Some(f) = fit_tris(mesh, &normals, &region)
+                // large regions refit only their kind (the automatic choice runs once more at the
+                // end); the general kinds' iterative fits dominate the time otherwise
+                let refit = if region.len() <= 20 * seed_tris {
+                    // small regions may still change kind (a narrow chamfer band starts out
+                    // looking like a cylinder)
+                    fit_tris(mesh, &normals, &region)
+                } else {
+                    fit_kind_tris(mesh, &normals, &region, fit.primitive.kind())
+                };
+                if let Some(f) = refit
                     && f.rms <= tol
                 {
                     fit = f;
