@@ -107,7 +107,10 @@ Szczegóły w planach milestone'ów.
 
 Wszystkie milestones M0–M6 są zamknięte. Do decyzji użytkownika:
 1. Dostawca LLM i klucz API dla asystenta (dziś: dowolny program przez `SURFACECRAFT_AI_COMMAND`).
-2. Działania poza repo (wymagają zgody): PR upstream do solidcore (`SHELL_BASED_SURFACE_MODEL` w `step-export`,
-   przeniesienie `iges_out`, „sheet from surface”, thicken wielościennych arkuszy), wpis w `craft-launcher`.
+2. Upstream (za zgodą użytkownika, zgodnie z zasadami solidcore: najpierw issue z reprodukcją): zgłoszone
+   tangency-labs/solidcore#3228 („sheet from surface”, `face_on` 1001), #3229 (thicken arkusza wielościennego → `NotSolid`),
+   #3230 (propozycja writera IGES nad rekordem). Zapis STEP otwartych powłok jest już przenoszony upstream (#2579) —
+   bez dublowania. Reprodukcja: gałąź `repro/surfacecraft-sheets` w forku `d0pawlus/solidcore`. Po decyzji maintainerów:
+   PR-y lub wymiana adaptacji. Wpis w `craft-launcher` — nadal czeka na zgodę.
 Kandydaci post-MVP z design doc: retopologia niestrukturalna (Instant Meshes), druga strategia freeform (sieć łat
 z krzywych cech), CAD Correct/Refit, trwałe nazewnictwo topologii w cechach, out-of-core/LOD dla 100 mln+ trójkątów.
