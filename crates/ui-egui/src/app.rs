@@ -353,6 +353,8 @@ impl SurfaceCraftApp {
                         ObjectKind::Primitive => "primitive",
                         ObjectKind::Surface => "surface",
                         ObjectKind::Quad => "quads",
+                        ObjectKind::Sketch => "sketch",
+                        ObjectKind::Feature => "feature",
                     };
                     let sel = self.selected_object == Some(s.id);
                     if ui
@@ -498,6 +500,7 @@ impl SurfaceCraftApp {
                     ObjectKind::Primitive => PRIMITIVE_COLOR,
                     ObjectKind::Surface => SURFACE_COLOR,
                     ObjectKind::Quad => QUAD_COLOR,
+                    ObjectKind::Sketch => [1.0, 1.0, 0.3, 1.0],
                     _ => MESH_COLOR,
                 },
                 mesh: d.mesh,

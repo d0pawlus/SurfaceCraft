@@ -1,0 +1,16 @@
+{
+  "commands": [
+    {"command": "sketch.create", "params": {"name": "base"}},
+    {"command": "sketch.add", "params": {"sketch": "base", "entities": [{"polygon": {"points": [[0, 0], [39, 0.5], [40, 20], [0, 19]]}}]}},
+    {"command": "sketch.constrain", "params": {"sketch": "base", "constraints": [
+      {"type": "fix", "point": 0, "at": [0, 0]}, {"type": "horizontal", "line": 0}, {"type": "vertical", "line": 1},
+      {"type": "horizontal", "line": 2}, {"type": "vertical", "line": 3},
+      {"type": "length", "line": 0, "value": 40}, {"type": "length", "line": 1, "value": 20}]}},
+    {"command": "feature.extrude", "params": {"sketch": "base", "distance": 10, "name": "plate"}},
+    {"command": "feature.fillet", "params": {"body": "plate", "edges": [0], "size": 2}},
+    {"command": "sketch.edit_constraint", "params": {"sketch": "base", "index": 5, "constraint": {"type": "length", "line": 0, "value": 50}}},
+    {"command": "feature.tree"},
+    {"command": "export.step", "params": {"objects": ["plate"]}},
+    {"command": "export.iges", "params": {"objects": ["plate"]}}
+  ]
+}

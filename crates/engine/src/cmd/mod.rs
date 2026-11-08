@@ -18,10 +18,12 @@ pub mod body;
 pub mod deviation;
 pub mod doc;
 pub mod exchange;
+pub mod feature;
 pub mod mesh;
 pub mod primitive;
 pub mod quad;
 pub mod region;
+pub mod sketch;
 pub mod surface;
 
 /// An error from a command's `run`.
@@ -116,11 +118,13 @@ static REGISTRY: LazyLock<Vec<CommandSpec>> = LazyLock::new(|| {
     v.extend_from_slice(body::COMMANDS);
     v.extend_from_slice(doc::COMMANDS);
     v.extend_from_slice(exchange::COMMANDS);
+    v.extend_from_slice(feature::COMMANDS);
     v.extend_from_slice(deviation::COMMANDS);
     v.extend_from_slice(mesh::COMMANDS);
     v.extend_from_slice(primitive::COMMANDS);
     v.extend_from_slice(quad::COMMANDS);
     v.extend_from_slice(region::COMMANDS);
+    v.extend_from_slice(sketch::COMMANDS);
     v.extend_from_slice(surface::COMMANDS);
     v.sort_by_key(|c| c.id);
     v

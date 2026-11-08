@@ -121,7 +121,7 @@ pub fn transform(body: &Brep, rows: &[[f64; 4]; 4]) -> Result<Brep> {
         return Err(KernelError::Argument("transform must be finite".into()));
     }
     let b = decode(body)?;
-    b.transform(rows).map_err(|e| op_err("transform", e))?;
+    b.transform(&crate::to_kernel_matrix(rows)).map_err(|e| op_err("transform", e))?;
     encode(&b)
 }
 

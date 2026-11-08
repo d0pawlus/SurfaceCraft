@@ -150,6 +150,18 @@ impl Session {
             };
             out.push(DisplayItem { id, kind: ObjectKind::Quad, key: Arc::as_ptr(&mesh) as usize, mesh, colors: None });
         }
+        for k in self.doc.sketches.iter().filter(|k| k.visible) {
+            let m = Arc::new(sketch_ribbons(&k.sketch));
+            if m.triangle_count() > 0 {
+                out.push(DisplayItem {
+                    id: k.id,
+                    kind: ObjectKind::Sketch,
+                    key: Arc::as_ptr(&m) as usize,
+                    mesh: m,
+                    colors: None,
+                });
+            }
+        }
         for p in self.doc.primitives.iter().filter(|p| p.visible) {
             out.push(DisplayItem {
                 id: p.id,
@@ -161,4 +173,59 @@ impl Session {
         }
         out
     }
+}
+
+/// Sketch entities drawn as thin ribbons in their plane (the viewport draws triangles).
+fn sketch_ribbons(s: &surfacecraft_sketch::Sketch) -> Mesh {
+    use surfacecraft_sketch::Entity;
+    let pt = |i: usize| s.points.get(i).copied().unwrap_or([0.0, 0.0]);
+    let mut polylines: Vec<Vec<[f64; 2]>> = Vec::new();
+    for e in &s.entities {
+        match e {
+            Entity::Line { a, b } => polylines.push(vec![pt(*a), pt(*b)]),
+            Entity::Arc { center, a, b } => {
+                let (c, pa, pb) = (pt(*center), pt(*a), pt(*b));
+                let r = (pa[0] - c[0]).hypot(pa[1] - c[1]);
+                let a0 = (pa[1] - c[1]).atan2(pa[0] - c[0]);
+                let sweep = ((pb[1] - c[1]).atan2(pb[0] - c[0]) - a0).rem_euclid(std::f64::consts::TAU);
+                polylines.push(
+                    (0..=24)
+                        .map(|k| {
+                            let t = a0 + sweep * f64::from(k) / 24.0;
+                            [c[0] + r * t.cos(), c[1] + r * t.sin()]
+                        })
+                        .collect(),
+                );
+            }
+            Entity::Circle { center, radius } => {
+                let c = pt(*center);
+                polylines.push(
+                    (0..=48)
+                        .map(|k| {
+                            let t = std::f64::consts::TAU * f64::from(k) / 48.0;
+                            [c[0] + radius * t.cos(), c[1] + radius * t.sin()]
+                        })
+                        .collect(),
+                );
+            }
+        }
+    }
+    let size = s.points.iter().fold(1.0f64, |m, p| m.max(p[0].abs()).max(p[1].abs()));
+    let w = size * 0.004;
+    let mut m = Mesh::default();
+    for pl in polylines {
+        for seg in pl.windows(2) {
+            let (a, b) = (seg[0], seg[1]);
+            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+            let n = dx.hypot(dy).max(1e-12);
+            let (ox, oy) = (-dy / n * w, dx / n * w);
+            let base = m.positions.len() as u32;
+            for q in [[a[0] + ox, a[1] + oy], [b[0] + ox, b[1] + oy], [b[0] - ox, b[1] - oy], [a[0] - ox, a[1] - oy]] {
+                m.positions.push(s.plane.to_3d(q));
+            }
+            m.triangles.push([base, base + 1, base + 2]);
+            m.triangles.push([base, base + 2, base + 3]);
+        }
+    }
+    m
 }
