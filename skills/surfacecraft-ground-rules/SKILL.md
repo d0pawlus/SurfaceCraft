@@ -9,7 +9,9 @@ description: Licences, assets, clean-room and test data rules for SurfaceCraft.
   behaviour (`docs/superpowers/specs/*functional-analysis.md`). Never add their code, icons, texts,
   layouts, or data. Their sample scans (e.g. `X:\QUICKSURFACE2026`) are used only locally:
   set `SURFACECRAFT_LOCAL_CORPUS` and run the ignored tests (`cargo test -- --ignored local_corpus`).
-  Nothing derived from them (numbers, screenshots, exported files) is committed.
+  Nothing derived from a single file (exported meshes, screenshots, per-file dimensions) is
+  committed; `docs/STATUS.md` keeps only aggregate pass/fail, accuracy and timing figures with
+  files referred to by number (production-readiness plan, criterion 1).
 - **Licences.** Dependencies must be on the allowlist in `xtask/src/licences.rs` (MIT, Apache-2.0,
   BSD, ISC, Zlib, Unicode, CC0, BSL-1.0 …). GPL/LGPL/AGPL is refused. `cargo xtask licences --check`
   also regenerates `THIRD-PARTY-LICENSES.txt` (never edit it by hand).

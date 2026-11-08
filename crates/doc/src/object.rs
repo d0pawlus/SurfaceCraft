@@ -684,6 +684,28 @@ impl Document {
         before != self.summaries().len()
     }
 
+    /// Replaces a mesh's geometry after an edit that changed its triangles: regions and quad
+    /// layouts of the mesh refer to triangle indices, so they are removed (primitives and surfaces
+    /// fitted to them keep their geometry). Returns how many regions went; false id → `None`.
+    pub fn replace_mesh_topology(&mut self, id: ObjectId, mesh: Mesh) -> Option<usize> {
+        let m = self.mesh_mut(id)?;
+        m.mesh = Arc::new(mesh);
+        let gone: Vec<ObjectId> = self.regions.iter().filter(|r| r.mesh == id).map(|r| r.id).collect();
+        self.regions.retain(|r| r.mesh != id);
+        self.quads.retain(|q| q.mesh != id);
+        for p in &mut self.primitives {
+            if p.region.is_some_and(|r| gone.contains(&r)) {
+                p.region = None;
+            }
+        }
+        for s in &mut self.surfaces {
+            if s.region.is_some_and(|r| gone.contains(&r)) {
+                s.region = None;
+            }
+        }
+        Some(gone.len())
+    }
+
     /// Renames an object; false when it does not exist.
     pub fn rename(&mut self, id: ObjectId, name: &str) -> bool {
         let name = self.unique_name(name);

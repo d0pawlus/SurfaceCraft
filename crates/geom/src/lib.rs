@@ -14,6 +14,7 @@
 
 pub mod aabb;
 pub mod bvh;
+pub mod edit;
 pub mod kdtree;
 pub mod mesh;
 pub mod rng;
