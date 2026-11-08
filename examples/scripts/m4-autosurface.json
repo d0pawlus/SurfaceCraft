@@ -1,0 +1,9 @@
+{
+  "commands": [
+    {"command": "mesh.synth", "params": {"shape": "wave", "resolution": 90, "noise": 0.02, "seed": 8, "name": "scan"}},
+    {"command": "quad.create", "params": {"mesh": "scan", "target_quads": 12}},
+    {"command": "surface.auto", "params": {"object": "quads"}},
+    {"command": "surface.thicken", "params": {"object": "autosurface", "thickness": 2.0}},
+    {"command": "export.step", "params": {"objects": ["thickened"]}}
+  ]
+}

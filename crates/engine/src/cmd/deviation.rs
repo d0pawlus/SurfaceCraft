@@ -101,7 +101,7 @@ fn compute(s: &mut Session, i: ComputeIn) -> CmdResult<ComputeOut> {
             }
             v
         }
-        ObjectKind::Region => {
+        ObjectKind::Region | ObjectKind::Quad => {
             return Err(CmdError::Params("compare against a primitive, mesh, body or surface".into()));
         }
     };

@@ -86,6 +86,17 @@ pub fn chamfer(body: &Brep, edges: &[usize], distance: f64) -> Result<Brep> {
     encode(&b)
 }
 
+/// Thickens a sheet into a solid (`ops::offset::thicken`, design doc §8 M4): `thickness` along
+/// the face normals, or half each way when `symmetric`.
+pub fn thicken(sheet: &Brep, thickness: f64, symmetric: bool) -> Result<Brep> {
+    if !thickness.is_finite() || thickness == 0.0 {
+        return Err(KernelError::Argument("thickness must be finite and non-zero".into()));
+    }
+    let b = decode(sheet)?;
+    ops::offset::thicken(&b, thickness, symmetric).map_err(|e| op_err("thicken", e))?;
+    encode(&b)
+}
+
 /// Topology counts straight from the record.
 #[must_use]
 pub fn counts(body: &Brep) -> Counts {

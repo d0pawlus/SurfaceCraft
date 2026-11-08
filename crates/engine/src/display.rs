@@ -28,6 +28,7 @@ pub struct DisplayItem {
 pub struct TessCache {
     entries: HashMap<ObjectId, (usize, Arc<Mesh>)>,
     region_colors: HashMap<ObjectId, (u64, Arc<Vec<[f32; 4]>>)>,
+    quads: HashMap<ObjectId, (u64, Arc<Mesh>)>,
 }
 
 /// Colour of a region by its type (unclassified regions cycle a neutral palette).
@@ -129,6 +130,25 @@ impl Session {
                 mesh: o.display.clone(),
                 colors: None,
             });
+        }
+        let quads: Vec<_> =
+            self.doc.quads.iter().filter(|q| q.visible).map(|q| (q.id, q.vertices.clone(), q.clone())).collect();
+        for (id, verts, q) in quads {
+            let mut key = verts.len() as u64;
+            for v in &verts {
+                for c in v {
+                    key = key.wrapping_mul(1_099_511_628_211) ^ c.to_bits();
+                }
+            }
+            let mesh = match self.tess.quads.get(&id) {
+                Some((k, m)) if *k == key => m.clone(),
+                _ => {
+                    let m = Arc::new(q.display_mesh());
+                    self.tess.quads.insert(id, (key, m.clone()));
+                    m
+                }
+            };
+            out.push(DisplayItem { id, kind: ObjectKind::Quad, key: Arc::as_ptr(&mesh) as usize, mesh, colors: None });
         }
         for p in self.doc.primitives.iter().filter(|p| p.visible) {
             out.push(DisplayItem {

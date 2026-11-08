@@ -20,6 +20,7 @@ pub mod doc;
 pub mod exchange;
 pub mod mesh;
 pub mod primitive;
+pub mod quad;
 pub mod region;
 pub mod surface;
 
@@ -118,6 +119,7 @@ static REGISTRY: LazyLock<Vec<CommandSpec>> = LazyLock::new(|| {
     v.extend_from_slice(deviation::COMMANDS);
     v.extend_from_slice(mesh::COMMANDS);
     v.extend_from_slice(primitive::COMMANDS);
+    v.extend_from_slice(quad::COMMANDS);
     v.extend_from_slice(region::COMMANDS);
     v.extend_from_slice(surface::COMMANDS);
     v.sort_by_key(|c| c.id);
