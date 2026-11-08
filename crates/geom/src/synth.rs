@@ -154,9 +154,159 @@ pub fn bracket() -> Mesh {
     m
 }
 
+/// Scan defects applied by [`scanify`] (P1 corpus level 1: CAD meshes made to look scanned).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScanDefects {
+    /// Target edge length at the low-x end of the part (mm).
+    pub spacing: f64,
+    /// Edge length grows linearly to `spacing × (1 + density_ramp)` at the high-x end
+    /// (non-uniform density, as from a scan taken from one side).
+    pub density_ramp: f64,
+    /// Gaussian noise σ along the normal (mm).
+    pub noise: f64,
+    /// Number of holes (missing data) punched as balls of `hole_radius`.
+    pub holes: usize,
+    /// Radius of the holes (mm).
+    pub hole_radius: f64,
+    /// Fraction of vertices turned into spikes along the normal.
+    pub spikes: f64,
+    /// Number of small floating debris patches.
+    pub debris: usize,
+}
+
+impl Default for ScanDefects {
+    fn default() -> Self {
+        Self { spacing: 0.8, density_ramp: 1.0, noise: 0.03, holes: 3, hole_radius: 1.5, spikes: 0.0005, debris: 4 }
+    }
+}
+
+/// Splits edges longer than `h(midpoint)` until none is (conforming: shared edges split once).
+#[must_use]
+pub fn refine(mesh: &Mesh, h: impl Fn(&Point3) -> f64) -> Mesh {
+    let mut m = mesh.clone();
+    if m.validate().is_err() {
+        return m;
+    }
+    for _pass in 0..16 {
+        let mut mid: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
+        let mut any = false;
+        let tris = std::mem::take(&mut m.triangles);
+        let mut out = Vec::with_capacity(tris.len() * 2);
+        for t in tris {
+            let mut e = [u32::MAX; 3];
+            for k in 0..3 {
+                let (a, b) = (t[k], t[(k + 1) % 3]);
+                let (pa, pb) = (m.positions[a as usize], m.positions[b as usize]);
+                let c = Point3::from((pa.coords + pb.coords) / 2.0);
+                let lim = h(&c);
+                if lim > 0.0 && (pb - pa).norm() > lim {
+                    let key = (a.min(b), a.max(b));
+                    let id = *mid.entry(key).or_insert_with(|| {
+                        m.positions.push(c);
+                        (m.positions.len() - 1) as u32
+                    });
+                    e[k] = id;
+                    any = true;
+                }
+            }
+            let [a, b, c] = t;
+            let [ab, bc, ca] = e;
+            let s = |x: u32| x != u32::MAX;
+            match (s(ab), s(bc), s(ca)) {
+                (false, false, false) => out.push(t),
+                (true, false, false) => out.extend([[a, ab, c], [ab, b, c]]),
+                (false, true, false) => out.extend([[a, b, bc], [a, bc, c]]),
+                (false, false, true) => out.extend([[a, b, ca], [ca, b, c]]),
+                (true, true, false) => out.extend([[a, ab, c], [ab, bc, c], [ab, b, bc]]),
+                (false, true, true) => out.extend([[a, b, ca], [ca, b, bc], [ca, bc, c]]),
+                (true, false, true) => out.extend([[a, ab, ca], [ab, b, c], [ab, c, ca]]),
+                (true, true, true) => out.extend([[a, ab, ca], [ab, b, bc], [ca, bc, c], [ab, bc, ca]]),
+            }
+        }
+        m.triangles = out;
+        if !any {
+            break;
+        }
+        if m.triangles.len() > 20_000_000 {
+            break;
+        }
+    }
+    m
+}
+
+/// Makes a clean (e.g. tessellated CAD) mesh look like a raw scan: dense, non-uniform sampling,
+/// noise, holes, spikes and debris. The input must be welded.
+#[must_use]
+pub fn scanify(mesh: &Mesh, d: &ScanDefects, rng: &mut Rng) -> Mesh {
+    let b = mesh.bbox();
+    if b.is_empty() || !(d.spacing > 0.0) {
+        return mesh.clone();
+    }
+    let (x0, dx) = (b.min.x, (b.max.x - b.min.x).max(1e-9));
+    let ramp = d.density_ramp.max(0.0);
+    let mut m = refine(mesh, |p| d.spacing * (1.0 + ramp * ((p.x - x0) / dx).clamp(0.0, 1.0)));
+    // holes: drop triangles whose centroid falls in a ball around a random surface point
+    let centres: Vec<Point3> = m.sample_points(d.holes, rng).into_iter().map(|(p, _)| p).collect();
+    if !centres.is_empty() {
+        let r2 = d.hole_radius * d.hole_radius;
+        let keep: Vec<u32> = (0..m.triangle_count())
+            .filter(|&t| m.face_centroid(t).is_some_and(|c| centres.iter().all(|h| (c - h).norm_squared() > r2)))
+            .map(|t| t as u32)
+            .collect();
+        m = m.submesh(&keep);
+    }
+    if d.noise > 0.0 {
+        add_noise(&mut m, d.noise, rng);
+    }
+    // spikes along the normal
+    let normals = m.vertex_normals();
+    let n = m.positions.len();
+    let count = (n as f64 * d.spikes.clamp(0.0, 1.0)) as usize;
+    for _ in 0..count {
+        let i = rng.index(n);
+        let mag = d.spacing * rng.range(3.0, 8.0) * if rng.uniform() < 0.5 { -1.0 } else { 1.0 };
+        if let (Some(p), Some(nn)) = (m.positions.get_mut(i), normals.get(i)) {
+            *p += nn * mag;
+        }
+    }
+    // floating debris: tiny patches a little off the surface
+    for _ in 0..d.debris {
+        let Some((p, nn)) = m.sample_points(1, rng).into_iter().next() else { break };
+        let u = crate::any_perpendicular(&nn);
+        let v = nn.cross(&u);
+        let o = p + nn * (3.0 * d.spacing) - u * d.spacing - v * d.spacing;
+        let mut patch = plane(o, u, v, 2.0 * d.spacing, 2.0 * d.spacing, 2, 2);
+        patch.weld(1e-9);
+        m.append(&patch);
+    }
+    m
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refine_is_conforming_and_scanify_adds_defects() {
+        let mut b = cuboid(Point3::origin(), Vec3::new(20.0, 10.0, 5.0), 1);
+        b.weld(1e-9);
+        let r = refine(&b, |_| 1.0);
+        // every edge short, still closed (no boundary edges: each directed edge has its reverse)
+        let mut dir = std::collections::HashSet::new();
+        for t in &r.triangles {
+            for k in 0..3 {
+                let (a, c) = (t[k], t[(k + 1) % 3]);
+                assert!((r.positions[a as usize] - r.positions[c as usize]).norm() <= 1.0 + 1e-12);
+                dir.insert((a, c));
+            }
+        }
+        assert!(dir.iter().all(|(a, c)| dir.contains(&(*c, *a))));
+        assert!((r.area() - b.area()).abs() < 1e-9);
+        let d = ScanDefects { holes: 2, debris: 3, ..ScanDefects::default() };
+        let s = scanify(&b, &d, &mut Rng::new(7));
+        assert!(s.triangle_count() > r.triangle_count() / 2);
+        assert!(s.area() < b.area() + 3.0 * 4.0 * d.spacing * d.spacing);
+    }
 
     #[test]
     fn shapes_are_on_their_surfaces() {

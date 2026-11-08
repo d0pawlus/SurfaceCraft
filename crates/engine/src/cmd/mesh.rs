@@ -5,7 +5,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use surfacecraft_doc::{ObjectId, ObjectKind, base64};
-use surfacecraft_geom::{Mesh, Point3, Rng, Transform, Vec3, synth};
+use surfacecraft_geom::{Mesh, Point3, Rng, Transform, Vec3, edit, synth};
 use surfacecraft_io::{Limits, MeshFormat, read_mesh, write_mesh};
 
 /// Facts about a mesh.
@@ -330,6 +330,266 @@ fn synth_cmd(s: &mut Session, i: SynthIn) -> CmdResult<MeshInfo> {
     mesh_info(s, id)
 }
 
+/// Result of a mesh edit.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct EditOut {
+    /// Object id.
+    pub id: ObjectId,
+    /// Triangles before.
+    pub triangles_before: usize,
+    /// Triangles after.
+    pub triangles: usize,
+    /// Triangles removed.
+    pub removed_triangles: usize,
+    /// Triangles added.
+    pub added_triangles: usize,
+    /// Holes filled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub holes_filled: Option<usize>,
+    /// Holes left open (above the size limit).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub holes_left: Option<usize>,
+    /// Largest vertex displacement (smoothing), mm.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_displacement: Option<f64>,
+    /// Regions of the mesh dropped because its triangles changed.
+    pub regions_dropped: usize,
+}
+
+/// Runs `f` on a copy of the mesh and stores the result (regions dropped when triangles changed).
+fn edit_mesh(
+    s: &mut Session,
+    object: &ObjRef,
+    f: impl FnOnce(&mut Mesh, &mut EditOut) -> CmdResult<()>,
+) -> CmdResult<EditOut> {
+    let id = object.resolve(s, ObjectKind::Mesh)?;
+    let obj = s.doc.mesh(id).ok_or_else(|| CmdError::Params(format!("no mesh {id}")))?;
+    let mut m: Mesh = (*obj.mesh).clone();
+    let mut o = EditOut {
+        id,
+        triangles_before: m.triangle_count(),
+        triangles: 0,
+        removed_triangles: 0,
+        added_triangles: 0,
+        holes_filled: None,
+        holes_left: None,
+        max_displacement: None,
+        regions_dropped: 0,
+    };
+    let old_tris = m.triangles.clone();
+    f(&mut m, &mut o)?;
+    o.triangles = m.triangle_count();
+    if m.triangles != old_tris {
+        o.regions_dropped = s.doc.replace_mesh_topology(id, m).unwrap_or(0);
+    } else if let Some(obj) = s.doc.mesh_mut(id) {
+        obj.mesh = Arc::new(m);
+    }
+    s.overlays.remove(&id);
+    Ok(o)
+}
+
+fn positive(v: Option<f64>, name: &str, default: f64) -> CmdResult<f64> {
+    match v {
+        None => Ok(default),
+        Some(x) if x.is_finite() && x > 0.0 => Ok(x),
+        Some(_) => Err(CmdError::Params(format!("{name} must be a positive number"))),
+    }
+}
+
+fn fraction(v: Option<f64>, name: &str, default: f64) -> CmdResult<f64> {
+    match v {
+        None => Ok(default),
+        Some(x) if x.is_finite() && (0.0..=1.0).contains(&x) => Ok(x),
+        Some(_) => Err(CmdError::Params(format!("{name} must be in [0, 1]"))),
+    }
+}
+
+/// Clean-up parameters.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CleanIn {
+    /// Mesh id or name.
+    pub object: ObjRef,
+    /// Components smaller than this fraction of the largest are removed (default 0.01).
+    #[serde(default)]
+    pub min_component_fraction: Option<f64>,
+    /// Components with fewer triangles are removed (default 20).
+    #[serde(default)]
+    pub min_component_triangles: Option<usize>,
+    /// Spike threshold: distance off the one-ring plane over the ring radius (default 1.5;
+    /// `0` skips outlier removal).
+    #[serde(default)]
+    pub outlier_ratio: Option<f64>,
+    /// Also fill holes up to this many edges (default: leave holes).
+    #[serde(default)]
+    pub fill_holes_max_edges: Option<usize>,
+}
+
+fn clean(s: &mut Session, i: CleanIn) -> CmdResult<EditOut> {
+    let frac = fraction(i.min_component_fraction, "min_component_fraction", 0.01)?;
+    let ratio = i.outlier_ratio.unwrap_or(1.5);
+    if !(ratio.is_finite() && ratio >= 0.0) {
+        return Err(CmdError::Params("outlier_ratio must be ≥ 0".into()));
+    }
+    edit_mesh(s, &i.object, |m, o| {
+        let mut removed = m.remove_degenerate(0.0);
+        if ratio > 0.0 {
+            removed += edit::remove_outliers(m, ratio);
+        }
+        removed += edit::remove_small_components(m, frac, i.min_component_triangles.unwrap_or(20));
+        o.removed_triangles = removed;
+        if let Some(n) = i.fill_holes_max_edges {
+            let before = m.triangle_count();
+            let r = edit::fill_holes(m, n, true);
+            o.added_triangles = m.triangle_count() - before;
+            o.holes_filled = Some(r.filled);
+            o.holes_left = Some(r.skipped);
+        }
+        edit::compact(m);
+        Ok(())
+    })
+}
+
+/// Outlier removal parameters.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OutliersIn {
+    /// Mesh id or name.
+    pub object: ObjRef,
+    /// Distance off the one-ring plane over the ring radius above which a vertex is a spike
+    /// (default 1.5).
+    #[serde(default)]
+    pub ratio: Option<f64>,
+}
+
+fn outliers(s: &mut Session, i: OutliersIn) -> CmdResult<EditOut> {
+    let ratio = positive(i.ratio, "ratio", 1.5)?;
+    edit_mesh(s, &i.object, |m, o| {
+        o.removed_triangles = edit::remove_outliers(m, ratio);
+        Ok(())
+    })
+}
+
+/// Small component removal parameters.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SmallIn {
+    /// Mesh id or name.
+    pub object: ObjRef,
+    /// Fraction of the largest component below which a component goes (default 0.01).
+    #[serde(default)]
+    pub min_fraction: Option<f64>,
+    /// Triangle count below which a component goes (default 20).
+    #[serde(default)]
+    pub min_triangles: Option<usize>,
+}
+
+fn small(s: &mut Session, i: SmallIn) -> CmdResult<EditOut> {
+    let frac = fraction(i.min_fraction, "min_fraction", 0.01)?;
+    edit_mesh(s, &i.object, |m, o| {
+        o.removed_triangles = edit::remove_small_components(m, frac, i.min_triangles.unwrap_or(20));
+        Ok(())
+    })
+}
+
+/// Hole filling parameters.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FillIn {
+    /// Mesh id or name.
+    pub object: ObjRef,
+    /// Largest hole filled, in boundary edges (default 300, at most 4000).
+    #[serde(default)]
+    pub max_edges: Option<usize>,
+    /// Curvature-following fill (refined, thin-plate faired); `false` = flat (default true).
+    #[serde(default)]
+    pub smooth: Option<bool>,
+}
+
+fn fill(s: &mut Session, i: FillIn) -> CmdResult<EditOut> {
+    edit_mesh(s, &i.object, |m, o| {
+        let before = m.triangle_count();
+        let r = edit::fill_holes(m, i.max_edges.unwrap_or(300), i.smooth.unwrap_or(true));
+        o.added_triangles = m.triangle_count() - before;
+        o.holes_filled = Some(r.filled);
+        o.holes_left = Some(r.skipped);
+        Ok(())
+    })
+}
+
+/// Decimation parameters: a `target` triangle count or a `ratio` of the current count.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DecimateIn {
+    /// Mesh id or name.
+    pub object: ObjRef,
+    /// Triangles to keep.
+    #[serde(default)]
+    pub target: Option<usize>,
+    /// Fraction of triangles to keep, (0, 1] (default 0.5 when `target` is not given).
+    #[serde(default)]
+    pub ratio: Option<f64>,
+    /// Never move the surface more than this (mm, approximate).
+    #[serde(default)]
+    pub max_error: Option<f64>,
+    /// Edges sharper than this stay in place (degrees, default 40).
+    #[serde(default)]
+    pub feature_angle_deg: Option<f64>,
+    /// Keep the open boundary in place (default true).
+    #[serde(default)]
+    pub preserve_boundary: Option<bool>,
+}
+
+fn decimate(s: &mut Session, i: DecimateIn) -> CmdResult<EditOut> {
+    let ratio = i.ratio.unwrap_or(0.5);
+    if !(ratio.is_finite() && ratio > 0.0 && ratio <= 1.0) {
+        return Err(CmdError::Params("ratio must be in (0, 1]".into()));
+    }
+    if let Some(e) = i.max_error
+        && !(e.is_finite() && e > 0.0)
+    {
+        return Err(CmdError::Params("max_error must be positive".into()));
+    }
+    let angle = positive(i.feature_angle_deg, "feature_angle_deg", 40.0)?;
+    edit_mesh(s, &i.object, |m, o| {
+        let target = i.target.unwrap_or((m.triangle_count() as f64 * ratio) as usize);
+        let opts = edit::DecimateOptions {
+            target_triangles: target,
+            max_error: i.max_error,
+            feature_angle_deg: angle,
+            preserve_boundary: i.preserve_boundary.unwrap_or(true),
+        };
+        o.removed_triangles = edit::decimate(m, &opts);
+        Ok(())
+    })
+}
+
+/// Smoothing parameters.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SmoothIn {
+    /// Mesh id or name.
+    pub object: ObjRef,
+    /// Taubin iterations (default 5, at most 1000).
+    #[serde(default)]
+    pub iterations: Option<usize>,
+    /// Keep boundary vertices in place (default true).
+    #[serde(default)]
+    pub fix_boundary: Option<bool>,
+    /// Vertices on edges sharper than this stay (degrees, default 40; 180 smooths everything).
+    #[serde(default)]
+    pub feature_angle_deg: Option<f64>,
+}
+
+fn smooth(s: &mut Session, i: SmoothIn) -> CmdResult<EditOut> {
+    let angle = positive(i.feature_angle_deg, "feature_angle_deg", 40.0)?;
+    edit_mesh(s, &i.object, |m, o| {
+        let feat = if angle >= 180.0 { None } else { Some(angle) };
+        o.max_displacement = Some(edit::smooth(m, i.iterations.unwrap_or(5), i.fix_boundary.unwrap_or(true), feat));
+        Ok(())
+    })
+}
+
 /// `mesh.*` commands.
 pub static COMMANDS: &[CommandSpec] = &[
     command!(
@@ -381,5 +641,65 @@ pub static COMMANDS: &[CommandSpec] = &[
         SynthIn,
         MeshInfo,
         synth_cmd
+    ),
+    command!(
+        "mesh.clean",
+        "Clean scan",
+        "Mesh",
+        true,
+        "Removes degenerate triangles, spikes (`outlier_ratio`) and small components; optionally fills holes up to `fill_holes_max_edges`.",
+        CleanIn,
+        EditOut,
+        clean
+    ),
+    command!(
+        "mesh.remove_outliers",
+        "Remove spikes",
+        "Mesh",
+        true,
+        "Removes triangles at vertices farther than `ratio` × ring radius off their one-ring plane.",
+        OutliersIn,
+        EditOut,
+        outliers
+    ),
+    command!(
+        "mesh.remove_small",
+        "Remove small pieces",
+        "Mesh",
+        true,
+        "Removes components below `min_fraction` of the largest or `min_triangles`.",
+        SmallIn,
+        EditOut,
+        small
+    ),
+    command!(
+        "mesh.fill_holes",
+        "Fill holes",
+        "Mesh",
+        true,
+        "Fills boundary loops up to `max_edges`; `smooth` follows the surrounding curvature, else flat.",
+        FillIn,
+        EditOut,
+        fill
+    ),
+    command!(
+        "mesh.decimate",
+        "Decimate",
+        "Mesh",
+        true,
+        "Reduces to `target` triangles or `ratio`, within `max_error` mm, keeping edges sharper than `feature_angle_deg`.",
+        DecimateIn,
+        EditOut,
+        decimate
+    ),
+    command!(
+        "mesh.smooth",
+        "Smooth",
+        "Mesh",
+        true,
+        "Taubin smoothing, `iterations`, keeping the boundary and edges sharper than `feature_angle_deg`.",
+        SmoothIn,
+        EditOut,
+        smooth
     ),
 ];
