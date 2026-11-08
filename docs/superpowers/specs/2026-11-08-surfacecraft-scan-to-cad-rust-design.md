@@ -7,6 +7,10 @@
 > Rewizja 2026-11-08 (po przeglądzie): ujednolicona kolejność eksportu (STEP w M3, IGES w M5 — §8/§10/§11),
 > `Region` przypisany do M2 (§6.2/§8), korpus testowy rozdzielony na repo/lokalny zgodnie z clean-room (§9/§11.1),
 > nota o progach względem szumu skanu (§10, progi zatwierdzone bez zmian).
+> Rewizja 2026-11-08 (po spike'u ekosystemu — [raport](./2026-11-08-surfacecraft-ecosystem-spike.md)): solidcore z git
+> (pin `rev`) przez `solidcore-ops`/`-record`/`-tess`; STEP z solidcore zamiast `truck` (truck usunięty); render = surowe
+> `wgpu` przez egui-wgpu; podział obliczeń mesh↔B-rep; konwencje rodziny do M0; zasada „upstream, potem adaptacja”
+> dla kodu rodziny; repo na koncie autora; nowe ryzyka (§1, §5, §6.3, §6.4, §8, §9, §10, §11, §12).
 
 ---
 
@@ -22,9 +26,10 @@ Dlaczego teraz: istniejący komercyjny lider tej niszy (QuickSurface, KVS Ltd) j
 oparty na płatnym kernelu Parasolid i MFC, i częściowo deleguje operacje parametryczne do
 SolidWorks/Inventor. Pojawienie się czysto-rustowego, otwartego kernela B-rep (`solidcore`,
 port NVIDIA SMLib, Apache-2.0, buduje się na `wasm32`) zaczyna umożliwiać zbudowanie w pełni
-samodzielnego, otwartego odpowiednika bez komercyjnych zależności. **Zastrzeżenie:** `solidcore`
-jest wczesny (0.0.x, „experimental", „stays at 0.0.x until usable end to end") — to główne ryzyko
-projektu (patrz §11), a nie fakt dokonany.
+samodzielnego, otwartego odpowiednika bez komercyjnych zależności. **Zastrzeżenie:** na crates.io jest
+`solidcore` 1.0.1, ale numer odpowiada wersji upstream usd-brep, a README nadal deklaruje API eksperymentalne;
+warstwa operacji (`solidcore-ops`), rekord, tessellacja i STEP są **tylko w git**. Dojrzałość kernela pozostaje
+głównym ryzykiem projektu (patrz §11), a nie faktem dokonanym.
 
 > Materiał źródłowy analizy funkcjonalnej QuickSurface:
 > [`2026-11-08-quicksurface-functional-analysis.md`](./2026-11-08-quicksurface-functional-analysis.md).
@@ -111,13 +116,14 @@ Warstwy, gdzie „nic poniżej `ui` nie wie o egui" (wymienialny front):
 
 ```
 geom      — typy geometryczne f64: punkty, wektory, mesh, KD-tree, przekroje, dopasowania LSQ
-kernel    — adapter na solidcore (B-rep): prymitywy, extrude/revolve/boolean/fillet/shell, NURBS
+kernel    — adapter na solidcore-ops + solidcore-record + solidcore-tess (B-rep): prymitywy, extrude/revolve/
+            loft/boolean/fillet/shell/thicken, NURBS, tessellacja do wyświetlania; JEDYNY crate zależny od solidcore
 fit       — algorytmy dopasowania: prymitywy (LSQ/RANSAC), NURBS, retopo/quad, symmetry
 align     — wyrównanie: 3-2-1 datum, Kabsch/Umeyama (N-point), ICP point-to-plane
 sketch    — geometria 2D + solver więzów (Newton/LSQ), fit łuków/linii do przekrojów
 doc       — model dokumentu: DAG historii cech, parametry, undo/redo, (de)serializacja projektu
 engine    — sesje, rejestr komend, snapy, wykonanie komendy (źródło prawdy dla wszystkich wejść)
-io        — STEP/IGES (OSOBNY strumień: NIE z solidcore — patrz §10/§11), STL/OBJ/PLY (mesh), format projektu
+io        — STEP/IGES (przez rekord solidcore + writery rodziny — patrz §10), STL/OBJ/PLY (mesh), format projektu
 deviation — analiza odchyłki mesh↔powierzchnia (KD-tree), dane do mapy kolorów
 ui-egui   — desktop + web (wasm) front
 cli       — `surfacecraft-cli` (run skryptów JSON, batch, eksport)
@@ -128,7 +134,16 @@ ai        — (post-MVP) asystent LLM: tryby „align" i „workflow", wejście 
 **Zasada command-driven (wzorzec z rodziny):** każda akcja UI = komenda wywoływalna także jako JSON
 i przez MCP. To automatycznie daje skryptowalność, testowalność i integrację z agentami.
 
-**Render 3D:** `wgpu` (lub `three-d`/`rend3` jako warstwa wyżej) — wieloplatformowy, wasm-friendly.
+**Podział obliczeń geometrycznych (reguła rodziny „apps compute no geometry”, solidcore `docs/layers.md`):**
+- **obliczenia na meshu** (KD-tree, ICP, RANSAC, segmentacja regionów, odchyłka mesh↔mesh) zostają w SurfaceCraft
+  (`geom`/`fit`/`align`/`deviation`) — to nie jest geometria B-rep;
+- **tworzenie i ewaluacja geometrii B-rep/NURBS** (płat z punktów, projekcja punktu na powierzchnię, konstrukcja
+  ścian, operacje bryłowe) idzie przez solidcore (`kernel`). Brakujące prymitywy (np. fit NURBS do punktów
+  rozproszonych, constrained fit krawędzi pod G1) zgłaszamy upstream, a do czasu ich wejścia trzymamy w `fit`
+  na jawnej allowliście (`cargo xtask app-geometry`, shrink-only).
+
+**Render 3D:** surowe **`wgpu` 30 przez `egui-wgpu` 0.37** (własne pipeline'y viewportu, jak SolidCraft); tessellacja
+B-rep do wyświetlania z `solidcore-tess`. Rodzina nie używa `three-d`/`rend3`.
 
 **Matematyka:** `nalgebra` (SVD, macierze, kwaterniony) + `faer` (szybkie LSQ/układy liniowe).
 Bez OpenBLAS/Fortran (w przeciwieństwie do QS).
@@ -168,7 +183,10 @@ Skrót z analiz QS i GDX (pełny materiał: [analiza QS](./2026-11-08-quicksurfa
   obecność InstantMeshes/xremeshlib w QS)*
 - Algorytm: parametryzacja + LSQ na punktach kontrolnych B-spline/NURBS; retopo = pole kierunków+pozycji
   (Instant Meshes) → łaty Béziera/NURBS zszyte z ciągłością G1.
-- Rust: `fit` + `truck` (NURBS/B-spline) lub `solidcore`; retopo = port/adaptacja **Instant Meshes (MIT)**
+- Rust: NURBS = **`solidcore`** (płat z punktów kontrolnych, `srf_fit::lst_sq_approx` na siatce regularnej,
+  ewaluacja z pochodnymi, `surface_closest_point` jako rdzeń mapy odchyłek, arkusz z płata). **Luka:** brak fitu
+  NURBS do punktów **rozproszonych** — w M3 resampling regionu do siatki (parametryzacja) albo własny LSQ (`faer`)
+  w `fit` na allowliście (§5), docelowo prymityw kernela upstream. Retopo = port/adaptacja **Instant Meshes (MIT)**
   — *decyzja do buildera: port natywny vs wywołanie jako proces na starcie* (patrz §10).
 - **Druga, uzupełniająca strategia** *(wzorzec z GDX: `Trace Feature Line` → `Extract Contour Curves` →
   `Construct Patch Network` → `Relax Contour`/`Relax Patches` → `Repair Patches` → zszycie NURBS)* —
@@ -188,9 +206,11 @@ Skrót z analiz QS i GDX (pełny materiał: [analiza QS](./2026-11-08-quicksurfa
   offsetu itp., zamiast czekać na ręczny input)* — ten sam LSQ-fit co ekstrakcja prymitywów (§6.2), tylko
   wywołany lokalnie w momencie tworzenia cechy. Tanie algorytmicznie, duży zysk UX; wpleść w kreatory cech
   w M5, nie jako osobny moduł.
-- Rust: kernel = **`solidcore`** (booleany/fillet/chamfer/shell/sweep/prymitywy/NURBS potwierdzone w zakresie;
-  **extrude/revolve/trim/pattern — do weryfikacji** na `tangency-labs.github.io/solidcore`); solver więzów = własny
-  (`faer`); DAG+replay = `doc`/`engine`. **STEP/IGES: osobny strumień, NIE solidcore** (patrz §10/§11).
+- Rust: kernel = **`solidcore-ops`** — extrude (z pochyleniem), revolve, loft, sweep, split/trim, booleany,
+  fillet/chamfer, shell/offset/draft, stitch, przekroje i pomiary są w API (spike §1.3). Trim i przekrój płaski
+  (`brep_planar_section`) mają w porcie status *partial* — do testu przed M5. **Pattern** nie ma dedykowanej
+  operacji: recepta copy + transform + `union_all` w `engine`. Solver więzów = własny (`faer`) albo adaptacja
+  `solidcraft-sketch` wg zasady z §9; DAG+replay = `doc`/`engine`. STEP/IGES — patrz §10.
 - **Największy pojedynczy kawałek pracy** (solver więzów + DAG + komplet cech).
 
 ## 7. Wzorce z QuickSurface i Geomagic Design X warte powtórzenia (jako wzór, nie kod)
@@ -220,29 +240,55 @@ Asystent AI (tryby „align"/„workflow", wejście = obraz viewportu) — post-
 
 Rosnąco wg trudności; każdy kamień daje działającą, testowalną całość:
 
-- **M0 — szkielet:** workspace, warstwy, import mesh (STL/OBJ/PLY), viewport wgpu, rejestr komend, CLI.
+- **M0 — szkielet:** workspace i konwencje rodziny (§9), warstwy z kontrolą `cargo xtask layers`, import mesh
+  (STL/OBJ/PLY), viewport wgpu, rejestr komend, CLI; **pin `rev` solidcore + `deny.toml` (allow-git) + smoke test
+  granicy `kernel`** (box → fillet → `to_record`), żeby M2+ miało na czym się opierać.
 - **M1 — Wyrównanie (beachhead):** 3-2-1, N-point, ICP, world-axis. Pierwsza użyteczna wersja.
 - **M2 — Prymitywy:** fit plane/cylinder/cone/sphere/torus + auto-typ + symmetry; deviation;
   **`Region` jako trwała encja w `doc`** (auto-segment + merge/split; pozostałe operacje — resegment/insert/
   separate/enlarge/shrink — mogą dojść później, patrz §6.2).
 - **M3 — Fit Surface:** pojedynczy płat NURBS na region + mapa odchyłek; **eksport STEP** (powierzchnie/shell —
   pierwszy writer, patrz §10).
-- **M4 — Freeform/AutoSurface:** retopo quad + łaty NURBS + snap/crease/merge; thicken→bryła.
+- **M4 — Freeform/AutoSurface:** retopo quad + łaty NURBS + snap/crease/merge; thicken→bryła (`offset::thicken`).
 - **M5 — Parametryka:** szkic 2D + solver więzów, przekroje, extrude/revolve, fillet/chamfer/shell,
   pattern/trim/cut/boolean, DAG historii; eksport STEP pełnych brył parametrycznych + **eksport IGES**.
 - **M6 — Web (wasm) + MCP** równolegle utrzymywane; **AI assistant** jako ostatnie.
 
 ## 9. Ograniczenia
 
-- **Pure Rust / wasm-compatible** — kernel `solidcore` (Apache-2.0, crates.io, czysty Rust bez toolchainu C++,
-  buduje się na `wasm32-unknown-unknown` — potwierdzone; uwaga na stack size w wasm: `-zstack-size`), zero
+- **Pure Rust / wasm-compatible** — kernel `solidcore` (Apache-2.0, czysty Rust bez toolchainu C++), zero
   Parasolid/OCCT jako głównego kernela, zero zależności Fortran/BLAS natywnych (preferuj `faer`).
-- **Licencja MIT OR Apache-2.0**; pliki LICENSE-APACHE, LICENSE-MIT, NOTICE, ATTRIBUTION.md; `cargo xtask ci`.
+  **Dystrybucja:** zależność **z git z pinem `rev`** (`solidcore`, `solidcore-ops`, `solidcore-record`,
+  `solidcore-tess`, `step-*` — poza `solidcore` nic nie jest na crates.io), `deny.toml` z `unknown-git = "deny"`
+  i `allow-git = ["https://github.com/tangency-labs/solidcore"]`. wasm: CI solidcore sprawdza tylko crate
+  `solidcore` — resztę sprawdza nasz `cargo xtask wasm`; konsument wasm potrzebuje `-zstack-size=8388608`.
+- **Licencja MIT OR Apache-2.0**; pliki LICENSE-APACHE, LICENSE-MIT, NOTICE, ATTRIBUTION.md, generowany
+  THIRD-PARTY-LICENSES.txt; `cargo xtask ci`.
 - **Clean-room:** żadnego kodu/zasobów QuickSurface, Geomagic Design X ani brandingu ArtCraft w forku; tylko
   analiza funkcji. Dotyczy także danych testowych: przykładowe skany z instalacji QS/GDX są tylko lokalne (§11.1).
-  Jeśli dołączamy do rodziny — przestrzegać `AGENTS.md`/`CONTRIBUTING.md` danej org.
-- **„Dołączenie do pakietu ArtCraft" = zgodność konwencji + wpis na listę Crafting Apps**, nie API pluginu
-  (brak publicznego launchera/rejestru — ustalono z RE; patrz §11 „ryzyka").
+- **Kod rodziny Crafting Apps (decyzja użytkownika 2026-11-08): „najpierw upstream, potem adaptacja”.** Clean-room
+  dotyczy tylko kodu zamkniętego; otwarty kod rodziny (MIT OR Apache-2.0, np. SolidCraft) wolno wykorzystać, w tej
+  kolejności: (1) użyć tego, co jest w solidcore; (2) brakującą rzecz zaproponować/dopisać **upstream** do solidcore
+  (zgodnie z regułą rodziny „one implementation per job”); (3) dopiero gdy upstream się nie da albo blokuje
+  milestone — **adaptacja** kodu z repo rodziny do SurfaceCraft z atrybucją: zachowane nagłówki copyright, wpis
+  w `NOTICE` i `ATTRIBUTION.md`, oznaczenie zmodyfikowanych plików (Apache-2.0 §4), bez nazw/ikon/brandingu
+  źródła. Adaptacje oznaczamy jako dług do wymiany na wersję z solidcore, gdy ta powstanie. **Nie** zależymy od
+  ciężkich crate'ów aplikacji (np. `solidcraft-kernel`) przez git.
+- **Konwencje rodziny (twarde wymaganie, §12; szczegóły: [raport spike'u](./2026-11-08-surfacecraft-ecosystem-spike.md) §3):**
+  workspace `resolver = "3"`, `crates/*` + `apps/*` + `xtask`, edition 2024, MSRV 1.95, pakiety `surfacecraft-<crate>`;
+  aplikacje `apps/surfacecraft`, `apps/surfacecraft-cli`, `apps/surfacecraft-web`; tabela warstw w `xtask` (crate'y UI
+  dopiero od warstwy UI); `unsafe_code = "forbid"` + deny `unwrap/expect/panic/todo/unimplemented/unreachable`
+  w kodzie produkcyjnym; wejście traktowane jako wrogie (bez panik); `cargo xtask ci` = fmt → assets → licences →
+  layers → clippy `-D warnings` → wasm check → testy; `AGENTS.md` jako router do `skills/<obszar>/SKILL.md`,
+  `CLAUDE.md` = `@AGENTS.md`; `CommandSpec` z id `area.verb` i schematami wejścia/wyjścia (JSON Schema), skrypty
+  `{"commands": [...]}`, wywołania programowe bez dialogów; MCP jako własny JSON-RPC 2.0 po stdio (bez `rmcp`),
+  tryb „bridged” do działającej aplikacji przez `127.0.0.1` z tokenem sesji.
+- **Repo i organizacja (decyzja użytkownika 2026-11-08):** SurfaceCraft żyje na koncie autora
+  (`github.com/d0pawlus/surfacecraft`, na razie prywatne). Blok house rules z `storytold/craft-contrib` nie jest
+  obowiązkowy — własny `AGENTS.md` w duchu SolidCrafta; blok można dodać, jeśli projekt trafi do organizacji rodziny.
+- **Dołączenie do rodziny = zgodność konwencji + wpis w `storytold/craft-launcher`** jako *community app*
+  (decyzja maintainera; kontrakt wydań: własne bundle id, `SHA256SUMS.txt`, podpis Developer ID na macOS).
+  API pluginu nie ma. Wydania przygotowujemy zgodnie z tym kontraktem.
 - Wejście: mesh (nie surowa chmura). Jednostki: mm (z obsługą skali przy imporcie, jak QS).
 - **Skala i rozszerzalność (decyzja użytkownika):** MVP celuje w mesh **do ~10 mln trójkątów, in-memory,
   desktop**. Architektura musi jednak zostawiać ścieżkę rozwoju do **100 mln+** bez przepisywania rdzenia:
@@ -252,16 +298,25 @@ Rosnąco wg trudności; każdy kamień daje działającą, testowalną całość
 
 ## 10. Co zostaje do decyzji buildera
 
-- **Dostawca STEP/IGES (M3/M5):** solidcore tego NIE robi (translatory poza zakresem). Opcje: `truck`/`truck-stepio`,
-  inny crate, albo własny writer. Zweryfikować na starcie, jak solidcraft realizuje STEP/IGES, i czy jego ścieżka
-  jest wielokrotnego użytku. Kolejność (spójna z §8 i §11): **STEP w M3** (najważniejszy dla CAD; najpierw
-  powierzchnie/shell), **IGES w M5** razem z pełnymi bryłami. Do decyzji buildera zostaje sam dostawca, nie kolejność.
+- **Dostawca STEP/IGES (M3/M5) — rozstrzygnięty po spike'u, wg zasady z §9:** wszystkie writery czytają ten sam
+  neutralny rekord (`Body::to_record` → `solidcore_record::brep::Brep`), więc nie ma tłumaczenia topologii.
+  - **M3 — STEP powierzchni:** PR upstream do `solidcore/step-export` dodający `SHELL_BASED_SURFACE_MODEL`/`OPEN_SHELL`
+    dla `BodyKind::ShellModel` (model i `brep_to_model` już to obsługują). Fallback: adaptacja zapisu otwartych powłok
+    z `solidcraft-step`.
+  - **M5 — STEP brył:** `step-brep::brep_to_model` + `step-export::write_with_metadata` (AP214/AP242), round-trip przez
+    `step_brep::import`; po scaleniu STEP w `solidcore-ops` przejście na API `ops`.
+  - **M5 — IGES:** propozycja przeniesienia `iges_out` SolidCrafta do solidcore; fallback: adaptacja `iges_out`
+    (IGES 5.3, encje 186/514) z atrybucją.
+  - `truck`/`truck-stepio` odpada (rodzina z niego zrezygnowała; truck-stepio nieaktualizowany od 2024-09).
+  Kolejność bez zmian: **STEP w M3**, **IGES w M5**.
 - **Retopologia (M4):** port Instant Meshes do Rust vs wywołanie binarki jako proces na start
   (rekomendacja: najpierw proces/MVP, potem natywny port).
-- **NURBS:** `truck` vs natywne w `solidcore` — zależnie od tego, co solidcore eksponuje (sprawdzić
-  `Cargo.toml`/API solidcore).
+- ~~NURBS: `truck` vs `solidcore`~~ — **zamknięte: solidcore** (§6.3). Otwarte zostaje tylko: jak zamknąć lukę fitu do
+  punktów rozproszonych w M3 (resampling vs własny LSQ vs PR upstream).
 - Biblioteka solvera nieliniowego: `levenberg-marquardt` vs `argmin`.
-- Warstwa renderu: surowe `wgpu` vs `three-d`/`rend3`.
+- ~~Warstwa renderu~~ — **zamknięte: surowe `wgpu` przez `egui-wgpu`** (§5).
+- Opcjonalne wspólne biblioteki `storytold/craft-libs` (`craft-ui`, `craft-window`, `craft-update`; Apache-2.0) —
+  użyć czy nie, do decyzji przy M0.
 - Format projektu (serializacja DAG): `serde` + JSON/ron/binarny — dobór po M0.
 - Dokładny zestaw komend mesh-edit w MVP (minimalny vs rozszerzony).
 - **Progi względem szumu skanu:** zatwierdzone progi z §11.1 są bezwzględne (mm), a szum typowych skanerów
@@ -273,20 +328,25 @@ Rosnąco wg trudności; każdy kamień daje działającą, testowalną całość
 
 ## 11. Ryzyka i założenia
 
-- **Dojrzałość `solidcore` — ryzyko #1 projektu.** Kernel jest 0.0.x, „experimental", „stays at 0.0.x until usable
-  end to end", „integration remains in progress: deferred paths still limit coverage". Potwierdzone w zakresie:
-  booleany, fillet/chamfer, offset/shell, sweeps/skins, prymitywy, NURBS. **Niepotwierdzone wprost:**
-  extrude/revolve/loft/trim/pattern. **Działanie:** przed M2 zweryfikować aktualny status portu na
-  `tangency-labs.github.io/solidcore` (per-unit) i przetestować realne operacje; jeśli luki — uzupełnić `truck`
-  lub dołożyć własne operacje na bazie prymitywów kernela. Harmonogram M3–M5 zależy od tego wyniku. *(ryzyko)*
-- **STEP/IGES to osobny workstream** — solidcore nie ma translatorów plikowych. Eksport (twardy cel §3) wymaga
-  `truck`/własnego writera; zaplanować jako odrębne zadanie: M3 (STEP, powierzchnie) i M5 (STEP pełnych brył + IGES).
-  *(ryzyko)*
-- **wasm całego stosu** — kernel `solidcore` buduje się na `wasm32` (potwierdzone), ale wasm `truck` + ścieżki
-  renderu `wgpu` wymagają spike'u w M0/M6; limity pamięci przeglądarki mogą ograniczyć web do podzbioru
-  (mesh/align/view) na dużych skanach. „Web" traktujemy jako cel warunkowy, desktop-first. *(ryzyko/decyzja Claude)*
-- **Brak publicznego API launchera ArtCraft** (potwierdzone w RE org tangency-labs/storytold) — zakładamy,
-  że integracja to zgodność konwencji + listing; jeśli pojawi się mechanizm, dostosujemy. *(założenie)*
+- **Dojrzałość `solidcore` — ryzyko #1 projektu (częściowo obalone po spike'u).** API dla extrude/revolve/loft/
+  sweep/split/booleanów/filletów/shell/thicken istnieje w `solidcore-ops`; pattern to recepta aplikacji. Nadal otwarte:
+  27 unitów *partial* + 1 *blocked* w porcie (m.in. offset, trim, przekrój płaski, `boolean.api_brep`), API niestabilne
+  mimo numeru 1.0.1, a `solidcore-ops` nie jest jeszcze używane produkcyjnie nawet przez SolidCraft. **Działanie:**
+  smoke test granicy `kernel` w M0; przed M2 i przed M5 testy realnych operacji na naszych przypadkach; luki —
+  upstream albo własne operacje na prymitywach kernela (§9). *(ryzyko)*
+- **STEP/IGES (częściowo obalone)** — STEP brył jest w solidcore, STEP arkuszy i IGES są w SolidCrafcie; workstream
+  maleje do „integracja + mały PR upstream + IGES” (§10). *(ryzyko)*
+- **wasm całego stosu (częściowo obalone)** — truck wypada; `solidcore` jest sprawdzany na wasm w CI, a stos egui 0.37/
+  wgpu 30 + solidcore działa w `solidcraft-web`. Otwarte: `solidcore-ops`/`step-*` bez kontroli wasm w repo solidcore
+  (sprawdza nasz `xtask wasm`), limity pamięci przeglądarki dla dużych skanów — web zostaje celem warunkowym,
+  desktop-first. *(ryzyko/decyzja Claude)*
+- ~~Brak publicznego API launchera~~ — **obalone:** `storytold/craft-launcher` przyjmuje *community apps* (§9).
+- **Zależność git-only z pinem `rev`** *(nowe)* — solidcore przenosi zadania między crate'ami (scalanie STEP w `ops`,
+  `app-geometry`); wymaga regularnego podbijania pinu i testów kontraktowych na granicy `kernel`. *(ryzyko)*
+- **Reguła „apps compute no geometry”** *(nowe)* — nasze `fit`/`align`/`deviation` liczą geometrię meshu; podział
+  z §5 i allowlista `app-geometry` muszą być akceptowalne dla rodziny, jeśli SurfaceCraft ma trafić do launchera. *(ryzyko/decyzja)*
+- **Brak fitu NURBS do punktów rozproszonych** *(nowe, M3)* — resampling do siatki albo własny LSQ, docelowo
+  prymityw kernela upstream (§6.3). *(luka)*
 - **Solver więzów + pełne drzewo cech (M5)** to research-grade i największe ryzyko harmonogramu;
   nawet QS robi to pół-automatycznie/interaktywnie — zakładamy workflow z udziałem użytkownika, nie 100% auto.
 - **AutoSurface** (M4) jest kosztowny obliczeniowo i pamięciowo (QS używa dysku out-of-core). *(ryzyko wydajności)*
@@ -296,7 +356,9 @@ Rosnąco wg trudności; każdy kamień daje działającą, testowalną całość
   1. **Korpus w repo (CI, od M1):** wyłącznie dane na licencji zgodnej z MIT/Apache —
      **skany syntetyczne** (próbkowanie znanych prymitywów/brył CAD + szum gaussowski + dziury/outliery; znana
      prawda bazowa = dokładny test progów z niżej), własne skany autora oraz publiczne zbiory na wolnej licencji
-     (licencję każdego pliku zapisać w `ATTRIBUTION.md`).
+     (licencję każdego pliku zapisać w `ATTRIBUTION.md`). Gotowe źródło CC0 z rodziny:
+     [`tangency-labs/models`](https://github.com/tangency-labs/models) (STL/PLY/OBJ/STEP/IGES/3MF). Zgodnie z konwencją
+     rodziny duże pliki trzymamy w osobnym repo `surfacecraft-corpus`, nie w repo kodu.
   2. **Korpus lokalny (tylko maszyna dewelopera, NIGDY w repo):** skany z instalacji QS (`X:\QUICKSURFACE2026`):
      `machine_part.stl` (~32 MB), `steel.stl` (~32 MB), `basic_part.stl`, `qsm.stl`/`lego.stl`/`tool.stl`/
      `impeller.stl`/`bearinghousing.stl`/`aerosol_knob.stl`/`yholder.stl` (rząd setek tys.–kilku mln trójkątów)
@@ -317,6 +379,9 @@ Rosnąco wg trudności; każdy kamień daje działającą, testowalną całość
 - **Platformy:** desktop (Win/macOS/Linux) od M0; web+MCP później (warunkowo) — zatwierdzone.
 - **Zgodność z rodziną Tangency/ArtCraft:** **twarde wymaganie** (determinuje licencję MIT/Apache,
   warstwowanie, command-driven + MCP) — zatwierdzone.
+- **Kod rodziny:** „najpierw upstream, potem adaptacja z atrybucją” (§9) — zatwierdzone 2026-11-08.
+- **Repo:** konto autora, `d0pawlus/surfacecraft`, prywatne; bez obowiązkowych house rules storytold (§9) —
+  zatwierdzone 2026-11-08.
 
 ---
 
