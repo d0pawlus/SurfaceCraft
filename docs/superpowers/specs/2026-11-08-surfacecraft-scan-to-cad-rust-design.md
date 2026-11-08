@@ -300,11 +300,14 @@ Rosnąco wg trudności; każdy kamień daje działającą, testowalną całość
 
 - **Dostawca STEP/IGES (M3/M5) — rozstrzygnięty po spike'u, wg zasady z §9:** wszystkie writery czytają ten sam
   neutralny rekord (`Body::to_record` → `solidcore_record::brep::Brep`), więc nie ma tłumaczenia topologii.
-  - **M3 — STEP powierzchni:** PR upstream do `solidcore/step-export` dodający `SHELL_BASED_SURFACE_MODEL`/`OPEN_SHELL`
-    dla `BodyKind::ShellModel` (model i `brep_to_model` już to obsługują; luka potwierdzona przebiegiem probe). Fallback:
-    adaptacja zapisu otwartych powłok z `solidcraft-step`. Osobno: `ops` nie ma operacji „arkusz z płata” (kernelowe
-    `face_on` zwraca błąd 1001), więc w M3 arkusz budujemy jako rekord `Brep` z jedną ścianą `Spline`
-    (`Body::from_record`) i równolegle zgłaszamy upstream operację `ops` „sheet from surface”.
+  - **M3 — STEP powierzchni: od razu adaptacja (decyzja użytkownika 2026-11-08, wyjątek od kolejności z §9).**
+    Zapis otwartych powłok (`SHELL_BASED_SURFACE_MODEL`/`OPEN_SHELL`) adaptujemy z `solidcraft-step` (MIT OR Apache-2.0)
+    do naszego `io`, nad rekordem `solidcore_record::brep::Brep`, z atrybucją według §9 i wpisem jako dług do wymiany,
+    gdy solidcore dostanie zapis `ShellModel` (luka w `step-export` potwierdzona przebiegiem probe). M3 nie czeka na
+    upstream. PR `SHELL_BASED_SURFACE_MODEL` do `solidcore/step-export` jest opcjonalny i późniejszy, tylko za zgodą
+    użytkownika. Osobno: `ops` nie ma operacji „arkusz z płata” (kernelowe `face_on` zwraca błąd 1001), więc w M3 arkusz
+    budujemy jako rekord `Brep` z jedną ścianą `Spline` (`Body::from_record`); zgłoszenie upstream operacji
+    „sheet from surface” — też opcjonalnie, później.
   - **M5 — STEP brył:** `step-brep::brep_to_model` + `step-export::write_with_metadata` (AP214/AP242), round-trip przez
     `step_brep::import`; po scaleniu STEP w `solidcore-ops` przejście na API `ops`.
   - **M5 — IGES:** propozycja przeniesienia `iges_out` SolidCrafta do solidcore; fallback: adaptacja `iges_out`
@@ -385,6 +388,7 @@ Rosnąco wg trudności; każdy kamień daje działającą, testowalną całość
 - **Zgodność z rodziną Tangency/ArtCraft:** **twarde wymaganie** (determinuje licencję MIT/Apache,
   warstwowanie, command-driven + MCP) — zatwierdzone.
 - **Kod rodziny:** „najpierw upstream, potem adaptacja z atrybucją” (§9) — zatwierdzone 2026-11-08.
+  **Wyjątek:** STEP powierzchni w M3 idzie od razu ścieżką adaptacji z `solidcraft-step` (§10) — zatwierdzone 2026-11-08.
 - **Repo:** konto autora, `d0pawlus/surfacecraft`, prywatne; bez obowiązkowych house rules storytold (§9) —
   zatwierdzone 2026-11-08.
 
