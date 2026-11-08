@@ -1,0 +1,6 @@
+# Pozostałości po lokalnych testach REA (nie należą do projektu)
+analyze-*.json
+analyze-*.txt
+
+# Lokalny korpus testowy z instalacji QS/GDX — nigdy w repo (clean-room, design doc §9/§11.1)
+/local-corpus/
