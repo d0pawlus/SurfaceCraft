@@ -301,8 +301,10 @@ Rosnąco wg trudności; każdy kamień daje działającą, testowalną całość
 - **Dostawca STEP/IGES (M3/M5) — rozstrzygnięty po spike'u, wg zasady z §9:** wszystkie writery czytają ten sam
   neutralny rekord (`Body::to_record` → `solidcore_record::brep::Brep`), więc nie ma tłumaczenia topologii.
   - **M3 — STEP powierzchni:** PR upstream do `solidcore/step-export` dodający `SHELL_BASED_SURFACE_MODEL`/`OPEN_SHELL`
-    dla `BodyKind::ShellModel` (model i `brep_to_model` już to obsługują). Fallback: adaptacja zapisu otwartych powłok
-    z `solidcraft-step`.
+    dla `BodyKind::ShellModel` (model i `brep_to_model` już to obsługują; luka potwierdzona przebiegiem probe). Fallback:
+    adaptacja zapisu otwartych powłok z `solidcraft-step`. Osobno: `ops` nie ma operacji „arkusz z płata” (kernelowe
+    `face_on` zwraca błąd 1001), więc w M3 arkusz budujemy jako rekord `Brep` z jedną ścianą `Spline`
+    (`Body::from_record`) i równolegle zgłaszamy upstream operację `ops` „sheet from surface”.
   - **M5 — STEP brył:** `step-brep::brep_to_model` + `step-export::write_with_metadata` (AP214/AP242), round-trip przez
     `step_brep::import`; po scaleniu STEP w `solidcore-ops` przejście na API `ops`.
   - **M5 — IGES:** propozycja przeniesienia `iges_out` SolidCrafta do solidcore; fallback: adaptacja `iges_out`
@@ -331,14 +333,17 @@ Rosnąco wg trudności; każdy kamień daje działającą, testowalną całość
 - **Dojrzałość `solidcore` — ryzyko #1 projektu (częściowo obalone po spike'u).** API dla extrude/revolve/loft/
   sweep/split/booleanów/filletów/shell/thicken istnieje w `solidcore-ops`; pattern to recepta aplikacji. Nadal otwarte:
   27 unitów *partial* + 1 *blocked* w porcie (m.in. offset, trim, przekrój płaski, `boolean.api_brep`), API niestabilne
-  mimo numeru 1.0.1, a `solidcore-ops` nie jest jeszcze używane produkcyjnie nawet przez SolidCraft. **Działanie:**
+  mimo numeru 1.0.1, a `solidcore-ops` nie jest jeszcze używane produkcyjnie nawet przez SolidCraft. Probe ze spike'u
+  (raport §1.6) dał poprawne objętości dla 11 operacji (fillet, chamfer, shell, extrude z pochyleniem, revolve, loft,
+  boolean, pattern) natywnie i w wasm, ale to „happy path” na prostych bryłach, nie realne modele. **Działanie:**
   smoke test granicy `kernel` w M0; przed M2 i przed M5 testy realnych operacji na naszych przypadkach; luki —
   upstream albo własne operacje na prymitywach kernela (§9). *(ryzyko)*
 - **STEP/IGES (częściowo obalone)** — STEP brył jest w solidcore, STEP arkuszy i IGES są w SolidCrafcie; workstream
   maleje do „integracja + mały PR upstream + IGES” (§10). *(ryzyko)*
 - **wasm całego stosu (częściowo obalone)** — truck wypada; `solidcore` jest sprawdzany na wasm w CI, a stos egui 0.37/
-  wgpu 30 + solidcore działa w `solidcraft-web`. Otwarte: `solidcore-ops`/`step-*` bez kontroli wasm w repo solidcore
-  (sprawdza nasz `xtask wasm`), limity pamięci przeglądarki dla dużych skanów — web zostaje celem warunkowym,
+  wgpu 30 + solidcore działa w `solidcraft-web`. Probe z `ops` + `step-*` kompiluje się na wasm i daje wyniki
+  identyczne z natywnymi. Otwarte: brak kontroli wasm tych crate'ów w CI solidcore (sprawdza nasz `xtask wasm`),
+  rozmiar binarki (~40 MB nieoptymalizowanego .wasm), limity pamięci przeglądarki dla dużych skanów — web zostaje celem warunkowym,
   desktop-first. *(ryzyko/decyzja Claude)*
 - ~~Brak publicznego API launchera~~ — **obalone:** `storytold/craft-launcher` przyjmuje *community apps* (§9).
 - **Zależność git-only z pinem `rev`** *(nowe)* — solidcore przenosi zadania między crate'ami (scalanie STEP w `ops`,
