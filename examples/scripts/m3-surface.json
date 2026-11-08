@@ -1,0 +1,9 @@
+{
+  "commands": [
+    {"command": "mesh.synth", "params": {"shape": "wave", "resolution": 90, "noise": 0.02, "seed": 5, "name": "scan"}},
+    {"command": "region.grow", "params": {"mesh": "scan", "triangles": [100], "max_angle_deg": 60, "name": "free"}},
+    {"command": "surface.fit", "params": {"region": "free", "tolerance": 0.2}},
+    {"command": "deviation.compute", "params": {"object": "scan", "against": "surface", "tolerance": 0.1}},
+    {"command": "export.step", "params": {"objects": ["surface"]}}
+  ]
+}

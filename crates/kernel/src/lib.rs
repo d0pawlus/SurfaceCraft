@@ -14,7 +14,9 @@
     clippy::unreachable
 )]
 
+pub mod nurbs;
 pub mod solid;
+pub mod step;
 pub mod tess;
 
 pub use solid::{BodyInfo, Counts};

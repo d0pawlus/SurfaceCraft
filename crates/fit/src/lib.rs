@@ -13,6 +13,7 @@ pub mod auto;
 pub mod lm;
 pub mod plane;
 pub mod primitive;
+pub mod resample;
 pub mod segment;
 
 pub use auto::{AutoFit, fit_auto};

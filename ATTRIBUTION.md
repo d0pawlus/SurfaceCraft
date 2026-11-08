@@ -33,4 +33,5 @@ adaptation"). Each is technical debt to replace with the solidcore implementatio
 
 | File | Source | Licence | Notes |
 |---|---|---|---|
-| _(none yet)_ | | | |
+| crates/io/src/step/p21.rs | SolidCraft `crates/step/src/write.rs` @ fcd3186 (https://github.com/tangency-labs/solidcraft), © 2026 SolidCraft contributors | MIT OR Apache-2.0 | Part 21 writer; modified (own Param, reduced). Debt: replace with solidcore STEP writer when it writes shells. |
+| crates/io/src/step/mod.rs | SolidCraft `crates/step/src/write/topology.rs` @ fcd3186, © 2026 SolidCraft contributors | MIT OR Apache-2.0 | open-shell (SHELL_BASED_SURFACE_MODEL) writing over solidcore-record; modified (no solidcraft-geom, no pcurves, own product structure). Debt: replace with solidcore `step-export` ShellModel support. |

@@ -121,6 +121,15 @@ impl Session {
                 colors: None,
             });
         }
+        for o in self.doc.surfaces.iter().filter(|o| o.visible) {
+            out.push(DisplayItem {
+                id: o.id,
+                kind: ObjectKind::Surface,
+                key: Arc::as_ptr(&o.display) as usize,
+                mesh: o.display.clone(),
+                colors: None,
+            });
+        }
         for p in self.doc.primitives.iter().filter(|p| p.visible) {
             out.push(DisplayItem {
                 id: p.id,

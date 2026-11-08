@@ -21,4 +21,5 @@ pub mod object;
 pub use history::History;
 pub use object::{
     BodyObject, Document, MeshObject, Object, ObjectId, ObjectKind, ObjectSummary, PrimitiveObject, RegionObject,
+    SurfaceObject,
 };
