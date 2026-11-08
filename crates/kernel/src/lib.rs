@@ -15,6 +15,7 @@
 )]
 
 pub mod feature;
+pub mod hybrid;
 pub mod nurbs;
 pub mod solid;
 pub mod step;
