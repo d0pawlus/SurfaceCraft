@@ -40,9 +40,17 @@ approx 0.5.1
     licence: Apache-2.0
     source: https://github.com/brendanzab/approx
 
+arboard 3.7.0
+    licence: MIT OR Apache-2.0
+    source: https://github.com/1Password/arboard
+
 arrayvec 0.7.8
     licence: MIT OR Apache-2.0
     source: https://github.com/bluss/arrayvec
+
+as-raw-xcb-connection 1.0.1
+    licence: MIT OR Apache-2.0
+    source: https://github.com/psychon/as-raw-xcb-connection
 
 ash 0.38.0+1.3.281
     licence: MIT OR Apache-2.0
@@ -104,6 +112,10 @@ calloop 0.13.0
     licence: MIT
     source: https://github.com/Smithay/calloop
 
+calloop-wayland-source 0.3.0
+    licence: MIT
+    source: https://github.com/smithay/calloop-wayland-source
+
 cc 1.11.1
     licence: MIT OR Apache-2.0
     source: https://github.com/rust-lang/cc-rs
@@ -115,6 +127,14 @@ cfg-if 1.0.5
 cfg_aliases 0.2.2
     licence: MIT
     source: https://github.com/katharostech/cfg_aliases
+
+cgl 0.3.2
+    licence: MIT / Apache-2.0
+    source: https://github.com/servo/cgl-rs
+
+clipboard-win 5.4.3
+    licence: BSL-1.0
+    source: https://github.com/DoumanAsh/clipboard-win
 
 codespan-reporting 0.13.1
     licence: Apache-2.0
@@ -220,6 +240,10 @@ egui-winit 0.37.0
     licence: MIT OR Apache-2.0
     source: https://github.com/emilk/egui/tree/main/crates/egui-winit
 
+egui_glow 0.37.0
+    licence: MIT OR Apache-2.0
+    source: https://github.com/emilk/egui/tree/main/crates/egui_glow
+
 egui_kittest 0.37.0
     licence: MIT OR Apache-2.0
     source: https://github.com/emilk/egui
@@ -252,9 +276,17 @@ errno 0.3.14
     licence: MIT OR Apache-2.0
     source: https://github.com/lambda-fairy/rust-errno
 
+error-code 3.4.0
+    licence: BSL-1.0
+    source: https://github.com/DoumanAsh/error-code
+
 euclid 0.22.14
     licence: MIT OR Apache-2.0
     source: https://github.com/servo/euclid
+
+fax 0.2.7
+    licence: MIT
+    source: https://github.com/pdf-rs/fax
 
 fdeflate 0.3.7
     licence: MIT OR Apache-2.0
@@ -268,9 +300,17 @@ find-msvc-tools 0.1.15
     licence: MIT OR Apache-2.0
     source: https://github.com/rust-lang/cc-rs
 
+fixedbitset 0.5.7
+    licence: MIT OR Apache-2.0
+    source: https://github.com/petgraph/fixedbitset
+
 flate2 1.1.11
     licence: MIT OR Apache-2.0
     source: https://github.com/rust-lang/flate2-rs
+
+foldhash 0.1.5
+    licence: Zlib
+    source: https://github.com/orlp/foldhash
 
 foldhash 0.2.0
     licence: Zlib
@@ -304,6 +344,14 @@ futures-util 0.3.34
     licence: MIT OR Apache-2.0
     source: https://github.com/rust-lang/futures-rs
 
+gethostname 1.1.0
+    licence: Apache-2.0
+    source: https://codeberg.org/swsnr/gethostname.rs.git
+
+getrandom 0.3.4
+    licence: MIT OR Apache-2.0
+    source: https://github.com/rust-random/getrandom
+
 getrandom 0.4.3
     licence: MIT OR Apache-2.0
     source: https://github.com/rust-random/getrandom
@@ -336,6 +384,22 @@ glow 0.17.0
     licence: MIT OR Apache-2.0 OR Zlib
     source: https://github.com/grovesNL/glow
 
+glutin 0.32.3
+    licence: Apache-2.0
+    source: https://github.com/rust-windowing/glutin
+
+glutin-winit 0.5.0
+    licence: MIT
+    source: https://github.com/rust-windowing/glutin
+
+glutin_egl_sys 0.7.1
+    licence: Apache-2.0
+    source: https://github.com/rust-windowing/glutin
+
+glutin_glx_sys 0.6.1
+    licence: Apache-2.0
+    source: https://github.com/rust-windowing/glutin
+
 glutin_wgl_sys 0.6.1
     licence: Apache-2.0
     source: https://github.com/rust-windowing/glutin
@@ -355,6 +419,10 @@ half 2.7.1
 harfrust 0.12.0
     licence: MIT
     source: https://github.com/harfbuzz/harfrust
+
+hashbrown 0.15.5
+    licence: MIT OR Apache-2.0
+    source: https://github.com/rust-lang/hashbrown
 
 hashbrown 0.16.1
     licence: MIT OR Apache-2.0
@@ -476,6 +544,10 @@ memchr 2.8.3
     licence: Unlicense OR MIT
     source: https://github.com/BurntSushi/memchr
 
+memmap2 0.9.12
+    licence: MIT OR Apache-2.0
+    source: https://github.com/RazrFalcon/memmap2-rs
+
 miniz_oxide 0.8.9
     licence: MIT OR Zlib OR Apache-2.0
     source: https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide
@@ -519,6 +591,10 @@ ndk-sys 0.6.0+11769913
 nohash-hasher 0.2.0
     licence: Apache-2.0 OR MIT
     source: https://github.com/paritytech/nohash-hasher
+
+nom 8.0.0
+    licence: MIT
+    source: https://github.com/rust-bakery/nom
 
 num-bigint 0.4.8
     licence: MIT OR Apache-2.0
@@ -664,6 +740,10 @@ ordered-float 5.5.1
     licence: MIT
     source: https://github.com/reem/rust-ordered-float
 
+os_pipe 1.2.3
+    licence: MIT
+    source: https://github.com/oconnor663/os_pipe.rs
+
 parking_lot 0.12.5
     licence: MIT OR Apache-2.0
     source: https://github.com/Amanieu/parking_lot
@@ -679,6 +759,10 @@ peniko 0.6.1
 percent-encoding 2.3.2
     licence: MIT OR Apache-2.0
     source: https://github.com/servo/rust-url/
+
+petgraph 0.8.3
+    licence: MIT OR Apache-2.0
+    source: https://github.com/petgraph/petgraph
 
 pin-project 1.1.13
     licence: Apache-2.0 OR MIT
@@ -748,6 +832,10 @@ pxfm 0.1.30
     licence: BSD-3-Clause OR Apache-2.0
     source: https://github.com/awxkee/pxfm
 
+quick-error 2.0.1
+    licence: MIT/Apache-2.0
+    source: http://github.com/tailhook/quick-error
+
 quick-xml 0.41.0
     licence: MIT
     source: https://github.com/tafia/quick-xml
@@ -755,6 +843,10 @@ quick-xml 0.41.0
 quote 1.0.47
     licence: MIT OR Apache-2.0
     source: https://github.com/dtolnay/quote
+
+r-efi 5.3.0
+    licence: MIT OR Apache-2.0 OR LGPL-2.1-or-later
+    source: https://github.com/r-efi/r-efi
 
 r-efi 6.0.0
     licence: MIT OR Apache-2.0 OR LGPL-2.1-or-later
@@ -944,6 +1036,10 @@ smallvec 1.16.5
     licence: MIT OR Apache-2.0
     source: https://github.com/servo/rust-smallvec
 
+smithay-client-toolkit 0.19.2
+    licence: MIT
+    source: https://github.com/smithay/client-toolkit
+
 smol_str 0.2.2
     licence: MIT OR Apache-2.0
     source: https://github.com/rust-analyzer/smol_str
@@ -1020,6 +1116,10 @@ thiserror-impl 2.0.21
     licence: MIT OR Apache-2.0
     source: https://github.com/dtolnay/thiserror
 
+tiff 0.11.3
+    licence: MIT
+    source: https://github.com/image-rs/image-tiff
+
 tokio 1.54.1
     licence: MIT
     source: https://github.com/tokio-rs/tokio
@@ -1047,6 +1147,10 @@ tracing 0.1.44
 tracing-core 0.1.36
     licence: MIT
     source: https://github.com/tokio-rs/tracing
+
+tree_magic_mini 3.2.2
+    licence: MIT
+    source: https://github.com/mbrubeck/tree_magic/
 
 type-map 0.5.1
     licence: MIT/Apache-2.0
@@ -1100,6 +1204,10 @@ walkdir 2.5.0
     licence: Unlicense/MIT
     source: https://github.com/BurntSushi/walkdir
 
+wasip2 1.0.4+wasi-0.2.12
+    licence: Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
+    source: https://github.com/bytecodealliance/wasi-rs
+
 wasm-bindgen 0.2.130
     licence: MIT OR Apache-2.0
     source: https://github.com/wasm-bindgen/wasm-bindgen
@@ -1128,7 +1236,23 @@ wayland-client 0.31.15
     licence: MIT
     source: https://github.com/smithay/wayland-rs
 
+wayland-csd-frame 0.3.0
+    licence: MIT
+    source: https://github.com/rust-windowing/wayland-csd-frame
+
+wayland-cursor 0.31.14
+    licence: MIT
+    source: https://github.com/smithay/wayland-rs
+
 wayland-protocols 0.32.13
+    licence: MIT
+    source: https://github.com/smithay/wayland-rs
+
+wayland-protocols-plasma 0.3.12
+    licence: MIT
+    source: https://github.com/smithay/wayland-rs
+
+wayland-protocols-wlr 0.3.12
     licence: MIT
     source: https://github.com/smithay/wayland-rs
 
@@ -1147,6 +1271,10 @@ web-sys 0.3.107
 web-time 1.1.0
     licence: MIT OR Apache-2.0
     source: https://github.com/daxpedda/web-time
+
+weezl 0.1.12
+    licence: MIT OR Apache-2.0
+    source: https://github.com/image-rs/weezl
 
 wgpu 30.0.1
     licence: MIT OR Apache-2.0
@@ -1292,6 +1420,30 @@ winnow 1.0.5
     licence: MIT
     source: https://github.com/winnow-rs/winnow
 
+wit-bindgen 0.57.1
+    licence: Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
+    source: https://github.com/bytecodealliance/wit-bindgen
+
+wl-clipboard-rs 0.9.5
+    licence: MIT OR Apache-2.0
+    source: https://github.com/YaLTeR/wl-clipboard-rs
+
+x11-dl 2.21.0
+    licence: MIT
+    source: https://github.com/AltF02/x11-rs.git
+
+x11rb 0.13.2
+    licence: MIT OR Apache-2.0
+    source: https://github.com/psychon/x11rb
+
+x11rb-protocol 0.13.2
+    licence: MIT OR Apache-2.0
+    source: https://github.com/psychon/x11rb
+
+xcursor 0.3.11
+    licence: MIT
+    source: https://github.com/esposm03/xcursor-rs
+
 xkbcommon-dl 0.4.2
     licence: MIT
     source: https://github.com/rust-windowing/xkbcommon-dl
@@ -1319,3 +1471,11 @@ zlib-rs 0.6.8
 zmij 1.0.23
     licence: MIT
     source: https://github.com/dtolnay/zmij
+
+zune-core 0.5.3
+    licence: MIT OR Apache-2.0 OR Zlib
+    source: https://github.com/etemesi254/zune-image
+
+zune-jpeg 0.5.15
+    licence: MIT OR Apache-2.0 OR Zlib
+    source: https://github.com/etemesi254/zune-image/tree/dev/crates/zune-jpeg
