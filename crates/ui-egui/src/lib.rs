@@ -14,6 +14,11 @@
 
 pub mod app;
 pub mod camera;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod control;
+pub mod shot;
 pub mod viewport;
+#[cfg(target_arch = "wasm32")]
+pub mod web;
 
 pub use app::SurfaceCraftApp;

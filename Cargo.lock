@@ -2686,6 +2686,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "surfacecraft-ai"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "surfacecraft-engine",
+]
+
+[[package]]
 name = "surfacecraft-align"
 version = "0.1.0"
 dependencies = [
@@ -2702,7 +2711,10 @@ name = "surfacecraft-cli"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "surfacecraft-ai",
  "surfacecraft-engine",
+ "surfacecraft-mcp",
+ "surfacecraft-ui-egui",
 ]
 
 [[package]]
@@ -2801,6 +2813,10 @@ dependencies = [
 [[package]]
 name = "surfacecraft-mcp"
 version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "surfacecraft-engine",
+]
 
 [[package]]
 name = "surfacecraft-sketch"
@@ -2823,15 +2839,22 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui_kittest",
+ "getrandom 0.4.3",
+ "js-sys",
  "log",
+ "png",
  "pollster 0.4.0",
  "rfd",
  "serde_json",
+ "surfacecraft-ai",
  "surfacecraft-doc",
  "surfacecraft-engine",
  "surfacecraft-fit",
  "surfacecraft-geom",
  "surfacecraft-kernel",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
  "wgpu",
 ]
 

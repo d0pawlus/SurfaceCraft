@@ -190,3 +190,30 @@ fn sketch_and_feature_menus_build_a_part() {
     assert!((v - 1500.0).abs() < 1e-3, "status {}", app.status);
     assert!(app.session.display_items().iter().any(|d| d.kind == surfacecraft_doc::ObjectKind::Sketch));
 }
+
+/// The assistant from the GUI: a provider's tool calls run as ordinary commands.
+#[test]
+fn assistant_panel_runs_provider_calls() {
+    use surfacecraft_ai::{Response, ScriptedProvider, ToolCall};
+    let mut h = harness();
+    let app = h.state_mut();
+    app.run_command("mesh.synth", json!({"shape": "box", "size": [40, 20, 10], "center": [200, 0, 0], "name": "scan"}))
+        .unwrap();
+    app.set_provider(Box::new(ScriptedProvider {
+        answers: vec![
+            Response {
+                text: "centring".into(),
+                calls: vec![ToolCall { name: "align.center".into(), arguments: json!({"object": "scan"}) }],
+            },
+            Response { text: "centred".into(), calls: vec![] },
+        ],
+        seen: vec![],
+    }));
+    app.assistant_goal = "center the scan".into();
+    h.run();
+    h.get_by_label("Ask assistant").click();
+    h.run();
+    let app = h.state();
+    assert!(app.status.contains("centred"), "{}", app.status);
+    assert!(app.session.doc.bbox().center().coords.norm() < 1e-9);
+}

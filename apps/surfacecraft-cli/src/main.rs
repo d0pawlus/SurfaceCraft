@@ -25,6 +25,8 @@ const USAGE: &str = "usage:
   surfacecraft-cli exec <command> [<params-json>] [--open <project>] [--save <project>]
   surfacecraft-cli commands [<filter>]
   surfacecraft-cli describe <command>
+  surfacecraft-cli mcp [--local] [--allow-files]
+  surfacecraft-cli assist <align|workflow> <goal> [--open <project>] [--save <project>]
   surfacecraft-cli licences
 
 A script is {\"commands\": [{\"command\": \"mesh.import\", \"params\": {\"path\": \"scan.stl\"}}, ...]}.";
@@ -114,6 +116,28 @@ fn run(args: &[String]) -> Result<bool, String> {
             print(&v);
             Ok(true)
         }
+        "assist" => {
+            let mode = match o.positional.first().map(String::as_str) {
+                Some("align") => surfacecraft_ai::Mode::Align,
+                Some("workflow") => surfacecraft_ai::Mode::Workflow,
+                _ => return Err("assist needs a mode: align or workflow".into()),
+            };
+            let goal = o.positional.get(1).cloned().unwrap_or_default();
+            let mut provider = surfacecraft_ai::CommandProvider::from_env()
+                .ok_or("set SURFACECRAFT_AI_COMMAND to the program that answers the assistant (request JSON on stdin, response JSON on stdout)")?;
+            with_project(&o, &mut s)?;
+            let png = surfacecraft_ui_egui::shot::screenshot_png(&mut s, None, 512, 384);
+            let out = surfacecraft_ai::run(&mut s, &mut provider, mode, &goal, png.as_deref(), 20)?;
+            print(&serde_json::to_value(&out).unwrap_or(Value::Null));
+            save_project(&o, &mut s)?;
+            Ok(out.steps.iter().all(|st| st.ok))
+        }
+        "mcp" => {
+            let local = o.positional.iter().any(|a| a == "--local");
+            let allow_files = o.positional.iter().any(|a| a == "--allow-files");
+            mcp_stdio(local, allow_files);
+            Ok(true)
+        }
         "licences" | "licenses" => {
             println!("{}", include_str!("../../../NOTICE"));
             println!("{}", include_str!("../../../THIRD-PARTY-LICENSES.txt"));
@@ -125,6 +149,39 @@ fn run(args: &[String]) -> Result<bool, String> {
         }
         other => Err(format!("unknown subcommand `{other}`\n\n{USAGE}")),
     }
+}
+
+fn serve<B: surfacecraft_mcp::Backend>(mut server: surfacecraft_mcp::Server<B>) {
+    use std::io::{BufRead, Write};
+    let stdin = std::io::stdin();
+    let mut out = std::io::stdout();
+    for line in stdin.lock().lines() {
+        let Ok(line) = line else { break };
+        if let Some(reply) = server.handle_line(&line)
+            && (writeln!(out, "{reply}").is_err() || out.flush().is_err())
+        {
+            break;
+        }
+    }
+}
+
+/// `surfacecraft-cli mcp`: bridged to a running desktop app when one answers, else headless.
+fn mcp_stdio(local: bool, allow_files: bool) {
+    if !local
+        && let Some(b) =
+            surfacecraft_mcp::bridge::BridgeBackend::connect(&surfacecraft_ui_egui::control::discovery_path())
+    {
+        eprintln!("surfacecraft mcp: bridged to the running SurfaceCraft app");
+        serve(surfacecraft_mcp::Server::new(b));
+        return;
+    }
+    eprintln!(
+        "surfacecraft mcp: headless session (files {})",
+        if allow_files { "allowed" } else { "off; pass data inline" }
+    );
+    let mut backend = surfacecraft_mcp::LocalBackend::new(allow_files);
+    backend.render = Some(Box::new(|s, w, h| surfacecraft_ui_egui::shot::screenshot_png(s, None, w, h)));
+    serve(surfacecraft_mcp::Server::new(backend));
 }
 
 fn main() -> ExitCode {

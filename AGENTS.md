@@ -35,4 +35,5 @@ current state and next step: `docs/STATUS.md`.
 | Licences, assets, clean-room, test data | `skills/surfacecraft-ground-rules/SKILL.md` |
 | Non-test Rust, hostile input | `skills/surfacecraft-crash-safety/SKILL.md` |
 | A command, a crate boundary, the CLI, MCP | `skills/surfacecraft-commands/SKILL.md` |
+| MCP, bridged mode, scripts, the AI assistant | `skills/surfacecraft-agent-tools/SKILL.md` |
 | Writing or running tests, accuracy gates | `skills/surfacecraft-tests/SKILL.md` |
