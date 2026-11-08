@@ -125,6 +125,7 @@ Szczegóły w planach milestone'ów.
   rozszerzające się wzdłuż z (z dyskiem 0,01 mm przy wierzchołku); (2) fillet zwraca walec jako `Cone` o półkącie 0 (rozpoznawane
   w `faces_on_shape`); (3) przecięcie dwóch prawie współosiowych powierzchni obrotowych (osie różne o szum fitu) kończy się
   status 1001 — obejście aplikacji: `snap_axes` (auto-więz współosiowości, ≤ 3° / 0,5 mm).
+  Reprodukcje (1–3): `crates/kernel/tests/upstream_repro.rs` (`#[ignore]`); szkice zgłoszeń: `docs/upstream/solidcore-p3.md`.
 - `region.auto_segment` rozbija płaskie pierścienie (wałek z otworem: dwie płaszczyzny → ~85 kawałków po 30–280 trójkątów) —
   w teście P3 płaszczyzny wybrane geometrycznie (`region.create`); do poprawy w segmentacji (P1/P4).
 - Kanał sterowania zapisuje token w pliku tymczasowym (dostęp lokalnego użytkownika); jedna instancja aplikacji naraz.
