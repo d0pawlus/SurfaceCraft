@@ -2,8 +2,11 @@
 use crate::camera::Camera;
 use crate::viewport::{self, DrawItem, Frame, ViewportCallback};
 use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::sync::Arc;
 use surfacecraft_doc::{ObjectId, ObjectKind};
 use surfacecraft_engine::{EngineError, Session};
+use surfacecraft_geom::{Bvh, Point3};
 
 const MESH_COLOR: [f32; 4] = [0.62, 0.66, 0.72, 1.0];
 const BODY_COLOR: [f32; 4] = [0.35, 0.55, 0.85, 1.0];
@@ -24,9 +27,24 @@ pub struct SurfaceCraftApp {
     pub palette_filter: String,
     /// Last status line.
     pub status: String,
+    /// Points picked in the viewport (click: replace, Shift+click: add).
+    pub picks: Vec<Pick>,
     /// Whether a wgpu render state exists (false in headless tests).
     gpu: bool,
     fit_pending: bool,
+    bvh_cache: HashMap<usize, Bvh>,
+    highlights: HashMap<ObjectId, Arc<Vec<u32>>>,
+}
+
+/// A point picked on an object in the viewport.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pick {
+    /// Object hit.
+    pub object: ObjectId,
+    /// Hit point (model coordinates).
+    pub point: Point3,
+    /// Triangle hit (of the object's mesh or display mesh).
+    pub triangle: u32,
 }
 
 impl Default for SurfaceCraftApp {
@@ -47,8 +65,82 @@ impl SurfaceCraftApp {
             palette_params: "{}".into(),
             palette_filter: String::new(),
             status: "Ready".into(),
+            picks: Vec::new(),
             gpu: false,
             fit_pending: false,
+            bvh_cache: HashMap::new(),
+            highlights: HashMap::new(),
+        }
+    }
+
+    /// Picks the nearest object under viewport pixel `(x, y)` of a `w × h` viewport.
+    /// Returns whether something was hit.
+    pub fn pick_at(&mut self, x: f64, y: f64, w: f64, h: f64, add: bool) -> bool {
+        let (origin, dir) = self.camera.ray(x, y, w, h);
+        let items = self.session.display_items();
+        let live: Vec<usize> = items.iter().map(|d| d.key).collect();
+        self.bvh_cache.retain(|k, _| live.contains(k));
+        let mut best: Option<(f64, Pick)> = None;
+        for d in &items {
+            let bvh = self.bvh_cache.entry(d.key).or_insert_with(|| Bvh::build(&d.mesh));
+            if let Some((tri, t)) = bvh.ray_cast(&origin, &dir)
+                && best.as_ref().is_none_or(|(bt, _)| t < *bt)
+            {
+                best = Some((t, Pick { object: d.id, point: origin + dir * t, triangle: tri as u32 }));
+            }
+        }
+        if !add {
+            self.picks.clear();
+        }
+        let hit = match best {
+            Some((_, p)) => {
+                self.status = format!("picked {} at ({:.3}, {:.3}, {:.3})", p.object, p.point.x, p.point.y, p.point.z);
+                self.selected_object = Some(p.object);
+                self.picks.push(p);
+                true
+            }
+            None => false,
+        };
+        self.refresh_highlights();
+        hit
+    }
+
+    /// Clears the picks.
+    pub fn clear_picks(&mut self) {
+        self.picks.clear();
+        self.refresh_highlights();
+    }
+
+    fn refresh_highlights(&mut self) {
+        let mut by: HashMap<ObjectId, Vec<u32>> = HashMap::new();
+        for p in &self.picks {
+            by.entry(p.object).or_default().push(p.triangle);
+        }
+        self.highlights = by.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
+    }
+
+    fn picks_panel(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.strong(format!("Picks ({})", self.picks.len()));
+            if ui.small_button("Clear").clicked() {
+                self.clear_picks();
+            }
+        });
+        ui.weak("Click the model to pick, Shift+click to add. Picks prefill `from`/`points`/`triangles`.");
+        for p in self.picks.iter().rev().take(12) {
+            ui.monospace(format!(
+                "{} t{} ({:.3}, {:.3}, {:.3})",
+                p.object, p.triangle, p.point.x, p.point.y, p.point.z
+            ));
+        }
+    }
+
+    fn pick_context(&self) -> PickContext {
+        PickContext {
+            selected: self.selected_object,
+            points: self.picks.iter().map(|p| [p.point.x, p.point.y, p.point.z]).collect(),
+            triangles: self.picks.iter().map(|p| p.triangle).collect(),
         }
     }
 
@@ -84,7 +176,7 @@ impl SurfaceCraftApp {
         self.palette_command = Some(id);
         let schema = surfacecraft_engine::cmd::find(id).map(|c| (c.input)()).unwrap_or(Value::Null);
         self.palette_params =
-            serde_json::to_string_pretty(&template(&schema, self.selected_object)).unwrap_or_else(|_| "{}".into());
+            serde_json::to_string_pretty(&template(&schema, &self.pick_context())).unwrap_or_else(|_| "{}".into());
     }
 
     /// Runs the palette's command with its edited parameters.
@@ -228,7 +320,7 @@ impl SurfaceCraftApp {
             ui.weak("No objects. Import a mesh (File) or run mesh.synth.");
         }
         let mut action: Option<(&str, Value)> = None;
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("objects").max_height(320.0).show(ui, |ui| {
             for s in &summaries {
                 ui.horizontal(|ui| {
                     let mut vis = s.visible;
@@ -256,6 +348,7 @@ impl SurfaceCraftApp {
         if let Some((id, p)) = action {
             let _ = self.run_command(id, p);
         }
+        self.picks_panel(ui);
     }
 
     fn palette_panel(&mut self, ui: &mut egui::Ui) {
@@ -342,6 +435,18 @@ impl SurfaceCraftApp {
         }
         if resp.double_clicked() {
             self.fit_pending = true;
+        } else if resp.clicked()
+            && let Some(pos) = resp.interact_pointer_pos()
+        {
+            let local = pos - rect.min;
+            let add = ui.input(|i| i.modifiers.shift);
+            self.pick_at(
+                f64::from(local.x),
+                f64::from(local.y),
+                f64::from(rect.width()),
+                f64::from(rect.height()),
+                add,
+            );
         }
         if self.fit_pending {
             self.camera.fit(&self.session.doc.bbox());
@@ -368,7 +473,7 @@ impl SurfaceCraftApp {
                 color: if d.kind == ObjectKind::Body { BODY_COLOR } else { MESH_COLOR },
                 mesh: d.mesh,
                 colors: d.colors,
-                highlight: None,
+                highlight: self.highlights.get(&d.id).cloned(),
             })
             .collect();
         let bg = if ui.visuals().dark_mode { [0.08, 0.09, 0.11] } else { [0.85, 0.87, 0.9] };
@@ -392,10 +497,21 @@ fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n { s.to_string() } else { s.chars().take(n).collect::<String>() + "…" }
 }
 
-/// Example parameters from an input schema: required properties with neutral values; an object
-/// reference gets the selected object's id.
+/// What the UI knows when it prefills parameters.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PickContext {
+    /// Selected object.
+    pub selected: Option<ObjectId>,
+    /// Picked points.
+    pub points: Vec<[f64; 3]>,
+    /// Picked triangles.
+    pub triangles: Vec<u32>,
+}
+
+/// Example parameters from an input schema: required properties with neutral values; `object`
+/// gets the selected object, `from`/`points` the picked points, `triangles` the picked triangles.
 #[must_use]
-pub fn template(schema: &Value, selected: Option<ObjectId>) -> Value {
+pub fn template(schema: &Value, ctx: &PickContext) -> Value {
     let mut out = serde_json::Map::new();
     let props = schema.get("properties").and_then(Value::as_object);
     let required: Vec<&str> = schema
@@ -406,7 +522,12 @@ pub fn template(schema: &Value, selected: Option<ObjectId>) -> Value {
     if let Some(props) = props {
         for name in required {
             let p = props.get(name).cloned().unwrap_or(Value::Null);
-            let v = if name == "object" { selected.map_or(json!(0), |id| json!(id.0)) } else { example(&p, schema) };
+            let v = match name {
+                "object" | "mesh" => ctx.selected.map_or(json!(0), |id| json!(id.0)),
+                "from" | "points" if !ctx.points.is_empty() => json!(ctx.points),
+                "triangles" if !ctx.triangles.is_empty() => json!(ctx.triangles),
+                _ => example(&p, schema),
+            };
             out.insert(name.to_string(), v);
         }
     }
@@ -440,7 +561,7 @@ fn example(p: &Value, root: &Value) -> Value {
             let item = p.get("items").map_or(json!(0), |i| example(i, root));
             Value::Array((0..n).map(|_| item.clone()).collect())
         }
-        Some("object") => template(p, None),
+        Some("object") => template(p, &PickContext::default()),
         _ => json!(null),
     }
 }

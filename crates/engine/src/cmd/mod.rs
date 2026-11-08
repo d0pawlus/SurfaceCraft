@@ -12,6 +12,7 @@ use serde_json::Value;
 use std::sync::LazyLock;
 use surfacecraft_doc::{ObjectId, ObjectKind};
 
+pub mod align;
 pub mod app;
 pub mod body;
 pub mod doc;
@@ -104,6 +105,7 @@ macro_rules! command {
 
 static REGISTRY: LazyLock<Vec<CommandSpec>> = LazyLock::new(|| {
     let mut v: Vec<CommandSpec> = Vec::new();
+    v.extend_from_slice(align::COMMANDS);
     v.extend_from_slice(app::COMMANDS);
     v.extend_from_slice(body::COMMANDS);
     v.extend_from_slice(doc::COMMANDS);

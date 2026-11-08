@@ -53,7 +53,36 @@ fn palette_runs_commands_and_log_replays_in_the_engine() {
 #[test]
 fn template_prefills_required_parameters() {
     let schema = (surfacecraft_engine::cmd::find("body.fillet").unwrap().input)();
-    let t = surfacecraft_ui_egui::app::template(&schema, Some(surfacecraft_doc::ObjectId(7)));
+    let ctx =
+        surfacecraft_ui_egui::app::PickContext { selected: Some(surfacecraft_doc::ObjectId(7)), ..Default::default() };
+    let t = surfacecraft_ui_egui::app::template(&schema, &ctx);
     assert_eq!(t["object"], 7);
     assert!(t.get("edges").is_some() && t.get("size").is_some());
+}
+
+/// N-point alignment from the GUI: picks on the model prefill `from` of `align.n_point`.
+#[test]
+fn viewport_picks_feed_n_point_alignment() {
+    let mut h = harness();
+    h.state_mut().run_command("mesh.synth", json!({"shape": "box", "size": [40, 30, 20], "resolution": 16})).unwrap();
+    h.run();
+    // three picks through the viewport's ray cast (the same path a click takes)
+    let app = h.state_mut();
+    assert!(app.pick_at(500.0, 400.0, 1000.0, 800.0, false));
+    assert!(app.pick_at(450.0, 380.0, 1000.0, 800.0, true));
+    assert!(app.pick_at(560.0, 430.0, 1000.0, 800.0, true));
+    assert_eq!(app.picks.len(), 3);
+    app.choose_command("align.n_point");
+    let params: serde_json::Value = serde_json::from_str(&app.palette_params).unwrap();
+    assert_eq!(params["from"].as_array().unwrap().len(), 3);
+    // move the picks by +10 in x: the mesh follows
+    let to: Vec<[f64; 3]> = app.picks.iter().map(|p| [p.point.x + 10.0, p.point.y, p.point.z]).collect();
+    let mut p = params.clone();
+    p["to"] = json!(to);
+    app.palette_params = p.to_string();
+    h.run();
+    h.get_by_label("Run").click();
+    h.run();
+    let b = h.state().session.doc.bbox();
+    assert!((b.min.x - 10.0).abs() < 1e-6, "{b:?} status {}", h.state().status);
 }
