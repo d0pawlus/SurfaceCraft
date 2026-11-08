@@ -269,7 +269,97 @@ pub fn segment(mesh: &Mesh, opts: &SegmentOptions) -> Vec<Segment> {
         region.sort_unstable();
         out.push(Segment { triangles: region, primitive: fit.primitive, rms: fit.rms });
     }
+    let out = relax_boundaries(mesh, &normals, &nb, out, tol);
     merge_adjacent(mesh, &normals, &nb, out, tol)
+}
+
+/// Mean corner distance of triangle `t` to `prim`, plus a small normal-disagreement term (tie
+/// break); `None` for a degenerate triangle.
+fn boundary_cost(mesh: &Mesh, prim: &Primitive, t: usize, tol: f64) -> Option<f64> {
+    let corners = mesh.triangle(t)?;
+    let (n, c) = (mesh.face_normal(t)?, mesh.face_centroid(t)?);
+    let d: f64 = corners.iter().map(|p| prim.distance(p).abs()).sum::<f64>() / 3.0;
+    Some(d + 0.1 * tol * (1.0 - prim.normal(&c).dot(&n).abs()))
+}
+
+/// Boundary relaxation: region growing accepts anything within the tolerance, so a region bleeds
+/// over a tangent boundary (a fillet over the neighbouring plane stays within 0.2 mm for about
+/// 1.4 mm) and the strip biases its fit. Each pass moves every triangle that borders another
+/// region to the neighbouring region whose primitive it fits best, then refits the regions that
+/// changed. Deterministic (moves are decided on the previous state), a few passes, boundary-sized.
+fn relax_boundaries(mesh: &Mesh, normals: &[Vec3], nb: &[[u32; 3]], mut segs: Vec<Segment>, tol: f64) -> Vec<Segment> {
+    const PASSES: usize = 8;
+    if segs.len() < 2 {
+        return segs;
+    }
+    let mut owner = vec![u32::MAX; mesh.triangle_count()];
+    for (i, s) in segs.iter().enumerate() {
+        for &t in &s.triangles {
+            owner[t as usize] = i as u32;
+        }
+    }
+    for _pass in 0..PASSES {
+        let mut moves: Vec<(u32, u32)> = Vec::new();
+        for (t, nn) in nb.iter().enumerate() {
+            let a = owner[t];
+            if a == u32::MAX {
+                continue;
+            }
+            let mut cands: Vec<u32> = nn.iter().filter(|&&o| o != u32::MAX).map(|&o| owner[o as usize]).collect();
+            cands.retain(|&b| b != a && b != u32::MAX);
+            if cands.is_empty() {
+                continue;
+            }
+            cands.sort_unstable();
+            cands.dedup();
+            let Some(mut best_cost) = segs.get(a as usize).and_then(|s| boundary_cost(mesh, &s.primitive, t, tol))
+            else {
+                continue;
+            };
+            let mut best = a;
+            for b in cands {
+                let cost = segs.get(b as usize).and_then(|s| boundary_cost(mesh, &s.primitive, t, tol));
+                if let Some(c) = cost
+                    && c < best_cost
+                {
+                    best_cost = c;
+                    best = b;
+                }
+            }
+            if best != a {
+                moves.push((t as u32, best));
+            }
+        }
+        if moves.is_empty() {
+            break;
+        }
+        let mut touched = vec![false; segs.len()];
+        for &(t, b) in &moves {
+            touched[owner[t as usize] as usize] = true;
+            touched[b as usize] = true;
+            owner[t as usize] = b;
+        }
+        let mut members: Vec<Vec<u32>> = vec![Vec::new(); segs.len()];
+        for (t, &o) in owner.iter().enumerate() {
+            if o != u32::MAX && touched[o as usize] {
+                members[o as usize].push(t as u32);
+            }
+        }
+        for (i, tris) in members.into_iter().enumerate() {
+            if !touched[i] {
+                continue;
+            }
+            if let Some(f) = fit_tris(mesh, normals, &tris)
+                && f.rms <= tol
+            {
+                segs[i].primitive = f.primitive;
+                segs[i].rms = f.rms;
+            }
+            segs[i].triangles = tris;
+        }
+    }
+    segs.retain(|s| !s.triangles.is_empty());
+    segs
 }
 
 /// Cheap pre-test for merging: two primitives of the same kind describing (nearly) the same

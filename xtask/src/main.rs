@@ -1,9 +1,11 @@
 //! `cargo xtask <task>`: the repository's checks.
 //!
 //! `ci` runs, in order: fmt → assets → licences → layers → app-geometry → clippy → wasm → test.
+//! `dist` (not in ci) builds the host-target release binaries and `dist/<target>/SHA256SUMS.txt`.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod assets;
+mod dist;
 mod layers;
 mod licences;
 
@@ -75,6 +77,7 @@ fn web() -> Result<(), String> {
     let mut b = Command::new("wasm-bindgen");
     b.arg(&wasm).args(["--target", "web", "--no-typescript", "--out-dir"]).arg(&dist);
     run(b, "wasm-bindgen")?;
+    optimise_wasm(&dist.join("surfacecraft-web_bg.wasm"));
     let html = include_str!("../../apps/surfacecraft-web/index.html").replace(
         "<link data-trunk rel=\"rust\" data-bin=\"surfacecraft-web\" data-wasm-opt=\"z\" />",
         "<script type=\"module\">import init from './surfacecraft-web.js'; init();</script>",
@@ -82,6 +85,30 @@ fn web() -> Result<(), String> {
     std::fs::write(dist.join("index.html"), html).map_err(|e| format!("write index.html: {e}"))?;
     eprintln!("==> web bundle in {}", dist.display());
     Ok(())
+}
+
+/// Runs `wasm-opt -Oz` on the bundle when it is on PATH; otherwise (or on failure) keeps the
+/// unoptimised file, so the build never depends on binaryen being installed.
+fn optimise_wasm(path: &Path) {
+    let size = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    let available = Command::new("wasm-opt").arg("--version").output().is_ok_and(|o| o.status.success());
+    let before = size(path);
+    if !available {
+        eprintln!(
+            "==> wasm-opt not on PATH: bundle left unoptimised at {before} bytes (install binaryen to shrink it)"
+        );
+        return;
+    }
+    let tmp = path.with_extension("opt.wasm");
+    let mut c = Command::new("wasm-opt");
+    c.arg("-Oz").arg(path).arg("-o").arg(&tmp);
+    let ok = c.status().is_ok_and(|s| s.success());
+    if ok && std::fs::rename(&tmp, path).is_ok() {
+        eprintln!("==> wasm-opt -Oz: {before} -> {} bytes", size(path));
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+        eprintln!("==> wasm-opt failed: bundle left unoptimised ({before} bytes)");
+    }
 }
 
 fn test() -> Result<(), String> {
@@ -164,23 +191,55 @@ fn ci() -> Result<(), String> {
     Ok(())
 }
 
+/// The local pre-commit check: the cheap static steps, then clippy `-D warnings` and tests of the
+/// packages named (`cargo xtask quick surfacecraft-fit surfacecraft-engine`). The full
+/// `cargo xtask ci` runs on GitHub Actions for every pull request.
+fn quick(packages: &[String]) -> Result<(), String> {
+    fmt()?;
+    assets::check()?;
+    licences::run(true)?;
+    layers::check()?;
+    app_geometry()?;
+    if !packages.is_empty() {
+        let mut c = cargo();
+        c.args(["clippy", "--all-targets", "--profile", "ci"]);
+        for p in packages {
+            c.args(["-p", p]);
+        }
+        c.args(["--", "-D", "warnings"]);
+        run(c, "clippy -D warnings (named packages)")?;
+        let mut t = cargo();
+        t.args(["test", "--profile", "ci"]);
+        for p in packages {
+            t.args(["-p", p]);
+        }
+        run(t, "tests (named packages)")?;
+    }
+    eprintln!("==> quick passed (full ci runs on the pull request)");
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let task = args.first().map(String::as_str).unwrap_or("help");
     let check = args.iter().any(|a| a == "--check");
-    let r = match task {
-        "ci" => ci(),
-        "fmt" => fmt(),
-        "assets" => assets::check(),
-        "licences" | "licenses" => licences::run(check),
-        "layers" => layers::check(),
-        "app-geometry" => app_geometry(),
-        "clippy" => clippy(),
-        "wasm" => wasm(),
-        "test" => test(),
-        "web" => web(),
-        _ => Err("tasks: ci, fmt, assets, licences [--check], layers, app-geometry, clippy, wasm, test".into()),
-    };
+    let r =
+        match task {
+            "ci" => ci(),
+            "quick" => quick(args.get(1..).unwrap_or_default()),
+            "fmt" => fmt(),
+            "assets" => assets::check(),
+            "licences" | "licenses" => licences::run(check),
+            "layers" => layers::check(),
+            "app-geometry" => app_geometry(),
+            "clippy" => clippy(),
+            "wasm" => wasm(),
+            "test" => test(),
+            "web" => web(),
+            "dist" => dist::run(),
+            _ => Err("tasks: ci, quick [packages], fmt, assets, licences [--check], layers, app-geometry, clippy, wasm, test, web, dist"
+                .into()),
+        };
     match r {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

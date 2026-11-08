@@ -19,6 +19,7 @@ pub mod deviation;
 pub mod doc;
 pub mod exchange;
 pub mod feature;
+pub mod hybrid;
 pub mod mesh;
 pub mod primitive;
 pub mod quad;
@@ -119,6 +120,7 @@ static REGISTRY: LazyLock<Vec<CommandSpec>> = LazyLock::new(|| {
     v.extend_from_slice(doc::COMMANDS);
     v.extend_from_slice(exchange::COMMANDS);
     v.extend_from_slice(feature::COMMANDS);
+    v.extend_from_slice(hybrid::COMMANDS);
     v.extend_from_slice(deviation::COMMANDS);
     v.extend_from_slice(mesh::COMMANDS);
     v.extend_from_slice(primitive::COMMANDS);
