@@ -86,14 +86,11 @@ pub fn icp(source: &Mesh, target: &Bvh, init: &Transform, opts: &IcpOptions) -> 
     for _ in 0..opts.max_iterations.max(1) {
         // correspondences
         let moved: Vec<Point3> = pts.iter().map(|p| t.apply(p)).collect();
-        let hits: Vec<Option<(Point3, Vec3, f64)>> = moved
-            .iter()
-            .map(|p| {
-                target
-                    .closest(p, f64::INFINITY)
-                    .and_then(|h| target.triangle_normal(h.triangle).map(|n| (h.point, n, h.distance)))
-            })
-            .collect();
+        let hits: Vec<Option<(Point3, Vec3, f64)>> = surfacecraft_geom::par::map_slice(&moved, |p| {
+            target
+                .closest(p, f64::INFINITY)
+                .and_then(|h| target.triangle_normal(h.triangle).map(|n| (h.point, n, h.distance)))
+        });
         let mut dists: Vec<f64> = hits.iter().flatten().map(|h| h.2).collect();
         if dists.len() < 6 {
             return Err(AlignError::NotEnough("too few correspondences".into()));

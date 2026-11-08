@@ -75,16 +75,13 @@ pub fn against_primitive(points: &[Point3], prim: &Primitive) -> Vec<f64> {
 /// farther than `max_distance`).
 #[must_use]
 pub fn against_mesh(points: &[Point3], target: &Bvh, max_distance: f64) -> Vec<f64> {
-    points
-        .iter()
-        .map(|p| match target.closest(p, max_distance) {
-            Some(h) => {
-                let sign = target.triangle_normal(h.triangle).map_or(1.0, |n| (p - h.point).dot(&n).signum());
-                h.distance * if sign == 0.0 { 1.0 } else { sign }
-            }
-            None => f64::NAN,
-        })
-        .collect()
+    surfacecraft_geom::par::map_slice(points, |p| match target.closest(p, max_distance) {
+        Some(h) => {
+            let sign = target.triangle_normal(h.triangle).map_or(1.0, |n| (p - h.point).dot(&n).signum());
+            h.distance * if sign == 0.0 { 1.0 } else { sign }
+        }
+        None => f64::NAN,
+    })
 }
 
 /// Colour per value: green within ±tol, through yellow/orange to red above, through cyan to

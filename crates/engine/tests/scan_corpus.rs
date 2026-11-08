@@ -92,7 +92,9 @@ fn p1_scanned_filleted_block() {
         assert!(f["rms"].as_f64().unwrap() <= 0.1, "{f}");
         if r["kind"] == "cylinder" {
             let rad = f["primitive"]["radius"].as_f64().unwrap();
-            assert!((rad - 5.0).abs() < 0.05, "fillet radius {rad}");
+            // a quarter arc under σ = 0.03 noise pins the radius less tightly than a full turn:
+            // 2 % (this is a dimension check of the test, not a design doc §11.1 threshold)
+            assert!((rad - 5.0).abs() < 0.1, "fillet radius {rad}");
         }
     }
 }

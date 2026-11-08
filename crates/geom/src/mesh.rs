@@ -285,25 +285,35 @@ impl Mesh {
     /// a non-manifold edge). Edge `k` runs from corner `k` to corner `k + 1`.
     #[must_use]
     pub fn triangle_neighbours(&self) -> Vec<[u32; 3]> {
-        let mut edges: HashMap<(u32, u32), Vec<(u32, u8)>> = HashMap::with_capacity(self.triangles.len() * 3 / 2);
+        // sort half-edges by their undirected key (linear memory, no hash map: 10 M triangles)
+        let mut half: Vec<(u64, u32)> = Vec::with_capacity(self.triangles.len() * 3);
         for (ti, t) in self.triangles.iter().enumerate() {
-            for k in 0..3u8 {
+            for k in 0..3u32 {
                 let a = t[k as usize];
                 let b = t[((k + 1) % 3) as usize];
-                let key = if a < b { (a, b) } else { (b, a) };
-                edges.entry(key).or_default().push((ti as u32, k));
+                let key = (u64::from(a.min(b)) << 32) | u64::from(a.max(b));
+                half.push((key, ti as u32 * 3 + k));
             }
         }
+        crate::par::sort_unstable(&mut half);
         let mut n = vec![[u32::MAX; 3]; self.triangles.len()];
-        for list in edges.values() {
-            if let [(t0, k0), (t1, k1)] = list.as_slice() {
-                if let Some(s) = n.get_mut(*t0 as usize).and_then(|x| x.get_mut(*k0 as usize)) {
-                    *s = *t1;
+        let mut i = 0;
+        while i < half.len() {
+            let mut j = i + 1;
+            while j < half.len() && half[j].0 == half[i].0 {
+                j += 1;
+            }
+            // manifold edges only: exactly two half-edges
+            if j - i == 2 {
+                let (h0, h1) = (half[i].1, half[i + 1].1);
+                if let Some(s) = n.get_mut((h0 / 3) as usize).and_then(|x| x.get_mut((h0 % 3) as usize)) {
+                    *s = h1 / 3;
                 }
-                if let Some(s) = n.get_mut(*t1 as usize).and_then(|x| x.get_mut(*k1 as usize)) {
-                    *s = *t0;
+                if let Some(s) = n.get_mut((h1 / 3) as usize).and_then(|x| x.get_mut((h1 % 3) as usize)) {
+                    *s = h0 / 3;
                 }
             }
+            i = j;
         }
         n
     }
