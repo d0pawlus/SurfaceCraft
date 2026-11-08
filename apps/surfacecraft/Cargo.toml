@@ -15,3 +15,11 @@ egui.workspace = true
 
 [lints]
 workspace = true
+
+# Product metadata for installers (docs/distribution.md). The bundle id is reverse-DNS of the
+# owner's domain (pawlus.dev); the version comes from the workspace.
+[package.metadata.surfacecraft]
+product-name = "SurfaceCraft"
+bundle-id = "dev.pawlus.surfacecraft"
+binary = "surfacecraft"
+cli-binary = "surfacecraft-cli"

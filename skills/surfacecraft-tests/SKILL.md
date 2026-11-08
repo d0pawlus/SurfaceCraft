@@ -6,7 +6,11 @@ description: Writing and running SurfaceCraft tests and the accuracy gates of de
 # Tests
 
 - `cargo xtask ci` runs everything CI runs: fmt, assets, licences, layers, app-geometry, clippy
-  `-D warnings`, wasm check, tests.
+  `-D warnings`, wasm check, tests. It runs on GitHub Actions for every pull request (Linux, plus
+  Windows tests); merge only when every check is green.
+- Locally, before each commit: `cargo xtask quick <changed packages>` (the static steps plus clippy
+  and tests of those packages). Several parallel full builds of solidcore exhaust the RAM of a
+  workstation; the pull request runs the whole suite.
 - Unit tests sit next to the code; cross-crate behaviour in `crates/<c>/tests/`. A regression test
   goes into the area's existing test file.
 - Accuracy gates (design doc §11.1, never loosened to make a test pass):
