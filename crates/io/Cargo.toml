@@ -1,0 +1,20 @@
+[package]
+name = "surfacecraft-io"
+description = "SurfaceCraft L3: mesh files (STL, OBJ, PLY) read as hostile input, and CAD export (STEP, IGES) over the kernel record"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+surfacecraft-geom.workspace = true
+surfacecraft-kernel.workspace = true
+surfacecraft-doc.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+schemars.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,18 @@
+SurfaceCraft
+Copyright (c) 2026 SurfaceCraft contributors
+
+Licensed under either of the Apache License, Version 2.0 (LICENSE-APACHE) or the MIT license
+(LICENSE-MIT), at your option.
+
+Third-party material
+--------------------
+
+- solidcore (https://github.com/tangency-labs/solidcore), Apache-2.0: the B-rep kernel, used as a
+  dependency (crates solidcore, solidcore-ops, solidcore-record, solidcore-convert, solidcore-tess,
+  step-brep, step-export), pinned by git revision. Only crates/kernel depends on it.
+
+Adapted source files are listed in ATTRIBUTION.md ("Adapted code"), each keeping its original
+copyright notice and marked as modified (Apache-2.0 section 4).
+
+SurfaceCraft contains no code, icons, text or data from QuickSurface or Geomagic Design X; their
+documented behaviour was studied only as a functional reference (clean-room).

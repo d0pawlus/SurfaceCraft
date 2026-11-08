@@ -1,0 +1,22 @@
+[package]
+name = "surfacecraft-web"
+description = "SurfaceCraft in the browser (wasm32, WebGPU with WebGL2 fallback)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+surfacecraft-ui-egui.workspace = true
+eframe.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Window", "Document", "HtmlCanvasElement", "Element"] }
+wasm-bindgen = "0.2"
+getrandom = { workspace = true, features = ["wasm_js"] }
+
+[lints]
+workspace = true
