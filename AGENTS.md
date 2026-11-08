@@ -27,7 +27,9 @@ current state and next step: `docs/STATUS.md`.
 - Application code is Rust only and builds for wasm: `cargo xtask wasm`.
 - Thresholds of design doc §11.1 are never loosened to make a test pass.
 - Code, comments, commit messages and docs in the code are in English.
-- Run `cargo xtask ci` before every commit.
+- Before every commit run `cargo xtask quick <changed packages>` (fmt, assets, licences, layers,
+  app-geometry, clippy and tests of those packages); the full `cargo xtask ci` runs on GitHub
+  Actions for every pull request, and a pull request is merged only with all checks green.
 
 ## Working on X: read the skill first
 | Working on | Read |

@@ -420,7 +420,7 @@ mod patch_tests {
 /// Renumbers edges and vertices into the record's canonical order (first appearance walking
 /// faces → loops → oriented edges, then edges' start/end vertices) and rebuilds the uses in
 /// walk order. Faces must all be used forward.
-fn canonicalize(mut b: Brep) -> Brep {
+pub(crate) fn canonicalize(mut b: Brep) -> Brep {
     let ne = b.edges.len();
     let mut new_of_edge = vec![u32::MAX; ne];
     let mut order: Vec<usize> = Vec::with_capacity(ne);
