@@ -28,7 +28,7 @@ pub mod tri;
 pub use aabb::Aabb;
 pub use bvh::{Bvh, SurfaceHit};
 pub use kdtree::KdTree;
-pub use mesh::{Mesh, MeshError, PointSource};
+pub use mesh::{Mesh, MeshError, PointSource, TriangleSource};
 pub use rng::Rng;
 pub use transform::Transform;
 

@@ -76,6 +76,7 @@ pub fn minimize(
                 lambda = (lambda * 0.3).max(1e-15);
                 improved = true;
                 if small || rel < 1e-15 {
+                    crate::stats::lm_run(it);
                     return Some(LmResult { params: p, cost, iterations: it });
                 }
                 break;
@@ -89,6 +90,7 @@ pub fn minimize(
             break;
         }
     }
+    crate::stats::lm_run(it);
     Some(LmResult { params: p, cost, iterations: it })
 }
 

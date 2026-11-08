@@ -72,12 +72,12 @@ pub fn cluster(mesh: &Mesh, budget: usize) -> Option<Lod> {
             triangle_map: (0..nt as u32).collect(),
         });
     }
-    let b = mesh.bbox();
+    let b = crate::mesh::source_bbox(mesh);
     if b.is_empty() {
         return None;
     }
     // a surface of area A sampled at cell size h has about 2 A / h² triangles
-    let area = mesh.area().max(1e-12);
+    let area = crate::mesh::source_area(mesh).max(1e-12);
     let mut h = (2.0 * area / budget.max(4) as f64).sqrt();
     for _attempt in 0..6 {
         let lod = cluster_with(mesh, h, &b.min);

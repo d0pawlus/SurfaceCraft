@@ -2,6 +2,20 @@
 //! threads). Callers write one closure; the result order is the index order either way, so
 //! parallel and sequential runs give identical results.
 
+/// Does this build run work on several threads? (Results never depend on it; it only tells
+/// callers whether speculative work can pay off.)
+#[must_use]
+pub fn parallel() -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        rayon::current_num_threads() > 1
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        false
+    }
+}
+
 /// `f(0), f(1), …, f(n − 1)`, evaluated in parallel where threads exist.
 pub fn map<T, F>(n: usize, f: F) -> Vec<T>
 where
@@ -34,6 +48,24 @@ where
     #[cfg(target_arch = "wasm32")]
     {
         items.iter().map(f).collect()
+    }
+}
+
+/// Runs both closures, in parallel where threads exist; the results are those of `(a(), b())`.
+pub fn join<A, B, RA, RB>(a: A, b: B) -> (RA, RB)
+where
+    A: FnOnce() -> RA + Send,
+    B: FnOnce() -> RB + Send,
+    RA: Send,
+    RB: Send,
+{
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        rayon::join(a, b)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        (a(), b())
     }
 }
 

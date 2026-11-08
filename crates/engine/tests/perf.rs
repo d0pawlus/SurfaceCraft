@@ -58,10 +58,12 @@ fn perf_scan_scale() {
         let t = Instant::now();
         s.execute("mesh.clean", json!({"object": "scan"})).unwrap();
         let clean = t.elapsed().as_secs_f64();
+        surfacecraft_fit::stats::reset();
         let t = Instant::now();
         let seg = s.execute("region.auto_segment", json!({"mesh": "scan"})).unwrap();
         let segment = t.elapsed().as_secs_f64();
         let regions = seg["regions"].as_array().map_or(0, Vec::len);
+        let work = surfacecraft_fit::stats::snapshot();
         s.execute("mesh.import", json!({"path": dir.to_string_lossy(), "name": "moved"})).unwrap();
         s.execute("mesh.transform", json!({"object": "moved", "rotate": {"axis": [0.2, 0.3, 1.0], "degrees": 2.0}, "translate": [1.0, 0.5, -0.4]}))
             .unwrap();
@@ -81,5 +83,13 @@ fn perf_scan_scale() {
              icp {icp_s:.2} s ({} it), deviation {dev:.2} s, display prep {disp:.2} s ({drawn} tris drawn)",
             icp["iterations"]
         );
+        eprintln!(
+            "perf {m} M work: {} seed fits, {} grow refits, {} final fits, {} LM runs, {} LM iterations",
+            work.seed_fits, work.grow_refits, work.final_fits, work.lm_runs, work.lm_iterations
+        );
+        let phases = surfacecraft_fit::stats::phase_seconds();
+        let timed: f64 = phases.iter().map(|(_, s)| s).sum();
+        let list: Vec<String> = phases.iter().map(|(n, s)| format!("{n} {s:.1}")).collect();
+        eprintln!("perf {m} M segment phases (s): {}, patches+growth {:.1}", list.join(", "), segment - timed);
     }
 }

@@ -53,12 +53,13 @@ pub fn fit_auto(pts: &[Point3], normals: &[Vec3]) -> Option<AutoFit> {
     let extent = Aabb::from_points(pts).diagonal().max(1e-9);
     let mut fits: Vec<PrimitiveFit> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
-    for k in PrimitiveKind::ALL {
-        if let Some(f) = fit(k, pts, normals) {
-            match degenerate(&f, extent) {
-                Some(n) => notes.push(n),
-                None => fits.push(f),
-            }
+    // the kinds are independent: fitted in parallel, judged in the fixed kind order
+    let kinds = PrimitiveKind::ALL;
+    let results = surfacecraft_geom::par::map(kinds.len(), |i| kinds.get(i).and_then(|&k| fit(k, pts, normals)));
+    for f in results.into_iter().flatten() {
+        match degenerate(&f, extent) {
+            Some(n) => notes.push(n),
+            None => fits.push(f),
         }
     }
     let best_rms = fits.iter().map(|f| f.rms).fold(f64::INFINITY, f64::min);
