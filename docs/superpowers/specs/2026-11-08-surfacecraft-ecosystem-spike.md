@@ -29,9 +29,11 @@
    żeby zapisać STEP, nie ma sensu.
 4. **Launcher istnieje.** `storytold/craft-launcher` ma katalog z kategorią *community app* (SolidCraft dodano
    2026-10-28). Wpis wymaga decyzji maintainera. Założenie z §9/§11 („brak publicznego launchera”) jest nieaktualne.
-5. **Nie udało się zbudować ani uruchomić przykładu.** `cargo build` sklonowanego kodu zablokował klasyfikator
-   uprawnień sesji. Probe jest napisany i czeka na uruchomienie (§1.6). Wnioski o tym, co „działa”, opierają się
-   na CI solidcore, jego rigu przypadków i produkcyjnym użyciu w SolidCraft, a **nie na własnym przebiegu**.
+5. **Probe uruchomiony natywnie i w wasm, z identycznymi wynikami** (§1.6). Box+fillet (1 i 12 krawędzi), chamfer,
+   shell, extrude (także z pochyleniem), revolve, loft, boolean, „pattern”, fit NURBS + projekcja punktu oraz eksport
+   STEP bryły z re-importem działają. Objętości zgadzają się z wartościami dokładnymi do 1e-4. Nie działają dwie
+   rzeczy: arkusz z wolnego płata przez kernelowe `face_on` (błąd upstream 1001) i **zapis arkusza do STEP**
+   (`step-export` odrzuca `ShellModel`). Arkusz NURBS przez `ops` (otwarty loft) działa.
 
 **Wpływ na harmonogram:** M2–M5 nie wymagają zmiany kolejności. Zmienia się skład zależności: kernel z git
 (pin `rev`, jak SolidCraft), STEP z rodziny, a nie z truck. Pojawiają się też dwie nowe decyzje: dopasowanie
@@ -138,28 +140,46 @@ a własny wrapper to `solidcraft-smlib`. `ops` jest młodszą, mniej sprawdzoną
 
 | Krok | Wynik |
 |---|---|
-| Klon `tangency-labs/solidcore` (`--depth 1`) do `C:\spike\solidcore` | ✅ |
-| Probe `C:\spike\probe` (path-deps na `solidcore`, `solidcore-ops`, `solidcore-convert`, `solidcore-record`, `step-brep`, `step-export`, `step-import`) | ✅ napisany (≈200 linii) |
-| `cargo build --release` natywnie (x86_64-pc-windows-gnu, cargo 1.99.1) | ⛔ **nie wykonano**: polecenie odrzucił klasyfikator uprawnień sesji (budowa i uruchomienie pobranego kodu). Nie obchodziłem blokady |
-| `cargo check --target wasm32-unknown-unknown` | ⛔ nie wykonano (jw.); lokalnie zainstalowany jest tylko target `x86_64-pc-windows-gnu` |
+| Klon `tangency-labs/solidcore` (`--depth 1`, `b9c02da`) do `C:\spike\solidcore` | ✅ |
+| Probe `C:\spike\probe` (path-deps na `solidcore`, `solidcore-ops`, `solidcore-convert`, `solidcore-record`, `step-brep`, `step-export`, `step-import`) | ✅ ≈230 linii; dwie poprawki nazw API przy pierwszej kompilacji (`BooleanOp::Subtract`, `solidcore_convert::brep::to_record`) |
+| `cargo build --release` + uruchomienie natywnie (x86_64-pc-windows-gnu, cargo 1.99.1) | ✅ cały probe < 0,6 s |
+| `cargo check --lib --target wasm32-unknown-unknown` (cały stos probe, także `ops` i `step-*`) | ✅ bez błędów |
+| Build `wasm32-wasip1` z `-zstack-size=8388608` (39,8 MB .wasm, release) i **uruchomienie pod Node 26 WASI** | ✅ ~1 s; **wyniki identyczne z natywnymi** co do cyfry (determinizm); plik STEP różni się o 8 bajtów, najpewniej nagłówkiem (znacznik czasu) |
 
-Co probe sprawdza (do uruchomienia ręcznie, komendy w §6):
-1. box 20×10×5 + `blend Round r=2` na 1 krawędzi i `r=1` na 12 krawędziach, `Chamfer`, `shell t=1` (liczniki, objętość
-   wobec wartości dokładnej);
-2. `extrude` prostokąta (prosty i z pochyleniem 0,05 rad), `revolve` pierścienia (dokładnie 36π), `loft` kwadratów
-   (ścięty ostrosłup, 533,333);
-3. `boolean` box − walec, „pattern” 4 walców przez `union_all`;
-4. `lst_sq_approx` siatki 20×20 (z = 0,5·sin(x/5)·cos(y/5)) netem 8×8 st. 3, `eval`, `surface_closest_point`
-   i maksymalna odchyłka próbek; arkusz `face_on` → `brep_to_model` → `step_export::write` (oczekiwany **błąd** dla
-   `ShellModel`, por. §2.1) oraz `to_record`;
-5. box z filletem → `to_record` → `to_kernel_body` → `brep_to_model` → `step_export::write` → `step_brep::import`
-   (round-trip).
+Wyniki (natywnie = wasm):
 
-Dowody zastępcze dla „działa” (nie zastępują własnego przebiegu):
+| Test | Wynik | Wartość dokładna / ocena |
+|---|---|---|
+| box 20×10×5 | 6 ścian / 12 krawędzi / 8 wierzchołków, V = 1000 | ✅ |
+| fillet `Round r=2`, krawędź 0 | 7/15/10, V = 991,4159 | ✅ = 1000 − (4−π)·10 (krawędź 0 ma 10 mm; etykieta „exact” w probe zakładała 20 mm i jest błędna) |
+| fillet `r=1`, wszystkie 12 krawędzi (narożniki kuliste) | 26/48/24, V = 971,2950 | ✅ = 432 + 444·1 + π·116/4 + 4π/3 = 971,2950 (wzór Steinera) |
+| chamfer `d=1`, 2 krawędzie stykające się w narożniku | 8/17/11, V = 985,3333 | ✅ = 1000 − 0,5·30 + 1/3 |
+| shell `t=1`, otwarta ściana 0 | 11/24/16, V = 694 | ✅ = 22·11·7 − 1000: **grubość dodatnia idzie na zewnątrz**, ściana 0 jest prostopadła do Y |
+| extrude 10×4 o 3 | V = 120 | ✅ |
+| extrude z pochyleniem 0,05 rad | V = 113,7849 | ✅ (< 120, zwęża się do wewnątrz) |
+| revolve pierścienia r 2…4, h 3 | V = 113,0973 | ✅ = 36π |
+| loft 10×10 → 6×6, h 8, st. 1 | V = 522,6667 | ✅ = h/3·(100+36+60); etykieta „533,33” w probe była błędna |
+| box 20×20×5 − walec r3 | V = 1858,6283 | ✅ = 2000 − 45π |
+| „pattern”: 4 walce, `union_all` | V = 201,0619 | ✅ = 64π |
+| `lst_sq_approx` siatki 20×20 netem 8×8 st. 3 + `eval` | ok | ✅ |
+| odchyłka siatki od płata przez `surface_closest_point` (49 próbek) | max **0,00098 mm** | ✅ mieści się w progu 0,2 mm z §11.1 z dużym zapasem |
+| projekcja punktu spoza płata | dist 2,1443 | ✅ wiarygodne |
+| arkusz z wolnego płata: kernel `sheet::face_on` | ❌ `Upstream { operation: "topology::brep::p8", code: 1001 }` | ścieżka niezalecana dla aplikacji (omija `ops`); nie diagnozowano dalej |
+| arkusz NURBS przez `ops::sweep::loft(…, cap=false)` między dwiema krzywymi `Curve::Nurbs` | ✅ 1/4/4, rekord: 1 ściana `Spline`, 1 powłoka | ✅ ścieżka `ops` działa |
+| arkusz → `brep_to_model` → `step_export::write` | ❌ `body #1 is ShellModel; step-export writes MANIFOLD_SOLID_BREP and FACETED_BREP` | **potwierdza lukę M3 z §2.1** |
+| box z filletem → rekord → kernel → `brep_to_model` → `write` (AP203) | ✅ 26,8 kB, 1× `MANIFOLD_SOLID_BREP`, 1× `CYLINDRICAL_SURFACE` | ✅ fillet zapisany jako walec analityczny, nie B-spline |
+| re-import tego STEP (`step_brep::import`) | ✅ 1 bryła | ✅ round-trip |
+
+Wnioski dla M3: aplikacja nie może budować arkusza z „gołego” płata przez `ops`, bo `ops` nie ma takiej funkcji.
+Musi zbudować rekord `Brep` z jedną ścianą `Spline` i 4 krawędziami (`Body::from_record`) albo dostać nową operację
+`ops` („sheet from surface”), którą warto zgłosić upstream razem z PR `SHELL_BASED_SURFACE_MODEL`. Ścieżki przez rekord
+nie testowano: ręczne składanie rekordu (ściany, pętle, krawędzie, pcurves) to zadanie dla M3.
+
+Dowody uzupełniające (z repozytoriów):
 - **wasm:** CI solidcore uruchamia `cargo check -p solidcore --target wasm32-unknown-unknown`
   ([ci.yml](https://github.com/tangency-labs/solidcore/blob/main/.github/workflows/ci.yml) l. 230–231; także
   `release.yml`). Sprawdzany jest **tylko crate `solidcore`**: `solidcore-ops`, `-record`, `-tess` i `step-*` nie są
-  objęte kontrolą wasm w repo solidcore. SolidCraft sprawdza wasm dla wszystkich crate'ów warstw + `solidcraft-web`
+  objęte kontrolą wasm w repo solidcore (probe sprawdził je sam, patrz tabela wyżej). SolidCraft sprawdza wasm dla wszystkich crate'ów warstw + `solidcraft-web`
   (`cargo xtask wasm`), więc `solidcore`+`solidcore-record` budują się na wasm w realnej aplikacji (publikowana jako
   `tangency-labs/solidcraft-app`). README wymaga `-zstack-size=8388608` (8 MiB) u konsumenta wasm.
 - **Operacje:** `solidcore-ops` ma rig przypadków (`cargo test -p solidcore-ops --test kernel_cases`) w CI.
@@ -308,9 +328,9 @@ Lista do przeniesienia **jako konwencja** (bez kodu, bez brandingu ArtCraft). Ź
 
 | Ryzyko (§11) | Status | Uzasadnienie |
 |---|---|---|
-| Dojrzałość `solidcore` (ryzyko #1), w tym „niepotwierdzone extrude/revolve/loft/trim/pattern” | **częściowo obalone / nadal otwarte** | API istnieje dla extrude/revolve/loft/sweep/split/booleanów/filletów/shell/thicken (§1.3); pattern jest recepturą aplikacji. Otwarte: 27 partial + 1 blocked unit (m.in. offset, trim, planar section), API niestabilne mimo numeru 1.0.1, `ops` nieużywane jeszcze przez SolidCraft, **brak własnego przebiegu probe** |
+| Dojrzałość `solidcore` (ryzyko #1), w tym „niepotwierdzone extrude/revolve/loft/trim/pattern” | **częściowo obalone / nadal otwarte** | API istnieje dla extrude/revolve/loft/sweep/split/booleanów/filletów/shell/thicken (§1.3); pattern jest recepturą aplikacji. Otwarte: 27 partial + 1 blocked unit (m.in. offset, trim, planar section), API niestabilne mimo numeru 1.0.1, `ops` nieużywane jeszcze przez SolidCraft. Probe (§1.6) potwierdził poprawne objętości dla 11 operacji natywnie i w wasm; jest to jednak tylko przypadek „happy path” na prostych bryłach, nie realne modele |
 | STEP/IGES to osobny workstream (solidcore bez translatorów) | **częściowo obalone** | STEP brył: jest w solidcore (`step-export`, git-only). STEP arkuszy: brak w solidcore, jest w `solidcraft-step`. IGES: tylko w SolidCraft. Workstream maleje do „integracja + mały PR + IGES” |
-| wasm całego stosu (`truck` + `wgpu`) | **częściowo obalone** | Truck wypada z gry. `solidcore` sprawdzany na wasm w CI; pełny stos egui 0.37/wgpu 30 + solidcore działa w `solidcraft-web`. Otwarte: `solidcore-ops`/`step-*` bez kontroli wasm w CI, limity pamięci przeglądarki dla dużych skanów |
+| wasm całego stosu (`truck` + `wgpu`) | **częściowo obalone** | Truck wypada z gry. `solidcore` sprawdzany na wasm w CI; pełny stos egui 0.37/wgpu 30 + solidcore działa w `solidcraft-web`. Probe z `ops`+`step-*` kompiluje się na `wasm32-unknown-unknown` i daje na `wasm32-wasip1` wyniki identyczne z natywnymi. Otwarte: brak kontroli wasm tych crate'ów w CI solidcore, rozmiar binarki (~40 MB nieoptymalizowanego .wasm), limity pamięci przeglądarki dla dużych skanów |
 | Brak publicznego API launchera ArtCraft | **obalone** | `storytold/craft-launcher` (publiczny, Apache-2.0) z kategorią community app; SolidCraft wpisany 2026-10-28. Wpis wymaga zgody maintainera, API pluginu nadal brak |
 | Solver więzów + pełne drzewo cech (M5) | **nadal otwarte** | poza zakresem spike'u; `solidcraft-sketch` (MIT OR Apache-2.0) to publiczna referencja konwencji |
 | AutoSurface kosztowny obliczeniowo (M4) | **nadal otwarte** | poza zakresem spike'u |
@@ -333,7 +353,8 @@ Lista do przeniesienia **jako konwencja** (bez kodu, bez brandingu ArtCraft). Ź
    ewaluacja, `surface_closest_point`). Usunąć `truck` z zależności i ryzyk. Dopisać lukę: fit do punktów rozproszonych.
 6. **§6.4:** extrude/revolve/loft/trim potwierdzone w `ops`; pattern jako recepta copy+transform+`union_all` w `engine`.
    Dopisać `offset::thicken` jako dostawcę „thicken→bryła” w M4.
-7. **§10 „Dostawca STEP/IGES”:** M3 to PR `SHELL_BASED_SURFACE_MODEL` do `solidcore/step-export` (fallback: `solidcraft-step`
+7. **§10 „Dostawca STEP/IGES”:** M3 to PR `SHELL_BASED_SURFACE_MODEL` do `solidcore/step-export` (luka potwierdzona
+   przebiegiem probe) plus arkusz z płata przez rekord albo nowa operacja `ops` „sheet from surface” (fallback: `solidcraft-step`
    z tym samym pinem `solidcore-record`); M5 STEP to `step-brep`+`step-export` (AP214/AP242); M5 IGES to przeniesienie
    `iges_out` do solidcore albo własny writer IGES 5.3 nad rekordem.
 8. **§9/§11 launcher:** zastąpić „brak publicznego launchera” informacją o `storytold/craft-launcher` (community app,
@@ -347,17 +368,22 @@ Lista do przeniesienia **jako konwencja** (bez kodu, bez brandingu ArtCraft). Ź
 
 ---
 
-## 6. Do zrobienia po spike'u (niewykonane tutaj)
+## 6. Odtworzenie probe
 
-Uruchomić probe na maszynie z uprawnieniem do budowania (nie trafia do repo SurfaceCraft):
+Probe nie trafia do repo SurfaceCraft. Źródło: `C:\spike\probe\src\lib.rs` (path-deps na `../solidcore` @ `b9c02da`),
+kopia w folderze notatek sesji. Uruchomienie:
 
 ```bash
 cd /c/spike/probe && cargo run --release --bin probe
 ```
 
 ```bash
-rustup target add wasm32-unknown-unknown && cd /c/spike/probe && cargo check --lib --target wasm32-unknown-unknown
+cd /c/spike/probe && cargo check --lib --release --target wasm32-unknown-unknown
 ```
 
-Wynik (liczniki ścian, objętości wobec wartości dokładnych, maks. odchyłka fitu, błąd `ShellModel`, round-trip STEP)
-dopisać do §1.6 tego dokumentu. Źródło probe: `C:\spike\probe\src\lib.rs`. Kopia leży w folderze notatek sesji.
+```bash
+cd /c/spike/probe && RUSTFLAGS="-C link-arg=-zstack-size=8388608" cargo build --release --target wasm32-wasip1 --bin probe
+```
+
+Plik `.wasm` uruchamiany pod `node:wasi` (preview1), skryptem z ~8 linii. Następne kroki poza spike'iem: diagnoza błędu
+1001 w `face_on` i budowa arkusza z płata przez rekord (M3).
