@@ -12,6 +12,7 @@ publish.workspace = true
 surfacecraft-geom.workspace = true
 surfacecraft-kernel.workspace = true
 surfacecraft-fit.workspace = true
+surfacecraft-sketch.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

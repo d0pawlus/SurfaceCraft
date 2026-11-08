@@ -135,8 +135,46 @@ fn info(s: &mut Session, i: BodyIn) -> CmdResult<BodyOut> {
     body_out(s, id)
 }
 
+/// Mesh-from-body parameters.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ToMeshIn {
+    /// Body id or name.
+    pub object: ObjRef,
+    /// Chord tolerance (mm, default from the body size).
+    #[serde(default)]
+    pub chord: Option<f64>,
+    /// Mesh name.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+fn to_mesh(s: &mut Session, i: ToMeshIn) -> CmdResult<crate::cmd::mesh::MeshInfo> {
+    let id = i.object.resolve(s, ObjectKind::Body)?;
+    let b = s.doc.body(id).ok_or_else(|| CmdError::Params(format!("no body {id}")))?;
+    if let Some(c) = i.chord
+        && !(c.is_finite() && c > 0.0)
+    {
+        return Err(CmdError::Params("chord must be positive".into()));
+    }
+    let m = surfacecraft_kernel::tess::tessellate(&b.brep, i.chord)?;
+    let name = i.name.unwrap_or_else(|| format!("{} mesh", b.name));
+    let mid = s.doc.add_mesh(&name, m);
+    crate::cmd::mesh::mesh_info(s, mid)
+}
+
 /// `body.*` commands.
 pub static COMMANDS: &[CommandSpec] = &[
+    command!(
+        "body.to_mesh",
+        "Body to mesh",
+        "Solid",
+        true,
+        "Tessellates body `object` into a new mesh (chord tolerance `chord`).",
+        ToMeshIn,
+        crate::cmd::mesh::MeshInfo,
+        to_mesh
+    ),
     command!("body.box", "Box", "Solid", true, "Creates a box body of `size` at `origin`.", BoxIn, BodyOut, make_box),
     command!(
         "body.cylinder",

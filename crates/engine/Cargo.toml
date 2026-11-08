@@ -16,6 +16,7 @@ surfacecraft-io.workspace = true
 surfacecraft-align.workspace = true
 surfacecraft-fit.workspace = true
 surfacecraft-deviation.workspace = true
+surfacecraft-sketch.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 schemars.workspace = true

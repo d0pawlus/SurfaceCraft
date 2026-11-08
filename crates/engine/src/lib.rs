@@ -15,6 +15,7 @@
 
 pub mod cmd;
 pub mod display;
+pub mod replay;
 pub mod session;
 
 pub use cmd::{CmdError, CommandSpec, registry};

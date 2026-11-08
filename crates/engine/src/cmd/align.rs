@@ -139,7 +139,9 @@ fn target_mesh(s: &mut Session, r: &ObjRef) -> CmdResult<Arc<Mesh>> {
             s.doc.surface(id).map(|o| o.display.clone()).ok_or_else(|| CmdError::Params(format!("no surface {id}")))
         }
         ObjectKind::Quad => Ok(Arc::new(s.doc.quad(id).map(|q| q.display_mesh()).unwrap_or_default())),
-        ObjectKind::Region => Err(CmdError::Params(format!("{id} is a region; align to a mesh, body or primitive"))),
+        ObjectKind::Region | ObjectKind::Sketch | ObjectKind::Feature => {
+            Err(CmdError::Params(format!("{id} is not geometry to align to; use a mesh, body or primitive")))
+        }
     }
 }
 

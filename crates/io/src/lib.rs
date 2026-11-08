@@ -12,6 +12,7 @@
     clippy::unreachable
 )]
 
+pub mod iges;
 pub mod mesh;
 pub mod step;
 

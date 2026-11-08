@@ -12,7 +12,8 @@ Third-party material
   step-brep, step-export), pinned by git revision. Only crates/kernel depends on it.
 
 - SolidCraft (https://github.com/tangency-labs/solidcraft), MIT OR Apache-2.0, Copyright (c) 2026 SolidCraft
-  contributors: the STEP open-shell writer in crates/io/src/step/ is adapted from its crates/step (modified).
+  contributors: the STEP open-shell writer in crates/io/src/step/ is adapted from its crates/step, and
+  the IGES writer crates/io/src/iges.rs from its crates/kernel/src/iges_out.rs (both modified).
 
 Adapted source files are listed in ATTRIBUTION.md ("Adapted code"), each keeping its original
 copyright notice and marked as modified (Apache-2.0 section 4).

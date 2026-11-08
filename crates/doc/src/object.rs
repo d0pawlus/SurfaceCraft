@@ -38,6 +38,10 @@ pub enum ObjectKind {
     Surface,
     /// A quad layout (retopology cage) over a mesh region.
     Quad,
+    /// A 2-D sketch.
+    Sketch,
+    /// A parametric feature of the history.
+    Feature,
 }
 
 /// Common face of every object.
@@ -285,6 +289,30 @@ impl QuadObject {
 }
 object_common!(QuadObject, ObjectKind::Quad);
 
+impl crate::feature::SketchObject {
+    fn describe(&self) -> String {
+        let st = self.report.as_ref().map_or_else(|| "not solved".to_string(), |r| r.message.clone());
+        format!("{} entities, {} constraints, {st}", self.sketch.entities.len(), self.sketch.constraints.len())
+    }
+}
+object_common!(crate::feature::SketchObject, ObjectKind::Sketch);
+
+impl crate::feature::FeatureObject {
+    fn describe(&self) -> String {
+        let state = if self.suppressed {
+            " (suppressed)".to_string()
+        } else {
+            self.error.as_ref().map_or_else(String::new, |e| format!(" — error: {e}"))
+        };
+        format!("{} → {}{state}", self.op.label(), self.body)
+    }
+}
+object_common!(crate::feature::FeatureObject, ObjectKind::Feature);
+
+pub(crate) fn yes_fn() -> bool {
+    true
+}
+
 fn yes() -> bool {
     true
 }
@@ -325,6 +353,12 @@ pub struct Document {
     /// Quad layouts.
     #[serde(default)]
     pub quads: Vec<QuadObject>,
+    /// Sketches.
+    #[serde(default)]
+    pub sketches: Vec<crate::feature::SketchObject>,
+    /// Features, in history order.
+    #[serde(default)]
+    pub features: Vec<crate::feature::FeatureObject>,
     /// Next free id.
     #[serde(default)]
     pub next_id: u64,
@@ -357,6 +391,14 @@ macro_rules! stores {
             let $s = &$doc.quads;
             $body;
         }
+        {
+            let $s = &$doc.sketches;
+            $body;
+        }
+        {
+            let $s = &$doc.features;
+            $body;
+        }
     }};
     (mut $doc:expr, $s:ident => $body:expr) => {{
         {
@@ -381,6 +423,14 @@ macro_rules! stores {
         }
         {
             let $s = &mut $doc.quads;
+            $body;
+        }
+        {
+            let $s = &mut $doc.sketches;
+            $body;
+        }
+        {
+            let $s = &mut $doc.features;
             $body;
         }
     }};
@@ -474,6 +524,30 @@ impl Document {
         id
     }
 
+    /// Adds a sketch and returns its id.
+    pub fn add_sketch(&mut self, name: &str, sketch: surfacecraft_sketch::Sketch) -> ObjectId {
+        let id = self.fresh_id();
+        let name = self.unique_name(name);
+        self.sketches.push(crate::feature::SketchObject { id, name, sketch, report: None, visible: true });
+        id
+    }
+
+    /// Appends a feature writing `body` and returns its id.
+    pub fn add_feature(&mut self, name: &str, op: crate::feature::FeatureOp, body: ObjectId) -> ObjectId {
+        let id = self.fresh_id();
+        let name = self.unique_name(name);
+        self.features.push(crate::feature::FeatureObject {
+            id,
+            name,
+            op,
+            body,
+            suppressed: false,
+            error: None,
+            visible: true,
+        });
+        id
+    }
+
     /// Adds a quad layout and returns its id.
     pub fn add_quad(&mut self, mut q: QuadObject) -> ObjectId {
         q.id = self.fresh_id();
@@ -523,6 +597,28 @@ impl Document {
     /// Mutable region with `id`.
     pub fn region_mut(&mut self, id: ObjectId) -> Option<&mut RegionObject> {
         self.regions.iter_mut().find(|r| r.id == id)
+    }
+
+    /// The sketch with `id`.
+    #[must_use]
+    pub fn sketch(&self, id: ObjectId) -> Option<&crate::feature::SketchObject> {
+        self.sketches.iter().find(|s| s.id == id)
+    }
+
+    /// Mutable sketch with `id`.
+    pub fn sketch_mut(&mut self, id: ObjectId) -> Option<&mut crate::feature::SketchObject> {
+        self.sketches.iter_mut().find(|s| s.id == id)
+    }
+
+    /// The feature with `id`.
+    #[must_use]
+    pub fn feature(&self, id: ObjectId) -> Option<&crate::feature::FeatureObject> {
+        self.features.iter().find(|f| f.id == id)
+    }
+
+    /// Mutable feature with `id`.
+    pub fn feature_mut(&mut self, id: ObjectId) -> Option<&mut crate::feature::FeatureObject> {
+        self.features.iter_mut().find(|f| f.id == id)
     }
 
     /// The quad layout with `id`.

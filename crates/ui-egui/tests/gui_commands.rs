@@ -159,3 +159,34 @@ fn freeform_menu_runs_autosurface() {
     assert_eq!(app.session.doc.surfaces.len(), 1, "status {}", app.status);
     assert!(app.session.display_items().iter().any(|d| d.kind == surfacecraft_doc::ObjectKind::Quad));
 }
+
+/// Parametric modelling from the GUI: Sketch and Feature menus reach the same commands; the
+/// extruded body appears and the history replays after a sketch edit.
+#[test]
+fn sketch_and_feature_menus_build_a_part() {
+    let mut h = harness();
+    let steps = [
+        ("Sketch", "New sketch", json!({"name": "base"})),
+        (
+            "Sketch",
+            "Add sketch entities",
+            json!({"sketch": "base", "entities": [{"polygon": {"points": [[0, 0], [30, 0], [30, 10], [0, 10]]}}]}),
+        ),
+        ("Feature", "Extrude", json!({"sketch": "base", "distance": 5.0, "name": "part"})),
+    ];
+    for (menu, item, params) in steps {
+        h.get_by_label(menu).click();
+        h.run();
+        h.get_by_label(item).click();
+        h.run();
+        h.state_mut().palette_params = params.to_string();
+        h.run();
+        h.get_by_label("Run").click();
+        h.run();
+    }
+    let app = h.state_mut();
+    let part = app.session.doc.bodies.iter().find(|b| b.name == "part").expect("body made by the extrude");
+    let v = surfacecraft_kernel::solid::volume(&part.brep).unwrap();
+    assert!((v - 1500.0).abs() < 1e-3, "status {}", app.status);
+    assert!(app.session.display_items().iter().any(|d| d.kind == surfacecraft_doc::ObjectKind::Sketch));
+}

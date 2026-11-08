@@ -2727,6 +2727,7 @@ dependencies = [
  "surfacecraft-fit",
  "surfacecraft-geom",
  "surfacecraft-kernel",
+ "surfacecraft-sketch",
  "thiserror 2.0.21",
 ]
 
@@ -2744,6 +2745,7 @@ dependencies = [
  "surfacecraft-geom",
  "surfacecraft-io",
  "surfacecraft-kernel",
+ "surfacecraft-sketch",
  "thiserror 2.0.21",
 ]
 
@@ -2803,6 +2805,14 @@ version = "0.1.0"
 [[package]]
 name = "surfacecraft-sketch"
 version = "0.1.0"
+dependencies = [
+ "nalgebra",
+ "schemars",
+ "serde",
+ "serde_json",
+ "surfacecraft-geom",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "surfacecraft-ui-egui"
@@ -2821,6 +2831,7 @@ dependencies = [
  "surfacecraft-engine",
  "surfacecraft-fit",
  "surfacecraft-geom",
+ "surfacecraft-kernel",
  "wgpu",
 ]
 

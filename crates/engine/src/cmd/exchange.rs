@@ -132,8 +132,34 @@ fn import_step(s: &mut Session, i: ImportIn) -> CmdResult<ImportOut> {
     Ok(ImportOut { bodies, faces })
 }
 
+fn export_iges(s: &mut Session, i: ExportIn) -> CmdResult<ExportOut> {
+    let items = collect(s, &i.objects)?;
+    let name = i.name.unwrap_or_else(|| "surfacecraft".into());
+    let refs: Vec<&Brep> = items.iter().map(|(_, b)| b).collect();
+    let text = surfacecraft_io::iges::write_iges(&name, &refs)?;
+    let sheets = items.iter().filter(|(_, b)| surfacecraft_io::step::is_sheet(b)).count();
+    let content = if sheets == 0 {
+        "solids"
+    } else if sheets == items.len() {
+        "sheets"
+    } else {
+        "mixed"
+    };
+    finish(s, text, i.path, items.len(), content)
+}
+
 /// Exchange commands.
 pub static COMMANDS: &[CommandSpec] = &[
+    command!(
+        "export.iges",
+        "Export IGES…",
+        "File",
+        false,
+        "Writes surfaces and bodies of `objects` as IGES 5.3 (186 solids, 514 shells) to `path` or base64 `data`.",
+        ExportIn,
+        ExportOut,
+        export_iges
+    ),
     command!(
         "export.step",
         "Export STEP…",

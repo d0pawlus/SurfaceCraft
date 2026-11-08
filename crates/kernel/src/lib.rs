@@ -14,6 +14,7 @@
     clippy::unreachable
 )]
 
+pub mod feature;
 pub mod nurbs;
 pub mod solid;
 pub mod step;
@@ -48,4 +49,18 @@ pub(crate) fn op_err(op: &'static str, e: impl std::fmt::Display) -> KernelError
 
 pub(crate) fn finite_all(vals: &[f64]) -> bool {
     vals.iter().all(|v| v.is_finite())
+}
+
+/// Our row-major column-vector matrix (`p' = M·p`, translation in the last column) as the
+/// kernel's row-vector form (`p' = p·A + t`, translation in the last row): the transpose.
+pub(crate) fn to_kernel_matrix(m: &[[f64; 4]; 4]) -> [[f64; 4]; 4] {
+    let mut t = [[0.0; 4]; 4];
+    for (i, row) in m.iter().enumerate() {
+        for (j, v) in row.iter().enumerate() {
+            if let Some(slot) = t.get_mut(j).and_then(|r| r.get_mut(i)) {
+                *slot = *v;
+            }
+        }
+    }
+    t
 }

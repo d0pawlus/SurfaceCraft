@@ -17,6 +17,7 @@ pub mod bvh;
 pub mod kdtree;
 pub mod mesh;
 pub mod rng;
+pub mod section;
 pub mod synth;
 pub mod transform;
 pub mod tri;
