@@ -312,7 +312,8 @@ fn relax_boundaries(mesh: &Mesh, normals: &[Vec3], nb: &[[u32; 3]], mut segs: Ve
             }
             cands.sort_unstable();
             cands.dedup();
-            let Some(mut best_cost) = segs.get(a as usize).and_then(|s| boundary_cost(mesh, &s.primitive, t, tol)) else {
+            let Some(mut best_cost) = segs.get(a as usize).and_then(|s| boundary_cost(mesh, &s.primitive, t, tol))
+            else {
                 continue;
             };
             let mut best = a;
