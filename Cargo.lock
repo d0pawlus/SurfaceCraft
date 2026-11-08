@@ -2688,6 +2688,14 @@ dependencies = [
 [[package]]
 name = "surfacecraft-align"
 version = "0.1.0"
+dependencies = [
+ "nalgebra",
+ "schemars",
+ "serde",
+ "surfacecraft-fit",
+ "surfacecraft-geom",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "surfacecraft-cli"
@@ -2720,7 +2728,9 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "surfacecraft-align",
  "surfacecraft-doc",
+ "surfacecraft-fit",
  "surfacecraft-geom",
  "surfacecraft-io",
  "surfacecraft-kernel",
@@ -2730,6 +2740,12 @@ dependencies = [
 [[package]]
 name = "surfacecraft-fit"
 version = "0.1.0"
+dependencies = [
+ "nalgebra",
+ "schemars",
+ "serde",
+ "surfacecraft-geom",
+]
 
 [[package]]
 name = "surfacecraft-geom"

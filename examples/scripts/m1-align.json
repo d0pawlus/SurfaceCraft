@@ -1,0 +1,9 @@
+{
+  "commands": [
+    {"command": "mesh.synth", "params": {"shape": "bracket", "name": "reference"}},
+    {"command": "mesh.synth", "params": {"shape": "bracket", "noise": 0.02, "seed": 3, "name": "scan"}},
+    {"command": "mesh.transform", "params": {"object": "scan", "rotate": {"axis": [0.2, 0.9, -0.4], "degrees": 4}, "translate": [1.5, -2.0, 1.0]}},
+    {"command": "align.icp", "params": {"object": "scan", "target": "reference"}},
+    {"command": "align.principal", "params": {"object": "reference", "also": ["scan"]}}
+  ]
+}

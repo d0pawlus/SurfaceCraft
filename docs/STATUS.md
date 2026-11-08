@@ -9,7 +9,7 @@
 | M | Zakres (§8) | Stan | Plan |
 |---|---|---|---|
 | M0 | szkielet, konwencje, import, viewport, rejestr komend, CLI, smoke kernela | **zamknięty** | [plan](superpowers/plans/2026-11-08-m0-skeleton.md) |
-| M1 | wyrównanie: 3-2-1, N-point, ICP, world-axis | do zrobienia | — |
+| M1 | wyrównanie: 3-2-1, N-point, ICP, world-axis | **zamknięty** | [plan](superpowers/plans/2026-11-08-m1-alignment.md) |
 | M2 | prymitywy, auto-typ, symetria, deviation, Region | do zrobienia | — |
 | M3 | Fit Surface (NURBS), mapa odchyłek, STEP powierzchni | do zrobienia | — |
 | M4 | Freeform/AutoSurface, thicken | do zrobienia | — |
@@ -38,6 +38,9 @@ cargo run -p surfacecraft
 | Fuzz importu (3000 rund × 4 formaty, losowe bajty + uszkodzenia plików) | 0 panik | `io::mesh::tests::hostile_bytes_never_panic` |
 | Wrogie parametry (każda komenda × 20 wartości) | 0 panik | `engine/tests/commands.rs::hostile_params_never_panic` |
 | Render offscreen (GPU lokalnie; CI bez GPU — test się pomija) | piksel środka = siatka, róg = tło | `ui-egui::viewport::tests::offscreen_render_shows_the_mesh` |
+| M1: ICP bez szumu (bracket, ruch 4° + 2,7 mm) | błąd 2,1e-12 mm (próg 1e-6), 4 iteracje, ostatnie Δ 2,6e-5 mm (próg 1e-4) | `align::icp::tests::gate_m1_icp_recovers_known_motion_noise_free` |
+| M1: N-point i 3-2-1 bez szumu | ≤ 1e-9 mm | `gate_m1_n_point_command_recovers_known_motion`, `gate_m1_datum_321_recovers_known_motion` |
+| M1: ICP z szumem σ = 0,02 mm | RMS 0,015 mm, 9 iteracji, kąt odzyskany 3,996° z 4° | `examples/scripts/m1-align.json`, `noisy_scan_converges_close_to_truth` |
 
 ## Decyzje buildera (z uzasadnieniem)
 
@@ -53,6 +56,7 @@ Szczegóły w planach milestone'ów.
 - Adaptacje kodu rodziny: brak (pierwsza planowana w M3: zapis `SHELL_BASED_SURFACE_MODEL` z `solidcraft-step`).
 - `surfacecraft-web` to tylko runner eframe (bez wczytywania plików w przeglądarce) — pełny web w M6.
 - Brak osobnego repo `surfacecraft-corpus`: korpus w CI jest w całości syntetyczny (`geom::synth`).
+- Gizmo manipulatora w viewporcie (§6.1) — w M1 ruch ręczny tylko przez `mesh.transform`.
 
 ## Luki / ryzyka
 
@@ -61,6 +65,7 @@ Szczegóły w planach milestone'ów.
 
 ## Następny krok
 
-M1 — wyrównanie (plan `docs/superpowers/plans/…-m1-alignment.md`): Kabsch/Umeyama, ICP point-to-plane na
-KD-tree, 3-2-1 datum z płaszczyzn/osi, world-axis (PCA); komendy `align.*`; bramki: odzyskanie znanej
-transformacji ≤ 1e-6 mm (bez szumu) i zbieżność ICP Δ < 1e-4 mm/iter.
+M2 — prymitywy (plan `docs/superpowers/plans/…-m2-primitives.md`): fit plane/sphere/cylinder/cone/torus (LSQ +
+własny Levenberg-Marquardt), auto-typ po residuum, płaszczyzna symetrii, deviation mesh↔prymityw/mesh z mapą
+kolorów, `Region` w `doc` (auto-segment, merge, split), zaznaczanie trójkątów w GUI; bramka: RMS ≤ 0,1 mm na
+zaszumionych danych syntetycznych i poprawny auto-typ.

@@ -61,6 +61,13 @@ impl Bvh {
         self.tris.is_empty()
     }
 
+    /// Unit normal of triangle `i` (`None` when degenerate or missing).
+    #[must_use]
+    pub fn triangle_normal(&self, i: usize) -> Option<Vec3> {
+        let [a, b, c] = self.tris.get(i)?;
+        tri::normal(a, b, c)
+    }
+
     fn tri_box(&self, oi: usize) -> Aabb {
         let t = self.order.get(oi).and_then(|&i| self.tris.get(i as usize));
         t.map_or_else(Aabb::empty, |t| Aabb::from_points(t.iter()))
