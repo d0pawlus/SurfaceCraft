@@ -1,8 +1,14 @@
 //! Objects of a document.
+//!
+//! Every kind of object lives in its own list of the [`Document`]; the [`Object`] trait gives
+//! them a common face (id, name, visibility, kind, a one-line detail) and the `stores!` macro
+//! runs generic operations (find, rename, remove, list) over every list, so adding a kind is
+//! one struct, one list and one line in the macro.
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use surfacecraft_geom::{Aabb, Mesh};
+use surfacecraft_fit::{Primitive, PrimitiveKind};
+use surfacecraft_geom::{Aabb, Mesh, Point3};
 use surfacecraft_kernel::record::brep::Brep;
 
 /// A document-unique object id (shared by every kind of object).
@@ -24,6 +30,56 @@ pub enum ObjectKind {
     Mesh,
     /// A B-rep body (solid or sheet).
     Body,
+    /// A persistent set of triangles of a mesh (design doc §6.2).
+    Region,
+    /// A fitted analytic primitive.
+    Primitive,
+}
+
+/// Common face of every object.
+pub trait Object {
+    /// Id.
+    fn id(&self) -> ObjectId;
+    /// Name.
+    fn name(&self) -> &str;
+    /// Mutable name.
+    fn name_mut(&mut self) -> &mut String;
+    /// Shown?
+    fn visible(&self) -> bool;
+    /// Mutable visibility.
+    fn visible_mut(&mut self) -> &mut bool;
+    /// Kind.
+    fn kind(&self) -> ObjectKind;
+    /// Short facts for lists.
+    fn detail(&self) -> String;
+}
+
+macro_rules! object_common {
+    ($t:ty, $kind:expr) => {
+        impl Object for $t {
+            fn id(&self) -> ObjectId {
+                self.id
+            }
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn name_mut(&mut self) -> &mut String {
+                &mut self.name
+            }
+            fn visible(&self) -> bool {
+                self.visible
+            }
+            fn visible_mut(&mut self) -> &mut bool {
+                &mut self.visible
+            }
+            fn kind(&self) -> ObjectKind {
+                $kind
+            }
+            fn detail(&self) -> String {
+                self.describe()
+            }
+        }
+    };
 }
 
 /// A scan or other triangle mesh.
@@ -41,6 +97,13 @@ pub struct MeshObject {
     pub visible: bool,
 }
 
+impl MeshObject {
+    fn describe(&self) -> String {
+        format!("{} triangles, {} vertices", self.mesh.triangle_count(), self.mesh.vertex_count())
+    }
+}
+object_common!(MeshObject, ObjectKind::Mesh);
+
 /// A B-rep body, held as the kernel's neutral record.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BodyObject {
@@ -54,6 +117,74 @@ pub struct BodyObject {
     #[serde(default = "yes")]
     pub visible: bool,
 }
+
+impl BodyObject {
+    fn describe(&self) -> String {
+        format!("{} faces, {} edges", self.brep.faces.len(), self.brep.edges.len())
+    }
+}
+object_common!(BodyObject, ObjectKind::Body);
+
+/// A persistent region: triangles of one mesh, optionally classified by a fitted primitive.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RegionObject {
+    /// Id.
+    pub id: ObjectId,
+    /// Display name.
+    pub name: String,
+    /// The mesh the triangles belong to.
+    pub mesh: ObjectId,
+    /// Triangle indices, sorted and unique.
+    pub triangles: Arc<Vec<u32>>,
+    /// Geometry type after classification.
+    #[serde(default)]
+    pub kind: Option<PrimitiveKind>,
+    /// RMS of the classification fit (mm).
+    #[serde(default)]
+    pub rms: Option<f64>,
+    /// Shown in the viewport (as a colour on its mesh).
+    #[serde(default = "yes")]
+    pub visible: bool,
+}
+
+impl RegionObject {
+    fn describe(&self) -> String {
+        let k = self.kind.map_or_else(|| "unclassified".to_string(), |k| format!("{k:?}").to_lowercase());
+        format!("{} triangles of {}, {k}", self.triangles.len(), self.mesh)
+    }
+}
+object_common!(RegionObject, ObjectKind::Region);
+
+/// A fitted primitive.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PrimitiveObject {
+    /// Id.
+    pub id: ObjectId,
+    /// Display name.
+    pub name: String,
+    /// The surface.
+    pub primitive: Primitive,
+    /// Region it was fitted to, if any.
+    #[serde(default)]
+    pub region: Option<ObjectId>,
+    /// RMS of the fit (mm).
+    pub rms: f64,
+    /// Largest deviation of the fit (mm).
+    pub max: f64,
+    /// Display patch (the part of the surface the fitted points cover).
+    #[serde(with = "crate::format::mesh_b64")]
+    pub patch: Arc<Mesh>,
+    /// Shown in the viewport.
+    #[serde(default = "yes")]
+    pub visible: bool,
+}
+
+impl PrimitiveObject {
+    fn describe(&self) -> String {
+        format!("{:?}, rms {:.4} mm", self.primitive.kind(), self.rms).to_lowercase()
+    }
+}
+object_common!(PrimitiveObject, ObjectKind::Primitive);
 
 fn yes() -> bool {
     true
@@ -83,9 +214,55 @@ pub struct Document {
     /// B-rep bodies.
     #[serde(default)]
     pub bodies: Vec<BodyObject>,
+    /// Regions.
+    #[serde(default)]
+    pub regions: Vec<RegionObject>,
+    /// Primitives.
+    #[serde(default)]
+    pub primitives: Vec<PrimitiveObject>,
     /// Next free id.
     #[serde(default)]
     pub next_id: u64,
+}
+
+/// Runs `$body` with `$s` bound to each object list (immutable or mutable).
+macro_rules! stores {
+    ($doc:expr, $s:ident => $body:expr) => {{
+        {
+            let $s = &$doc.meshes;
+            $body;
+        }
+        {
+            let $s = &$doc.bodies;
+            $body;
+        }
+        {
+            let $s = &$doc.regions;
+            $body;
+        }
+        {
+            let $s = &$doc.primitives;
+            $body;
+        }
+    }};
+    (mut $doc:expr, $s:ident => $body:expr) => {{
+        {
+            let $s = &mut $doc.meshes;
+            $body;
+        }
+        {
+            let $s = &mut $doc.bodies;
+            $body;
+        }
+        {
+            let $s = &mut $doc.regions;
+            $body;
+        }
+        {
+            let $s = &mut $doc.primitives;
+            $body;
+        }
+    }};
 }
 
 impl Document {
@@ -112,7 +289,9 @@ impl Document {
     }
 
     fn name_taken(&self, n: &str) -> bool {
-        self.meshes.iter().any(|m| m.name == n) || self.bodies.iter().any(|b| b.name == n)
+        let mut taken = false;
+        stores!(self, s => taken |= s.iter().any(|o| o.name() == n));
+        taken
     }
 
     /// Adds a mesh and returns its id.
@@ -128,6 +307,49 @@ impl Document {
         let id = self.fresh_id();
         let name = self.unique_name(name);
         self.bodies.push(BodyObject { id, name, brep: Arc::new(brep), visible: true });
+        id
+    }
+
+    /// Adds a region (triangles sorted and deduplicated) and returns its id.
+    pub fn add_region(&mut self, name: &str, mesh: ObjectId, mut triangles: Vec<u32>) -> ObjectId {
+        triangles.sort_unstable();
+        triangles.dedup();
+        let id = self.fresh_id();
+        let name = self.unique_name(name);
+        self.regions.push(RegionObject {
+            id,
+            name,
+            mesh,
+            triangles: Arc::new(triangles),
+            kind: None,
+            rms: None,
+            visible: true,
+        });
+        id
+    }
+
+    /// Adds a primitive and returns its id.
+    pub fn add_primitive(
+        &mut self,
+        name: &str,
+        primitive: Primitive,
+        region: Option<ObjectId>,
+        rms: f64,
+        max: f64,
+        patch: Mesh,
+    ) -> ObjectId {
+        let id = self.fresh_id();
+        let name = self.unique_name(name);
+        self.primitives.push(PrimitiveObject {
+            id,
+            name,
+            primitive,
+            region,
+            rms,
+            max,
+            patch: Arc::new(patch),
+            visible: true,
+        });
         id
     }
 
@@ -153,103 +375,105 @@ impl Document {
         self.bodies.iter_mut().find(|b| b.id == id)
     }
 
+    /// The region with `id`.
+    #[must_use]
+    pub fn region(&self, id: ObjectId) -> Option<&RegionObject> {
+        self.regions.iter().find(|r| r.id == id)
+    }
+
+    /// Mutable region with `id`.
+    pub fn region_mut(&mut self, id: ObjectId) -> Option<&mut RegionObject> {
+        self.regions.iter_mut().find(|r| r.id == id)
+    }
+
+    /// The primitive with `id`.
+    #[must_use]
+    pub fn primitive(&self, id: ObjectId) -> Option<&PrimitiveObject> {
+        self.primitives.iter().find(|p| p.id == id)
+    }
+
+    /// Regions of a mesh.
+    pub fn regions_of(&self, mesh: ObjectId) -> impl Iterator<Item = &RegionObject> {
+        self.regions.iter().filter(move |r| r.mesh == mesh)
+    }
+
     /// Finds an object by name.
     #[must_use]
     pub fn find_by_name(&self, name: &str) -> Option<(ObjectId, ObjectKind)> {
-        self.meshes
-            .iter()
-            .find(|m| m.name == name)
-            .map(|m| (m.id, ObjectKind::Mesh))
-            .or_else(|| self.bodies.iter().find(|b| b.name == name).map(|b| (b.id, ObjectKind::Body)))
+        let mut found = None;
+        stores!(self, s => if found.is_none() { found = s.iter().find(|o| o.name() == name).map(|o| (o.id(), o.kind())); });
+        found
     }
 
     /// The kind of object `id` names.
     #[must_use]
     pub fn kind_of(&self, id: ObjectId) -> Option<ObjectKind> {
-        if self.mesh(id).is_some() {
-            Some(ObjectKind::Mesh)
-        } else if self.body(id).is_some() {
-            Some(ObjectKind::Body)
-        } else {
-            None
-        }
+        let mut found = None;
+        stores!(self, s => if found.is_none() { found = s.iter().find(|o| o.id() == id).map(|o| o.kind()); });
+        found
     }
 
-    /// Removes an object of any kind; true when something was removed.
+    /// Removes an object of any kind (a mesh takes its regions with it); true when removed.
     pub fn remove(&mut self, id: ObjectId) -> bool {
-        let before = self.meshes.len() + self.bodies.len();
-        self.meshes.retain(|m| m.id != id);
-        self.bodies.retain(|b| b.id != id);
-        before != self.meshes.len() + self.bodies.len()
+        let before = self.summaries().len();
+        stores!(mut self, s => s.retain(|o| o.id() != id));
+        self.regions.retain(|r| r.mesh != id);
+        for p in &mut self.primitives {
+            if p.region == Some(id) {
+                p.region = None;
+            }
+        }
+        before != self.summaries().len()
     }
 
     /// Renames an object; false when it does not exist.
     pub fn rename(&mut self, id: ObjectId, name: &str) -> bool {
         let name = self.unique_name(name);
-        if let Some(m) = self.mesh_mut(id) {
-            m.name = name;
-            true
-        } else if let Some(b) = self.body_mut(id) {
-            b.name = name;
-            true
-        } else {
-            false
-        }
+        let mut done = false;
+        stores!(mut self, s => if let Some(o) = s.iter_mut().find(|o| o.id() == id) { *o.name_mut() = name.clone(); done = true; });
+        done
     }
 
     /// Shows or hides an object.
     pub fn set_visible(&mut self, id: ObjectId, visible: bool) -> bool {
-        if let Some(m) = self.mesh_mut(id) {
-            m.visible = visible;
-            true
-        } else if let Some(b) = self.body_mut(id) {
-            b.visible = visible;
-            true
-        } else {
-            false
-        }
+        let mut done = false;
+        stores!(mut self, s => if let Some(o) = s.iter_mut().find(|o| o.id() == id) { *o.visible_mut() = visible; done = true; });
+        done
     }
 
     /// Every object, in creation order.
     #[must_use]
     pub fn summaries(&self) -> Vec<ObjectSummary> {
-        let mut v: Vec<ObjectSummary> = self
-            .meshes
-            .iter()
-            .map(|m| ObjectSummary {
-                id: m.id,
-                kind: ObjectKind::Mesh,
-                name: m.name.clone(),
-                visible: m.visible,
-                detail: format!("{} triangles, {} vertices", m.mesh.triangle_count(), m.mesh.vertex_count()),
-            })
-            .chain(self.bodies.iter().map(|b| ObjectSummary {
-                id: b.id,
-                kind: ObjectKind::Body,
-                name: b.name.clone(),
-                visible: b.visible,
-                detail: format!("{} faces, {} edges", b.brep.faces.len(), b.brep.edges.len()),
-            }))
-            .collect();
+        let mut v: Vec<ObjectSummary> = Vec::new();
+        stores!(self, s => v.extend(s.iter().map(|o| ObjectSummary {
+            id: o.id(),
+            kind: o.kind(),
+            name: o.name().to_string(),
+            visible: o.visible(),
+            detail: o.detail(),
+        })));
         v.sort_by_key(|s| s.id);
         v
     }
 
-    /// Bounding box of every visible mesh.
+    /// Bounding box of every visible mesh, body and primitive patch.
     #[must_use]
     pub fn bbox(&self) -> Aabb {
         let mut b = Aabb::empty();
-        for m in self.meshes.iter().filter(|m| m.visible) {
-            let mb = m.mesh.bbox();
+        let mut add = |mb: Aabb| {
             if !mb.is_empty() {
                 b.grow(&mb.min);
                 b.grow(&mb.max);
             }
+        };
+        for m in self.meshes.iter().filter(|m| m.visible) {
+            add(m.mesh.bbox());
+        }
+        for p in self.primitives.iter().filter(|p| p.visible) {
+            add(p.patch.bbox());
         }
         for body in self.bodies.iter().filter(|b| b.visible) {
-            for v in &body.brep.vertices {
-                b.grow(&surfacecraft_geom::Point3::new(v.point[0], v.point[1], v.point[2]));
-            }
+            add(Aabb::from_points(&body.brep.vertices.iter().map(|v| Point3::from(v.point)).collect::<Vec<_>>()));
         }
         b
     }
@@ -267,10 +491,16 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(d.mesh(b).unwrap().name, "scan 2");
         assert_eq!(d.find_by_name("scan 2"), Some((b, ObjectKind::Mesh)));
+        let r = d.add_region("region", b, vec![3, 1, 3]);
+        assert_eq!(*d.region(r).unwrap().triangles, vec![1, 3]);
         assert!(d.remove(a));
         assert!(!d.remove(a));
-        assert_eq!(d.summaries().len(), 1);
+        assert_eq!(d.summaries().len(), 2);
         assert!(d.rename(b, "part"));
         assert_eq!(d.kind_of(b), Some(ObjectKind::Mesh));
+        assert_eq!(d.kind_of(r), Some(ObjectKind::Region));
+        // removing the mesh removes its regions
+        assert!(d.remove(b));
+        assert!(d.summaries().is_empty());
     }
 }

@@ -1,0 +1,10 @@
+{
+  "commands": [
+    {"command": "mesh.synth", "params": {"shape": "bracket", "noise": 0.05, "seed": 4, "name": "scan"}},
+    {"command": "deviation.noise", "params": {"object": "scan"}},
+    {"command": "region.auto_segment", "params": {"mesh": "scan"}},
+    {"command": "primitive.fit", "params": {"region": "cylinder 5"}},
+    {"command": "deviation.compute", "params": {"object": "scan", "against": "cylinder", "region": "cylinder 5"}},
+    {"command": "primitive.symmetry", "params": {"mesh": "scan"}}
+  ]
+}

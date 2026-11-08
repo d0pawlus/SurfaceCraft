@@ -9,6 +9,12 @@
     clippy::unreachable
 )]
 
+pub mod auto;
+pub mod lm;
 pub mod plane;
+pub mod primitive;
+pub mod segment;
 
+pub use auto::{AutoFit, fit_auto};
 pub use plane::{PlaneFit, fit_plane};
+pub use primitive::{Primitive, PrimitiveFit, PrimitiveKind};

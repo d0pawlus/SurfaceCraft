@@ -86,3 +86,24 @@ fn viewport_picks_feed_n_point_alignment() {
     let b = h.state().session.doc.bbox();
     assert!((b.min.x - 10.0).abs() < 1e-6, "{b:?} status {}", h.state().status);
 }
+
+/// Regions from the GUI: a picked triangle prefills `region.grow`, Run creates a classified
+/// region, and the viewport colours the mesh by region.
+#[test]
+fn picked_triangle_grows_a_region() {
+    let mut h = harness();
+    h.state_mut().run_command("mesh.synth", json!({"shape": "box", "size": [40, 30, 20], "resolution": 16})).unwrap();
+    h.run();
+    let app = h.state_mut();
+    assert!(app.pick_at(500.0, 400.0, 1000.0, 800.0, false));
+    app.choose_command("region.grow");
+    let p: serde_json::Value = serde_json::from_str(&app.palette_params).unwrap();
+    assert_eq!(p["triangles"].as_array().unwrap().len(), 1);
+    h.run();
+    h.get_by_label("Run").click();
+    h.run();
+    let app = h.state_mut();
+    assert_eq!(app.session.doc.regions.len(), 1, "status {}", app.status);
+    assert_eq!(app.session.doc.regions[0].kind, Some(surfacecraft_fit::PrimitiveKind::Plane));
+    assert!(app.session.display_items().iter().any(|d| d.colors.is_some()));
+}
