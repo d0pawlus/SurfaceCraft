@@ -36,6 +36,8 @@ pub enum ObjectKind {
     Primitive,
     /// A fitted freeform (NURBS) surface.
     Surface,
+    /// A quad layout (retopology cage) over a mesh region.
+    Quad,
 }
 
 /// Common face of every object.
@@ -208,6 +210,10 @@ pub struct SurfaceObject {
     pub rms: f64,
     /// Largest deviation of the fitted points (mm).
     pub max: f64,
+    /// For a patch network fitted from one spline: that spline as a one-face sheet (same
+    /// geometry; used where the kernel needs one face, e.g. thicken).
+    #[serde(default)]
+    pub parent: Option<Arc<Brep>>,
     /// Display mesh.
     #[serde(with = "crate::format::mesh_b64")]
     pub display: Arc<Mesh>,
@@ -222,6 +228,62 @@ impl SurfaceObject {
     }
 }
 object_common!(SurfaceObject, ObjectKind::Surface);
+
+/// A structured quad layout over a region (retopology cage, design doc §6.3): `(nu + 1) × (nv + 1)`
+/// vertices snapped to the scan, on a plane frame the region is a height field over.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QuadObject {
+    /// Id.
+    pub id: ObjectId,
+    /// Display name.
+    pub name: String,
+    /// Scan mesh.
+    pub mesh: ObjectId,
+    /// Region the layout covers (none = the whole mesh).
+    #[serde(default)]
+    pub region: Option<ObjectId>,
+    /// Plane frame: origin, u, v, normal.
+    pub frame: [[f64; 3]; 4],
+    /// `[[u0, u1], [v0, v1]]` in plane coordinates.
+    pub domain: [[f64; 2]; 2],
+    /// Quads along u.
+    pub nu: usize,
+    /// Quads along v.
+    pub nv: usize,
+    /// Vertices, `vertices[i * (nv + 1) + j]`.
+    pub vertices: Vec<[f64; 3]>,
+    /// Crease lines along v at these u indices (1..nu): patches are not joined smoothly there.
+    #[serde(default)]
+    pub crease_u: Vec<usize>,
+    /// Crease lines along u at these v indices (1..nv).
+    #[serde(default)]
+    pub crease_v: Vec<usize>,
+    /// Shown in the viewport.
+    #[serde(default = "yes")]
+    pub visible: bool,
+}
+
+impl QuadObject {
+    fn describe(&self) -> String {
+        format!("{} × {} quads, {} creases", self.nu, self.nv, self.crease_u.len() + self.crease_v.len())
+    }
+
+    /// Display mesh: two triangles per quad.
+    #[must_use]
+    pub fn display_mesh(&self) -> Mesh {
+        let w = (self.nv + 1) as u32;
+        let mut triangles = Vec::with_capacity(self.nu * self.nv * 2);
+        for i in 0..self.nu as u32 {
+            for j in 0..self.nv as u32 {
+                let a = i * w + j;
+                triangles.push([a, a + w, a + w + 1]);
+                triangles.push([a, a + w + 1, a + 1]);
+            }
+        }
+        Mesh { positions: self.vertices.iter().map(|p| Point3::from(*p)).collect(), triangles }
+    }
+}
+object_common!(QuadObject, ObjectKind::Quad);
 
 fn yes() -> bool {
     true
@@ -260,6 +322,9 @@ pub struct Document {
     /// Freeform surfaces (sheets).
     #[serde(default)]
     pub surfaces: Vec<SurfaceObject>,
+    /// Quad layouts.
+    #[serde(default)]
+    pub quads: Vec<QuadObject>,
     /// Next free id.
     #[serde(default)]
     pub next_id: u64,
@@ -288,6 +353,10 @@ macro_rules! stores {
             let $s = &$doc.surfaces;
             $body;
         }
+        {
+            let $s = &$doc.quads;
+            $body;
+        }
     }};
     (mut $doc:expr, $s:ident => $body:expr) => {{
         {
@@ -308,6 +377,10 @@ macro_rules! stores {
         }
         {
             let $s = &mut $doc.surfaces;
+            $body;
+        }
+        {
+            let $s = &mut $doc.quads;
             $body;
         }
     }};
@@ -401,6 +474,15 @@ impl Document {
         id
     }
 
+    /// Adds a quad layout and returns its id.
+    pub fn add_quad(&mut self, mut q: QuadObject) -> ObjectId {
+        q.id = self.fresh_id();
+        q.name = self.unique_name(&q.name);
+        let id = q.id;
+        self.quads.push(q);
+        id
+    }
+
     /// Adds a surface and returns its id.
     pub fn add_surface(&mut self, mut s: SurfaceObject) -> ObjectId {
         s.id = self.fresh_id();
@@ -443,6 +525,17 @@ impl Document {
         self.regions.iter_mut().find(|r| r.id == id)
     }
 
+    /// The quad layout with `id`.
+    #[must_use]
+    pub fn quad(&self, id: ObjectId) -> Option<&QuadObject> {
+        self.quads.iter().find(|q| q.id == id)
+    }
+
+    /// Mutable quad layout with `id`.
+    pub fn quad_mut(&mut self, id: ObjectId) -> Option<&mut QuadObject> {
+        self.quads.iter_mut().find(|q| q.id == id)
+    }
+
     /// The surface with `id`.
     #[must_use]
     pub fn surface(&self, id: ObjectId) -> Option<&SurfaceObject> {
@@ -481,6 +574,7 @@ impl Document {
         let before = self.summaries().len();
         stores!(mut self, s => s.retain(|o| o.id() != id));
         self.regions.retain(|r| r.mesh != id);
+        self.quads.retain(|q| q.mesh != id);
         for p in &mut self.primitives {
             if p.region == Some(id) {
                 p.region = None;

@@ -12,6 +12,7 @@ const MESH_COLOR: [f32; 4] = [0.62, 0.66, 0.72, 1.0];
 const BODY_COLOR: [f32; 4] = [0.35, 0.55, 0.85, 1.0];
 const PRIMITIVE_COLOR: [f32; 4] = [0.95, 0.75, 0.2, 0.55];
 const SURFACE_COLOR: [f32; 4] = [0.55, 0.85, 0.95, 0.8];
+const QUAD_COLOR: [f32; 4] = [0.9, 0.4, 0.9, 0.35];
 
 /// The SurfaceCraft UI.
 pub struct SurfaceCraftApp {
@@ -351,6 +352,7 @@ impl SurfaceCraftApp {
                         ObjectKind::Region => "region",
                         ObjectKind::Primitive => "primitive",
                         ObjectKind::Surface => "surface",
+                        ObjectKind::Quad => "quads",
                     };
                     let sel = self.selected_object == Some(s.id);
                     if ui
@@ -495,6 +497,7 @@ impl SurfaceCraftApp {
                     ObjectKind::Body => BODY_COLOR,
                     ObjectKind::Primitive => PRIMITIVE_COLOR,
                     ObjectKind::Surface => SURFACE_COLOR,
+                    ObjectKind::Quad => QUAD_COLOR,
                     _ => MESH_COLOR,
                 },
                 mesh: d.mesh,

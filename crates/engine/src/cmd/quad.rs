@@ -1,0 +1,421 @@
+//! `quad.*` and `surface.auto`: structured quad layouts over a region and AutoSurface — one
+//! NURBS patch per quad, stitched by construction (design doc §6.3, milestone M4).
+//!
+//! Decision (design doc §10, retopology): neither an Instant Meshes port nor an external
+//! binary in M4. A layout is a structured quad grid over a height-field chart of the region
+//! (the same parameterisation as Fit Surface), its vertices snapped to the scan. AutoSurface fits
+//! one B-spline per crease-free block with one knot span per quad and splits it into its Bézier
+//! patches (solidcore `decompose_to_bez`), so neighbouring patches are C² — G1 by construction —
+//! and share their edges exactly. Creases split the layout into blocks fitted separately.
+//! Field-aligned unstructured retopology stays a gap (docs/STATUS.md).
+use super::{CmdError, CmdResult, CommandSpec, ObjRef};
+use crate::{Session, command};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use surfacecraft_doc::{ObjectId, ObjectKind, QuadObject, SurfaceObject};
+use surfacecraft_fit::resample::HeightField;
+use surfacecraft_fit::segment::region_points;
+use surfacecraft_geom::{Bvh, Mesh, Point3, Vec3};
+use surfacecraft_kernel::nurbs::{SurfaceProbe, decompose, fit_grid, sheet_from_patches, sheet_from_spline};
+
+/// Samples per quad along each direction when resampling a block for its fit.
+const SAMPLES_PER_QUAD: usize = 6;
+/// Largest layout (quads per direction).
+const MAX_QUADS: usize = 128;
+
+/// A layout as reported.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct QuadInfo {
+    /// Id.
+    pub id: ObjectId,
+    /// Quads along u.
+    pub nu: usize,
+    /// Quads along v.
+    pub nv: usize,
+    /// Crease lines (u indices, v indices).
+    pub creases: (Vec<usize>, Vec<usize>),
+    /// Largest distance of a cage vertex from the scan after snapping (mm).
+    pub snap_max: f64,
+}
+
+fn points_of(s: &Session, mesh: ObjectId, region: Option<ObjectId>) -> CmdResult<(Arc<Mesh>, Vec<Point3>, Vec<Vec3>)> {
+    let m = s.doc.mesh(mesh).map(|m| m.mesh.clone()).ok_or_else(|| CmdError::Params(format!("no mesh {mesh}")))?;
+    let tris: Vec<u32> = match region {
+        Some(r) => {
+            s.doc.region(r).map(|r| r.triangles.to_vec()).ok_or_else(|| CmdError::Params(format!("no region {r}")))?
+        }
+        None => (0..m.triangle_count() as u32).collect(),
+    };
+    let normals = m.vertex_normals();
+    let (p, n) = region_points(&m, &normals, &tris);
+    Ok((m, p, n))
+}
+
+fn field_of(s: &Session, q: &QuadObject) -> CmdResult<HeightField> {
+    let (_, p, _) = points_of(s, q.mesh, q.region)?;
+    let [o, u, v, n] = q.frame;
+    HeightField::in_frame(&p, Point3::from(o), Vec3::from(u), Vec3::from(v), Vec3::from(n))
+        .ok_or_else(|| CmdError::Failed("the region no longer covers the layout".into()))
+}
+
+/// Recomputes the cage vertices on the scan (height field) for the current `nu × nv`.
+fn rebuild(s: &mut Session, id: ObjectId) -> CmdResult<QuadInfo> {
+    let q = s.doc.quad(id).cloned().ok_or_else(|| CmdError::Params(format!("no quad layout {id}")))?;
+    let field = field_of(s, &q)?;
+    let g = field
+        .grid(q.domain, q.nu + 1, q.nv + 1)
+        .ok_or_else(|| CmdError::Failed("the height field could not be evaluated".into()))?;
+    let verts: Vec<[f64; 3]> = g.into_iter().flatten().collect();
+    if let Some(m) = s.doc.quad_mut(id) {
+        m.vertices = verts;
+    }
+    snap(s, id)
+}
+
+/// Projects every cage vertex onto the scan surface.
+fn snap(s: &mut Session, id: ObjectId) -> CmdResult<QuadInfo> {
+    let q = s.doc.quad(id).cloned().ok_or_else(|| CmdError::Params(format!("no quad layout {id}")))?;
+    let m = s.doc.mesh(q.mesh).map(|m| m.mesh.clone()).ok_or_else(|| CmdError::Params("no mesh".into()))?;
+    let bvh = Bvh::build(&m);
+    let mut max: f64 = 0.0;
+    let verts: Vec<[f64; 3]> = q
+        .vertices
+        .iter()
+        .map(|v| {
+            let p = Point3::from(*v);
+            match bvh.closest(&p, f64::INFINITY) {
+                Some(h) => {
+                    max = max.max(h.distance);
+                    [h.point.x, h.point.y, h.point.z]
+                }
+                None => *v,
+            }
+        })
+        .collect();
+    if let Some(mq) = s.doc.quad_mut(id) {
+        mq.vertices = verts;
+    }
+    let q = s.doc.quad(id).ok_or_else(|| CmdError::Params(format!("no quad layout {id}")))?;
+    Ok(QuadInfo { id, nu: q.nu, nv: q.nv, creases: (q.crease_u.clone(), q.crease_v.clone()), snap_max: max })
+}
+
+/// Create parameters.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CreateIn {
+    /// Region to cover.
+    #[serde(default)]
+    pub region: Option<ObjRef>,
+    /// Mesh to cover whole (when no region).
+    #[serde(default)]
+    pub mesh: Option<ObjRef>,
+    /// Target number of quads (default 64).
+    #[serde(default)]
+    pub target_quads: Option<usize>,
+    /// Name.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+fn create(s: &mut Session, i: CreateIn) -> CmdResult<QuadInfo> {
+    let (mesh, region) = match (&i.region, &i.mesh) {
+        (Some(r), None) => {
+            let rid = r.resolve(s, ObjectKind::Region)?;
+            (s.doc.region(rid).map(|r| r.mesh).ok_or_else(|| CmdError::Params("no region".into()))?, Some(rid))
+        }
+        (None, Some(m)) => (m.resolve(s, ObjectKind::Mesh)?, None),
+        _ => return Err(CmdError::Params("give `region` or `mesh`".into())),
+    };
+    let target = i.target_quads.unwrap_or(64);
+    if !(1..=MAX_QUADS * MAX_QUADS).contains(&target) {
+        return Err(CmdError::Params(format!("target_quads must be 1..={}", MAX_QUADS * MAX_QUADS)));
+    }
+    let (_, p, n) = points_of(s, mesh, region)?;
+    let field = HeightField::new(&p, &n).ok_or_else(|| {
+        CmdError::Failed("the region is not one patch over a plane (it folds or is degenerate); split it".into())
+    })?;
+    let [[u0, u1], [v0, v1]] = field.domain;
+    let aspect = ((u1 - u0) / (v1 - v0)).clamp(1e-3, 1e3);
+    let nv = ((target as f64 / aspect).sqrt().round() as usize).clamp(1, MAX_QUADS);
+    let nu = ((target as f64 / nv as f64).round() as usize).clamp(1, MAX_QUADS);
+    let q = QuadObject {
+        id: ObjectId(0),
+        name: i.name.unwrap_or_else(|| "quads".into()),
+        mesh,
+        region,
+        frame: [field.origin.into(), field.u.into(), field.v.into(), field.n.into()],
+        domain: field.domain,
+        nu,
+        nv,
+        vertices: Vec::new(),
+        crease_u: Vec::new(),
+        crease_v: Vec::new(),
+        visible: true,
+    };
+    let id = s.doc.add_quad(q);
+    rebuild(s, id)
+}
+
+/// One layout.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct QuadIn {
+    /// Quad layout id or name.
+    pub object: ObjRef,
+}
+
+fn split(s: &mut Session, i: QuadIn) -> CmdResult<QuadInfo> {
+    let id = i.object.resolve(s, ObjectKind::Quad)?;
+    let q = s.doc.quad_mut(id).ok_or_else(|| CmdError::Params(format!("no quad layout {id}")))?;
+    if q.nu * 2 > MAX_QUADS || q.nv * 2 > MAX_QUADS {
+        return Err(CmdError::Params(format!("the layout would exceed {MAX_QUADS} quads per direction")));
+    }
+    q.nu *= 2;
+    q.nv *= 2;
+    q.crease_u.iter_mut().for_each(|c| *c *= 2);
+    q.crease_v.iter_mut().for_each(|c| *c *= 2);
+    rebuild(s, id)
+}
+
+fn merge(s: &mut Session, i: QuadIn) -> CmdResult<QuadInfo> {
+    let id = i.object.resolve(s, ObjectKind::Quad)?;
+    let q = s.doc.quad_mut(id).ok_or_else(|| CmdError::Params(format!("no quad layout {id}")))?;
+    if q.nu < 2 || q.nv < 2 || q.nu % 2 != 0 || q.nv % 2 != 0 {
+        return Err(CmdError::Params("merging 2 × 2 quads needs an even number of quads ≥ 2 each way".into()));
+    }
+    q.nu /= 2;
+    q.nv /= 2;
+    q.crease_u.retain(|c| c % 2 == 0);
+    q.crease_v.retain(|c| c % 2 == 0);
+    q.crease_u.iter_mut().for_each(|c| *c /= 2);
+    q.crease_v.iter_mut().for_each(|c| *c /= 2);
+    rebuild(s, id)
+}
+
+fn snap_cmd(s: &mut Session, i: QuadIn) -> CmdResult<QuadInfo> {
+    let id = i.object.resolve(s, ObjectKind::Quad)?;
+    snap(s, id)
+}
+
+/// Crease parameters.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CreaseIn {
+    /// Quad layout id or name.
+    pub object: ObjRef,
+    /// Grid lines along v at these u indices (1..nu).
+    #[serde(default)]
+    pub u_lines: Vec<usize>,
+    /// Grid lines along u at these v indices (1..nv).
+    #[serde(default)]
+    pub v_lines: Vec<usize>,
+    /// Remove instead of add.
+    #[serde(default)]
+    pub remove: bool,
+}
+
+fn crease(s: &mut Session, i: CreaseIn) -> CmdResult<QuadInfo> {
+    let id = i.object.resolve(s, ObjectKind::Quad)?;
+    let q = s.doc.quad_mut(id).ok_or_else(|| CmdError::Params(format!("no quad layout {id}")))?;
+    if i.u_lines.iter().any(|&c| c == 0 || c >= q.nu) || i.v_lines.iter().any(|&c| c == 0 || c >= q.nv) {
+        return Err(CmdError::Params(format!("crease lines must be interior: u in 1..{}, v in 1..{}", q.nu, q.nv)));
+    }
+    for (list, add) in [(&mut q.crease_u, &i.u_lines), (&mut q.crease_v, &i.v_lines)] {
+        if i.remove {
+            list.retain(|c| !add.contains(c));
+        } else {
+            list.extend(add.iter().copied());
+        }
+        list.sort_unstable();
+        list.dedup();
+    }
+    let q = s.doc.quad(id).ok_or_else(|| CmdError::Params(format!("no quad layout {id}")))?;
+    Ok(QuadInfo { id, nu: q.nu, nv: q.nv, creases: (q.crease_u.clone(), q.crease_v.clone()), snap_max: 0.0 })
+}
+
+/// AutoSurface parameters.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AutoIn {
+    /// Quad layout id or name.
+    pub object: ObjRef,
+    /// Target maximum deviation (mm, default 0.2).
+    #[serde(default)]
+    pub tolerance: Option<f64>,
+    /// Name.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// One block's surface.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct AutoBlock {
+    /// Surface object of the block (its faces are the block's quads).
+    pub id: ObjectId,
+    /// Patches (faces).
+    pub patches: usize,
+    /// RMS deviation of the block's points (mm).
+    pub rms: f64,
+    /// Largest deviation (mm).
+    pub max: f64,
+}
+
+/// AutoSurface result.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct AutoOut {
+    /// One surface per crease-free block.
+    pub blocks: Vec<AutoBlock>,
+    /// Largest deviation over every block (mm).
+    pub max: f64,
+    /// Within the target?
+    pub within_tolerance: bool,
+    /// Advice when the target was not met.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+fn spans(n: usize, creases: &[usize]) -> Vec<(usize, usize)> {
+    let mut cuts: Vec<usize> = vec![0];
+    cuts.extend(creases.iter().copied().filter(|&c| c > 0 && c < n));
+    cuts.push(n);
+    cuts.sort_unstable();
+    cuts.dedup();
+    cuts.windows(2).filter_map(|w| if let [a, b] = w { Some((*a, *b)) } else { None }).collect()
+}
+
+fn auto(s: &mut Session, i: AutoIn) -> CmdResult<AutoOut> {
+    let id = i.object.resolve(s, ObjectKind::Quad)?;
+    let q = s.doc.quad(id).cloned().ok_or_else(|| CmdError::Params(format!("no quad layout {id}")))?;
+    let tol = i.tolerance.unwrap_or(0.2);
+    if !(tol.is_finite() && tol > 0.0) {
+        return Err(CmdError::Params("tolerance must be positive".into()));
+    }
+    let field = field_of(s, &q)?;
+    let (_, pts, _) = points_of(s, q.mesh, q.region)?;
+    let [o, uu, vv, _] = q.frame;
+    let (o, uu, vv) = (Vec3::from(o), Vec3::from(uu), Vec3::from(vv));
+    let degree = 3;
+    let [[u0, u1], [v0, v1]] = q.domain;
+    let du = (u1 - u0) / q.nu as f64;
+    let dv = (v1 - v0) / q.nv as f64;
+    let mut blocks = Vec::new();
+    let mut worst: f64 = 0.0;
+    let name = i.name.unwrap_or_else(|| "autosurface".into());
+    for (ia, ib) in spans(q.nu, &q.crease_u) {
+        for (ja, jb) in spans(q.nv, &q.crease_v) {
+            let (bu, bv) = (ib - ia, jb - ja);
+            let d = [[u0 + du * ia as f64, u0 + du * ib as f64], [v0 + dv * ja as f64, v0 + dv * jb as f64]];
+            let g = field
+                .grid(d, bu * SAMPLES_PER_QUAD + 1, bv * SAMPLES_PER_QUAD + 1)
+                .ok_or_else(|| CmdError::Failed("the height field could not be evaluated".into()))?;
+            let srf = fit_grid(&g, bu + degree, bv + degree, degree)?;
+            let patches = decompose(&srf)?;
+            let sheet = sheet_from_patches(&patches)?;
+            let parent = sheet_from_spline(&srf)?;
+            // deviation of the points inside this block
+            let probe = SurfaceProbe::new(&srf)?;
+            let mut sq = 0.0;
+            let mut max: f64 = 0.0;
+            let mut n = 0usize;
+            let eps = 1e-9 * (1.0 + du.abs() + dv.abs());
+            for p in &pts {
+                let w = p.coords - o;
+                let (x, y) = (w.dot(&uu), w.dot(&vv));
+                if x < d[0][0] - eps || x > d[0][1] + eps || y < d[1][0] - eps || y > d[1][1] + eps {
+                    continue;
+                }
+                let (dist, _) = probe.closest([p.x, p.y, p.z])?;
+                sq += dist * dist;
+                max = max.max(dist);
+                n += 1;
+            }
+            let rms = (sq / n.max(1) as f64).sqrt();
+            worst = worst.max(max);
+            let display = surfacecraft_kernel::tess::tessellate(&sheet, None).unwrap_or_default();
+            let faces = sheet.faces.len();
+            let sid = s.doc.add_surface(SurfaceObject {
+                id: ObjectId(0),
+                name: name.clone(),
+                sheet: Arc::new(sheet),
+                region: q.region,
+                control: [bu + degree, bv + degree],
+                degree,
+                rms,
+                max,
+                display: Arc::new(display),
+                parent: Some(Arc::new(parent)),
+                visible: true,
+            });
+            blocks.push(AutoBlock { id: sid, patches: faces, rms, max });
+        }
+    }
+    let within = worst <= tol;
+    let warning = (!within)
+        .then(|| format!("max deviation {worst:.4} mm exceeds {tol} mm: split the layout (quad.split) and run again"));
+    Ok(AutoOut { blocks, max: worst, within_tolerance: within, warning })
+}
+
+/// `quad.*` and `surface.auto` commands.
+pub static COMMANDS: &[CommandSpec] = &[
+    command!(
+        "quad.create",
+        "Quad layout",
+        "Freeform",
+        true,
+        "Structured quad layout (≈ `target_quads`) over `region` or `mesh`, snapped to the scan.",
+        CreateIn,
+        QuadInfo,
+        create
+    ),
+    command!(
+        "quad.split",
+        "Split quads 4×",
+        "Freeform",
+        true,
+        "Splits every quad of `object` into four.",
+        QuadIn,
+        QuadInfo,
+        split
+    ),
+    command!(
+        "quad.merge",
+        "Merge quads 2×2",
+        "Freeform",
+        true,
+        "Merges 2 × 2 quads of `object` into one.",
+        QuadIn,
+        QuadInfo,
+        merge
+    ),
+    command!(
+        "quad.snap",
+        "Snap to mesh",
+        "Freeform",
+        true,
+        "Projects the cage vertices of `object` onto the scan.",
+        QuadIn,
+        QuadInfo,
+        snap_cmd
+    ),
+    command!(
+        "quad.crease",
+        "Crease",
+        "Freeform",
+        true,
+        "Marks (or with `remove` clears) crease lines `u_lines`/`v_lines` of `object`: patches meet without smoothing there.",
+        CreaseIn,
+        QuadInfo,
+        crease
+    ),
+    command!(
+        "surface.auto",
+        "AutoSurface",
+        "Freeform",
+        true,
+        "One NURBS patch per quad of `object`, G1 across quads, one surface per crease-free block.",
+        AutoIn,
+        AutoOut,
+        auto
+    ),
+];

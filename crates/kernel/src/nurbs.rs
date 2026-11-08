@@ -248,3 +248,245 @@ mod tests {
         assert!(fit_grid(&[], 4, 4, 3).is_err());
     }
 }
+
+/// Splits a spline surface into its Bézier patches, `patches[a][b]` (a along u), each a
+/// record spline on its own span of the original parameters.
+pub fn decompose(s: &Surface) -> Result<Vec<Vec<Surface>>> {
+    let n = to_nurb(s)?;
+    let bez = solidcore::nurbs::srf_tool::p1::decompose_to_bez(&n)
+        .map_err(|e| op_err("decompose_to_bez", format!("{e:?}")))?;
+    bez.iter().map(|row| row.iter().map(to_record).collect::<Result<Vec<_>>>()).collect()
+}
+
+/// A sheet of `patches[a][b]` (a along u, b along v) that meet edge to edge, as one shell:
+/// neighbouring faces share their edge, so the patch network is one connected sheet.
+pub fn sheet_from_patches(patches: &[Vec<Surface>]) -> Result<Brep> {
+    let na = patches.len();
+    let nb = patches.first().map_or(0, Vec::len);
+    if na == 0 || nb == 0 || patches.iter().any(|r| r.len() != nb) {
+        return Err(KernelError::Argument("the patch grid must be rectangular and non-empty".into()));
+    }
+    let get = |a: usize, b: usize| -> Result<&Surface> {
+        patches.get(a).and_then(|r| r.get(b)).ok_or_else(|| KernelError::Argument("patch index".into()))
+    };
+    let mut doms = vec![vec![[[0.0; 2]; 2]; nb]; na];
+    for a in 0..na {
+        for b in 0..nb {
+            doms[a][b] = domain(get(a, b)?)?;
+        }
+    }
+    // vertices (na+1) × (nb+1)
+    let vid = |a: usize, b: usize| (a * (nb + 1) + b) as u32;
+    let mut vertices = Vec::with_capacity((na + 1) * (nb + 1));
+    for a in 0..=na {
+        for b in 0..=nb {
+            let (pa, pb) = (a.min(na - 1), b.min(nb - 1));
+            let d = doms[pa][pb];
+            let u = if a == na { d[0][1] } else { d[0][0] };
+            let v = if b == nb { d[1][1] } else { d[1][0] };
+            let p = SurfaceProbe::new(get(pa, pb)?)?.eval(u, v)?;
+            vertices.push(Vertex { point: p, tolerance: 1e-6 });
+        }
+    }
+    let rows = |s: &Surface, last: bool| -> Result<(Vec<f64>, Vec<[f64; 3]>)> {
+        let (u, _, pts) = spline_parts(s)?;
+        let j = if last { pts.first().map_or(0, Vec::len) - 1 } else { 0 };
+        Ok((u.to_vec(), pts.iter().filter_map(|r| r.get(j).copied()).collect()))
+    };
+    let cols = |s: &Surface, last: bool| -> Result<(Vec<f64>, Vec<[f64; 3]>)> {
+        let (_, v, pts) = spline_parts(s)?;
+        let i = if last { pts.len() - 1 } else { 0 };
+        Ok((v.to_vec(), pts.get(i).cloned().unwrap_or_default()))
+    };
+    // edges along u: H[a][b], a < na, b ≤ nb; along v: V[a][b], a ≤ na, b < nb
+    let mut edges: Vec<Edge> = Vec::new();
+    let mut h_id = vec![vec![0u32; nb + 1]; na];
+    for a in 0..na {
+        for b in 0..=nb {
+            let (k, pts) = if b < nb { rows(get(a, b)?, false)? } else { rows(get(a, nb - 1)?, true)? };
+            let d = doms[a][b.min(nb - 1)];
+            h_id[a][b] = edges.len() as u32;
+            edges.push(Edge {
+                curve: Curve::Spline { knots: k, points: pts },
+                nurbs: None,
+                interval: d[0],
+                vertices: [vid(a, b), vid(a + 1, b)],
+                tolerance: 1e-6,
+                uses: Vec::new(),
+            });
+        }
+    }
+    let mut v_id = vec![vec![0u32; nb]; na + 1];
+    for a in 0..=na {
+        for b in 0..nb {
+            let (k, pts) = if a < na { cols(get(a, b)?, false)? } else { cols(get(na - 1, b)?, true)? };
+            let d = doms[a.min(na - 1)][b];
+            v_id[a][b] = edges.len() as u32;
+            edges.push(Edge {
+                curve: Curve::Spline { knots: k, points: pts },
+                nurbs: None,
+                interval: d[1],
+                vertices: [vid(a, b), vid(a, b + 1)],
+                tolerance: 1e-6,
+                uses: Vec::new(),
+            });
+        }
+    }
+    let mut faces = Vec::with_capacity(na * nb);
+    let mut oriented = Vec::with_capacity(na * nb);
+    for a in 0..na {
+        for b in 0..nb {
+            let f = faces.len() as u32;
+            let [[u0, u1], [v0, v1]] = doms[a][b];
+            let uses = [
+                (h_id[a][b], true, line2([u0, v0], [u1, v0], u0, u1)),
+                (v_id[a + 1][b], true, line2([u1, v0], [u1, v1], v0, v1)),
+                (h_id[a][b + 1], false, line2([u0, v1], [u1, v1], u0, u1)),
+                (v_id[a][b], false, line2([u0, v0], [u0, v1], v0, v1)),
+            ];
+            let mut le = Vec::with_capacity(4);
+            for (pos, (e, fw, pc)) in uses.into_iter().enumerate() {
+                if let Some(edge) = edges.get_mut(e as usize) {
+                    edge.uses.push(EdgeUseRef { face: f, r#loop: 0, position: pos as u32, upper: !fw });
+                }
+                le.push(OrientedEdge { edge: e, forward: fw, pcurve: pc });
+            }
+            faces.push(Face {
+                surface: get(a, b)?.clone(),
+                nurbs: None,
+                domain: doms[a][b],
+                loops: vec![Loop::Edges { edges: le }],
+            });
+            oriented.push(OrientedFace { face: f, forward: true });
+        }
+    }
+    let brep = Brep {
+        version: crate::record::brep::VERSION,
+        tolerance: 1e-6,
+        regions: vec![Region { shells: vec![0], void: false }],
+        shells: vec![Shell::Faces { faces: oriented, wires: vec![] }],
+        faces,
+        edges,
+        vertices,
+    };
+    let brep = canonicalize(brep);
+    brep.validate().map_err(|e| op_err("record validate", e))?;
+    let (body, _) = solidcore_ops::Body::from_record(&brep, false).map_err(|e| op_err("from_record", e))?;
+    body.to_record().map(|(r, _)| r).map_err(|e| op_err("to_record", e))
+}
+
+/// Sews faces of a sheet whose edges meet within `tolerance` (solidcore `stitch`). Returns the
+/// sheet and whether everything was sewn.
+pub fn stitch(b: &Brep, tolerance: f64) -> Result<(Brep, bool)> {
+    let body = crate::solid::decode(b)?;
+    let (out, all) = solidcore_ops::stitch::stitch(body, tolerance).map_err(|e| op_err("stitch", e))?;
+    Ok((crate::solid::encode(&out)?, all))
+}
+
+#[cfg(test)]
+mod patch_tests {
+    use super::*;
+
+    #[test]
+    fn bezier_patch_network_and_thicken() {
+        let grid: Vec<Vec<[f64; 3]>> = (0..30)
+            .map(|i| {
+                (0..20)
+                    .map(|j| {
+                        let (x, y) = (60.0 * f64::from(i) / 29.0, 40.0 * f64::from(j) / 19.0);
+                        [x, y, 3.0 * (x / 12.0).sin() * (y / 9.0).cos()]
+                    })
+                    .collect()
+            })
+            .collect();
+        let s = fit_grid(&grid, 7, 6, 3).unwrap();
+        let patches = decompose(&s).unwrap();
+        assert_eq!((patches.len(), patches[0].len()), (4, 3));
+        let sheet = sheet_from_patches(&patches).unwrap();
+        assert_eq!(sheet.faces.len(), 12);
+        // interior edges are shared by two faces
+        let shared = sheet.edges.iter().filter(|e| e.uses.len() == 2).count();
+        assert_eq!(shared, 3 * 3 + 4 * 2);
+        // the multi-face network does not thicken in solidcore yet (offset units partial); the
+        // patches come from one spline, so its single-face sheet is the same geometry
+        assert!(crate::solid::thicken(&sheet, 2.0, false).is_err());
+        let solid = crate::solid::thicken(&sheet_from_spline(&s).unwrap(), 2.0, false).unwrap();
+        let v = crate::solid::volume(&solid).unwrap();
+        // ≈ area × thickness (the wave adds a few percent of area)
+        assert!(v > 60.0 * 40.0 * 2.0 * 0.99 && v < 60.0 * 40.0 * 2.0 * 1.2, "volume {v}");
+    }
+}
+
+/// Renumbers edges and vertices into the record's canonical order (first appearance walking
+/// faces → loops → oriented edges, then edges' start/end vertices) and rebuilds the uses in
+/// walk order. Faces must all be used forward.
+fn canonicalize(mut b: Brep) -> Brep {
+    let ne = b.edges.len();
+    let mut new_of_edge = vec![u32::MAX; ne];
+    let mut order: Vec<usize> = Vec::with_capacity(ne);
+    let mut uses: Vec<Vec<EdgeUseRef>> = vec![Vec::new(); ne];
+    for (fi, f) in b.faces.iter().enumerate() {
+        for (li, l) in f.loops.iter().enumerate() {
+            if let Loop::Edges { edges } = l {
+                for (p, u) in edges.iter().enumerate() {
+                    let e = u.edge as usize;
+                    if let Some(slot) = new_of_edge.get_mut(e)
+                        && *slot == u32::MAX
+                    {
+                        *slot = order.len() as u32;
+                        order.push(e);
+                    }
+                    if let Some(list) = uses.get_mut(e) {
+                        list.push(EdgeUseRef {
+                            face: fi as u32,
+                            r#loop: li as u32,
+                            position: p as u32,
+                            upper: !u.forward,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    let old_edges = std::mem::take(&mut b.edges);
+    let mut edges: Vec<Edge> = order
+        .iter()
+        .filter_map(|&e| {
+            old_edges.get(e).map(|ed| {
+                let mut ed = ed.clone();
+                ed.uses = uses.get(e).cloned().unwrap_or_default();
+                ed
+            })
+        })
+        .collect();
+    for f in &mut b.faces {
+        for l in &mut f.loops {
+            if let Loop::Edges { edges: le } = l {
+                for u in le {
+                    u.edge = new_of_edge.get(u.edge as usize).copied().unwrap_or(u.edge);
+                }
+            }
+        }
+    }
+    let nv = b.vertices.len();
+    let mut new_of_vertex = vec![u32::MAX; nv];
+    let mut vorder: Vec<usize> = Vec::with_capacity(nv);
+    for e in &edges {
+        for &v in &e.vertices {
+            if let Some(slot) = new_of_vertex.get_mut(v as usize)
+                && *slot == u32::MAX
+            {
+                *slot = vorder.len() as u32;
+                vorder.push(v as usize);
+            }
+        }
+    }
+    for e in &mut edges {
+        for v in &mut e.vertices {
+            *v = new_of_vertex.get(*v as usize).copied().unwrap_or(*v);
+        }
+    }
+    b.vertices = vorder.iter().filter_map(|&v| b.vertices.get(v).cloned()).collect();
+    b.edges = edges;
+    b
+}

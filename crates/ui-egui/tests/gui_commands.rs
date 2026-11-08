@@ -135,3 +135,27 @@ fn surface_menu_fits_a_patch() {
     assert_eq!(app.session.doc.surfaces.len(), 1, "status {}", app.status);
     assert!(app.session.display_items().iter().any(|d| d.kind == surfacecraft_doc::ObjectKind::Surface));
 }
+
+/// AutoSurface from the GUI: the Freeform menu reaches the quad layout and AutoSurface.
+#[test]
+fn freeform_menu_runs_autosurface() {
+    let mut h = harness();
+    h.state_mut().run_command("mesh.synth", json!({"shape": "wave", "resolution": 40, "name": "scan"})).unwrap();
+    h.run();
+    for (item, params) in
+        [("Quad layout", json!({"mesh": "scan", "target_quads": 6})), ("AutoSurface", json!({"object": "quads"}))]
+    {
+        h.get_by_label("Freeform").click();
+        h.run();
+        h.get_by_label(item).click();
+        h.run();
+        h.state_mut().palette_params = params.to_string();
+        h.run();
+        h.get_by_label("Run").click();
+        h.run();
+    }
+    let app = h.state_mut();
+    assert_eq!(app.session.doc.quads.len(), 1, "status {}", app.status);
+    assert_eq!(app.session.doc.surfaces.len(), 1, "status {}", app.status);
+    assert!(app.session.display_items().iter().any(|d| d.kind == surfacecraft_doc::ObjectKind::Quad));
+}

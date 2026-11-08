@@ -50,7 +50,9 @@ fn exec_reports_errors_with_exit_code() {
 fn commands_and_describe() {
     let out = cli().args(["commands", "mesh"]).output().unwrap();
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert!(v["commands"].as_array().unwrap().iter().all(|c| c["id"].as_str().unwrap().contains("mesh")));
+    assert!(v["commands"].as_array().unwrap().iter().all(|c| {
+        c["id"].as_str().unwrap().contains("mesh") || c["label"].as_str().unwrap().to_lowercase().contains("mesh")
+    }));
     let out = cli().args(["describe", "mesh.import"]).output().unwrap();
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert!(v["input_schema"]["properties"]["path"].is_object());

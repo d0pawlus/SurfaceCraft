@@ -12,7 +12,7 @@
 | M1 | wyrównanie: 3-2-1, N-point, ICP, world-axis | **zamknięty** | [plan](superpowers/plans/2026-11-08-m1-alignment.md) |
 | M2 | prymitywy, auto-typ, symetria, deviation, Region | **zamknięty** | [plan](superpowers/plans/2026-11-08-m2-primitives.md) |
 | M3 | Fit Surface (NURBS), mapa odchyłek, STEP powierzchni | **zamknięty** | [plan](superpowers/plans/2026-11-08-m3-fit-surface.md) |
-| M4 | Freeform/AutoSurface, thicken | do zrobienia | — |
+| M4 | Freeform/AutoSurface, thicken | **zamknięty** | [plan](superpowers/plans/2026-11-08-m4-freeform.md) |
 | M5 | szkic + solver, cechy, DAG, STEP brył, IGES | do zrobienia | — |
 | M6 | web (wasm), MCP, asystent AI | do zrobienia | — |
 
@@ -48,6 +48,9 @@ cargo run -p surfacecraft
 | M2: estymacja szumu | płaszczyzna σ=0,05 → 0,03–0,08; bracket σ=0,05 → 0,078 (krawędzie i krzywizna zawyżają) | `deviation::tests` |
 | M3: Fit Surface, fala 60×40, A = 3 mm | bez szumu: siatka 6×6, RMS 0,020, max 0,067 mm; σ = 0,02: RMS 0,029, max 0,108 mm (próg 0,2) | `gate_m3_fit_surface_max_deviation` |
 | M3: STEP arkusza, round-trip przez importer solidcore | 1 ściana, odległość powierzchni 1,7e-11 mm; odchyłka skanu zgodna < 0,02 mm | `gate_m3_sheet_step_roundtrip`, `gate_m3_surface_step_roundtrip_through_commands` |
+| M4: AutoSurface, fala, 12 quadów | bez szumu max 0,044 mm, σ = 0,02 max 0,089 mm (próg 0,2); 12 łat, wspólne krawędzie | `gate_m4_autosurface_deviation_and_continuity` |
+| M4: ciągłość łat | skok normalnej ≤ 8e-5 rad (różnice skończone; C² z konstrukcji) | jw. |
+| M4: thicken 2 mm → bryła | objętość w zakresie pole × 2 mm (+< 20 %), eksport STEP + import | `split_merge_crease_and_thicken` |
 
 ## Decyzje buildera (z uzasadnieniem)
 
@@ -62,6 +65,7 @@ Szczegóły w planach milestone'ów.
 - Segmentacja: deterministyczny fit-and-grow na spójności meshu (wariant Efficient RANSAC).
 - Fit do punktów rozproszonych (§10): resampling regionu do siatki (MLS nad płaszczyzną PCA) → `lst_sq_approx` w kernelu; `app-geometry` pusta.
 - Arkusz z płata: rekord `Brep` z jedną ścianą `Spline` składany w `kernel::nurbs` (sprawdzany przez `validate` i `Body::from_record`).
+- Retopologia (§10): strukturalny układ quad na mapie wysokości (bez portu Instant Meshes i bez procesu zewnętrznego); AutoSurface = jeden B-spline na blok rozłożony na łaty Béziera (G1 z konstrukcji).
 
 ## Dług techniczny
 
@@ -73,6 +77,8 @@ Szczegóły w planach milestone'ów.
 - Regiony: brak resegment/insert/separate/enlarge/shrink (§8 dopuszcza później); zaznaczanie w GUI tylko przez wskazanie + `region.grow` (bez pędzla/lasso).
 - Estymator szumu zawyża przy ostrych krawędziach i dużej krzywiźnie względem gęstości siatki.
 - Fit Surface: jeden płat na region wysokościowy nad płaszczyzną (region zawinięty → odmowa, trzeba podzielić); brzeg płata = prostokąt w parametrach (bez przycinania do konturu regionu).
+- Retopologia niestrukturalna (pole kierunków, regiony zawinięte/zamknięte) — brak; AutoSurface wymaga regionu-mapy wysokości.
+- solidcore: `thicken` odmawia na wielościennym arkuszu (offset *partial*) — `surface.thicken` używa jednościennego arkusza-rodzica; bloki z przełamaniami pogrubia się osobno. Kandydat do zgłoszenia upstream (za zgodą).
 
 ## Luki / ryzyka
 
@@ -81,6 +87,6 @@ Szczegóły w planach milestone'ów.
 
 ## Następny krok
 
-M4 — Freeform/AutoSurface (plan `docs/superpowers/plans/…-m4-freeform.md`): retopologia quad (decyzja §10:
-port natywny vs proces), łaty NURBS na quadach zszyte G0/G1, snap/crease/merge, thicken → bryła
-(`ops::offset::thicken`); bramka: max odchyłka ≤ 0,2 mm.
+M5 — Parametryka (plan `docs/superpowers/plans/…-m5-parametric.md`): szkic 2D + solver więzów (Newton/LSQ,
+wykrywanie przedefiniowania), przekroje meshu, extrude/revolve/fillet/chamfer/shell/pattern/boolean jako cechy
+w DAG z replay/undo, STEP brył (round-trip) + IGES (writer nad rekordem).

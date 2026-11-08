@@ -29,52 +29,10 @@ pub struct HeightGrid {
 /// 10 points, a degenerate spread, or a region that folds over its plane.
 #[must_use]
 pub fn height_grid(points: &[Point3], normals: &[Vec3], nu: usize, nv: usize) -> Option<HeightGrid> {
-    if points.len() < 10 {
-        return None;
-    }
-    let orient: Vec3 = normals.iter().filter(|n| surfacecraft_geom::finite_vec(n)).sum();
-    let pl = crate::plane::fit_plane(points, if orient.norm() > 0.0 { Some(&orient) } else { None })?;
-    let n = pl.normal;
-    let u = any_perpendicular(&n);
-    let v = n.cross(&u);
-    // the normals must all face the plane side: otherwise the patch folds over it
-    if normals.len() == points.len() && normals.iter().filter(|m| m.dot(&n) < 0.05).count() * 50 > normals.len() {
-        return None;
-    }
-    let o = pl.point;
-    let flat: Vec<Point3> = points.iter().map(|p| Point3::new((p - o).dot(&u), (p - o).dot(&v), 0.0)).collect();
-    let heights: Vec<f64> = points.iter().map(|p| (p - o).dot(&n)).collect();
-    let (mut u0, mut u1, mut v0, mut v1) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
-    for f in &flat {
-        u0 = u0.min(f.x);
-        u1 = u1.max(f.x);
-        v0 = v0.min(f.y);
-        v1 = v1.max(f.y);
-    }
-    if !(u1 - u0 > 1e-9 && v1 - v0 > 1e-9) {
-        return None;
-    }
-    let tree = KdTree::build(&flat);
-    let k = 24.min(points.len());
-    let mls = |x: f64, y: f64| -> Option<f64> {
-        let nb = tree.knn(&Point3::new(x, y, 0.0), k);
-        let h2 = nb.last().map_or(1.0, |l| l.1).max(1e-18);
-        let mut a = Matrix6::<f64>::zeros();
-        let mut b = Vector6::<f64>::zeros();
-        for (i, d2) in &nb {
-            let (Some(f), Some(h)) = (flat.get(*i), heights.get(*i)) else { continue };
-            let w = (-2.0 * d2 / h2).exp();
-            let (dx, dy) = (f.x - x, f.y - y);
-            let row = Vector6::new(1.0, dx, dy, dx * dx, dx * dy, dy * dy);
-            a += row * row.transpose() * w;
-            b += row * (h * w);
-        }
-        // a little ridge keeps sparse corners stable
-        for d in 3..6 {
-            a[(d, d)] += 1e-9 * (1.0 + a[(d, d)]);
-        }
-        a.lu().solve(&b).map(|c| c[0]).filter(|z| z.is_finite())
-    };
+    let field = HeightField::new(points, normals)?;
+    let (o, u, v, n) = (field.origin, field.u, field.v, field.n);
+    let [[u0, u1], [v0, v1]] = field.domain;
+    let mls = |x: f64, y: f64| field.height(x, y);
     let mut grid = Vec::with_capacity(nu);
     for i in 0..nu {
         let x = u0 + (u1 - u0) * i as f64 / (nu.max(2) - 1) as f64;
@@ -90,12 +48,118 @@ pub fn height_grid(points: &[Point3], normals: &[Vec3], nu: usize, nv: usize) ->
     // fold detector: a folded patch has points far from the height field
     let stride = points.len().div_ceil(500).max(1);
     let mut fold: f64 = 0.0;
-    for (f, h) in flat.iter().zip(&heights).step_by(stride) {
+    for (f, h) in field.flat.iter().zip(&field.heights).step_by(stride) {
         if let Some(z) = mls(f.x, f.y) {
             fold = fold.max((z - h).abs());
         }
     }
     Some(HeightGrid { grid, origin: o, u, v, n, fold })
+}
+
+/// A region seen as a height field over its best-fit plane, with moving-least-squares heights.
+#[derive(Clone, Debug)]
+pub struct HeightField {
+    /// Plane origin.
+    pub origin: Point3,
+    /// Plane u axis.
+    pub u: Vec3,
+    /// Plane v axis.
+    pub v: Vec3,
+    /// Plane normal.
+    pub n: Vec3,
+    /// `[[u0, u1], [v0, v1]]` covered by the points.
+    pub domain: [[f64; 2]; 2],
+    tree: KdTree,
+    flat: Vec<Point3>,
+    heights: Vec<f64>,
+}
+
+impl HeightField {
+    /// The field of `points` (`None` for fewer than 10, a degenerate spread, or a fold).
+    #[must_use]
+    pub fn new(points: &[Point3], normals: &[Vec3]) -> Option<Self> {
+        if points.len() < 10 {
+            return None;
+        }
+        let orient: Vec3 = normals.iter().filter(|n| surfacecraft_geom::finite_vec(n)).sum();
+        let pl = crate::plane::fit_plane(points, if orient.norm() > 0.0 { Some(&orient) } else { None })?;
+        let n = pl.normal;
+        // the normals must all face the plane side: otherwise the patch folds over it
+        if normals.len() == points.len() && normals.iter().filter(|m| m.dot(&n) < 0.05).count() * 50 > normals.len() {
+            return None;
+        }
+        let u = any_perpendicular(&n);
+        let v = n.cross(&u);
+        Self::in_frame(points, pl.point, u, v, n)
+    }
+
+    /// The field of `points` over a given plane frame.
+    #[must_use]
+    pub fn in_frame(points: &[Point3], origin: Point3, u: Vec3, v: Vec3, n: Vec3) -> Option<Self> {
+        if points.len() < 10 {
+            return None;
+        }
+        let flat: Vec<Point3> =
+            points.iter().map(|p| Point3::new((p - origin).dot(&u), (p - origin).dot(&v), 0.0)).collect();
+        let heights: Vec<f64> = points.iter().map(|p| (p - origin).dot(&n)).collect();
+        let (mut u0, mut u1, mut v0, mut v1) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
+        for f in &flat {
+            u0 = u0.min(f.x);
+            u1 = u1.max(f.x);
+            v0 = v0.min(f.y);
+            v1 = v1.max(f.y);
+        }
+        if !(u1 - u0 > 1e-9 && v1 - v0 > 1e-9) {
+            return None;
+        }
+        Some(Self { origin, u, v, n, domain: [[u0, u1], [v0, v1]], tree: KdTree::build(&flat), flat, heights })
+    }
+
+    /// Height above the plane at plane coordinates `(x, y)` (weighted quadratic of the 24 nearest).
+    #[must_use]
+    pub fn height(&self, x: f64, y: f64) -> Option<f64> {
+        let k = 24.min(self.flat.len());
+        let nb = self.tree.knn(&Point3::new(x, y, 0.0), k);
+        let h2 = nb.last().map_or(1.0, |l| l.1).max(1e-18);
+        let mut a = Matrix6::<f64>::zeros();
+        let mut b = Vector6::<f64>::zeros();
+        for (i, d2) in &nb {
+            let (Some(f), Some(h)) = (self.flat.get(*i), self.heights.get(*i)) else { continue };
+            let w = (-2.0 * d2 / h2).exp();
+            let (dx, dy) = (f.x - x, f.y - y);
+            let row = Vector6::new(1.0, dx, dy, dx * dx, dx * dy, dy * dy);
+            a += row * row.transpose() * w;
+            b += row * (h * w);
+        }
+        // a little ridge keeps sparse corners stable
+        for d in 3..6 {
+            a[(d, d)] += 1e-9 * (1.0 + a[(d, d)]);
+        }
+        a.lu().solve(&b).map(|c| c[0]).filter(|z| z.is_finite())
+    }
+
+    /// The surface point at plane coordinates `(x, y)`.
+    #[must_use]
+    pub fn point(&self, x: f64, y: f64) -> Option<Point3> {
+        self.height(x, y).map(|z| self.origin + self.u * x + self.v * y + self.n * z)
+    }
+
+    /// An `nu × nv` grid of surface points over `[[x0, x1], [y0, y1]]`.
+    #[must_use]
+    pub fn grid(&self, d: [[f64; 2]; 2], nu: usize, nv: usize) -> Option<Vec<Vec<[f64; 3]>>> {
+        let mut g = Vec::with_capacity(nu);
+        for i in 0..nu {
+            let x = d[0][0] + (d[0][1] - d[0][0]) * i as f64 / (nu.max(2) - 1) as f64;
+            let mut row = Vec::with_capacity(nv);
+            for j in 0..nv {
+                let y = d[1][0] + (d[1][1] - d[1][0]) * j as f64 / (nv.max(2) - 1) as f64;
+                let p = self.point(x, y)?;
+                row.push([p.x, p.y, p.z]);
+            }
+            g.push(row);
+        }
+        Some(g)
+    }
 }
 
 #[cfg(test)]
