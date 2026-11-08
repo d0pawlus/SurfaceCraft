@@ -1,0 +1,22 @@
+[package]
+name = "surfacecraft-engine"
+description = "SurfaceCraft L4: sessions, the command registry and command execution, the one source of truth for desktop, web, CLI and MCP"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+surfacecraft-geom.workspace = true
+surfacecraft-kernel.workspace = true
+surfacecraft-doc.workspace = true
+surfacecraft-io.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

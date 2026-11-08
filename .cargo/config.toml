@@ -1,0 +1,6 @@
+[alias]
+xtask = "run --quiet --package xtask --"
+
+[target.wasm32-unknown-unknown]
+# solidcore needs an 8 MiB stack in wasm (solidcore README); getrandom uses the browser backend.
+rustflags = ["-C", "link-arg=-zstack-size=8388608", "--cfg", "getrandom_backend=\"wasm_js\""]

@@ -1,0 +1,86 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/*", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.95"
+authors = ["SurfaceCraft contributors"]
+repository = "https://github.com/d0pawlus/surfacecraft"
+publish = false
+
+[workspace.dependencies]
+surfacecraft-geom = { path = "crates/geom" }
+surfacecraft-kernel = { path = "crates/kernel" }
+surfacecraft-fit = { path = "crates/fit" }
+surfacecraft-align = { path = "crates/align" }
+surfacecraft-sketch = { path = "crates/sketch" }
+surfacecraft-deviation = { path = "crates/deviation" }
+surfacecraft-doc = { path = "crates/doc" }
+surfacecraft-io = { path = "crates/io" }
+surfacecraft-engine = { path = "crates/engine" }
+surfacecraft-ui-egui = { path = "crates/ui-egui" }
+surfacecraft-mcp = { path = "crates/mcp" }
+
+# solidcore: git-only crates pinned by rev (design doc §9, spike §1.1). Only crates/kernel uses them.
+solidcore = { git = "https://github.com/tangency-labs/solidcore", rev = "b9c02da746f48d24f1c2a32deb834276b1014d03" }
+solidcore-ops = { git = "https://github.com/tangency-labs/solidcore", rev = "b9c02da746f48d24f1c2a32deb834276b1014d03" }
+solidcore-record = { git = "https://github.com/tangency-labs/solidcore", rev = "b9c02da746f48d24f1c2a32deb834276b1014d03" }
+solidcore-convert = { git = "https://github.com/tangency-labs/solidcore", rev = "b9c02da746f48d24f1c2a32deb834276b1014d03" }
+solidcore-tess = { git = "https://github.com/tangency-labs/solidcore", rev = "b9c02da746f48d24f1c2a32deb834276b1014d03" }
+step-brep = { git = "https://github.com/tangency-labs/solidcore", rev = "b9c02da746f48d24f1c2a32deb834276b1014d03" }
+step-export = { git = "https://github.com/tangency-labs/solidcore", rev = "b9c02da746f48d24f1c2a32deb834276b1014d03" }
+
+thiserror = "2"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+schemars = "1.2"
+nalgebra = { version = "0.35", features = ["serde-serialize"] }
+log = "0.4"
+getrandom = "0.4"
+
+egui = { version = "0.37", features = ["default_fonts"] }
+eframe = { version = "0.37", default-features = false, features = ["persistence", "wgpu", "default_fonts"] }
+egui-wgpu = "0.37"
+wgpu = { version = "30", default-features = false, features = ["std", "wgsl", "webgpu", "webgl"] }
+bytemuck = { version = "1", features = ["derive"] }
+web-time = "1"
+pollster = "0.4"
+rfd = "0.17"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+too_many_arguments = "allow"
+type_complexity = "allow"
+needless_range_loop = "allow"
+neg_cmp_op_on_partial_ord = "allow"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.ci]
+inherits = "dev"
+opt-level = 1
+debug = "line-tables-only"
+debug-assertions = false
+overflow-checks = true
+incremental = false
+
+[profile.ci.package."*"]
+opt-level = 2
+debug = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+debug = "line-tables-only"

@@ -1,0 +1,10 @@
+{
+  "commands": [
+    {"command": "mesh.synth", "params": {"shape": "bracket", "noise": 0.02, "seed": 7, "name": "scan"}},
+    {"command": "mesh.info", "params": {"object": "scan"}},
+    {"command": "body.box", "params": {"size": [20.0, 10.0, 5.0]}},
+    {"command": "body.fillet", "params": {"object": "box", "edges": [0], "size": 2.0}},
+    {"command": "body.info", "params": {"object": "box"}},
+    {"command": "doc.list"}
+  ]
+}
