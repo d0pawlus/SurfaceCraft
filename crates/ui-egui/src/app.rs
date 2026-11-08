@@ -10,6 +10,7 @@ use surfacecraft_geom::{Bvh, Point3};
 
 const MESH_COLOR: [f32; 4] = [0.62, 0.66, 0.72, 1.0];
 const BODY_COLOR: [f32; 4] = [0.35, 0.55, 0.85, 1.0];
+const PRIMITIVE_COLOR: [f32; 4] = [0.95, 0.75, 0.2, 0.55];
 
 /// The SurfaceCraft UI.
 pub struct SurfaceCraftApp {
@@ -330,6 +331,8 @@ impl SurfaceCraftApp {
                     let kind = match s.kind {
                         ObjectKind::Mesh => "mesh",
                         ObjectKind::Body => "body",
+                        ObjectKind::Region => "region",
+                        ObjectKind::Primitive => "primitive",
                     };
                     let sel = self.selected_object == Some(s.id);
                     if ui
@@ -470,7 +473,11 @@ impl SurfaceCraftApp {
             .into_iter()
             .map(|d| DrawItem {
                 key: d.key,
-                color: if d.kind == ObjectKind::Body { BODY_COLOR } else { MESH_COLOR },
+                color: match d.kind {
+                    ObjectKind::Body => BODY_COLOR,
+                    ObjectKind::Primitive => PRIMITIVE_COLOR,
+                    _ => MESH_COLOR,
+                },
                 mesh: d.mesh,
                 colors: d.colors,
                 highlight: self.highlights.get(&d.id).cloned(),

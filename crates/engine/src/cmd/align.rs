@@ -132,6 +132,10 @@ fn target_mesh(s: &mut Session, r: &ObjRef) -> CmdResult<Arc<Mesh>> {
             let m = surfacecraft_kernel::tess::tessellate(&b.brep, None)?;
             Ok(Arc::new(m))
         }
+        ObjectKind::Primitive => {
+            s.doc.primitive(id).map(|p| p.patch.clone()).ok_or_else(|| CmdError::Params(format!("no primitive {id}")))
+        }
+        ObjectKind::Region => Err(CmdError::Params(format!("{id} is a region; align to a mesh, body or primitive"))),
     }
 }
 

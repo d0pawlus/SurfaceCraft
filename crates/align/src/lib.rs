@@ -19,11 +19,13 @@ pub mod datum;
 pub mod icp;
 pub mod kabsch;
 pub mod principal;
+pub mod symmetry;
 
 pub use datum::{Datum, datum_321};
 pub use icp::{IcpOptions, IcpReport, icp};
 pub use kabsch::kabsch;
 pub use principal::principal_frame;
+pub use symmetry::{SymmetryPlane, symmetry_plane};
 
 /// Why an alignment could not be computed.
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
@@ -34,4 +36,12 @@ pub enum AlignError {
     /// The input is degenerate (collinear points, parallel planes…).
     #[error("degenerate input: {0}")]
     Degenerate(String),
+}
+
+/// Plane through points with the normal oriented along `orient` (PCA).
+pub(crate) fn fit_plane_for_symmetry(
+    pts: &[surfacecraft_geom::Point3],
+    orient: &surfacecraft_geom::Vec3,
+) -> Option<(surfacecraft_geom::Point3, surfacecraft_geom::Vec3)> {
+    surfacecraft_fit::plane::fit_plane(pts, Some(orient)).map(|f| (f.point, f.normal))
 }

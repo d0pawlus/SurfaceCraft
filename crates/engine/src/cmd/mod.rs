@@ -15,8 +15,11 @@ use surfacecraft_doc::{ObjectId, ObjectKind};
 pub mod align;
 pub mod app;
 pub mod body;
+pub mod deviation;
 pub mod doc;
 pub mod mesh;
+pub mod primitive;
+pub mod region;
 
 /// An error from a command's `run`.
 #[derive(Clone, Debug, PartialEq)]
@@ -109,7 +112,10 @@ static REGISTRY: LazyLock<Vec<CommandSpec>> = LazyLock::new(|| {
     v.extend_from_slice(app::COMMANDS);
     v.extend_from_slice(body::COMMANDS);
     v.extend_from_slice(doc::COMMANDS);
+    v.extend_from_slice(deviation::COMMANDS);
     v.extend_from_slice(mesh::COMMANDS);
+    v.extend_from_slice(primitive::COMMANDS);
+    v.extend_from_slice(region::COMMANDS);
     v.sort_by_key(|c| c.id);
     v
 });

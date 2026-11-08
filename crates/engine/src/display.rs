@@ -1,9 +1,11 @@
-//! What the viewport draws: every visible mesh, and every visible body tessellated through the
-//! kernel (cached per record, so a body is meshed again only after it changes).
+//! What the viewport draws: every visible mesh (with its deviation map, or its regions in
+//! colour), every visible body tessellated through the kernel, and every visible primitive's
+//! patch. Derived data is cached, so it is rebuilt only after the geometry changes.
 use crate::Session;
 use std::collections::HashMap;
 use std::sync::Arc;
 use surfacecraft_doc::{ObjectId, ObjectKind};
+use surfacecraft_fit::PrimitiveKind;
 use surfacecraft_geom::Mesh;
 
 /// One drawable.
@@ -17,32 +19,88 @@ pub struct DisplayItem {
     pub mesh: Arc<Mesh>,
     /// Changes whenever the geometry does (GPU buffers are re-uploaded on change).
     pub key: usize,
-    /// Optional per-vertex colours (deviation maps), RGBA.
+    /// Optional per-vertex colours (deviation maps, regions), RGBA.
     pub colors: Option<Arc<Vec<[f32; 4]>>>,
 }
 
-/// Cache of body display meshes.
+/// Caches of derived display data.
 #[derive(Debug, Default)]
 pub struct TessCache {
     entries: HashMap<ObjectId, (usize, Arc<Mesh>)>,
+    region_colors: HashMap<ObjectId, (u64, Arc<Vec<[f32; 4]>>)>,
 }
 
+/// Colour of a region by its type (unclassified regions cycle a neutral palette).
+#[must_use]
+pub fn region_color(kind: Option<PrimitiveKind>, index: usize) -> [f32; 4] {
+    match kind {
+        Some(PrimitiveKind::Plane) => [0.35, 0.6, 0.95, 1.0],
+        Some(PrimitiveKind::Cylinder) => [0.95, 0.6, 0.25, 1.0],
+        Some(PrimitiveKind::Cone) => [0.85, 0.4, 0.8, 1.0],
+        Some(PrimitiveKind::Sphere) => [0.4, 0.85, 0.45, 1.0],
+        Some(PrimitiveKind::Torus) => [0.95, 0.85, 0.3, 1.0],
+        None => {
+            const P: [[f32; 4]; 4] =
+                [[0.7, 0.55, 0.55, 1.0], [0.55, 0.7, 0.6, 1.0], [0.6, 0.6, 0.75, 1.0], [0.75, 0.7, 0.5, 1.0]];
+            P[index % P.len()]
+        }
+    }
+}
+
+const MESH_GREY: [f32; 4] = [0.62, 0.66, 0.72, 1.0];
+
 impl Session {
-    /// Everything visible, meshes first.
-    pub fn display_items(&mut self) -> Vec<DisplayItem> {
-        let mut out: Vec<DisplayItem> = self
+    fn region_overlay(&mut self, mesh_id: ObjectId, mesh: &Mesh, mesh_key: usize) -> Option<Arc<Vec<[f32; 4]>>> {
+        let regions: Vec<(usize, Arc<Vec<u32>>, Option<PrimitiveKind>)> = self
             .doc
-            .meshes
-            .iter()
-            .filter(|m| m.visible)
-            .map(|m| DisplayItem {
-                id: m.id,
-                kind: ObjectKind::Mesh,
-                key: Arc::as_ptr(&m.mesh) as usize,
-                mesh: m.mesh.clone(),
-                colors: self.overlays.get(&m.id).cloned(),
-            })
+            .regions_of(mesh_id)
+            .filter(|r| r.visible)
+            .enumerate()
+            .map(|(k, r)| (k, r.triangles.clone(), r.kind))
             .collect();
+        if regions.is_empty() {
+            self.tess.region_colors.remove(&mesh_id);
+            return None;
+        }
+        let mut key = mesh_key as u64;
+        for (k, t, kind) in &regions {
+            key = key.wrapping_mul(1_099_511_628_211) ^ (Arc::as_ptr(t) as u64) ^ ((*k as u64) << 48);
+            key ^= kind.map_or(7, |k| k as u64 + 1);
+        }
+        if let Some((k, c)) = self.tess.region_colors.get(&mesh_id)
+            && *k == key
+        {
+            return Some(c.clone());
+        }
+        let mut colors = vec![MESH_GREY; mesh.vertex_count()];
+        for (k, tris, kind) in &regions {
+            let c = region_color(*kind, *k);
+            for &t in tris.iter() {
+                for &vi in mesh.triangles.get(t as usize).into_iter().flatten() {
+                    if let Some(x) = colors.get_mut(vi as usize) {
+                        *x = c;
+                    }
+                }
+            }
+        }
+        let c = Arc::new(colors);
+        self.tess.region_colors.insert(mesh_id, (key, c.clone()));
+        Some(c)
+    }
+
+    /// Everything visible: meshes, bodies, primitives.
+    pub fn display_items(&mut self) -> Vec<DisplayItem> {
+        let meshes: Vec<(ObjectId, Arc<Mesh>)> =
+            self.doc.meshes.iter().filter(|m| m.visible).map(|m| (m.id, m.mesh.clone())).collect();
+        let mut out = Vec::new();
+        for (id, mesh) in meshes {
+            let key = Arc::as_ptr(&mesh) as usize;
+            let colors = match self.overlays.get(&id) {
+                Some(c) if c.len() == mesh.vertex_count() => Some(c.clone()),
+                _ => self.region_overlay(id, &mesh, key),
+            };
+            out.push(DisplayItem { id, kind: ObjectKind::Mesh, key, mesh, colors });
+        }
         let live: Vec<ObjectId> = self.doc.bodies.iter().map(|b| b.id).collect();
         self.tess.entries.retain(|id, _| live.contains(id));
         for b in self.doc.bodies.iter().filter(|b| b.visible) {
@@ -60,6 +118,15 @@ impl Session {
                 kind: ObjectKind::Body,
                 key: Arc::as_ptr(&mesh) as usize,
                 mesh,
+                colors: None,
+            });
+        }
+        for p in self.doc.primitives.iter().filter(|p| p.visible) {
+            out.push(DisplayItem {
+                id: p.id,
+                kind: ObjectKind::Primitive,
+                key: Arc::as_ptr(&p.patch) as usize,
+                mesh: p.patch.clone(),
                 colors: None,
             });
         }
