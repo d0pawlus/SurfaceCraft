@@ -4,12 +4,16 @@
 use crate::Session;
 use std::collections::HashMap;
 use std::sync::Arc;
-use surfacecraft_doc::{BoolOp, FeatureOp, Mode, ObjectId};
+use surfacecraft_doc::{BoolOp, FeatureOp, Mode, ObjectId, Side};
 use surfacecraft_geom::{Transform, Vec3};
-use surfacecraft_kernel::feature::{BoolKind, ProfileCurve, boolean, extrude, pattern, revolve, shell};
+use surfacecraft_kernel::feature::{
+    BoolKind, ProfileCurve, boolean, draft, extrude, loft, mirror, pattern, pattern_placed, revolve, shell, split,
+    sweep,
+};
+use surfacecraft_kernel::naming::{EdgeSig, FaceSig, capture_edges, capture_faces, resolve_edges, resolve_faces};
 use surfacecraft_kernel::record::brep::Brep;
 use surfacecraft_kernel::solid::{chamfer, fillet};
-use surfacecraft_sketch::{Segment3, profiles};
+use surfacecraft_sketch::{Segment3, open_paths, path_samples, profiles};
 
 fn curves(seg: &[Segment3]) -> Vec<ProfileCurve> {
     seg.iter()
@@ -65,6 +69,88 @@ fn loop_area(s: &surfacecraft_sketch::Sketch, seg: &[Segment3]) -> f64 {
         * 0.5
 }
 
+/// The outer (largest) closed profile of a sketch as profile curves.
+fn outer_profile(sk: &surfacecraft_sketch::Sketch) -> Result<Vec<ProfileCurve>, String> {
+    let mut loops = profiles(sk, 1e-6);
+    loops.sort_by(|a, b| loop_area(sk, b).abs().total_cmp(&loop_area(sk, a).abs()));
+    loops.first().map(|l| curves(l)).ok_or_else(|| "the sketch has no closed profile".to_string())
+}
+
+/// The longest open chain of a sketch.
+fn path_of(sk: &surfacecraft_sketch::Sketch) -> Result<Vec<Segment3>, String> {
+    open_paths(sk, 1e-6)
+        .into_iter()
+        .next()
+        .ok_or_else(|| "the path sketch has no open chain of lines and arcs".to_string())
+}
+
+/// Persistent naming: binds the edge or face references of a feature to the body it reads.
+/// Without signatures they are captured from the stored indices (first run); with signatures
+/// the indices are re-resolved geometrically against the current body, so an earlier edit that
+/// moves the topology cannot move the reference. Returns whether the operation changed.
+fn bind_refs(op: &mut FeatureOp, bodies: &HashMap<ObjectId, Brep>) -> Result<bool, String> {
+    match op {
+        FeatureOp::Fillet { target, edges, edge_refs, .. } | FeatureOp::Chamfer { target, edges, edge_refs, .. } => {
+            bind_edges(bodies.get(target), edges, edge_refs)
+        }
+        FeatureOp::Shell { target, faces, face_refs, .. } | FeatureOp::Draft { target, faces, face_refs, .. } => {
+            bind_faces(bodies.get(target), faces, face_refs)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn bind_edges(body: Option<&Brep>, edges: &mut Vec<usize>, refs: &mut Vec<EdgeSig>) -> Result<bool, String> {
+    let Some(b) = body else { return Ok(false) };
+    if refs.is_empty() {
+        *refs = capture_edges(b, edges).map_err(|e| e.to_string())?;
+        return Ok(!refs.is_empty());
+    }
+    let resolved = resolve_edges(b, refs).map_err(|e| e.to_string())?;
+    let changed = resolved != *edges;
+    *edges = resolved;
+    Ok(changed)
+}
+
+fn bind_faces(body: Option<&Brep>, faces: &mut Vec<usize>, refs: &mut Vec<FaceSig>) -> Result<bool, String> {
+    let Some(b) = body else { return Ok(false) };
+    if refs.is_empty() {
+        *refs = capture_faces(b, faces).map_err(|e| e.to_string())?;
+        return Ok(!refs.is_empty());
+    }
+    let resolved = resolve_faces(b, refs).map_err(|e| e.to_string())?;
+    let changed = resolved != *faces;
+    *faces = resolved;
+    Ok(changed)
+}
+
+/// Absolute placements of a pattern along a path: the start, then evenly spaced points; with
+/// `follow` each copy also turns with the path tangent.
+fn path_placements(chain: &[Segment3], count: usize, follow: bool) -> Result<Vec<[[f64; 4]; 4]>, String> {
+    let pts = path_samples(chain, count).ok_or("the path is empty or has no length, or the count is zero")?;
+    let (p0, t0) = pts.first().map(|(p, t)| (Vec3::from(*p), Vec3::from(*t))).ok_or("no path points")?;
+    let mut out = Vec::with_capacity(pts.len());
+    for (p, t) in &pts {
+        let (p, t) = (Vec3::from(*p), Vec3::from(*t));
+        let m = if follow {
+            let axis = t0.cross(&t);
+            let (sin, cos) = (axis.norm(), t0.dot(&t));
+            let rot = if sin > 1e-9 {
+                Transform::rotation_axis_angle(&(axis / sin), sin.atan2(cos))
+            } else if cos < 0.0 {
+                Transform::rotation_axis_angle(&surfacecraft_geom::any_perpendicular(&t0), std::f64::consts::PI)
+            } else {
+                Transform::translation(Vec3::zeros())
+            };
+            Transform::translation(p).then_after(&rot).then_after(&Transform::translation(-p0))
+        } else {
+            Transform::translation(p - p0)
+        };
+        out.push(m.to_rows());
+    }
+    Ok(out)
+}
+
 fn run(s: &Session, op: &FeatureOp, bodies: &HashMap<ObjectId, Brep>, own: Option<&Brep>) -> Result<Brep, String> {
     let body =
         |id: &ObjectId| bodies.get(id).ok_or_else(|| format!("body {id} does not exist at this point of the history"));
@@ -93,11 +179,13 @@ fn run(s: &Session, op: &FeatureOp, bodies: &HashMap<ObjectId, Brep>, own: Optio
             let base = target.as_ref().map(body).transpose()?.or(own);
             combine(base, made, *mode)
         }
-        FeatureOp::Fillet { target, edges, radius } => fillet(body(target)?, edges, *radius).map_err(|e| e.to_string()),
-        FeatureOp::Chamfer { target, edges, distance } => {
+        FeatureOp::Fillet { target, edges, radius, .. } => {
+            fillet(body(target)?, edges, *radius).map_err(|e| e.to_string())
+        }
+        FeatureOp::Chamfer { target, edges, distance, .. } => {
             chamfer(body(target)?, edges, *distance).map_err(|e| e.to_string())
         }
-        FeatureOp::Shell { target, faces, thickness } => {
+        FeatureOp::Shell { target, faces, thickness, .. } => {
             shell(body(target)?, faces, *thickness).map_err(|e| e.to_string())
         }
         FeatureOp::Pattern { target, count, translate, rotate_axis, rotate_origin, rotate_deg } => {
@@ -110,6 +198,41 @@ fn run(s: &Session, op: &FeatureOp, bodies: &HashMap<ObjectId, Brep>, own: Optio
                 step = step.then_after(&rot);
             }
             pattern(body(target)?, *count, &step.to_rows()).map_err(|e| e.to_string())
+        }
+        FeatureOp::Loft { sketches, degree, mode, target } => {
+            let mut secs = Vec::with_capacity(sketches.len());
+            for id in sketches {
+                let sk = s.doc.sketch(*id).ok_or_else(|| format!("sketch {id} is gone"))?;
+                secs.push(outer_profile(&sk.sketch)?);
+            }
+            let deg = degree.unwrap_or_else(|| u32::try_from(secs.len().saturating_sub(1)).unwrap_or(3).clamp(1, 3));
+            let made = loft(&secs, deg, true).map_err(|e| e.to_string())?;
+            let base = target.as_ref().map(body).transpose()?.or(own);
+            combine(base, made, *mode)
+        }
+        FeatureOp::Sweep { profile, path, follow, mode, target } => {
+            let psk = s.doc.sketch(*profile).ok_or_else(|| format!("sketch {profile} is gone"))?;
+            let ksk = s.doc.sketch(*path).ok_or_else(|| format!("sketch {path} is gone"))?;
+            let made = sweep(&outer_profile(&psk.sketch)?, &curves(&path_of(&ksk.sketch)?), *follow)
+                .map_err(|e| e.to_string())?;
+            let base = target.as_ref().map(body).transpose()?.or(own);
+            combine(base, made, *mode)
+        }
+        FeatureOp::Draft { target, faces, angle_deg, neutral_origin, neutral_normal, pull, .. } => {
+            let pull = pull.unwrap_or(*neutral_normal);
+            draft(body(target)?, faces, *neutral_origin, *neutral_normal, pull, angle_deg.to_radians())
+                .map_err(|e| e.to_string())
+        }
+        FeatureOp::Mirror { target, plane_origin, plane_normal, merge } => {
+            mirror(body(target)?, *plane_origin, *plane_normal, *merge).map_err(|e| e.to_string())
+        }
+        FeatureOp::Split { target, plane_origin, plane_normal, keep } => {
+            split(body(target)?, *plane_origin, *plane_normal, *keep == Side::Front).map_err(|e| e.to_string())
+        }
+        FeatureOp::PathPattern { target, path, count, follow } => {
+            let ksk = s.doc.sketch(*path).ok_or_else(|| format!("sketch {path} is gone"))?;
+            let placements = path_placements(&path_of(&ksk.sketch)?, *count, *follow)?;
+            pattern_placed(body(target)?, &placements).map_err(|e| e.to_string())
         }
         FeatureOp::Boolean { target, tool, op } => {
             let k = match op {
@@ -132,8 +255,16 @@ pub fn replay(s: &mut Session) -> usize {
     let mut failed = 0;
     let ops: Vec<(usize, FeatureOp, ObjectId, bool)> =
         s.doc.features.iter().enumerate().map(|(i, f)| (i, f.op.clone(), f.body, f.suppressed)).collect();
-    for (i, op, out, suppressed) in ops {
-        let result = if suppressed { Ok(None) } else { run(s, &op, &bodies, bodies.get(&out)).map(Some) };
+    for (i, mut op, out, suppressed) in ops {
+        let mut rebound = false;
+        let result = if suppressed {
+            Ok(None)
+        } else {
+            bind_refs(&mut op, &bodies).and_then(|changed| {
+                rebound = changed;
+                run(s, &op, &bodies, bodies.get(&out)).map(Some)
+            })
+        };
         let err = match result {
             Ok(Some(b)) => {
                 bodies.insert(out, b);
@@ -150,6 +281,10 @@ pub fn replay(s: &mut Session) -> usize {
         };
         if let Some(f) = s.doc.features.get_mut(i) {
             f.error = err;
+            // keep the resolved indices and any newly captured signatures
+            if rebound {
+                f.op = op;
+            }
         }
     }
     // write the results back into body objects

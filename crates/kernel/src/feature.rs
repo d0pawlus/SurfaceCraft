@@ -164,6 +164,140 @@ pub fn pattern(body: &Brep, count: usize, step: &[[f64; 4]; 4]) -> Result<Brep> 
     encode(&u)
 }
 
+/// A skin through closed `sections` (each a loop of profile curves), `degree` across them
+/// (1 = ruled), capped into a solid.
+pub fn loft(sections: &[Vec<ProfileCurve>], degree: u32, cap: bool) -> Result<Brep> {
+    if sections.len() < 2 {
+        return Err(KernelError::Argument("a loft needs at least two sections".into()));
+    }
+    if !(1..=3).contains(&degree) {
+        return Err(KernelError::Argument("loft degree must be 1..=3".into()));
+    }
+    let secs: Vec<Vec<ops::sweep::Curve>> = sections.iter().map(|s| loop_ops(s)).collect::<Result<_>>()?;
+    let b = ops::sweep::loft(&secs, degree, cap).map_err(|e| op_err("sweep::loft", e))?;
+    encode(&b)
+}
+
+/// `profile` (a closed loop at the start of the path) swept along `path` (an open chain). With
+/// `follow` the profile turns with the path, otherwise it only moves along it.
+pub fn sweep(profile: &[ProfileCurve], path: &[ProfileCurve], follow: bool) -> Result<Brep> {
+    let frame = if follow { ops::sweep::SweepFrame::Follow } else { ops::sweep::SweepFrame::Translate };
+    let (b, _, _) = ops::sweep::sweep_placed(&loop_ops(profile)?, &loop_ops(path)?, frame, true)
+        .map_err(|e| op_err("sweep::sweep_placed", e))?;
+    encode(&b)
+}
+
+/// Drafts the listed faces (record indices) by `angle` radians about the neutral plane through
+/// `neutral_origin` with normal `neutral_normal`, leaning in going along `pull`.
+pub fn draft(
+    body: &Brep,
+    faces: &[usize],
+    neutral_origin: [f64; 3],
+    neutral_normal: [f64; 3],
+    pull: [f64; 3],
+    angle: f64,
+) -> Result<Brep> {
+    if !finite_all(&neutral_origin) || !finite_all(&neutral_normal) || !finite_all(&pull) || !angle.is_finite() {
+        return Err(KernelError::Argument("draft needs a finite plane, pull and angle".into()));
+    }
+    if faces.is_empty() || faces.iter().any(|&f| f >= body.faces.len()) {
+        return Err(KernelError::Argument(format!("face indices must be in 0..{}", body.faces.len())));
+    }
+    let b = decode(body)?;
+    let (_, order) = b.to_record().map_err(|e| op_err("to_record", e))?;
+    ops::offset::draft(&b, &order, faces, neutral_origin, neutral_normal, pull, angle)
+        .map_err(|e| op_err("draft", e))?;
+    encode(&b)
+}
+
+fn plane_frame(normal: [f64; 3]) -> Result<([f64; 3], [f64; 3], [f64; 3])> {
+    let len = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+    if !finite_all(&normal) || !len.is_finite() || len < 1e-9 {
+        return Err(KernelError::Argument("a plane needs a finite non-zero normal".into()));
+    }
+    let n = [normal[0] / len, normal[1] / len, normal[2] / len];
+    // the axis least aligned with n, crossed with n, gives the first in-plane direction
+    let a = if n[0].abs() <= n[1].abs() && n[0].abs() <= n[2].abs() {
+        [1.0, 0.0, 0.0]
+    } else if n[1].abs() <= n[2].abs() {
+        [0.0, 1.0, 0.0]
+    } else {
+        [0.0, 0.0, 1.0]
+    };
+    let cross =
+        |p: [f64; 3], q: [f64; 3]| [p[1] * q[2] - p[2] * q[1], p[2] * q[0] - p[0] * q[2], p[0] * q[1] - p[1] * q[0]];
+    let u0 = cross(n, a);
+    let ul = (u0[0] * u0[0] + u0[1] * u0[1] + u0[2] * u0[2]).sqrt();
+    let u = [u0[0] / ul, u0[1] / ul, u0[2] / ul];
+    let v = cross(n, u);
+    Ok((n, u, v))
+}
+
+/// The body reflected in the plane through `origin` with `normal`; with `merge` united with the
+/// original, else the reflection alone.
+pub fn mirror(body: &Brep, origin: [f64; 3], normal: [f64; 3], merge: bool) -> Result<Brep> {
+    if !finite_all(&origin) {
+        return Err(KernelError::Argument("mirror origin must be finite".into()));
+    }
+    let (n, _, _) = plane_frame(normal)?;
+    let d = n[0] * origin[0] + n[1] * origin[1] + n[2] * origin[2];
+    let m = [
+        [1.0 - 2.0 * n[0] * n[0], -2.0 * n[0] * n[1], -2.0 * n[0] * n[2], 2.0 * d * n[0]],
+        [-2.0 * n[1] * n[0], 1.0 - 2.0 * n[1] * n[1], -2.0 * n[1] * n[2], 2.0 * d * n[1]],
+        [-2.0 * n[2] * n[0], -2.0 * n[2] * n[1], 1.0 - 2.0 * n[2] * n[2], 2.0 * d * n[2]],
+        [0.0, 0.0, 0.0, 1.0],
+    ];
+    let reflected = crate::solid::transform(body, &m)?;
+    if merge { boolean(body, &reflected, BoolKind::Union) } else { Ok(reflected) }
+}
+
+/// Cuts the solid by the plane through `origin` with `normal` and keeps the front (`normal`
+/// side) or the back part.
+pub fn split(body: &Brep, origin: [f64; 3], normal: [f64; 3], keep_front: bool) -> Result<Brep> {
+    if !finite_all(&origin) {
+        return Err(KernelError::Argument("split origin must be finite".into()));
+    }
+    let (_, u, v) = plane_frame(normal)?;
+    // the cutting patch must reach over the whole body
+    let reach = body
+        .vertices
+        .iter()
+        .map(|p| {
+            let d = [p.point[0] - origin[0], p.point[1] - origin[1], p.point[2] - origin[2]];
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+        })
+        .fold(1.0_f64, f64::max)
+        * 4.0;
+    let tool = ops::split::Tool {
+        surface: crate::record::brep::Surface::Plane { origin, u_axis: u, v_axis: v },
+        domain: [[-reach, reach], [-reach, reach]],
+    };
+    let (back, front) = ops::split::split_body(&decode(body)?, &tool)
+        .map_err(|e| op_err("split_body", e))?
+        .ok_or_else(|| KernelError::Op { op: "split_body", message: "a side of the cut is empty".into() })?;
+    encode(if keep_front { &front } else { &back })
+}
+
+/// Copies of a solid, the `k`-th moved by `placements[k]` (row-major rigid 4×4, absolute),
+/// united. The first placement is normally the identity.
+pub fn pattern_placed(body: &Brep, placements: &[[[f64; 4]; 4]]) -> Result<Brep> {
+    if placements.is_empty() || placements.len() > 1000 {
+        return Err(KernelError::Argument("pattern needs 1..=1000 placements".into()));
+    }
+    if placements.iter().flatten().flatten().any(|v| !v.is_finite()) {
+        return Err(KernelError::Argument("pattern placements must be finite".into()));
+    }
+    let base = decode(body)?;
+    let mut bodies = Vec::with_capacity(placements.len());
+    for m in placements {
+        let c = base.copy().map_err(|e| op_err("copy", e))?;
+        c.transform(&crate::to_kernel_matrix(m)).map_err(|e| op_err("transform", e))?;
+        bodies.push(c.copy().map_err(|e| op_err("copy", e))?);
+    }
+    let u = ops::boolean::union_all(bodies).map_err(|e| op_err("union_all", e))?;
+    encode(&u)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
