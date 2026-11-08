@@ -1,5 +1,6 @@
 [package]
 name = "surfacecraft-mcp"
+description = "SurfaceCraft L5: Model Context Protocol server (JSON-RPC 2.0, line-delimited) exposing every engine command as a tool"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,6 +9,8 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+surfacecraft-engine.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

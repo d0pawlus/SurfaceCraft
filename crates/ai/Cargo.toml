@@ -1,0 +1,17 @@
+[package]
+name = "surfacecraft-ai"
+description = "SurfaceCraft L5: the AI assistant — align and workflow modes driving engine commands through a provider-neutral tool-calling loop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+surfacecraft-engine.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

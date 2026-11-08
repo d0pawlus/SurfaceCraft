@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "surfacecraft-web",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "http.server", "8765", "-d", "apps/surfacecraft-web/dist"],
+      "port": 8765
+    }
+  ]
+}

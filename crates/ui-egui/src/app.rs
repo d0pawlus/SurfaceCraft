@@ -37,6 +37,15 @@ pub struct SurfaceCraftApp {
     fit_pending: bool,
     bvh_cache: HashMap<usize, Bvh>,
     highlights: HashMap<ObjectId, Arc<Vec<u32>>>,
+    /// The assistant's goal text.
+    pub assistant_goal: String,
+    /// Align (true) or workflow mode.
+    pub assistant_align: bool,
+    provider: Option<Box<dyn surfacecraft_ai::Provider>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    control: Option<std::sync::mpsc::Receiver<crate::control::Request>>,
+    #[cfg(target_arch = "wasm32")]
+    inbox: crate::web::Inbox,
 }
 
 /// A point picked on an object in the viewport.
@@ -73,6 +82,13 @@ impl SurfaceCraftApp {
             fit_pending: false,
             bvh_cache: HashMap::new(),
             highlights: HashMap::new(),
+            assistant_goal: String::new(),
+            assistant_align: true,
+            provider: default_provider(),
+            #[cfg(not(target_arch = "wasm32"))]
+            control: None,
+            #[cfg(target_arch = "wasm32")]
+            inbox: Default::default(),
         }
     }
 
@@ -155,6 +171,11 @@ impl SurfaceCraftApp {
             viewport::install(rs);
             app.gpu = true;
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let ctx = cc.egui_ctx.clone();
+            app.control = crate::control::start(move || ctx.request_repaint()).map(|(rx, _)| rx);
+        }
         app
     }
 
@@ -211,6 +232,10 @@ impl SurfaceCraftApp {
 
     /// Draws the whole UI (the body of `eframe::App::ui`).
     pub fn draw(&mut self, ui: &mut egui::Ui) {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.poll_control();
+        #[cfg(target_arch = "wasm32")]
+        self.poll_inbox();
         self.shortcuts(ui);
         egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui));
         egui::Panel::bottom("status").show(ui, |ui| {
@@ -222,6 +247,82 @@ impl SurfaceCraftApp {
         egui::Panel::left("objects").resizable(true).default_size(230.0).show(ui, |ui| self.objects_panel(ui));
         egui::Panel::right("palette").resizable(true).default_size(320.0).show(ui, |ui| self.palette_panel(ui));
         egui::CentralPanel::default().show(ui, |ui| self.viewport_panel(ui));
+    }
+
+    /// Answers control-channel requests (bridged MCP) between frames.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn poll_control(&mut self) {
+        let Some(rx) = self.control.as_ref() else { return };
+        let reqs: Vec<crate::control::Request> = rx.try_iter().collect();
+        for r in reqs {
+            let reply = match r.method.as_str() {
+                "engine.execute" => {
+                    let cmd = r.params.get("command").and_then(Value::as_str).unwrap_or("").to_string();
+                    let params = r.params.get("params").cloned().unwrap_or(Value::Null);
+                    match self.run_command(&cmd, params) {
+                        Ok(v) => json!({"ok": v}),
+                        Err(e) => json!({"err": e}),
+                    }
+                }
+                "ui.screenshot" => {
+                    let dim = |k: &str, d: u64| r.params.get(k).and_then(Value::as_u64).unwrap_or(d) as u32;
+                    let cam = self.camera.clone();
+                    match crate::shot::screenshot_png(
+                        &mut self.session,
+                        Some(&cam),
+                        dim("width", 800),
+                        dim("height", 600),
+                    ) {
+                        Some(png) => json!({"png": surfacecraft_doc::base64::encode(&png)}),
+                        None => json!({"err": "no renderer"}),
+                    }
+                }
+                other => json!({"err": format!("unknown method {other}")}),
+            };
+            let _ = r.reply.send(reply);
+        }
+    }
+
+    /// Imports files the browser picked (web build).
+    #[cfg(target_arch = "wasm32")]
+    fn poll_inbox(&mut self) {
+        let files: Vec<(String, Vec<u8>)> = self.inbox.borrow_mut().drain(..).collect();
+        for (name, bytes) in files {
+            let lower = name.to_lowercase();
+            let ext = lower.rsplit('.').next().unwrap_or("").to_string();
+            let stem = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s).to_string();
+            let data = surfacecraft_doc::base64::encode(&bytes);
+            let r = if ext == "step" || ext == "stp" {
+                self.run_command("import.step", json!({"data": data, "name": stem}))
+            } else {
+                self.run_command("mesh.import", json!({"data": data, "format": ext, "name": stem}))
+            };
+            if r.is_ok() {
+                self.fit_pending = true;
+            }
+        }
+    }
+
+    /// Downloads the selected object: a mesh as STL, a body or surface as STEP (web build).
+    #[cfg(target_arch = "wasm32")]
+    fn download_selected(&mut self) {
+        let Some(id) = self.selected_object else {
+            self.status = "select an object first".into();
+            return;
+        };
+        let (cmd, params, file) = match self.session.doc.kind_of(id) {
+            Some(ObjectKind::Mesh) => ("mesh.export", json!({"object": id.0, "format": "stl"}), "mesh.stl"),
+            Some(ObjectKind::Body | ObjectKind::Surface) => ("export.step", json!({"objects": [id.0]}), "model.step"),
+            _ => {
+                self.status = "only meshes, bodies and surfaces download".into();
+                return;
+            }
+        };
+        if let Ok(v) = self.run_command(cmd, params)
+            && let Some(Ok(bytes)) = v.get("data").and_then(Value::as_str).map(surfacecraft_doc::base64::decode)
+        {
+            crate::web::download(file, &bytes);
+        }
     }
 
     fn shortcuts(&mut self, ui: &mut egui::Ui) {
@@ -297,6 +398,21 @@ impl SurfaceCraftApp {
                         }
                         ui.close();
                     }
+                }
+            });
+            #[cfg(target_arch = "wasm32")]
+            ui.menu_button("Web files", |ui| {
+                if ui.button("Import mesh…").clicked() {
+                    crate::web::pick_file(&self.inbox, &["stl", "obj", "ply"], ui.ctx().clone());
+                    ui.close();
+                }
+                if ui.button("Import STEP…").clicked() {
+                    crate::web::pick_file(&self.inbox, &["step", "stp"], ui.ctx().clone());
+                    ui.close();
+                }
+                if ui.button("Download selected (STL / STEP)").clicked() {
+                    self.download_selected();
+                    ui.close();
                 }
             });
             ui.menu_button("Edit", |ui| {
@@ -417,6 +533,49 @@ impl SurfaceCraftApp {
         } else {
             ui.weak("Choose a command to see its parameters.");
         }
+        self.assistant_panel(ui);
+    }
+
+    /// Uses `p` as the assistant's language model.
+    pub fn set_provider(&mut self, p: Box<dyn surfacecraft_ai::Provider>) {
+        self.provider = Some(p);
+    }
+
+    /// Runs the assistant on the current goal with a picture of the viewport.
+    pub fn ask_assistant(&mut self) {
+        let Some(mut p) = self.provider.take() else {
+            self.status =
+                "No AI provider: set SURFACECRAFT_AI_COMMAND (a program answering the assistant's JSON)".into();
+            return;
+        };
+        let mode = if self.assistant_align { surfacecraft_ai::Mode::Align } else { surfacecraft_ai::Mode::Workflow };
+        let cam = self.camera.clone();
+        let png = crate::shot::screenshot_png(&mut self.session, Some(&cam), 512, 384);
+        let goal = self.assistant_goal.clone();
+        self.status = match surfacecraft_ai::run(&mut self.session, p.as_mut(), mode, &goal, png.as_deref(), 20) {
+            Ok(o) => format!("assistant: {} ({} commands)", o.summary, o.steps.len()),
+            Err(e) => format!("assistant failed: {e}"),
+        };
+        self.provider = Some(p);
+        self.fit_pending = true;
+    }
+
+    fn assistant_panel(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.strong("Assistant");
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut self.assistant_align, true, "Align");
+            ui.radio_value(&mut self.assistant_align, false, "Workflow");
+        });
+        let l = ui.label("Goal");
+        ui.add(egui::TextEdit::singleline(&mut self.assistant_goal).hint_text("e.g. align the scan to its faces"))
+            .labelled_by(l.id);
+        if ui.button("Ask assistant").clicked() {
+            self.ask_assistant();
+        }
+        if self.provider.is_none() {
+            ui.weak("No provider configured (SURFACECRAFT_AI_COMMAND).");
+        }
     }
 
     fn log_panel(&mut self, ui: &mut egui::Ui) {
@@ -495,14 +654,7 @@ impl SurfaceCraftApp {
             .into_iter()
             .map(|d| DrawItem {
                 key: d.key,
-                color: match d.kind {
-                    ObjectKind::Body => BODY_COLOR,
-                    ObjectKind::Primitive => PRIMITIVE_COLOR,
-                    ObjectKind::Surface => SURFACE_COLOR,
-                    ObjectKind::Quad => QUAD_COLOR,
-                    ObjectKind::Sketch => [1.0, 1.0, 0.3, 1.0],
-                    _ => MESH_COLOR,
-                },
+                color: kind_color(d.kind),
                 mesh: d.mesh,
                 colors: d.colors,
                 highlight: self.highlights.get(&d.id).cloned(),
@@ -595,5 +747,29 @@ fn example(p: &Value, root: &Value) -> Value {
         }
         Some("object") => template(p, &PickContext::default()),
         _ => json!(null),
+    }
+}
+
+/// Viewport colour of an object kind.
+#[must_use]
+pub fn kind_color(kind: ObjectKind) -> [f32; 4] {
+    match kind {
+        ObjectKind::Body => BODY_COLOR,
+        ObjectKind::Primitive => PRIMITIVE_COLOR,
+        ObjectKind::Surface => SURFACE_COLOR,
+        ObjectKind::Quad => QUAD_COLOR,
+        ObjectKind::Sketch => [1.0, 1.0, 0.3, 1.0],
+        ObjectKind::Mesh | ObjectKind::Region | ObjectKind::Feature => MESH_COLOR,
+    }
+}
+
+fn default_provider() -> Option<Box<dyn surfacecraft_ai::Provider>> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        surfacecraft_ai::CommandProvider::from_env().map(|p| Box::new(p) as Box<dyn surfacecraft_ai::Provider>)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        None
     }
 }

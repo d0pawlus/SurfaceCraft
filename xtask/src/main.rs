@@ -23,6 +23,7 @@ const WASM_CRATES: &[&str] = &[
     "surfacecraft-engine",
     "surfacecraft-ui-egui",
     "surfacecraft-mcp",
+    "surfacecraft-ai",
     "surfacecraft-web",
 ];
 
@@ -61,6 +62,26 @@ fn wasm() -> Result<(), String> {
         c.args(["-p", k]);
     }
     run(c, "wasm check")
+}
+
+/// Builds the browser bundle into apps/surfacecraft-web/dist (needs `wasm-bindgen` on PATH).
+fn web() -> Result<(), String> {
+    let mut c = cargo();
+    c.args(["build", "--release", "--target", "wasm32-unknown-unknown", "-p", "surfacecraft-web"]);
+    run(c, "web build")?;
+    let dist = root().join("apps").join("surfacecraft-web").join("dist");
+    std::fs::create_dir_all(&dist).map_err(|e| format!("create dist: {e}"))?;
+    let wasm = root().join("target").join("wasm32-unknown-unknown").join("release").join("surfacecraft-web.wasm");
+    let mut b = Command::new("wasm-bindgen");
+    b.arg(&wasm).args(["--target", "web", "--no-typescript", "--out-dir"]).arg(&dist);
+    run(b, "wasm-bindgen")?;
+    let html = include_str!("../../apps/surfacecraft-web/index.html").replace(
+        "<link data-trunk rel=\"rust\" data-bin=\"surfacecraft-web\" data-wasm-opt=\"z\" />",
+        "<script type=\"module\">import init from './surfacecraft-web.js'; init();</script>",
+    );
+    std::fs::write(dist.join("index.html"), html).map_err(|e| format!("write index.html: {e}"))?;
+    eprintln!("==> web bundle in {}", dist.display());
+    Ok(())
 }
 
 fn test() -> Result<(), String> {
@@ -157,6 +178,7 @@ fn main() -> ExitCode {
         "clippy" => clippy(),
         "wasm" => wasm(),
         "test" => test(),
+        "web" => web(),
         _ => Err("tasks: ci, fmt, assets, licences [--check], layers, app-geometry, clippy, wasm, test".into()),
     };
     match r {

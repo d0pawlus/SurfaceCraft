@@ -79,7 +79,13 @@ fn import(s: &mut Session, i: ImportIn) -> CmdResult<MeshInfo> {
         .or(ext_fmt)
         .or_else(|| MeshFormat::sniff(&bytes))
         .ok_or_else(|| CmdError::Params("cannot tell the mesh format; pass `format`".into()))?;
-    let mut mesh = read_mesh(&bytes, fmt, &Limits::default())?;
+    // the browser has far less memory (design doc §11): smaller meshes on the web
+    let limits = if cfg!(target_arch = "wasm32") {
+        Limits { max_triangles: 5_000_000, max_vertices: 5_000_000, ..Limits::default() }
+    } else {
+        Limits::default()
+    };
+    let mut mesh = read_mesh(&bytes, fmt, &limits)?;
     if let Some(sc) = i.scale {
         if !(sc.is_finite() && sc > 0.0) {
             return Err(CmdError::Params("scale must be positive".into()));

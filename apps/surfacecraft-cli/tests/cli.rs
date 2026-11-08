@@ -57,3 +57,54 @@ fn commands_and_describe() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert!(v["input_schema"]["properties"]["path"].is_object());
 }
+
+/// `assist` talks to the configured provider program; here a tiny script stands in for an LLM.
+#[test]
+fn assist_runs_a_command_provider() {
+    let dir = std::env::temp_dir().join(format!("sc-assist-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // the stand-in answers once with align.center, then with a summary (state in a file)
+    let reply1 = r#"{"text":"centring","calls":[{"name":"align.center","arguments":{"object":"scan"}}]}"#;
+    let reply2 = r#"{"text":"centred","calls":[]}"#;
+    let (prog, args): (String, Vec<String>) = if cfg!(windows) {
+        let script = dir.join("llm.cmd");
+        std::fs::write(
+            &script,
+            format!("@echo off\r\nmore > nul\r\nif exist \"%~dp0seen\" (echo {reply2}) else (echo x> \"%~dp0seen\" & echo {reply1})\r\n"),
+        )
+        .unwrap();
+        ("cmd".into(), vec!["/C".into(), script.to_string_lossy().to_string()])
+    } else {
+        let script = dir.join("llm.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ncat > /dev/null\nd=$(dirname \"$0\")\nif [ -f \"$d/seen\" ]; then echo '{reply2}'; else touch \"$d/seen\"; echo '{reply1}'; fi\n"),
+        )
+        .unwrap();
+        ("sh".into(), vec![script.to_string_lossy().to_string()])
+    };
+    let proj = dir.join("p.scproj");
+    let mk = cli()
+        .args([
+            "exec",
+            "mesh.synth",
+            r#"{"shape":"box","center":[100,0,0],"name":"scan"}"#,
+            "--save",
+            &proj.to_string_lossy(),
+        ])
+        .output()
+        .unwrap();
+    assert!(mk.status.success());
+    let out = cli()
+        .env("SURFACECRAFT_AI_COMMAND", format!("{prog} {}", args.join(" ")))
+        .args(["assist", "align", "center the scan", "--open", &proj.to_string_lossy()])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["summary"], "centred", "{v}");
+    assert_eq!(v["steps"][0]["command"], "align.center");
+    let none = cli().env_remove("SURFACECRAFT_AI_COMMAND").args(["assist", "align", "x"]).output().unwrap();
+    assert_eq!(none.status.code(), Some(2));
+    let _ = std::fs::remove_dir_all(dir);
+}
