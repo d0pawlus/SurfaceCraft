@@ -86,6 +86,11 @@ cargo run -p surfacecraft
 | P3: część A — blok 40×30 z filletami r = 5 i falistym wierzchem (skan σ = 0,03; 5 płaszczyzn + 4 walce + płat) | 1 zamknięta bryła, 10 ścian jak CAD; V 12771,75 vs CAD 12787,05 (0,12 %; CAD = kwadratura z 6e-6); max odchyłka skanu od bryły 0,177 mm (rms 0,031; 0 wierzchołków > 0,2); STEP round-trip V 1,3e-9, 10 → 10 ścian | `gate_p3_block_with_freeform_top` |
 | P3: część B — wałek r = 12 z fazą 3 mm i otworem przelotowym r = 4 (2 płaszczyzny, walec, stożek, walec wklęsły) | 1 bryła, 5 ścian; V 11751,67 vs CAD 11752,69 (0,009 %); max odchyłka 0,128 mm (rms 0,030); STEP round-trip V 1,7e-7, 5 → 5 ścian | `gate_p3_chamfered_cylinder_with_hole` |
 | P3: `replace_face` (płaski wierzch bloku → płat), `*.trim_to_region` (arkusz ściany bryły na płacie/prymitywie) | blok 6 ścian, V 13020 (40·30·mean h); każde wejście `from_regions` ma dokładnie 1 ścianę | `gate_p3_block_with_freeform_top` |
+| P3b Z1+Z2: blok 60×50×20 z kieszenią 30×20 (naroża r = 4, fillet dna r = 1) i otworem Ø8 z dnem stożkowym 118° (skan σ = 0,03; 11 płaszczyzn, 4 walce naroży, 4 walce fillet dna, ściana otworu, stożek) | 1 zamknięta bryła, 25 ścian jak CAD; V 54709,85 vs CAD 54686,11 (0,043 %); max odchyłka skanu od bryły 0,160 mm (rms 0,031; 0 wierzchołków > 0,2); STEP round-trip V 2,8e-11, 25 → 25 ścian. Bez prymitywów fillet dna: 17 ścian jak CAD bez fillet, V 0,044 % od CAD bez fillet, max odchyłka 0,33 mm w pasie fillet (0,16 poza nim) | `gate_p3b_block_with_pocket_and_blind_hole` |
+| P3b Z2: płyta 50×40×10 z oknem przelotowym (r = 3) i rowkiem otwartym do krawędzi (półokrągły koniec r = 4) | 18 ścian jak CAD; V 17359,33 vs CAD 17345,93 (0,077 %); max odchyłka 0,138 mm; STEP round-trip V 4e-16 | `p3b_plate_with_window_and_open_slot` |
+
+| P3b/Z4: `replace_face` w górę i w dół (płat falisty przecina płaską ścianę, wzniesienie 2,5 mm) | 1 zamknięta bryła, 6 ścian; V 13018,6646 vs kwadratura 13018,6605 (4e-6 %); STEP round-trip V < 1e-6; kolizja odrzucona z komunikatem | `gate_p3b_replace_face_up_and_down` |
+| P3b/Z3: płyta 60×40×8 z zaokrągleniami r = 5 (krawędzie pionowe + górne, narożniki = łaty sferyczne) i czopem Ø16 do z = 20 z wklęsłym fillet r = 2 u podstawy (torus) i fazą 1,5 mm na czole (stożek); skan σ = 0,03, regiony przez selekcję geometryczną (jak w P3 część B) | 1 zamknięta bryła, 22 ściany jak CAD, 0 pominięć; V 20385,64 vs CAD 20444,29 (0,29 %); max odchyłka skanu od bryły 0,152 mm; STEP round-trip V < 1e-6, 22 → 22 ściany | `gate_p3b_plate_with_boss` |
 
 ## Decyzje buildera (z uzasadnieniem)
 
@@ -132,14 +137,35 @@ Szczegóły w planach milestone'ów.
 - Auto-więzy (§6.2): relacje równoległość, prostopadłość, współosiowość, równe promienie (płaszczyzna, walec, stożek, torus, kula); brak stycznych, symetrii i odległości równych.
 - **Asystent AI bez skonfigurowanego dostawcy LLM:** działa z dowolnym programem-dostawcą, ale żadna usługa nie jest wybrana ani podpięta (decyzja użytkownika: dostawca i klucz API).
 - P3 (`kernel::hybrid`): obsługiwane cięcia to płaszczyzna, wypukły walec styczny do dwóch płaszczyzn (fillet), walec/stożek/sfera/torus
-  obejmujące oś w całości, płat swobodny; pominięte (raportowane): częściowy wklęsły walec/stożek, częściowa sfera/torus, otwory
-  ślepe, kieszenie; `replace_face` tylko odcina materiał (płat musi przechodzić przez bryłę).
+  obejmujące oś w całości, płat swobodny; `replace_face` (P3b/Z4) dodaje i odcina materiał (ściana wyciągnięta o wzniesienie płata, suma, cięcie;
+  odmawia, gdy wyciągnięcie koliduje z bryłą; obrys tylko z odcinków i łuków, ściana bez otworów).
+- P3b (Z1+Z2, `engine::cmd::plan`, `kernel::local`): planer rozróżnia cięcia globalne (przed płaszczyzną < 0,5 % skanu) i lokalne;
+  lokalne tworzą narzędzia odejmowane — otwór nieprzelotowy (walec + dno płaskie lub stożek wiertła, obrót profilu), kieszeń
+  (podłoga + ścianki/naroża → profil, wyciągnięcie, opcjonalny fillet dna r z walców stycznych do dna), wybranie przelotowe i rowek
+  otwarty (profil zamykany poza bryłą). `body.plan_regions` zwraca rolę i powód każdego regionu, narzędzia i graf styków
+  (wypukły/wklęsły/styczny) — ta sama logika co `body.from_regions`. Ograniczenia: profil z kątem wklęsłym (reflex), dwa łuki obok
+  siebie i kieszeń z wyspą są raportowane jako pominięte; ściany kieszeni, otworów i slotów z wyciągnięcia/obrotu wracają z kernela
+  jako rational spline (rozpoznawane po wierzchołkach, nie jako walec/stożek analityczny); kierunek narzędzia jest przyciągany do osi
+  modelu (≤ 0,5°) — narzędzie o kierunku dokładnie równym normalnej dopasowanej płaszczyzny bryły wywala boolean w solidcore
+  (`from_record` odrzuca wynik, status SM_ERR_INVALID_INPUT) — do reprodukcji w Z5. Kolejne regiony płaszczyzny podzielonej przez
+  segmentację są scalane po równości płaszczyzny (≤ 0,25 mm, normalne ≤ 3,6°) w planerze.
+- P3b Z3 (`kernel::blends`, `kernel::local::LocalAdd`): częściowe kształty to zaokrąglenia, fazy i bryły lokalne. Krawędź zaokrąglana jest
+  znajdowana w topologii bryły (dwie ściany płaskie równoległe do osi walca, wypukła lub wklęsła; krawędź kołowa między płaszczyzną i
+  współosiowym walcem dla torusa i stożka), zaokrąglenia jednego promienia idą **jednym wywołaniem** `blend` (kernel robi łatę narożną =
+  `BallPatch`, sfera dostaje status „corner patch”), faza stożka przez `chamfer_sides` (odległości z kąta połówkowego). Czop (wypukły pełny
+  walec z płaszczyzną-czołem i płaszczyzną-podstawą) = `LocalAdd::Boss` (walec zagłębiony 0,5 mm, suma), jego płaszczyzna podstawy zostaje
+  globalna (skan przed nią wyjaśnia czop); kopułka (sfera niestyczna do niczego, stojąca na płaszczyźnie globalnej) = `LocalAdd::Dome`
+  (kula ∩ półprzestrzeń, suma). Kolejność: płaszczyzny → zaokrąglenia płaszczyzna–płaszczyzna → obroty globalne → odjęcia lokalne → dodania
+  lokalne → pozostałe zaokrąglenia/fazy (od największego promienia) → płaty. Globalne płaszczyzny ≤ `square_planes_deg` (domyślnie 0,3°, 0 wyłącza) od osi modelu są prostowane, o ile przesunięcie nad regionem ≤ max(2σ, 0,05 mm) (raport `squared_planes` w `body.plan_regions`)
+  (inaczej okrąg przecięcia z czopem jest elipsą i kernel nie widzi krawędzi kołowej). Pominięte (raportowane z powodem): stopnie i żebra
+  (wypukły płat nad częścią ściany bez walca-czopa), wklęsła częściowa sfera (dołek), częściowy stożek/torus bez płaszczyzny i walca współosiowego.
 - **Blokery solidcore (b9c02da), do zgłoszenia upstream za zgodą:** (1) bryła ze ścianą stożkową zapisaną jako rekord `Cone`
   z ujemnym półkątem (zwężający się wzdłuż z; np. `make_cone([0;3], 5, 1, 10)`) po `step_export` + `step_brep::import` rozpada się na
   osobne „bryły” po jednej ścianie (dodatni półkąt i stożek ostry 5→0 działają) — obejście: narzędzie stożkowe budowane
   rozszerzające się wzdłuż z (z dyskiem 0,01 mm przy wierzchołku); (2) fillet zwraca walec jako `Cone` o półkącie 0 (rozpoznawane
   w `faces_on_shape`); (3) przecięcie dwóch prawie współosiowych powierzchni obrotowych (osie różne o szum fitu) kończy się
   status 1001 — obejście aplikacji: `snap_axes` (auto-więz współosiowości, ≤ 3° / 0,5 mm).
+  Reprodukcje (1–3): `crates/kernel/tests/upstream_repro.rs` (`#[ignore]`); szkice zgłoszeń: `docs/upstream/solidcore-p3.md`.
 - `region.auto_segment` rozbija płaskie pierścienie (wałek z otworem: dwie płaszczyzny → ~85 kawałków po 30–280 trójkątów) —
   w teście P3 płaszczyzny wybrane geometrycznie (`region.create`); do poprawy w segmentacji (P1/P4).
 - Kanał sterowania zapisuje token w pliku tymczasowym (dostęp lokalnego użytkownika); jedna instancja aplikacji naraz.

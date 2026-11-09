@@ -14,8 +14,10 @@
     clippy::unreachable
 )]
 
+mod blends;
 pub mod feature;
 pub mod hybrid;
+pub mod local;
 pub mod naming;
 pub mod nurbs;
 pub mod solid;

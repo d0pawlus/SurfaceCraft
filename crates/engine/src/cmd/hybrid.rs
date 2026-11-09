@@ -4,6 +4,7 @@
 //! B-rep work, see `surfacecraft_kernel::hybrid`); the faces of that solid are the primitives
 //! and patches trimmed to the contours where they meet.
 use super::body::{BodyOut, body_out};
+use super::plan::{self, Item, PlanOut, RoleKind};
 use super::{CmdError, CmdResult, CommandSpec, ObjRef};
 use crate::{Session, command};
 use schemars::JsonSchema;
@@ -16,6 +17,7 @@ use surfacecraft_fit::resample::HeightField;
 use surfacecraft_fit::segment::region_points;
 use surfacecraft_geom::{Point3, Vec3, normalize};
 use surfacecraft_kernel::hybrid::{self, Cut, CutStatus, FreeCut, Shape};
+use surfacecraft_kernel::local::{LocalAdd, LocalTool};
 use surfacecraft_kernel::nurbs::fit_grid;
 use surfacecraft_kernel::record::brep::Surface;
 
@@ -64,7 +66,7 @@ fn angles_about(pts: &[Point3], origin: Vec3, axis: Vec3) -> Vec<f64> {
 
 /// A [`Cut`] from a fitted primitive and its region's points: which side the material is
 /// (from the scan normals) and whether the region goes all the way round.
-fn cut_of(p: &Primitive, pts: &[Point3], nrm: &[Vec3]) -> Result<Cut, String> {
+pub(super) fn cut_of(p: &Primitive, pts: &[Point3], nrm: &[Vec3]) -> Result<Cut, String> {
     if pts.is_empty() || pts.len() != nrm.len() {
         return Err("the region has no points".into());
     }
@@ -278,6 +280,10 @@ pub struct FromRegionsIn {
     /// Name of the solid.
     #[serde(default)]
     pub name: Option<String>,
+    /// Global planes within this many degrees of a model axis are squared to it unless that
+    /// moves them over their region by more than max(2 sigma, 0.05 mm) (default 0.3, 0 disables).
+    #[serde(default)]
+    pub square_planes_deg: Option<f64>,
 }
 
 /// Which face of the solid an input became.
@@ -289,6 +295,9 @@ pub struct FaceOf {
     pub faces: Vec<usize>,
     /// How it was applied, or why it was left out.
     pub how: String,
+    /// Its role in the plan: `global`, `blend`, `local-subtract`, `local-add` or `skipped`.
+    #[serde(default)]
+    pub role: String,
 }
 
 /// Result of `body.from_regions`.
@@ -310,6 +319,62 @@ fn describe(c: &CutStatus) -> (String, bool) {
     }
 }
 
+/// The fitted primitives of `refs` as planner items, all from one mesh, with the scan's points;
+/// `grow` sees the points of every region. Primitives whose cut cannot be made are returned as
+/// skipped.
+fn collect_items(
+    s: &Session,
+    refs: &[ObjRef],
+    cache: &mut HashMap<ObjectId, Arc<Vec<Vec3>>>,
+    mut grow: impl FnMut(&[Point3]),
+) -> CmdResult<(Vec<Item>, Vec<FaceOf>, Vec<Point3>)> {
+    let mut items: Vec<Item> = Vec::new();
+    let mut early: Vec<FaceOf> = Vec::new();
+    let mut mesh: Option<ObjectId> = None;
+    for r in refs {
+        let id = r.resolve(s, ObjectKind::Primitive)?;
+        let o = s.doc.primitive(id).ok_or_else(|| CmdError::Params(format!("no primitive {id}")))?;
+        let prim = o.primitive.clone();
+        let rid = o.region.ok_or_else(|| {
+            CmdError::Params(format!("primitive {id} has no source region (its points give the material side)"))
+        })?;
+        let reg = s.doc.region(rid).ok_or_else(|| CmdError::Params(format!("no region {rid}")))?;
+        match mesh {
+            None => mesh = Some(reg.mesh),
+            Some(m) if m != reg.mesh => {
+                return Err(CmdError::Params("all primitives must come from regions of one mesh".into()));
+            }
+            Some(_) => {}
+        }
+        let (pts, nrm) = region_cloud(s, rid, cache)?;
+        grow(&pts);
+        match cut_of(&prim, &pts, &nrm) {
+            Ok(cut) => items.push(Item { id, kind: kind_name(&prim), cut, pts }),
+            Err(why) => early.push(FaceOf {
+                object: id,
+                faces: Vec::new(),
+                how: format!("skipped: {why}"),
+                role: RoleKind::Skipped.name().to_string(),
+            }),
+        }
+    }
+    let scan: Vec<Point3> = match mesh.and_then(|m| s.doc.mesh(m)) {
+        Some(m) => m.mesh.positions.clone(),
+        None => Vec::new(),
+    };
+    Ok((items, early, scan))
+}
+
+fn kind_name(p: &Primitive) -> &'static str {
+    match p {
+        Primitive::Plane { .. } => "plane",
+        Primitive::Sphere { .. } => "sphere",
+        Primitive::Cylinder { .. } => "cylinder",
+        Primitive::Cone { .. } => "cone",
+        Primitive::Torus { .. } => "torus",
+    }
+}
+
 fn from_regions(s: &mut Session, i: FromRegionsIn) -> CmdResult<FromRegionsOut> {
     if i.primitives.is_empty() && i.surfaces.is_empty() {
         return Err(CmdError::Params("give `primitives` and/or `surfaces`".into()));
@@ -323,33 +388,13 @@ fn from_regions(s: &mut Session, i: FromRegionsIn) -> CmdResult<FromRegionsOut> 
         return Err(CmdError::Params("margin must be finite and non-negative".into()));
     }
     let mut cache = HashMap::new();
-    let mut cuts: Vec<Cut> = Vec::new();
-    let mut prim_ids: Vec<ObjectId> = Vec::new();
     let (mut lo, mut hi) = (Vec3::repeat(f64::INFINITY), Vec3::repeat(f64::NEG_INFINITY));
-    let mut grow = |pts: &[Point3]| {
+    let (items, skipped_early, scan) = collect_items(s, &i.primitives, &mut cache, |pts| {
         for p in pts {
             lo = lo.inf(&p.coords);
             hi = hi.sup(&p.coords);
         }
-    };
-    let mut skipped_early: Vec<FaceOf> = Vec::new();
-    for r in &i.primitives {
-        let id = r.resolve(s, ObjectKind::Primitive)?;
-        let o = s.doc.primitive(id).ok_or_else(|| CmdError::Params(format!("no primitive {id}")))?;
-        let prim = o.primitive.clone();
-        let rid = o.region.ok_or_else(|| {
-            CmdError::Params(format!("primitive {id} has no source region (its points give the material side)"))
-        })?;
-        let (pts, nrm) = region_cloud(s, rid, &mut cache)?;
-        grow(&pts);
-        match cut_of(&prim, &pts, &nrm) {
-            Ok(c) => {
-                cuts.push(c);
-                prim_ids.push(id);
-            }
-            Err(why) => skipped_early.push(FaceOf { object: id, faces: Vec::new(), how: format!("skipped: {why}") }),
-        }
-    }
+    })?;
     // the freeform regions bound the stock too
     let mut surf_regions: Vec<(ObjectId, ObjectId)> = Vec::new();
     for r in &i.surfaces {
@@ -357,7 +402,10 @@ fn from_regions(s: &mut Session, i: FromRegionsIn) -> CmdResult<FromRegionsOut> 
         let o = s.doc.surface(id).ok_or_else(|| CmdError::Params(format!("no surface {id}")))?;
         let rid = o.region.ok_or_else(|| CmdError::Params(format!("surface {id} has no source region")))?;
         let (pts, _) = region_cloud(s, rid, &mut cache)?;
-        grow(&pts);
+        for p in &pts {
+            lo = lo.inf(&p.coords);
+            hi = hi.sup(&p.coords);
+        }
         surf_regions.push((id, rid));
     }
     if !(lo.iter().chain(hi.iter()).all(|v| v.is_finite())) {
@@ -371,25 +419,98 @@ fn from_regions(s: &mut Session, i: FromRegionsIn) -> CmdResult<FromRegionsOut> 
         let (spline, outward) = extended_spline(s, *id, margin + 1.0, &mut cache)?;
         free.push(FreeCut { surface: spline, outward });
     }
+    // which regions are global cuts of the stock and which form local tools (blind holes,
+    // pockets, slots)
+    let square = square_deg(i.square_planes_deg)?;
+    let plan = plan::plan(&items, &scan, square);
+    let mut cuts = plan.cuts.clone();
     snap_axes(&mut cuts);
-    let built = hybrid::solid_from_cuts(arr(slo), arr(shi), &cuts, &free)?;
+    let tools: Vec<LocalTool> = plan.tools.iter().map(|t| t.tool.clone()).collect();
+    if cuts.is_empty() && free.is_empty() {
+        return Err(CmdError::Failed(
+            "no region is a global cut of the stock (see body.plan_regions for the role of each)".into(),
+        ));
+    }
+    let adds: Vec<LocalAdd> = plan.adds.iter().map(|t| t.add.clone()).collect();
+    let built = hybrid::solid_from_plan(arr(slo), arr(shi), &cuts, &free, &tools, &adds)?;
     let mut faces_of = skipped_early;
     let tol = 0.02 * diag.max(1.0) / 10.0 + 1e-3;
     let mut skipped = faces_of.len();
-    for ((cut, id), st) in cuts.iter().zip(&prim_ids).zip(&built.primitives) {
-        let (how, applied) = describe(st);
-        let faces = if applied { hybrid::faces_on_shape(&built.brep, &cut.shape, tol) } else { Vec::new() };
+    for (k, it) in items.iter().enumerate() {
+        let Some(role) = plan.roles.get(k) else { continue };
+        let (how, applied, shape) = match role.kind {
+            RoleKind::Global | RoleKind::Blend => {
+                let ci = plan.cut_members.iter().position(|m| m.contains(&k));
+                match ci.and_then(|ci| built.primitives.get(ci).zip(cuts.get(ci))) {
+                    Some((st, cut)) => {
+                        let (how, ok) = describe(st);
+                        (how, ok, cut.shape.clone())
+                    }
+                    None => ("skipped: not passed to the kernel".to_string(), false, role.shape.clone()),
+                }
+            }
+            RoleKind::LocalSubtract => {
+                let sts: Vec<&CutStatus> = role.tools.iter().filter_map(|&t| built.tools.get(t)).collect();
+                match sts.iter().find(|st| matches!(st, CutStatus::Skipped(_))) {
+                    Some(bad) => (describe(bad).0, false, role.shape.clone()),
+                    None if sts.is_empty() => ("skipped: no tool".to_string(), false, role.shape.clone()),
+                    None => (sts.first().map_or(String::new(), |st| describe(st).0), true, role.shape.clone()),
+                }
+            }
+            RoleKind::LocalAdd => {
+                let sts: Vec<&CutStatus> = role.adds.iter().filter_map(|&t| built.adds.get(t)).collect();
+                match sts.iter().find(|st| matches!(st, CutStatus::Skipped(_))) {
+                    Some(bad) => (describe(bad).0, false, role.shape.clone()),
+                    None if sts.is_empty() => ("skipped: no addition".to_string(), false, role.shape.clone()),
+                    None => (sts.first().map_or(String::new(), |st| describe(st).0), true, role.shape.clone()),
+                }
+            }
+            RoleKind::Skipped => (format!("skipped: {}", role.how), false, role.shape.clone()),
+        };
+        let faces = if applied { hybrid::faces_on_shape(&built.brep, &shape, tol) } else { Vec::new() };
         skipped += usize::from(!applied);
-        faces_of.push(FaceOf { object: *id, faces, how });
+        faces_of.push(FaceOf { object: it.id, faces, how, role: role.kind.name().to_string() });
     }
     for (((id, _), f), st) in surf_regions.iter().zip(&free).zip(&built.freeform) {
         let (how, applied) = describe(st);
         let faces = if applied { hybrid::faces_on_spline(&built.brep, &f.surface, tol)? } else { Vec::new() };
         skipped += usize::from(!applied);
-        faces_of.push(FaceOf { object: *id, faces, how });
+        faces_of.push(FaceOf { object: *id, faces, how, role: "global".to_string() });
     }
     let bid = s.doc.add_body(i.name.as_deref().unwrap_or("hybrid"), built.brep);
     Ok(FromRegionsOut { body: body_out(s, bid)?, faces_of, skipped })
+}
+
+/// Parameters of `body.plan_regions`.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PlanRegionsIn {
+    /// Fitted primitives (each needs its source region), the same list `body.from_regions` takes.
+    pub primitives: Vec<ObjRef>,
+    /// As in `body.from_regions` (default 0.3, 0 disables squaring of global planes).
+    #[serde(default)]
+    pub square_planes_deg: Option<f64>,
+}
+
+fn square_deg(v: Option<f64>) -> CmdResult<f64> {
+    let d = v.unwrap_or(0.3);
+    if d.is_finite() && (0.0..=5.0).contains(&d) {
+        Ok(d)
+    } else {
+        Err(CmdError::Params("square_planes_deg must be between 0 and 5".into()))
+    }
+}
+
+fn plan_regions(s: &mut Session, i: PlanRegionsIn) -> CmdResult<PlanOut> {
+    if i.primitives.is_empty() {
+        return Err(CmdError::Params("give `primitives`".into()));
+    }
+    if i.primitives.len() > 256 {
+        return Err(CmdError::Params("at most 256 inputs".into()));
+    }
+    let (items, _, scan) = collect_items(s, &i.primitives, &mut HashMap::new(), |_| {})?;
+    let p = plan::plan(&items, &scan, square_deg(i.square_planes_deg)?);
+    Ok(plan::report(&items, &p))
 }
 
 /// Parameters of `body.replace_face`.
@@ -401,7 +522,8 @@ pub struct ReplaceFaceIn {
     /// Record index of a planar face.
     pub face: usize,
     /// Fitted freeform surface that takes its place (needs its source region). It must run
-    /// across the whole face and cuts material away (it does not add any).
+    /// across the whole face; where it lies above the face material is added (the face is
+    /// extruded first), where it lies below material is cut away.
     pub surface: ObjRef,
     /// Extension of the patch past its region on every side, mm (default 3).
     #[serde(default)]
@@ -522,6 +644,16 @@ pub static COMMANDS: &[CommandSpec] = &[
         FromRegionsIn,
         FromRegionsOut,
         from_regions
+    ),
+    command!(
+        "body.plan_regions",
+        "Plan regions",
+        "Solid",
+        false,
+        "Reports the role of each fitted `primitives` region in `body.from_regions` (global cut, local tool part, fillet, skipped, with the reason), the local tools (blind holes, pockets, slots) and the convex/concave contacts between regions.",
+        PlanRegionsIn,
+        PlanOut,
+        plan_regions
     ),
     command!(
         "body.replace_face",
