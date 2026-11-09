@@ -94,6 +94,8 @@ pub struct Built {
     pub primitives: Vec<CutStatus>,
     /// Per freeform cut: applied?
     pub freeform: Vec<CutStatus>,
+    /// Per local tool (blind hole, pocket, slot): applied?
+    pub tools: Vec<CutStatus>,
 }
 
 /// The outcome of one cut.
@@ -105,31 +107,31 @@ pub enum CutStatus {
     Skipped(String),
 }
 
-type V = [f64; 3];
+pub(crate) type V = [f64; 3];
 
-fn sub(a: V, b: V) -> V {
+pub(crate) fn sub(a: V, b: V) -> V {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
-fn add(a: V, b: V) -> V {
+pub(crate) fn add(a: V, b: V) -> V {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
 }
-fn scale(a: V, s: f64) -> V {
+pub(crate) fn scale(a: V, s: f64) -> V {
     [a[0] * s, a[1] * s, a[2] * s]
 }
-fn dot(a: V, b: V) -> f64 {
+pub(crate) fn dot(a: V, b: V) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
-fn cross(a: V, b: V) -> V {
+pub(crate) fn cross(a: V, b: V) -> V {
     [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
 }
-fn norm(a: V) -> f64 {
+pub(crate) fn norm(a: V) -> f64 {
     dot(a, a).sqrt()
 }
-fn unit(a: V) -> Option<V> {
+pub(crate) fn unit(a: V) -> Option<V> {
     let n = norm(a);
     (n.is_finite() && n > 1e-12).then(|| scale(a, 1.0 / n))
 }
-fn perpendicular(a: V) -> V {
+pub(crate) fn perpendicular(a: V) -> V {
     let t = if a[0].abs() < 0.6 { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] };
     let p = sub(t, scale(a, dot(t, a)));
     unit(p).unwrap_or([0.0, 0.0, 1.0])
@@ -147,7 +149,7 @@ fn frame_matrix(origin: V, axis: V) -> [[f64; 4]; 4] {
     ]
 }
 
-fn corners(lo: V, hi: V) -> Vec<V> {
+pub(crate) fn corners(lo: V, hi: V) -> Vec<V> {
     (0..8)
         .map(|k| {
             [
@@ -277,6 +279,18 @@ fn edge_between(brep: &Brep, a: (V, V), b: (V, V), tol: f64) -> Option<usize> {
 /// planes and full-revolution shapes are applied in that order, then fillets, then freeform
 /// cuts. Cuts the kernel cannot honour are reported as skipped; the solid is verified closed.
 pub fn solid_from_cuts(lo: V, hi: V, cuts: &[Cut], free: &[FreeCut]) -> Result<Built> {
+    solid_from_cuts_and_tools(lo, hi, cuts, free, &[])
+}
+
+/// [`solid_from_cuts`] plus local tools (plan P3b, Z2): after the global cuts, each tool of
+/// [`crate::local`] (blind hole, pocket, through slot) is subtracted from the stock.
+pub fn solid_from_cuts_and_tools(
+    lo: V,
+    hi: V,
+    cuts: &[Cut],
+    free: &[FreeCut],
+    tools: &[crate::local::LocalTool],
+) -> Result<Built> {
     if !finite_all(&lo) || !finite_all(&hi) || (0..3).any(|i| hi[i] <= lo[i]) {
         return Err(KernelError::Argument("stock bounds must be finite with hi > lo".into()));
     }
@@ -285,6 +299,9 @@ pub fn solid_from_cuts(lo: V, hi: V, cuts: &[Cut], free: &[FreeCut]) -> Result<B
     }
     if cuts.is_empty() && free.is_empty() {
         return Err(KernelError::Argument("nothing to build from".into()));
+    }
+    if tools.len() > 256 {
+        return Err(KernelError::Argument("at most 256 local tools".into()));
     }
     let half = 4.0 * norm(sub(hi, lo)).max(1.0);
     let stock = ops::make_box(lo, sub(hi, lo)).map_err(|e| op_err("make_box", e))?;
@@ -373,6 +390,17 @@ pub fn solid_from_cuts(lo: V, hi: V, cuts: &[Cut], free: &[FreeCut]) -> Result<B
             *s = CutStatus::Applied(how);
         }
     }
+    // 3b. local tools: blind holes, pockets, slots
+    let mut tstatus = Vec::with_capacity(tools.len());
+    for t in tools {
+        let (b, r) = crate::local::subtract_tool(body, t, lo, hi);
+        body = b;
+        tstatus.push(match r {
+            Ok(crate::local::Applied::Done(how)) => CutStatus::Applied(how),
+            Ok(crate::local::Applied::Partly(why)) => CutStatus::Skipped(why),
+            Err(e) => CutStatus::Skipped(e.to_string()),
+        });
+    }
     // 4. freeform tools
     let mut fstatus = Vec::with_capacity(free.len());
     for f in free {
@@ -392,7 +420,7 @@ pub fn solid_from_cuts(lo: V, hi: V, cuts: &[Cut], free: &[FreeCut]) -> Result<B
             message: format!("the result has {n} solids, expected 1"),
         });
     }
-    Ok(Built { brep: encode(&body)?, primitives: status, freeform: fstatus })
+    Ok(Built { brep: encode(&body)?, primitives: status, freeform: fstatus, tools: tstatus })
 }
 
 /// The normal of a spline at the middle of its domain, as finite differences of the surface.
@@ -555,6 +583,11 @@ pub fn faces_on_shape(body: &Brep, shape: &Shape, tol: f64) -> Vec<usize> {
                     && (minor_radius - nr).abs() < tol
                     && norm(sub(frame.origin, *center)) < tol
             }
+            // a sweep of an arc (a pocket's rounded corner) or a revolve (a hole's wall, a drill
+            // point) comes back as a rational spline: it is on the shape when its corners are
+            (Surface::Spline { .. } | Surface::RationalSpline { .. }, Shape::Cylinder { .. } | Shape::Cone { .. }) => {
+                spline_face_on_revolved(body, i, shape, tol)
+            }
             _ => false,
         };
         if hit {
@@ -562,6 +595,27 @@ pub fn faces_on_shape(body: &Brep, shape: &Shape, tol: f64) -> Vec<usize> {
         }
     }
     out
+}
+
+/// Do all the boundary vertices of the spline face `face` lie within `tol` of the cylinder or
+/// cone `shape` (and are there enough of them to say)?
+fn spline_face_on_revolved(body: &Brep, face: usize, shape: &Shape, tol: f64) -> bool {
+    let vs = face_vertices(body, face);
+    if vs.len() < 2 {
+        return false;
+    }
+    vs.iter().all(|&p| match shape {
+        Shape::Cylinder { point, axis, radius } => {
+            unit(*axis).is_some_and(|a| (axis_distance(p, *point, a) - radius).abs() < tol)
+        }
+        Shape::Cone { apex, axis, half_angle } => unit(*axis).is_some_and(|a| {
+            let d = sub(p, *apex);
+            let t = dot(d, a);
+            let rho = axis_distance(p, *apex, a);
+            (rho * half_angle.cos() - t * half_angle.sin()).abs() < tol
+        }),
+        _ => false,
+    })
 }
 
 /// The faces of `body` whose boundary vertices all lie within `tol` of the spline `surface`.

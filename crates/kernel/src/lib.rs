@@ -16,6 +16,7 @@
 
 pub mod feature;
 pub mod hybrid;
+pub mod local;
 pub mod nurbs;
 pub mod solid;
 pub mod step;

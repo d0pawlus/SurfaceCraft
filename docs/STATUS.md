@@ -76,6 +76,8 @@ cargo run -p surfacecraft
 | P3: część A — blok 40×30 z filletami r = 5 i falistym wierzchem (skan σ = 0,03; 5 płaszczyzn + 4 walce + płat) | 1 zamknięta bryła, 10 ścian jak CAD; V 12771,75 vs CAD 12787,05 (0,12 %; CAD = kwadratura z 6e-6); max odchyłka skanu od bryły 0,177 mm (rms 0,031; 0 wierzchołków > 0,2); STEP round-trip V 1,3e-9, 10 → 10 ścian | `gate_p3_block_with_freeform_top` |
 | P3: część B — wałek r = 12 z fazą 3 mm i otworem przelotowym r = 4 (2 płaszczyzny, walec, stożek, walec wklęsły) | 1 bryła, 5 ścian; V 11751,67 vs CAD 11752,69 (0,009 %); max odchyłka 0,128 mm (rms 0,030); STEP round-trip V 1,7e-7, 5 → 5 ścian | `gate_p3_chamfered_cylinder_with_hole` |
 | P3: `replace_face` (płaski wierzch bloku → płat), `*.trim_to_region` (arkusz ściany bryły na płacie/prymitywie) | blok 6 ścian, V 13020 (40·30·mean h); każde wejście `from_regions` ma dokładnie 1 ścianę | `gate_p3_block_with_freeform_top` |
+| P3b Z1+Z2: blok 60×50×20 z kieszenią 30×20 (naroża r = 4, fillet dna r = 1) i otworem Ø8 z dnem stożkowym 118° (skan σ = 0,03; 11 płaszczyzn, 4 walce naroży, 4 walce fillet dna, ściana otworu, stożek) | 1 zamknięta bryła, 25 ścian jak CAD; V 54709,85 vs CAD 54686,11 (0,043 %); max odchyłka skanu od bryły 0,160 mm (rms 0,031; 0 wierzchołków > 0,2); STEP round-trip V 2,8e-11, 25 → 25 ścian. Bez prymitywów fillet dna: 17 ścian jak CAD bez fillet, V 0,044 % od CAD bez fillet, max odchyłka 0,33 mm w pasie fillet (0,16 poza nim) | `gate_p3b_block_with_pocket_and_blind_hole` |
+| P3b Z2: płyta 50×40×10 z oknem przelotowym (r = 3) i rowkiem otwartym do krawędzi (półokrągły koniec r = 4) | 18 ścian jak CAD; V 17359,33 vs CAD 17345,93 (0,077 %); max odchyłka 0,138 mm; STEP round-trip V 4e-16 | `p3b_plate_with_window_and_open_slot` |
 
 ## Decyzje buildera (z uzasadnieniem)
 
@@ -117,8 +119,18 @@ Szczegóły w planach milestone'ów.
 - Auto-constrain relacji między prymitywami (§6.2) i część operacji (trim/split, sweep, loft) nie mają komend cech.
 - **Asystent AI bez skonfigurowanego dostawcy LLM:** działa z dowolnym programem-dostawcą, ale żadna usługa nie jest wybrana ani podpięta (decyzja użytkownika: dostawca i klucz API).
 - P3 (`kernel::hybrid`): obsługiwane cięcia to płaszczyzna, wypukły walec styczny do dwóch płaszczyzn (fillet), walec/stożek/sfera/torus
-  obejmujące oś w całości, płat swobodny; pominięte (raportowane): częściowy wklęsły walec/stożek, częściowa sfera/torus, otwory
-  ślepe, kieszenie; `replace_face` tylko odcina materiał (płat musi przechodzić przez bryłę).
+  obejmujące oś w całości, płat swobodny; pominięte (raportowane): częściowy wypukły stożek, częściowa sfera/torus, bossy i stopnie
+  (wypukły walec, którego na zewnątrz leży skan); `replace_face` tylko odcina materiał (płat musi przechodzić przez bryłę).
+- P3b (Z1+Z2, `engine::cmd::plan`, `kernel::local`): planer rozróżnia cięcia globalne (przed płaszczyzną < 0,5 % skanu) i lokalne;
+  lokalne tworzą narzędzia odejmowane — otwór nieprzelotowy (walec + dno płaskie lub stożek wiertła, obrót profilu), kieszeń
+  (podłoga + ścianki/naroża → profil, wyciągnięcie, opcjonalny fillet dna r z walców stycznych do dna), wybranie przelotowe i rowek
+  otwarty (profil zamykany poza bryłą). `body.plan_regions` zwraca rolę i powód każdego regionu, narzędzia i graf styków
+  (wypukły/wklęsły/styczny) — ta sama logika co `body.from_regions`. Ograniczenia: profil z kątem wklęsłym (reflex), dwa łuki obok
+  siebie i kieszeń z wyspą są raportowane jako pominięte; ściany kieszeni, otworów i slotów z wyciągnięcia/obrotu wracają z kernela
+  jako rational spline (rozpoznawane po wierzchołkach, nie jako walec/stożek analityczny); kierunek narzędzia jest przyciągany do osi
+  modelu (≤ 0,5°) — narzędzie o kierunku dokładnie równym normalnej dopasowanej płaszczyzny bryły wywala boolean w solidcore
+  (`from_record` odrzuca wynik, status SM_ERR_INVALID_INPUT) — do reprodukcji w Z5. Kolejne regiony płaszczyzny podzielonej przez
+  segmentację są scalane po równości płaszczyzny (≤ 0,25 mm, normalne ≤ 3,6°) w planerze.
 - **Blokery solidcore (b9c02da), do zgłoszenia upstream za zgodą:** (1) bryła ze ścianą stożkową zapisaną jako rekord `Cone`
   z ujemnym półkątem (zwężający się wzdłuż z; np. `make_cone([0;3], 5, 1, 10)`) po `step_export` + `step_brep::import` rozpada się na
   osobne „bryły” po jednej ścianie (dodatni półkąt i stożek ostry 5→0 działają) — obejście: narzędzie stożkowe budowane
