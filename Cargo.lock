@@ -3043,6 +3043,7 @@ dependencies = [
  "serde",
  "serde_json",
  "surfacecraft-ai",
+ "surfacecraft-deviation",
  "surfacecraft-doc",
  "surfacecraft-engine",
  "surfacecraft-fit",
