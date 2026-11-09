@@ -120,12 +120,16 @@ pub fn remove_outliers(mesh: &mut Mesh, ratio: f64) -> usize {
     }
     let ratio = if ratio.is_finite() && ratio > 0.0 { ratio } else { 1.5 };
     let ring = vertex_rings(mesh);
-    let mut bad = vec![false; mesh.positions.len()];
-    for (i, r) in ring.iter().enumerate() {
+    let positions = &mesh.positions;
+    let bad: Vec<bool> = crate::par::map(ring.len(), |i| {
+        let Some(r) = ring.get(i) else { return false };
         if r.len() < 3 {
-            continue;
+            return false;
         }
-        let pts: Vec<Point3> = r.iter().map(|&j| mesh.positions[j as usize]).collect();
+        let pts: Vec<Point3> = r.iter().filter_map(|&j| positions.get(j as usize).copied()).collect();
+        if pts.len() < 3 {
+            return false;
+        }
         let c = pts.iter().fold(Vec3::zeros(), |a, p| a + p.coords) / pts.len() as f64;
         let mut cov = Matrix3::zeros();
         let mut radius = 0.0;
@@ -136,7 +140,7 @@ pub fn remove_outliers(mesh: &mut Mesh, ratio: f64) -> usize {
         }
         radius /= pts.len() as f64;
         if !(radius > 0.0) {
-            continue;
+            return false;
         }
         let e = cov.symmetric_eigen();
         let mut k = 0;
@@ -146,11 +150,9 @@ pub fn remove_outliers(mesh: &mut Mesh, ratio: f64) -> usize {
             }
         }
         let n = e.eigenvectors.column(k).into_owned();
-        let d = (mesh.positions[i].coords - c).dot(&n).abs();
-        if d > ratio * radius {
-            bad[i] = true;
-        }
-    }
+        let Some(p) = positions.get(i) else { return false };
+        (p.coords - c).dot(&n).abs() > ratio * radius
+    });
     let before = mesh.triangles.len();
     mesh.triangles.retain(|t| !t.iter().any(|&v| bad[v as usize]));
     compact(mesh);

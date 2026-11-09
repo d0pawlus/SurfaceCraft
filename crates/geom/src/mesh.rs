@@ -51,6 +51,46 @@ impl PointSource for Vec<Point3> {
     }
 }
 
+/// Read access to the triangles of a mesh on top of its points: the second half of the
+/// out-of-core seam (design doc §9). Algorithms that only stream over triangles take this instead
+/// of `&Mesh`; [`source_bbox`] and [`source_area`] are the first two, used by the display LOD.
+pub trait TriangleSource: PointSource {
+    /// Number of triangles.
+    fn triangle_count_of(&self) -> usize;
+    /// Vertex indices of triangle `i`, or `None` past the end.
+    fn triangle_indices_at(&self, i: usize) -> Option<[u32; 3]>;
+    /// Corner points of triangle `i`, or `None` when it is out of range or references a missing vertex.
+    fn triangle_points_at(&self, i: usize) -> Option<[Point3; 3]> {
+        let t = self.triangle_indices_at(i)?;
+        Some([self.point_at(t[0] as usize)?, self.point_at(t[1] as usize)?, self.point_at(t[2] as usize)?])
+    }
+}
+
+impl TriangleSource for Mesh {
+    fn triangle_count_of(&self) -> usize {
+        self.triangles.len()
+    }
+    fn triangle_indices_at(&self, i: usize) -> Option<[u32; 3]> {
+        self.triangles.get(i).copied()
+    }
+}
+
+/// Bounding box of the points of any source.
+#[must_use]
+pub fn source_bbox<S: PointSource + ?Sized>(s: &S) -> crate::Aabb {
+    let mut b = crate::Aabb::empty();
+    for p in (0..s.point_count()).filter_map(|i| s.point_at(i)) {
+        b.grow(&p);
+    }
+    b
+}
+
+/// Total area of the triangles of any source.
+#[must_use]
+pub fn source_area<S: TriangleSource + ?Sized>(s: &S) -> f64 {
+    (0..s.triangle_count_of()).filter_map(|i| s.triangle_points_at(i)).map(|[a, b, c]| tri::area(&a, &b, &c)).sum()
+}
+
 /// An indexed triangle mesh in millimetres. Triangles are counter-clockwise seen from outside.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Mesh {
@@ -212,22 +252,43 @@ impl Mesh {
     }
 
     /// Merges vertices closer than `tol` (grid hashing) and drops triangles that collapse.
-    /// Returns the number of removed vertices.
+    /// Returns the number of removed vertices. Sorting instead of a hash map keeps it parallel
+    /// and deterministic: the first vertex of every grid cell survives, in index order.
     pub fn weld(&mut self, tol: f64) -> usize {
         let tol = if tol > 0.0 && tol.is_finite() { tol } else { 1e-9 };
         let inv = 1.0 / tol;
-        let mut map: HashMap<[i64; 3], u32> = HashMap::with_capacity(self.positions.len());
-        let mut remap = Vec::with_capacity(self.positions.len());
-        let mut out: Vec<Point3> = Vec::with_capacity(self.positions.len());
-        for p in &self.positions {
-            let key = [(p.x * inv).round() as i64, (p.y * inv).round() as i64, (p.z * inv).round() as i64];
-            let id = *map.entry(key).or_insert_with(|| {
-                out.push(*p);
-                (out.len() - 1) as u32
-            });
-            remap.push(id);
+        let n = self.positions.len();
+        let pos = &self.positions;
+        let mut keyed: Vec<([i64; 3], u32)> = crate::par::map(n, |i| {
+            let p = pos.get(i).copied().unwrap_or_else(Point3::origin);
+            ([(p.x * inv).round() as i64, (p.y * inv).round() as i64, (p.z * inv).round() as i64], i as u32)
+        });
+        crate::par::sort_unstable(&mut keyed);
+        // representative (lowest index) of every vertex's cell
+        let mut rep = vec![0u32; n];
+        let mut start = 0;
+        while start < keyed.len() {
+            let key = keyed[start].0;
+            let first = keyed[start].1;
+            let mut end = start;
+            while end < keyed.len() && keyed[end].0 == key {
+                rep[keyed[end].1 as usize] = first;
+                end += 1;
+            }
+            start = end;
         }
-        let removed = self.positions.len() - out.len();
+        drop(keyed);
+        // new ids in order of first occurrence
+        let mut new_id = vec![0u32; n];
+        let mut out: Vec<Point3> = Vec::new();
+        for i in 0..n {
+            if rep[i] as usize == i {
+                new_id[i] = out.len() as u32;
+                out.push(self.positions[i]);
+            }
+        }
+        let remap: Vec<u32> = rep.iter().map(|&r| new_id[r as usize]).collect();
+        let removed = n - out.len();
         self.positions = out;
         let tris = std::mem::take(&mut self.triangles);
         self.triangles = tris
@@ -285,25 +346,35 @@ impl Mesh {
     /// a non-manifold edge). Edge `k` runs from corner `k` to corner `k + 1`.
     #[must_use]
     pub fn triangle_neighbours(&self) -> Vec<[u32; 3]> {
-        let mut edges: HashMap<(u32, u32), Vec<(u32, u8)>> = HashMap::with_capacity(self.triangles.len() * 3 / 2);
+        // sort half-edges by their undirected key (linear memory, no hash map: 10 M triangles)
+        let mut half: Vec<(u64, u32)> = Vec::with_capacity(self.triangles.len() * 3);
         for (ti, t) in self.triangles.iter().enumerate() {
-            for k in 0..3u8 {
+            for k in 0..3u32 {
                 let a = t[k as usize];
                 let b = t[((k + 1) % 3) as usize];
-                let key = if a < b { (a, b) } else { (b, a) };
-                edges.entry(key).or_default().push((ti as u32, k));
+                let key = (u64::from(a.min(b)) << 32) | u64::from(a.max(b));
+                half.push((key, ti as u32 * 3 + k));
             }
         }
+        crate::par::sort_unstable(&mut half);
         let mut n = vec![[u32::MAX; 3]; self.triangles.len()];
-        for list in edges.values() {
-            if let [(t0, k0), (t1, k1)] = list.as_slice() {
-                if let Some(s) = n.get_mut(*t0 as usize).and_then(|x| x.get_mut(*k0 as usize)) {
-                    *s = *t1;
+        let mut i = 0;
+        while i < half.len() {
+            let mut j = i + 1;
+            while j < half.len() && half[j].0 == half[i].0 {
+                j += 1;
+            }
+            // manifold edges only: exactly two half-edges
+            if j - i == 2 {
+                let (h0, h1) = (half[i].1, half[i + 1].1);
+                if let Some(s) = n.get_mut((h0 / 3) as usize).and_then(|x| x.get_mut((h0 % 3) as usize)) {
+                    *s = h1 / 3;
                 }
-                if let Some(s) = n.get_mut(*t1 as usize).and_then(|x| x.get_mut(*k1 as usize)) {
-                    *s = *t0;
+                if let Some(s) = n.get_mut((h1 / 3) as usize).and_then(|x| x.get_mut((h1 % 3) as usize)) {
+                    *s = h0 / 3;
                 }
             }
+            i = j;
         }
         n
     }

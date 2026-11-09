@@ -12,13 +12,16 @@ use wgpu::util::DeviceExt;
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
+/// Geometry stream of a vertex: uploaded with the mesh, never rewritten by a colour change.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct Vertex {
+struct Geo {
     pos: [f32; 3],
     normal: [f32; 3],
-    color: [f32; 4],
 }
+
+/// Colour of a triangle selection.
+const HIGHLIGHT: [f32; 4] = [1.0, 0.55, 0.1, 1.0];
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -31,7 +34,7 @@ struct Globals {
 /// One object to draw this frame.
 #[derive(Clone)]
 pub struct DrawItem {
-    /// Changes when the geometry changes.
+    /// Changes when the geometry changes (the GPU mesh is re-uploaded).
     pub key: usize,
     /// Geometry.
     pub mesh: Arc<Mesh>,
@@ -39,7 +42,9 @@ pub struct DrawItem {
     pub color: [f32; 4],
     /// Optional per-vertex colours.
     pub colors: Option<Arc<Vec<[f32; 4]>>>,
-    /// Optional per-triangle highlight (selected triangles), drawn in the highlight colour.
+    /// Changes when the content of `colors` does (only the colour buffer is rewritten).
+    pub colors_key: u64,
+    /// Optional per-triangle highlight (selected triangles of `mesh`), drawn in the highlight colour.
     pub highlight: Option<Arc<Vec<u32>>>,
 }
 
@@ -59,10 +64,20 @@ pub struct Frame {
 }
 
 struct GpuMesh {
+    /// Positions and normals.
     vb: wgpu::Buffer,
+    /// Colours, a separate stream so a colour change is one `write_buffer`.
+    cb: wgpu::Buffer,
     ib: wgpu::Buffer,
     count: u32,
+    vertices: usize,
     origin: [f64; 3],
+    /// Colour state last written to `cb`.
+    color_state: u64,
+    /// Highlighted triangles (indices into the mesh) and their index buffer.
+    hl_ids: Vec<u32>,
+    hl_ib: Option<wgpu::Buffer>,
+    hl_count: u32,
     used: bool,
 }
 
@@ -77,25 +92,42 @@ struct Target {
 /// GPU state kept in egui-wgpu's callback resources.
 pub struct Renderer {
     mesh_pipeline: wgpu::RenderPipeline,
+    /// Same geometry stream, one colour for the whole draw (selection highlight).
+    highlight_pipeline: wgpu::RenderPipeline,
+    highlight_color: wgpu::Buffer,
     line_pipeline: wgpu::RenderPipeline,
     blit_pipeline: wgpu::RenderPipeline,
     globals: wgpu::Buffer,
     globals_bind: wgpu::BindGroup,
     blit_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    meshes: HashMap<(usize, u64), GpuMesh>,
+    meshes: HashMap<usize, GpuMesh>,
     axes: wgpu::Buffer,
+    axes_colors: wgpu::Buffer,
     target: Option<Target>,
-    draw_list: Vec<(usize, u64)>,
+    draw_list: Vec<usize>,
+    /// Number of full mesh uploads so far (tests and the fps benchmark).
+    pub uploads: u64,
+    /// Number of colour-buffer rewrites.
+    pub color_writes: u64,
 }
 
-fn color_hash(c: &[f32; 4], has_colors: bool, hl: usize) -> u64 {
+/// What the colour buffer of an item shows: its base colour and which colour array.
+fn color_state(c: &[f32; 4], has_colors: bool, key: u64) -> u64 {
     let mut h = 1469598103934665603u64;
     for v in c {
         h = (h ^ u64::from(v.to_bits())).wrapping_mul(1099511628211);
     }
     h ^= u64::from(has_colors);
-    (h ^ hl as u64).wrapping_mul(1099511628211)
+    (h ^ key).wrapping_mul(1099511628211)
+}
+
+fn colors_of(item: &DrawItem) -> Vec<[f32; 4]> {
+    let n = item.mesh.positions.len();
+    match &item.colors {
+        Some(c) if c.len() == n => c.as_ref().clone(),
+        _ => vec![item.color; n],
+    }
 }
 
 impl Renderer {
@@ -139,13 +171,19 @@ impl Renderer {
             bind_group_layouts: &[Some(&globals_layout)],
             immediate_size: 0,
         });
-        let attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4];
-        let vlayout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<Vertex>() as u64,
+        let geo_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
+        let color_attrs = wgpu::vertex_attr_array![2 => Float32x4];
+        let geo_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Geo>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &attrs,
+            attributes: &geo_attrs,
         };
-        let make = |topology: wgpu::PrimitiveTopology, label: &str| {
+        let color_layout = |step_mode| wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<[f32; 4]>() as u64,
+            step_mode,
+            attributes: &color_attrs,
+        };
+        let make = |topology: wgpu::PrimitiveTopology, label: &str, step: wgpu::VertexStepMode| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&layout),
@@ -153,7 +191,7 @@ impl Renderer {
                     module: &shader,
                     entry_point: Some("vs_main"),
                     compilation_options: Default::default(),
-                    buffers: &[Some(vlayout.clone())],
+                    buffers: &[Some(geo_layout.clone()), Some(color_layout(step))],
                 },
                 primitive: wgpu::PrimitiveState { topology, cull_mode: None, ..Default::default() },
                 depth_stencil: Some(wgpu::DepthStencilState {
@@ -178,8 +216,15 @@ impl Renderer {
                 cache: None,
             })
         };
-        let mesh_pipeline = make(wgpu::PrimitiveTopology::TriangleList, "mesh");
-        let line_pipeline = make(wgpu::PrimitiveTopology::LineList, "lines");
+        let mesh_pipeline = make(wgpu::PrimitiveTopology::TriangleList, "mesh", wgpu::VertexStepMode::Vertex);
+        let highlight_pipeline =
+            make(wgpu::PrimitiveTopology::TriangleList, "highlight", wgpu::VertexStepMode::Instance);
+        let line_pipeline = make(wgpu::PrimitiveTopology::LineList, "lines", wgpu::VertexStepMode::Vertex);
+        let highlight_color = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("highlight colour"),
+            contents: bytemuck::cast_slice(&[HIGHLIGHT]),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
         let blit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("blit"),
             entries: &[
@@ -239,12 +284,26 @@ impl Renderer {
         });
         let axes = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("axes"),
-            size: (6 * std::mem::size_of::<Vertex>()) as u64,
+            size: (6 * std::mem::size_of::<Geo>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let axes_colors = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("axes colours"),
+            contents: bytemuck::cast_slice(&[
+                [0.9f32, 0.2, 0.2, 1.0],
+                [0.9, 0.2, 0.2, 1.0],
+                [0.2, 0.8, 0.2, 1.0],
+                [0.2, 0.8, 0.2, 1.0],
+                [0.25, 0.4, 0.95, 1.0],
+                [0.25, 0.4, 0.95, 1.0],
+            ]),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
         Self {
             mesh_pipeline,
+            highlight_pipeline,
+            highlight_color,
             line_pipeline,
             blit_pipeline,
             globals,
@@ -253,8 +312,11 @@ impl Renderer {
             sampler,
             meshes: HashMap::new(),
             axes,
+            axes_colors,
             target: None,
             draw_list: Vec::new(),
+            uploads: 0,
+            color_writes: 0,
         }
     }
 
@@ -301,46 +363,65 @@ impl Renderer {
     fn upload(device: &wgpu::Device, item: &DrawItem, origin: &Point3) -> GpuMesh {
         let m = &item.mesh;
         let normals = m.vertex_normals();
-        let hl_color = [1.0f32, 0.55, 0.1, 1.0];
-        let mut verts: Vec<Vertex> = m
+        let verts: Vec<Geo> = m
             .positions
             .iter()
             .enumerate()
             .map(|(i, p)| {
                 let q = p - origin.coords;
                 let n = normals.get(i).copied().unwrap_or_default();
-                let color = item.colors.as_ref().and_then(|c| c.get(i).copied()).unwrap_or(item.color);
-                Vertex {
-                    pos: [q.x as f32, q.y as f32, q.z as f32],
-                    normal: [n.x as f32, n.y as f32, n.z as f32],
-                    color,
-                }
+                Geo { pos: [q.x as f32, q.y as f32, q.z as f32], normal: [n.x as f32, n.y as f32, n.z as f32] }
             })
             .collect();
-        let mut indices: Vec<u32> = m.triangles.iter().flatten().copied().collect();
-        // highlighted triangles get their own vertices in the highlight colour
-        if let Some(hl) = &item.highlight {
-            for &t in hl.iter() {
-                let Some(tri) = m.triangles.get(t as usize) else { continue };
-                for &vi in tri {
-                    if let Some(v) = verts.get(vi as usize).copied() {
-                        indices.push(verts.len() as u32);
-                        verts.push(Vertex { color: hl_color, ..v });
-                    }
-                }
-            }
-        }
+        drop(normals);
+        let indices: Vec<u32> = m.triangles.iter().flatten().copied().collect();
         let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("mesh vb"),
             contents: bytemuck::cast_slice(&verts),
             usage: wgpu::BufferUsages::VERTEX,
+        });
+        let cb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("mesh colours"),
+            contents: bytemuck::cast_slice(&colors_of(item)),
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
         let ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("mesh ib"),
             contents: bytemuck::cast_slice(&indices),
             usage: wgpu::BufferUsages::INDEX,
         });
-        GpuMesh { vb, ib, count: indices.len() as u32, origin: [origin.x, origin.y, origin.z], used: true }
+        GpuMesh {
+            vb,
+            cb,
+            ib,
+            count: indices.len() as u32,
+            vertices: verts.len(),
+            origin: [origin.x, origin.y, origin.z],
+            color_state: color_state(&item.color, item.colors.is_some(), item.colors_key),
+            hl_ids: Vec::new(),
+            hl_ib: None,
+            hl_count: 0,
+            used: true,
+        }
+    }
+
+    /// Index buffer of the highlighted triangles (indices into the mesh's own vertices).
+    fn upload_highlight(device: &wgpu::Device, g: &mut GpuMesh, item: &DrawItem) {
+        let ids: &[u32] = item.highlight.as_ref().map_or(&[], |h| h.as_slice());
+        if g.hl_ids == ids {
+            return;
+        }
+        g.hl_ids = ids.to_vec();
+        let indices: Vec<u32> =
+            ids.iter().filter_map(|&t| item.mesh.triangles.get(t as usize)).flatten().copied().collect();
+        g.hl_count = indices.len() as u32;
+        g.hl_ib = (!indices.is_empty()).then(|| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("highlight ib"),
+                contents: bytemuck::cast_slice(&indices),
+                usage: wgpu::BufferUsages::INDEX,
+            })
+        });
     }
 
     /// Uploads changed meshes and renders the frame offscreen.
@@ -358,21 +439,22 @@ impl Renderer {
         self.draw_list.clear();
         let o = [f.origin.x, f.origin.y, f.origin.z];
         for item in &f.items {
-            let k = (
-                item.key,
-                color_hash(
-                    &item.color,
-                    item.colors.is_some(),
-                    item.highlight.as_ref().map_or(0, |h| Arc::as_ptr(h) as usize),
-                ),
-            );
-            let fresh = self.meshes.get(&k).is_none_or(|g| g.origin != o);
+            let k = item.key;
+            let fresh = self.meshes.get(&k).is_none_or(|g| g.origin != o || g.vertices != item.mesh.positions.len());
             if fresh {
                 let g = Self::upload(device, item, &f.origin);
                 self.meshes.insert(k, g);
+                self.uploads += 1;
             }
             if let Some(g) = self.meshes.get_mut(&k) {
                 g.used = true;
+                let st = color_state(&item.color, item.colors.is_some(), item.colors_key);
+                if g.color_state != st {
+                    queue.write_buffer(&g.cb, 0, bytemuck::cast_slice(&colors_of(item)));
+                    g.color_state = st;
+                    self.color_writes += 1;
+                }
+                Self::upload_highlight(device, g, item);
             }
             self.draw_list.push(k);
         }
@@ -397,22 +479,13 @@ impl Renderer {
         // axis triad at the world origin, sized to the view
         let len = (f.camera.distance * 0.15) as f32;
         let oo = [-(f.origin.x as f32), -(f.origin.y as f32), -(f.origin.z as f32)];
-        let mk = |d: [f32; 3], c: [f32; 4]| {
+        let mk = |d: [f32; 3]| {
             [
-                Vertex { pos: oo, normal: [0.0; 3], color: c },
-                Vertex {
-                    pos: [oo[0] + d[0] * len, oo[1] + d[1] * len, oo[2] + d[2] * len],
-                    normal: [0.0; 3],
-                    color: c,
-                },
+                Geo { pos: oo, normal: [0.0; 3] },
+                Geo { pos: [oo[0] + d[0] * len, oo[1] + d[1] * len, oo[2] + d[2] * len], normal: [0.0; 3] },
             ]
         };
-        let axes: Vec<Vertex> = [
-            mk([1.0, 0.0, 0.0], [0.9, 0.2, 0.2, 1.0]),
-            mk([0.0, 1.0, 0.0], [0.2, 0.8, 0.2, 1.0]),
-            mk([0.0, 0.0, 1.0], [0.25, 0.4, 0.95, 1.0]),
-        ]
-        .concat();
+        let axes: Vec<Geo> = [mk([1.0, 0.0, 0.0]), mk([0.0, 1.0, 0.0]), mk([0.0, 0.0, 1.0])].concat();
         queue.write_buffer(&self.axes, 0, bytemuck::cast_slice(&axes));
         let Some(t) = &self.target else { return };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -445,12 +518,25 @@ impl Renderer {
         for k in &self.draw_list {
             if let Some(g) = self.meshes.get(k) {
                 pass.set_vertex_buffer(0, g.vb.slice(..));
+                pass.set_vertex_buffer(1, g.cb.slice(..));
                 pass.set_index_buffer(g.ib.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..g.count, 0, 0..1);
             }
         }
+        pass.set_pipeline(&self.highlight_pipeline);
+        pass.set_vertex_buffer(1, self.highlight_color.slice(..));
+        for k in &self.draw_list {
+            if let Some(g) = self.meshes.get(k)
+                && let Some(ib) = &g.hl_ib
+            {
+                pass.set_vertex_buffer(0, g.vb.slice(..));
+                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..g.hl_count, 0, 0..1);
+            }
+        }
         pass.set_pipeline(&self.line_pipeline);
         pass.set_vertex_buffer(0, self.axes.slice(..));
+        pass.set_vertex_buffer(1, self.axes_colors.slice(..));
         pass.draw(0..6, 0..1);
     }
 
@@ -507,14 +593,63 @@ impl Renderer {
 #[cfg(not(target_arch = "wasm32"))]
 #[must_use]
 pub fn render_offscreen(frame: &Frame) -> Option<Vec<u8>> {
-    let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()?;
+    let (device, queue) = headless_device()?;
     let mut r = Renderer::new(&device, COLOR_FORMAT);
     let mut enc = device.create_command_encoder(&Default::default());
     r.prepare(&device, &queue, &mut enc, frame);
     queue.submit([enc.finish()]);
     r.read_rgba(&device, &queue)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+    let instance = wgpu::Instance::default();
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
+}
+
+/// Frame rate of the offscreen renderer (P2 criterion: viewport at 10 M triangles).
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug)]
+pub struct Bench {
+    /// First frame: buffer upload, normals and the first draw (s).
+    pub first_frame_s: f64,
+    /// Frames timed after the first.
+    pub frames: usize,
+    /// Mean frames per second over those, camera orbiting, each frame waited for.
+    pub fps: f64,
+    /// Full mesh uploads during the run.
+    pub uploads: u64,
+    /// Triangles drawn per frame.
+    pub triangles: usize,
+}
+
+/// Renders `frame` once (upload) and then `frames` more times with an orbiting camera, waiting for
+/// the GPU after every frame. `None` without a GPU adapter.
+#[cfg(not(target_arch = "wasm32"))]
+#[must_use]
+pub fn bench_offscreen(frame: &Frame, frames: usize) -> Option<Bench> {
+    let (device, queue) = headless_device()?;
+    let mut r = Renderer::new(&device, COLOR_FORMAT);
+    let mut run = |f: &Frame| -> Option<()> {
+        let mut enc = device.create_command_encoder(&Default::default());
+        r.prepare(&device, &queue, &mut enc, f);
+        queue.submit([enc.finish()]);
+        device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+        Some(())
+    };
+    let t = std::time::Instant::now();
+    run(frame)?;
+    let first_frame_s = t.elapsed().as_secs_f64();
+    let mut f = frame.clone();
+    let t = std::time::Instant::now();
+    for _ in 0..frames {
+        f.camera.orbit(0.03, 0.002);
+        run(&f)?;
+    }
+    let secs = t.elapsed().as_secs_f64().max(1e-9);
+    let triangles = frame.items.iter().map(|i| i.mesh.triangles.len()).sum();
+    Some(Bench { first_frame_s, frames, fps: frames as f64 / secs, uploads: r.uploads, triangles })
 }
 
 /// The paint callback carrying one frame.
@@ -569,7 +704,14 @@ mod tests {
             size: [64, 48],
             origin: camera.target,
             camera,
-            items: vec![DrawItem { key: 1, mesh, color: [1.0, 0.0, 0.0, 1.0], colors: None, highlight: None }],
+            items: vec![DrawItem {
+                key: 1,
+                mesh,
+                color: [1.0, 0.0, 0.0, 1.0],
+                colors: None,
+                colors_key: 0,
+                highlight: None,
+            }],
             background: [0.0, 0.0, 1.0],
         };
         let Some(px) = render_offscreen(&frame) else {
@@ -582,5 +724,47 @@ mod tests {
         assert!(c[0] > 60 && c[2] < 60, "centre pixel {c:?} should be the red sphere");
         let corner = at(1, 1);
         assert!(corner[2] > 200 && corner[0] < 30, "corner pixel {corner:?} should be blue background");
+    }
+
+    /// New colours for the same geometry rewrite the colour buffer only: no second upload, and
+    /// the new colours reach the picture. Skipped without a GPU.
+    #[test]
+    fn colour_change_does_not_reupload_geometry() {
+        let mesh = Arc::new(synth::sphere(Point3::origin(), 10.0, 32, 16));
+        let mut camera = Camera::default();
+        camera.fit(&mesh.bbox());
+        let n = mesh.vertex_count();
+        let item = |colors: [f32; 4], key: u64| DrawItem {
+            key: 1,
+            mesh: mesh.clone(),
+            color: [1.0, 1.0, 1.0, 1.0],
+            colors: Some(Arc::new(vec![colors; n])),
+            colors_key: key,
+            highlight: None,
+        };
+        let frame = |i: DrawItem| Frame {
+            size: [64, 48],
+            origin: camera.target,
+            camera: camera.clone(),
+            items: vec![i],
+            background: [0.0, 0.0, 1.0],
+        };
+        let Some((device, queue)) = headless_device() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let mut r = Renderer::new(&device, COLOR_FORMAT);
+        let mut draw = |f: &Frame| {
+            let mut enc = device.create_command_encoder(&Default::default());
+            r.prepare(&device, &queue, &mut enc, f);
+            queue.submit([enc.finish()]);
+            r.read_rgba(&device, &queue).unwrap_or_default()
+        };
+        let red = draw(&frame(item([1.0, 0.0, 0.0, 1.0], 1)));
+        let green = draw(&frame(item([0.0, 1.0, 0.0, 1.0], 2)));
+        let c = |px: &[u8]| px[(24 * 64 + 32) * 4..(24 * 64 + 32) * 4 + 3].to_vec();
+        assert!(c(&red)[0] > 60 && c(&red)[1] < 40, "red {:?}", c(&red));
+        assert!(c(&green)[1] > 60 && c(&green)[0] < 40, "green {:?}", c(&green));
+        assert_eq!((r.uploads, r.color_writes), (1, 1), "geometry once, colours rewritten once");
     }
 }

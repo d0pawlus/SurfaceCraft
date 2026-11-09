@@ -10,7 +10,7 @@ use crate::auto::fit_auto;
 use crate::primitive::{Primitive, PrimitiveKind};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use surfacecraft_geom::{Mesh, Point3, Vec3};
 
 /// Segmentation settings.
@@ -51,7 +51,7 @@ pub fn region_points(mesh: &Mesh, normals: &[Vec3], tris: &[u32]) -> (Vec<Point3
     // call this thousands of times on scans of millions of vertices)
     let mut ids: Vec<u32> =
         tris.iter().filter_map(|&t| mesh.triangles.get(t as usize)).flat_map(|t| t.iter().copied()).collect();
-    ids.sort_unstable();
+    surfacecraft_geom::par::sort_unstable(&mut ids);
     ids.dedup();
     let mut p = Vec::with_capacity(ids.len());
     let mut n = Vec::with_capacity(ids.len());
@@ -97,13 +97,47 @@ pub fn grow_smooth(mesh: &Mesh, seeds: &[u32], max_angle_deg: f64) -> Vec<u32> {
     inside.iter().enumerate().filter(|(_, f)| **f).map(|(i, _)| i as u32).collect()
 }
 
-fn accepts(mesh: &Mesh, prim: &Primitive, t: usize, tol: f64, cos: f64) -> bool {
+fn accepts(mesh: &Mesh, fnorm: &[Option<Vec3>], prim: &Primitive, t: usize, tol: f64, cos: f64) -> bool {
     let Some(corners) = mesh.triangle(t) else { return false };
     if corners.iter().any(|c| prim.distance(c).abs() > tol) {
         return false;
     }
-    let (Some(n), Some(c)) = (mesh.face_normal(t), mesh.face_centroid(t)) else { return false };
+    let (Some(n), Some(c)) = (fnorm.get(t).copied().flatten(), mesh.face_centroid(t)) else { return false };
     prim.normal(&c).dot(&n).abs() >= cos
+}
+
+/// Vertex normals averaged over their one ring twice, only across neighbours within 35° (so
+/// scanner noise on dense meshes stops breaking regions up, while sharp edges stay sharp), and
+/// per-triangle normals from them.
+fn smoothed_normals(mesh: &Mesh) -> (Vec<Vec3>, Vec<Option<Vec3>>) {
+    let mut n = mesh.vertex_normals();
+    let cos = 35f64.to_radians().cos();
+    for _ in 0..2 {
+        let mut acc = n.clone();
+        for t in &mesh.triangles {
+            for k in 0..3 {
+                let (a, b) = (t[k] as usize, t[(k + 1) % 3] as usize);
+                let (Some(na), Some(nb)) = (n.get(a).copied(), n.get(b).copied()) else { continue };
+                if na.dot(&nb) >= cos {
+                    if let Some(x) = acc.get_mut(a) {
+                        *x += nb;
+                    }
+                    if let Some(x) = acc.get_mut(b) {
+                        *x += na;
+                    }
+                }
+            }
+        }
+        n = acc.into_iter().map(|v| surfacecraft_geom::normalize(v).unwrap_or_else(Vec3::zeros)).collect();
+    }
+    let f = surfacecraft_geom::par::map(mesh.triangle_count(), |t| {
+        let tri = mesh.triangles.get(t)?;
+        let raw = mesh.face_normal(t)?;
+        let s: Vec3 = tri.iter().filter_map(|&v| n.get(v as usize)).sum();
+        // keep the orientation of the triangle itself
+        surfacecraft_geom::normalize(s).map(|v| if v.dot(&raw) < 0.0 { raw } else { v })
+    });
+    (n, f)
 }
 
 /// Points used for one fit at most (evenly strided); the final RMS is over every point.
@@ -119,10 +153,87 @@ fn fit_tris(mesh: &Mesh, normals: &[Vec3], tris: &[u32]) -> Option<crate::primit
     let ps: Vec<Point3> = p.iter().step_by(stride).copied().collect();
     let ns: Vec<Vec3> = n.iter().step_by(stride).copied().collect();
     let mut f = fit_auto(&ps, &ns)?.best;
-    let sq: f64 = p.iter().map(|q| f.primitive.distance(q).powi(2)).sum();
+    // distances in parallel, summed in index order (the same value on every thread count)
+    let prim = &f.primitive;
+    let sq: f64 = surfacecraft_geom::par::map_slice(&p, |q| prim.distance(q).powi(2)).iter().sum();
     f.rms = (sq / p.len() as f64).sqrt();
     f.count = p.len();
     Some(f)
+}
+
+/// Refit of a region keeping its `kind`: the fit uses an even subsample, the RMS is over every
+/// point (parallel, summed in index order).
+fn refit_kind_all(
+    mesh: &Mesh,
+    normals: &[Vec3],
+    tris: &[u32],
+    kind: PrimitiveKind,
+) -> Option<crate::primitive::PrimitiveFit> {
+    let mut f = fit_kind_tris(mesh, normals, tris, kind)?;
+    let (p, _) = region_points(mesh, normals, tris);
+    if p.is_empty() {
+        return None;
+    }
+    let prim = &f.primitive;
+    let sq: f64 = surfacecraft_geom::par::map_slice(&p, |q| prim.distance(q).powi(2)).iter().sum();
+    f.rms = (sq / p.len() as f64).sqrt();
+    f.count = p.len();
+    Some(f)
+}
+
+/// Fit of one `kind` to a set of triangles on at most [`FIT_POINTS`] / 2 of their vertices; the
+/// RMS is over that subsample (it only steers the growth).
+fn fit_kind_tris(
+    mesh: &Mesh,
+    normals: &[Vec3],
+    tris: &[u32],
+    kind: PrimitiveKind,
+) -> Option<crate::primitive::PrimitiveFit> {
+    let (p, n) = region_points(mesh, normals, tris);
+    let stride = p.len().div_ceil(FIT_POINTS / 2).max(1);
+    let ps: Vec<Point3> = p.iter().step_by(stride).copied().collect();
+    let ns: Vec<Vec3> = n.iter().step_by(stride).copied().collect();
+    crate::primitive::fit(kind, &ps, &ns)
+}
+
+/// What seed patches are built from.
+struct SeedCtx<'a> {
+    nb: &'a [[u32; 3]],
+    fnorm: &'a [Option<Vec3>],
+    areas: &'a [f64],
+    seed_tris: usize,
+    seed_area: f64,
+}
+
+impl SeedCtx<'_> {
+    /// Seed patch: the smooth unassigned neighbourhood of `seed`, breadth first, up to the seed
+    /// area. Depends only on which triangles are owned.
+    fn patch(&self, seed: u32, owner: &[u32], mark: &mut [u32], g: u32) -> Vec<u32> {
+        let s = seed as usize;
+        let mut patch = vec![seed];
+        let mut area = self.areas[s];
+        mark[s] = g;
+        let mut q = VecDeque::from([seed]);
+        while let Some(t) = q.pop_front() {
+            if (patch.len() >= self.seed_tris && area >= self.seed_area) || patch.len() >= 8 * self.seed_tris {
+                break;
+            }
+            let Some(n0) = self.fnorm[t as usize] else { continue };
+            for &o in &self.nb[t as usize] {
+                let oi = o as usize;
+                if o == u32::MAX || mark[oi] == g || owner[oi] != u32::MAX {
+                    continue;
+                }
+                if self.fnorm[oi].is_some_and(|m| m.dot(&n0) > 0.94) {
+                    mark[oi] = g;
+                    patch.push(o);
+                    area += self.areas[oi];
+                    q.push_back(o);
+                }
+            }
+        }
+        patch
+    }
 }
 
 /// Segments `mesh` into primitive regions.
@@ -139,10 +250,10 @@ pub fn segment(mesh: &Mesh, opts: &SegmentOptions) -> Vec<Segment> {
     }
     let tol = if opts.tolerance.is_finite() && opts.tolerance > 0.0 { opts.tolerance } else { 0.2 };
     let cos = opts.max_angle_deg.clamp(1.0, 89.0).to_radians().cos();
+    let sw = crate::stats::Stopwatch::start();
     let nb = mesh.triangle_neighbours();
-    let normals = mesh.vertex_normals();
-    let fnorm: Vec<Option<Vec3>> = (0..nt).map(|t| mesh.face_normal(t)).collect();
-    let areas: Vec<f64> = (0..nt).map(|t| mesh.face_area(t)).collect();
+    let (normals, fnorm) = smoothed_normals(mesh);
+    let areas: Vec<f64> = surfacecraft_geom::par::map(nt, |t| mesh.face_area(t));
     let seed_tris = opts.seed_size.max(8);
     let seed_area = {
         let mut a: Vec<f64> = areas.iter().copied().filter(|x| *x > 0.0).collect();
@@ -151,19 +262,19 @@ pub fn segment(mesh: &Mesh, opts: &SegmentOptions) -> Vec<Segment> {
         med * seed_tris as f64
     };
     // flatness of each triangle: smallest = flattest neighbourhood (best seeds)
-    let mut order: Vec<(f64, u32)> = (0..nt)
-        .map(|t| {
-            let n = fnorm[t].unwrap_or_else(Vec3::z);
-            let worst = nb[t]
-                .iter()
-                .filter(|&&o| o != u32::MAX)
-                .filter_map(|&o| fnorm.get(o as usize).copied().flatten())
-                .map(|m| 1.0 - m.dot(&n))
-                .fold(0.0, f64::max);
-            (worst, t as u32)
-        })
-        .collect();
-    order.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mut order: Vec<(u64, u32)> = surfacecraft_geom::par::map(nt, |t| {
+        let n = fnorm[t].unwrap_or_else(Vec3::z);
+        let worst = nb[t]
+            .iter()
+            .filter(|&&o| o != u32::MAX)
+            .filter_map(|&o| fnorm.get(o as usize).copied().flatten())
+            .map(|m| 1.0 - m.dot(&n))
+            .fold(0.0, f64::max);
+        // non-negative floats order like their bits
+        (worst.max(0.0).to_bits(), t as u32)
+    });
+    surfacecraft_geom::par::sort_unstable(&mut order);
+    sw.stop(crate::stats::Phase::Prep);
     let mut owner = vec![u32::MAX; nt];
     let mut out: Vec<Segment> = Vec::new();
     let mut tried = vec![false; nt];
@@ -179,7 +290,15 @@ pub fn segment(mesh: &Mesh, opts: &SegmentOptions) -> Vec<Segment> {
         gen_id
     };
     let max_regions = 10_000;
-    for &(_, seed) in &order {
+    let ctx = SeedCtx { nb: &nb, fnorm: &fnorm, areas: &areas, seed_tris, seed_area };
+    // Speculative seed fits: the seed fits dominate the time and are independent of each other, so
+    // the next few eligible seeds get their patch and fit computed in parallel. A speculative
+    // result is used only when its patch equals the one the sequential algorithm computes at that
+    // moment, so the output does not depend on the batch size or the thread count.
+    let mut spec: HashMap<u32, (Vec<u32>, Option<crate::primitive::PrimitiveFit>)> = HashMap::new();
+    let mut batch: usize = if surfacecraft_geom::par::parallel() { 8 } else { 1 };
+    let (mut spec_made, mut spec_used) = (0usize, 0usize);
+    for (idx, &(_, seed)) in order.iter().enumerate() {
         if out.len() >= max_regions {
             break;
         }
@@ -188,36 +307,68 @@ pub fn segment(mesh: &Mesh, opts: &SegmentOptions) -> Vec<Segment> {
             continue;
         }
         let g = next_gen(&mut mark);
-        // seed patch: smooth unassigned neighbourhood, breadth first, up to the seed area
-        let mut patch = vec![seed];
-        let mut area = areas[s];
-        mark[s] = g;
-        let mut q = VecDeque::from([seed]);
-        while let Some(t) = q.pop_front() {
-            if (patch.len() >= seed_tris && area >= seed_area) || patch.len() >= 8 * seed_tris {
-                break;
-            }
-            let Some(n0) = fnorm[t as usize] else { continue };
-            for &o in &nb[t as usize] {
-                let oi = o as usize;
-                if o == u32::MAX || mark[oi] == g || owner[oi] != u32::MAX {
-                    continue;
-                }
-                if fnorm[oi].is_some_and(|m| m.dot(&n0) > 0.94) {
-                    mark[oi] = g;
-                    patch.push(o);
-                    area += areas[oi];
-                    q.push_back(o);
-                }
-            }
-        }
+        let patch = ctx.patch(seed, &owner, &mut mark, g);
         for &t in &patch {
             tried[t as usize] = true;
         }
         if patch.len() < 8 {
             continue;
         }
-        let Some(mut fit) = fit_tris(mesh, &normals, &patch) else { continue };
+        crate::stats::seed_fit();
+        let sw = crate::stats::Stopwatch::start();
+        let cached = match spec.remove(&seed) {
+            Some((p, f)) if p == patch => {
+                spec_used += 1;
+                Some(f)
+            }
+            _ => None,
+        };
+        let seed_fit = match cached {
+            Some(f) => f,
+            None => {
+                if batch > 1 {
+                    // adapt the look-ahead to how much of the last batches was actually needed
+                    if spec_made >= 16 {
+                        batch = if spec_used * 2 >= spec_made { (batch * 2).min(32) } else { (batch / 2).max(2) };
+                        spec_made = 0;
+                        spec_used = 0;
+                    }
+                    spec.clear();
+                    let mut seeds = vec![seed];
+                    let mut patches = vec![patch.clone()];
+                    for &(_, o) in order.iter().skip(idx + 1).take(4096) {
+                        if patches.len() >= batch {
+                            break;
+                        }
+                        let oi = o as usize;
+                        if owner[oi] != u32::MAX || tried[oi] {
+                            continue;
+                        }
+                        let g2 = next_gen(&mut mark);
+                        let p = ctx.patch(o, &owner, &mut mark, g2);
+                        if p.len() >= 8 {
+                            seeds.push(o);
+                            patches.push(p);
+                        }
+                    }
+                    let fits = surfacecraft_geom::par::map_slice(&patches, |p| fit_tris(mesh, &normals, p));
+                    spec_made += patches.len() - 1;
+                    let mut first = None;
+                    for ((sd, p), f) in seeds.into_iter().zip(patches).zip(fits) {
+                        if sd == seed {
+                            first = Some(f);
+                        } else {
+                            spec.insert(sd, (p, f));
+                        }
+                    }
+                    first.flatten()
+                } else {
+                    fit_tris(mesh, &normals, &patch)
+                }
+            }
+        };
+        sw.stop(crate::stats::Phase::Seed);
+        let Some(mut fit) = seed_fit else { continue };
         if fit.rms > tol {
             continue;
         }
@@ -227,7 +378,7 @@ pub fn segment(mesh: &Mesh, opts: &SegmentOptions) -> Vec<Segment> {
         let mut region: Vec<u32> = Vec::new();
         let mut q: VecDeque<u32> = VecDeque::new();
         for &t in &patch {
-            if accepts(mesh, &fit.primitive, t as usize, tol, cos) {
+            if accepts(mesh, &fnorm, &fit.primitive, t as usize, tol, cos) {
                 mark[t as usize] = g;
                 region.push(t);
                 q.push_back(t);
@@ -240,7 +391,7 @@ pub fn segment(mesh: &Mesh, opts: &SegmentOptions) -> Vec<Segment> {
                 if o == u32::MAX || mark[oi] == g || owner[oi] != u32::MAX {
                     continue;
                 }
-                if accepts(mesh, &fit.primitive, oi, tol, cos) {
+                if accepts(mesh, &fnorm, &fit.primitive, oi, tol, cos) {
                     mark[oi] = g;
                     region.push(o);
                     q.push_back(o);
@@ -248,7 +399,19 @@ pub fn segment(mesh: &Mesh, opts: &SegmentOptions) -> Vec<Segment> {
             }
             if region.len() >= next_refit {
                 next_refit *= 2;
-                if let Some(f) = fit_tris(mesh, &normals, &region)
+                crate::stats::grow_refit();
+                let sw = crate::stats::Stopwatch::start();
+                // large regions refit only their kind (the automatic choice runs once more at the
+                // end); the general kinds' iterative fits dominate the time otherwise
+                let refit = if region.len() <= 20 * seed_tris {
+                    // small regions may still change kind (a narrow chamfer band starts out
+                    // looking like a cylinder)
+                    fit_tris(mesh, &normals, &region)
+                } else {
+                    fit_kind_tris(mesh, &normals, &region, fit.primitive.kind())
+                };
+                sw.stop(crate::stats::Phase::Refit);
+                if let Some(f) = refit
                     && f.rms <= tol
                 {
                     fit = f;
@@ -258,7 +421,11 @@ pub fn segment(mesh: &Mesh, opts: &SegmentOptions) -> Vec<Segment> {
         if region.len() < opts.min_triangles {
             continue;
         }
-        if let Some(f) = fit_tris(mesh, &normals, &region)
+        crate::stats::final_fit();
+        let sw = crate::stats::Stopwatch::start();
+        let last = fit_tris(mesh, &normals, &region);
+        sw.stop(crate::stats::Phase::Final);
+        if let Some(f) = last
             && f.rms <= tol
         {
             fit = f;
@@ -269,8 +436,13 @@ pub fn segment(mesh: &Mesh, opts: &SegmentOptions) -> Vec<Segment> {
         region.sort_unstable();
         out.push(Segment { triangles: region, primitive: fit.primitive, rms: fit.rms });
     }
+    let sw = crate::stats::Stopwatch::start();
     let out = relax_boundaries(mesh, &normals, &nb, out, tol);
-    merge_adjacent(mesh, &normals, &nb, out, tol)
+    sw.stop(crate::stats::Phase::Relax);
+    let sw = crate::stats::Stopwatch::start();
+    let merged = merge_adjacent(mesh, &normals, &nb, out, tol);
+    sw.stop(crate::stats::Phase::Merge);
+    merged
 }
 
 /// Mean corner distance of triangle `t` to `prim`, plus a small normal-disagreement term (tie
@@ -345,11 +517,17 @@ fn relax_boundaries(mesh: &Mesh, normals: &[Vec3], nb: &[[u32; 3]], mut segs: Ve
                 members[o as usize].push(t as u32);
             }
         }
-        for (i, tris) in members.into_iter().enumerate() {
-            if !touched[i] {
-                continue;
-            }
-            if let Some(f) = fit_tris(mesh, normals, &tris)
+        // regions keep their kind (a boundary move does not change it); independent refits run in parallel
+        let jobs: Vec<(usize, Vec<u32>, PrimitiveKind)> = members
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| touched[*i])
+            .map(|(i, tris)| (i, tris, segs[i].primitive.kind()))
+            .collect();
+        let fits =
+            surfacecraft_geom::par::map_slice(&jobs, |(_, tris, kind)| refit_kind_all(mesh, normals, tris, *kind));
+        for ((i, tris, _), f) in jobs.into_iter().zip(fits) {
+            if let Some(f) = f
                 && f.rms <= tol
             {
                 segs[i].primitive = f.primitive;
@@ -409,7 +587,18 @@ fn same_surface(a: &Primitive, b: &Primitive, tol: f64) -> bool {
 /// Merges adjacent segments describing the same surface whose union still fits one primitive
 /// about as well as the parts.
 fn merge_adjacent(mesh: &Mesh, normals: &[Vec3], nb: &[[u32; 3]], mut segs: Vec<Segment>, tol: f64) -> Vec<Segment> {
-    for _pass in 0..4 {
+    // pairs whose union was already refused (identified by first triangle and size of both
+    // parts): later passes must not repeat those fits
+    let mut refused: std::collections::HashSet<(u32, u32, usize, usize)> = std::collections::HashSet::new();
+    let key_of = |segs: &[Segment], a: usize, b: usize| {
+        (
+            segs[a].triangles.first().copied().unwrap_or(u32::MAX),
+            segs[b].triangles.first().copied().unwrap_or(u32::MAX),
+            segs[a].triangles.len(),
+            segs[b].triangles.len(),
+        )
+    };
+    for _pass in 0..64 {
         let mut owner = vec![u32::MAX; mesh.triangle_count()];
         for (i, s) in segs.iter().enumerate() {
             for &t in &s.triangles {
@@ -445,16 +634,20 @@ fn merge_adjacent(mesh: &Mesh, normals: &[Vec3], nb: &[[u32; 3]], mut segs: Vec<
         let mut merged_any = false;
         for ((a, b), _) in cand {
             let (a, b) = (a as usize, b as usize);
-            if busy[a] || busy[b] {
+            if busy[a] || busy[b] || refused.contains(&key_of(&segs, a, b)) {
                 continue;
             }
             let mut tris = segs[a].triangles.clone();
             tris.extend_from_slice(&segs[b].triangles);
-            let Some(f) = fit_tris(mesh, normals, &tris) else { continue };
+            let Some(f) = fit_tris(mesh, normals, &tris) else {
+                refused.insert(key_of(&segs, a, b));
+                continue;
+            };
             // the union must fit about as well as its parts did (not merely within the growth
             // tolerance), so merging never trades accuracy for fewer regions
             let limit = (segs[a].rms.max(segs[b].rms) * 1.25).max(0.25 * tol).min(tol);
             if f.rms > limit || f.primitive.kind() != segs[a].primitive.kind() {
+                refused.insert(key_of(&segs, a, b));
                 continue;
             }
             tris.sort_unstable();
@@ -510,6 +703,32 @@ mod tests {
         // nearly every triangle is assigned
         let assigned: usize = segs.iter().map(|s| s.triangles.len()).sum();
         assert!(assigned as f64 >= 0.9 * m.triangle_count() as f64, "{assigned} of {}", m.triangle_count());
+    }
+
+    /// An annular plane (a disc with a hole) is one plane region, not a chain of fragments
+    /// (merging runs to a fixed point).
+    #[test]
+    fn annular_plane_is_one_region() {
+        let full = synth::plane(Point3::new(-12.0, -12.0, 0.0), Vec3::x(), Vec3::y(), 24.0, 24.0, 160, 160);
+        let keep: Vec<u32> = (0..full.triangle_count())
+            .filter(|&i| {
+                full.face_centroid(i).is_some_and(|c| {
+                    let r = c.x.hypot(c.y);
+                    (4.0..=12.0).contains(&r)
+                })
+            })
+            .map(|i| i as u32)
+            .collect();
+        let mut m = full.submesh(&keep);
+        synth::add_noise(&mut m, 0.01, &mut Rng::new(5));
+        let segs = segment(&m, &SegmentOptions::default());
+        let planes: Vec<usize> =
+            segs.iter().filter(|s| s.primitive.kind() == PrimitiveKind::Plane).map(|s| s.triangles.len()).collect();
+        let total = m.triangle_count();
+        assert!(
+            planes.iter().copied().max().unwrap_or(0) as f64 >= 0.95 * total as f64,
+            "annulus fragmented: {planes:?} of {total}"
+        );
     }
 
     #[test]
