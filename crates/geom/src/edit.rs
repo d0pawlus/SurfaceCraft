@@ -12,7 +12,7 @@
 //! - decimation: quadric error metric edge collapse (Garland & Heckbert 1997) with boundary and
 //!   feature-edge constraint planes, link-condition and normal-flip checks;
 //! - smoothing: Taubin λ|μ (1995), boundary and sharp-edge vertices optionally fixed.
-use crate::{Mesh, Point3, Vec3, tri};
+use crate::{Bvh, Mesh, Point3, Vec3, tri};
 use nalgebra::{Matrix3, Matrix4, Vector4};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -95,7 +95,7 @@ pub fn remove_small_components(mesh: &mut Mesh, min_fraction: f64, min_triangles
 }
 
 /// Vertex → neighbouring vertices (one ring, unordered, no duplicates).
-fn vertex_rings(mesh: &Mesh) -> Vec<Vec<u32>> {
+pub(crate) fn vertex_rings(mesh: &Mesh) -> Vec<Vec<u32>> {
     let mut ring: Vec<Vec<u32>> = vec![Vec::new(); mesh.positions.len()];
     for t in &mesh.triangles {
         for k in 0..3 {
@@ -634,6 +634,33 @@ impl Default for DecimateOptions {
 
 /// Quadric edge-collapse decimation; returns the number of triangles removed.
 pub fn decimate(mesh: &mut Mesh, opts: &DecimateOptions) -> usize {
+    decimate_guarded(mesh, opts, None)
+}
+
+/// Measured guard of a collapse: the reduction of [`crate::reduce`] checks every collapse against
+/// the original surface instead of trusting the quadric alone (which overestimates the error of noisy
+/// data and ignores the sagitta inside a triangle).
+pub(crate) struct Guard<'a> {
+    /// The original surface.
+    pub bvh: &'a Bvh,
+    /// Per-vertex error budget (mm), indexed by the vertices of the mesh before the call; a collapse
+    /// is allowed only when the measured deviation is within the smaller budget of its two vertices,
+    /// and the merged vertex keeps that smaller budget.
+    pub budget: &'a mut Vec<f64>,
+}
+
+/// Collapses whose quadric error is below this fraction of the budget are not measured.
+const GUARD_SKIP: f64 = 0.25;
+/// With a guard, a collapse may not grow a vertex above this many neighbours (or above the valence
+/// it already has). Flat regions collapse at zero cost, and without the cap they pile up in a few
+/// hubs whose rings make every further collapse linear in the ring (minutes on a 100k-triangle block).
+const GUARD_VALENCE: usize = 32;
+
+/// [`decimate`] with an optional measured [`Guard`]; without one it is [`decimate`].
+pub(crate) fn decimate_guarded(mesh: &mut Mesh, opts: &DecimateOptions, mut guard: Option<Guard<'_>>) -> usize {
+    if guard.as_ref().is_some_and(|g| g.budget.len() != mesh.positions.len()) {
+        return 0;
+    }
     if mesh.validate().is_err() || mesh.triangles.len() <= opts.target_triangles.max(4) {
         return 0;
     }
@@ -768,9 +795,13 @@ pub fn decimate(mesh: &mut Mesh, opts: &DecimateOptions) -> usize {
         if common != shared.len() {
             continue;
         }
+        if guard.is_some() && na.len() + nb.len() - common - 2 > GUARD_VALENCE.max(na.len()).max(nb.len()) {
+            continue;
+        }
         let p = Point3::new(c.target[0], c.target[1], c.target[2]);
         // no flipped or degenerate faces around the new vertex
         let mut ok = true;
+        let mut fan: Vec<[Point3; 3]> = Vec::new();
         for &f in fa.iter().chain(fb.iter()) {
             if shared.contains(&f) {
                 continue;
@@ -779,6 +810,7 @@ pub fn decimate(mesh: &mut Mesh, opts: &DecimateOptions) -> usize {
             let old = tri::cross(&pos[t[0] as usize], &pos[t[1] as usize], &pos[t[2] as usize]);
             let corners: Vec<Point3> = t.iter().map(|&v| if v == a || v == b { p } else { pos[v as usize] }).collect();
             let new = tri::cross(&corners[0], &corners[1], &corners[2]);
+            fan.push([corners[0], corners[1], corners[2]]);
             if new.dot(&old) <= 0.0 || new.norm() < 1e-3 * old.norm() {
                 ok = false;
                 break;
@@ -792,6 +824,14 @@ pub fn decimate(mesh: &mut Mesh, opts: &DecimateOptions) -> usize {
         }
         if !ok {
             continue;
+        }
+        if let Some(g) = guard.as_ref() {
+            let limit = g.budget[a as usize].min(g.budget[b as usize]);
+            if c.cost > (GUARD_SKIP * limit).powi(2)
+                && !collapse_within(g.bvh, limit, &p, &[pos[a as usize], pos[b as usize]], &fan)
+            {
+                continue;
+            }
         }
         // collapse b into a
         for &f in &shared {
@@ -812,6 +852,9 @@ pub fn decimate(mesh: &mut Mesh, opts: &DecimateOptions) -> usize {
         vfaces[b as usize].clear();
         vfaces[a as usize].retain(|&f| alive_t[f as usize]);
         alive_v[b as usize] = false;
+        if let Some(g) = guard.as_mut() {
+            g.budget[a as usize] = g.budget[a as usize].min(g.budget[b as usize]);
+        }
         pos[a as usize] = p;
         let qb = q[b as usize];
         q[a as usize] += qb;
@@ -843,6 +886,22 @@ pub fn decimate(mesh: &mut Mesh, opts: &DecimateOptions) -> usize {
     mesh.triangles = tris;
     compact(mesh);
     before - mesh.triangles.len()
+}
+
+/// Is the surface after a collapse within `limit` of the original? Measured: the new vertex and the
+/// centroids of the new triangles (`fan`) against the original surface, and the two vertices
+/// that vanish (`old`) against the new triangles.
+fn collapse_within(original: &Bvh, limit: f64, p: &Point3, old: &[Point3], fan: &[[Point3; 3]]) -> bool {
+    if original.closest(p, limit).is_none() {
+        return false;
+    }
+    for t in fan {
+        let centroid = Point3::from((t[0].coords + t[1].coords + t[2].coords) / 3.0);
+        if original.closest(&centroid, limit).is_none() {
+            return false;
+        }
+    }
+    old.iter().all(|q| fan.iter().any(|t| (tri::closest_point(q, &t[0], &t[1], &t[2]) - q).norm() <= limit))
 }
 
 /// Taubin smoothing; `fix_boundary` keeps boundary vertices, `feature_angle_deg` keeps vertices on

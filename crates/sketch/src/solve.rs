@@ -213,6 +213,116 @@ pub fn solve(s: &mut Sketch) -> Result<SolveReport, SketchError> {
     Ok(SolveReport { status, dof, residual, iterations: it, redundant, conflicting, message })
 }
 
+/// Moves the unknowns (points and radii) of a solved sketch to minimise the sum of squares of
+/// `data` (residuals that depend on the sketch, such as the distances of scan samples from their
+/// entities) while every constraint stays satisfied: equality-constrained Gauss–Newton, each
+/// step a KKT solve, each trial projected back onto the constraints. Returns the final sum of
+/// squares; the sketch is left as it was when no step reduces it.
+pub fn polish(s: &mut Sketch, data: &dyn Fn(&Sketch) -> Vec<f64>) -> Result<f64, SketchError> {
+    s.validate()?;
+    let l = Layout::of(s);
+    let mut x = unknowns(s, &l);
+    let n = x.len();
+    let mut scratch = s.clone();
+    let mut eval = |x: &[f64]| {
+        write_back(&mut scratch, &l, x);
+        data(&scratch)
+    };
+    let sumsq = |v: &[f64]| v.iter().map(|a| a * a).sum::<f64>();
+    let mut r = eval(&x);
+    let mut cost = sumsq(&r);
+    if !cost.is_finite() || r.is_empty() || n == 0 {
+        return Ok(cost);
+    }
+    for _ in 0..40 {
+        let m = r.len();
+        let mut jd = DMatrix::<f64>::zeros(m, n);
+        let mut xp = x.clone();
+        for k in 0..n {
+            let h = 1e-6 * (1.0 + x.get(k).map_or(0.0, |v| v.abs()));
+            let orig = xp.get(k).copied().unwrap_or(0.0);
+            if let Some(v) = xp.get_mut(k) {
+                *v = orig + h;
+            }
+            let rp = eval(&xp);
+            if let Some(v) = xp.get_mut(k) {
+                *v = orig - h;
+            }
+            let rm = eval(&xp);
+            if let Some(v) = xp.get_mut(k) {
+                *v = orig;
+            }
+            for (i, (a, b)) in rp.iter().zip(&rm).enumerate().take(m) {
+                jd[(i, k)] = (a - b) / (2.0 * h);
+            }
+        }
+        let (f, _) = residuals(s, &l, &x);
+        let mc = f.len();
+        let jc = jacobian(s, &l, &x, mc);
+        let jt = jd.transpose();
+        let mut a = &jt * &jd;
+        let mu = 1e-9 * (1.0 + a.trace() / n as f64);
+        for k in 0..n {
+            a[(k, k)] += mu;
+        }
+        let g = &jt * DVector::from_column_slice(&r);
+        let mut kkt = DMatrix::<f64>::zeros(n + mc, n + mc);
+        kkt.view_mut((0, 0), (n, n)).copy_from(&a);
+        kkt.view_mut((0, n), (n, mc)).copy_from(&jc.transpose());
+        kkt.view_mut((n, 0), (mc, n)).copy_from(&jc);
+        for i in 0..mc {
+            kkt[(n + i, n + i)] = -1e-12;
+        }
+        let mut rhs = DVector::<f64>::zeros(n + mc);
+        rhs.rows_mut(0, n).copy_from(&(-g));
+        rhs.rows_mut(n, mc).copy_from(&(-DVector::from_vec(f)));
+        let Some(sol) = kkt.lu().solve(&rhs) else { break };
+        let mut t = 1.0;
+        let mut accepted = false;
+        for _ in 0..10 {
+            let mut xn: Vec<f64> = x.iter().enumerate().map(|(k, v)| v + t * sol[k]).collect();
+            restore(s, &l, &mut xn);
+            let rn = eval(&xn);
+            let cn = sumsq(&rn);
+            if cn.is_finite() && cn < cost {
+                let gain = cost - cn;
+                (x, r, cost) = (xn, rn, cn);
+                accepted = true;
+                if gain < 1e-10 * cost.max(1e-30) {
+                    accepted = false;
+                }
+                break;
+            }
+            t *= 0.5;
+        }
+        if !accepted {
+            break;
+        }
+    }
+    write_back(s, &l, &x);
+    Ok(cost)
+}
+
+/// Newton steps of least norm that bring `x` back onto the constraints.
+fn restore(s: &Sketch, l: &Layout, x: &mut [f64]) {
+    for _ in 0..8 {
+        let (f, _) = residuals(s, l, x);
+        if max_abs(&f) < 1e-11 || f.is_empty() {
+            break;
+        }
+        let jc = jacobian(s, l, x, f.len());
+        let mut jjt = &jc * jc.transpose();
+        for k in 0..f.len() {
+            jjt[(k, k)] += 1e-12;
+        }
+        let Some(y) = jjt.lu().solve(&DVector::from_vec(f)) else { break };
+        let dx = -(jc.transpose() * y);
+        for (xi, d) in x.iter_mut().zip(dx.iter()) {
+            *xi += d;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -25,6 +25,7 @@ pub mod mesh;
 pub mod plan;
 pub mod primitive;
 pub mod quad;
+pub mod refit;
 pub mod region;
 pub mod section;
 pub mod sketch;
@@ -129,6 +130,7 @@ static REGISTRY: LazyLock<Vec<CommandSpec>> = LazyLock::new(|| {
     v.extend_from_slice(mesh::COMMANDS);
     v.extend_from_slice(primitive::COMMANDS);
     v.extend_from_slice(quad::COMMANDS);
+    v.extend_from_slice(refit::COMMANDS);
     v.extend_from_slice(region::COMMANDS);
     v.extend_from_slice(section::COMMANDS);
     v.extend_from_slice(sketch::COMMANDS);
@@ -154,9 +156,14 @@ const HEAVY: &[&str] = &[
     "align.icp",
     "body.from_regions",
     "body.plan_regions",
+    "body.refit_faces",
+    "body.refit_features",
     "body.to_mesh",
     "deviation.compute",
+    "deviation.hotspots",
     "deviation.noise",
+    "deviation.stats",
+    "deviation.to_primitive",
     "export.iges",
     "export.section_sheet",
     "export.step",
@@ -177,6 +184,7 @@ const HEAVY: &[&str] = &[
     "region.auto_segment",
     "region.grow",
     "section.stack",
+    "sketch.fit_chains",
     "surface.auto",
     "surface.fit",
     "surface.thicken",

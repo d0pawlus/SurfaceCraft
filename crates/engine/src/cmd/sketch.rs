@@ -5,7 +5,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use surfacecraft_doc::{ObjectId, ObjectKind};
 use surfacecraft_geom::{Point3, Vec3, section::section};
-use surfacecraft_sketch::{Constraint, Entity, Sketch, SketchPlane, SolveReport, fit2d::fit_polyline, solve};
+use surfacecraft_sketch::{
+    Constraint, Entity, Sketch, SketchPlane, SolveReport,
+    chains::{Chain2, ChainOptions, ChainReport, fit_chains},
+    fit2d::fit_polyline,
+    solve,
+};
 
 /// A sketch as reported.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -316,6 +321,114 @@ fn from_section(s: &mut Session, i: SectionIn) -> CmdResult<SketchOut> {
     resolve(s, id)
 }
 
+/// Chain-fit parameters.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FitChainsIn {
+    /// Mesh.
+    pub mesh: ObjRef,
+    /// Section plane origin.
+    pub origin: [f64; 3],
+    /// Section plane normal.
+    pub normal: [f64; 3],
+    /// Fit tolerance (mm): RMS bound of a line or arc and of the chain after its relations (the
+    /// maximum may be three times as large). Default `max(0.05, 2 × noise_sigma)`.
+    #[serde(default)]
+    pub tolerance: Option<f64>,
+    /// Noise of the scan (mm, default 0), from which the default tolerance follows.
+    #[serde(default)]
+    pub noise_sigma: Option<f64>,
+    /// Angle within which lines count as horizontal, vertical, parallel or perpendicular, and
+    /// three times within which a junction counts as tangent (degrees, default 1).
+    #[serde(default)]
+    pub angle_tolerance_degrees: Option<f64>,
+    /// Turn the sketch frame to the dominant line direction when the lines lie within 5 degrees of
+    /// the axes (default true), so a part scanned a little off the plane axes still gets
+    /// horizontal and vertical lines.
+    #[serde(default)]
+    pub align_frame: Option<bool>,
+    /// Name.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// Most section chains fitted in one call (the longest, closed ones first).
+const MAX_CHAINS: usize = 64;
+
+/// Chain-fit result.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct FitChainsOut {
+    /// The sketch.
+    pub sketch: SketchOut,
+    /// Tolerance used (mm).
+    pub tolerance: f64,
+    /// Angle tolerance used (degrees).
+    pub angle_tolerance_degrees: f64,
+    /// How far the sketch frame was turned to the part's axes (degrees).
+    pub frame_rotation_degrees: f64,
+    /// Section chains beyond the 64 fitted.
+    pub chains_not_fitted: usize,
+    /// One report per fitted chain (closed first, longest first): entities, relations kept and
+    /// refused with reasons, deviation before and after the relations, solve status.
+    pub chains: Vec<ChainReport>,
+}
+
+fn fit_chains_cmd(s: &mut Session, i: FitChainsIn) -> CmdResult<FitChainsOut> {
+    let mesh = i.mesh.resolve(s, ObjectKind::Mesh)?;
+    let m = s.doc.mesh(mesh).map(|m| m.mesh.clone()).ok_or_else(|| CmdError::Params(format!("no mesh {mesh}")))?;
+    let pl = SketchPlane::from_normal(i.origin, i.normal)
+        .filter(SketchPlane::is_valid)
+        .ok_or_else(|| CmdError::Params("section plane must be finite with a non-zero normal".into()))?;
+    let sigma = i.noise_sigma.unwrap_or(0.0);
+    if !(sigma.is_finite() && (0.0..=1e6).contains(&sigma)) {
+        return Err(CmdError::Params("noise_sigma must be finite and not negative".into()));
+    }
+    let tol = i.tolerance.unwrap_or_else(|| ChainOptions::tolerance_for_noise(sigma));
+    if !(tol.is_finite() && tol > 0.0 && tol <= 1e6) {
+        return Err(CmdError::Params("tolerance must be positive".into()));
+    }
+    let angle = i.angle_tolerance_degrees.unwrap_or(1.0);
+    if !(angle.is_finite() && angle > 0.0 && angle <= 20.0) {
+        return Err(CmdError::Params("angle_tolerance_degrees must be in (0, 20]".into()));
+    }
+    let polys = section(&m, &Point3::from(i.origin), &Vec3::from(i.normal));
+    if polys.is_empty() {
+        return Err(CmdError::Failed("the plane does not cut the mesh".into()));
+    }
+    let len = |p: &surfacecraft_geom::section::Polyline| p.points.windows(2).map(|w| (w[1] - w[0]).norm()).sum::<f64>();
+    let mut order: Vec<(bool, f64, usize)> = polys.iter().enumerate().map(|(k, p)| (p.closed, len(p), k)).collect();
+    order.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.total_cmp(&a.1)));
+    let chains_not_fitted = order.len().saturating_sub(MAX_CHAINS);
+    let chains: Vec<Chain2> = order
+        .iter()
+        .take(MAX_CHAINS)
+        .filter_map(|(closed, _, k)| {
+            polys.get(*k).map(|p| Chain2 { points: p.points.iter().map(|q| pl.to_2d(q)).collect(), closed: *closed })
+        })
+        .collect();
+    let opts =
+        ChainOptions { tolerance: tol, angle_tolerance_degrees: angle, align_frame: i.align_frame.unwrap_or(true) };
+    let fit = fit_chains(&pl, &chains, &opts);
+    if fit.sketch.entities.is_empty() {
+        let why = fit.chains.iter().find_map(|c| c.note.clone()).unwrap_or_default();
+        return Err(CmdError::Failed(format!("no lines or arcs could be fitted to the section: {why}")));
+    }
+    let frame = fit.frame_rotation_degrees;
+    let id = s.doc.add_sketch(i.name.as_deref().unwrap_or("section"), fit.sketch);
+    if let Some(o) = s.doc.sketch_mut(id) {
+        o.report = Some(fit.report);
+    }
+    let failed = crate::replay::replay(s);
+    Ok(FitChainsOut {
+        sketch: out(s, id, failed)?,
+        tolerance: tol,
+        angle_tolerance_degrees: angle,
+        frame_rotation_degrees: frame,
+        chains_not_fitted,
+        chains: fit.chains,
+    })
+}
+
 /// `sketch.*` commands.
 pub static COMMANDS: &[CommandSpec] = &[
     command!(
@@ -367,6 +480,16 @@ pub static COMMANDS: &[CommandSpec] = &[
         SketchIn,
         SketchOut,
         solve_cmd
+    ),
+    command!(
+        "sketch.fit_chains",
+        "Fit section chains",
+        "Sketch",
+        true,
+        "Cuts `mesh` with a plane and fits every section chain into connected lines and arcs (split and merge within `tolerance`, closed chains stay closed), then adds the relations that hold within the tolerance (horizontal, vertical, tangent, concentric, collinear, equal radius, parallel, perpendicular) without over-defining the sketch; reports per chain the relations kept and refused and the deviation before and after.",
+        FitChainsIn,
+        FitChainsOut,
+        fit_chains_cmd
     ),
     command!(
         "sketch.from_section",
