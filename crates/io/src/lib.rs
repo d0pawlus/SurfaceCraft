@@ -12,11 +12,31 @@
     clippy::unreachable
 )]
 
+pub mod dxf;
 pub mod iges;
 pub mod mesh;
 pub mod step;
+pub mod svg;
 
 pub use mesh::{Limits, MeshFormat, Scan, read_mesh, read_points, read_scan, write_mesh};
+
+/// A polyline of a 2-D drawing, in plane coordinates (millimetres).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DrawPath {
+    /// Points in order (a path with fewer than two points is not written).
+    pub points: Vec<[f64; 2]>,
+    /// Does the path close on itself?
+    pub closed: bool,
+}
+
+/// One named layer of a 2-D drawing (a section level).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DrawLayer {
+    /// Layer name; characters the target format does not allow are replaced.
+    pub name: String,
+    /// The paths of the layer.
+    pub paths: Vec<DrawPath>,
+}
 
 /// Why a file could not be read or written.
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
