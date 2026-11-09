@@ -35,6 +35,44 @@ struct Globals {
     view_proj: [[f32; 4]; 4],
     eye: [f32; 4],
     light: [f32; 4],
+    /// Clip plane `(n, d)` in the shifted space: fragments with `n · p > d` are discarded.
+    clip: [f32; 4],
+}
+
+/// What a frame adds to the objects: a clip plane and preview motions.
+#[derive(Clone, Debug, Default)]
+pub struct Overlay {
+    /// Clip plane `(nx, ny, nz, d)` in world coordinates (fragments with `n · p > d` are
+    /// discarded); all zero = no clipping.
+    pub clip: [f64; 4],
+    /// Preview motion of drawn items by `DrawItem::key`: row-major rigid world transforms (an
+    /// object being dragged by the gizmo is drawn moved without touching its mesh).
+    pub models: Vec<(usize, [[f64; 4]; 4])>,
+}
+
+/// A world-space model matrix as the shader takes it for vertices stored relative to `origin`:
+/// column-major, with the shift folded in (`p' = M (q + o) - o`).
+fn shifted_model(rows: &[[f64; 4]; 4], o: &Point3) -> [[f32; 4]; 4] {
+    let oo = [o.x, o.y, o.z];
+    let mut out = [[0f32; 4]; 4];
+    for r in 0..3 {
+        for c in 0..3 {
+            out[c][r] = rows[r][c] as f32;
+        }
+        let rot_o = rows[r][0] * oo[0] + rows[r][1] * oo[1] + rows[r][2] * oo[2];
+        out[3][r] = (rot_o + rows[r][3] - oo[r]) as f32;
+    }
+    out[3][3] = 1.0;
+    out
+}
+
+/// The identity as a world row-major matrix.
+fn identity_rows() -> [[f64; 4]; 4] {
+    let mut m = [[0f64; 4]; 4];
+    for (i, row) in m.iter_mut().enumerate() {
+        row[i] = 1.0;
+    }
+    m
 }
 
 /// One object to draw this frame.
@@ -67,9 +105,14 @@ pub struct Frame {
     pub items: Vec<DrawItem>,
     /// Background colour.
     pub background: [f64; 3],
+    /// Clip plane and preview motions.
+    pub overlay: Overlay,
 }
 
 struct GpuMesh {
+    /// Preview motion (column-major mat4 uniform) and its bind group.
+    model_buf: wgpu::Buffer,
+    model_bind: wgpu::BindGroup,
     /// Positions and normals.
     vb: wgpu::Buffer,
     /// Colours, a separate stream so a colour change is one `write_buffer`.
@@ -105,6 +148,9 @@ pub struct Renderer {
     blit_pipeline: wgpu::RenderPipeline,
     globals: wgpu::Buffer,
     globals_bind: wgpu::BindGroup,
+    model_layout: wgpu::BindGroupLayout,
+    /// Bind group of the identity model matrix (axes, anything not moved).
+    identity_bind: wgpu::BindGroup,
     blit_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     meshes: HashMap<usize, GpuMesh>,
@@ -172,9 +218,32 @@ impl Renderer {
             layout: &globals_layout,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() }],
         });
+        let model_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("model"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let identity_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("identity model"),
+            contents: bytemuck::cast_slice(&shifted_model(&identity_rows(), &Point3::origin())),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let identity_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("identity model"),
+            layout: &model_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: identity_buf.as_entire_binding() }],
+        });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mesh"),
-            bind_group_layouts: &[Some(&globals_layout)],
+            bind_group_layouts: &[Some(&globals_layout), Some(&model_layout)],
             immediate_size: 0,
         });
         let geo_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
@@ -307,6 +376,8 @@ impl Renderer {
             blit_pipeline,
             globals,
             globals_bind,
+            model_layout,
+            identity_bind,
             blit_layout,
             sampler,
             meshes: HashMap::new(),
@@ -359,7 +430,12 @@ impl Renderer {
         self.target = Some(Target { size, color, color_view, depth_view, bind });
     }
 
-    fn upload(device: &wgpu::Device, item: &DrawItem, origin: &Point3) -> GpuMesh {
+    fn upload(
+        device: &wgpu::Device,
+        model_layout: &wgpu::BindGroupLayout,
+        item: &DrawItem,
+        origin: &Point3,
+    ) -> GpuMesh {
         let m = &item.mesh;
         let normals = m.vertex_normals();
         let verts: Vec<Geo> = m
@@ -389,7 +465,19 @@ impl Renderer {
             contents: bytemuck::cast_slice(&indices),
             usage: wgpu::BufferUsages::INDEX,
         });
+        let model_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("mesh model"),
+            contents: bytemuck::cast_slice(&shifted_model(&identity_rows(), origin)),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let model_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mesh model"),
+            layout: model_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: model_buf.as_entire_binding() }],
+        });
         GpuMesh {
+            model_buf,
+            model_bind,
             vb,
             cb,
             ib,
@@ -441,12 +529,14 @@ impl Renderer {
             let k = item.key;
             let fresh = self.meshes.get(&k).is_none_or(|g| g.origin != o || g.vertices != item.mesh.positions.len());
             if fresh {
-                let g = Self::upload(device, item, &f.origin);
+                let g = Self::upload(device, &self.model_layout, item, &f.origin);
                 self.meshes.insert(k, g);
                 self.uploads += 1;
             }
             if let Some(g) = self.meshes.get_mut(&k) {
                 g.used = true;
+                let rows = f.overlay.models.iter().find(|(mk, _)| *mk == k).map_or_else(identity_rows, |(_, m)| *m);
+                queue.write_buffer(&g.model_buf, 0, bytemuck::cast_slice(&shifted_model(&rows, &f.origin)));
                 let st = color_state(&item.color, item.colors.is_some(), item.colors_key);
                 if g.color_state != st {
                     queue.write_buffer(&g.cb, 0, bytemuck::cast_slice(&colors_of(item)));
@@ -473,6 +563,7 @@ impl Renderer {
             view_proj,
             eye: [eye.x as f32, eye.y as f32, eye.z as f32, 1.0],
             light: [light.x as f32, light.y as f32, light.z as f32, 0.0],
+            clip: crate::sectionview::shifted_plane(&f.overlay.clip, &f.origin),
         };
         queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&g));
         // axis triad at the world origin, sized to the view
@@ -516,6 +607,7 @@ impl Renderer {
         pass.set_pipeline(&self.mesh_pipeline);
         for k in &self.draw_list {
             if let Some(g) = self.meshes.get(k) {
+                pass.set_bind_group(1, &g.model_bind, &[]);
                 pass.set_vertex_buffer(0, g.vb.slice(..));
                 pass.set_vertex_buffer(1, g.cb.slice(..));
                 pass.set_index_buffer(g.ib.slice(..), wgpu::IndexFormat::Uint32);
@@ -528,11 +620,13 @@ impl Renderer {
             if let Some(g) = self.meshes.get(k)
                 && let Some(ib) = &g.hl_ib
             {
+                pass.set_bind_group(1, &g.model_bind, &[]);
                 pass.set_vertex_buffer(0, g.vb.slice(..));
                 pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..g.hl_count, 0, 0..1);
             }
         }
+        pass.set_bind_group(1, &self.identity_bind, &[]);
         pass.set_pipeline(&self.line_pipeline);
         pass.set_vertex_buffer(0, self.axes.slice(..));
         pass.set_vertex_buffer(1, self.axes_colors.slice(..));
@@ -712,6 +806,7 @@ mod tests {
                 highlight: None,
             }],
             background: [0.0, 0.0, 1.0],
+            overlay: Default::default(),
         };
         let Some(px) = render_offscreen(&frame) else {
             eprintln!("skipping: no GPU adapter");
@@ -747,6 +842,7 @@ mod tests {
             camera: camera.clone(),
             items: vec![i],
             background: [0.0, 0.0, 1.0],
+            overlay: Default::default(),
         };
         let Some((device, queue)) = headless_device() else {
             eprintln!("skipping: no GPU adapter");

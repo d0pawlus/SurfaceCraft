@@ -13,17 +13,23 @@
 )]
 
 pub mod app;
+pub mod brep;
 pub mod camera;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod control;
 pub mod dock;
+pub mod gizmo;
 pub mod i18n;
 pub mod icons;
+pub mod sectionview;
+pub mod select;
 pub mod settings;
 pub mod shell;
 pub mod shot;
 pub mod theme;
+pub mod viewcube;
 pub mod viewport;
+pub mod viewtools;
 #[cfg(target_arch = "wasm32")]
 pub mod web;
 

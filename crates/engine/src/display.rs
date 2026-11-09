@@ -33,6 +33,55 @@ pub struct DisplayItem {
     pub pick_key: usize,
     /// How `mesh` derives from `pick_mesh` (`None` when drawn at full resolution).
     pub lod: Option<Arc<Lod>>,
+    /// B-rep identities of a body's display mesh (faces and edges the viewport can pick).
+    pub topo: Option<Arc<BodyTopo>>,
+}
+
+/// What of a body's B-rep the viewport can pick: the face of every display triangle (grouped
+/// into per-face triangle ranges) and the edge polylines, indexed as in the body record, so the
+/// indices go straight into the `edges` / `faces` parameters of feature commands.
+#[derive(Clone, Debug, Default)]
+pub struct BodyTopo {
+    /// B-rep face of every triangle of the display mesh.
+    pub tri_face: Vec<u32>,
+    /// `(face, first triangle, one past the last)` for each run of triangles of one face.
+    pub face_ranges: Vec<(u32, u32, u32)>,
+    /// Edge polylines in the body's edge order.
+    pub edges: Vec<Vec<surfacecraft_geom::Point3>>,
+}
+
+impl BodyTopo {
+    /// Builds the per-face ranges from the per-triangle face list.
+    #[must_use]
+    pub fn new(tri_face: Vec<u32>, edges: Vec<Vec<surfacecraft_geom::Point3>>) -> Self {
+        let mut face_ranges: Vec<(u32, u32, u32)> = Vec::new();
+        for (i, &f) in tri_face.iter().enumerate() {
+            let i = i as u32;
+            match face_ranges.last_mut() {
+                Some(r) if r.0 == f && r.2 == i => r.2 = i + 1,
+                _ => face_ranges.push((f, i, i + 1)),
+            }
+        }
+        Self { tri_face, face_ranges, edges }
+    }
+
+    /// The face of triangle `t`.
+    #[must_use]
+    pub fn face_of(&self, t: u32) -> Option<u32> {
+        self.tri_face.get(t as usize).copied()
+    }
+
+    /// The display triangles of the given faces (ascending).
+    #[must_use]
+    pub fn triangles_of_faces(&self, faces: &[usize]) -> Vec<u32> {
+        let mut out = Vec::new();
+        for &(f, a, b) in &self.face_ranges {
+            if faces.contains(&(f as usize)) {
+                out.extend(a..b);
+            }
+        }
+        out
+    }
 }
 
 impl DisplayItem {
@@ -40,7 +89,18 @@ impl DisplayItem {
     #[must_use]
     pub fn plain(id: ObjectId, kind: ObjectKind, mesh: Arc<Mesh>) -> Self {
         let key = Arc::as_ptr(&mesh) as usize;
-        Self { id, kind, key, colors: None, colors_key: 0, pick_mesh: mesh.clone(), pick_key: key, lod: None, mesh }
+        Self {
+            id,
+            kind,
+            key,
+            colors: None,
+            colors_key: 0,
+            pick_mesh: mesh.clone(),
+            pick_key: key,
+            lod: None,
+            topo: None,
+            mesh,
+        }
     }
 
     /// Drawn triangles for a selection of full-resolution triangle ids.
@@ -56,7 +116,7 @@ impl DisplayItem {
 /// Caches of derived display data.
 #[derive(Debug, Default)]
 pub struct TessCache {
-    entries: HashMap<ObjectId, (usize, Arc<Mesh>)>,
+    entries: HashMap<ObjectId, (usize, Arc<Mesh>, Arc<BodyTopo>)>,
     region_colors: HashMap<ObjectId, (u64, Arc<Vec<[f32; 4]>>)>,
     quads: HashMap<ObjectId, (u64, Arc<Mesh>)>,
     /// Display level of detail per scan: (mesh pointer, budget, lod, lod mesh).
@@ -212,21 +272,26 @@ impl Session {
                 pick_mesh: mesh,
                 pick_key,
                 lod: lod.map(|(l, _)| l),
+                topo: None,
             });
         }
         let live: Vec<ObjectId> = self.doc.bodies.iter().map(|b| b.id).collect();
         self.tess.entries.retain(|id, _| live.contains(id));
         for b in self.doc.bodies.iter().filter(|b| b.visible) {
             let key = Arc::as_ptr(&b.brep) as usize;
-            let mesh = match self.tess.entries.get(&b.id) {
-                Some((k, m)) if *k == key => m.clone(),
+            let (mesh, topo) = match self.tess.entries.get(&b.id) {
+                Some((k, m, t)) if *k == key => (m.clone(), t.clone()),
                 _ => {
-                    let m = Arc::new(surfacecraft_kernel::tess::tessellate(&b.brep, None).unwrap_or_default());
-                    self.tess.entries.insert(b.id, (key, m.clone()));
-                    m
+                    let tm = surfacecraft_kernel::tess::tessellate_topo(&b.brep, None).unwrap_or_default();
+                    let topo = Arc::new(BodyTopo::new(tm.tri_face, tm.edges));
+                    let m = Arc::new(tm.mesh);
+                    self.tess.entries.insert(b.id, (key, m.clone(), topo.clone()));
+                    (m, topo)
                 }
             };
-            out.push(DisplayItem::plain(b.id, ObjectKind::Body, mesh));
+            let mut item = DisplayItem::plain(b.id, ObjectKind::Body, mesh);
+            item.topo = Some(topo);
+            out.push(item);
         }
         for o in self.doc.surfaces.iter().filter(|o| o.visible) {
             out.push(DisplayItem::plain(o.id, ObjectKind::Surface, o.display.clone()));
