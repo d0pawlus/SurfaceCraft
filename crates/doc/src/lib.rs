@@ -19,7 +19,7 @@ pub mod format;
 pub mod history;
 pub mod object;
 
-pub use feature::{BoolOp, FeatureObject, FeatureOp, Mode, SketchObject};
+pub use feature::{BoolOp, FeatureObject, FeatureOp, Mode, Side, SketchObject};
 pub use history::History;
 pub use object::{
     BodyObject, Document, MeshObject, Object, ObjectId, ObjectKind, ObjectSummary, PrimitiveObject, QuadObject,

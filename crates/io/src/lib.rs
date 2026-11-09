@@ -16,7 +16,7 @@ pub mod iges;
 pub mod mesh;
 pub mod step;
 
-pub use mesh::{Limits, MeshFormat, read_mesh, write_mesh};
+pub use mesh::{Limits, MeshFormat, Scan, read_mesh, read_points, read_scan, write_mesh};
 
 /// Why a file could not be read or written.
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]

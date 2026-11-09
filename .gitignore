@@ -9,3 +9,6 @@ analyze-*.txt
 /target/
 /apps/surfacecraft-web/dist/
 *.profraw
+
+# Installers and release binaries (cargo xtask dist): not committed
+/dist/

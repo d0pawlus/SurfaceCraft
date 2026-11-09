@@ -14,11 +14,13 @@
 
 pub mod aabb;
 pub mod bvh;
+pub mod cloud;
 pub mod edit;
 pub mod kdtree;
 pub mod lod;
 pub mod mesh;
 pub mod par;
+pub mod recon;
 pub mod rng;
 pub mod section;
 pub mod synth;
@@ -27,8 +29,10 @@ pub mod tri;
 
 pub use aabb::Aabb;
 pub use bvh::{Bvh, SurfaceHit};
+pub use cloud::{CloudError, PointCloud};
 pub use kdtree::KdTree;
 pub use mesh::{Mesh, MeshError, PointSource, TriangleSource};
+pub use recon::{ReconError, ReconParams, ReconReport, reconstruct};
 pub use rng::Rng;
 pub use transform::Transform;
 
