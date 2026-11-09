@@ -18,8 +18,13 @@ const CONTAINERS: &[(&str, usize)] = &[("CentralPanel::", 1), ("DockArea::new(",
 fn code_of(source: &str) -> String {
     let mut out = String::new();
     for line in source.lines() {
-        if line.trim_start().starts_with("#[cfg(test)]") {
+        let t = line.trim_start();
+        if t.starts_with("#[cfg(test)]") || t.starts_with("#[cfg(all(test") {
             break;
+        }
+        // a vector that only looks like a colour (a unit direction) says so
+        if line.contains("// not a colour") {
+            continue;
         }
         let code = line.split("//").next().unwrap_or("");
         out.push_str(code);
@@ -34,7 +39,9 @@ fn raw_colour(line: &str) -> Option<String> {
     while let Some(i) = rest.find("Color32::") {
         let after = &rest[i + "Color32::".len()..];
         let ident: String = after.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
-        if ident.starts_with("from_") || (!ident.is_empty() && ident.chars().all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())) {
+        if ident.starts_with("from_")
+            || (!ident.is_empty() && ident.chars().all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit()))
+        {
             return Some(format!("Color32::{ident}"));
         }
         rest = after;
@@ -48,8 +55,11 @@ fn raw_colour(line: &str) -> Option<String> {
         let after = &s[open + 1..];
         if let Some(close) = after.find(']') {
             let items: Vec<&str> = after[..close].split(',').map(str::trim).collect();
-            let floats: Vec<f32> =
-                items.iter().filter(|t| t.contains('.')).filter_map(|t| t.trim_end_matches("f32").parse::<f32>().ok()).collect();
+            let floats: Vec<f32> = items
+                .iter()
+                .filter(|t| t.contains('.'))
+                .filter_map(|t| t.trim_end_matches("f32").parse::<f32>().ok())
+                .collect();
             if (items.len() == 3 || items.len() == 4)
                 && floats.len() == items.len()
                 && floats.iter().all(|f| (0.0..=1.0).contains(f))
@@ -105,11 +115,7 @@ pub(crate) fn check() -> Result<(), String> {
             errors.push(format!("{} uses of `{pat}` in {SRC} (at most {max}: one outer container)", counts[k]));
         }
     }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.join("\n"))
-    }
+    if errors.is_empty() { Ok(()) } else { Err(errors.join("\n")) }
 }
 
 #[cfg(test)]

@@ -81,6 +81,7 @@ impl Density {
                 icon: 16.0,
                 tab_height: 24.0,
                 side_dock_width: 240.0,
+                panel_padding: 4.0,
             },
             Density::Comfortable => Metrics {
                 item_spacing: Vec2::new(8.0, 5.0),
@@ -90,6 +91,7 @@ impl Density {
                 icon: 18.0,
                 tab_height: 28.0,
                 side_dock_width: 280.0,
+                panel_padding: 8.0,
             },
         }
     }
@@ -110,6 +112,8 @@ pub struct Metrics {
     pub icon: f32,
     /// Height of a dock tab.
     pub tab_height: f32,
+    /// Space between a panel's edge and its content.
+    pub panel_padding: f32,
     /// Default width of a side dock column.
     pub side_dock_width: f32,
 }
@@ -174,6 +178,7 @@ tokens! {
     ObjectSurface => "object.surface",
     ObjectQuad => "object.quad",
     ObjectSketch => "object.sketch",
+    Highlight => "object.highlight",
     AxisX => "axis.x",
     AxisY => "axis.y",
     AxisZ => "axis.z",
@@ -196,6 +201,7 @@ fn raw(preset: Preset, token: Token) -> [u8; 4] {
             ObjectSurface => [140, 217, 242, 204],
             ObjectQuad => [230, 102, 230, 89],
             ObjectSketch => [255, 255, 77, 255],
+            Highlight => [255, 140, 26, 255],
             AxisX => [230, 51, 51, 255],
             AxisY => [51, 204, 51, 255],
             AxisZ => [64, 102, 242, 255],
@@ -309,7 +315,12 @@ impl Tokens {
     /// The colour a token means in this preset.
     #[must_use]
     pub fn color(&self, token: Token) -> Color32 {
-        Token::ALL.iter().position(|&t| t == token).and_then(|i| self.colors.get(i)).copied().unwrap_or(Color32::TRANSPARENT)
+        Token::ALL
+            .iter()
+            .position(|&t| t == token)
+            .and_then(|i| self.colors.get(i))
+            .copied()
+            .unwrap_or(Color32::TRANSPARENT)
     }
 
     /// The token as straight-alpha RGBA in 0..1, the form the viewport's renderer takes.

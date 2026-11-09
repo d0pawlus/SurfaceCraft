@@ -4,7 +4,8 @@
 //! ([`crate::app`]); this module owns only identity, arrangement and persistence.
 use crate::app::SurfaceCraftApp;
 use craft_ui::docking::{
-    Action, Column, DockContent, DockHeights, Group, Layout, Node, PanelLimits, Permissions, Side, Workspace as CraftWorkspace,
+    Action, Column, DockContent, DockHeights, Group, Layout, Node, PanelLimits, Permissions, Side,
+    Workspace as CraftWorkspace,
 };
 use craft_ui::layout::{SplitAxis, SplitSize};
 use serde::{Deserialize, Serialize};
@@ -31,8 +32,15 @@ pub enum Panel {
 
 impl Panel {
     /// Every panel, in menu order.
-    pub const ALL: [Panel; 7] =
-        [Panel::Viewport, Panel::Objects, Panel::History, Panel::Properties, Panel::Regions, Panel::Deviation, Panel::Log];
+    pub const ALL: [Panel; 7] = [
+        Panel::Viewport,
+        Panel::Objects,
+        Panel::History,
+        Panel::Properties,
+        Panel::Regions,
+        Panel::Deviation,
+        Panel::Log,
+    ];
 
     /// The catalogue key of the panel's title.
     #[must_use]
@@ -99,7 +107,8 @@ fn dock(side: Side, width: f32, groups: &[&[Panel]]) -> Node<Panel> {
 /// the viewport over the log in the middle, properties over regions and deviation on the right.
 #[must_use]
 pub fn default_workspace(side_width: f32) -> Workspace {
-    let centre = split(SplitAxis::Vertical, SplitSize::FixedSecond(150.0), tabs(&[Panel::Viewport]), tabs(&[Panel::Log]));
+    let centre =
+        split(SplitAxis::Vertical, SplitSize::FixedSecond(150.0), tabs(&[Panel::Viewport]), tabs(&[Panel::Log]));
     let right = dock(Side::End, side_width + 40.0, &[&[Panel::Properties], &[Panel::Regions, Panel::Deviation]]);
     let left = dock(Side::Start, side_width, &[&[Panel::Objects], &[Panel::History]]);
     Workspace::new(Layout {
@@ -117,7 +126,9 @@ pub fn default_workspace(side_width: f32) -> Workspace {
 /// file gives the default arrangement; the viewport is always shown.
 pub fn reconcile(workspace: &mut Workspace, default: &Workspace) {
     workspace.reconcile(|p| Panel::ALL.contains(p), permissions, default);
-    if !workspace.layout.contains(&Panel::Viewport) || workspace.layout.floating.iter().any(|w| w.contains(&Panel::Viewport)) {
+    if !workspace.layout.contains(&Panel::Viewport)
+        || workspace.layout.floating.iter().any(|w| w.contains(&Panel::Viewport))
+    {
         *workspace = default.clone();
     }
 }
@@ -147,15 +158,21 @@ pub struct Panels<'a> {
 
 impl DockContent<Panel> for Panels<'_> {
     fn body(&mut self, ui: &mut egui::Ui, panel: &Panel) {
-        match panel {
-            Panel::Viewport => self.app.viewport_panel(ui),
+        if *panel == Panel::Viewport {
+            self.app.viewport_panel(ui);
+            return;
+        }
+        // panel content sits inside the density's padding
+        let pad = self.app.settings.theme.density.metrics().panel_padding;
+        egui::Frame::NONE.inner_margin(egui::Margin::same(pad.round() as i8)).show(ui, |ui| match panel {
             Panel::Objects => scroll(ui, "dock-objects", |ui| self.app.objects_panel(ui)),
             Panel::History => scroll(ui, "dock-history", |ui| self.app.history_panel(ui)),
             Panel::Properties => scroll(ui, "dock-properties", |ui| self.app.palette_panel(ui)),
             Panel::Regions => scroll(ui, "dock-regions", |ui| self.app.regions_panel(ui)),
             Panel::Deviation => scroll(ui, "dock-deviation", |ui| self.app.deviation_panel(ui)),
             Panel::Log => self.app.log_panel(ui),
-        }
+            Panel::Viewport => {}
+        });
     }
 
     fn logical_label(&self, panel: &Panel) -> String {
@@ -176,8 +193,14 @@ impl DockContent<Panel> for Panels<'_> {
     }
 
     fn dock_heights(&self, panel: &Panel) -> Option<DockHeights> {
-        // The object tree keeps more room than the history under it.
-        (*panel == Panel::Objects).then(|| DockHeights::new(360.0))
+        // The object tree keeps more room than the history under it; the properties (command
+        // list, parameters, assistant) take the right dock's height, regions and deviation the rest.
+        match panel {
+            Panel::Objects => Some(DockHeights::new(360.0)),
+            Panel::Properties => Some(DockHeights::new(640.0).compact(360.0).fill(460.0)),
+            Panel::Regions | Panel::Deviation => Some(DockHeights::new(150.0).compact(110.0)),
+            _ => None,
+        }
     }
 
     fn paint_icon(&mut self, painter: &egui::Painter, rect: egui::Rect, panel: &Panel, color: egui::Color32) -> bool {

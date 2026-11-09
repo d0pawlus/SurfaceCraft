@@ -24,6 +24,7 @@ Etapy po MVP ([plan production-readiness](superpowers/plans/2026-11-09-productio
 | P2 | wydajność i skala do 10 mln trójkątów: równoległość, LOD wyświetlania, kolory bez re-uploadu, pomiary | **w toku** (kryterium 3: import, segmentacja, ICP, fps spełnione; patrz tabela) | [plan](superpowers/plans/2026-11-09-p2-performance.md) |
 | P5 | stabilna parametryka (trwałe nazewnictwo topologii) i komplet cech (loft, sweep, draft, mirror, split, wzór po ścieżce), auto-więzy, podpowiedzi osi/kąta | **zamknięty** (luki w długu technicznym) | [plan](superpowers/plans/2026-11-09-p5-parametric.md) |
 | P3 | model hybrydowy: prymitywy + płaty → jedna zamknięta bryła, STEP round-trip | **zamknięty** | [plan](superpowers/plans/2026-11-09-p3-hybrid.md) |
+| P6 | ergonomia GUI zgodna z rodziną ArtCraft | **w toku: G1** (powłoka: `craft-ui` docking, tokeny motywu, ikony SVG, i18n en/pl, `cargo xtask ui-containers`); G2–G6 czekają | [plan](superpowers/plans/2026-11-09-p6-gui.md) |
 | P7 | dystrybucja: `cargo xtask dist` (binarki + `SHA256SUMS.txt`), metadane produktu, `wasm-opt`, [docs/distribution.md](distribution.md) | częściowo — kroki poza repo czekają na zgodę | [plan](superpowers/plans/2026-11-09-production-readiness.md) |
 
 ## Jak uruchomić
@@ -142,6 +143,7 @@ Szczegóły w planach milestone'ów.
   status 1001 — obejście aplikacji: `snap_axes` (auto-więz współosiowości, ≤ 3° / 0,5 mm).
 - `region.auto_segment` rozbija płaskie pierścienie (wałek z otworem: dwie płaszczyzny → ~85 kawałków po 30–280 trójkątów) —
   w teście P3 płaszczyzny wybrane geometrycznie (`region.create`); do poprawy w segmentacji (P1/P4).
+- P6/G1: `craft-ui` przypięty do `acf6f79` (ostatni rev bez forka egui). Nowsze rewizje (`fonts`, `localized`, IME) wymagają `[patch.crates-io]` na `storytold/egui` i `storytold/winit` (tak robi CADCraft) — zmiana stosu UI całej aplikacji, osobna decyzja; do tego czasu czcionki to domyślne `egui` (`default_fonts`), bez `craft_ui::fonts`. `craft-dialogs` (rev `1a11a48`) nie zależy od `craft-ui`. `rfd` zostaje tylko w buildzie web (wybór plików w przeglądarce; desktop używa `craft-dialogs`). Brak własnego paska tytułu (`craft-window` tylko decyduje o ramce; przy `Frame::App` zostaje ramka systemu). Nazwy grup menu komend i etykiety komend pochodzą z silnika (po angielsku; grupy mają klucze `group.*`, etykiety komend jeszcze nie). Panel Właściwości nadal z edytorem JSON (G2).
 - Kanał sterowania zapisuje token w pliku tymczasowym (dostęp lokalnego użytkownika); jedna instancja aplikacji naraz.
 
 ## Luki / ryzyka

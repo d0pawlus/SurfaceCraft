@@ -13,8 +13,25 @@ macro_rules! icons {
 }
 
 icons!(
-    "new", "open", "save", "import", "export", "undo", "redo", "fit", "objects", "history", "properties", "regions",
-    "deviation", "eye", "eye-off", "trash", "play", "theme", "viewport",
+    "new",
+    "open",
+    "save",
+    "import",
+    "export",
+    "undo",
+    "redo",
+    "fit",
+    "objects",
+    "history",
+    "properties",
+    "regions",
+    "deviation",
+    "eye",
+    "eye-off",
+    "trash",
+    "play",
+    "theme",
+    "viewport",
 );
 
 /// The prepared catalogue (`currentColor` becomes white so a draw-time tint recolours it).
@@ -22,7 +39,12 @@ icons!(
 pub fn set() -> &'static SvgIconSet {
     static SET: OnceLock<SvgIconSet> = OnceLock::new();
     SET.get_or_init(|| {
-        SvgIconSet::new(FILES, SvgStyle { current_color: "white", stroke_width: None }, "bytes://surfacecraft/icons/", "new")
+        SvgIconSet::new(
+            FILES,
+            SvgStyle { current_color: "white", stroke_width: None },
+            "bytes://surfacecraft/icons/",
+            "new",
+        )
     })
 }
 

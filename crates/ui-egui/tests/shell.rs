@@ -128,11 +128,11 @@ fn the_english_and_polish_catalogues_are_complete() {
         assert!(!text.trim().is_empty(), "{key} is empty");
     }
     // the same placeholders in both languages
-    let placeholders = |s: &str| {
+    fn placeholders(s: &str) -> Vec<&str> {
         let mut v: Vec<&str> = s.split('{').skip(1).filter_map(|r| r.split('}').next()).collect();
         v.sort_unstable();
         v
-    };
+    }
     for (key, text) in en {
         assert_eq!(placeholders(text), placeholders(&pl[key]), "placeholders of {key}");
     }

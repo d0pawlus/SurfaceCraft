@@ -203,7 +203,8 @@ impl SurfaceCraftApp {
             .storage
             .and_then(|s| s.get_string(crate::settings::STORAGE_KEY))
             .map(|json| UiSettings::from_json(&json));
-        let settings = saved.unwrap_or_else(|| UiSettings { lang: crate::i18n::Lang::from_system(), ..UiSettings::default() });
+        let settings =
+            saved.unwrap_or_else(|| UiSettings { lang: crate::i18n::Lang::from_system(), ..UiSettings::default() });
         let mut app = Self::with_settings(settings);
         if let Some(rs) = cc.wgpu_render_state.as_ref() {
             viewport::install(rs);
@@ -390,7 +391,9 @@ impl SurfaceCraftApp {
             egui::CollapsingHeader::new(title).id_salt(("objects", kind_key(kind))).default_open(true).show(ui, |ui| {
                 for s in of_kind {
                     ui.horizontal(|ui| {
-                        if self.icon_toggle(ui, "objects.show_hide", if s.visible { "eye" } else { "eye-off" }, !s.visible).clicked()
+                        if self
+                            .icon_toggle(ui, "objects.show_hide", if s.visible { "eye" } else { "eye-off" }, !s.visible)
+                            .clicked()
                         {
                             action = Some(("doc.show", json!({"object": s.id.0, "visible": !s.visible})));
                         }
@@ -464,7 +467,10 @@ impl SurfaceCraftApp {
             (Token::DeviationOutside, "deviation.outside"),
         ] {
             ui.horizontal(|ui| {
-                let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(self.settings.theme.density.metrics().icon), egui::Sense::hover());
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::Vec2::splat(self.settings.theme.density.metrics().icon),
+                    egui::Sense::hover(),
+                );
                 ui.painter().rect_filled(rect, 3.0, self.tokens.color(token));
                 ui.label(t(key));
             });
@@ -504,7 +510,7 @@ impl SurfaceCraftApp {
                 .labelled_by(l.id);
         });
         let filter = self.palette_filter.to_lowercase();
-        egui::ScrollArea::vertical().id_salt("cmdlist").max_height(220.0).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("cmdlist").max_height(160.0).show(ui, |ui| {
             for c in self.session.commands() {
                 if !filter.is_empty() && !c.id.contains(&filter) && !c.label.to_lowercase().contains(&filter) {
                     continue;

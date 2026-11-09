@@ -21,7 +21,13 @@ struct Geo {
 }
 
 /// Colour of a triangle selection.
-const HIGHLIGHT: [f32; 4] = [1.0, 0.55, 0.1, 1.0];
+fn highlight() -> [f32; 4] {
+    crate::theme::Tokens::default().rgba(crate::theme::Token::Highlight)
+}
+
+const X_AXIS: [f32; 3] = [1.0, 0.0, 0.0]; // not a colour
+const Y_AXIS: [f32; 3] = [0.0, 1.0, 0.0]; // not a colour
+const Z_AXIS: [f32; 3] = [0.0, 0.0, 1.0]; // not a colour
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -222,7 +228,7 @@ impl Renderer {
         let line_pipeline = make(wgpu::PrimitiveTopology::LineList, "lines", wgpu::VertexStepMode::Vertex);
         let highlight_color = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("highlight colour"),
-            contents: bytemuck::cast_slice(&[HIGHLIGHT]),
+            contents: bytemuck::cast_slice(&[highlight()]),
             usage: wgpu::BufferUsages::VERTEX,
         });
         let blit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -478,7 +484,7 @@ impl Renderer {
                 Geo { pos: [oo[0] + d[0] * len, oo[1] + d[1] * len, oo[2] + d[2] * len], normal: [0.0; 3] },
             ]
         };
-        let axes: Vec<Geo> = [mk([1.0, 0.0, 0.0]), mk([0.0, 1.0, 0.0]), mk([0.0, 0.0, 1.0])].concat();
+        let axes: Vec<Geo> = [mk(X_AXIS), mk(Y_AXIS), mk(Z_AXIS)].concat();
         queue.write_buffer(&self.axes, 0, bytemuck::cast_slice(&axes));
         let Some(t) = &self.target else { return };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {

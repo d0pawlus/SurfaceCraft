@@ -7,7 +7,9 @@ use crate::i18n::{self, Lang, t};
 use crate::theme::{self, Density, Preset};
 use craft_ui::docking::DockArea;
 use craft_ui::layout::fit_toolbar;
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(not(target_arch = "wasm32"))]
+use serde_json::json;
 use surfacecraft_doc::ObjectKind;
 
 /// What a menu item or toolbar button does.
@@ -160,7 +162,9 @@ impl SurfaceCraftApp {
         match action {
             AppAction::Undo => !self.session.history.undo_labels().is_empty(),
             AppAction::Redo => self.session.history.redo_len() > 0,
-            AppAction::ExportStep => self.selected_kind().is_some_and(|k| matches!(k, ObjectKind::Body | ObjectKind::Surface)),
+            AppAction::ExportStep => {
+                self.selected_kind().is_some_and(|k| matches!(k, ObjectKind::Body | ObjectKind::Surface))
+            }
             AppAction::ExportMesh => self.selected_kind() == Some(ObjectKind::Mesh),
             #[cfg(target_arch = "wasm32")]
             AppAction::Open | AppAction::Save => false,
@@ -386,7 +390,8 @@ impl SurfaceCraftApp {
                 ui.menu_button(t("toolbar.more"), |ui| {
                     for group in TOOLBAR.iter().skip(shown) {
                         for &action in *group {
-                            if ui.add_enabled(self.enabled(action), egui::Button::new(t(action.label_key()))).clicked() {
+                            if ui.add_enabled(self.enabled(action), egui::Button::new(t(action.label_key()))).clicked()
+                            {
                                 clicked = Some(action);
                                 ui.close();
                             }

@@ -22,7 +22,8 @@ fn main() -> eframe::Result {
     // (`SURFACECRAFT_TITLEBAR=app|system` overrides). SurfaceCraft has no header bar of its own
     // yet, so the desktop's frame is kept when the decision would be the app's.
     let choice = craft_window::Choice::probe(craft_window::Prefix::new("SURFACECRAFT"));
-    let viewport = if choice.frame().decorations() { craft_window::decorate(viewport, choice.frame()) } else { viewport };
+    let viewport =
+        if choice.frame().decorations() { craft_window::decorate(viewport, choice.frame()) } else { viewport };
     let options = eframe::NativeOptions {
         viewport,
         renderer: eframe::Renderer::Wgpu,

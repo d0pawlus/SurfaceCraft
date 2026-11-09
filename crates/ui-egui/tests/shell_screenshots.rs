@@ -20,7 +20,11 @@ fn scene(app: &mut SurfaceCraftApp) {
     };
     run(app, "mesh.synth", json!({"shape": "wave", "resolution": 48, "name": "scan"}));
     let n = app.session.doc.meshes[0].mesh.triangle_count() as u32;
-    run(app, "region.create", json!({"mesh": "scan", "triangles": (0..n / 2).collect::<Vec<u32>>(), "name": "left half"}));
+    run(
+        app,
+        "region.create",
+        json!({"mesh": "scan", "triangles": (0..n / 2).collect::<Vec<u32>>(), "name": "left half"}),
+    );
     run(app, "body.box", json!({"size": [24.0, 16.0, 8.0], "name": "block"}));
     app.camera.fit(&app.session.doc.bbox());
     app.camera.orbit(70.0, -45.0);
@@ -59,7 +63,8 @@ fn shoot(dir: &std::path::Path, name: &str, theme: Theme, lang: Lang, panels_hid
     let mut app = SurfaceCraftApp::with_settings(settings);
     scene(&mut app);
     if panels_hidden {
-        let _ = surfacecraft_ui_egui::dock::set_visible(&mut app.workspace, surfacecraft_ui_egui::dock::Panel::Log, false);
+        let _ =
+            surfacecraft_ui_egui::dock::set_visible(&mut app.workspace, surfacecraft_ui_egui::dock::Panel::Log, false);
     }
     let mut h = Harness::builder()
         .with_size((1500.0, 900.0))
