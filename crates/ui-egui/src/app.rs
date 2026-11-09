@@ -39,6 +39,8 @@ pub struct SurfaceCraftApp {
     pub status: String,
     /// Points picked in the viewport (click: replace, Shift+click: add).
     pub picks: Vec<Pick>,
+    /// The form field the viewport is filling by clicks (3-2-1 datums, point lists, body edges).
+    pub field_pick: Option<crate::fieldpick::FieldPick>,
     /// Theme, density, language and dock layout, saved between runs.
     pub settings: UiSettings,
     /// The dock layout in use (saved into `settings` on exit).
@@ -114,6 +116,7 @@ impl SurfaceCraftApp {
             hist_panel: Default::default(),
             status: t("status.ready").to_string(),
             picks: Vec::new(),
+            field_pick: None,
             tokens: Tokens::resolve(settings.theme.preset),
             workspace,
             settings,
@@ -138,9 +141,8 @@ impl SurfaceCraftApp {
         }
     }
 
-    /// Picks the nearest object under viewport pixel `(x, y)` of a `w × h` viewport.
-    /// Returns whether something was hit.
-    pub fn pick_at(&mut self, x: f64, y: f64, w: f64, h: f64, add: bool) -> bool {
+    /// The nearest object hit by the ray through viewport pixel `(x, y)` of a `w × h` viewport.
+    pub(crate) fn ray_hit(&mut self, x: f64, y: f64, w: f64, h: f64) -> Option<Pick> {
         let (origin, dir) = self.camera.ray(x, y, w, h);
         let items = self.session.display_items();
         let live: Vec<usize> = items.iter().map(|d| d.pick_key).collect();
@@ -155,11 +157,18 @@ impl SurfaceCraftApp {
                 best = Some((t, Pick { object: d.id, point: origin + dir * t, triangle: tri as u32 }));
             }
         }
+        best.map(|(_, p)| p)
+    }
+
+    /// Picks the nearest object under viewport pixel `(x, y)` of a `w × h` viewport.
+    /// Returns whether something was hit.
+    pub fn pick_at(&mut self, x: f64, y: f64, w: f64, h: f64, add: bool) -> bool {
+        let best = self.ray_hit(x, y, w, h);
         if !add {
             self.picks.clear();
         }
         let hit = match best {
-            Some((_, p)) => {
+            Some(p) => {
                 self.status = format!("picked {} at ({:.3}, {:.3}, {:.3})", p.object, p.point.x, p.point.y, p.point.z);
                 self.selected_object = Some(p.object);
                 self.picks.push(p);
@@ -270,6 +279,7 @@ impl SurfaceCraftApp {
     /// Chooses a command in the palette and prefills its parameters.
     pub fn choose_command(&mut self, id: &'static str) {
         self.palette_command = Some(id);
+        self.field_pick = None;
         // the form is what the Properties panel shows now: the list folds to one line
         self.palette_list_open = false;
         let schema = surfacecraft_engine::cmd::find(id).map(|c| (c.input)()).unwrap_or(Value::Null);
@@ -279,6 +289,7 @@ impl SurfaceCraftApp {
 
     /// Runs the palette's command with its edited parameters.
     pub fn run_palette(&mut self) {
+        self.field_pick = None;
         let Some(id) = self.palette_command else {
             self.status = t("status.choose_command").to_string();
             return;
@@ -847,6 +858,9 @@ pub fn template(schema: &Value, ctx: &PickContext) -> Value {
                 "triangles" if !ctx.triangles.is_empty() => json!(ctx.triangles),
                 "faces" if !ctx.faces.is_empty() => json!(ctx.faces),
                 "edges" if !ctx.edges.is_empty() => json!(ctx.edges),
+                "primary" | "secondary" | "tertiary" => {
+                    crate::fieldpick::datum_default(name).unwrap_or_else(|| example(&p, schema))
+                }
                 _ => example(&p, schema),
             };
             out.insert(name.to_string(), v);

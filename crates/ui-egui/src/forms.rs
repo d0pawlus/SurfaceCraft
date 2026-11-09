@@ -6,9 +6,11 @@
 //! `param.<command>.<name>` / `param.<name>`). Numbers use the locale's decimal separator and show
 //! their unit and limits; optional parameters have a "set" check box; object parameters are
 //! pickers over the document's objects; invalid values get a message from [`validate`].
+use crate::fieldpick::{PickKind, PickRequest, datum_default, datum_need};
 use crate::i18n::{self, Lang, find, t, tf};
 use crate::theme::{Token, Tokens};
 use serde_json::{Map, Number, Value, json};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use surfacecraft_doc::ObjectKind;
 
@@ -37,6 +39,11 @@ pub struct FormCtx<'a> {
     pub pick_points: &'a [[f64; 3]],
     /// Triangles picked in the viewport.
     pub pick_triangles: &'a [u32],
+    /// The parameter the viewport is picking into right now, with the hint to show next to it.
+    pub picking: Option<(&'a str, &'a str)>,
+    /// Where a "pick in viewport" button leaves its request (the caller acts on it after the
+    /// form: the form itself never starts anything).
+    pub pick_request: &'a RefCell<Option<PickRequest>>,
     /// Theme tokens (error colour).
     pub tokens: &'a Tokens,
     /// Validation messages by path (see [`validate`]).
@@ -568,8 +575,11 @@ fn property_row(
                 let resp = value_widget(ui, root, prop, v, name, &path, ctx, Some(name_resp.id));
                 changed |= resp;
             } else if required {
-                // a required parameter without a value: give it one
-                let d = default_value(root, prop, Some(ctx));
+                // a required parameter without a value: give it one (the 3-2-1 datums start as the
+                // world planes and axes, so they show their fields and can be edited or picked)
+                let d = datum_default(name)
+                    .filter(|_| kind == Kind::Any && path == name)
+                    .unwrap_or_else(|| default_value(root, prop, Some(ctx)));
                 map.insert(name.to_string(), d);
                 changed = true;
             } else {
@@ -706,9 +716,47 @@ fn value_widget(
                 changed |= object_rows(ui, root, s, map, path, ctx);
             }
         }
-        Kind::Any => changed |= json_text(ui, value, path, label),
+        Kind::Any => match datum_need(name).filter(|_| path == name) {
+            // a 3-2-1 datum: JSON text, or points clicked in the viewport
+            Some(need) => {
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        changed |= json_text(ui, value, path, label);
+                        pick_button(ui, ctx, name, path, PickKind::Datum { need });
+                    });
+                    pick_hint_line(ui, ctx, name);
+                });
+            }
+            None => changed |= json_text(ui, value, path, label),
+        },
     }
     changed
+}
+
+/// The "pick in viewport" toggle of a top-level parameter the viewport can fill.
+fn pick_button(ui: &mut egui::Ui, ctx: &FormCtx<'_>, name: &str, path: &str, kind: PickKind) {
+    if name != path {
+        return;
+    }
+    let active = ctx.picking.is_some_and(|(field, _)| field == name);
+    let hint = match kind {
+        PickKind::Datum { .. } => "form.pick_hint.datum",
+        PickKind::Points => "form.pick_hint.points",
+        PickKind::Edges => "form.pick_hint.edges",
+    };
+    let label = t(if active { "form.pick_stop" } else { "form.pick" });
+    if ui.selectable_label(active, label).on_hover_text(t(hint)).clicked() {
+        *ctx.pick_request.borrow_mut() = Some(PickRequest { field: name.to_string(), kind, start: !active });
+    }
+}
+
+/// What to click, under the parameter being picked.
+fn pick_hint_line(ui: &mut egui::Ui, ctx: &FormCtx<'_>, name: &str) {
+    if let Some((field, hint)) = ctx.picking
+        && field == name
+    {
+        ui.colored_label(ctx.tokens.color(Token::AccentPrimary), hint);
+    }
 }
 
 fn limits_text(min: f64, max: f64) -> String {
@@ -792,6 +840,12 @@ fn list_widget(
             changed = true;
         }
         let is_point = is_tuple(&item_schema, root) && item_schema.get("minItems").and_then(Value::as_u64) == Some(3);
+        if is_point {
+            pick_button(ui, ctx, name, path, PickKind::Points);
+        }
+        if item_kind == Kind::Int && name == "edges" {
+            pick_button(ui, ctx, name, path, PickKind::Edges);
+        }
         if is_point && !ctx.pick_points.is_empty() && ui.small_button(t("form.use_picked_points")).clicked() {
             *items = ctx.pick_points.iter().map(|p| json!(p)).collect();
             changed = true;
@@ -818,6 +872,7 @@ fn list_widget(
             changed = true;
         }
     });
+    pick_hint_line(ui, ctx, name);
     changed
 }
 
