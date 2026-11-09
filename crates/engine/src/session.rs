@@ -104,6 +104,24 @@ impl Session {
         mapped
     }
 
+    /// Runs command `id` on a copy of the document and returns the copy: the preview of what
+    /// executing it would do. This session (document, history, log) is not touched; the copy
+    /// has no file access and never opens a dialog. Commands that change nothing
+    /// (`!undoable`) are refused, and so are [`cmd::is_heavy`] ones, which a front end must not
+    /// run on its UI thread every time a parameter changes.
+    pub fn preview(&self, id: &str, params: Value) -> Result<Session, EngineError> {
+        let spec = cmd::find(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
+        if !spec.undoable {
+            return Err(EngineError::Unavailable(format!("{id} does not change the document")));
+        }
+        if cmd::is_heavy(id) {
+            return Err(EngineError::Unavailable(format!("{id} is too heavy to preview")));
+        }
+        let mut copy = Session { doc: self.doc.clone(), allow_files: false, ..Session::default() };
+        copy.execute(id, params)?;
+        Ok(copy)
+    }
+
     /// Runs `{"commands": [{"command": id, "params": {…}}, …]}`.
     pub fn run_script(&mut self, script: &Value) -> Result<ScriptReport, EngineError> {
         let list = script

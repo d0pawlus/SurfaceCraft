@@ -14,10 +14,13 @@
 
 pub mod app;
 pub mod camera;
+pub mod command_panel;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod control;
 pub mod deviation_panel;
 pub mod dock;
+pub mod forms;
+pub mod history_panel;
 pub mod i18n;
 pub mod icons;
 pub mod settings;
