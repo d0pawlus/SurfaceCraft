@@ -205,3 +205,18 @@ fn panels_show_the_state_of_the_document() {
     h.run();
     assert!(h.state().session.doc.summaries().is_empty());
 }
+
+#[test]
+fn the_dock_never_reports_an_error_in_a_small_or_unsized_window() {
+    // The web canvas can be 800x600 or not sized yet on the first frame: the shell must not put a
+    // "docking geometry" message into the status bar for that.
+    for (w, h) in [(800.0_f32, 600.0_f32), (640.0, 480.0), (400.0, 300.0), (0.0, 0.0), (1.0, 1.0)] {
+        let app = SurfaceCraftApp::headless();
+        let ready = app.status.clone();
+        let mut harness =
+            Harness::builder().with_size((w, h)).build_ui_state(|ui, app: &mut SurfaceCraftApp| app.draw(ui), app);
+        harness.run();
+        harness.run();
+        assert_eq!(harness.state().status, ready, "status after the first frames at {w}x{h}");
+    }
+}
