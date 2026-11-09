@@ -1,0 +1,160 @@
+name: release
+
+# Builds unsigned release packages for Windows, Linux and macOS and attaches them, with one combined
+# SHA256SUMS.txt, to a GitHub Release. It starts on a pushed tag `v*`, or by hand with an existing tag.
+# The package names follow the Craft launcher's asset convention (docs/distribution.md, "Release
+# assets"). No secret is used: GITHUB_TOKEN creates the release. Code signing is not done yet.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to package and release, e.g. v0.1.0 (must match the workspace version)'
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  prepare:
+    name: check the tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - id: tag
+        name: check the tag name
+        env:
+          RAW_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          tag="$RAW_TAG"
+          if [[ ${#tag} -gt 64 || ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'$tag' is not a release tag (vX.Y.Z or vX.Y.Z-pre)"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  package:
+    name: package (${{ matrix.target }})
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.prepare.outputs.tag }}
+      - name: System libraries for eframe/rfd
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.target }}
+          cache-all-crates: true
+      - name: cargo xtask dist (release binaries and packages)
+        shell: bash
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: cargo xtask dist --tag "$TAG"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/${{ matrix.target }}/release/
+          if-no-files-found: error
+
+  release:
+    name: publish the release
+    needs: [prepare, package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: downloads
+      - name: merge the checksums and check every package
+        run: |
+          set -euo pipefail
+          mkdir assets
+          : > all-sums.txt
+          for dir in downloads/release-*/; do
+            if [[ ! -f "${dir}SHA256SUMS.txt" ]]; then
+              echo "::error::${dir} has no SHA256SUMS.txt"
+              exit 1
+            fi
+            for file in "$dir"*; do
+              if [[ "$(basename "$file")" != "SHA256SUMS.txt" ]]; then
+                cp "$file" assets/
+              fi
+            done
+            cat "${dir}SHA256SUMS.txt" >> all-sums.txt
+          done
+          sort -k2 all-sums.txt > assets/SHA256SUMS.txt
+          rm all-sums.txt
+          cd assets
+          if [[ -n "$(awk '{ print $2 }' SHA256SUMS.txt | sort | uniq -d)" ]]; then
+            echo "::error::a file name appears twice in SHA256SUMS.txt"
+            exit 1
+          fi
+          if [[ "$(wc -l < SHA256SUMS.txt)" -ne "$(find . -type f ! -name SHA256SUMS.txt | wc -l)" ]]; then
+            echo "::error::SHA256SUMS.txt does not list exactly the packages"
+            exit 1
+          fi
+          sha256sum --check SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: write the release notes
+        run: |
+          set -euo pipefail
+          {
+            printf '# SurfaceCraft %s\n\n' "$TAG"
+            cat <<'NOTES'
+          These builds are not code-signed yet. Windows SmartScreen warns about an unknown publisher, and
+          macOS Gatekeeper blocks the app until it is opened on purpose (right-click, Open, or System
+          Settings > Privacy & Security). Check each download against SHA256SUMS.txt.
+
+          The macOS build is for Apple silicon only. Intel Macs are not built yet.
+
+          ## Files
+
+          NOTES
+            awk '{ print "- `" $2 "`" }' assets/SHA256SUMS.txt
+          } > notes.md
+      - name: create the GitHub release
+        run: |
+          set -euo pipefail
+          flags=()
+          case "$TAG" in
+            *-*) flags+=(--prerelease) ;;
+          esac
+          gh release create "$TAG" --title "SurfaceCraft $TAG" --notes-file notes.md --verify-tag "${flags[@]}" assets/*
