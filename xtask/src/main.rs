@@ -73,16 +73,21 @@ fn web() -> Result<(), String> {
     run(c, "web build")?;
     let dist = root().join("apps").join("surfacecraft-web").join("dist");
     std::fs::create_dir_all(&dist).map_err(|e| format!("create dist: {e}"))?;
-    let wasm = root().join("target").join("wasm32-unknown-unknown").join("release").join("surfacecraft-web.wasm");
+    let target = std::env::var_os("CARGO_TARGET_DIR").map_or_else(|| root().join("target"), std::path::PathBuf::from);
+    let wasm = target.join("wasm32-unknown-unknown").join("release").join("surfacecraft-web.wasm");
     let mut b = Command::new("wasm-bindgen");
     b.arg(&wasm).args(["--target", "web", "--no-typescript", "--out-dir"]).arg(&dist);
     run(b, "wasm-bindgen")?;
     optimise_wasm(&dist.join("surfacecraft-web_bg.wasm"));
     let html = include_str!("../../apps/surfacecraft-web/index.html").replace(
         "<link data-trunk rel=\"rust\" data-bin=\"surfacecraft-web\" data-wasm-opt=\"z\" />",
-        "<script type=\"module\">import init from './surfacecraft-web.js'; init();</script>",
+        "<script type=\"module\">import init from './surfacecraft-web.js'; init().then(() => document.getElementById('loading')?.remove());</script>",
     );
     std::fs::write(dist.join("index.html"), html).map_err(|e| format!("write index.html: {e}"))?;
+    // a public bundle carries its licences and the third-party notices
+    for f in ["LICENSE-MIT", "LICENSE-APACHE", "NOTICE", "THIRD-PARTY-LICENSES.txt"] {
+        std::fs::copy(root().join(f), dist.join(f)).map_err(|e| format!("copy {f}: {e}"))?;
+    }
     eprintln!("==> web bundle in {}", dist.display());
     Ok(())
 }
