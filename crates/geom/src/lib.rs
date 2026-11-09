@@ -21,6 +21,7 @@ pub mod lod;
 pub mod mesh;
 pub mod par;
 pub mod recon;
+pub mod reduce;
 pub mod rng;
 pub mod section;
 pub mod synth;

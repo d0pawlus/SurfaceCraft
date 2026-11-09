@@ -108,6 +108,26 @@ pub fn cuboid(min: Point3, size: Vec3, n: usize) -> Mesh {
     m
 }
 
+/// A closed box `[min, min + size]` with all twelve edges and eight corners rounded to radius `r`
+/// (clamped to half the smallest side), each face split `n × n` before rounding: the surface of the
+/// inner box offset by `r`.
+#[must_use]
+pub fn rounded_cuboid(min: Point3, size: Vec3, r: f64, n: usize) -> Mesh {
+    let mut m = cuboid(min, size, n);
+    let half = size / 2.0;
+    let r = r.clamp(0.0, half.x.min(half.y).min(half.z));
+    let centre = min + half;
+    let inner = half - Vec3::new(r, r, r);
+    for p in &mut m.positions {
+        let q = *p - centre;
+        let c = Vec3::new(q.x.clamp(-inner.x, inner.x), q.y.clamp(-inner.y, inner.y), q.z.clamp(-inner.z, inner.z));
+        if let Some(d) = crate::normalize(q - c) {
+            *p = centre + c + d * r;
+        }
+    }
+    m
+}
+
 /// Displaces every vertex along its normal by `N(0, sigma²)`.
 pub fn add_noise(mesh: &mut Mesh, sigma: f64, rng: &mut Rng) {
     let normals = mesh.vertex_normals();
