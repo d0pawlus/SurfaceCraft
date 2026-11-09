@@ -147,6 +147,44 @@ pub fn find(id: &str) -> Option<&'static CommandSpec> {
     registry().iter().find(|c| c.id == id)
 }
 
+/// Commands too slow to run on every parameter change (a front end skips their live preview).
+const HEAVY: &[&str] = &[
+    "align.icp",
+    "body.from_regions",
+    "body.plan_regions",
+    "body.to_mesh",
+    "deviation.compute",
+    "deviation.noise",
+    "export.iges",
+    "export.step",
+    "feature.replay",
+    "import.step",
+    "mesh.clean",
+    "mesh.decimate",
+    "mesh.export",
+    "mesh.fill_holes",
+    "mesh.import",
+    "mesh.reconstruct",
+    "mesh.remove_outliers",
+    "mesh.smooth",
+    "primitive.auto_constrain",
+    "primitive.fit",
+    "primitive.symmetry",
+    "quad.retopo",
+    "region.auto_segment",
+    "region.grow",
+    "surface.auto",
+    "surface.fit",
+    "surface.thicken",
+    "surface.trim_to_region",
+];
+
+/// Whether command `id` is too slow to preview live (see [`Session::preview`]).
+#[must_use]
+pub fn is_heavy(id: &str) -> bool {
+    HEAVY.contains(&id)
+}
+
 /// No parameters.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -220,6 +258,9 @@ mod tests {
             assert!((c.input)().is_object(), "{} input schema", c.id);
             assert!((c.output)().is_object(), "{} output schema", c.id);
             assert!(!c.summary.is_empty() && !c.label.is_empty());
+        }
+        for h in HEAVY {
+            assert!(find(h).is_some(), "heavy list names unknown command {h}");
         }
     }
 }

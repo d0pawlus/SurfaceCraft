@@ -27,6 +27,10 @@ pub struct SurfaceCraftApp {
     pub palette_params: String,
     /// Palette filter text.
     pub palette_filter: String,
+    /// The Properties panel's form and live preview.
+    pub cmd_panel: crate::command_panel::CommandPanel,
+    /// The feature history's editor.
+    pub hist_panel: crate::history_panel::HistoryPanel,
     /// Last status line.
     pub status: String,
     /// Points picked in the viewport (click: replace, Shift+click: add).
@@ -98,6 +102,8 @@ impl SurfaceCraftApp {
             palette_command: None,
             palette_params: "{}".into(),
             palette_filter: String::new(),
+            cmd_panel: Default::default(),
+            hist_panel: Default::default(),
             status: t("status.ready").to_string(),
             picks: Vec::new(),
             tokens: Tokens::resolve(settings.theme.preset),
@@ -420,6 +426,7 @@ impl SurfaceCraftApp {
 
     /// The operation history: what undo would step back through, newest first.
     pub(crate) fn history_panel(&mut self, ui: &mut egui::Ui) {
+        crate::history_panel::feature_tree(self, ui);
         let labels = self.session.history.undo_labels();
         if labels.is_empty() {
             ui.weak(t("history.empty"));
@@ -523,24 +530,7 @@ impl SurfaceCraftApp {
         });
         ui.separator();
         if let Some(id) = self.palette_command {
-            ui.strong(id);
-            if let Some(c) = surfacecraft_engine::cmd::find(id) {
-                ui.label(c.summary);
-            }
-            let l = ui.label(t("palette.parameters"));
-            ui.add(egui::TextEdit::multiline(&mut self.palette_params).code_editor().desired_rows(6)).labelled_by(l.id);
-            if ui.button(t("palette.run")).clicked() {
-                self.run_palette();
-            }
-            if let Some(last) = self.session.log.last()
-                && last.command == id
-            {
-                ui.separator();
-                egui::ScrollArea::vertical().id_salt("result").show(ui, |ui| {
-                    let text = serde_json::to_string_pretty(&last.outcome).unwrap_or_default();
-                    ui.monospace(truncate(&text, 4000));
-                });
-            }
+            crate::command_panel::command_body(self, ui, id);
         } else {
             ui.weak(t("palette.choose"));
         }
@@ -677,6 +667,8 @@ impl SurfaceCraftApp {
             })
             .collect();
         let bg = self.tokens.viewport_background().map(f64::from);
+        let mut items = items;
+        items.extend(self.cmd_panel.draw_items(&tokens));
         let frame = Frame { size, camera: self.camera.clone(), origin: self.camera.target, items, background: bg };
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(rect, ViewportCallback(frame)));
     }
@@ -722,7 +714,7 @@ fn kind_plural_key(kind: ObjectKind) -> &'static str {
     }
 }
 
-fn truncate(s: &str, n: usize) -> String {
+pub(crate) fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n { s.to_string() } else { s.chars().take(n).collect::<String>() + "…" }
 }
 
