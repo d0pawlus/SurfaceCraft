@@ -14,6 +14,7 @@ pub fn draw_items(session: &mut Session) -> Vec<DrawItem> {
             color: crate::app::kind_color(d.kind),
             mesh: d.mesh,
             colors: d.colors,
+            colors_key: d.colors_key,
             highlight: None,
         })
         .collect()

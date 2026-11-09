@@ -1,6 +1,7 @@
 //! P1: the full pipeline on real scans that stay outside the repository.
 //!
-//! `SURFACECRAFT_LOCAL_CORPUS` names a directory of third-party scans (STL/OBJ/PLY). They are never
+//! `SURFACECRAFT_LOCAL_CORPUS` names a directory of third-party scans (STL/OBJ/PLY, point clouds
+//! as PLY/OBJ without faces or XYZ). They are never
 //! committed and nothing derived from a single file (exported meshes, screenshots) goes into the
 //! repository; `docs/STATUS.md` keeps only aggregate pass/fail and timing figures.
 //!
@@ -17,7 +18,7 @@ fn corpus() -> Vec<std::path::PathBuf> {
     v.retain(|p| {
         p.extension()
             .and_then(|e| e.to_str())
-            .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "stl" | "obj" | "ply"))
+            .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "stl" | "obj" | "ply" | "xyz" | "asc"))
     });
     if let Ok(only) = std::env::var("SURFACECRAFT_LOCAL_CORPUS_ONLY") {
         v.retain(|p| p.to_string_lossy().contains(&only));
@@ -30,6 +31,10 @@ fn corpus() -> Vec<std::path::PathBuf> {
 #[derive(Debug, Default)]
 struct Report {
     triangles: u64,
+    /// Point cloud files: points, points left out of the mesh, boundary loops after reconstruction.
+    cloud_points: u64,
+    cloud_unused: u64,
+    cloud_holes_left: u64,
     import_s: f64,
     sigma: f64,
     clean_removed: u64,
@@ -53,6 +58,12 @@ fn run_one(path: &std::path::Path) -> Result<Report, String> {
     let info = s.execute("mesh.import", json!({"path": path.to_string_lossy(), "name": "scan"})).map_err(e)?;
     r.import_s = t.elapsed().as_secs_f64();
     r.triangles = info["triangles"].as_u64().unwrap_or(0);
+    if let Some(c) = info.get("point_cloud") {
+        // a point cloud: reconstructed into a mesh by the import
+        r.cloud_points = c["points"].as_u64().unwrap_or(0);
+        r.cloud_unused = c["unused_points"].as_u64().unwrap_or(0);
+        r.cloud_holes_left = c["holes_left"].as_u64().unwrap_or(0);
+    }
 
     // clean-up a real scan needs before segmentation
     let c = s.execute("mesh.clean", json!({"object": "scan", "fill_holes_max_edges": 300})).map_err(e)?;
@@ -62,9 +73,11 @@ fn run_one(path: &std::path::Path) -> Result<Report, String> {
     let n = s.execute("deviation.noise", json!({"object": "scan"})).map_err(e)?;
     r.sigma = n["sigma"].as_f64().unwrap_or(f64::NAN);
 
+    surfacecraft_fit::stats::reset();
     let t = Instant::now();
     let seg = s.execute("region.auto_segment", json!({"mesh": "scan"})).map_err(e)?;
     r.segment_s = t.elapsed().as_secs_f64();
+    eprintln!("  segment phases (s): {:?}", surfacecraft_fit::stats::phase_seconds());
     let regions = seg["regions"].as_array().cloned().unwrap_or_default();
     r.regions = regions.len();
     let assigned: u64 = regions.iter().filter_map(|x| x["triangles"].as_u64()).sum();

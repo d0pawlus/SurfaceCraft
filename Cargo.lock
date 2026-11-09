@@ -2776,6 +2776,7 @@ name = "surfacecraft-geom"
 version = "0.1.0"
 dependencies = [
  "nalgebra",
+ "rayon",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

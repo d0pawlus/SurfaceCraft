@@ -6,6 +6,7 @@ use crate::ObjectId;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use surfacecraft_kernel::naming::{EdgeSig, FaceSig};
 use surfacecraft_kernel::record::brep::Brep;
 use surfacecraft_sketch::{Sketch, SolveReport};
 
@@ -20,6 +21,17 @@ pub enum Mode {
     Add,
     /// Subtracted from the target body.
     Cut,
+}
+
+/// Which side of a cutting plane a split keeps.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Side {
+    /// The side the plane normal points to.
+    #[default]
+    Front,
+    /// The side the plane normal points away from.
+    Back,
 }
 
 /// Boolean operations.
@@ -85,6 +97,10 @@ pub enum FeatureOp {
         edges: Vec<usize>,
         /// Radius.
         radius: f64,
+        /// Geometric signatures of `edges` (persistent naming; filled in by the replay).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[schemars(skip)]
+        edge_refs: Vec<EdgeSig>,
     },
     /// Bevel edges of a body.
     Chamfer {
@@ -94,6 +110,10 @@ pub enum FeatureOp {
         edges: Vec<usize>,
         /// Distance.
         distance: f64,
+        /// Geometric signatures of `edges` (persistent naming; filled in by the replay).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[schemars(skip)]
+        edge_refs: Vec<EdgeSig>,
     },
     /// Hollow a body.
     Shell {
@@ -103,6 +123,10 @@ pub enum FeatureOp {
         faces: Vec<usize>,
         /// Wall thickness (positive outward).
         thickness: f64,
+        /// Geometric signatures of `faces` (persistent naming; filled in by the replay).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[schemars(skip)]
+        face_refs: Vec<FaceSig>,
     },
     /// Copies of a body, united.
     Pattern {
@@ -122,6 +146,92 @@ pub enum FeatureOp {
         /// Rotation angle between instances, degrees.
         #[serde(default)]
         rotate_deg: f64,
+    },
+    /// A skin through the profiles of several sketches, capped into a solid.
+    Loft {
+        /// Section sketches in order (each contributes its outer closed profile).
+        sketches: Vec<ObjectId>,
+        /// Degree across the sections (1 = ruled); `None` = the highest the section count allows (≤ 3).
+        #[serde(default)]
+        degree: Option<u32>,
+        /// New body, add to or cut from `target`.
+        #[serde(default)]
+        mode: Mode,
+        /// Target body for add/cut.
+        #[serde(default)]
+        target: Option<ObjectId>,
+    },
+    /// The first closed profile of one sketch swept along the open path of another.
+    Sweep {
+        /// Sketch with the profile (placed at the start of the path).
+        profile: ObjectId,
+        /// Sketch with the open path (a chain of lines and arcs).
+        path: ObjectId,
+        /// The profile turns with the path (true) or only moves along it (false).
+        #[serde(default = "crate::object::yes_fn")]
+        follow: bool,
+        /// New body, add to or cut from `target`.
+        #[serde(default)]
+        mode: Mode,
+        /// Target body for add/cut.
+        #[serde(default)]
+        target: Option<ObjectId>,
+    },
+    /// Tilts faces of a body away from a pull direction about a neutral plane.
+    Draft {
+        /// Body.
+        target: ObjectId,
+        /// Faces drafted (record indices of the body before this feature).
+        faces: Vec<usize>,
+        /// Draft angle, degrees (positive leans the faces in going along `pull`).
+        angle_deg: f64,
+        /// A point of the neutral plane (it does not move).
+        neutral_origin: [f64; 3],
+        /// Normal of the neutral plane.
+        neutral_normal: [f64; 3],
+        /// Pull direction (default: the neutral normal).
+        #[serde(default)]
+        pull: Option<[f64; 3]>,
+        /// Geometric signatures of `faces` (persistent naming; filled in by the replay).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[schemars(skip)]
+        face_refs: Vec<FaceSig>,
+    },
+    /// The body reflected in a plane, united with the original (or replacing it).
+    Mirror {
+        /// Body.
+        target: ObjectId,
+        /// A point of the mirror plane.
+        plane_origin: [f64; 3],
+        /// Normal of the mirror plane.
+        plane_normal: [f64; 3],
+        /// Unite the reflection with the original (true) or keep only the reflection.
+        #[serde(default = "crate::object::yes_fn")]
+        merge: bool,
+    },
+    /// Cuts the body by a plane and keeps one side.
+    Split {
+        /// Body.
+        target: ObjectId,
+        /// A point of the cutting plane.
+        plane_origin: [f64; 3],
+        /// Normal of the cutting plane.
+        plane_normal: [f64; 3],
+        /// The side kept.
+        #[serde(default)]
+        keep: Side,
+    },
+    /// Copies of a body spaced evenly along the open path of a sketch, united.
+    PathPattern {
+        /// Body.
+        target: ObjectId,
+        /// Sketch with the open path (a chain of lines and arcs).
+        path: ObjectId,
+        /// Instances including the original (at the start of the path).
+        count: usize,
+        /// Each copy turns with the path tangent.
+        #[serde(default)]
+        follow: bool,
     },
     /// Boolean of the target with a tool body (the tool is consumed: hidden).
     Boolean {
@@ -143,9 +253,15 @@ impl FeatureOp {
             FeatureOp::Extrude { sketch, target, .. } | FeatureOp::Revolve { sketch, target, .. } => {
                 std::iter::once(*sketch).chain(*target).collect()
             }
+            FeatureOp::Loft { sketches, target, .. } => sketches.iter().copied().chain(*target).collect(),
+            FeatureOp::Sweep { profile, path, target, .. } => [*profile, *path].into_iter().chain(*target).collect(),
+            FeatureOp::PathPattern { target, path, .. } => vec![*target, *path],
             FeatureOp::Fillet { target, .. }
             | FeatureOp::Chamfer { target, .. }
             | FeatureOp::Shell { target, .. }
+            | FeatureOp::Draft { target, .. }
+            | FeatureOp::Mirror { target, .. }
+            | FeatureOp::Split { target, .. }
             | FeatureOp::Pattern { target, .. } => vec![*target],
             FeatureOp::Boolean { target, tool, .. } => vec![*target, *tool],
         }
@@ -162,6 +278,12 @@ impl FeatureOp {
             FeatureOp::Chamfer { .. } => "chamfer",
             FeatureOp::Shell { .. } => "shell",
             FeatureOp::Pattern { .. } => "pattern",
+            FeatureOp::Loft { .. } => "loft",
+            FeatureOp::Sweep { .. } => "sweep",
+            FeatureOp::Draft { .. } => "draft",
+            FeatureOp::Mirror { .. } => "mirror",
+            FeatureOp::Split { .. } => "split",
+            FeatureOp::PathPattern { .. } => "path_pattern",
             FeatureOp::Boolean { .. } => "boolean",
         }
     }
