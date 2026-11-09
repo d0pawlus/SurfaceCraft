@@ -15,6 +15,7 @@ use surfacecraft_doc::{ObjectId, ObjectKind};
 pub mod align;
 pub mod app;
 pub mod body;
+pub mod curves;
 pub mod deviation;
 pub mod doc;
 pub mod exchange;
@@ -120,6 +121,7 @@ static REGISTRY: LazyLock<Vec<CommandSpec>> = LazyLock::new(|| {
     v.extend_from_slice(doc::COMMANDS);
     v.extend_from_slice(exchange::COMMANDS);
     v.extend_from_slice(feature::COMMANDS);
+    v.extend_from_slice(curves::COMMANDS);
     v.extend_from_slice(hybrid::COMMANDS);
     v.extend_from_slice(deviation::COMMANDS);
     v.extend_from_slice(mesh::COMMANDS);

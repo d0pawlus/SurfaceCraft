@@ -162,3 +162,60 @@ fn local_corpus_full_pipeline() {
     }
     assert!(failures.is_empty(), "failed: {failures:?}");
 }
+
+/// P4: retopology and patches on a region of an organic real scan (aggregate figures only).
+///
+/// `SURFACECRAFT_LOCAL_CORPUS_ONLY` selects the file by a part of its name; the region is the
+/// largest connected piece of the triangles within 12 % of the bounding-box diagonal of the
+/// highest vertex.
+#[test]
+#[ignore = "needs SURFACECRAFT_LOCAL_CORPUS (third-party scans, never committed)"]
+fn local_organic_region_retopo() {
+    let files = corpus();
+    assert!(!files.is_empty(), "set SURFACECRAFT_LOCAL_CORPUS to a directory with STL/OBJ/PLY scans");
+    let path = &files[0];
+    let mut s = Session::new();
+    let t = Instant::now();
+    let info = s.execute("mesh.import", json!({"path": path.to_string_lossy(), "name": "scan"})).unwrap();
+    s.execute("mesh.clean", json!({"object": "scan", "fill_holes_max_edges": 300})).unwrap();
+    eprintln!("P4 local: {} triangles, import+clean {:.1} s", info["triangles"], t.elapsed().as_secs_f64());
+    let (mid, _) = s.doc.find_by_name("scan").unwrap();
+    let mesh = s.doc.mesh(mid).unwrap().mesh.clone();
+    let diag = mesh.bbox().diagonal();
+    let top = mesh.positions.iter().max_by(|a, b| a.z.total_cmp(&b.z)).copied().unwrap();
+    let r2 = (0.12 * diag) * (0.12 * diag);
+    let ids: Vec<u32> = (0..mesh.triangle_count() as u32)
+        .filter(|&t| mesh.face_centroid(t as usize).is_some_and(|c| (c - top).norm_squared() < r2))
+        .collect();
+    let sub = mesh.submesh(&ids);
+    let comps = surfacecraft_geom::edit::components(&sub);
+    let biggest = comps.iter().max_by_key(|c| c.len()).unwrap();
+    let tris: Vec<u32> = biggest.iter().map(|&k| ids[k as usize]).collect();
+    eprintln!("P4 local: region of {} triangles (diagonal {:.0} mm)", tris.len(), diag);
+    let reg = s.execute("region.create", json!({"mesh": "scan", "triangles": tris})).unwrap();
+    let t = Instant::now();
+    let r = s.execute("quad.retopo", json!({"region": reg["id"], "target_quads": 120})).unwrap();
+    eprintln!(
+        "P4 local: retopo {:.1} s: layout {} quads {} irregular {:.2} euler {} closed {}",
+        t.elapsed().as_secs_f64(),
+        r["layout"],
+        r["quads"],
+        r["irregular_fraction"].as_f64().unwrap(),
+        r["euler"],
+        r["closed"]
+    );
+    let t = Instant::now();
+    let a = s.execute("surface.auto", json!({"object": r["id"], "tolerance": 0.2})).unwrap();
+    eprintln!(
+        "P4 local: surface.auto {:.1} s: patches {} max {:.4} rms {:.4} refinements {} jump max {:.2} deg mean {:.2} deg uncovered {:.3} within {}",
+        t.elapsed().as_secs_f64(),
+        a["blocks"][0]["patches"],
+        a["max"].as_f64().unwrap(),
+        a["blocks"][0]["rms"].as_f64().unwrap(),
+        a["refinements"],
+        a["normal_jump_max_deg"].as_f64().unwrap(),
+        a["normal_jump_mean_deg"].as_f64().unwrap(),
+        a["uncovered"].as_f64().unwrap(),
+        a["within_tolerance"]
+    );
+}

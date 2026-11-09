@@ -490,3 +490,208 @@ pub(crate) fn canonicalize(mut b: Brep) -> Brep {
     b.edges = edges;
     b
 }
+
+/// A watertight network of Bézier patches meeting edge to edge (design doc §6.3, P4).
+///
+/// `patches[f][i][j]` is the control net of patch `f` (`i` along u, `j` along v, any common
+/// degree 1 to 8); `corners[f]` are the layout vertex ids of its corners `[0][0]`, `[n][0]`,
+/// `[n][n]`, `[0][n]`. Patches that share a layout edge must carry identical control points
+/// along it (checked), so the kernel sees one shared edge; faces are oriented by `u × v`, which
+/// must be consistent over the layout. With every edge used twice the shell is closed and the
+/// result is a solid.
+pub fn sheet_from_bezier_network(patches: &[Vec<Vec<[f64; 3]>>], corners: &[[u32; 4]]) -> Result<Brep> {
+    let nf = patches.len();
+    if nf == 0 || corners.len() != nf {
+        return Err(KernelError::Argument("the network needs at least one patch and one corner list per patch".into()));
+    }
+    let n = patches.first().map_or(0, |p| p.len().saturating_sub(1));
+    if n == 0 || n > 8 || patches.iter().any(|p| p.len() != n + 1 || p.iter().any(|r| r.len() != n + 1)) {
+        return Err(KernelError::Argument("patches must be square nets of one degree between 1 and 8".into()));
+    }
+    if patches.iter().flatten().flatten().flatten().any(|c| !c.is_finite()) {
+        return Err(KernelError::Argument("control points must be finite".into()));
+    }
+    let nv = corners.iter().flatten().copied().max().map_or(0, |m| m as usize + 1);
+    if nv > 4 * nf + 4 {
+        return Err(KernelError::Argument("corner ids are not compact".into()));
+    }
+    let mut vertex_pts: Vec<Option<[f64; 3]>> = vec![None; nv];
+    let mut knots = vec![0.0; n + 1];
+    knots.extend(std::iter::repeat_n(1.0, n + 1));
+    let at = |f: usize, i: usize, j: usize| -> [f64; 3] {
+        patches.get(f).and_then(|p| p.get(i)).and_then(|r| r.get(j)).copied().unwrap_or([0.0; 3])
+    };
+    let tol = 1e-7;
+    let same = |a: &[f64; 3], b: &[f64; 3]| (0..3).all(|k| (a[k] - b[k]).abs() <= tol * (1.0 + a[k].abs()));
+    // the four sides in loop direction c0 → c1 → c2 → c3 → c0 with their control points
+    let side_pts = |f: usize, s: usize| -> Vec<[f64; 3]> {
+        (0..=n)
+            .map(|k| match s {
+                0 => at(f, k, 0),
+                1 => at(f, n, k),
+                2 => at(f, n - k, n),
+                _ => at(f, 0, n - k),
+            })
+            .collect()
+    };
+    let uv_corner = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+    let mut edges: Vec<Edge> = Vec::new();
+    let mut edge_of: std::collections::BTreeMap<(u32, u32), u32> = std::collections::BTreeMap::new();
+    let mut faces: Vec<Face> = Vec::with_capacity(nf);
+    let mut oriented = Vec::with_capacity(nf);
+    for f in 0..nf {
+        let c = corners.get(f).copied().unwrap_or([0; 4]);
+        for (k, &vid) in c.iter().enumerate() {
+            let p = match k {
+                0 => at(f, 0, 0),
+                1 => at(f, n, 0),
+                2 => at(f, n, n),
+                _ => at(f, 0, n),
+            };
+            let slot = vertex_pts
+                .get_mut(vid as usize)
+                .ok_or_else(|| KernelError::Argument("corner id out of range".into()))?;
+            match slot {
+                Some(q) if !same(q, &p) => {
+                    return Err(KernelError::Argument(format!("patch {f} corner {k} does not meet its neighbours")));
+                }
+                Some(_) => {}
+                None => *slot = Some(p),
+            }
+        }
+        let mut loop_edges = Vec::with_capacity(4);
+        for s in 0..4 {
+            let (a, b) = (c[s], c[(s + 1) % 4]);
+            if a == b {
+                return Err(KernelError::Argument(format!("patch {f} has a repeated corner")));
+            }
+            let pts = side_pts(f, s);
+            let (lo, hi) = (a.min(b), a.max(b));
+            let forward = a < b;
+            let native: Vec<[f64; 3]> = if forward { pts.clone() } else { pts.iter().rev().copied().collect() };
+            let eid = match edge_of.get(&(lo, hi)) {
+                Some(&e) => {
+                    let existing = edges.get(e as usize).ok_or_else(|| KernelError::Argument("edge index".into()))?;
+                    let Curve::Spline { points, .. } = &existing.curve else {
+                        return Err(KernelError::Argument("edge curve".into()));
+                    };
+                    if points.len() != native.len() || points.iter().zip(&native).any(|(x, y)| !same(x, y)) {
+                        return Err(KernelError::Argument(format!(
+                            "patches meeting along edge {lo}-{hi} do not share their boundary curve"
+                        )));
+                    }
+                    e
+                }
+                None => {
+                    let e = edges.len() as u32;
+                    edges.push(Edge {
+                        curve: Curve::Spline { knots: knots.clone(), points: native },
+                        nurbs: None,
+                        interval: [0.0, 1.0],
+                        vertices: [lo, hi],
+                        tolerance: 1e-6,
+                        uses: Vec::new(),
+                    });
+                    edge_of.insert((lo, hi), e);
+                    e
+                }
+            };
+            // pcurve in the edge's own direction
+            let (p0, p1) = (uv_corner[s], uv_corner[(s + 1) % 4]);
+            let (start, end) = if forward { (p0, p1) } else { (p1, p0) };
+            if let Some(edge) = edges.get_mut(eid as usize) {
+                edge.uses.push(EdgeUseRef { face: f as u32, r#loop: 0, position: s as u32, upper: !forward });
+            }
+            loop_edges.push(OrientedEdge { edge: eid, forward, pcurve: line2(start, end, 0.0, 1.0) });
+        }
+        let points: Vec<Vec<[f64; 3]>> = (0..=n).map(|i| (0..=n).map(|j| at(f, i, j)).collect()).collect();
+        faces.push(Face {
+            surface: Surface::Spline { u_knots: knots.clone(), v_knots: knots.clone(), points },
+            nurbs: None,
+            domain: [[0.0, 1.0], [0.0, 1.0]],
+            loops: vec![Loop::Edges { edges: loop_edges }],
+        });
+        oriented.push(OrientedFace { face: f as u32, forward: true });
+    }
+    if edges.iter().any(|e| e.uses.len() > 2) {
+        return Err(KernelError::Argument("an edge is shared by more than two patches".into()));
+    }
+    let vertices: Vec<Vertex> =
+        vertex_pts.into_iter().map(|p| Vertex { point: p.unwrap_or([0.0; 3]), tolerance: 1e-6 }).collect();
+    // a closed shell bounds the infinite region and encloses one solid region
+    let closed = edges.iter().all(|e| e.uses.len() == 2);
+    let mut regions = vec![Region { shells: vec![0], void: false }];
+    if closed {
+        regions.push(Region { shells: vec![0], void: false });
+    }
+    let brep = Brep {
+        version: crate::record::brep::VERSION,
+        tolerance: 1e-6,
+        regions,
+        shells: vec![Shell::Faces { faces: oriented, wires: vec![] }],
+        faces,
+        edges,
+        vertices,
+    };
+    let brep = canonicalize(brep);
+    brep.validate().map_err(|e| op_err("record validate", e))?;
+    let (body, _) = solidcore_ops::Body::from_record(&brep, false).map_err(|e| op_err("from_record", e))?;
+    body.to_record().map(|(r, _)| r).map_err(|e| op_err("to_record", e))
+}
+
+/// Is every edge of the sheet used by two faces (a closed shell)?
+#[must_use]
+pub fn is_closed(b: &Brep) -> bool {
+    !b.edges.is_empty() && b.edges.iter().all(|e| e.uses.len() == 2)
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::*;
+
+    /// A planar bicubic patch on the quad through `a`, `b` (along u) and `d` (along v).
+    fn flat(a: [f64; 3], b: [f64; 3], d: [f64; 3]) -> Vec<Vec<[f64; 3]>> {
+        (0..4)
+            .map(|i| {
+                (0..4)
+                    .map(|j| {
+                        let (s, t) = (i as f64 / 3.0, j as f64 / 3.0);
+                        [
+                            a[0] + (b[0] - a[0]) * s + (d[0] - a[0]) * t,
+                            a[1] + (b[1] - a[1]) * s + (d[1] - a[1]) * t,
+                            a[2] + (b[2] - a[2]) * s + (d[2] - a[2]) * t,
+                        ]
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn closed_cube_network_is_a_solid() {
+        let v: [[f64; 3]; 8] = [
+            [0.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+            [10.0, 10.0, 0.0],
+            [0.0, 10.0, 0.0],
+            [0.0, 0.0, 10.0],
+            [10.0, 0.0, 10.0],
+            [10.0, 10.0, 10.0],
+            [0.0, 10.0, 10.0],
+        ];
+        // quads counter-clockwise seen from outside
+        let q: [[u32; 4]; 6] = [[0, 3, 2, 1], [4, 5, 6, 7], [0, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7]];
+        let patches: Vec<Vec<Vec<[f64; 3]>>> =
+            q.iter().map(|c| flat(v[c[0] as usize], v[c[1] as usize], v[c[3] as usize])).collect();
+        let sheet = sheet_from_bezier_network(&patches, &q).unwrap();
+        assert_eq!(sheet.faces.len(), 6);
+        assert_eq!(sheet.edges.len(), 12);
+        assert!(is_closed(&sheet));
+        let vol = crate::solid::volume(&sheet).unwrap();
+        assert!((vol - 1000.0).abs() < 1e-6, "volume {vol}");
+        // patches that do not share their edge are refused
+        let mut bad = patches.clone();
+        bad[1][1][0][2] += 0.5;
+        assert!(sheet_from_bezier_network(&bad, &q).is_err());
+    }
+}

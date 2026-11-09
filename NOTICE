@@ -15,6 +15,13 @@ Third-party material
   contributors: the STEP open-shell writer in crates/io/src/step/ is adapted from its crates/step, and
   the IGES writer crates/io/src/iges.rs from its crates/kernel/src/iges_out.rs (both modified).
 
+- Instant Meshes (https://github.com/wjakob/instant-meshes; permissive licence, see its LICENSE.txt: design doc §10
+  records it as MIT, the repository file reads BSD-3-Clause; re-check before any source is adapted), Copyright (c)
+  2015 Wenzel Jakob, Daniele Panozzo, Marco Tarini and Olga Sorkine-Hornung ("Instant Field-Aligned Meshes",
+  SIGGRAPH Asia 2015): the retopology in crates/fit/src/retopo.rs implements the orientation and position field
+  method of that paper, written from the publication; no source code of the reference implementation was copied
+  or adapted.
+
 Adapted source files are listed in ATTRIBUTION.md ("Adapted code"), each keeping its original
 copyright notice and marked as modified (Apache-2.0 section 4).
 

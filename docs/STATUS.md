@@ -22,6 +22,7 @@ Etapy po MVP ([plan production-readiness](superpowers/plans/2026-11-09-productio
 |---|---|---|---|
 | P1 | realne skany: pomiar, edycja siatki, odporność segmentacji i szumu | **zamknięty** | [plan](superpowers/plans/2026-11-09-p1-real-scans.md) |
 | P3 | model hybrydowy: prymitywy + płaty → jedna zamknięta bryła, STEP round-trip | **zamknięty** (PR) | [plan](superpowers/plans/2026-11-09-p3-hybrid.md) |
+| P4 | freeform organiczny: retopologia niestrukturalna (pola kierunków), łaty G1, sieć łat z krzywych cech | **zamknięty** (PR, na P3) | [plan](superpowers/plans/2026-11-09-p4-organic.md) |
 
 ## Jak uruchomić
 
@@ -76,6 +77,11 @@ cargo run -p surfacecraft
 | P3: część B — wałek r = 12 z fazą 3 mm i otworem przelotowym r = 4 (2 płaszczyzny, walec, stożek, walec wklęsły) | 1 bryła, 5 ścian; V 11751,67 vs CAD 11752,69 (0,009 %); max odchyłka 0,128 mm (rms 0,030); STEP round-trip V 1,7e-7, 5 → 5 ścian | `gate_p3_chamfered_cylinder_with_hole` |
 | P3: `replace_face` (płaski wierzch bloku → płat), `*.trim_to_region` (arkusz ściany bryły na płacie/prymitywie) | blok 6 ścian, V 13020 (40·30·mean h); każde wejście `from_regions` ma dokładnie 1 ścianę | `gate_p3_block_with_freeform_top` |
 
+| P4: zamknięty kształt organiczny (kula r = 20 z gładkimi wybrzuszeniami ±4 mm, skan σ = 0,025, `scanify`, `mesh.clean`) | `quad.retopo` (pole orientacji + pozycji): 74 ściany z pola (52 quady, 15 % wierzchołków nieregularnych, χ = 2) → 276 łat bikubicznych; max odchyłka skanu od łat 0,122 mm (niezależnie względem teselacji kernela 0,124; próg 0,2), łaty od dokładnego kształtu 0,041 mm; skok normalnej przez krawędzie: max 3,1°, średnio 0,30°; sieć zamknięta → bryła 276 ścian, V 33808,31 vs dokładna 33812,44 (0,012 %), każda krawędź w 2 ścianach | `gate_p4_closed_organic_blob` |
+| P4: otwarta powierzchnia zawinięta o 240° (nie mapa wysokości; `surface.fit` i `quad.create` odmawiają), skan σ = 0,025 | układ z pola: 80 ścian (78 quadów, 1 % nieregularnych) → 318 łat; max odchyłka 0,102 mm (99. percentyl niezależnie 0,077); skok normalnej max 0,29°, średnio 0,047°; 2 % punktów poza brzegiem układu (nie liczone) | `gate_p4_open_wrapped_patch` |
+| P4: obudowa z ostrymi krawędziami (60×40×24, ściany wybrzuszone do 2,5 mm), skan σ = 0,025, `surface.from_curves` | 6 łat stopnia 5 na 12 wspólnych krzywych cech, bryła zamknięta; max odchyłka 0,103 mm (rms 0,026); V 67316,73 vs dokładna 67326,83 (0,015 %) | `gate_p4_feature_curve_housing` |
+| P4: kernel — sieć łat Béziera (`nurbs::sheet_from_bezier_network`) | sześcian z 6 łat bikubicznych: 12 wspólnych krawędzi, powłoka zamknięta = bryła, V = 1000 (1e-6); łaty o niezgodnym brzegu odrzucone | `kernel::nurbs::network_tests` |
+
 ## Decyzje buildera (z uzasadnieniem)
 
 Szczegóły w planach milestone'ów.
@@ -89,7 +95,7 @@ Szczegóły w planach milestone'ów.
 - Segmentacja: deterministyczny fit-and-grow na spójności meshu (wariant Efficient RANSAC).
 - Fit do punktów rozproszonych (§10): resampling regionu do siatki (MLS nad płaszczyzną PCA) → `lst_sq_approx` w kernelu; `app-geometry` pusta.
 - Arkusz z płata: rekord `Brep` z jedną ścianą `Spline` składany w `kernel::nurbs` (sprawdzany przez `validate` i `Body::from_record`).
-- Retopologia (§10): strukturalny układ quad na mapie wysokości (bez portu Instant Meshes i bez procesu zewnętrznego); AutoSurface = jeden B-spline na blok rozłożony na łaty Béziera (G1 z konstrukcji).
+- Retopologia (§10): M4 — strukturalny układ quad na mapie wysokości; P4 — natywny, napisany z publikacji układ z pól Instant Meshes (4-RoSy + 2-PoSy) dla regionów zawiniętych/zamkniętych (bez procesu zewnętrznego i bez kodu referencyjnego); AutoSurface strukturalny = jeden B-spline na blok rozłożony na łaty Béziera (G1 z konstrukcji), niestrukturalny = łata bikubiczna na quad.
 - Solver więzów: własny (LM + analiza rzędu jakobianu), bez adaptacji `solidcraft-sketch`.
 - MCP: własny JSON-RPC (bez `rmcp`), narzędzie na komendę; bridged przez kanał sterowania 127.0.0.1 + token.
 - Asystent AI: pętla narzędzi niezależna od dostawcy; dostawca = program z `SURFACECRAFT_AI_COMMAND` (wybór usługi LLM czeka na użytkownika).
@@ -109,7 +115,10 @@ Szczegóły w planach milestone'ów.
 - Segmentacja jednowątkowa: ~40 s na 650 k trójkątów (cel P2: < 60 s na 10 mln).
 - Edycja siatki: decymacja QEM i wypełnianie dziur bez równoległości; dziury > 4000 krawędzi pomijane.
 - Fit Surface: jeden płat na region wysokościowy nad płaszczyzną (region zawinięty → odmowa, trzeba podzielić); brzeg płata = prostokąt w parametrach (bez przycinania do konturu regionu).
-- Retopologia niestrukturalna (pole kierunków, regiony zawinięte/zamknięte) — brak; AutoSurface wymaga regionu-mapy wysokości.
+- P4 (retopologia): hierarchia z decymacji QEM zamiast grafu Instant Meshes, jeden wątek, ekstrakcja przez sąsiedztwo komórek kraty (bez śledzenia krawędzi); przy osobliwościach 20–30 % ścian to trójkąty/pięciokąty → podział 4→1 całego układu (4× łat); gdy pole nie daje czystej siatki lub zostają odwrócone quady — układ zapasowy (decymacja → 3 quady na trójkąt), raportowany. Decymacja QEM jest wolna na idealnie płaskich siatkach (kilkanaście sekund przy 14 tys. trójkątów). Brak wyrównania do ostrych krawędzi w polu (to robi `surface.from_curves`).
+- P4 (G1): łaty mają wspólne krzywe brzegowe i wspólne płaszczyzny styczne w wierzchołkach; wzdłuż krawędzi G1 jest przybliżone (skok mierzony, max 3° na blobie). Dokładne G1 przy dowolnej walencji = konstrukcja „vertex enclosure” (constrained fit krawędzi) — kandydat na prymityw kernela/upstream solidcore (za zgodą użytkownika). Do tego czasu `crates/fit/src/{patch,features}.rs` liczą ewaluację i dopasowanie łat Béziera po stronie aplikacji (wpisy w `xtask/app-geometry.txt` z markerem `APP-GEOMETRY:`; B-rep powstaje w kernelu).
+- P4 (`surface.from_curves`): obsługuje regiony z dokładnie 4 rogami (inne pomijane z powodem); rogi = wierzchołki styku ≥ 3 regionów; brak ciągłości stycznych na ostrych krawędziach z założenia.
+- P4: `thicken` otwartej sieci wielołatowej nadal zależy od solidcore (offset *partial*); sieć zamknięta daje bryłę wprost (`surface.auto`/`surface.from_curves` tworzą `body`).
 - solidcore: `thicken` odmawia na wielościennym arkuszu (offset *partial*) — `surface.thicken` używa jednościennego arkusza-rodzica; bloki z przełamaniami pogrubia się osobno. Kandydat do zgłoszenia upstream (za zgodą).
 - Indeksy krawędzi/ścian w cechach (fillet, shell) są pozycyjne: po zmianie topologii wcześniejszej cechy mogą wskazać inną krawędź (brak trwałego nazewnictwa topologii).
 - Auto-constrain relacji między prymitywami (§6.2) i część operacji (trim/split, sweep, loft) nie mają komend cech.
