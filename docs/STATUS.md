@@ -79,6 +79,8 @@ cargo run -p surfacecraft
 | P3b Z1+Z2: blok 60×50×20 z kieszenią 30×20 (naroża r = 4, fillet dna r = 1) i otworem Ø8 z dnem stożkowym 118° (skan σ = 0,03; 11 płaszczyzn, 4 walce naroży, 4 walce fillet dna, ściana otworu, stożek) | 1 zamknięta bryła, 25 ścian jak CAD; V 54709,85 vs CAD 54686,11 (0,043 %); max odchyłka skanu od bryły 0,160 mm (rms 0,031; 0 wierzchołków > 0,2); STEP round-trip V 2,8e-11, 25 → 25 ścian. Bez prymitywów fillet dna: 17 ścian jak CAD bez fillet, V 0,044 % od CAD bez fillet, max odchyłka 0,33 mm w pasie fillet (0,16 poza nim) | `gate_p3b_block_with_pocket_and_blind_hole` |
 | P3b Z2: płyta 50×40×10 z oknem przelotowym (r = 3) i rowkiem otwartym do krawędzi (półokrągły koniec r = 4) | 18 ścian jak CAD; V 17359,33 vs CAD 17345,93 (0,077 %); max odchyłka 0,138 mm; STEP round-trip V 4e-16 | `p3b_plate_with_window_and_open_slot` |
 
+| P3b/Z4: `replace_face` w górę i w dół (płat falisty przecina płaską ścianę, wzniesienie 2,5 mm) | 1 zamknięta bryła, 6 ścian; V 13018,6646 vs kwadratura 13018,6605 (4e-6 %); STEP round-trip V < 1e-6; kolizja odrzucona z komunikatem | `gate_p3b_replace_face_up_and_down` |
+
 ## Decyzje buildera (z uzasadnieniem)
 
 Szczegóły w planach milestone'ów.
@@ -120,7 +122,8 @@ Szczegóły w planach milestone'ów.
 - **Asystent AI bez skonfigurowanego dostawcy LLM:** działa z dowolnym programem-dostawcą, ale żadna usługa nie jest wybrana ani podpięta (decyzja użytkownika: dostawca i klucz API).
 - P3 (`kernel::hybrid`): obsługiwane cięcia to płaszczyzna, wypukły walec styczny do dwóch płaszczyzn (fillet), walec/stożek/sfera/torus
   obejmujące oś w całości, płat swobodny; pominięte (raportowane): częściowy wypukły stożek, częściowa sfera/torus, bossy i stopnie
-  (wypukły walec, którego na zewnątrz leży skan); `replace_face` tylko odcina materiał (płat musi przechodzić przez bryłę).
+  (wypukły walec, którego na zewnątrz leży skan); `replace_face` (P3b/Z4) dodaje i odcina materiał (ściana wyciągnięta o wzniesienie płata, suma, cięcie;
+  odmawia, gdy wyciągnięcie koliduje z bryłą; obrys tylko z odcinków i łuków, ściana bez otworów).
 - P3b (Z1+Z2, `engine::cmd::plan`, `kernel::local`): planer rozróżnia cięcia globalne (przed płaszczyzną < 0,5 % skanu) i lokalne;
   lokalne tworzą narzędzia odejmowane — otwór nieprzelotowy (walec + dno płaskie lub stożek wiertła, obrót profilu), kieszeń
   (podłoga + ścianki/naroża → profil, wyciągnięcie, opcjonalny fillet dna r z walców stycznych do dna), wybranie przelotowe i rowek
@@ -137,6 +140,7 @@ Szczegóły w planach milestone'ów.
   rozszerzające się wzdłuż z (z dyskiem 0,01 mm przy wierzchołku); (2) fillet zwraca walec jako `Cone` o półkącie 0 (rozpoznawane
   w `faces_on_shape`); (3) przecięcie dwóch prawie współosiowych powierzchni obrotowych (osie różne o szum fitu) kończy się
   status 1001 — obejście aplikacji: `snap_axes` (auto-więz współosiowości, ≤ 3° / 0,5 mm).
+  Reprodukcje (1–3): `crates/kernel/tests/upstream_repro.rs` (`#[ignore]`); szkice zgłoszeń: `docs/upstream/solidcore-p3.md`.
 - `region.auto_segment` rozbija płaskie pierścienie (wałek z otworem: dwie płaszczyzny → ~85 kawałków po 30–280 trójkątów) —
   w teście P3 płaszczyzny wybrane geometrycznie (`region.create`); do poprawy w segmentacji (P1/P4).
 - Kanał sterowania zapisuje token w pliku tymczasowym (dostęp lokalnego użytkownika); jedna instancja aplikacji naraz.

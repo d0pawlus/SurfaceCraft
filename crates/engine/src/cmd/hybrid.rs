@@ -496,7 +496,8 @@ pub struct ReplaceFaceIn {
     /// Record index of a planar face.
     pub face: usize,
     /// Fitted freeform surface that takes its place (needs its source region). It must run
-    /// across the whole face and cuts material away (it does not add any).
+    /// across the whole face; where it lies above the face material is added (the face is
+    /// extruded first), where it lies below material is cut away.
     pub surface: ObjRef,
     /// Extension of the patch past its region on every side, mm (default 3).
     #[serde(default)]
