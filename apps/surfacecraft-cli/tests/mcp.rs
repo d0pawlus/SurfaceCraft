@@ -49,6 +49,86 @@ fn gate_m6_mcp_stdio_exposes_and_runs_every_command() {
     let _ = child.wait();
 }
 
+/// Starts `surfacecraft-cli mcp --local` with `args` and extra environment; returns the child and
+/// its stdin and stdout.
+fn start_mcp(
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> (std::process::Child, std::process::ChildStdin, BufReader<std::process::ChildStdout>) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_surfacecraft-cli"));
+    cmd.args(["mcp", "--local"]).args(args).env_remove("SURFACECRAFT_MCP_TOOLS").env_remove("SURFACECRAFT_MCP_AREAS");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let stdin = child.stdin.take().unwrap();
+    let stdout = BufReader::new(child.stdout.take().unwrap());
+    (child, stdin, stdout)
+}
+
+/// One request/reply exchange with the server.
+fn exchange(stdin: &mut std::process::ChildStdin, out: &mut BufReader<std::process::ChildStdout>, msg: Value) -> Value {
+    writeln!(stdin, "{msg}").unwrap();
+    stdin.flush().unwrap();
+    let mut line = String::new();
+    out.read_line(&mut line).unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
+/// The tool names a `tools/list` reply carries.
+fn listed(reply: &Value) -> Vec<String> {
+    reply["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect()
+}
+
+#[test]
+fn gate_p8_compact_mode_and_queued_jobs_over_stdio() {
+    let list = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
+    // the listing comes from the arguments: one tool per area, only the areas asked for
+    let (mut child, mut stdin, mut out) = start_mcp(&["--tools", "compact", "--areas", "mesh,app,guide"], &[]);
+    let names = listed(&exchange(&mut stdin, &mut out, list.clone()));
+    assert!(names.iter().any(|n| n == "mesh") && names.iter().any(|n| n == "guide"), "{names:?}");
+    assert!(!names.iter().any(|n| n.starts_with("mesh_") || n == "body"), "{names:?}");
+    assert!(names.iter().any(|n| n == "job_wait") && names.iter().any(|n| n == "set_tool_mode"));
+    let call = |name: &str, args: Value| json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": name, "arguments": args}});
+    // a queued call answers at once with its job id; job_wait returns the result
+    let queued = exchange(
+        &mut stdin,
+        &mut out,
+        call(
+            "mesh",
+            json!({"verb": "synth", "params": {"shape": "bracket", "noise": 0.05, "seed": 4, "name": "scan"}, "queued": true}),
+        ),
+    );
+    assert_eq!(queued["result"]["structuredContent"]["state"], "queued", "{queued}");
+    let job = queued["result"]["structuredContent"]["job"].clone();
+    let done = exchange(&mut stdin, &mut out, call("job_wait", json!({"job": job, "timeout_ms": 60_000})));
+    assert_eq!(done["result"]["structuredContent"]["state"], "done", "{done}");
+    // several steps in one call, each its own undo step
+    let r = exchange(
+        &mut stdin,
+        &mut out,
+        call(
+            "app",
+            json!({"verb": "batch", "params": {"commands": [{"command": "body.box", "params": {"size": [10, 10, 10]}}]}}),
+        ),
+    );
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    // the listing changes at run time
+    let r = exchange(&mut stdin, &mut out, call("set_tool_mode", json!({"mode": "full", "areas": null})));
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    let names = listed(&exchange(&mut stdin, &mut out, list.clone()));
+    assert!(names.iter().any(|n| n == "mesh_import") && names.iter().any(|n| n == "body_box"));
+    drop(stdin);
+    let _ = child.wait();
+
+    // without arguments the environment chooses
+    let (mut child, mut stdin, mut out) = start_mcp(&[], &[("SURFACECRAFT_MCP_TOOLS", "compact")]);
+    let names = listed(&exchange(&mut stdin, &mut out, list));
+    assert!(names.iter().any(|n| n == "mesh") && !names.iter().any(|n| n == "mesh_import"), "{names:?}");
+    drop(stdin);
+    let _ = child.wait();
+}
+
 #[test]
 fn bridge_forwards_to_a_running_app() {
     use surfacecraft_engine::Session;
