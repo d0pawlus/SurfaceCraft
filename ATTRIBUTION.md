@@ -24,6 +24,7 @@ Policy:
 | skills/** | SurfaceCraft contributors | this repository | MIT OR Apache-2.0 |
 | examples/** | SurfaceCraft contributors | this repository | MIT OR Apache-2.0 |
 | apps/surfacecraft-web/index.html | SurfaceCraft contributors | this repository | MIT OR Apache-2.0 |
+| vercel.json | SurfaceCraft contributors | own Vercel project configuration (Git-triggered deployments off; no third-party text) | MIT OR Apache-2.0 |
 | crates/ui-egui/src/shaders/*.wgsl | SurfaceCraft contributors | this repository | MIT OR Apache-2.0 |
 | crates/ui-egui/assets/icons/*.svg | SurfaceCraft contributors | own monochrome line icons drawn for SurfaceCraft on a 24-unit grid (no icon from any other application or icon set) | MIT OR Apache-2.0 |
 | crates/ui-egui/assets/locales/*.json | SurfaceCraft contributors | own interface strings (English, Polish) | MIT OR Apache-2.0 |
