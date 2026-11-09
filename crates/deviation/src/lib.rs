@@ -40,8 +40,11 @@ fn lerp(a: [f32; 4], b: [f32; 4], k: f32) -> [f32; 4] {
 /// Deviation statistics.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct DeviationStats {
-    /// Points measured.
+    /// Points measured (facing the reference, see [`Sample`]).
     pub count: usize,
+    /// Points left out because their normal points away from the reference normal.
+    #[serde(default)]
+    pub not_facing: usize,
     /// Smallest signed deviation (mm; 0 without points).
     pub min: f64,
     /// Largest signed deviation (mm; 0 without points).
@@ -87,6 +90,7 @@ pub fn stats(values: &[f64], tolerance: f64) -> DeviationStats {
     let (min, max) = if n == 0 { (0.0, 0.0) } else { (min, max) };
     DeviationStats {
         count: n,
+        not_facing: 0,
         min,
         max,
         max_abs,
@@ -115,6 +119,468 @@ pub fn against_mesh(points: &[Point3], target: &Bvh, max_distance: f64) -> Vec<f
         }
         None => f64::NAN,
     })
+}
+
+/// One scan point measured against a reference: its signed deviation and whether it faces it.
+///
+/// Sign convention: the deviation is positive when the scan lies outside the reference material,
+/// judged by the reference surface normal (outward for bodies, spheres, cylinders, cones and tori;
+/// for a plane, see [`oriented_plane`]). A point whose own normal points away from the reference
+/// normal (dot < 0) is not facing: its nearest reference surface is then another wall of the part
+/// (the far side of a thin plate), so it is left out of the statistics.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Sample {
+    /// Signed deviation (mm); NaN when the point is not measured.
+    pub d: f64,
+    /// False when the scan normal points away from the reference normal.
+    pub facing: bool,
+    /// Unit reference normal at the nearest reference point (zero when unknown, as for freeform
+    /// surfaces). Areas are projected along it, see [`hotspots`].
+    pub reference: [f64; 3],
+}
+
+impl Sample {
+    /// A point that was not measured (outside the region, or farther than the reach).
+    pub const UNMEASURED: Sample = Sample { d: f64::NAN, facing: false, reference: [0.0; 3] };
+
+    /// Measured and facing: counted in the statistics.
+    #[must_use]
+    pub fn counted(&self) -> bool {
+        self.d.is_finite() && self.facing
+    }
+
+    /// Measured, but not facing the reference: left out of the statistics.
+    #[must_use]
+    pub fn not_facing(&self) -> bool {
+        self.d.is_finite() && !self.facing
+    }
+}
+
+/// Whether a scan normal faces the reference normal. A missing or non-finite comparison counts as
+/// facing: nothing in the data contradicts the measurement.
+fn faces(scan: Option<&Vec3>, reference: &Vec3) -> bool {
+    scan.is_none_or(|n| !(n.dot(reference) < 0.0))
+}
+
+/// Samples of points against a primitive. `normals[i]` is the scan normal of `points[i]` (missing
+/// normals count as facing).
+#[must_use]
+pub fn samples_primitive(points: &[Point3], normals: &[Vec3], prim: &Primitive) -> Vec<Sample> {
+    points
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let n = prim.normal(p);
+            Sample { d: prim.distance(p), facing: faces(normals.get(i), &n), reference: [n.x, n.y, n.z] }
+        })
+        .collect()
+}
+
+/// Samples of points against a mesh surface: the sign comes from the normal of the nearest
+/// triangle, and points farther than `max_distance` are not measured. `normals[i]` is the scan
+/// normal of `points[i]`.
+#[must_use]
+pub fn samples_mesh(points: &[Point3], normals: &[Vec3], target: &Bvh, max_distance: f64) -> Vec<Sample> {
+    surfacecraft_geom::par::map(points.len(), |i| {
+        let Some(p) = points.get(i) else { return Sample::UNMEASURED };
+        let Some(h) = target.closest(p, max_distance) else { return Sample::UNMEASURED };
+        let Some(n) = target.triangle_normal(h.triangle) else {
+            // a degenerate reference triangle has no side: its distance is taken as outside
+            return Sample { d: h.distance, facing: true, reference: [0.0; 3] };
+        };
+        let outside = (p - h.point).dot(&n) >= 0.0;
+        Sample {
+            d: if outside { h.distance } else { -h.distance },
+            facing: faces(normals.get(i), &n),
+            reference: [n.x, n.y, n.z],
+        }
+    })
+}
+
+/// The deviation values of the counted points, NaN for the others (for the colour map).
+#[must_use]
+pub fn counted_values(samples: &[Sample]) -> Vec<f64> {
+    samples.iter().map(|s| if s.counted() { s.d } else { f64::NAN }).collect()
+}
+
+/// [`stats`] of the samples, with the points that do not face the reference counted apart.
+#[must_use]
+pub fn stats_of(samples: &[Sample], tolerance: f64) -> DeviationStats {
+    let mut st = stats(&counted_values(samples), tolerance);
+    st.not_facing = samples.iter().filter(|s| s.not_facing()).count();
+    st
+}
+
+/// The primitive with a plane's normal turned to agree with `normals` (the scan normals of the
+/// points it describes). A plane has no inherent side, so its material side comes from the scan:
+/// the normal is flipped when the scan normals point against it on balance. Other primitives are
+/// returned unchanged, since their normals point outward by construction.
+#[must_use]
+pub fn oriented_plane(prim: &Primitive, normals: &[Vec3]) -> Primitive {
+    if let Primitive::Plane { point, normal } = prim {
+        let n = Vec3::new(normal[0], normal[1], normal[2]);
+        let vote: f64 =
+            normals.iter().filter(|v| surfacecraft_geom::finite_vec(v) && v.norm() > 0.5).map(|v| v.dot(&n)).sum();
+        if vote < 0.0 {
+            return Primitive::Plane { point: *point, normal: [-normal[0], -normal[1], -normal[2]] };
+        }
+    }
+    prim.clone()
+}
+
+/// Largest number of histogram bins [`report`] accepts.
+pub const MAX_BINS: usize = 1000;
+/// Largest number of tolerance bands [`report`] accepts.
+pub const MAX_BANDS: usize = 64;
+
+/// Percentiles of the signed deviation (mm), linearly interpolated between sorted values.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Percentiles {
+    /// 1st percentile.
+    pub p1: f64,
+    /// 5th percentile.
+    pub p5: f64,
+    /// Median.
+    pub p50: f64,
+    /// 95th percentile.
+    pub p95: f64,
+    /// 99th percentile.
+    pub p99: f64,
+}
+
+/// Histogram of the signed deviation: equal bins over `lo..hi`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Histogram {
+    /// Lower edge of the first bin (mm).
+    pub lo: f64,
+    /// Upper edge of the last bin (mm).
+    pub hi: f64,
+    /// Counted points per bin. Values outside `lo..hi` fall in the end bins, so the counts sum to
+    /// the number of counted points.
+    pub counts: Vec<usize>,
+}
+
+/// The share of counted points whose |deviation| is within one tolerance.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Band {
+    /// Tolerance (mm).
+    pub tolerance: f64,
+    /// Counted points with |deviation| ≤ tolerance.
+    pub count: usize,
+    /// Their share of the counted points (0..1).
+    pub share: f64,
+}
+
+/// Statistics of the signed deviation of a set of samples.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Report {
+    /// Counted points (measured and facing the reference).
+    pub count: usize,
+    /// Points left out because their normal points away from the reference normal.
+    pub not_facing: usize,
+    /// Points not measured: outside the region, or farther than the reach of the reference.
+    pub unmeasured: usize,
+    /// Smallest signed deviation (mm; 0 without counted points).
+    pub min: f64,
+    /// Largest signed deviation (mm; 0 without counted points).
+    pub max: f64,
+    /// Mean signed deviation (mm).
+    pub mean: f64,
+    /// RMS of the signed deviation (mm).
+    pub rms: f64,
+    /// Percentiles of the signed deviation.
+    pub percentiles: Percentiles,
+    /// Histogram of the signed deviation.
+    pub histogram: Histogram,
+    /// Share within each requested tolerance of |deviation|.
+    pub bands: Vec<Band>,
+}
+
+/// Options of [`report`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReportOptions {
+    /// Histogram bins, 1 to [`MAX_BINS`].
+    pub bins: usize,
+    /// Histogram range (mm, finite, lower < upper). Default: ±p99 of |deviation|, or ±1 mm when
+    /// every deviation is zero.
+    pub range: Option<[f64; 2]>,
+    /// Tolerances of the bands (mm, positive, at most [`MAX_BANDS`]).
+    pub bands: Vec<f64>,
+}
+
+/// Linear interpolation of the `p`-th percentile (0..=100) of sorted values; 0 when empty.
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    let Some(last) = sorted.len().checked_sub(1) else { return 0.0 };
+    let rank = (p / 100.0).clamp(0.0, 1.0) * last as f64;
+    let lo = rank.floor();
+    let hi = rank.ceil();
+    let a = sorted.get(lo as usize).copied().unwrap_or(0.0);
+    let b = sorted.get(hi as usize).copied().unwrap_or(0.0);
+    a + (b - a) * (rank - lo)
+}
+
+/// Statistics of the signed deviation of the counted samples: extremes, mean, RMS, percentiles, a
+/// histogram and the share within each tolerance band.
+///
+/// # Errors
+/// Returns a message when the options are out of range (bins, range, bands).
+pub fn report(samples: &[Sample], opts: &ReportOptions) -> Result<Report, String> {
+    if opts.bins == 0 || opts.bins > MAX_BINS {
+        return Err(format!("bins must be between 1 and {MAX_BINS}"));
+    }
+    if opts.bands.len() > MAX_BANDS {
+        return Err(format!("at most {MAX_BANDS} bands"));
+    }
+    if let Some(t) = opts.bands.iter().find(|t| !(t.is_finite() && **t > 0.0)) {
+        return Err(format!("band tolerance {t} must be positive"));
+    }
+    if let Some([lo, hi]) = opts.range
+        && !(lo.is_finite() && hi.is_finite() && lo < hi)
+    {
+        return Err(format!("range {lo} to {hi} must be finite with lower < upper"));
+    }
+    let mut vals: Vec<f64> = samples.iter().filter(|s| s.counted()).map(|s| s.d).collect();
+    vals.sort_by(f64::total_cmp);
+    let count = vals.len();
+    let mut abs: Vec<f64> = vals.iter().map(|d| d.abs()).collect();
+    abs.sort_by(f64::total_cmp);
+    let (min, max, mean, rms) = if count == 0 {
+        (0.0, 0.0, 0.0, 0.0)
+    } else {
+        let n = count as f64;
+        let sum: f64 = vals.iter().sum();
+        let sq: f64 = vals.iter().map(|d| d * d).sum();
+        let min = vals.first().copied().unwrap_or(0.0);
+        let max = vals.last().copied().unwrap_or(0.0);
+        (min, max, sum / n, (sq / n).sqrt())
+    };
+    let (lo, hi) = match opts.range {
+        Some([lo, hi]) => (lo, hi),
+        None => {
+            let p99 = percentile(&abs, 99.0);
+            let half = if p99 > 0.0 { p99 } else { abs.last().copied().unwrap_or(0.0) };
+            let half = if half > 0.0 { half } else { 1.0 };
+            (-half, half)
+        }
+    };
+    let width = (hi - lo) / opts.bins as f64;
+    let last = (opts.bins - 1) as f64;
+    let mut counts = vec![0usize; opts.bins];
+    for d in &vals {
+        let k = ((d - lo) / width).floor();
+        let idx = if k.is_nan() { 0 } else { k.clamp(0.0, last) as usize };
+        if let Some(c) = counts.get_mut(idx) {
+            *c += 1;
+        }
+    }
+    let bands = opts
+        .bands
+        .iter()
+        .map(|&tolerance| {
+            let n = abs.partition_point(|&a| a <= tolerance);
+            Band { tolerance, count: n, share: if count > 0 { n as f64 / count as f64 } else { 0.0 } }
+        })
+        .collect();
+    Ok(Report {
+        count,
+        not_facing: samples.iter().filter(|s| s.not_facing()).count(),
+        unmeasured: samples.iter().filter(|s| !s.d.is_finite()).count(),
+        min,
+        max,
+        mean,
+        rms,
+        percentiles: Percentiles {
+            p1: percentile(&vals, 1.0),
+            p5: percentile(&vals, 5.0),
+            p50: percentile(&vals, 50.0),
+            p95: percentile(&vals, 95.0),
+            p99: percentile(&vals, 99.0),
+        },
+        histogram: Histogram { lo, hi, counts },
+        bands,
+    })
+}
+
+/// The side of a group: `positive` is excess material (the scan lies outside the reference),
+/// `negative` is missing material.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Sign {
+    /// Scan outside the reference: excess material.
+    Positive,
+    /// Scan inside the reference: missing material.
+    Negative,
+}
+
+/// A connected group of scan triangles whose |deviation| is above the tolerance.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Hotspot {
+    /// Triangles in the group.
+    pub triangles: usize,
+    /// Footprint area on the reference (mm²): each triangle's area projected along the reference
+    /// normal. Sloped borders of a step add little here; a flat patch has its plain area.
+    pub area: f64,
+    /// Surface area of the scan triangles (mm²), sloped borders included.
+    pub surface_area: f64,
+    /// Signed deviation of the triangle with the largest |deviation| (mm).
+    pub max: f64,
+    /// Area-weighted mean signed deviation (mm).
+    pub mean: f64,
+    /// Area-weighted centroid (mm).
+    pub centroid: [f64; 3],
+    /// Side of the group.
+    pub sign: Sign,
+}
+
+/// Volume error of the scan against the reference: the sum over triangles of footprint area × mean
+/// signed deviation (the material between the two surfaces, measured along the reference normal),
+/// split by sign.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Volume {
+    /// Excess material, mm³ (≥ 0): positive triangles.
+    pub excess_mm3: f64,
+    /// Missing material, mm³ (≤ 0): negative triangles.
+    pub missing_mm3: f64,
+    /// Excess plus missing, mm³.
+    pub net_mm3: f64,
+    /// Footprint area of the measured triangles on the reference (mm²), see [`Hotspot::area`].
+    pub area_mm2: f64,
+    /// Measured triangles: all three corners counted and in scope.
+    pub triangles: usize,
+}
+
+/// Hotspot groups (sorted by area, largest first) and the volume error.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct HotspotReport {
+    /// Groups with area at least `min_area`, largest first.
+    pub groups: Vec<Hotspot>,
+    /// Volume error over every measured triangle.
+    pub volume: Volume,
+}
+
+/// A measured scan triangle: mean signed deviation of its corners, footprint and surface areas, and
+/// centroid.
+#[derive(Clone, Copy)]
+struct TriValue {
+    d: f64,
+    area: f64,
+    surface: f64,
+    centre: Point3,
+}
+
+/// The value of triangle `t` when it is in scope and all three corners are counted. Its footprint
+/// is the triangle's area projected along the mean reference normal of its corners; without
+/// reference normals (a freeform surface) the footprint is the surface area.
+fn triangle_value(mesh: &Mesh, samples: &[Sample], t: usize) -> Option<TriValue> {
+    let corners = mesh.triangles.get(t)?;
+    let mut sum = 0.0;
+    let mut refs = Vec3::zeros();
+    for &vi in corners {
+        let s = samples.get(vi as usize)?;
+        if !s.counted() {
+            return None;
+        }
+        sum += s.d;
+        refs += Vec3::from(s.reference);
+    }
+    let [a, b, c] = mesh.triangle(t)?;
+    let surface = mesh.face_area(t);
+    let area = match surfacecraft_geom::normalize(refs) {
+        Some(n) => 0.5 * (b - a).cross(&(c - a)).dot(&n).abs(),
+        None => surface,
+    };
+    Some(TriValue { d: sum / 3.0, area, surface, centre: mesh.face_centroid(t)? })
+}
+
+/// Connected groups of scan triangles with |deviation| above `tolerance`, and the volume error.
+///
+/// Triangles are measured when they are in `in_scope` and all three corners are counted (see
+/// [`Sample`]); their deviation is the mean of the corners. Areas are footprints on the reference:
+/// a triangle's area projected along the reference normal. Sloped borders of a step therefore add
+/// little area, and a wall (normal perpendicular to the reference) adds none. Groups connect through edges shared by
+/// exactly two triangles, and only triangles of the same sign join a group. Groups smaller than
+/// `min_area` (mm²) are dropped; the rest are sorted by area, largest first.
+#[must_use]
+pub fn hotspots(mesh: &Mesh, samples: &[Sample], in_scope: &[bool], tolerance: f64, min_area: f64) -> HotspotReport {
+    let nt = mesh.triangle_count();
+    let tri: Vec<Option<TriValue>> = (0..nt)
+        .map(|t| if in_scope.get(t).copied().unwrap_or(false) { triangle_value(mesh, samples, t) } else { None })
+        .collect();
+    let mut volume = Volume::default();
+    for v in tri.iter().flatten() {
+        volume.area_mm2 += v.area;
+        volume.triangles += 1;
+        if v.d > 0.0 {
+            volume.excess_mm3 += v.area * v.d;
+        } else if v.d < 0.0 {
+            volume.missing_mm3 += v.area * v.d;
+        }
+    }
+    volume.net_mm3 = volume.excess_mm3 + volume.missing_mm3;
+    let neighbours = mesh.triangle_neighbours();
+    let mut seen = vec![false; nt];
+    let mut groups = Vec::new();
+    for start in 0..nt {
+        let already = seen.get(start).copied().unwrap_or(true);
+        let Some(first) = tri.get(start).copied().flatten() else { continue };
+        if already || first.d.abs() <= tolerance {
+            continue;
+        }
+        let positive = first.d > 0.0;
+        if let Some(s) = seen.get_mut(start) {
+            *s = true;
+        }
+        let mut stack = vec![start];
+        let mut members: Vec<TriValue> = Vec::new();
+        while let Some(t) = stack.pop() {
+            let Some(v) = tri.get(t).copied().flatten() else { continue };
+            members.push(v);
+            for &nb in neighbours.get(t).into_iter().flatten() {
+                let nb = nb as usize;
+                // boundary edges hold u32::MAX, which is out of range
+                let Some(mark) = seen.get_mut(nb) else { continue };
+                if *mark {
+                    continue;
+                }
+                let Some(w) = tri.get(nb).copied().flatten() else { continue };
+                if w.d.abs() <= tolerance || (w.d > 0.0) != positive {
+                    continue;
+                }
+                *mark = true;
+                stack.push(nb);
+            }
+        }
+        let n = members.len();
+        let (mut area, mut surface, mut area_d, mut sum_d, mut area_c, mut sum_c) =
+            (0.0, 0.0, 0.0, 0.0, Vec3::zeros(), Vec3::zeros());
+        let mut max = first.d;
+        for v in &members {
+            area += v.area;
+            surface += v.surface;
+            area_d += v.area * v.d;
+            sum_d += v.d;
+            area_c += v.centre.coords * v.area;
+            sum_c += v.centre.coords;
+            if v.d.abs() > max.abs() {
+                max = v.d;
+            }
+        }
+        let (mean, centre) =
+            if area > 0.0 { (area_d / area, area_c / area) } else { (sum_d / n as f64, sum_c / n as f64) };
+        if area >= min_area {
+            groups.push(Hotspot {
+                triangles: n,
+                area,
+                surface_area: surface,
+                max,
+                mean,
+                centroid: [centre.x, centre.y, centre.z],
+                sign: if positive { Sign::Positive } else { Sign::Negative },
+            });
+        }
+    }
+    groups.sort_by(|a, b| b.area.total_cmp(&a.area));
+    HotspotReport { groups, volume }
 }
 
 /// Colour per value: green within ±tol, through yellow/orange to red above, through cyan to
