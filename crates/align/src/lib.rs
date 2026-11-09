@@ -22,7 +22,7 @@ pub mod principal;
 pub mod symmetry;
 
 pub use datum::{Datum, datum_321};
-pub use icp::{IcpOptions, IcpReport, icp};
+pub use icp::{IcpOptions, IcpReport, icp, rms_to_surface};
 pub use kabsch::kabsch;
 pub use principal::principal_frame;
 pub use symmetry::{SymmetryPlane, symmetry_plane};
