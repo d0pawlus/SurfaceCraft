@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 surfacecraft-geom.workspace = true
 surfacecraft-doc.workspace = true
+surfacecraft-sketch.workspace = true
 surfacecraft-engine.workspace = true
 surfacecraft-ai.workspace = true
 serde_json.workspace = true
