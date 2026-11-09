@@ -53,11 +53,49 @@ fn palette_runs_commands_and_log_replays_in_the_engine() {
 #[test]
 fn template_prefills_required_parameters() {
     let schema = (surfacecraft_engine::cmd::find("body.fillet").unwrap().input)();
-    let ctx =
-        surfacecraft_ui_egui::app::PickContext { selected: Some(surfacecraft_doc::ObjectId(7)), ..Default::default() };
+    let id = surfacecraft_doc::ObjectId(7);
+    let ctx = surfacecraft_ui_egui::app::PickContext {
+        selected: Some(id),
+        objects: vec![(id, surfacecraft_doc::ObjectKind::Body)],
+        ..Default::default()
+    };
     let t = surfacecraft_ui_egui::app::template(&schema, &ctx);
     assert_eq!(t["object"], 7);
     assert!(t.get("edges").is_some() && t.get("size").is_some());
+}
+
+/// Object references are prefilled with a real object (the selection, else the only object of
+/// the needed kind), never with id 0.
+#[test]
+fn template_never_prefills_object_zero() {
+    use surfacecraft_doc::{ObjectId, ObjectKind};
+    use surfacecraft_ui_egui::app::{PickContext, template};
+    let mut h = harness();
+    h.state_mut().run_command("mesh.synth", json!({"shape": "box", "size": [40, 30, 20], "resolution": 8})).unwrap();
+    let app = h.state_mut();
+    let mesh = app.session.doc.meshes[0].id;
+    assert_ne!(mesh.0, 0);
+    // nothing selected: the only mesh
+    app.selected_object = None;
+    for cmd in ["mesh.info", "region.auto_segment"] {
+        app.choose_command(cmd);
+        let p: serde_json::Value = serde_json::from_str(&app.palette_params).unwrap();
+        let r = p.get("object").or_else(|| p.get("mesh")).unwrap();
+        assert_eq!(r, &json!(mesh.0), "{cmd}: {p}");
+    }
+    // the kind decides: a selected body does not fill a `mesh` parameter
+    let ctx = PickContext {
+        selected: Some(ObjectId(9)),
+        objects: vec![(ObjectId(1), ObjectKind::Mesh), (ObjectId(9), ObjectKind::Body)],
+        ..Default::default()
+    };
+    assert_eq!(ctx.reference_for("mesh"), Some(ObjectId(1)));
+    assert_eq!(ctx.reference_for("body"), Some(ObjectId(9)));
+    assert_eq!(ctx.reference_for("object"), Some(ObjectId(9)));
+    let none = PickContext::default();
+    assert_eq!(none.reference_for("mesh"), None);
+    let schema = (surfacecraft_engine::cmd::find("mesh.info").unwrap().input)();
+    assert_ne!(template(&schema, &none)["object"], json!(0));
 }
 
 /// N-point alignment from the GUI: picks on the model prefill `from` of `align.n_point`.

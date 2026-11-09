@@ -124,8 +124,19 @@ fn color_state(c: &[f32; 4], has_colors: bool, key: u64) -> u64 {
     for v in c {
         h = (h ^ u64::from(v.to_bits())).wrapping_mul(1099511628211);
     }
-    h ^= u64::from(has_colors);
-    (h ^ key).wrapping_mul(1099511628211)
+    // fold each field in on its own: XOR-ing `has_colors` and `key` together made
+    // (no colours, key 0) and (colours, key 1) - the first colour array ever shown - the same
+    // state, so the first region/deviation colours were never uploaded
+    for v in [u64::from(has_colors), key] {
+        h = (h ^ v).wrapping_mul(1099511628211);
+    }
+    h
+}
+
+/// Whether the colour buffer must be rewritten: what it shows (`shown`) differs from what the
+/// item wants now (new colours with the same geometry key included).
+fn colors_need_upload(shown: u64, item: &DrawItem) -> bool {
+    shown != color_state(&item.color, item.colors.is_some(), item.colors_key)
 }
 
 fn colors_of(item: &DrawItem) -> Vec<[f32; 4]> {
@@ -447,10 +458,9 @@ impl Renderer {
             }
             if let Some(g) = self.meshes.get_mut(&k) {
                 g.used = true;
-                let st = color_state(&item.color, item.colors.is_some(), item.colors_key);
-                if g.color_state != st {
+                if colors_need_upload(g.color_state, item) {
                     queue.write_buffer(&g.cb, 0, bytemuck::cast_slice(&colors_of(item)));
-                    g.color_state = st;
+                    g.color_state = color_state(&item.color, item.colors.is_some(), item.colors_key);
                     self.color_writes += 1;
                 }
                 Self::upload_highlight(device, g, item);
@@ -765,5 +775,42 @@ mod tests {
         assert!(c(&red)[0] > 60 && c(&red)[1] < 40, "red {:?}", c(&red));
         assert!(c(&green)[1] > 60 && c(&green)[0] < 40, "green {:?}", c(&green));
         assert_eq!((r.uploads, r.color_writes), (1, 1), "geometry once, colours rewritten once");
+    }
+
+    fn plain_item(mesh: &Arc<surfacecraft_geom::Mesh>) -> DrawItem {
+        DrawItem {
+            key: 1,
+            mesh: mesh.clone(),
+            color: [0.6, 0.6, 0.6, 1.0],
+            colors: None,
+            colors_key: 0,
+            highlight: None,
+        }
+    }
+
+    /// New colours with the same geometry key are uploaded: from none to the very first colour
+    /// array (its stamp is 1), between arrays, and back to none.
+    #[test]
+    fn new_colours_with_the_same_geometry_key_are_uploaded() {
+        let mesh = Arc::new(synth::sphere(Point3::origin(), 10.0, 8, 4));
+        let n = mesh.vertex_count();
+        let plain = plain_item(&mesh);
+        let with = |key: u64, c: [f32; 4]| DrawItem {
+            colors: Some(Arc::new(vec![c; n])),
+            colors_key: key,
+            ..plain_item(&mesh)
+        };
+        let shown = color_state(&plain.color, false, 0);
+        assert!(!colors_need_upload(shown, &plain), "unchanged: nothing to write");
+        let first = with(1, [1.0, 0.0, 0.0, 1.0]);
+        assert!(colors_need_upload(shown, &first), "first colours (key 1) after a plain mesh");
+        let shown = color_state(&first.color, true, 1);
+        assert!(!colors_need_upload(shown, &first));
+        assert!(colors_need_upload(shown, &with(2, [0.0, 1.0, 0.0, 1.0])), "next colour array");
+        assert!(colors_need_upload(shown, &plain), "colours removed");
+        // every small key differs from the plain state
+        for key in 0..64u64 {
+            assert!(colors_need_upload(color_state(&plain.color, false, 0), &with(key.max(1), [1.0; 4])));
+        }
     }
 }

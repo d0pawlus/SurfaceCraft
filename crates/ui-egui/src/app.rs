@@ -192,6 +192,7 @@ impl SurfaceCraftApp {
             selected: self.selected_object,
             points: self.picks.iter().map(|p| [p.point.x, p.point.y, p.point.z]).collect(),
             triangles: self.picks.iter().map(|p| p.triangle).collect(),
+            objects: self.session.doc.summaries().iter().map(|o| (o.id, o.kind)).collect(),
         }
     }
 
@@ -735,6 +736,44 @@ pub struct PickContext {
     pub points: Vec<[f64; 3]>,
     /// Picked triangles.
     pub triangles: Vec<u32>,
+    /// Every object of the document (id, kind), so object references can be prefilled with a
+    /// real object instead of a made-up id.
+    pub objects: Vec<(ObjectId, ObjectKind)>,
+}
+
+impl PickContext {
+    /// The object a reference parameter called `name` should point at: the selection when it
+    /// fits, else the first object of the needed kind (any object when the kind is open).
+    #[must_use]
+    pub fn reference_for(&self, name: &str) -> Option<ObjectId> {
+        let want = ref_kind(name);
+        let fits = |k: ObjectKind| want.is_none_or(|w| w == k);
+        if let Some(sel) = self.selected
+            && self.objects.iter().any(|(id, k)| *id == sel && fits(*k))
+        {
+            return Some(sel);
+        }
+        self.objects.iter().find(|(_, k)| fits(*k)).map(|(id, _)| *id)
+    }
+}
+
+/// The kind of object a reference parameter names (`None` when any kind goes).
+fn ref_kind(name: &str) -> Option<ObjectKind> {
+    match name {
+        "mesh" | "against" => Some(ObjectKind::Mesh),
+        "region" | "regions" => Some(ObjectKind::Region),
+        "sketch" | "sketches" | "profile" | "path" => Some(ObjectKind::Sketch),
+        "body" | "tool" => Some(ObjectKind::Body),
+        "feature" => Some(ObjectKind::Feature),
+        "surface" | "surfaces" => Some(ObjectKind::Surface),
+        "primitive" | "primitives" => Some(ObjectKind::Primitive),
+        _ => None,
+    }
+}
+
+/// Whether a property schema is an object reference (`ObjRef`: an id or a name).
+fn is_obj_ref(p: &Value) -> bool {
+    p.get("$ref").and_then(Value::as_str).is_some_and(|r| r.ends_with("/ObjRef"))
 }
 
 /// Example parameters from an input schema: required properties with neutral values; `object`
@@ -752,7 +791,14 @@ pub fn template(schema: &Value, ctx: &PickContext) -> Value {
         for name in required {
             let p = props.get(name).cloned().unwrap_or(Value::Null);
             let v = match name {
-                "object" | "mesh" => ctx.selected.map_or(json!(0), |id| json!(id.0)),
+                _ if is_obj_ref(&p) || name == "object" || name == "mesh" => {
+                    ctx.reference_for(name).map_or(json!(""), |id| json!(id.0))
+                }
+                _ if p.get("items").is_some_and(is_obj_ref) => {
+                    let n = p.get("minItems").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    let id = ctx.reference_for(name).map_or(json!(""), |id| json!(id.0));
+                    Value::Array(vec![id; n])
+                }
                 "from" | "points" if !ctx.points.is_empty() => json!(ctx.points),
                 "triangles" if !ctx.triangles.is_empty() => json!(ctx.triangles),
                 _ => example(&p, schema),
