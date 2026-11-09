@@ -14,11 +14,38 @@ use serde::{Deserialize, Serialize};
 use surfacecraft_fit::Primitive;
 use surfacecraft_geom::{Bvh, KdTree, Mesh, Point3, Vec3};
 
+/// Colours of the deviation map, linear RGBA in 0..1. [`colorize`] paints the viewport from these
+/// constants, and the UI legend resolves the same values through its theme tokens, so the legend
+/// and the map cannot drift apart.
+pub mod palette {
+    /// Within ±tolerance (green).
+    pub const IN_TOLERANCE: [f32; 4] = [0.2, 0.8, 0.3, 1.0];
+    /// Just above +tolerance: the start of the above-ramp (yellow-orange).
+    pub const ABOVE_NEAR: [f32; 4] = [1.0, 0.85, 0.1, 1.0];
+    /// At +3·tolerance and beyond: the end of the above-ramp (red).
+    pub const ABOVE_FAR: [f32; 4] = [1.0, 0.0, 0.1, 1.0];
+    /// Just below −tolerance: the start of the below-ramp (cyan).
+    pub const BELOW_NEAR: [f32; 4] = [0.1, 0.75, 1.0, 1.0];
+    /// At −3·tolerance and beyond: the end of the below-ramp (blue).
+    pub const BELOW_FAR: [f32; 4] = [0.1, 0.0, 1.0, 1.0];
+    /// Points that were not measured (NaN, farther than the reference's reach).
+    pub const UNMEASURED: [f32; 4] = [0.45, 0.45, 0.45, 1.0];
+}
+
+/// Linear interpolation of two RGBA colours (`k` in 0..=1).
+fn lerp(a: [f32; 4], b: [f32; 4], k: f32) -> [f32; 4] {
+    [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k, 1.0]
+}
+
 /// Deviation statistics.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct DeviationStats {
     /// Points measured.
     pub count: usize,
+    /// Smallest signed deviation (mm; 0 without points).
+    pub min: f64,
+    /// Largest signed deviation (mm; 0 without points).
+    pub max: f64,
     /// Largest |deviation| (mm).
     pub max_abs: f64,
     /// Mean signed deviation (mm).
@@ -40,11 +67,14 @@ pub fn stats(values: &[f64], tolerance: f64) -> DeviationStats {
     let vals: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
     let n = vals.len();
     let mut h = [0usize; 10];
-    let (mut sum, mut sq, mut max, mut within) = (0.0, 0.0, 0.0f64, 0usize);
+    let (mut sum, mut sq, mut max_abs, mut within) = (0.0, 0.0, 0.0f64, 0usize);
+    let (mut min, mut max) = (f64::INFINITY, f64::NEG_INFINITY);
     for &d in &vals {
         sum += d;
         sq += d * d;
-        max = max.max(d.abs());
+        min = min.min(d);
+        max = max.max(d);
+        max_abs = max_abs.max(d.abs());
         if d.abs() <= tol {
             within += 1;
         }
@@ -54,9 +84,12 @@ pub fn stats(values: &[f64], tolerance: f64) -> DeviationStats {
         }
     }
     let nf = n.max(1) as f64;
+    let (min, max) = if n == 0 { (0.0, 0.0) } else { (min, max) };
     DeviationStats {
         count: n,
-        max_abs: max,
+        min,
+        max,
+        max_abs,
         mean: sum / nf,
         rms: (sq / nf).sqrt(),
         tolerance: tol,
@@ -93,17 +126,17 @@ pub fn colorize(values: &[f64], tolerance: f64) -> Vec<[f32; 4]> {
         .iter()
         .map(|&d| {
             if !d.is_finite() {
-                return [0.45, 0.45, 0.45, 1.0];
+                return palette::UNMEASURED;
             }
             let t = (d / tol) as f32;
             if t.abs() <= 1.0 {
-                [0.2, 0.8, 0.3, 1.0]
+                palette::IN_TOLERANCE
             } else if t > 0.0 {
                 let k = ((t - 1.0) / 2.0).clamp(0.0, 1.0);
-                [1.0, 0.85 * (1.0 - k), 0.1, 1.0]
+                lerp(palette::ABOVE_NEAR, palette::ABOVE_FAR, k)
             } else {
                 let k = ((-t - 1.0) / 2.0).clamp(0.0, 1.0);
-                [0.1, 0.75 * (1.0 - k), 1.0, 1.0]
+                lerp(palette::BELOW_NEAR, palette::BELOW_FAR, k)
             }
         })
         .collect()
@@ -184,6 +217,8 @@ mod tests {
         assert_eq!(s.count, 4);
         assert!((s.within - 0.75).abs() < 1e-12);
         assert!((s.max_abs - 0.3).abs() < 1e-12);
+        assert!((s.min + 0.05).abs() < 1e-12 && (s.max - 0.3).abs() < 1e-12);
+        assert_eq!(s.histogram.iter().sum::<usize>(), s.count);
         let c = colorize(&[0.0, 0.3, -0.3, f64::NAN], 0.1);
         assert_eq!(c[0], [0.2, 0.8, 0.3, 1.0]);
         assert!(c[1][0] > 0.9 && c[2][2] > 0.9);

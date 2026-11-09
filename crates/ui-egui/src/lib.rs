@@ -16,6 +16,7 @@ pub mod app;
 pub mod camera;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod control;
+pub mod deviation_panel;
 pub mod dock;
 pub mod i18n;
 pub mod icons;
