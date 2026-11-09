@@ -1,7 +1,7 @@
 //! `cargo xtask <task>`: the repository's checks.
 //!
 //! `ci` runs, in order: fmt → assets → licences → layers → ui-containers → app-geometry → clippy → wasm → test.
-//! `dist` (not in ci) builds the host-target release binaries and `dist/<target>/SHA256SUMS.txt`.
+//! `dist [--tag vX.Y.Z]` (not in ci) builds the host-target release packages in `dist/<target>/release/`.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod assets;
@@ -264,8 +264,8 @@ fn main() -> ExitCode {
             "wasm" => wasm(),
             "test" => test(),
             "web" => web(),
-            "dist" => dist::run(),
-            _ => Err("tasks: ci, quick [--tests] [packages], fmt, assets, licences [--check], layers, ui-containers, app-geometry, clippy, wasm, test, web, dist"
+            "dist" => dist::run(&args),
+            _ => Err("tasks: ci, quick [--tests] [packages], fmt, assets, licences [--check], layers, ui-containers, app-geometry, clippy, wasm, test, web, dist [--tag vX.Y.Z]"
                 .into()),
         };
     match r {
