@@ -192,6 +192,26 @@ Szczegóły w planach milestone'ów.
 - CI nie ma GPU: test renderu offscreen pomija się na runnerach (działa lokalnie).
 - Zależność git-only solidcore — pin trzeba okresowo podbijać i powtarzać smoke test.
 
+## Backlog z analizy ScanRuler (2026-11-09)
+
+Źródło: [`2026-11-09-scanruler-functional-analysis.md`](superpowers/specs/2026-11-09-scanruler-functional-analysis.md) §6.3.
+ScanRuler jest na AGPL-3.0 — każdy punkt to wyłącznie reimplementacja clean-room na podstawie opisu zachowania, bez kodu.
+
+1. **Odchyłki:** mapa ze znakiem zgodna z orientacją powierzchni, zakres kolorów z percentyli, histogram i pasma,
+   regiony hotspotów / błędu objętości, lokalne dokładne dopasowanie zaznaczonego obszaru, wyrównanie z par punktów
+   jako fallback, odchyłka względem pojedynczego dopasowanego prymitywu.
+2. **Bryła z powierzchni + Auto Constrain:** zamykanie zbioru dopasowanych powierzchni w bryłę oraz przyciąganie
+   prymitywów do relacji (równoległe / prostopadłe / współosiowe) — pokrywa się z długiem §6.2 powyżej.
+3. **Szkice z przekrojów:** dopasowanie całych łańcuchów przekroju jako połączonych linii i łuków z wywnioskowanymi
+   relacjami, stosy przekrojów raportujące pochylenie (draft/taper), eksport arkusza przekrojów do DXF/SVG.
+4. **Siatka:** decymacja z mierzoną i weryfikowaną tolerancją (oba kierunki) oraz edycja nieniszcząca na kopii
+   z mapą odległości od oryginału.
+5. **Ergonomia agenta i trwałe referencje:** przewodniki serwowane przez aplikację, kompaktowa/filtrowana lista
+   narzędzi (dziś 104+), kolejka zadań, komenda kontroli skanu, raport ciało-vs-skan per ściana, wybór ścian/krawędzi
+   po odcisku geometrycznym zamiast indeksu pozycyjnego (dług powyżej).
+
+Do decyzji użytkownika: czy SurfaceCraft dostaje warstwę inspekcji (wymiary, GD&T, grubość ścianek, pomiar 2D).
+
 ## Następny krok
 
 Wszystkie milestones M0–M6 są zamknięte. Do decyzji użytkownika:
@@ -207,3 +227,4 @@ sprawdzenie wskazywania 3-2-1 i krawędzi filletu (#42) oraz zbiorczy przebieg s
 (`docs/integration.md`).
 Kandydaci post-MVP z design doc: retopologia niestrukturalna (Instant Meshes), druga strategia freeform (sieć łat
 z krzywych cech), CAD Correct/Refit, trwałe nazewnictwo topologii w cechach, out-of-core/LOD dla 100 mln+ trójkątów.
+Etap P8 (backlog ScanRuler, CAD Correct/Refit, 100 mln+ trójkątów, dług, zgłoszenia upstream): [plan](superpowers/plans/2026-11-09-p8-backlog-refit-scale-debt.md) — w toku.
