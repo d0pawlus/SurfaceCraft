@@ -174,11 +174,21 @@ fn refit_kind_all(
     if p.is_empty() {
         return None;
     }
-    let prim = &f.primitive;
-    let sq: f64 = surfacecraft_geom::par::map_slice(&p, |q| prim.distance(q).powi(2)).iter().sum();
-    f.rms = (sq / p.len() as f64).sqrt();
+    f.rms = rms_of(&p, &f.primitive);
     f.count = p.len();
     Some(f)
+}
+
+/// RMS of the points to `prim` (parallel, summed in index order).
+fn rms_of(p: &[Point3], prim: &Primitive) -> f64 {
+    let sq: f64 = surfacecraft_geom::par::map_slice(p, |q| prim.distance(q).powi(2)).iter().sum();
+    (sq / p.len() as f64).sqrt()
+}
+
+/// RMS of the vertices of `tris` to `prim`; `None` for an empty set.
+fn rms_over(mesh: &Mesh, normals: &[Vec3], tris: &[u32], prim: &Primitive) -> Option<f64> {
+    let (p, _) = region_points(mesh, normals, tris);
+    (!p.is_empty()).then(|| rms_of(&p, prim))
 }
 
 /// Fit of one `kind` to a set of triangles on at most [`FIT_POINTS`] / 2 of their vertices; the
@@ -527,11 +537,18 @@ fn relax_boundaries(mesh: &Mesh, normals: &[Vec3], nb: &[[u32; 3]], mut segs: Ve
         let fits =
             surfacecraft_geom::par::map_slice(&jobs, |(_, tris, kind)| refit_kind_all(mesh, normals, tris, *kind));
         for ((i, tris, _), f) in jobs.into_iter().zip(fits) {
-            if let Some(f) = f
-                && f.rms <= tol
-            {
-                segs[i].primitive = f.primitive;
-                segs[i].rms = f.rms;
+            match f {
+                Some(f) if f.rms <= tol => {
+                    segs[i].primitive = f.primitive;
+                    segs[i].rms = f.rms;
+                }
+                // the refit was rejected but the triangles move all the same: the primitive stays,
+                // its RMS must describe the triangles it now has
+                _ => {
+                    if let Some(rms) = rms_over(mesh, normals, &tris, &segs[i].primitive) {
+                        segs[i].rms = rms;
+                    }
+                }
             }
             segs[i].triangles = tris;
         }
