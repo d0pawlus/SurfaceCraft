@@ -312,6 +312,9 @@ impl SurfaceCraftApp {
             for g in groups.into_iter().filter(|g| !matches!(*g, "File" | "Edit" | "View" | "App")) {
                 let label = i18n::find(&format!("group.{g}")).unwrap_or(g).to_string();
                 ui.menu_button(label, |ui| {
+                    if g == "Sketch" {
+                        self.sketch_menu_items(ui);
+                    }
                     for c in self.session.commands().iter().filter(|c| c.group == g) {
                         if ui.button(c.label).on_hover_text(c.summary).clicked() {
                             self.choose_command(c.id);

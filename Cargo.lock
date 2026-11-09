@@ -3049,6 +3049,7 @@ dependencies = [
  "surfacecraft-fit",
  "surfacecraft-geom",
  "surfacecraft-kernel",
+ "surfacecraft-sketch",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",

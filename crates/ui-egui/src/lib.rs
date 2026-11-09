@@ -23,6 +23,7 @@ pub mod icons;
 pub mod settings;
 pub mod shell;
 pub mod shot;
+pub mod sketch_editor;
 pub mod theme;
 pub mod viewport;
 #[cfg(target_arch = "wasm32")]
