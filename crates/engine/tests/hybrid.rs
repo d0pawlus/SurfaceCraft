@@ -308,3 +308,75 @@ fn p3_commands_refuse_bad_input() {
     assert_eq!(f["faces"], 1);
     assert!(f["volume"].as_f64().is_none_or(|v| v.abs() < 1e-9), "{f}");
 }
+
+fn patch_below() -> surfacecraft_kernel::record::brep::Surface {
+    let n = 12;
+    let grid: Vec<Vec<[f64; 3]>> = (0..n)
+        .map(|i| {
+            (0..n)
+                .map(|j| {
+                    let x = -4.0 + 48.0 * i as f64 / (n - 1) as f64;
+                    let y = -4.0 + 38.0 * j as f64 / (n - 1) as f64;
+                    [x, y, 8.0 + (x / 9.0).sin() * (y / 7.0).cos()]
+                })
+                .collect()
+        })
+        .collect();
+    nurbs::fit_grid(&grid, 8, 8, 3).unwrap()
+}
+
+/// P3b gate 3: `replace_face` with a patch that crosses the face (partly above, partly below)
+/// adds and removes material. Volume against quadrature of the patch over the footprint, a
+/// closed manifold solid, STEP round trip; a face that cannot be raised is refused.
+#[test]
+fn gate_p3b_replace_face_up_and_down() {
+    let mut s = Session::new();
+    s.execute("body.box", json!({"size": [40.0, 30.0, 11.0], "name": "slab"})).unwrap();
+    let slab = body_brep(&s, "slab");
+    let plane = hybrid::Shape::Plane { point: [0.0, 0.0, 11.0], normal: [0.0, 0.0, 1.0] };
+    let top = hybrid::faces_on_shape(&slab, &plane, 1e-6);
+    assert_eq!(top.len(), 1);
+    let patch = wave_spline();
+    let rise = hybrid::patch_rise(&slab, top[0], &patch, [0.0, 0.0, 1.0]).unwrap();
+    assert!(rise > 2.0, "the patch must rise above the face, rise {rise}");
+    let r = hybrid::replace_face(&slab, top[0], &patch).unwrap();
+    // quadrature of the patch height over the footprint (the wave is the patch's own formula)
+    let (nx, ny) = (2000, 1500);
+    let (dx, dy) = (40.0 / nx as f64, 30.0 / ny as f64);
+    let mut exact = 0.0;
+    for i in 0..nx {
+        for j in 0..ny {
+            exact += wave((i as f64 + 0.5) * dx, (j as f64 + 0.5) * dy) * dx * dy;
+        }
+    }
+    let v = solid::volume(&r).unwrap();
+    let rel = (v - exact).abs() / exact;
+    eprintln!(
+        "GATE p3b replace_face up+down: volume {v:.4} vs quadrature {exact:.4}: {:.4} % (rise {rise:.3}, faces {})",
+        rel * 100.0,
+        r.faces.len()
+    );
+    assert!(rel < 1e-3, "volume {v} vs quadrature {exact}");
+    assert!(!surfacecraft_io::step::is_sheet(&r));
+    // STEP round trip through the engine
+    let id = s.doc.add_body("up and down", r);
+    let e = s.execute("export.step", json!({"objects": [id.0]})).unwrap();
+    assert_eq!(e["content"], "solids");
+    let back = s.execute("import.step", json!({"data": e["data"], "name": "again"})).unwrap();
+    assert_eq!(back["bodies"].as_array().unwrap().len(), 1);
+    let v2 = s.execute("body.info", json!({"object": back["bodies"][0]})).unwrap()["volume"].as_f64().unwrap();
+    assert!((v2 - v).abs() / v < 1e-6, "round trip volume {v2} vs {v}");
+    // a patch entirely below keeps the old behaviour (material only removed)
+    let low = hybrid::replace_face(&slab, top[0], &patch_below()).unwrap();
+    assert!(solid::volume(&low).unwrap() < 40.0 * 30.0 * 11.0);
+    // collision: an overhang above the face blocks the extension
+    let base = solid::make_box([0.0, 0.0, 0.0], [40.0, 30.0, 11.0]).unwrap();
+    let post = solid::make_box([-10.0, 0.0, 0.0], [10.0, 30.0, 14.0]).unwrap();
+    let arm = solid::make_box([-10.0, 0.0, 12.0], [40.0, 30.0, 7.0]).unwrap();
+    let tee = boolean(&boolean(&base, &post, BoolKind::Union).unwrap(), &arm, BoolKind::Union).unwrap();
+    let t_top = hybrid::faces_on_shape(&tee, &plane, 1e-6);
+    assert_eq!(t_top.len(), 1);
+    let err = hybrid::replace_face(&tee, t_top[0], &patch).unwrap_err();
+    eprintln!("collision refused: {err}");
+    assert!(err.to_string().contains("cannot be raised"), "{err}");
+}
