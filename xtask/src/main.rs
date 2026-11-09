@@ -191,10 +191,11 @@ fn ci() -> Result<(), String> {
     Ok(())
 }
 
-/// The local pre-commit check: the cheap static steps, then clippy `-D warnings` and tests of the
-/// packages named (`cargo xtask quick surfacecraft-fit surfacecraft-engine`). The full
-/// `cargo xtask ci` runs on GitHub Actions for every pull request.
-fn quick(packages: &[String]) -> Result<(), String> {
+/// The local pre-commit check: the cheap static steps, then clippy `-D warnings` (which type-checks)
+/// of the packages named (`cargo xtask quick surfacecraft-fit surfacecraft-engine`); `--tests` also
+/// runs their tests. The full `cargo xtask ci` runs on GitHub Actions for every pull request, and
+/// local-only checks run in batched integration passes (docs/integration.md).
+fn quick(packages: &[String], with_tests: bool) -> Result<(), String> {
     fmt()?;
     assets::check()?;
     licences::run(true)?;
@@ -208,12 +209,14 @@ fn quick(packages: &[String]) -> Result<(), String> {
         }
         c.args(["--", "-D", "warnings"]);
         run(c, "clippy -D warnings (named packages)")?;
-        let mut t = cargo();
-        t.args(["test", "--profile", "ci"]);
-        for p in packages {
-            t.args(["-p", p]);
+        if with_tests {
+            let mut t = cargo();
+            t.args(["test", "--profile", "ci"]);
+            for p in packages {
+                t.args(["-p", p]);
+            }
+            run(t, "tests (named packages)")?;
         }
-        run(t, "tests (named packages)")?;
     }
     eprintln!("==> quick passed (full ci runs on the pull request)");
     Ok(())
@@ -226,7 +229,10 @@ fn main() -> ExitCode {
     let r =
         match task {
             "ci" => ci(),
-            "quick" => quick(args.get(1..).unwrap_or_default()),
+            "quick" => {
+                let rest: Vec<String> = args.iter().skip(1).filter(|a| *a != "--tests").cloned().collect();
+                quick(&rest, args.iter().any(|a| a == "--tests"))
+            }
             "fmt" => fmt(),
             "assets" => assets::check(),
             "licences" | "licenses" => licences::run(check),
@@ -237,7 +243,7 @@ fn main() -> ExitCode {
             "test" => test(),
             "web" => web(),
             "dist" => dist::run(),
-            _ => Err("tasks: ci, quick [packages], fmt, assets, licences [--check], layers, app-geometry, clippy, wasm, test, web, dist"
+            _ => Err("tasks: ci, quick [--tests] [packages], fmt, assets, licences [--check], layers, app-geometry, clippy, wasm, test, web, dist"
                 .into()),
         };
     match r {
