@@ -61,7 +61,7 @@ impl SurfaceCraftApp {
 
     /// Creates a sketch on the plane with `normal` through the origin and starts editing it.
     pub fn new_sketch_on(&mut self, normal: [f64; 3]) {
-        let params = json!({"plane": {"origin": [0.0, 0.0, 0.0], "normal": normal}});
+        let params = json!({"plane": {"origin": [0.0, 0.0, 0.0], "normal": normal}}); // not a colour
         if let Ok(v) = self.run_command("sketch.create", params)
             && let Some(id) = v.get("id").and_then(Value::as_u64)
         {
@@ -72,9 +72,9 @@ impl SurfaceCraftApp {
     /// The entries of the Sketch menu that belong to the editor.
     pub(crate) fn sketch_menu_items(&mut self, ui: &mut egui::Ui) {
         for (key, normal) in [
-            ("sketch.menu.new_xy", [0.0, 0.0, 1.0]),
+            ("sketch.menu.new_xy", [0.0, 0.0, 1.0]), // not a colour
             ("sketch.menu.new_xz", [0.0, -1.0, 0.0]),
-            ("sketch.menu.new_yz", [1.0, 0.0, 0.0]),
+            ("sketch.menu.new_yz", [1.0, 0.0, 0.0]), // not a colour
         ] {
             if ui.button(t(key)).clicked() {
                 self.new_sketch_on(normal);

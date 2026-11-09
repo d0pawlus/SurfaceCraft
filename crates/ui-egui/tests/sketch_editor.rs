@@ -49,7 +49,10 @@ fn line_tool_click_click_is_one_sketch_add_in_plane_coordinates() {
     let cmds = click(&mut e, &sk, [4.0, 6.0]);
     assert_eq!(
         cmds,
-        vec![Cmd { id: "sketch.add", params: json!({"sketch": 1, "entities": [{"line": {"from": [1.0, 2.0], "to": [4.0, 6.0]}}]}) }]
+        vec![Cmd {
+            id: "sketch.add",
+            params: json!({"sketch": 1, "entities": [{"line": {"from": [1.0, 2.0], "to": [4.0, 6.0]}}]})
+        }]
     );
     assert!(e.gesture.is_empty(), "the gesture is over");
     // a second line is a new gesture
@@ -113,7 +116,10 @@ fn circle_rectangle_and_arcs_make_one_entity_each() {
     let mut e = editor(Tool::Rect);
     click(&mut e, &sk, [0.0, 0.0]);
     let c = click(&mut e, &sk, [6.0, 4.0]);
-    assert_eq!(c[0].params["entities"][0]["polygon"]["points"], json!([[0.0, 0.0], [6.0, 0.0], [6.0, 4.0], [0.0, 4.0]]));
+    assert_eq!(
+        c[0].params["entities"][0]["polygon"]["points"],
+        json!([[0.0, 0.0], [6.0, 0.0], [6.0, 4.0], [0.0, 4.0]])
+    );
     // a degenerate rectangle is nothing
     click(&mut e, &sk, [0.0, 0.0]);
     assert!(click(&mut e, &sk, [3.0, 0.0]).is_empty());
@@ -354,7 +360,9 @@ fn editing_a_dimension_issues_sketch_edit_constraint_and_the_solver_follows() {
     let del = e2.delete_constraint(dim);
     assert_eq!(del[0].params, json!({"sketch": id.0, "index": dim}));
     run(&mut s, &del);
-    assert!(s.doc.sketch(id).expect("sketch").sketch.constraints.iter().all(|c| !matches!(c, Constraint::Length { .. })));
+    assert!(
+        s.doc.sketch(id).expect("sketch").sketch.constraints.iter().all(|c| !matches!(c, Constraint::Length { .. }))
+    );
 }
 
 #[test]
@@ -393,7 +401,8 @@ fn solver_status_maps_to_a_line_and_a_token_and_names_the_conflict() {
     // fully defined
     let mut s = Session::new();
     let id = new_sketch(&mut s, json!({}));
-    s.execute("sketch.add", json!({"sketch": id.0, "entities": [{"circle": {"center": [0.0, 0.0], "radius": 2.0}}]})).expect("add");
+    s.execute("sketch.add", json!({"sketch": id.0, "entities": [{"circle": {"center": [0.0, 0.0], "radius": 2.0}}]}))
+        .expect("add");
     s.execute(
         "sketch.constrain",
         json!({"sketch": id.0, "constraints": [{"type": "fix", "point": 0, "at": [0.0, 0.0]}, {"type": "radius", "entity": 0, "value": 2.0}]}),
@@ -509,8 +518,11 @@ fn double_clicking_a_dimension_label_opens_it_and_enter_edits_it() {
         json!({"sketch": id.0, "entities": [{"line": {"from": [-20.0, -10.0], "to": [20.0, -10.0]}}]}),
     )
     .expect("add");
-    app.run_command("sketch.constrain", json!({"sketch": id.0, "constraints": [{"type": "length", "line": 0, "value": 40.0}]}))
-        .expect("constrain");
+    app.run_command(
+        "sketch.constrain",
+        json!({"sketch": id.0, "constraints": [{"type": "length", "line": 0, "value": 40.0}]}),
+    )
+    .expect("constrain");
     let mut h = harness(app);
     h.run();
     h.run();
@@ -519,16 +531,26 @@ fn double_clicking_a_dimension_label_opens_it_and_enter_edits_it() {
     let pos = origin + egui::vec2((rect[0] + rect[2]) / 2.0, (rect[1] + rect[3]) / 2.0);
     h.hover_at(pos);
     h.run();
-    for _ in 0..2 {
-        h.drag_at(pos);
-        h.drop_at(pos);
+    // the harness advances time between frames: allow a slow double click
+    h.ctx.options_mut(|o| o.input_options.max_double_click_delay = 10.0);
+    for pressed in [true, false, true, false] {
+        h.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
     }
     h.run();
     let pending = h.state().sketch_editor.pending.clone().expect("the value field opened");
     assert_eq!((pending.index, pending.text.as_str()), (Some(idx), "40"));
-    if let Some(p) = h.state_mut().sketch_editor.pending.as_mut() { p.text = "55".into(); }
+    if let Some(p) = h.state_mut().sketch_editor.pending.as_mut() {
+        p.text = "55".into();
+    }
     let n = h.state().session.log.len();
-    if let Some(p) = h.state_mut().sketch_editor.pending.as_mut() { p.text = "55".into(); }
+    if let Some(p) = h.state_mut().sketch_editor.pending.as_mut() {
+        p.text = "55".into();
+    }
     let cmds = h.state_mut().sketch_editor.commit_pending();
     for c in cmds {
         h.state_mut().run_command(c.id, c.params).expect("edit");
