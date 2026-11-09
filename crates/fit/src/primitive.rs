@@ -641,7 +641,11 @@ pub fn fit_torus(pts: &[Point3], normals: &[Vec3]) -> Option<PrimitiveFit> {
             }
         }
     }
-    let starts: Vec<(f64, f64, Vec3, Vec3, f64)> = best_per_factor.into_iter().flatten().collect();
+    let mut starts: Vec<(f64, f64, Vec3, Vec3, f64)> = best_per_factor.into_iter().flatten().collect();
+    // most promising first (smallest residual of the trial torus before the fit): the first start
+    // decides whether the others run at all, and the trials of the wrong side of the normals or of
+    // a wrong circle size start far from the surface
+    starts.sort_by(|x, y| x.0.total_cmp(&y.0));
     let mut best_fit: Option<(f64, Primitive)> = None;
     for &(_, s, c, a, big) in &starts {
         let (u, w) = basis(&a);
@@ -682,9 +686,10 @@ pub fn fit_torus(pts: &[Point3], normals: &[Vec3]) -> Option<PrimitiveFit> {
             best_fit = Some((res.cost, prim));
         }
         // the first start usually converges to the right torus: the others only run when the fit
-        // is poor relative to the size of the patch
+        // is poor relative to the size of the patch, or is held at the penalty bound (tube
+        // radius = 0.95 major radius), which is where a stalled fit ends, not a minimum
         let good = (TORUS_GOOD_RMS * ext).powi(2) * sub.len() as f64;
-        if best_fit.as_ref().is_some_and(|b| b.0 <= good) {
+        if best_fit.as_ref().is_some_and(|b| b.0 <= good && !at_penalty_bound(&b.1)) {
             break;
         }
     }
@@ -693,6 +698,12 @@ pub fn fit_torus(pts: &[Point3], normals: &[Vec3]) -> Option<PrimitiveFit> {
 
 /// RMS (relative to the patch extent) below which [`fit_torus`] stops trying further starts.
 const TORUS_GOOD_RMS: f64 = 0.003;
+
+/// Whether a torus sits at the bound `minor <= 0.95 major` that [`fit_torus`] enforces (a small
+/// margin for the penalty's softness).
+fn at_penalty_bound(p: &Primitive) -> bool {
+    matches!(p, Primitive::Torus { major_radius, minor_radius, .. } if *minor_radius >= 0.94 * *major_radius)
+}
 
 /// Factors by which [`fit_torus`] enlarges the circle of tube centres of each trial tube radius;
 /// the best trial of each factor starts one fit.
@@ -788,6 +799,39 @@ mod tests {
             assert!(f.rms <= 0.1, "torus {k}: rms {} major {major_radius} minor {minor_radius}", f.rms);
             assert!(minor_radius < major_radius, "torus {k}: spindle torus {major_radius} {minor_radius}");
         }
+    }
+
+    /// A broad partial torus (200° round the axis, the tube from 30° to 80° above the equator)
+    /// whose scan normals point towards the tube centre, on a large part: the start with the wrong
+    /// normal side stalls at a spurious, penalty-bound torus whose RMS is still below 0.3 % of the
+    /// extent, so the fit must try the most promising start (the smallest initial residual) first
+    /// and must not accept a penalty-bound result as converged.
+    #[test]
+    fn broad_concave_torus_patch_is_not_stopped_at_a_spurious_start() {
+        let axis = Vec3::new(-0.63, -0.03, -0.77).normalize();
+        let center = Point3::new(-18.0, -1.8, 29.0);
+        let x = surfacecraft_geom::any_perpendicular(&axis);
+        let y = axis.cross(&x);
+        let (big_r, r) = (55.5, 15.2);
+        let full = synth::torus(center, axis, big_r, r, 360, 120);
+        let normals = full.vertex_normals();
+        let mut rng = Rng::new(7);
+        let (mut p, mut n) = (Vec::new(), Vec::new());
+        for (q, nq) in full.positions.iter().zip(&normals) {
+            let d = q - center;
+            let (h, th) = (d.dot(&axis), d.dot(&y).atan2(d.dot(&x)));
+            let ph = h.atan2(d.dot(&x).hypot(d.dot(&y)) - big_r);
+            if (-50.0..=150.0).contains(&th.to_degrees()) && (30.0..=80.0).contains(&ph.to_degrees()) {
+                p.push(q + Vec3::new(rng.gauss(), rng.gauss(), rng.gauss()) * 0.02);
+                // scan normals towards the tube centre
+                n.push((-nq + Vec3::new(rng.gauss(), rng.gauss(), rng.gauss()) * 0.01).normalize());
+            }
+        }
+        let f = fit(PrimitiveKind::Torus, &p, &n).expect("a torus fit");
+        let Primitive::Torus { major_radius, minor_radius, .. } = f.primitive else { panic!() };
+        eprintln!("{} pts: rms {} major {major_radius} minor {minor_radius}", p.len(), f.rms);
+        assert!(f.rms <= 0.1, "rms {} major {major_radius} minor {minor_radius}", f.rms);
+        assert!((major_radius - big_r).abs() < 1.0 && (minor_radius - r).abs() < 0.5, "{major_radius} {minor_radius}");
     }
 
     /// The foot fillet of a boss (a quarter round, radius 2, about a ring of radius 10 on a boss of
