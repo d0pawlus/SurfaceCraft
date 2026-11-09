@@ -67,4 +67,4 @@ bundle with `cargo xtask web` after `ci` passes on `main` and uploads it prebuil
 secret `VERCEL_TOKEN` (created by the owner in Vercel); without it the bundle is built and the
 deploy is skipped with a warning. A manual deploy from a workstation: `cargo xtask web`, then in
 `apps/surfacecraft-web/dist` `npx vercel link` and `npx vercel deploy --prod`, after adding a
-`.vercelignore` with `.env*` (the CLI writes a token file there).
+`.vercelignore` with `.env*` (the CLI writes a token file there). The root `vercel.json` sets `git.deploymentEnabled` to `false` so that Git pushes never trigger a Vercel deployment, while the prebuilt CLI deploy from `apps/surfacecraft-web/dist` is unaffected; the Vercel bot's PR comments are silenced with the dashboard toggles under Settings > Git > "Connected Git Repository", since the `github.silent` key is deprecated.
