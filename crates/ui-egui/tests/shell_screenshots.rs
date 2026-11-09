@@ -29,7 +29,11 @@ fn run(app: &mut SurfaceCraftApp, id: &str, p: serde_json::Value) {
 fn scene(app: &mut SurfaceCraftApp) {
     run(app, "mesh.synth", json!({"shape": "wave", "resolution": 48, "name": "scan"}));
     let n = app.session.doc.meshes[0].mesh.triangle_count() as u32;
-    run(app, "region.create", json!({"mesh": "scan", "triangles": (0..n / 2).collect::<Vec<u32>>(), "name": "left half"}));
+    run(
+        app,
+        "region.create",
+        json!({"mesh": "scan", "triangles": (0..n / 2).collect::<Vec<u32>>(), "name": "left half"}),
+    );
     run(app, "body.box", json!({"size": [24.0, 16.0, 8.0], "name": "block"}));
     app.camera.fit(&app.session.doc.bbox());
     app.camera.orbit(70.0, -45.0);
