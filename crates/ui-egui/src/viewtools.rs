@@ -261,6 +261,18 @@ impl SurfaceCraftApp {
 
     fn brep_hit_at(&mut self, x: f64, y: f64, w: f64, h: f64) -> Option<(ObjectId, BrepHit)> {
         let target = if self.tools.tool == Tool::Edges { BrepTarget::Edges } else { BrepTarget::Faces };
+        self.brep_hit_at_target(x, y, w, h, target)
+    }
+
+    /// The face or edge (as `target` says) of the nearest body under pixel `(x, y)`.
+    pub(crate) fn brep_hit_at_target(
+        &mut self,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        target: BrepTarget,
+    ) -> Option<(ObjectId, BrepHit)> {
         let cam = self.camera.clone();
         let bodies: Vec<DisplayItem> = self
             .session
@@ -499,6 +511,11 @@ impl SurfaceCraftApp {
         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.cancel_interaction();
         }
+        // a form field is being picked: clicks fill it, navigation stays
+        let picking = self.field_pick.is_some();
+        if picking && resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        }
         self.tools.pointer = resp.hover_pos().map(local);
         let press = ui.input(|i| i.pointer.press_origin());
         let cube = Self::cube_rect(rect);
@@ -533,10 +550,19 @@ impl SurfaceCraftApp {
         let alt = mods.alt;
         let primary_drag = resp.dragged_by(Primary);
         let pos = resp.interact_pointer_pos().map(local);
-        let tool = if alt { Tool::Navigate } else { self.tools.tool };
+        let tool = if alt || picking { Tool::Navigate } else { self.tools.tool };
 
         // hover feedback
-        if !primary_drag {
+        if picking {
+            if resp.clicked_by(Secondary) {
+                self.stop_field_pick();
+            } else if !primary_drag {
+                match self.tools.pointer {
+                    Some(p) => self.field_pick_hover(p, w, h),
+                    None => self.field_pick_unhover(),
+                }
+            }
+        } else if !primary_drag {
             self.tools.hover = None;
             self.tools.gizmo_hover = None;
             if let Some(p) = self.tools.pointer {
@@ -554,7 +580,15 @@ impl SurfaceCraftApp {
                     let d = resp.drag_delta();
                     self.camera.orbit(f64::from(d.x), f64::from(d.y));
                 }
-                if resp.double_clicked() {
+                if picking {
+                    // the second click of a double click is not a second pick
+                    if resp.clicked()
+                        && !resp.double_clicked()
+                        && let Some(p) = pos
+                    {
+                        self.field_pick_click(p[0], p[1], w, h);
+                    }
+                } else if resp.double_clicked() {
                     self.fit_pending = true;
                 } else if resp.clicked()
                     && let Some(p) = pos
@@ -644,6 +678,7 @@ impl SurfaceCraftApp {
         }
         self.tools.lasso.clear();
         self.tools.last_brush = None;
+        self.stop_field_pick();
     }
 
     // ----------------------------------------------------------------- painting
@@ -697,11 +732,12 @@ impl SurfaceCraftApp {
             .into_iter()
             .filter(|d| d.kind == ObjectKind::Body && d.topo.is_some())
             .collect();
+        let (sel_body, sel_edges) = self.highlighted_edges();
         for d in &bodies {
             let Some(topo) = &d.topo else { continue };
-            if self.tools.brep.body == Some(d.id) {
+            if sel_body == Some(d.id) {
                 let stroke = egui::Stroke::new(3.0, self.token_color(Token::Highlight));
-                for &e in &self.tools.brep.edges {
+                for &e in &sel_edges {
                     if let Some(pl) = topo.edges.get(e) {
                         line(&painter, pl, stroke);
                     }
@@ -714,6 +750,8 @@ impl SurfaceCraftApp {
                 line(&painter, pl, egui::Stroke::new(3.0, self.token_color(Token::FocusRing)));
             }
         }
+
+        self.paint_field_marks(&painter, rect);
 
         // brush cursor and lasso outline
         if self.tools.tool == Tool::Brush
@@ -741,6 +779,34 @@ impl SurfaceCraftApp {
         self.paint_gizmo(&painter, rect);
         self.paint_view_cube(ui, &painter, rect);
         self.tool_strip(ui.ctx(), rect);
+    }
+
+    /// The points clicked for a form field (numbered) and the one under the pointer.
+    fn paint_field_marks(&self, painter: &egui::Painter, rect: egui::Rect) {
+        let (marks, hover) = self.field_pick_marks();
+        let (w, h) = (f64::from(rect.width()), f64::from(rect.height()));
+        let at = |p: [f64; 3]| {
+            self.camera
+                .project(&Point3::new(p[0], p[1], p[2]), w, h)
+                .map(|s| egui::pos2(rect.min.x + s[0] as f32, rect.min.y + s[1] as f32))
+        };
+        let accent = self.token_color(Token::Highlight);
+        for (i, p) in marks.iter().enumerate() {
+            if let Some(c) = at(*p) {
+                painter.circle_filled(c, 5.0, accent);
+                painter.circle_stroke(c, 5.0, egui::Stroke::new(1.5, self.token_color(Token::TextPrimary)));
+                painter.text(
+                    c + egui::vec2(8.0, -8.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    (i + 1).to_string(),
+                    egui::FontId::proportional(13.0),
+                    self.token_color(Token::TextPrimary),
+                );
+            }
+        }
+        if let Some(c) = hover.and_then(at) {
+            painter.circle_stroke(c, 7.0, egui::Stroke::new(1.5, self.token_color(Token::FocusRing)));
+        }
     }
 
     fn paint_gizmo(&mut self, painter: &egui::Painter, rect: egui::Rect) {
@@ -872,6 +938,7 @@ impl SurfaceCraftApp {
                         }
                         Tool::Navigate => {}
                     }
+                    self.field_pick_strip(ui);
                     self.selection_chip(ui);
                     self.section_controls(ui);
                     ui.horizontal(|ui| {
@@ -885,6 +952,18 @@ impl SurfaceCraftApp {
                 });
             },
         );
+    }
+
+    /// While a form field is being picked: what to click, and a button to stop.
+    fn field_pick_strip(&mut self, ui: &mut egui::Ui) {
+        let Some((_, hint)) = self.field_pick_hint() else { return };
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            ui.colored_label(self.token_color(Token::AccentPrimary), hint);
+            if ui.small_button(t("fieldpick.stop")).clicked() {
+                self.stop_field_pick();
+            }
+        });
     }
 
     fn selection_chip(&mut self, ui: &mut egui::Ui) {

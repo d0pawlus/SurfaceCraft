@@ -20,6 +20,7 @@ pub mod command_panel;
 pub mod control;
 pub mod deviation_panel;
 pub mod dock;
+pub mod fieldpick;
 pub mod forms;
 pub mod gizmo;
 pub mod history_panel;

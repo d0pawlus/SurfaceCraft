@@ -7,11 +7,13 @@
 //! the engine marks heavy are never previewed, and a preview waits for the parameters to stop
 //! changing (debounce) so the UI thread is not blocked on every drag step.
 use crate::app::SurfaceCraftApp;
+use crate::fieldpick::PickRequest;
 use crate::forms::{self, FormCtx, ObjInfo};
 use crate::i18n::{t, tf};
 use crate::theme::{Token, Tokens};
 use crate::viewport::DrawItem;
 use serde_json::Value;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use surfacecraft_doc::{ObjectId, ObjectKind};
@@ -145,6 +147,10 @@ pub struct CtxData {
     pick_objects: Vec<u64>,
     pick_points: Vec<[f64; 3]>,
     pick_triangles: Vec<u32>,
+    /// The parameter the viewport is picking into, with its hint.
+    picking: Option<(String, String)>,
+    /// What the form asked for this frame (start or stop picking a field).
+    request: RefCell<Option<PickRequest>>,
     /// Validation messages by path (the first per path).
     pub issues: HashMap<String, String>,
 }
@@ -164,8 +170,15 @@ impl CtxData {
             pick_objects: app.picks.iter().map(|p| p.object.0).collect(),
             pick_points: app.picks.iter().map(|p| [p.point.x, p.point.y, p.point.z]).collect(),
             pick_triangles: app.picks.iter().map(|p| p.triangle).collect(),
+            picking: app.field_pick_hint(),
+            request: RefCell::new(None),
             issues,
         }
+    }
+
+    /// The request a "pick in viewport" button left during the last form pass.
+    pub fn take_request(&self) -> Option<PickRequest> {
+        self.request.borrow_mut().take()
     }
 
     /// The form context for `command`.
@@ -178,6 +191,8 @@ impl CtxData {
             pick_objects: &self.pick_objects,
             pick_points: &self.pick_points,
             pick_triangles: &self.pick_triangles,
+            picking: self.picking.as_ref().map(|(f, h)| (f.as_str(), h.as_str())),
+            pick_request: &self.request,
             tokens,
             issues: &self.issues,
         }
@@ -266,6 +281,10 @@ fn body(app: &mut SurfaceCraftApp, panel: &mut CommandPanel, ui: &mut egui::Ui, 
         panel.cancel_preview();
         panel.last_command = Some(id);
     }
+    if app.field_pick.as_ref().is_some_and(|f| f.command != id) {
+        // picking for another command's form
+        app.field_pick = None;
+    }
     ui.strong(id);
     if let Some(c) = surfacecraft_engine::cmd::find(id) {
         ui.label(c.summary);
@@ -321,6 +340,10 @@ fn form_section(
     if forms::form(ui, schema, &mut panel.value, &ctx) {
         app.palette_params = serde_json::to_string_pretty(&panel.value).unwrap_or_else(|_| "{}".into());
         panel.synced = app.palette_params.clone();
+    }
+    // a "pick in viewport" button was pressed: start or stop picking that field
+    if let Some(req) = data.take_request() {
+        app.handle_pick_request(req);
     }
     if !data.issues.is_empty() {
         ui.colored_label(
