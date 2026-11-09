@@ -107,7 +107,20 @@ fn optimise_wasm(path: &Path) {
     }
     let tmp = path.with_extension("opt.wasm");
     let mut c = Command::new("wasm-opt");
-    c.arg("-Oz").arg(path).arg("-o").arg(&tmp);
+    // The wasm features rustc enables by default for wasm32-unknown-unknown; without them an older
+    // wasm-opt mangles the externref table wasm-bindgen emits and the bundle fails at start-up.
+    c.arg("-Oz")
+        .args([
+            "--enable-reference-types",
+            "--enable-bulk-memory",
+            "--enable-mutable-globals",
+            "--enable-sign-ext",
+            "--enable-nontrapping-float-to-int",
+            "--enable-multivalue",
+        ])
+        .arg(path)
+        .arg("-o")
+        .arg(&tmp);
     let ok = c.status().is_ok_and(|s| s.success());
     if ok && std::fs::rename(&tmp, path).is_ok() {
         eprintln!("==> wasm-opt -Oz: {before} -> {} bytes", size(path));

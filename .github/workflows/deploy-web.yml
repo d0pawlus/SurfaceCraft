@@ -50,10 +50,18 @@ jobs:
           v=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/version = |"/, ""); print; exit }' Cargo.lock)
           echo "wasm-bindgen $v"
           cargo install wasm-bindgen-cli --version "$v" --locked
-      - name: binaryen (wasm-opt, optional)
+      # Pinned release, not apt: Ubuntu's binaryen is too old for the reference-types table that
+      # wasm-bindgen emits and produced a bundle that failed at start-up in the browser.
+      - name: binaryen (wasm-opt, pinned)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y binaryen || true
+          v=version_133
+          f=binaryen-$v-x86_64-linux.tar.gz
+          curl -fsSL -o "$f" "https://github.com/WebAssembly/binaryen/releases/download/$v/$f"
+          curl -fsSL -o "$f.sha256" "https://github.com/WebAssembly/binaryen/releases/download/$v/$f.sha256"
+          sha256sum -c "$f.sha256"
+          tar -xzf "$f"
+          echo "$PWD/binaryen-$v/bin" >> "$GITHUB_PATH"
+          "binaryen-$v/bin/wasm-opt" --version
       - name: Build the bundle
         run: cargo xtask web
       - name: Bundle size
