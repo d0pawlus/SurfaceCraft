@@ -11,6 +11,12 @@ description: Writing and running SurfaceCraft tests and the accuracy gates of de
 - Locally, before each commit: `cargo xtask quick <changed packages>` (the static steps plus clippy
   and tests of those packages). Several parallel full builds of solidcore exhaust the RAM of a
   workstation; the pull request runs the whole suite.
+- Documentation-only commits (`*.md`, STATUS, plans, merge resolutions of those) skip the local
+  build entirely.
+- On a workstation with `sccache` installed as the rustc wrapper (`~/.cargo/config.toml`,
+  `build.rustc-wrapper`), every worktree reuses the compiled dependencies (solidcore once, not per
+  worktree). Builds that are not incremental (the `ci` and `release` profiles) are cached; keep
+  `CARGO_BUILD_JOBS` at 2 to 4 when several worktrees build at once.
 - Unit tests sit next to the code; cross-crate behaviour in `crates/<c>/tests/`. A regression test
   goes into the area's existing test file.
 - Accuracy gates (design doc §11.1, never loosened to make a test pass):

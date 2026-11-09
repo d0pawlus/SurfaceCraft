@@ -30,6 +30,8 @@ current state and next step: `docs/STATUS.md`.
 - Before every commit run `cargo xtask quick <changed packages>` (fmt, assets, licences, layers,
   app-geometry, clippy and tests of those packages); the full `cargo xtask ci` runs on GitHub
   Actions for every pull request, and a pull request is merged only with all checks green.
+  A commit that touches only documentation (`*.md`, STATUS, plans) or only resolves a merge of
+  such files needs no local build: push and let the pull request run.
 
 ## Working on X: read the skill first
 | Working on | Read |
