@@ -35,7 +35,19 @@ const INTRA_LAYER_ORDER: &[&str] = &[
 ];
 
 /// UI crates, allowed only from layer 5 up.
-const UI_CRATES: &[&str] = &["egui", "eframe", "egui-wgpu", "wgpu", "winit", "egui_kittest", "rfd"];
+const UI_CRATES: &[&str] = &[
+    "egui",
+    "eframe",
+    "egui-wgpu",
+    "egui_extras",
+    "wgpu",
+    "winit",
+    "egui_kittest",
+    "rfd",
+    "craft-ui",
+    "craft-window",
+    "craft-dialogs",
+];
 
 /// solidcore crates, allowed only in the kernel adapter.
 const SOLIDCORE: &[&str] = &[

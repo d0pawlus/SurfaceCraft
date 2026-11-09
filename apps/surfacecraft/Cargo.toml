@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 surfacecraft-ui-egui.workspace = true
 eframe.workspace = true
+craft-window.workspace = true
 egui.workspace = true
 
 [lints]
