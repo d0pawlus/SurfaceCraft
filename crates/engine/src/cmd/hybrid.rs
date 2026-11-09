@@ -17,7 +17,7 @@ use surfacecraft_fit::resample::HeightField;
 use surfacecraft_fit::segment::region_points;
 use surfacecraft_geom::{Point3, Vec3, normalize};
 use surfacecraft_kernel::hybrid::{self, Cut, CutStatus, FreeCut, Shape};
-use surfacecraft_kernel::local::LocalTool;
+use surfacecraft_kernel::local::{LocalAdd, LocalTool};
 use surfacecraft_kernel::nurbs::fit_grid;
 use surfacecraft_kernel::record::brep::Surface;
 
@@ -426,7 +426,8 @@ fn from_regions(s: &mut Session, i: FromRegionsIn) -> CmdResult<FromRegionsOut> 
             "no region is a global cut of the stock (see body.plan_regions for the role of each)".into(),
         ));
     }
-    let built = hybrid::solid_from_cuts_and_tools(arr(slo), arr(shi), &cuts, &free, &tools)?;
+    let adds: Vec<LocalAdd> = plan.adds.iter().map(|t| t.add.clone()).collect();
+    let built = hybrid::solid_from_plan(arr(slo), arr(shi), &cuts, &free, &tools, &adds)?;
     let mut faces_of = skipped_early;
     let tol = 0.02 * diag.max(1.0) / 10.0 + 1e-3;
     let mut skipped = faces_of.len();
@@ -451,7 +452,15 @@ fn from_regions(s: &mut Session, i: FromRegionsIn) -> CmdResult<FromRegionsOut> 
                     None => (sts.first().map_or(String::new(), |st| describe(st).0), true, role.shape.clone()),
                 }
             }
-            RoleKind::LocalAdd | RoleKind::Skipped => (format!("skipped: {}", role.how), false, role.shape.clone()),
+            RoleKind::LocalAdd => {
+                let sts: Vec<&CutStatus> = role.adds.iter().filter_map(|&t| built.adds.get(t)).collect();
+                match sts.iter().find(|st| matches!(st, CutStatus::Skipped(_))) {
+                    Some(bad) => (describe(bad).0, false, role.shape.clone()),
+                    None if sts.is_empty() => ("skipped: no addition".to_string(), false, role.shape.clone()),
+                    None => (sts.first().map_or(String::new(), |st| describe(st).0), true, role.shape.clone()),
+                }
+            }
+            RoleKind::Skipped => (format!("skipped: {}", role.how), false, role.shape.clone()),
         };
         let faces = if applied { hybrid::faces_on_shape(&built.brep, &shape, tol) } else { Vec::new() };
         skipped += usize::from(!applied);

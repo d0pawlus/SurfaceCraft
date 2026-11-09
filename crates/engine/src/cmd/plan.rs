@@ -15,7 +15,7 @@ use surfacecraft_doc::ObjectId;
 use surfacecraft_geom::{KdTree, Point3, Vec3, any_perpendicular, normalize};
 use surfacecraft_kernel::feature::ProfileCurve;
 use surfacecraft_kernel::hybrid::{Cut, Shape};
-use surfacecraft_kernel::local::{HoleBottom, LocalTool};
+use surfacecraft_kernel::local::{HoleBottom, LocalAdd, LocalTool};
 
 /// Fraction of the scan allowed in front of a plane (or outside a cylinder) that is still the
 /// part's envelope: outliers, not geometry.
@@ -44,7 +44,7 @@ pub enum RoleKind {
     Blend,
     /// Wall, floor or bottom of a tool that is subtracted (hole, pocket, slot).
     LocalSubtract,
-    /// A boss or step that adds material (not built yet).
+    /// A boss or dome that adds material (a step is not built yet).
     LocalAdd,
     /// Not used, with the reason.
     Skipped,
@@ -73,6 +73,8 @@ pub struct Role {
     pub how: String,
     /// Tools this region belongs to (indices into [`Plan::tools`]).
     pub tools: Vec<usize>,
+    /// Local additions this region belongs to (indices into [`Plan::adds`]).
+    pub adds: Vec<usize>,
     /// The surface as planned (snapped axes, refitted cone).
     pub shape: Shape,
 }
@@ -105,6 +107,19 @@ pub struct PlannedTool {
     pub detail: String,
 }
 
+/// A local addition (boss, dome) and the regions that form it.
+#[derive(Clone, Debug)]
+pub struct PlannedAdd {
+    /// The solid for the kernel.
+    pub add: LocalAdd,
+    /// `boss` or `dome`.
+    pub kind: &'static str,
+    /// Items that form it.
+    pub members: Vec<usize>,
+    /// Numbers for the report.
+    pub detail: String,
+}
+
 /// The plan.
 #[derive(Clone, Debug)]
 pub struct Plan {
@@ -114,6 +129,8 @@ pub struct Plan {
     pub cut_members: Vec<Vec<usize>>,
     /// Local tools.
     pub tools: Vec<PlannedTool>,
+    /// Local additions (bosses, domes).
+    pub adds: Vec<PlannedAdd>,
     /// Role per item.
     pub roles: Vec<Role>,
     /// Neighbour graph with the kind of each contact.
@@ -640,6 +657,241 @@ impl Frame {
 }
 
 // ---------------------------------------------------------------------------------------------
+// bosses
+
+/// Scan that is in front of a plane only because a boss stands on it.
+struct Explained {
+    o: Vec3,
+    u: Vec3,
+    reach: f64,
+    s_base: f64,
+}
+
+impl Explained {
+    /// Does this boss explain the point `p` in front of a plane with normal `n`?
+    fn covers(&self, p: &Point3, n: &Vec3) -> bool {
+        n.dot(&self.u).abs() > 0.99
+            && radial_axial(p, self.o, self.u).0 <= self.reach
+            && (p.coords - self.o).dot(&self.u) >= self.s_base - 0.3
+    }
+}
+
+/// The axial position of the plane `pn` along the axis `(o, a)`, and its unit normal.
+fn plane_t(pn: &Node, o: Vec3, a: Vec3) -> Option<(f64, Vec3)> {
+    let Shape::Plane { point, normal } = &pn.shape else { return None };
+    let n = normalize(v3(*normal))?;
+    let c = n.dot(&a);
+    (c.abs() > 0.99).then(|| ((v3(*point) - o).dot(&n) / c, n))
+}
+
+/// A boss: the convex full cylinder `ci`, the plane across its far end (its top) and the plane it
+/// stands on, with a chamfer or round on the top edge and a fillet at the base when the scan has
+/// them (a coaxial cone, a coaxial torus). On success the regions that form the boss are given
+/// their roles in `st`; the base plane stays for the global test (the boss explains the scan in
+/// front of it).
+fn plan_boss(
+    nodes: &[Node],
+    ci: usize,
+    st: &mut State,
+    anchors: &[Vec3],
+    add_index: usize,
+    outside: f64,
+) -> Result<(PlannedAdd, Explained), String> {
+    let nd = nodes.get(ci).ok_or("index")?;
+    let Shape::Cylinder { point, axis, radius } = &nd.shape else { return Err("not a cylinder".into()) };
+    let (o, a0, r) = (v3(*point), normalize(v3(*axis)).ok_or("degenerate axis")?, *radius);
+    let (mut t0, mut t1) = (f64::INFINITY, f64::NEG_INFINITY);
+    for p in &nd.pts {
+        let t = (p.coords - o).dot(&a0);
+        t0 = t0.min(t);
+        t1 = t1.max(t);
+    }
+    // the two ends: the top is a disc, the base a plane with the boss's foot in it
+    let mut found: Option<(Vec3, f64, f64, usize)> = None;
+    for sign in [1.0, -1.0] {
+        let u = a0 * sign;
+        let (s0, s1) = if sign > 0.0 { (t0, t1) } else { (-t1, -t0) };
+        let mut top: Option<(usize, f64)> = None;
+        let mut base: Option<f64> = None;
+        for (pi, pn) in nodes.iter().enumerate() {
+            if pi == ci || !st.pending(pi) {
+                continue;
+            }
+            let Some((t, n)) = plane_t(pn, o, a0) else { continue };
+            let s = sign * t;
+            if n.dot(&u) < 0.9 {
+                continue;
+            }
+            let inside = pn.pts.iter().filter(|p| radial_axial(p, o, a0).0 <= r + 0.6).count() as f64
+                / pn.pts.len().max(1) as f64;
+            let ring = pn
+                .pts
+                .iter()
+                .filter(|p| {
+                    let d = radial_axial(p, o, a0).0;
+                    d > r + 0.2 && d < r + 6.0
+                })
+                .count();
+            if inside >= 0.9
+                && (s1 - 0.4..=s1 + 4.0).contains(&s)
+                && top.is_none_or(|b| (s - s1).abs() < (b.1 - s1).abs())
+            {
+                top = Some((pi, s));
+            }
+            if ring >= 8 && (s0 - 4.0..=s0 + 0.4).contains(&s) && base.is_none_or(|b| (s - s0).abs() < (b - s0).abs()) {
+                base = Some(s);
+            }
+        }
+        if let (Some((ti, s_top)), Some(s_base)) = (top, base)
+            && s_top > s_base + 0.5
+        {
+            found = Some((u, s_base, s_top, ti));
+            break;
+        }
+    }
+    let Some((u0, s_base, s_top, ti)) = found else {
+        return Err("no plane across its end for a top, or no plane it stands on".into());
+    };
+    let u = snap_direction(u0, anchors, 0.5);
+    let h = s_top - s_base;
+    // the top edge: a chamfer (a coaxial cone) or a round (a coaxial convex torus); the foot: a
+    // coaxial concave torus
+    let mut members: Vec<usize> = vec![nd.base, nodes.get(ti).map_or(nd.base, |n| n.base)];
+    let mut parts: Vec<String> = Vec::new();
+    let mut m_base = 0.0;
+    for (ni, nn) in nodes.iter().enumerate() {
+        if ni == ci || ni == ti || !st.pending(ni) {
+            continue;
+        }
+        match &nn.shape {
+            Shape::Cone { .. } if nn.convex => {
+                let near_top = nn
+                    .pts
+                    .iter()
+                    .filter(|p| {
+                        let (rho, _) = radial_axial(p, o, u);
+                        let s = (p.coords - o).dot(&u);
+                        rho <= r + 0.5 && s >= s_top - 8.0 && s <= s_top + 0.5
+                    })
+                    .count();
+                if near_top * 10 < nn.pts.len() * 9 {
+                    continue;
+                }
+                // radius against height along the boss axis: rho = mr + k (s - ms)
+                let pairs: Vec<(f64, f64)> = nn
+                    .pts
+                    .iter()
+                    .map(|p| {
+                        let (rho, _) = radial_axial(p, o, u);
+                        ((p.coords - o).dot(&u), rho)
+                    })
+                    .collect();
+                let n = pairs.len() as f64;
+                if n < 10.0 {
+                    continue;
+                }
+                let (ms, mr) = (pairs.iter().map(|p| p.0).sum::<f64>() / n, pairs.iter().map(|p| p.1).sum::<f64>() / n);
+                let sxx: f64 = pairs.iter().map(|p| (p.0 - ms).powi(2)).sum();
+                let sxy: f64 = pairs.iter().map(|p| (p.0 - ms) * (p.1 - mr)).sum();
+                if sxx < 1e-9 {
+                    continue;
+                }
+                let k = sxy / sxx;
+                if !(-20.0..=-0.1).contains(&k) {
+                    continue;
+                }
+                let rho_top = mr + k * (s_top - ms);
+                let s_r = ms + (r - mr) / k;
+                let (c_rad, c_ax) = (r - rho_top, s_top - s_r);
+                if !(0.1..r).contains(&c_rad) || !(0.1..h).contains(&c_ax) {
+                    continue;
+                }
+                let half = (-k).atan();
+                let s_apex = ms - mr / k;
+                st.set(
+                    ni,
+                    RoleKind::Blend,
+                    format!("chamfer of the top edge of the boss: {c_rad:.2} mm on the top, {c_ax:.2} mm on the wall"),
+                );
+                if let Some(sh) = st.shape.get_mut(ni) {
+                    *sh = Shape::Cone { apex: arr(o + u * s_apex), axis: arr(-u), half_angle: half };
+                }
+                members.push(nn.base);
+                parts.push(format!("chamfer {c_rad:.2} x {c_ax:.2}"));
+            }
+            Shape::Torus { center, axis, major_radius, minor_radius } => {
+                let m = *minor_radius;
+                let Some(ta) = normalize(v3(*axis)) else { continue };
+                let tc = v3(*center);
+                let s_c = (tc - o).dot(&u);
+                let tol = 0.6 + 0.2 * m;
+                if ta.dot(&u).abs() < 0.99 || radial_axial(&Point3::from(tc), o, u).0 > 1.0 {
+                    continue;
+                }
+                let (name, center_s, major) = if nn.convex {
+                    ("round of the top edge of the boss", s_top - m, r - m)
+                } else {
+                    ("fillet at the foot of the boss", s_base + m, r + m)
+                };
+                if (major_radius - major).abs() > tol || (s_c - center_s).abs() > tol {
+                    continue;
+                }
+                st.set(ni, RoleKind::Blend, format!("{name}: torus, minor radius {m:.2}"));
+                if let Some(sh) = st.shape.get_mut(ni) {
+                    *sh = Shape::Torus {
+                        center: arr(o + u * center_s),
+                        axis: arr(u),
+                        major_radius: major,
+                        minor_radius: m,
+                    };
+                }
+                if !nn.convex {
+                    m_base = m;
+                }
+                members.push(nn.base);
+                parts.push(format!("{} r = {m:.2}", if nn.convex { "round" } else { "foot fillet" }));
+            }
+            _ => {}
+        }
+    }
+    let base_pt = o + u * s_base;
+    st.set(
+        ci,
+        RoleKind::LocalAdd,
+        format!(
+            "boss Ø{:.3}, {h:.2} mm tall ({:.1} % of the scan lies outside this cylinder)",
+            2.0 * r,
+            outside * 100.0
+        ),
+    );
+    st.set(ti, RoleKind::LocalAdd, format!("top of the boss Ø{:.3}", 2.0 * r));
+    for k in [ci, ti] {
+        if let Some(v) = st.adds.get_mut(k) {
+            v.push(add_index);
+        }
+    }
+    if let Some(sh) = st.shape.get_mut(ci) {
+        *sh = Shape::Cylinder { point: arr(base_pt), axis: arr(u), radius: r };
+    }
+    if let Some(sh) = st.shape.get_mut(ti) {
+        *sh = Shape::Plane { point: arr(o + u * s_top), normal: arr(u) };
+    }
+    Ok((
+        PlannedAdd {
+            add: LocalAdd::Boss { base: arr(base_pt), axis: arr(u), radius: r, height: h, embed: 0.5 },
+            kind: "boss",
+            members,
+            detail: format!(
+                "Ø{:.3}, {h:.2} mm tall{}",
+                2.0 * r,
+                if parts.is_empty() { String::new() } else { format!(", {}", parts.join(", ")) }
+            ),
+        },
+        Explained { o, u, reach: r + m_base + 0.6, s_base },
+    ))
+}
+
+// ---------------------------------------------------------------------------------------------
 // the planner
 
 struct State {
@@ -648,6 +900,7 @@ struct State {
     /// Why an attempt to use a still-unassigned region failed (the first one is kept).
     notes: Vec<String>,
     tools: Vec<Vec<usize>>,
+    adds: Vec<Vec<usize>>,
     shape: Vec<Shape>,
 }
 
@@ -681,6 +934,7 @@ pub fn plan(items: &[Item], scan: &[Point3]) -> Plan {
         how: vec![String::new(); nodes.len()],
         notes: vec![String::new(); nodes.len()],
         tools: vec![Vec::new(); nodes.len()],
+        adds: vec![Vec::new(); nodes.len()],
         shape: nodes.iter().map(|n| n.shape.clone()).collect(),
     };
     let mut tools: Vec<PlannedTool> = Vec::new();
@@ -696,8 +950,44 @@ pub fn plan(items: &[Item], scan: &[Point3]) -> Plan {
     let total = scan.len().max(1) as f64;
     let mut front_of: Vec<Option<f64>> = vec![None; nodes.len()];
 
+    // Auto-constraint of directions (design doc §6.2): the tools' directions (a pocket's, a hole's
+    // axis, a slot's) snap to the model axes when within half a degree. The kernel's booleans fail
+    // on a tool whose direction is, to the last digit, the normal of one of the stock's fitted
+    // planes (observed on a window in a plate); a model axis is not.
+    let global_normals: Vec<Vec3> = vec![Vec3::x(), Vec3::y(), Vec3::z()];
+
+    // --- 0. bosses: a convex full cylinder with scan outside it that stands on a plane. What is in
+    // front of that plane because of the boss is not an obstacle to the plane being global.
+    let mut adds: Vec<PlannedAdd> = Vec::new();
+    let mut explained: Vec<Explained> = Vec::new();
+    for ci in 0..nodes.len() {
+        let Some(nd) = nodes.get(ci) else { continue };
+        let Shape::Cylinder { point, axis, radius } = &nd.shape else { continue };
+        if !(nd.full && nd.convex) || !st.pending(ci) {
+            continue;
+        }
+        let (o, a) = (v3(*point), v3(*axis));
+        let tol = 0.1 + 0.05 * radius.min(2.0);
+        let out = scan.iter().filter(|p| radial_axial(p, o, a).0 > radius + tol).count() as f64 / total;
+        front_of[ci] = Some(out);
+        if out <= ENVELOPE_FRACTION {
+            continue;
+        }
+        let ai = adds.len();
+        match plan_boss(&nodes, ci, &mut st, &global_normals, ai, out) {
+            Ok((add, ex)) => {
+                adds.push(add);
+                explained.push(ex);
+            }
+            Err(why) => st.note(ci, why),
+        }
+    }
+
     // --- 1. global or local, from the scan
     for (ni, nd) in nodes.iter().enumerate() {
+        if !st.pending(ni) {
+            continue;
+        }
         match &nd.shape {
             Shape::Plane { point, normal } => {
                 let (p0, n) = (v3(*point), v3(*normal));
@@ -705,13 +995,31 @@ pub fn plan(items: &[Item], scan: &[Point3]) -> Plan {
                     / nd.pts.len().max(1) as f64)
                     .sqrt();
                 let tol = (0.1 + 3.0 * rms).min(0.4);
-                let front = scan.iter().filter(|p| (p.coords - p0).dot(&n) > tol).count() as f64 / total;
+                let (mut in_front, mut by_boss) = (0usize, 0usize);
+                for p in scan {
+                    if (p.coords - p0).dot(&n) > tol {
+                        if explained.iter().any(|e| e.covers(p, &n)) {
+                            by_boss += 1;
+                        } else {
+                            in_front += 1;
+                        }
+                    }
+                }
+                let front = in_front as f64 / total;
                 front_of[ni] = Some(front);
                 if front <= ENVELOPE_FRACTION {
+                    let boss = if by_boss > 0 {
+                        format!(
+                            "; {:.1} % of the scan in front of it is the boss standing on it",
+                            by_boss as f64 / total * 100.0
+                        )
+                    } else {
+                        String::new()
+                    };
                     st.set(
                         ni,
                         RoleKind::Global,
-                        format!("global plane: {:.3} % of the scan lies in front of it", front * 100.0),
+                        format!("global plane: {:.3} % of the scan lies in front of it{boss}", front * 100.0),
                     );
                 }
             }
@@ -727,10 +1035,14 @@ pub fn plan(items: &[Item], scan: &[Point3]) -> Plan {
                         format!("global cylinder: {:.3} % of the scan lies outside it", out * 100.0),
                     );
                 } else {
+                    let note = st.notes.get(ni).filter(|n| !n.is_empty()).map_or(String::new(), |n| format!(": {n}"));
                     st.set(
                         ni,
-                        RoleKind::LocalAdd,
-                        format!("boss or step: {:.1} % of the scan lies outside this convex cylinder (adding material is not built yet)", out * 100.0),
+                        RoleKind::Skipped,
+                        format!(
+                            "boss or step: {:.1} % of the scan lies outside this convex cylinder and it is no boss on a plane{note}",
+                            out * 100.0
+                        ),
                     );
                 }
             }
@@ -741,23 +1053,14 @@ pub fn plan(items: &[Item], scan: &[Point3]) -> Plan {
             Shape::Cylinder { .. } => {} // full concave: hole analysis below
             Shape::Cone { .. } if nd.full && !nd.convex => {} // pending: drill point or countersink
             Shape::Cone { .. } if nd.full => st.set(ni, RoleKind::Global, "global cone (full revolution, convex)"),
-            Shape::Cone { .. } => st.set(ni, RoleKind::Skipped, "partial convex cone: a chamfer is not built yet"),
-            Shape::Torus { .. } if !nd.full && !nd.convex => {} // pending: a floor fillet's corner
-            Shape::Sphere { .. } | Shape::Torus { .. } => {
-                if nd.full {
-                    st.set(ni, RoleKind::Global, "global revolved surface (full revolution)");
-                } else {
-                    st.set(ni, RoleKind::Skipped, "partial sphere or torus: not built yet");
-                }
+            Shape::Cone { .. } => {}  // pending: a chamfer of a circular edge (step 6)
+            Shape::Torus { .. } => {} // pending: a floor fillet's corner, or a circular fillet (step 6)
+            Shape::Sphere { .. } if nd.full => {
+                st.set(ni, RoleKind::Global, "global revolved surface (full revolution)")
             }
+            Shape::Sphere { .. } => {} // pending: a corner patch of equal fillets, or a dome (step 6)
         }
     }
-    // Auto-constraint of directions (design doc §6.2): the tools' directions (a pocket's, a hole's
-    // axis, a slot's) snap to the model axes when within half a degree. The kernel's booleans fail
-    // on a tool whose direction is, to the last digit, the normal of one of the stock's fitted
-    // planes (observed on a window in a plate); a model axis is not.
-    let global_normals: Vec<Vec3> = vec![Vec3::x(), Vec3::y(), Vec3::z()];
-
     // --- 2. holes: a concave full cylinder is through (global) or blind (a tool with a bottom)
     for hi in 0..nodes.len() {
         let Some(nd) = nodes.get(hi) else { continue };
@@ -1219,6 +1522,202 @@ pub fn plan(items: &[Item], scan: &[Point3]) -> Plan {
         }
     }
 
+    // --- 6. rounds, chamfers and corner patches: concave partial cylinders between planes, tori,
+    // partial cones and spheres (a corner of equal fillets, or a dome)
+    let kind_of = |st: &State, i: usize| st.kind.get(i).copied().flatten();
+    // (a) a concave partial cylinder tangent to two planes (its centre in front of both by r)
+    for ci in 0..nodes.len() {
+        let Some(nd) = nodes.get(ci) else { continue };
+        let Shape::Cylinder { point, axis, radius } = &nd.shape else { continue };
+        if nd.full || nd.convex || !st.pending(ci) {
+            continue;
+        }
+        let Some(a) = normalize(v3(*axis)) else { continue };
+        let (c0, r) = (v3(*point), *radius);
+        let normals: Vec<Vec3> = nodes
+            .iter()
+            .enumerate()
+            .filter(|(pi, _)| {
+                *pi != ci
+                    && matches!(
+                        kind_of(&st, *pi),
+                        Some(RoleKind::Global | RoleKind::LocalSubtract | RoleKind::LocalAdd)
+                    )
+            })
+            .filter_map(|(_, pn)| match &pn.shape {
+                Shape::Plane { point: pp, normal } => {
+                    let n = normalize(v3(*normal))?;
+                    (n.dot(&a).abs() < 0.05 && ((c0 - v3(*pp)).dot(&n) - r).abs() < 0.08 * r + 0.15).then_some(n)
+                }
+                _ => None,
+            })
+            .collect();
+        if normals.iter().enumerate().any(|(x, n)| normals.iter().skip(x + 1).any(|m| n.dot(m).abs() < 0.95)) {
+            st.set(ci, RoleKind::Blend, format!("fillet of a concave edge: r = {r:.2}, tangent to two planes"));
+        }
+    }
+    // (b) a torus tangent to a plane across its axis and to a coaxial cylinder: the circular
+    // fillet of the foot of a boss (concave) or of the rim of a disc (convex)
+    for ti in 0..nodes.len() {
+        let Some(nd) = nodes.get(ti) else { continue };
+        let Shape::Torus { center, axis, major_radius, minor_radius } = &nd.shape else { continue };
+        if !st.pending(ti) {
+            continue;
+        }
+        let (Some(a), c, mj, m) = (normalize(v3(*axis)), v3(*center), *major_radius, *minor_radius) else { continue };
+        let sgn = if nd.convex { -1.0 } else { 1.0 };
+        let want = if nd.convex { mj + m } else { mj - m };
+        let plane = nodes.iter().enumerate().any(|(pi, pn)| {
+            kind_of(&st, pi) == Some(RoleKind::Global)
+                && match &pn.shape {
+                    Shape::Plane { point: pp, normal } => normalize(v3(*normal)).is_some_and(|n| {
+                        n.dot(&a).abs() > 0.99 && ((c - v3(*pp)).dot(&n) - sgn * m).abs() < 0.4 + 0.15 * m
+                    }),
+                    _ => false,
+                }
+        });
+        let cyl = nodes.iter().enumerate().find_map(|(pi, pn)| {
+            if !matches!(kind_of(&st, pi), Some(RoleKind::Global | RoleKind::LocalAdd)) {
+                return None;
+            }
+            match &pn.shape {
+                Shape::Cylinder { point, axis, radius } if pn.full => {
+                    let ca = normalize(v3(*axis))?;
+                    let ok = ca.dot(&a).abs() > 0.99
+                        && radial_axial(&Point3::from(c), v3(*point), ca).0 < 1.0
+                        && (radius - want).abs() < 0.5 + 0.2 * m;
+                    ok.then(|| {
+                        // the torus on the cylinder's own axis, with its sign
+                        let ca = if ca.dot(&a) < 0.0 { -ca } else { ca };
+                        let on = v3(*point) + ca * (c - v3(*point)).dot(&ca);
+                        (on, ca, *radius)
+                    })
+                }
+                _ => None,
+            }
+        });
+        match (plane, cyl) {
+            (true, Some((on, ca, rc))) => {
+                st.set(
+                    ti,
+                    RoleKind::Blend,
+                    format!(
+                        "{} circular fillet, minor radius {m:.2}, tangent to a plane and a cylinder of radius {rc:.2}",
+                        if nd.convex { "convex (rim)" } else { "concave (foot)" }
+                    ),
+                );
+                if let Some(sh) = st.shape.get_mut(ti) {
+                    *sh = Shape::Torus {
+                        center: arr(on),
+                        axis: arr(ca),
+                        major_radius: if nd.convex { rc - m } else { rc + m },
+                        minor_radius: m,
+                    };
+                }
+            }
+            _ if nd.full => st.set(ti, RoleKind::Global, "global revolved surface (full revolution)"),
+            _ => st.note(ti, "no plane tangent to its tube and coaxial cylinder was found"),
+        }
+    }
+    // (c) a partial convex cone: the chamfer of a circular edge between a plane and a coaxial cylinder
+    for ci in 0..nodes.len() {
+        let Some(nd) = nodes.get(ci) else { continue };
+        let Shape::Cone { apex, axis, .. } = &nd.shape else { continue };
+        if nd.full || !nd.convex || !st.pending(ci) {
+            continue;
+        }
+        let (Some(a), ap) = (normalize(v3(*axis)), v3(*apex)) else { continue };
+        let plane = nodes.iter().enumerate().any(|(pi, pn)| {
+            kind_of(&st, pi) == Some(RoleKind::Global)
+                && matches!(&pn.shape, Shape::Plane { normal, .. } if normalize(v3(*normal)).is_some_and(|n| n.dot(&a).abs() > 0.99))
+        });
+        let cyl = nodes.iter().enumerate().any(|(pi, pn)| {
+            matches!(kind_of(&st, pi), Some(RoleKind::Global | RoleKind::LocalAdd))
+                && matches!(&pn.shape, Shape::Cylinder { point, axis, .. } if pn.full
+                    && normalize(v3(*axis)).is_some_and(|ca| ca.dot(&a).abs() > 0.99)
+                    && radial_axial(&Point3::from(ap), v3(*point), a).0 < 1.0)
+        });
+        if plane && cyl {
+            st.set(ci, RoleKind::Blend, "chamfer of a circular edge between a plane and a coaxial cylinder");
+        } else {
+            st.note(ci, "no plane across its axis and coaxial cylinder for it to chamfer");
+        }
+    }
+    // (d) a partial sphere: the corner patch of equal fillets, or a dome standing on a plane
+    for si in 0..nodes.len() {
+        let Some(nd) = nodes.get(si) else { continue };
+        let Shape::Sphere { center, radius } = &nd.shape else { continue };
+        if !st.pending(si) {
+            continue;
+        }
+        let (cs, rs) = (v3(*center), *radius);
+        if !nd.convex {
+            st.set(si, RoleKind::Skipped, "a concave partial sphere (a dimple) is not built");
+            continue;
+        }
+        let fillets = nodes
+            .iter()
+            .enumerate()
+            .filter(|(pi, pn)| {
+                *pi != si
+                    && kind_of(&st, *pi) == Some(RoleKind::Blend)
+                    && matches!(&pn.shape, Shape::Cylinder { point, axis, radius: rr }
+                        if (rr - rs).abs() <= 0.1 * rs + 0.15
+                            && normalize(v3(*axis)).is_some_and(|ca| radial_axial(&Point3::from(cs), v3(*point), ca).0 <= 0.25 * rs + 0.3))
+            })
+            .count();
+        if fillets >= 2 {
+            st.set(
+                si,
+                RoleKind::Blend,
+                format!("corner patch of {fillets} fillets of radius {rs:.2} (the kernel makes it when they meet)"),
+            );
+            continue;
+        }
+        // a dome: the plane it stands on has the sphere's lowest points in it and cuts the ball
+        let mut best: Option<(f64, Vec3, Vec3)> = None;
+        for (pi, pn) in nodes.iter().enumerate() {
+            if kind_of(&st, pi) != Some(RoleKind::Global) {
+                continue;
+            }
+            let Shape::Plane { point: pp, normal } = &pn.shape else { continue };
+            let (Some(n), p0) = (normalize(v3(*normal)), v3(*pp)) else { continue };
+            let hs: Vec<f64> = nd.pts.iter().map(|p| (p.coords - p0).dot(&n)).collect();
+            let low = hs.iter().copied().fold(f64::INFINITY, f64::min);
+            let below = hs.iter().filter(|&&h| h < -0.5).count();
+            if low > 0.8 || below * 50 > hs.len() || ((cs - p0).dot(&n)).abs() > rs - 0.2 {
+                continue;
+            }
+            if best.as_ref().is_none_or(|b| low.abs() < b.0) {
+                best = Some((low.abs(), p0, n));
+            }
+        }
+        match best {
+            Some((_, p0, n)) => {
+                let ai = adds.len();
+                adds.push(PlannedAdd {
+                    add: LocalAdd::Dome { center: arr(cs), radius: rs, plane_point: arr(p0), normal: arr(n) },
+                    kind: "dome",
+                    members: vec![nd.base],
+                    detail: format!("ball of radius {rs:.3} above a plane"),
+                });
+                st.set(
+                    si,
+                    RoleKind::LocalAdd,
+                    format!("dome: the cap of a ball of radius {rs:.3} standing on a plane"),
+                );
+                if let Some(v) = st.adds.get_mut(si) {
+                    v.push(ai);
+                }
+            }
+            None => st.set(
+                si,
+                RoleKind::Skipped,
+                "a convex partial sphere that is not the corner of equal fillets and stands on no global plane",
+            ),
+        }
+    }
+
     // --- 5. what is left
     for ni in 0..nodes.len() {
         if !st.pending(ni) {
@@ -1227,7 +1726,13 @@ pub fn plan(items: &[Item], scan: &[Point3]) -> Plan {
         let Some(nd) = nodes.get(ni) else { continue };
         let note = st.notes.get(ni).filter(|n| !n.is_empty()).map_or(String::new(), |n| format!("; {n}"));
         match &nd.shape {
+            Shape::Cone { .. } if nd.convex => {
+                st.set(ni, RoleKind::Skipped, format!("a partial convex cone that is no chamfer of a circular edge{note}"));
+            }
             Shape::Cone { .. } => st.set(ni, RoleKind::Global, "concave cone (countersink): subtracted from the stock"),
+            Shape::Torus { .. } | Shape::Sphere { .. } => {
+                st.set(ni, RoleKind::Skipped, format!("a partial torus or sphere that is no fillet, corner patch or dome{note}"));
+            }
             Shape::Plane { .. } => st.set(
                 ni,
                 RoleKind::Skipped,
@@ -1248,9 +1753,21 @@ pub fn plan(items: &[Item], scan: &[Point3]) -> Plan {
         let kind = st.kind.get(ni).copied().flatten().unwrap_or(RoleKind::Skipped);
         let how = st.how.get(ni).cloned().unwrap_or_default();
         let tl = st.tools.get(ni).cloned().unwrap_or_default();
-        let shape = st.shape.get(ni).cloned().unwrap_or_else(|| nd.shape.clone());
+        let al = st.adds.get(ni).cloned().unwrap_or_default();
+        let mut shape = st.shape.get(ni).cloned().unwrap_or_else(|| nd.shape.clone());
+        // Auto-constraint (design doc §6.2): a global plane within 0.3 degrees of a model axis is
+        // square to it, about the fit's own point. A plane that is off by fit noise would make the
+        // circle where a boss's cylinder meets it an ellipse, and the kernel's own blend would
+        // then see no circular edge.
+        if kind == RoleKind::Global
+            && let Shape::Plane { point, normal } = &shape
+            && let Some(n) = normalize(v3(*normal))
+        {
+            shape = Shape::Plane { point: *point, normal: arr(snap_direction(n, &global_normals, 0.3)) };
+        }
         if matches!(kind, RoleKind::Global | RoleKind::Blend) {
-            cuts.push(Cut { shape: shape.clone(), convex: nd.convex, full: nd.full });
+            // a blend is a partial surface for the kernel whatever the region's extent round its axis
+            cuts.push(Cut { shape: shape.clone(), convex: nd.convex, full: nd.full && kind == RoleKind::Global });
             cut_members.push(nd.members.clone());
         }
         for &m in &nd.members {
@@ -1260,7 +1777,13 @@ pub fn plan(items: &[Item], scan: &[Point3]) -> Plan {
                 String::new()
             };
             if let Some(r) = roles.get_mut(m) {
-                *r = Some(Role { kind, how: format!("{how}{merged}"), tools: tl.clone(), shape: shape.clone() });
+                *r = Some(Role {
+                    kind,
+                    how: format!("{how}{merged}"),
+                    tools: tl.clone(),
+                    adds: al.clone(),
+                    shape: shape.clone(),
+                });
             }
         }
     }
@@ -1272,13 +1795,14 @@ pub fn plan(items: &[Item], scan: &[Point3]) -> Plan {
                 kind: RoleKind::Skipped,
                 how: "not planned".into(),
                 tools: Vec::new(),
+                adds: Vec::new(),
                 shape: it.cut.shape.clone(),
             })
         })
         .collect();
     // tool members are node bases; every fragment of a merged plane shares the node's tools already
     let _ = (min_dist, pt as fn([f64; 3]) -> Point3);
-    Plan { cuts, cut_members, tools, roles, contacts }
+    Plan { cuts, cut_members, tools, adds, roles, contacts }
 }
 
 /// A wall's normal made exactly square to the profile's direction `d` and, within 0.3°, exactly
@@ -1338,6 +1862,9 @@ pub struct PlannedRegion {
     pub reason: String,
     /// Tools (indices into `tools`) this region belongs to.
     pub tools: Vec<usize>,
+    /// Local additions (indices into `adds`) this region belongs to.
+    #[serde(default)]
+    pub adds: Vec<usize>,
 }
 
 /// One local tool, for `body.plan_regions`.
@@ -1375,6 +1902,9 @@ pub struct PlanOut {
     pub regions: Vec<PlannedRegion>,
     /// Local tools (blind holes, pockets, through slots) the regions form.
     pub tools: Vec<PlannedToolOut>,
+    /// Local additions (bosses, domes) the regions form.
+    #[serde(default)]
+    pub adds: Vec<PlannedToolOut>,
     /// Neighbour graph.
     pub contacts: Vec<ContactOut>,
 }
@@ -1393,6 +1923,18 @@ pub fn report(items: &[Item], plan: &Plan) -> PlanOut {
                 role: r.kind.name().to_string(),
                 reason: r.how.clone(),
                 tools: r.tools.clone(),
+                adds: r.adds.clone(),
+            })
+            .collect(),
+        adds: plan
+            .adds
+            .iter()
+            .enumerate()
+            .map(|(index, t)| PlannedToolOut {
+                index,
+                kind: t.kind.to_string(),
+                members: t.members.iter().map(|&m| id(m)).collect(),
+                detail: t.detail.clone(),
             })
             .collect(),
         tools: plan
