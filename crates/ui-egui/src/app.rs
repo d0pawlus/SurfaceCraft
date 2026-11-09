@@ -366,7 +366,9 @@ impl SurfaceCraftApp {
                     }
                     ui.separator();
                     if ui.button("Import mesh…").clicked() {
-                        if let Some(p) = rfd::FileDialog::new().add_filter("Mesh", &["stl", "obj", "ply"]).pick_file() {
+                        if let Some(p) =
+                            rfd::FileDialog::new().add_filter("Mesh", &["stl", "obj", "ply", "xyz", "asc"]).pick_file()
+                        {
                             let _ = self.run_command("mesh.import", json!({"path": p.to_string_lossy()}));
                             self.fit_pending = true;
                         }

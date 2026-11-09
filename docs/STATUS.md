@@ -21,8 +21,10 @@ Etapy po MVP ([plan production-readiness](superpowers/plans/2026-11-09-productio
 | P | Zakres | Stan | Plan |
 |---|---|---|---|
 | P1 | realne skany: pomiar, edycja siatki, odporność segmentacji i szumu | **zamknięty** | [plan](superpowers/plans/2026-11-09-p1-real-scans.md) |
+| P5 | stabilna parametryka (trwałe nazewnictwo topologii) i komplet cech (loft, sweep, draft, mirror, split, wzór po ścieżce), auto-więzy, podpowiedzi osi/kąta | **zamknięty** (luki w długu technicznym) | [plan](superpowers/plans/2026-11-09-p5-parametric.md) |
 | P3 | model hybrydowy: prymitywy + płaty → jedna zamknięta bryła, STEP round-trip | **zamknięty** (PR) | [plan](superpowers/plans/2026-11-09-p3-hybrid.md) |
-| P4 | freeform organiczny: retopologia niestrukturalna (pola kierunków), łaty G1, sieć łat z krzywych cech | **zamknięty** (PR, na P3) | [plan](superpowers/plans/2026-11-09-p4-organic.md) |
+| P4 | freeform organiczny: retopologia niestrukturalna (pola kierunków), łaty G1, sieć łat z krzywych cech | **zamknięty** (PR) | [plan](superpowers/plans/2026-11-09-p4-organic.md) |
+| P7 | dystrybucja: `cargo xtask dist` (binarki + `SHA256SUMS.txt`), metadane produktu, `wasm-opt`, [docs/distribution.md](distribution.md) | częściowo — kroki poza repo czekają na zgodę | [plan](superpowers/plans/2026-11-09-production-readiness.md) |
 
 ## Jak uruchomić
 
@@ -71,6 +73,11 @@ cargo run -p surfacecraft
 | P1: freeform na realnych danych | największy nieprzypisany kawałek ≥ 500 trójkątów: 1 plik jako płat max 0,167 mm (≤ 0,2); w 2 plikach kawałek zawinięty/złożony (odmowa — potrzebne P3/P4); w 7 resztki < 500 trójkątów | jw. |
 | P1: korpus CAD „skanowany” w CI (rampa gęstości ×2, σ = 0,03, dziury, kolce, śmieci) | blok z zaokrągleniami r = 5: 6 płaszczyzn + 4 walce, promień ± 0,1 (ćwierć łuku); wałek z fazą 3 mm: walec r = 12 ± 0,03, stożek 45° ± 0,5°; po clean: 0 dziur, 1 komponent, każdy wierzchołek < 6σ od CAD; RMS ≤ 0,1 | `p1_scanned_filleted_block`, `p1_scanned_chamfered_cylinder` |
 | P1: edycja siatki | decymacja QEM: pudełko zostaje pudełkiem (wierzchołki na ścianach < 1e-6), sfera 10 % trójkątów < 0,3 mm; Taubin: RMS szumu ×< 0,5 bez skurczu (< 0,05 mm); dziura gładka (cienka płyta) vs płaska na sferze: 1,5 vs 4,0 mm; deterministyczne | `geom::edit::tests`, `p1_mesh_edit_commands` |
+| P5: stabilne odwołania (kryterium 5): wyciągnięcie + kieszeń przelotowa/ślepa + 2 fillety + shell, 20 losowych edycji (ziarno stałe) | fillety zawsze na krawędziach pionowych w tych samych narożnikach (pozycja znormalizowana), shell otwiera górną ścianę; objętość po filletach zgodna z postacią zamkniętą (błąd względny 5e-10); numeracja rekordu zmieniła się pod filletem 2 razy | `gate_p5_stable_references_over_20_random_edits` |
+| P5: objętości nowych cech | loft kwadrat 20 → 10, h = 10: 2333,333333 (dokł.); sweep kwadratu 2×2 po łuku R = 10, 90°: 62,831853 (Pappus); draft 5° bloku 20×20×10: 3660,251034 (dokł.); mirror 2000; split 1500 / 500 / połowa sześcianu 500; wzór po prostej 4 × π·16 | `crates/engine/tests/p5_features.rs` |
+| P5: auto-więzy na zaszumionym wsporniku (σ = 0,05) + 2 walce | 12 równoległości, 24 prostopadłości, 1 współosiowość, 3 równe promienie; po przyciągnięciu błąd kątowy < 1e-6° (przed: 0,084°), długościowy < 1e-9 mm | `auto_constrain_snaps_noisy_primitives` |
+| P5: podpowiedzi | oś walca R = 8: oś ±z, środek ±0,001, R = 8,0001; draft ściany po 5°: 5,000000° | `suggest_axis_from_a_scan`, `draft_block_volume_and_suggestion` |
+| P1: chmury punktów (PLY/OBJ bez ścian, XYZ) → siatka: normalne PCA + orientacja MST, ball pivoting 3 promienie (2,5·, 5·, 10· rozstaw), dziury ≤ 24 krawędzi | sfera/pudełko σ = 0,02–0,05: 0 pętli brzegowych (σ = 0,05: ≤ 4), wierzchołki ≤ 3σ od powierzchni; walec otwarty: 2 obrzeża; wspornik z 33 k punktów (σ = 0,03): 6 płaszczyzn + walec + sfera, RMS ≤ 0,1, r = 6 ± 0,05; lokalny skan 1,6 mln punktów (poza repo): import + rekonstrukcja 14 s (release, normalne wielowątkowo), 3,2 mln trójkątów, 12 pętli brzegowych, 0,7 % punktów pominiętych; cały potok `local_corpus` przechodzi (10/10 prymitywów, ICP 1e-13 mm; segmentacja 257 s → P2) | `p1_closed_shapes_from_noisy_points_are_watertight`, `p1_bracket_from_points_segments_and_fits`, `p1_open_cylinder_keeps_its_rims`, `geom::recon::tests`, `hostile_bytes_never_panic` |
 | P1: estymator szumu | bracket σ = 0,05 → 0,052 (było 0,078); skanowany box σ = 0,03 → 0,034 | `noise_estimate_is_robust_to_edges_and_density` |
 
 | P3: część A — blok 40×30 z filletami r = 5 i falistym wierzchem (skan σ = 0,03; 5 płaszczyzn + 4 walce + płat) | 1 zamknięta bryła, 10 ścian jak CAD; V 12771,75 vs CAD 12787,05 (0,12 %; CAD = kwadratura z 6e-6); max odchyłka skanu od bryły 0,177 mm (rms 0,031; 0 wierzchołków > 0,2); STEP round-trip V 1,3e-9, 10 → 10 ścian | `gate_p3_block_with_freeform_top` |
@@ -109,6 +116,7 @@ Szczegóły w planach milestone'ów.
 - **Adaptacja (dług):** `crates/io/src/iges.rs` z `iges_out` SolidCrafta — do wymiany, jeśli writer IGES trafi do solidcore (propozycja upstream wymaga zgody użytkownika: działanie poza repo).
 - Szkice w viewporcie przeliczane co klatkę (małe; do cache, gdy urosną).
 - Web: bundle nieoptymalizowany rozmiarowo (59 MB; brak `wasm-opt`), limit 5 mln trójkątów; brak MCP/kanału sterowania i asystenta bez dostawcy po stronie przeglądarki.
+- P7: instalatory, podpisy (Windows, Developer ID), wpis w `craft-launcher`, wydania czekają na zgodę ([docs/distribution.md](distribution.md)). Web: pliki czytane jednym buforem (`rfd` `read`); streaming pominięty — wymaga zmian w `io` i pętli wejścia UI.
 - Brak osobnego repo `surfacecraft-corpus`: `tangency-labs/models` nie ma jeszcze modeli (2026-11-08), więc korpus
   poziomu 1 w CI to części CAD z kernela „skanowane” w teście (`synth::scanify`); gdy pojawią się modele CC0, dołożyć je.
 - Gizmo manipulatora w viewporcie (§6.1) — w M1 ruch ręczny tylko przez `mesh.transform`.
@@ -122,8 +130,10 @@ Szczegóły w planach milestone'ów.
 - P4 (`surface.from_curves`): obsługuje regiony z dokładnie 4 rogami (inne pomijane z powodem); rogi = wierzchołki styku ≥ 3 regionów; brak ciągłości stycznych na ostrych krawędziach z założenia.
 - P4: `thicken` otwartej sieci wielołatowej nadal zależy od solidcore (offset *partial*); sieć zamknięta daje bryłę wprost (`surface.auto`/`surface.from_curves` tworzą `body`).
 - solidcore: `thicken` odmawia na wielościennym arkuszu (offset *partial*) — `surface.thicken` używa jednościennego arkusza-rodzica; bloki z przełamaniami pogrubia się osobno. Kandydat do zgłoszenia upstream (za zgodą).
-- Indeksy krawędzi/ścian w cechach (fillet, shell) są pozycyjne: po zmianie topologii wcześniejszej cechy mogą wskazać inną krawędź (brak trwałego nazewnictwa topologii).
-- Auto-constrain relacji między prymitywami (§6.2) i część operacji (trim/split, sweep, loft) nie mają komend cech.
+- Nazewnictwo topologii (P5) to sygnatury geometryczne z rekordu (`kernel::naming`), nie `provenance` solidcore (atrybuty nie przeżywają round-tripu rekordu). Ograniczenia: dwie krawędzie o tej samej pozycji, kierunku i sąsiadach są nieodróżnialne (wybierana pierwsza); odwołanie przechodzi, gdy najlepszy wynik ≤ 1,5, więc radykalna zmiana geometrii (np. krawędź zniknęła) kończy cechę błędem.
+- solidcore: unia ≥ 3 obróconych kopii (dotyczy też starego `feature.pattern` z obrotem) oraz zdekodowanie zapisanego rekordu po `shell` filletowanej bryły z kieszenią (1 z 20 kroków bramki P5) kończy się `from_record: SM_ERR_INVALID_INPUT` — bryła jest zapisana i eksportowalna wynikiem operacji, ale kernel nie odczyta jej z rekordu (np. objętość = brak). Do zgłoszenia upstream (za zgodą).
+- Cechy P5: `sweep` wymaga profilu położonego na początku ścieżki i ścieżki z linii/łuków (ścieżka ze splajnu — brak); `loft` bierze zewnętrzny profil każdego szkicu (bez krzywych prowadzących i dopasowania punktów startowych); `split` zostawia jedną stronę (drugą uzyskuje się na kopii); wzór po ścieżce dotyczy łańcucha linii i łuków (krzywa dowolna — brak); `draft` odmawia ścian, których kernel nie umie pochylić (nie-płaszczyzna/nie-stożek).
+- Auto-więzy (§6.2): relacje równoległość, prostopadłość, współosiowość, równe promienie (płaszczyzna, walec, stożek, torus, kula); brak stycznych, symetrii i odległości równych.
 - **Asystent AI bez skonfigurowanego dostawcy LLM:** działa z dowolnym programem-dostawcą, ale żadna usługa nie jest wybrana ani podpięta (decyzja użytkownika: dostawca i klucz API).
 - P3 (`kernel::hybrid`): obsługiwane cięcia to płaszczyzna, wypukły walec styczny do dwóch płaszczyzn (fillet), walec/stożek/sfera/torus
   obejmujące oś w całości, płat swobodny; pominięte (raportowane): częściowy wklęsły walec/stożek, częściowa sfera/torus, otwory
