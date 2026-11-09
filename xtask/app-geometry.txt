@@ -1,6 +1,7 @@
 # Files that compute B-rep/NURBS geometry on the application side (design doc §5).
 # Each carries an "APP-GEOMETRY:" marker naming the kernel primitive it stands in for.
 # This list only shrinks: entries are removed when solidcore gains the primitive.
-# P4 (debt, docs/STATUS.md): scattered-point Bézier patch fits with boundary/tangent constraints are not in solidcore yet.
+# P4 (debt, docs/STATUS.md; exception accepted by the owner 2026-11-09): scattered-point Bézier patch fits with
+# boundary/tangent constraints are not in solidcore yet; to be proposed upstream (with consent), then removed.
 crates/fit/src/patch.rs
 crates/fit/src/features.rs
