@@ -55,3 +55,16 @@ launcher expects (see the spike, §3.7 item 22).
 `cargo xtask web` runs `wasm-opt -Oz` on the bundle when `wasm-opt` (binaryen) is on PATH and prints
 the size before and after. Without it the bundle is left unoptimised and the build still succeeds.
 CI does not install binaryen.
+
+## Web deployment (surfacecraft.pawlus.dev)
+
+The browser app is served by the Vercel project `surfacecraft` (team of the `pawlus.dev` domain)
+at <https://surfacecraft.pawlus.dev>. The workflow `.github/workflows/deploy-web.yml` builds the
+bundle with `cargo xtask web` after `ci` passes on `main` and uploads it prebuilt
+(`vercel build` + `vercel deploy --prebuilt --prod`); it can also be started by hand
+(workflow_dispatch). Vercel never builds the repository itself: the project's Ignored Build Step is
+`exit 0`, so the Git connection cannot publish the source tree. The workflow needs the repository
+secret `VERCEL_TOKEN` (created by the owner in Vercel); without it the bundle is built and the
+deploy is skipped with a warning. A manual deploy from a workstation: `cargo xtask web`, then in
+`apps/surfacecraft-web/dist` `npx vercel link` and `npx vercel deploy --prod`, after adding a
+`.vercelignore` with `.env*` (the CLI writes a token file there).

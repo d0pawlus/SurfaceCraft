@@ -1,0 +1,70 @@
+name: deploy-web
+
+# Builds the browser bundle (`cargo xtask web`) and publishes it to surfacecraft.pawlus.dev
+# (Vercel project `surfacecraft`) after `ci` passes on main. Vercel itself never builds this
+# repository (its Ignored Build Step is `exit 0`): the bundle is built here and uploaded prebuilt.
+# Needs the repository secret VERCEL_TOKEN; without it the bundle is built and the deploy skipped.
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-web
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  deploy:
+    name: build and deploy the web app
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_ORG_ID: team_sFdj7XZXPmo0MFVBsgTpRgZA
+      VERCEL_PROJECT_ID: prj_WNN2uTzdMkcyOTtblzlYhqZtJ4vp
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # the commit ci tested, not whatever main points at now
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: web
+          cache-all-crates: true
+      - name: wasm-bindgen CLI (the version in Cargo.lock)
+        run: |
+          v=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/version = |"/, ""); print; exit }' Cargo.lock)
+          echo "wasm-bindgen $v"
+          cargo install wasm-bindgen-cli --version "$v" --locked
+      - name: binaryen (wasm-opt, optional)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binaryen || true
+      - name: Build the bundle
+        run: cargo xtask web
+      - name: Bundle size
+        run: ls -la apps/surfacecraft-web/dist
+      - name: No Vercel token
+        if: env.VERCEL_TOKEN == ''
+        run: echo "::warning::VERCEL_TOKEN is not set; the bundle was built but not deployed."
+      - name: Deploy to Vercel (prebuilt, production)
+        if: env.VERCEL_TOKEN != ''
+        working-directory: apps/surfacecraft-web/dist
+        run: |
+          npx --yes vercel@65 pull --yes --environment=production --token "$VERCEL_TOKEN"
+          npx --yes vercel@65 build --prod --token "$VERCEL_TOKEN"
+          npx --yes vercel@65 deploy --prebuilt --prod --token "$VERCEL_TOKEN"
