@@ -120,9 +120,26 @@ pub struct PlannedAdd {
     pub detail: String,
 }
 
+/// A global plane the planner tried to square to a model axis.
+#[derive(Clone, Debug)]
+pub struct SquaredPlane {
+    /// The item (base of its node).
+    pub item: usize,
+    /// Angle between the fitted and the squared normal, degrees.
+    pub angle_deg: f64,
+    /// Largest distance the squaring moves the plane over its region, mm.
+    pub max_shift: f64,
+    /// The largest shift allowed, mm.
+    pub limit: f64,
+    /// Squared (false: left as fitted because the shift exceeds the limit).
+    pub applied: bool,
+}
+
 /// The plan.
 #[derive(Clone, Debug)]
 pub struct Plan {
+    /// Planes the planner tried to square.
+    pub squared: Vec<SquaredPlane>,
     /// Cuts for the kernel's global steps.
     pub cuts: Vec<Cut>,
     /// Items per cut (merged coplanar planes share one).
@@ -926,7 +943,7 @@ impl State {
 /// Plans the build: classifies every region and forms the local tools. `scan` is the whole
 /// scanned cloud the regions come from (the "is there scan in front of it?" test).
 #[must_use]
-pub fn plan(items: &[Item], scan: &[Point3]) -> Plan {
+pub fn plan(items: &[Item], scan: &[Point3], square_deg: f64) -> Plan {
     let nodes = make_nodes(items);
     let contacts = contacts(&nodes);
     let mut st = State {
@@ -1748,22 +1765,44 @@ pub fn plan(items: &[Item], scan: &[Point3]) -> Plan {
     // --- the plan for the kernel and the report
     let mut cuts: Vec<Cut> = Vec::new();
     let mut cut_members: Vec<Vec<usize>> = Vec::new();
+    let mut squared: Vec<SquaredPlane> = Vec::new();
     let mut roles: Vec<Option<Role>> = vec![None; items.len()];
     for (ni, nd) in nodes.iter().enumerate() {
         let kind = st.kind.get(ni).copied().flatten().unwrap_or(RoleKind::Skipped);
-        let how = st.how.get(ni).cloned().unwrap_or_default();
+        let mut how = st.how.get(ni).cloned().unwrap_or_default();
         let tl = st.tools.get(ni).cloned().unwrap_or_default();
         let al = st.adds.get(ni).cloned().unwrap_or_default();
         let mut shape = st.shape.get(ni).cloned().unwrap_or_else(|| nd.shape.clone());
-        // Auto-constraint (design doc §6.2): a global plane within 0.3 degrees of a model axis is
-        // square to it, about the fit's own point. A plane that is off by fit noise would make the
-        // circle where a boss's cylinder meets it an ellipse, and the kernel's own blend would
-        // then see no circular edge.
-        if kind == RoleKind::Global
+        // Auto-constraint (design doc §6.2), switchable by `square_deg` (0 disables): a global plane
+        // within `square_deg` of a model axis is made square to it, about the fit's own point. A
+        // plane off by fit noise would make the circle where a boss's cylinder meets it an
+        // ellipse, and the kernel's blend would then see no circular edge. It is not squared when
+        // that would move it over its region by more than max(2 sigma, 0.05 mm): a real draft.
+        if square_deg > 0.0
+            && kind == RoleKind::Global
             && let Shape::Plane { point, normal } = &shape
             && let Some(n) = normalize(v3(*normal))
         {
-            shape = Shape::Plane { point: *point, normal: arr(snap_direction(n, &global_normals, 0.3)) };
+            let snapped = snap_direction(n, &global_normals, square_deg);
+            let angle = n.dot(&snapped).clamp(-1.0, 1.0).acos().to_degrees();
+            if angle > 1e-9 {
+                let p0 = v3(*point);
+                let rms = (nd.pts.iter().map(|p| (p.coords - p0).dot(&n).powi(2)).sum::<f64>()
+                    / nd.pts.len().max(1) as f64)
+                    .sqrt();
+                let limit = (2.0 * rms).max(0.05);
+                let shift = nd.pts.iter().map(|p| (p.coords - p0).dot(&(snapped - n)).abs()).fold(0.0, f64::max);
+                let applied = shift <= limit;
+                squared.push(SquaredPlane { item: nd.base, angle_deg: angle, max_shift: shift, limit, applied });
+                if applied {
+                    shape = Shape::Plane { point: *point, normal: arr(snapped) };
+                    how.push_str(&format!("; squared to a model axis ({angle:.3} deg, up to {shift:.3} mm)"));
+                } else {
+                    how.push_str(&format!(
+                        "; not squared: {angle:.3} deg would move it up to {shift:.3} mm (limit {limit:.3} mm)"
+                    ));
+                }
+            }
         }
         if matches!(kind, RoleKind::Global | RoleKind::Blend) {
             // a blend is a partial surface for the kernel whatever the region's extent round its axis
@@ -1802,7 +1841,7 @@ pub fn plan(items: &[Item], scan: &[Point3]) -> Plan {
         .collect();
     // tool members are node bases; every fragment of a merged plane shares the node's tools already
     let _ = (min_dist, pt as fn([f64; 3]) -> Point3);
-    Plan { cuts, cut_members, tools, adds, roles, contacts }
+    Plan { cuts, cut_members, tools, adds, roles, contacts, squared }
 }
 
 /// A wall's normal made exactly square to the profile's direction `d` and, within 0.3°, exactly
@@ -1895,9 +1934,27 @@ pub struct ContactOut {
     pub distance: f64,
 }
 
+/// One plane squared to a model axis (or left alone), for `body.plan_regions`.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SquaredOut {
+    /// The primitive object.
+    pub object: ObjectId,
+    /// Angle between the fitted and the squared normal, degrees.
+    pub angle_deg: f64,
+    /// Largest distance the squaring moves the plane over its region, mm.
+    pub max_shift_mm: f64,
+    /// The largest shift allowed, mm.
+    pub limit_mm: f64,
+    /// Whether the plane was squared (false: the shift exceeds the limit).
+    pub applied: bool,
+}
+
 /// The report of a plan.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct PlanOut {
+    /// Planes squared to a model axis, or left as fitted (see `applied`).
+    #[serde(default)]
+    pub squared_planes: Vec<SquaredOut>,
     /// Role of every input region.
     pub regions: Vec<PlannedRegion>,
     /// Local tools (blind holes, pockets, through slots) the regions form.
@@ -1914,6 +1971,17 @@ pub struct PlanOut {
 pub fn report(items: &[Item], plan: &Plan) -> PlanOut {
     let id = |i: usize| items.get(i).map_or(ObjectId(0), |it| it.id);
     PlanOut {
+        squared_planes: plan
+            .squared
+            .iter()
+            .map(|q| SquaredOut {
+                object: id(q.item),
+                angle_deg: q.angle_deg,
+                max_shift_mm: q.max_shift,
+                limit_mm: q.limit,
+                applied: q.applied,
+            })
+            .collect(),
         regions: items
             .iter()
             .zip(&plan.roles)
@@ -2047,5 +2115,65 @@ mod tests {
             wall([0.0, 50.0], [10.0, 50.0], [5.0, 25.0]),
         ];
         assert!(build_profile(&walls, &[], 100.0).is_err());
+    }
+
+    /// Box 100 x 40 x 10 as six plane items; the top plane is tilted by `tilt_deg` about y.
+    fn slab(tilt_deg: f64) -> (Vec<Item>, Vec<Point3>) {
+        let t = tilt_deg.to_radians();
+        let grid = |f: &dyn Fn(f64, f64) -> [f64; 3]| -> Vec<Point3> {
+            let mut v = Vec::new();
+            for i in 0..=20 {
+                for j in 0..=20 {
+                    let p = f(i as f64 / 20.0, j as f64 / 20.0);
+                    v.push(Point3::new(p[0], p[1], p[2]));
+                }
+            }
+            v
+        };
+        let top_n = [-t.sin(), 0.0, t.cos()];
+        let faces: Vec<([f64; 3], Vec<Point3>)> = vec![
+            ([0.0, 0.0, -1.0], grid(&|u, v| [100.0 * u, 40.0 * v, 0.0])),
+            // the tilted top: z = 10 + (x - 50) tan t
+            (top_n, grid(&|u, v| [100.0 * u, 40.0 * v, 10.0 + (100.0 * u - 50.0) * t.tan()])),
+            ([-1.0, 0.0, 0.0], grid(&|u, v| [0.0, 40.0 * u, (10.0 - 50.0 * t.tan()) * v])),
+            ([1.0, 0.0, 0.0], grid(&|u, v| [100.0, 40.0 * u, (10.0 + 50.0 * t.tan()) * v])),
+            ([0.0, -1.0, 0.0], grid(&|u, v| [100.0 * u, 0.0, (10.0 + (100.0 * u - 50.0) * t.tan()) * v])),
+            ([0.0, 1.0, 0.0], grid(&|u, v| [100.0 * u, 40.0, (10.0 + (100.0 * u - 50.0) * t.tan()) * v])),
+        ];
+        let scan: Vec<Point3> = faces.iter().flat_map(|f| f.1.iter().copied()).collect();
+        let items = faces
+            .into_iter()
+            .enumerate()
+            .map(|(i, (n, pts))| {
+                let c: Vec3 = pts.iter().map(|p| p.coords).sum::<Vec3>() / pts.len() as f64;
+                Item {
+                    id: ObjectId(i as u64),
+                    kind: "plane",
+                    cut: Cut { shape: Shape::Plane { point: arr(c), normal: n }, convex: true, full: false },
+                    pts,
+                }
+            })
+            .collect();
+        (items, scan)
+    }
+
+    #[test]
+    fn a_real_draft_on_a_long_face_is_not_squared() {
+        // 0.2 degrees over 50 mm to either side of the centroid: 0.17 mm, above max(2 sigma, 0.05)
+        let (items, scan) = slab(0.2);
+        let p = plan(&items, &scan, 0.3);
+        let top = p.squared.iter().find(|q| q.item == 1).expect("the top plane was considered");
+        assert!(!top.applied && top.max_shift > 0.15 && top.limit < 0.06, "{top:?}");
+        assert!(p.roles[1].how.contains("not squared"), "{}", p.roles[1].how);
+        assert!(matches!(&p.roles[1].shape, Shape::Plane { normal, .. } if normal[0].abs() > 1e-3));
+        // the report carries it
+        let r = report(&items, &p);
+        assert_eq!(r.squared_planes.iter().filter(|q| !q.applied).count(), 1);
+        // a hair of tilt is squared; zero disables
+        let (items, scan) = slab(0.005);
+        let p = plan(&items, &scan, 0.3);
+        assert!(p.squared.iter().any(|q| q.item == 1 && q.applied), "{:?}", p.squared);
+        assert!(matches!(&p.roles[1].shape, Shape::Plane { normal, .. } if normal[0] == 0.0));
+        assert!(plan(&items, &scan, 0.0).squared.is_empty());
     }
 }

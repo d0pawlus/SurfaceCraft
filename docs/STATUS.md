@@ -141,7 +141,7 @@ Szczegóły w planach milestone'ów.
   walec z płaszczyzną-czołem i płaszczyzną-podstawą) = `LocalAdd::Boss` (walec zagłębiony 0,5 mm, suma), jego płaszczyzna podstawy zostaje
   globalna (skan przed nią wyjaśnia czop); kopułka (sfera niestyczna do niczego, stojąca na płaszczyźnie globalnej) = `LocalAdd::Dome`
   (kula ∩ półprzestrzeń, suma). Kolejność: płaszczyzny → zaokrąglenia płaszczyzna–płaszczyzna → obroty globalne → odjęcia lokalne → dodania
-  lokalne → pozostałe zaokrąglenia/fazy (od największego promienia) → płaty. Globalne płaszczyzny ≤ 0,3° od osi modelu są prostowane
+  lokalne → pozostałe zaokrąglenia/fazy (od największego promienia) → płaty. Globalne płaszczyzny ≤ `square_planes_deg` (domyślnie 0,3°, 0 wyłącza) od osi modelu są prostowane, o ile przesunięcie nad regionem ≤ max(2σ, 0,05 mm) (raport `squared_planes` w `body.plan_regions`)
   (inaczej okrąg przecięcia z czopem jest elipsą i kernel nie widzi krawędzi kołowej). Pominięte (raportowane z powodem): stopnie i żebra
   (wypukły płat nad częścią ściany bez walca-czopa), wklęsła częściowa sfera (dołek), częściowy stożek/torus bez płaszczyzny i walca współosiowego.
 - **Blokery solidcore (b9c02da), do zgłoszenia upstream za zgodą:** (1) bryła ze ścianą stożkową zapisaną jako rekord `Cone`
