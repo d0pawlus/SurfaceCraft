@@ -269,6 +269,109 @@ pub(crate) fn subtract_tool(body: ops::Body, tool: &LocalTool, lo: V, hi: V) -> 
     (cut, Ok(Applied::Done(how)))
 }
 
+/// A solid to unite with the stock (plan P3b, Z3). A chamfer or round on a boss's top edge is a
+/// blend of the finished boss, not part of this tool.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LocalAdd {
+    /// A cylindrical boss standing on a plane: the cylinder of `radius` about the axis through
+    /// `base` (a point of the base plane) along unit `axis` (out of the material), `height` tall,
+    /// sunk `embed` below the base plane so that it fuses with the body.
+    Boss {
+        /// A point of the axis in the base plane.
+        base: [f64; 3],
+        /// Unit axis, pointing away from the body.
+        axis: [f64; 3],
+        /// Radius.
+        radius: f64,
+        /// Height from the base plane to the top.
+        height: f64,
+        /// How far the tool is sunk into the body.
+        embed: f64,
+    },
+    /// A dome: the part of the ball of `radius` about `center` that lies on the side of the plane
+    /// (through `plane_point`, unit `normal` pointing out of the body) the normal points to.
+    Dome {
+        /// Centre of the ball.
+        center: [f64; 3],
+        /// Radius of the ball.
+        radius: f64,
+        /// A point of the base plane.
+        plane_point: [f64; 3],
+        /// Unit normal of the base plane, out of the body.
+        normal: [f64; 3],
+    },
+}
+
+fn check_add(t: &LocalAdd) -> Result<()> {
+    let ok = match t {
+        LocalAdd::Boss { base, axis, radius, height, embed } => {
+            finite_all(base)
+                && finite_all(axis)
+                && unit(*axis).is_some()
+                && radius.is_finite()
+                && *radius > 0.0
+                && height.is_finite()
+                && *height > 0.0
+                && embed.is_finite()
+                && *embed >= 0.0
+        }
+        LocalAdd::Dome { center, radius, plane_point, normal } => {
+            finite_all(center)
+                && finite_all(plane_point)
+                && finite_all(normal)
+                && unit(*normal).is_some()
+                && radius.is_finite()
+                && *radius > 0.0
+        }
+    };
+    if ok { Ok(()) } else { Err(KernelError::Argument("local add parameters must be finite and in range".into())) }
+}
+
+/// The solid of an add, to be united with the body.
+fn add_solid(t: &LocalAdd) -> Result<ops::Body> {
+    match t {
+        LocalAdd::Boss { base, axis, radius, height, embed } => {
+            let a = unit(*axis).ok_or_else(|| KernelError::Argument("axis is zero".into()))?;
+            let b = ops::make_cylinder([0.0, 0.0, -embed], *radius, height + embed)
+                .map_err(|e| op_err("make_cylinder", e))?;
+            b.transform(&crate::to_kernel_matrix(&crate::hybrid::frame_matrix(*base, a)))
+                .map_err(|e| op_err("transform", e))?;
+            Ok(b)
+        }
+        LocalAdd::Dome { center, radius, plane_point, normal } => {
+            let n = unit(*normal).ok_or_else(|| KernelError::Argument("normal is zero".into()))?;
+            let ball = ops::make_sphere(*center, *radius).map_err(|e| op_err("make_sphere", e))?;
+            // the ball cut at the base plane (sunk a little: the part below the plane is inside the
+            // body), keeping the side the normal points to
+            let sink = 0.5_f64.min(0.25 * radius);
+            let p = sub(*plane_point, scale(n, sink));
+            crate::hybrid::keep_front(&ball, p, n, 4.0 * radius + 1.0)
+        }
+    }
+}
+
+/// Unites `add` with `body`. On failure the body is left as it was.
+pub(crate) fn unite_add(body: ops::Body, add: &LocalAdd) -> (ops::Body, Result<Applied>) {
+    let attempt = |body: &ops::Body| -> Result<ops::Body> {
+        check_add(add)?;
+        let t = add_solid(add)?;
+        let copy = body.copy().map_err(|e| op_err("copy", e))?;
+        ops::boolean::boolean(copy, t, ops::BooleanOp::Union)
+            .map_err(|e| op_err("boolean", format!("{e} (unite {add:?})")))?
+            .ok_or_else(|| KernelError::Op { op: "boolean", message: "the union is empty".into() })
+    };
+    match attempt(&body) {
+        Ok(b) => {
+            let how = match add {
+                LocalAdd::Boss { .. } => "unite (boss)",
+                LocalAdd::Dome { .. } => "unite (dome)",
+            };
+            (b, Ok(Applied::Done(how)))
+        }
+        Err(e) => (body, Err(e)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

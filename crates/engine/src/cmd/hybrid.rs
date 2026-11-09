@@ -17,7 +17,7 @@ use surfacecraft_fit::resample::HeightField;
 use surfacecraft_fit::segment::region_points;
 use surfacecraft_geom::{Point3, Vec3, normalize};
 use surfacecraft_kernel::hybrid::{self, Cut, CutStatus, FreeCut, Shape};
-use surfacecraft_kernel::local::LocalTool;
+use surfacecraft_kernel::local::{LocalAdd, LocalTool};
 use surfacecraft_kernel::nurbs::fit_grid;
 use surfacecraft_kernel::record::brep::Surface;
 
@@ -280,6 +280,10 @@ pub struct FromRegionsIn {
     /// Name of the solid.
     #[serde(default)]
     pub name: Option<String>,
+    /// Global planes within this many degrees of a model axis are squared to it unless that
+    /// moves them over their region by more than max(2 sigma, 0.05 mm) (default 0.3, 0 disables).
+    #[serde(default)]
+    pub square_planes_deg: Option<f64>,
 }
 
 /// Which face of the solid an input became.
@@ -417,7 +421,8 @@ fn from_regions(s: &mut Session, i: FromRegionsIn) -> CmdResult<FromRegionsOut> 
     }
     // which regions are global cuts of the stock and which form local tools (blind holes,
     // pockets, slots)
-    let plan = plan::plan(&items, &scan);
+    let square = square_deg(i.square_planes_deg)?;
+    let plan = plan::plan(&items, &scan, square);
     let mut cuts = plan.cuts.clone();
     snap_axes(&mut cuts);
     let tools: Vec<LocalTool> = plan.tools.iter().map(|t| t.tool.clone()).collect();
@@ -426,7 +431,8 @@ fn from_regions(s: &mut Session, i: FromRegionsIn) -> CmdResult<FromRegionsOut> 
             "no region is a global cut of the stock (see body.plan_regions for the role of each)".into(),
         ));
     }
-    let built = hybrid::solid_from_cuts_and_tools(arr(slo), arr(shi), &cuts, &free, &tools)?;
+    let adds: Vec<LocalAdd> = plan.adds.iter().map(|t| t.add.clone()).collect();
+    let built = hybrid::solid_from_plan(arr(slo), arr(shi), &cuts, &free, &tools, &adds)?;
     let mut faces_of = skipped_early;
     let tol = 0.02 * diag.max(1.0) / 10.0 + 1e-3;
     let mut skipped = faces_of.len();
@@ -451,7 +457,15 @@ fn from_regions(s: &mut Session, i: FromRegionsIn) -> CmdResult<FromRegionsOut> 
                     None => (sts.first().map_or(String::new(), |st| describe(st).0), true, role.shape.clone()),
                 }
             }
-            RoleKind::LocalAdd | RoleKind::Skipped => (format!("skipped: {}", role.how), false, role.shape.clone()),
+            RoleKind::LocalAdd => {
+                let sts: Vec<&CutStatus> = role.adds.iter().filter_map(|&t| built.adds.get(t)).collect();
+                match sts.iter().find(|st| matches!(st, CutStatus::Skipped(_))) {
+                    Some(bad) => (describe(bad).0, false, role.shape.clone()),
+                    None if sts.is_empty() => ("skipped: no addition".to_string(), false, role.shape.clone()),
+                    None => (sts.first().map_or(String::new(), |st| describe(st).0), true, role.shape.clone()),
+                }
+            }
+            RoleKind::Skipped => (format!("skipped: {}", role.how), false, role.shape.clone()),
         };
         let faces = if applied { hybrid::faces_on_shape(&built.brep, &shape, tol) } else { Vec::new() };
         skipped += usize::from(!applied);
@@ -473,6 +487,18 @@ fn from_regions(s: &mut Session, i: FromRegionsIn) -> CmdResult<FromRegionsOut> 
 pub struct PlanRegionsIn {
     /// Fitted primitives (each needs its source region), the same list `body.from_regions` takes.
     pub primitives: Vec<ObjRef>,
+    /// As in `body.from_regions` (default 0.3, 0 disables squaring of global planes).
+    #[serde(default)]
+    pub square_planes_deg: Option<f64>,
+}
+
+fn square_deg(v: Option<f64>) -> CmdResult<f64> {
+    let d = v.unwrap_or(0.3);
+    if d.is_finite() && (0.0..=5.0).contains(&d) {
+        Ok(d)
+    } else {
+        Err(CmdError::Params("square_planes_deg must be between 0 and 5".into()))
+    }
 }
 
 fn plan_regions(s: &mut Session, i: PlanRegionsIn) -> CmdResult<PlanOut> {
@@ -483,7 +509,7 @@ fn plan_regions(s: &mut Session, i: PlanRegionsIn) -> CmdResult<PlanOut> {
         return Err(CmdError::Params("at most 256 inputs".into()));
     }
     let (items, _, scan) = collect_items(s, &i.primitives, &mut HashMap::new(), |_| {})?;
-    let p = plan::plan(&items, &scan);
+    let p = plan::plan(&items, &scan, square_deg(i.square_planes_deg)?);
     Ok(plan::report(&items, &p))
 }
 

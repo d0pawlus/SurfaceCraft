@@ -96,6 +96,8 @@ pub struct Built {
     pub freeform: Vec<CutStatus>,
     /// Per local tool (blind hole, pocket, slot): applied?
     pub tools: Vec<CutStatus>,
+    /// Per local addition (boss, dome): applied?
+    pub adds: Vec<CutStatus>,
 }
 
 /// The outcome of one cut.
@@ -138,7 +140,7 @@ pub(crate) fn perpendicular(a: V) -> V {
 }
 
 /// Column-vector rigid matrix taking local (x, y, z) to the frame at `origin` with z along `axis`.
-fn frame_matrix(origin: V, axis: V) -> [[f64; 4]; 4] {
+pub(crate) fn frame_matrix(origin: V, axis: V) -> [[f64; 4]; 4] {
     let x = perpendicular(axis);
     let y = cross(axis, x);
     [
@@ -257,29 +259,16 @@ fn check_shape(s: &Shape) -> Result<()> {
     if ok { Ok(()) } else { Err(KernelError::Argument("shape parameters must be finite and in range".into())) }
 }
 
-/// The record edge of `brep` whose both end vertices lie on both planes (a sharp edge of two
-/// plane faces), if exactly one does.
-fn edge_between(brep: &Brep, a: (V, V), b: (V, V), tol: f64) -> Option<usize> {
-    let on = |p: V, pl: (V, V)| dot(sub(p, pl.0), pl.1).abs() < tol;
-    let mut found = None;
-    for (i, e) in brep.edges.iter().enumerate() {
-        let ends =
-            e.vertices.iter().filter_map(|&v| brep.vertices.get(v as usize)).map(|v| v.point).collect::<Vec<_>>();
-        if ends.len() == 2 && ends.iter().all(|&p| on(p, a) && on(p, b)) {
-            if found.is_some() {
-                return None;
-            }
-            found = Some(i);
-        }
-    }
-    found
+/// The ball cut at a plane: the part of `body` in front of the plane (the side `normal` points to).
+pub(crate) fn keep_front(body: &ops::Body, point: V, normal: V, half: f64) -> Result<ops::Body> {
+    half_space(body, point, scale(normal, -1.0), half)
 }
 
 /// Builds the solid. `lo`/`hi` bound the stock (it must contain the part, with room to spare);
 /// planes and full-revolution shapes are applied in that order, then fillets, then freeform
 /// cuts. Cuts the kernel cannot honour are reported as skipped; the solid is verified closed.
 pub fn solid_from_cuts(lo: V, hi: V, cuts: &[Cut], free: &[FreeCut]) -> Result<Built> {
-    solid_from_cuts_and_tools(lo, hi, cuts, free, &[])
+    solid_from_plan(lo, hi, cuts, free, &[], &[])
 }
 
 /// [`solid_from_cuts`] plus local tools (plan P3b, Z2): after the global cuts, each tool of
@@ -291,6 +280,23 @@ pub fn solid_from_cuts_and_tools(
     free: &[FreeCut],
     tools: &[crate::local::LocalTool],
 ) -> Result<Built> {
+    solid_from_plan(lo, hi, cuts, free, tools, &[])
+}
+
+/// The whole hybrid build (plan P3b, Z1 to Z3), in the order of the plan: the global cuts (planes,
+/// full revolutions), the local subtractions (`tools`), the local additions (`adds`: bosses and
+/// domes), then the blends of the partial cylinders, cones, tori and spheres among `cuts`
+/// (fillets of one radius in one kernel call, largest first, so that the kernel makes the corner
+/// patch where three meet; a plane-to-plane fillet is made before the revolutions, the rest after
+/// the additions), and last the freeform cuts.
+pub fn solid_from_plan(
+    lo: V,
+    hi: V,
+    cuts: &[Cut],
+    free: &[FreeCut],
+    tools: &[crate::local::LocalTool],
+    adds: &[crate::local::LocalAdd],
+) -> Result<Built> {
     if !finite_all(&lo) || !finite_all(&hi) || (0..3).any(|i| hi[i] <= lo[i]) {
         return Err(KernelError::Argument("stock bounds must be finite with hi > lo".into()));
     }
@@ -300,7 +306,7 @@ pub fn solid_from_cuts_and_tools(
     if cuts.is_empty() && free.is_empty() {
         return Err(KernelError::Argument("nothing to build from".into()));
     }
-    if tools.len() > 256 {
+    if tools.len() > 256 || adds.len() > 256 {
         return Err(KernelError::Argument("at most 256 local tools".into()));
     }
     let half = 4.0 * norm(sub(hi, lo)).max(1.0);
@@ -308,77 +314,32 @@ pub fn solid_from_cuts_and_tools(
     let mut body = stock;
     let mut status: Vec<CutStatus> = vec![CutStatus::Skipped("not applied".into()); cuts.len()];
     // 1. planes
-    let mut planes: Vec<(usize, V, V)> = Vec::new();
     for (i, c) in cuts.iter().enumerate() {
         if let Shape::Plane { point, normal } = &c.shape {
             let n = unit(*normal).ok_or_else(|| KernelError::Argument("plane normal is zero".into()))?;
             body = half_space(&body, *point, n, half)?;
-            planes.push((i, *point, n));
             if let Some(s) = status.get_mut(i) {
                 *s = CutStatus::Applied("halfspace");
             }
         }
     }
-    // 2. fillets: a partial convex cylinder tangent to two of the planes
-    for (i, c) in cuts.iter().enumerate() {
-        let Shape::Cylinder { point, axis, radius } = &c.shape else { continue };
-        if !c.convex || c.full {
-            continue;
-        }
-        let a = unit(*axis).ok_or_else(|| KernelError::Argument("axis is zero".into()))?;
-        let tol = 0.05 * radius + 0.05;
-        // planes parallel to the axis whose distance from it is the radius
-        let tangent: Vec<(V, V)> = planes
-            .iter()
-            .filter(|(_, p, n)| dot(*n, a).abs() < 0.05 && (dot(sub(*point, *p), *n).abs() - radius).abs() < tol)
-            .map(|(_, p, n)| (*p, *n))
-            .collect();
-        let mut done = false;
-        'pairs: for x in 0..tangent.len() {
-            for y in (x + 1)..tangent.len() {
-                let (p1, p2) = (tangent[x], tangent[y]);
-                // the centre lies behind both planes at distance r, and the pair is not parallel
-                if dot(p1.1, p2.1).abs() > 0.95 {
-                    continue;
-                }
-                // the cylinder's axis must be the offset intersection: check against both planes
-                let inside = |p: (V, V)| dot(sub(*point, p.0), p.1) < 0.0;
-                if !inside(p1) || !inside(p2) {
-                    continue;
-                }
-                let rec = encode(&body)?;
-                if let Some(e) = edge_between(&rec, p1, p2, 1e-4 * (1.0 + norm(sub(hi, lo)))) {
-                    body = decode(&solid::fillet(&rec, &[e], *radius)?)?;
-                    done = true;
-                    break 'pairs;
-                }
-            }
-        }
-        if let Some(s) = status.get_mut(i) {
-            *s = if done {
-                CutStatus::Applied("fillet")
-            } else {
-                CutStatus::Skipped("no edge of two planes tangent to this cylinder was found".into())
-            };
-        }
-    }
+    // 2. fillets of the edges the planes make (rounds that need a boss or a pocket wait)
+    body = crate::blends::blend_pass(body, cuts, &mut status, false)?;
     // 3. full-revolution shapes
     for (i, c) in cuts.iter().enumerate() {
-        let revolve = match &c.shape {
+        match &c.shape {
             Shape::Plane { .. } => continue,
-            Shape::Cylinder { .. } | Shape::Cone { .. } if !c.full => {
-                if c.convex {
-                    continue; // handled as a fillet above
-                }
-                if let Some(s) = status.get_mut(i) {
-                    *s = CutStatus::Skipped("a partial concave cylinder or cone is not supported yet".into());
+            // a partial cylinder, cone, torus or sphere is a blend (below)
+            Shape::Cylinder { .. } | Shape::Cone { .. } | Shape::Torus { .. } | Shape::Sphere { .. } if !c.full => {
+                if matches!(c.shape, Shape::Cone { .. })
+                    && !c.convex
+                    && let Some(s) = status.get_mut(i)
+                {
+                    *s = CutStatus::Skipped("a partial concave cone is not supported yet".into());
                 }
                 continue;
             }
-            _ => true,
-        };
-        if !revolve {
-            continue;
+            _ => {}
         }
         let tool = shape_solid(&c.shape, lo, hi)?;
         let (op, how) =
@@ -401,6 +362,19 @@ pub fn solid_from_cuts_and_tools(
             Err(e) => CutStatus::Skipped(e.to_string()),
         });
     }
+    // 3c. local additions: bosses and domes
+    let mut astatus = Vec::with_capacity(adds.len());
+    for t in adds {
+        let (b, r) = crate::local::unite_add(body, t);
+        body = b;
+        astatus.push(match r {
+            Ok(crate::local::Applied::Done(how)) => CutStatus::Applied(how),
+            Ok(crate::local::Applied::Partly(why)) => CutStatus::Skipped(why),
+            Err(e) => CutStatus::Skipped(e.to_string()),
+        });
+    }
+    // 3d. the remaining blends: rounds and chamfers of the edges the pockets and bosses made
+    body = crate::blends::blend_pass(body, cuts, &mut status, true)?;
     // 4. freeform tools
     let mut fstatus = Vec::with_capacity(free.len());
     for f in free {
@@ -420,7 +394,7 @@ pub fn solid_from_cuts_and_tools(
             message: format!("the result has {n} solids, expected 1"),
         });
     }
-    Ok(Built { brep: encode(&body)?, primitives: status, freeform: fstatus, tools: tstatus })
+    Ok(Built { brep: encode(&body)?, primitives: status, freeform: fstatus, tools: tstatus, adds: astatus })
 }
 
 /// The normal of a spline at the middle of its domain, as finite differences of the surface.
@@ -645,7 +619,7 @@ pub fn extract_face(body: &Brep, face: usize) -> Result<Brep> {
     encode(&b)
 }
 
-fn face_vertices(body: &Brep, face: usize) -> Vec<V> {
+pub(crate) fn face_vertices(body: &Brep, face: usize) -> Vec<V> {
     let mut out = Vec::new();
     if let Some(f) = body.faces.get(face) {
         for l in &f.loops {
@@ -665,11 +639,11 @@ fn face_vertices(body: &Brep, face: usize) -> Vec<V> {
     out
 }
 
-fn frame_axis(f: &Frame) -> V {
+pub(crate) fn frame_axis(f: &Frame) -> V {
     cross(f.x_axis, f.y_axis)
 }
 
-fn axis_distance(p: V, point: V, axis: V) -> f64 {
+pub(crate) fn axis_distance(p: V, point: V, axis: V) -> f64 {
     let d = sub(p, point);
     norm(sub(d, scale(axis, dot(d, axis))))
 }
@@ -705,6 +679,10 @@ pub fn faces_on_shape(body: &Brep, shape: &Shape, tol: f64) -> Vec<usize> {
             (Surface::Sphere { frame, radius }, Shape::Sphere { center, radius: r }) => {
                 (radius - r).abs() < tol && norm(sub(frame.origin, *center)) < tol
             }
+            // the corner of three equal rounds
+            (Surface::BallPatch { center: c, radius }, Shape::Sphere { center, radius: r }) => {
+                (radius - r).abs() < tol && norm(sub(*c, *center)) < tol
+            }
             (
                 Surface::Torus { frame, major_radius, minor_radius, .. },
                 Shape::Torus { center, axis, major_radius: mr, minor_radius: nr },
@@ -716,9 +694,10 @@ pub fn faces_on_shape(body: &Brep, shape: &Shape, tol: f64) -> Vec<usize> {
             }
             // a sweep of an arc (a pocket's rounded corner) or a revolve (a hole's wall, a drill
             // point) comes back as a rational spline: it is on the shape when its corners are
-            (Surface::Spline { .. } | Surface::RationalSpline { .. }, Shape::Cylinder { .. } | Shape::Cone { .. }) => {
-                spline_face_on_revolved(body, i, shape, tol)
-            }
+            (
+                Surface::Spline { .. } | Surface::RationalSpline { .. },
+                Shape::Cylinder { .. } | Shape::Cone { .. } | Shape::Torus { .. },
+            ) => spline_face_on_revolved(body, i, shape, tol),
             _ => false,
         };
         if hit {
@@ -744,6 +723,11 @@ fn spline_face_on_revolved(body: &Brep, face: usize, shape: &Shape, tol: f64) ->
             let t = dot(d, a);
             let rho = axis_distance(p, *apex, a);
             (rho * half_angle.cos() - t * half_angle.sin()).abs() < tol
+        }),
+        Shape::Torus { center, axis, major_radius, minor_radius } => unit(*axis).is_some_and(|a| {
+            let rho = axis_distance(p, *center, a);
+            let t = dot(sub(p, *center), a);
+            ((rho - major_radius).hypot(t) - minor_radius).abs() < tol
         }),
         _ => false,
     })
@@ -884,6 +868,178 @@ mod tests {
         assert!((v - exact).abs() < 1e-3 * exact, "volume {v} vs {exact}");
     }
 
+    fn box_planes(size: V) -> Vec<Cut> {
+        let mut cuts = Vec::new();
+        for (p, n) in [
+            ([0.0; 3], [-1.0, 0.0, 0.0]),
+            ([size[0], 0.0, 0.0], [1.0, 0.0, 0.0]),
+            ([0.0; 3], [0.0, -1.0, 0.0]),
+            ([0.0, size[1], 0.0], [0.0, 1.0, 0.0]),
+            ([0.0; 3], [0.0, 0.0, -1.0]),
+            ([0.0, 0.0, size[2]], [0.0, 0.0, 1.0]),
+        ] {
+            cuts.push(Cut { shape: Shape::Plane { point: p, normal: n }, convex: true, full: false });
+        }
+        cuts
+    }
+
+    fn circle_edges_at(b: &Brep, z: f64, radius: f64) -> Vec<usize> {
+        use crate::record::brep::Curve;
+        b.edges
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| match &e.curve {
+                Curve::Circle { radius: r, .. } => {
+                    (r - radius).abs() < 1e-6 && (b.vertices[e.vertices[0] as usize].point[2] - z).abs() < 1e-6
+                }
+                _ => false,
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    #[test]
+    fn equal_rounds_meet_in_a_corner_patch_and_a_boss_gets_foot_and_chamfer() {
+        use crate::local::LocalAdd;
+        let size = [60.0, 40.0, 8.0];
+        let r = 5.0;
+        let mut cuts = box_planes(size);
+        let zc = size[2] - r;
+        for c in [[r, r], [size[0] - r, r], [r, size[1] - r], [size[0] - r, size[1] - r]] {
+            cuts.push(Cut {
+                shape: Shape::Cylinder { point: [c[0], c[1], 0.0], axis: [0.0, 0.0, 1.0], radius: r },
+                convex: true,
+                full: false,
+            });
+            cuts.push(Cut { shape: Shape::Sphere { center: [c[0], c[1], zc], radius: r }, convex: true, full: false });
+        }
+        for y in [r, size[1] - r] {
+            cuts.push(Cut {
+                shape: Shape::Cylinder { point: [0.0, y, zc], axis: [1.0, 0.0, 0.0], radius: r },
+                convex: true,
+                full: false,
+            });
+        }
+        for x in [r, size[0] - r] {
+            cuts.push(Cut {
+                shape: Shape::Cylinder { point: [x, 0.0, zc], axis: [0.0, 1.0, 0.0], radius: r },
+                convex: true,
+                full: false,
+            });
+        }
+        // the CAD truth: one blend call on the eight edges
+        let cad = {
+            let b = solid::make_box([0.0; 3], size).unwrap();
+            let edges: Vec<usize> = (0..b.edges.len())
+                .filter(|&i| {
+                    let e = &b.edges[i];
+                    let (p, q) = (b.vertices[e.vertices[0] as usize].point, b.vertices[e.vertices[1] as usize].point);
+                    (p[2] - q[2]).abs() > 1.0 || ((p[2] - size[2]).abs() < 1e-9 && (q[2] - size[2]).abs() < 1e-9)
+                })
+                .collect();
+            solid::fillet(&b, &edges, r).unwrap()
+        };
+        let built = solid_from_cuts([-5.0, -5.0, -5.0], [65.0, 45.0, 14.0], &cuts, &[]).unwrap();
+        for s in &built.primitives {
+            assert!(matches!(s, CutStatus::Applied(_)), "{s:?} in {:?}", built.primitives);
+        }
+        assert_eq!(built.brep.faces.len(), cad.faces.len());
+        let (v, vc) = (solid::volume(&built.brep).unwrap(), solid::volume(&cad).unwrap());
+        assert!((v - vc).abs() < 1e-6 * vc, "rounded plate volume {v} vs {vc}");
+        for c in &cuts {
+            if matches!(c.shape, Shape::Sphere { .. }) {
+                assert_eq!(faces_on_shape(&built.brep, &c.shape, 1e-3).len(), 1, "corner patch {:?}", c.shape);
+            }
+        }
+
+        // the boss: plate (sharp), a boss Ø16 up to z = 20, foot fillet r = 2, top chamfer 1.5
+        let mut cuts = box_planes(size);
+        cuts.push(Cut {
+            shape: Shape::Torus {
+                center: [30.0, 20.0, 10.0],
+                axis: [0.0, 0.0, 1.0],
+                major_radius: 10.0,
+                minor_radius: 2.0,
+            },
+            convex: false,
+            full: false,
+        });
+        // the chamfer's cone: radius 6.5 at z = 20 widening downwards, 45 degrees: apex at z = 26.5
+        cuts.push(Cut {
+            shape: Shape::Cone {
+                apex: [30.0, 20.0, 26.5],
+                axis: [0.0, 0.0, -1.0],
+                half_angle: std::f64::consts::FRAC_PI_4,
+            },
+            convex: true,
+            full: false,
+        });
+        let boss =
+            LocalAdd::Boss { base: [30.0, 20.0, 8.0], axis: [0.0, 0.0, 1.0], radius: 8.0, height: 12.0, embed: 0.5 };
+        let cad = {
+            let b = solid::make_box([0.0; 3], size).unwrap();
+            let cyl = solid::make_cylinder([30.0, 20.0, 7.0], 8.0, 13.0).unwrap();
+            let u = crate::feature::boolean(&b, &cyl, crate::feature::BoolKind::Union).unwrap();
+            let u = solid::fillet(&u, &circle_edges_at(&u, 8.0, 8.0), 2.0).unwrap();
+            solid::chamfer(&u, &circle_edges_at(&u, 20.0, 8.0), 1.5).unwrap()
+        };
+        let built = solid_from_plan([-5.0, -5.0, -5.0], [65.0, 45.0, 30.0], &cuts, &[], &[], &[boss]).unwrap();
+        assert!(matches!(built.adds[0], CutStatus::Applied(_)), "{:?}", built.adds);
+        for s in &built.primitives {
+            assert!(matches!(s, CutStatus::Applied(_)), "{s:?} in {:?}", built.primitives);
+        }
+        assert_eq!(built.brep.faces.len(), cad.faces.len(), "faces");
+        let (v, vc) = (solid::volume(&built.brep).unwrap(), solid::volume(&cad).unwrap());
+        assert!((v - vc).abs() < 1e-6 * vc, "boss volume {v} vs {vc}");
+    }
+
+    #[test]
+    fn concave_cylinder_fillets_a_pocket_corner_and_a_dome_stands_on_a_plane() {
+        use crate::feature::ProfileCurve;
+        use crate::local::{LocalAdd, LocalTool};
+        let size = [60.0, 50.0, 20.0];
+        let line = |a: [f64; 2], b: [f64; 2]| ProfileCurve::Line { start: [a[0], a[1], 12.0], end: [b[0], b[1], 12.0] };
+        // a sharp 30 x 20 pocket, floor at z = 12
+        let pocket = LocalTool::Prism {
+            profile: vec![
+                line([8.0, 8.0], [38.0, 8.0]),
+                line([38.0, 8.0], [38.0, 28.0]),
+                line([38.0, 28.0], [8.0, 28.0]),
+                line([8.0, 28.0], [8.0, 8.0]),
+            ],
+            direction: [0.0, 0.0, 1.0],
+            through: false,
+            floor_fillet: None,
+        };
+        let mut cuts = box_planes(size);
+        // a concave round r = 3 in the pocket's corner at (8, 8), tangent to both walls
+        cuts.push(Cut {
+            shape: Shape::Cylinder { point: [11.0, 11.0, 0.0], axis: [0.0, 0.0, 1.0], radius: 3.0 },
+            convex: false,
+            full: false,
+        });
+        let dome = LocalAdd::Dome {
+            center: [48.0, 38.0, 17.0],
+            radius: 6.0,
+            plane_point: [0.0, 0.0, 20.0],
+            normal: [0.0, 0.0, 1.0],
+        };
+        let built =
+            solid_from_plan([-5.0, -5.0, -5.0], [65.0, 55.0, 40.0], &cuts, &[], std::slice::from_ref(&pocket), &[dome])
+                .unwrap();
+        assert!(matches!(built.primitives.last(), Some(CutStatus::Applied("fillet"))), "{:?}", built.primitives);
+        assert!(matches!(built.adds[0], CutStatus::Applied(_)), "{:?}", built.adds);
+        let sharp =
+            solid_from_plan([-5.0, -5.0, -5.0], [65.0, 55.0, 40.0], &box_planes(size), &[], &[pocket], &[]).unwrap();
+        let pi = std::f64::consts::PI;
+        let (vs, vb) = (solid::volume(&sharp.brep).unwrap(), solid::volume(&built.brep).unwrap());
+        // the fillet adds (1 - pi/4) r^2 over the pocket's 8 mm depth; the dome is the cap of the
+        // ball above z = 20: height 3, volume pi h^2 (3 R - h) / 3
+        let fillet = (1.0 - pi / 4.0) * 9.0 * 8.0;
+        let cap = pi * 9.0 * (18.0 - 3.0) / 3.0;
+        assert!((vb - vs - fillet - cap).abs() < 1e-3, "fillet + dome: {} vs {}", vb - vs, fillet + cap);
+        assert_eq!(built.brep.faces.len(), sharp.brep.faces.len() + 2, "a round and a dome");
+    }
     #[test]
     fn bad_input_is_refused() {
         assert!(solid_from_cuts([0.0; 3], [1.0; 3], &[], &[]).is_err());

@@ -80,6 +80,7 @@ cargo run -p surfacecraft
 | P3b Z2: płyta 50×40×10 z oknem przelotowym (r = 3) i rowkiem otwartym do krawędzi (półokrągły koniec r = 4) | 18 ścian jak CAD; V 17359,33 vs CAD 17345,93 (0,077 %); max odchyłka 0,138 mm; STEP round-trip V 4e-16 | `p3b_plate_with_window_and_open_slot` |
 
 | P3b/Z4: `replace_face` w górę i w dół (płat falisty przecina płaską ścianę, wzniesienie 2,5 mm) | 1 zamknięta bryła, 6 ścian; V 13018,6646 vs kwadratura 13018,6605 (4e-6 %); STEP round-trip V < 1e-6; kolizja odrzucona z komunikatem | `gate_p3b_replace_face_up_and_down` |
+| P3b/Z3: płyta 60×40×8 z zaokrągleniami r = 5 (krawędzie pionowe + górne, narożniki = łaty sferyczne) i czopem Ø16 do z = 20 z wklęsłym fillet r = 2 u podstawy (torus) i fazą 1,5 mm na czole (stożek); skan σ = 0,03, regiony przez selekcję geometryczną (jak w P3 część B) | 1 zamknięta bryła, 22 ściany jak CAD, 0 pominięć; V 20385,64 vs CAD 20444,29 (0,29 %); max odchyłka skanu od bryły 0,152 mm; STEP round-trip V < 1e-6, 22 → 22 ściany | `gate_p3b_plate_with_boss` |
 
 ## Decyzje buildera (z uzasadnieniem)
 
@@ -121,8 +122,7 @@ Szczegóły w planach milestone'ów.
 - Auto-constrain relacji między prymitywami (§6.2) i część operacji (trim/split, sweep, loft) nie mają komend cech.
 - **Asystent AI bez skonfigurowanego dostawcy LLM:** działa z dowolnym programem-dostawcą, ale żadna usługa nie jest wybrana ani podpięta (decyzja użytkownika: dostawca i klucz API).
 - P3 (`kernel::hybrid`): obsługiwane cięcia to płaszczyzna, wypukły walec styczny do dwóch płaszczyzn (fillet), walec/stożek/sfera/torus
-  obejmujące oś w całości, płat swobodny; pominięte (raportowane): częściowy wypukły stożek, częściowa sfera/torus, bossy i stopnie
-  (wypukły walec, którego na zewnątrz leży skan); `replace_face` (P3b/Z4) dodaje i odcina materiał (ściana wyciągnięta o wzniesienie płata, suma, cięcie;
+  obejmujące oś w całości, płat swobodny; `replace_face` (P3b/Z4) dodaje i odcina materiał (ściana wyciągnięta o wzniesienie płata, suma, cięcie;
   odmawia, gdy wyciągnięcie koliduje z bryłą; obrys tylko z odcinków i łuków, ściana bez otworów).
 - P3b (Z1+Z2, `engine::cmd::plan`, `kernel::local`): planer rozróżnia cięcia globalne (przed płaszczyzną < 0,5 % skanu) i lokalne;
   lokalne tworzą narzędzia odejmowane — otwór nieprzelotowy (walec + dno płaskie lub stożek wiertła, obrót profilu), kieszeń
@@ -134,6 +134,16 @@ Szczegóły w planach milestone'ów.
   modelu (≤ 0,5°) — narzędzie o kierunku dokładnie równym normalnej dopasowanej płaszczyzny bryły wywala boolean w solidcore
   (`from_record` odrzuca wynik, status SM_ERR_INVALID_INPUT) — do reprodukcji w Z5. Kolejne regiony płaszczyzny podzielonej przez
   segmentację są scalane po równości płaszczyzny (≤ 0,25 mm, normalne ≤ 3,6°) w planerze.
+- P3b Z3 (`kernel::blends`, `kernel::local::LocalAdd`): częściowe kształty to zaokrąglenia, fazy i bryły lokalne. Krawędź zaokrąglana jest
+  znajdowana w topologii bryły (dwie ściany płaskie równoległe do osi walca, wypukła lub wklęsła; krawędź kołowa między płaszczyzną i
+  współosiowym walcem dla torusa i stożka), zaokrąglenia jednego promienia idą **jednym wywołaniem** `blend` (kernel robi łatę narożną =
+  `BallPatch`, sfera dostaje status „corner patch”), faza stożka przez `chamfer_sides` (odległości z kąta połówkowego). Czop (wypukły pełny
+  walec z płaszczyzną-czołem i płaszczyzną-podstawą) = `LocalAdd::Boss` (walec zagłębiony 0,5 mm, suma), jego płaszczyzna podstawy zostaje
+  globalna (skan przed nią wyjaśnia czop); kopułka (sfera niestyczna do niczego, stojąca na płaszczyźnie globalnej) = `LocalAdd::Dome`
+  (kula ∩ półprzestrzeń, suma). Kolejność: płaszczyzny → zaokrąglenia płaszczyzna–płaszczyzna → obroty globalne → odjęcia lokalne → dodania
+  lokalne → pozostałe zaokrąglenia/fazy (od największego promienia) → płaty. Globalne płaszczyzny ≤ `square_planes_deg` (domyślnie 0,3°, 0 wyłącza) od osi modelu są prostowane, o ile przesunięcie nad regionem ≤ max(2σ, 0,05 mm) (raport `squared_planes` w `body.plan_regions`)
+  (inaczej okrąg przecięcia z czopem jest elipsą i kernel nie widzi krawędzi kołowej). Pominięte (raportowane z powodem): stopnie i żebra
+  (wypukły płat nad częścią ściany bez walca-czopa), wklęsła częściowa sfera (dołek), częściowy stożek/torus bez płaszczyzny i walca współosiowego.
 - **Blokery solidcore (b9c02da), do zgłoszenia upstream za zgodą:** (1) bryła ze ścianą stożkową zapisaną jako rekord `Cone`
   z ujemnym półkątem (zwężający się wzdłuż z; np. `make_cone([0;3], 5, 1, 10)`) po `step_export` + `step_brep::import` rozpada się na
   osobne „bryły” po jednej ścianie (dodatni półkąt i stożek ostry 5→0 działają) — obejście: narzędzie stożkowe budowane
