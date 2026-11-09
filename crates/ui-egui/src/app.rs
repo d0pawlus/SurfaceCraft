@@ -29,6 +29,10 @@ pub struct SurfaceCraftApp {
     pub palette_filter: String,
     /// The sketch editing mode (G5).
     pub sketch_editor: crate::sketch_editor::SketchEditor,
+    /// The Properties panel's form and live preview.
+    pub cmd_panel: crate::command_panel::CommandPanel,
+    /// The feature history's editor.
+    pub hist_panel: crate::history_panel::HistoryPanel,
     /// Last status line.
     pub status: String,
     /// Points picked in the viewport (click: replace, Shift+click: add).
@@ -44,8 +48,10 @@ pub struct SurfaceCraftApp {
     /// Whether a wgpu render state exists (false in headless tests).
     gpu: bool,
     pub(crate) fit_pending: bool,
-    bvh_cache: HashMap<usize, Bvh>,
-    highlights: HashMap<ObjectId, Arc<Vec<u32>>>,
+    pub(crate) bvh_cache: HashMap<usize, Bvh>,
+    pub(crate) highlights: HashMap<ObjectId, Arc<Vec<u32>>>,
+    /// The viewport tools: selection, face/edge picking, gizmo, section plane, view animation.
+    pub tools: crate::viewtools::ViewTools,
     /// The assistant's goal text.
     pub assistant_goal: String,
     /// Align (true) or workflow mode.
@@ -101,6 +107,8 @@ impl SurfaceCraftApp {
             palette_params: "{}".into(),
             palette_filter: String::new(),
             sketch_editor: crate::sketch_editor::SketchEditor::default(),
+            cmd_panel: Default::default(),
+            hist_panel: Default::default(),
             status: t("status.ready").to_string(),
             picks: Vec::new(),
             tokens: Tokens::resolve(settings.theme.preset),
@@ -111,6 +119,7 @@ impl SurfaceCraftApp {
             fit_pending: false,
             bvh_cache: HashMap::new(),
             highlights: HashMap::new(),
+            tools: crate::viewtools::ViewTools::default(),
             assistant_goal: String::new(),
             assistant_align: true,
             provider: default_provider(),
@@ -165,7 +174,8 @@ impl SurfaceCraftApp {
         self.refresh_highlights();
     }
 
-    fn refresh_highlights(&mut self) {
+    pub(crate) fn refresh_highlights(&mut self) {
+        self.tools.touch();
         let mut by: HashMap<ObjectId, Vec<u32>> = HashMap::new();
         for p in &self.picks {
             by.entry(p.object).or_default().push(p.triangle);
@@ -194,7 +204,15 @@ impl SurfaceCraftApp {
         PickContext {
             selected: self.selected_object,
             points: self.picks.iter().map(|p| [p.point.x, p.point.y, p.point.z]).collect(),
-            triangles: self.picks.iter().map(|p| p.triangle).collect(),
+            objects: self.session.doc.summaries().iter().map(|o| (o.id, o.kind)).collect(),
+            // a brush/lasso/smart selection wins over single picked triangles
+            triangles: if self.tools.selection.is_empty() {
+                self.picks.iter().map(|p| p.triangle).collect()
+            } else {
+                self.tools.selection.to_vec()
+            },
+            faces: self.tools.brep.face_list(),
+            edges: self.tools.brep.edge_list(),
         }
     }
 
@@ -423,6 +441,7 @@ impl SurfaceCraftApp {
 
     /// The operation history: what undo would step back through, newest first.
     pub(crate) fn history_panel(&mut self, ui: &mut egui::Ui) {
+        crate::history_panel::feature_tree(self, ui);
         let labels = self.session.history.undo_labels();
         if labels.is_empty() {
             ui.weak(t("history.empty"));
@@ -486,24 +505,7 @@ impl SurfaceCraftApp {
         });
         ui.separator();
         if let Some(id) = self.palette_command {
-            ui.strong(id);
-            if let Some(c) = surfacecraft_engine::cmd::find(id) {
-                ui.label(c.summary);
-            }
-            let l = ui.label(t("palette.parameters"));
-            ui.add(egui::TextEdit::multiline(&mut self.palette_params).code_editor().desired_rows(6)).labelled_by(l.id);
-            if ui.button(t("palette.run")).clicked() {
-                self.run_palette();
-            }
-            if let Some(last) = self.session.log.last()
-                && last.command == id
-            {
-                ui.separator();
-                egui::ScrollArea::vertical().id_salt("result").show(ui, |ui| {
-                    let text = serde_json::to_string_pretty(&last.outcome).unwrap_or_default();
-                    ui.monospace(truncate(&text, 4000));
-                });
-            }
+            crate::command_panel::command_body(self, ui, id);
         } else {
             ui.weak(t("palette.choose"));
         }
@@ -579,40 +581,16 @@ impl SurfaceCraftApp {
         let rect = ui.available_rect_before_wrap();
         self.viewport_rect = Some(rect);
         let resp = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+        // Sketch mode takes precedence over the viewport tools: the sketch editor owns the
+        // primary button and Esc (the innermost gesture); navigation stays (Alt+drag orbits).
         let sketching = self.sketch_editing();
         if sketching {
+            self.cancel_interaction();
             self.sketch_input(ui, &resp, rect);
-        }
-        if !sketching && resp.dragged_by(egui::PointerButton::Primary) {
-            let d = resp.drag_delta();
-            self.camera.orbit(f64::from(d.x), f64::from(d.y));
-        }
-        if resp.dragged_by(egui::PointerButton::Secondary) || resp.dragged_by(egui::PointerButton::Middle) {
-            let d = resp.drag_delta();
-            self.camera.pan(f64::from(d.x), f64::from(d.y), f64::from(rect.height()));
-        }
-        if resp.hovered() {
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            if scroll != 0.0 {
-                self.camera.zoom(f64::from(scroll));
-            }
-        }
-        if sketching {
-            // the sketch editor owns clicks
-        } else if resp.double_clicked() {
-            self.fit_pending = true;
-        } else if resp.clicked()
-            && let Some(pos) = resp.interact_pointer_pos()
-        {
-            let local = pos - rect.min;
-            let add = ui.input(|i| i.modifiers.shift);
-            self.pick_at(
-                f64::from(local.x),
-                f64::from(local.y),
-                f64::from(rect.width()),
-                f64::from(rect.height()),
-                add,
-            );
+            self.sketch_navigation(ui, &resp, rect);
+        } else {
+            // navigation, the view cube and the active tool (selection, gizmo, ...): viewtools.rs
+            self.view_input(ui, &resp, rect);
         }
         if self.fit_pending {
             self.camera.fit(&self.session.doc.bbox());
@@ -631,29 +609,66 @@ impl SurfaceCraftApp {
                 egui::FontId::proportional(14.0),
                 self.tokens.color(Token::TextMuted),
             );
+            self.paint_view_overlays(ui, rect);
             return;
         }
         let ppp = ui.ctx().pixels_per_point();
         let size = [(rect.width() * ppp).round().max(1.0) as u32, (rect.height() * ppp).round().max(1.0) as u32];
+        let frame = self.viewport_frame(size);
+        ui.painter().add(egui_wgpu::Callback::new_paint_callback(rect, ViewportCallback(frame)));
+        if sketching {
+            self.sketch_overlay(ui, rect);
+        } else {
+            self.paint_view_overlays(ui, rect);
+        }
+    }
+
+    /// What the 3D viewport draws now at `size` pixels: the document's objects (with the
+    /// selection highlights and the section clip), the live preview of a command form and the
+    /// camera. The wgpu callback of the viewport and the offscreen screenshots both render it.
+    pub fn viewport_frame(&mut self, size: [u32; 2]) -> Frame {
         let tokens = self.tokens.clone();
-        let items: Vec<DrawItem> = self
-            .session
-            .display_items()
+        let display = self.session.display_items();
+        let overlay = self.frame_overlay(&display);
+        let mut items: Vec<DrawItem> = display
             .into_iter()
             .map(|d| DrawItem {
                 key: d.key,
                 color: tokens.object(d.kind),
                 colors: d.colors.clone(),
                 colors_key: d.colors_key,
-                highlight: self.highlights.get(&d.id).map(|h| Arc::new(d.drawn_triangles(h))),
+                highlight: self.highlight_for(&d),
                 mesh: d.mesh,
             })
             .collect();
-        let bg = self.tokens.viewport_background().map(f64::from);
-        let frame = Frame { size, camera: self.camera.clone(), origin: self.camera.target, items, background: bg };
-        ui.painter().add(egui_wgpu::Callback::new_paint_callback(rect, ViewportCallback(frame)));
-        if sketching {
-            self.sketch_overlay(ui, rect);
+        items.extend(self.cmd_panel.draw_items(&tokens));
+        let background = tokens.viewport_background().map(f64::from);
+        Frame { size, camera: self.camera.clone(), origin: self.camera.target, items, background, overlay }
+    }
+
+    /// Lays the viewport out as with a GPU (no "no GPU" notice; the tool overlays are painted
+    /// over an empty viewport) while the test renderer has none. Screenshots use it to
+    /// composite the offscreen 3D image under the overlays the UI paints.
+    pub fn lay_out_for_gpu(&mut self) {
+        self.gpu = true;
+    }
+
+    /// Camera control while sketching: pan (right/middle drag), zoom (wheel) and Alt+drag
+    /// orbit. The primary button belongs to the sketch editor, so orbiting needs Alt.
+    fn sketch_navigation(&mut self, ui: &egui::Ui, resp: &egui::Response, rect: egui::Rect) {
+        if resp.dragged_by(egui::PointerButton::Secondary) || resp.dragged_by(egui::PointerButton::Middle) {
+            let d = resp.drag_delta();
+            self.camera.pan(f64::from(d.x), f64::from(d.y), f64::from(rect.height()));
+        }
+        if resp.dragged_by(egui::PointerButton::Primary) && ui.input(|i| i.modifiers.alt) {
+            let d = resp.drag_delta();
+            self.camera.orbit(f64::from(d.x), f64::from(d.y));
+        }
+        if resp.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll != 0.0 {
+                self.camera.zoom(f64::from(scroll));
+            }
         }
     }
 }
@@ -698,7 +713,7 @@ fn kind_plural_key(kind: ObjectKind) -> &'static str {
     }
 }
 
-fn truncate(s: &str, n: usize) -> String {
+pub(crate) fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n { s.to_string() } else { s.chars().take(n).collect::<String>() + "…" }
 }
 
@@ -709,8 +724,50 @@ pub struct PickContext {
     pub selected: Option<ObjectId>,
     /// Picked points.
     pub points: Vec<[f64; 3]>,
-    /// Picked triangles.
+    /// Picked triangles (original ids of the scan).
     pub triangles: Vec<u32>,
+    /// Every object of the document (id, kind), so object references can be prefilled with a
+    /// real object instead of a made-up id.
+    pub objects: Vec<(ObjectId, ObjectKind)>,
+    /// Picked B-rep faces (indices in the body record).
+    pub faces: Vec<usize>,
+    /// Picked B-rep edges (indices in the body record).
+    pub edges: Vec<usize>,
+}
+
+impl PickContext {
+    /// The object a reference parameter called `name` should point at: the selection when it
+    /// fits, else the first object of the needed kind (any object when the kind is open).
+    #[must_use]
+    pub fn reference_for(&self, name: &str) -> Option<ObjectId> {
+        let want = ref_kind(name);
+        let fits = |k: ObjectKind| want.is_none_or(|w| w == k);
+        if let Some(sel) = self.selected
+            && self.objects.iter().any(|(id, k)| *id == sel && fits(*k))
+        {
+            return Some(sel);
+        }
+        self.objects.iter().find(|(_, k)| fits(*k)).map(|(id, _)| *id)
+    }
+}
+
+/// The kind of object a reference parameter names (`None` when any kind goes).
+fn ref_kind(name: &str) -> Option<ObjectKind> {
+    match name {
+        "mesh" | "against" => Some(ObjectKind::Mesh),
+        "region" | "regions" => Some(ObjectKind::Region),
+        "sketch" | "sketches" | "profile" | "path" => Some(ObjectKind::Sketch),
+        "body" | "tool" => Some(ObjectKind::Body),
+        "feature" => Some(ObjectKind::Feature),
+        "surface" | "surfaces" => Some(ObjectKind::Surface),
+        "primitive" | "primitives" => Some(ObjectKind::Primitive),
+        _ => None,
+    }
+}
+
+/// Whether a property schema is an object reference (`ObjRef`: an id or a name).
+fn is_obj_ref(p: &Value) -> bool {
+    p.get("$ref").and_then(Value::as_str).is_some_and(|r| r.ends_with("/ObjRef"))
 }
 
 /// Example parameters from an input schema: required properties with neutral values; `object`
@@ -728,9 +785,18 @@ pub fn template(schema: &Value, ctx: &PickContext) -> Value {
         for name in required {
             let p = props.get(name).cloned().unwrap_or(Value::Null);
             let v = match name {
-                "object" | "mesh" => ctx.selected.map_or(json!(0), |id| json!(id.0)),
+                _ if is_obj_ref(&p) || name == "object" || name == "mesh" => {
+                    ctx.reference_for(name).map_or(json!(""), |id| json!(id.0))
+                }
+                _ if p.get("items").is_some_and(is_obj_ref) => {
+                    let n = p.get("minItems").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    let id = ctx.reference_for(name).map_or(json!(""), |id| json!(id.0));
+                    Value::Array(vec![id; n])
+                }
                 "from" | "points" if !ctx.points.is_empty() => json!(ctx.points),
                 "triangles" if !ctx.triangles.is_empty() => json!(ctx.triangles),
+                "faces" if !ctx.faces.is_empty() => json!(ctx.faces),
+                "edges" if !ctx.edges.is_empty() => json!(ctx.edges),
                 _ => example(&p, schema),
             };
             out.insert(name.to_string(), v);

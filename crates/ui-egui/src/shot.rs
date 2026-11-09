@@ -49,6 +49,7 @@ pub fn screenshot_png(session: &mut Session, camera: Option<&Camera>, w: u32, h:
         camera: cam,
         items: draw_items(session),
         background: crate::theme::Tokens::resolve(crate::theme::Preset::Light).viewport_background().map(f64::from),
+        overlay: crate::viewport::Overlay::default(),
     };
     let rgba = crate::viewport::render_offscreen(&frame)?;
     encode_png(&rgba, w, h)
