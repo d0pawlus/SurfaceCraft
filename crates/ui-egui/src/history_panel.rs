@@ -76,9 +76,13 @@ fn schema_for(kind: &str, op: &Map<String, Value>) -> Value {
                 props.insert(k.clone(), infer(v));
             }
         }
-        required = props.keys().map(|k| Value::String(k.clone())).collect();
+        // a parameter the feature leaves unset stays optional
+        required = props
+            .keys()
+            .filter(|k| op.get(*k).is_some_and(|v| !v.is_null()))
+            .map(|k| Value::String(k.clone()))
+            .collect();
     }
-    // every parameter shown is present on the feature: none is optional here
     root["required"] = Value::Array(required);
     root["additionalProperties"] = Value::Bool(true);
     root

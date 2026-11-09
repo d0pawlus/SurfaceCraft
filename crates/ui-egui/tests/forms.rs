@@ -40,20 +40,20 @@ fn a_form_is_generated_for_each_command() {
     // a plain command: enum, optional numbers and strings
     h.state_mut().choose_command("mesh.synth");
     settle(&mut h);
-    h.get_by_label_contains("shape");
+    h.get_by_label("shape *");
     h.get_by_label("resolution");
     h.get_by_label("noise");
     // a command with a nested object of optional settings, and an object reference
     h.state_mut().choose_command("region.auto_segment");
     settle(&mut h);
-    h.get_by_label_contains("mesh");
+    h.get_by_label("mesh *");
     h.get_by_label("options");
     h.get_by_label("replace");
     // a feature: object picker for the sketch, a number, the mode enum
     h.state_mut().choose_command("feature.extrude");
     settle(&mut h);
-    h.get_by_label_contains("sketch");
-    h.get_by_label_contains("distance");
+    h.get_by_label("sketch *");
+    h.get_by_label("distance *");
     h.get_by_label("mode");
     // the JSON toggle is still there for power users
     h.get_by_label("JSON").click();
@@ -69,11 +69,11 @@ fn editing_a_field_changes_the_produced_json() {
     settle(&mut h);
     assert!(params(&h).get("noise").is_none());
     // an optional parameter is set with its check box ...
-    h.get_by_label("noise").click();
+    h.get_by_role_and_label(egui::accesskit::Role::CheckBox, "noise").click();
     settle(&mut h);
     assert!(params(&h).get("noise").is_some(), "{}", h.state().palette_params);
     // ... and unset again
-    h.get_by_label("noise").click();
+    h.get_by_role_and_label(egui::accesskit::Role::CheckBox, "noise").click();
     settle(&mut h);
     assert!(params(&h).get("noise").is_none());
     // a number field: click, type, Enter
@@ -165,10 +165,9 @@ fn the_history_panel_suppresses_edits_and_shows_failures() {
     settle(&mut h);
     assert!(!h.state().session.doc.features[0].suppressed);
     // the same form edits the feature's parameters
-    h.get_by_label("Edit").click();
+    h.get_all_by_label("Edit").last().unwrap().click();
     settle(&mut h);
     h.get_by_label_contains("Editing extrude");
-    h.get_by_label_contains("distance");
     h.get_by_role_and_label(egui::accesskit::Role::SpinButton, "distance *").click();
     settle(&mut h);
     h.get_by_role_and_label(egui::accesskit::Role::SpinButton, "distance *").type_text("15");

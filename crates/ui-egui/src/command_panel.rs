@@ -274,6 +274,8 @@ fn body(app: &mut SurfaceCraftApp, panel: &mut CommandPanel, ui: &mut egui::Ui, 
         ui.selectable_value(&mut panel.json_mode, false, t("form.mode_form"));
         ui.selectable_value(&mut panel.json_mode, true, t("form.mode_json"));
     });
+    // the buttons come first: they stay in reach however long the form is
+    action_buttons(app, panel, ui, id);
     let schema = panel.schema(id);
     if panel.json_mode {
         let l = ui.label(t("palette.parameters"));
@@ -281,7 +283,6 @@ fn body(app: &mut SurfaceCraftApp, panel: &mut CommandPanel, ui: &mut egui::Ui, 
     } else {
         form_section(app, panel, ui, id, &schema);
     }
-    action_buttons(app, panel, ui, id);
     update_preview(app, panel, ui, id);
     preview_status(app, panel, ui);
     if let Some(last) = app.session.log.last()

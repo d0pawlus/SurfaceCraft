@@ -521,18 +521,24 @@ fn property_row(
     let compound = matches!(kind, Kind::Object) || (kind == Kind::Array && !is_tuple(schema, root));
     ui.push_id(&path, |ui| {
         if compound && set {
-            let header = egui::CollapsingHeader::new(marked(&label, required)).id_salt(&path).default_open(true);
-            let resp = header.show(ui, |ui| {
+            let id = ui.make_persistent_id(&path);
+            let state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true);
+            let label_id = std::cell::Cell::new(None);
+            let header = state.show_header(ui, |ui| {
+                let r = ui.label(marked(&label, required));
+                label_id.set(Some(r.id));
+                if let Some(h) = &hover {
+                    r.on_hover_text(h);
+                }
+            });
+            header.body(|ui| {
                 if !required {
                     changed |= presence(ui, map, name, false, prop, root, ctx);
                 }
                 if let Some(v) = map.get_mut(name) {
-                    changed |= value_widget(ui, root, prop, v, name, &path, ctx);
+                    changed |= value_widget(ui, root, prop, v, name, &path, ctx, label_id.get());
                 }
             });
-            if let Some(h) = &hover {
-                resp.header_response.on_hover_text(h);
-            }
             error_line(ui, ctx, &path);
             return;
         }
@@ -559,7 +565,7 @@ fn property_row(
             if map.get(name).is_some_and(|v| !v.is_null())
                 && let Some(v) = map.get_mut(name)
             {
-                let resp = value_widget_labelled(ui, root, prop, v, name, &path, ctx, Some(&name_resp));
+                let resp = value_widget(ui, root, prop, v, name, &path, ctx, Some(name_resp.id));
                 changed |= resp;
             } else if required {
                 // a required parameter without a value: give it one
@@ -613,6 +619,7 @@ fn is_tuple(schema: &Value, root: &Value) -> bool {
     numeric && min == max && (1..=6).contains(&min)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn value_widget(
     ui: &mut egui::Ui,
     root: &Value,
@@ -621,26 +628,13 @@ fn value_widget(
     name: &str,
     path: &str,
     ctx: &FormCtx<'_>,
-) -> bool {
-    value_widget_labelled(ui, root, schema, value, name, path, ctx, None)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn value_widget_labelled(
-    ui: &mut egui::Ui,
-    root: &Value,
-    schema: &Value,
-    value: &mut Value,
-    name: &str,
-    path: &str,
-    ctx: &FormCtx<'_>,
-    label: Option<&egui::Response>,
+    label: Option<egui::Id>,
 ) -> bool {
     let (kind, _, s) = classify(root, schema);
     let mut changed = false;
     let tag = |r: egui::Response| -> egui::Response {
         match label {
-            Some(l) => r.labelled_by(l.id),
+            Some(l) => r.labelled_by(l),
             None => r,
         }
     };
@@ -702,9 +696,9 @@ fn value_widget_labelled(
         Kind::ObjRef => changed |= object_picker(ui, value, name, path, ctx, label),
         Kind::Array => {
             if is_tuple(schema, root) {
-                changed |= tuple_row(ui, s, value, name, tag_label(label));
+                changed |= tuple_row(ui, s, value, name, label);
             } else {
-                changed |= list_widget(ui, root, s, value, name, path, ctx);
+                changed |= list_widget(ui, root, s, value, name, path, ctx, label);
             }
         }
         Kind::Object => {
@@ -712,13 +706,9 @@ fn value_widget_labelled(
                 changed |= object_rows(ui, root, s, map, path, ctx);
             }
         }
-        Kind::Any => changed |= json_text(ui, value, path),
+        Kind::Any => changed |= json_text(ui, value, path, label),
     }
     changed
-}
-
-fn tag_label(l: Option<&egui::Response>) -> Option<egui::Id> {
-    l.map(|r| r.id)
 }
 
 fn limits_text(min: f64, max: f64) -> String {
@@ -762,6 +752,7 @@ fn tuple_row(ui: &mut egui::Ui, schema: &Value, value: &mut Value, name: &str, l
     changed
 }
 
+#[allow(clippy::too_many_arguments)]
 fn list_widget(
     ui: &mut egui::Ui,
     root: &Value,
@@ -770,6 +761,7 @@ fn list_widget(
     name: &str,
     path: &str,
     ctx: &FormCtx<'_>,
+    label: Option<egui::Id>,
 ) -> bool {
     let mut changed = false;
     let item_schema = schema.get("items").cloned().unwrap_or(Value::Bool(true));
@@ -783,7 +775,7 @@ fn list_widget(
         ui.horizontal(|ui| {
             let ipath = format!("{path}[{i}]");
             ui.label(format!("{}", i + 1));
-            changed |= value_widget(ui, root, &item_schema, v, name, &ipath, ctx);
+            changed |= value_widget(ui, root, &item_schema, v, name, &ipath, ctx, label);
             if items_len_over_min && ui.small_button(t("form.remove")).clicked() {
                 remove = Some(i);
             }
@@ -835,7 +827,7 @@ fn object_picker(
     name: &str,
     path: &str,
     ctx: &FormCtx<'_>,
-    label: Option<&egui::Response>,
+    label: Option<egui::Id>,
 ) -> bool {
     let mut changed = false;
     let hint = kind_hint(name);
@@ -863,7 +855,7 @@ fn object_picker(
         }
     });
     if let Some(l) = label {
-        resp.response.labelled_by(l.id);
+        resp.response.labelled_by(l);
     }
     if let Some(sel) = ctx.selected
         && ui.small_button(t("form.use_selection")).on_hover_text(t("form.use_selection_hint")).clicked()
@@ -885,11 +877,14 @@ fn object_picker(
 }
 
 /// Free-form JSON of one value (parameters whose schema has no structure).
-fn json_text(ui: &mut egui::Ui, value: &mut Value, path: &str) -> bool {
+fn json_text(ui: &mut egui::Ui, value: &mut Value, path: &str, label: Option<egui::Id>) -> bool {
     let id = ui.scope_id().with(("form-json", path));
     let mut text: String = ui.data_mut(|d| d.get_temp(id)).unwrap_or_else(|| value.to_string());
     let mut changed = false;
     let r = ui.add(egui::TextEdit::singleline(&mut text).code_editor().desired_width(160.0));
+    if let Some(l) = label {
+        r.clone().labelled_by(l);
+    }
     if r.changed() {
         if let Ok(v) = serde_json::from_str::<Value>(&text) {
             *value = v;
