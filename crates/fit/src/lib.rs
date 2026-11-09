@@ -10,10 +10,14 @@
 )]
 
 pub mod auto;
+pub mod features;
 pub mod lm;
+pub mod mls;
+pub mod patch;
 pub mod plane;
 pub mod primitive;
 pub mod resample;
+pub mod retopo;
 pub mod segment;
 pub mod stats;
 

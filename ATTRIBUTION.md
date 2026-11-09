@@ -29,6 +29,15 @@ Policy:
 | crates/ui-egui/assets/locales/*.json | SurfaceCraft contributors | own interface strings (English, Polish) | MIT OR Apache-2.0 |
 | docs/screenshots/*.png | SurfaceCraft contributors | rendered by the SurfaceCraft test suite from synthetic scans (`crates/ui-egui/tests/shell_screenshots.rs`) | MIT OR Apache-2.0 |
 
+## Algorithm references (no source copied)
+
+Methods implemented from publications; no code of the reference implementations is used.
+
+| Code | Reference | Notes |
+|---|---|---|
+| crates/fit/src/retopo.rs | Jakob, Tarini, Panozzo, Sorkine-Hornung, "Instant Field-Aligned Meshes", SIGGRAPH Asia 2015 (Instant Meshes, permissive licence, see NOTICE) | 4-RoSy orientation field and 2-PoSy position field by Gauss-Seidel smoothing, extraction of a quad-dominant layout; written from the paper, own extraction by lattice-cell adjacency. |
+| crates/fit/src/mls.rs | moving least squares projection (Levin 1998; Alexa et al. 2003) | Gaussian-weighted local quadric. |
+
 ## Adapted code
 
 Code adapted from other openly licensed projects (design doc §9: "upstream first, then

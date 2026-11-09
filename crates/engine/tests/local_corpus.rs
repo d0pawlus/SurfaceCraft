@@ -175,3 +175,124 @@ fn local_corpus_full_pipeline() {
     }
     assert!(failures.is_empty(), "failed: {failures:?}");
 }
+
+/// P4: retopology and patches on regions of an organic real scan (aggregate figures only).
+///
+/// `SURFACECRAFT_LOCAL_CORPUS_ONLY` selects the file by a part of its name. Each region is the
+/// largest connected piece of the triangles within a fraction of the bounding-box diagonal of
+/// an extreme vertex (highest z, highest x); the fractions are 2.5 % and 4 %.
+#[test]
+#[ignore = "needs SURFACECRAFT_LOCAL_CORPUS (third-party scans, never committed)"]
+fn local_organic_region_retopo() {
+    let files = corpus();
+    assert!(!files.is_empty(), "set SURFACECRAFT_LOCAL_CORPUS to a directory with STL/OBJ/PLY scans");
+    let path = &files[0];
+    let mut s = Session::new();
+    let t = Instant::now();
+    let info = s.execute("mesh.import", json!({"path": path.to_string_lossy(), "name": "scan"})).unwrap();
+    s.execute("mesh.clean", json!({"object": "scan", "fill_holes_max_edges": 300})).unwrap();
+    eprintln!("P4 local: {} triangles, import+clean {:.1} s", info["triangles"], t.elapsed().as_secs_f64());
+    let (mid, _) = s.doc.find_by_name("scan").unwrap();
+    let mesh = s.doc.mesh(mid).unwrap().mesh.clone();
+    let diag = mesh.bbox().diagonal();
+    let seeds = [
+        mesh.positions.iter().max_by(|a, b| a.z.total_cmp(&b.z)).copied().unwrap(),
+        mesh.positions.iter().max_by(|a, b| a.x.total_cmp(&b.x)).copied().unwrap(),
+    ];
+    for (si, seed) in seeds.iter().enumerate() {
+        for frac in [0.025, 0.04] {
+            let r2 = (frac * diag) * (frac * diag);
+            let ids: Vec<u32> = (0..mesh.triangle_count() as u32)
+                .filter(|&t| mesh.face_centroid(t as usize).is_some_and(|c| (c - seed).norm_squared() < r2))
+                .collect();
+            let sub = mesh.submesh(&ids);
+            let comps = surfacecraft_geom::edit::components(&sub);
+            let Some(biggest) = comps.iter().max_by_key(|c| c.len()) else { continue };
+            let tris: Vec<u32> = biggest.iter().map(|&k| ids[k as usize]).collect();
+            let tag = format!("seed {si} radius {:.1} %", frac * 100.0);
+            let reg = s.execute("region.create", json!({"mesh": "scan", "triangles": tris})).unwrap();
+            let t = Instant::now();
+            let r = match s.execute("quad.retopo", json!({"region": reg["id"], "target_quads": 120})) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("P4 local [{tag}]: {} triangles, retopo refused: {e}", tris.len());
+                    continue;
+                }
+            };
+            eprintln!(
+                "P4 local [{tag}]: {} triangles; retopo {:.1} s: layout {} quads {} irregular {:.2} euler {} closed {} folded {}",
+                tris.len(),
+                t.elapsed().as_secs_f64(),
+                r["layout"],
+                r["quads"],
+                r["irregular_fraction"].as_f64().unwrap(),
+                r["euler"],
+                r["closed"],
+                r["folded"]
+            );
+            let t = Instant::now();
+            match s.execute("surface.auto", json!({"object": r["id"], "tolerance": 0.2})) {
+                Ok(a) => eprintln!(
+                    "P4 local [{tag}]: surface.auto {:.1} s: patches {} max {:.4} rms {:.4} refinements {} folded {} jump max {:.2} deg mean {:.2} deg uncovered {:.3} within {}",
+                    t.elapsed().as_secs_f64(),
+                    a["blocks"][0]["patches"],
+                    a["max"].as_f64().unwrap(),
+                    a["blocks"][0]["rms"].as_f64().unwrap(),
+                    a["refinements"],
+                    a["folded"],
+                    a["normal_jump_max_deg"].as_f64().unwrap(),
+                    a["normal_jump_mean_deg"].as_f64().unwrap(),
+                    a["uncovered"].as_f64().unwrap(),
+                    a["within_tolerance"]
+                ),
+                Err(e) => eprintln!("P4 local [{tag}]: surface.auto failed: {e}"),
+            }
+            if let Some(sid) = s.doc.surfaces.last().map(|o| o.id) {
+                let surf = s.doc.surfaces.iter().find(|o| o.id == sid).unwrap().clone();
+                let tess = surfacecraft_kernel::tess::tessellate(&surf.sheet, Some(0.02)).unwrap();
+                let bvh = surfacecraft_geom::Bvh::build(&tess);
+                let mut verts: Vec<u32> = tris.iter().flat_map(|&t| mesh.triangles[t as usize]).collect();
+                verts.sort_unstable();
+                verts.dedup();
+                let mut d: Vec<f64> = verts
+                    .iter()
+                    .filter_map(|&v| bvh.closest(&mesh.positions[v as usize], f64::INFINITY).map(|h| h.distance))
+                    .collect();
+                // where are the worst points? distance to the boundary of the region
+                {
+                    let rm = mesh.submesh(&tris);
+                    let loops = surfacecraft_geom::edit::boundary_loops(&rm);
+                    let bpts: Vec<surfacecraft_geom::Point3> =
+                        loops.iter().flatten().map(|&v| rm.positions[v as usize]).collect();
+                    let tree = surfacecraft_geom::KdTree::build(&bpts);
+                    let mut worst: Vec<(f64, f64)> = verts
+                        .iter()
+                        .filter_map(|&v| {
+                            let p = mesh.positions[v as usize];
+                            let h = bvh.closest(&p, f64::INFINITY)?;
+                            Some((h.distance, tree.nearest(&p).map_or(f64::NAN, |x| x.1.sqrt())))
+                        })
+                        .collect();
+                    worst.sort_by(|a, b| b.0.total_cmp(&a.0));
+                    let near_boundary = worst.iter().take(200).filter(|w| w.1 < 25.0).count();
+                    eprintln!(
+                        "P4 local [{tag}]: worst 5 (distance, distance to region boundary): {:.2?}; of the worst 200, {near_boundary} lie within 25 mm of the region boundary",
+                        &worst[..5.min(worst.len())]
+                    );
+                }
+                d.sort_by(f64::total_cmp);
+                let q = |f: f64| d[((d.len() as f64 - 1.0) * f) as usize];
+                let over = d.iter().filter(|&&x| x > 0.2).count() as f64 / d.len() as f64;
+                eprintln!(
+                    "P4 local [{tag}]: scan vertex distance to the patches: median {:.4} p95 {:.4} p99 {:.4} p99.9 {:.4} max {:.3}, {:.2} % above 0.2 mm",
+                    q(0.5),
+                    q(0.95),
+                    q(0.99),
+                    q(0.999),
+                    d[d.len() - 1],
+                    over * 100.0
+                );
+            }
+        }
+    }
+}

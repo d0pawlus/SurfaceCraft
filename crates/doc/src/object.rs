@@ -262,6 +262,13 @@ pub struct QuadObject {
     /// Crease lines along u at these v indices (1..nv).
     #[serde(default)]
     pub crease_v: Vec<usize>,
+    /// Unstructured layout (P4): quads as vertex ids into `vertices`, counter-clockwise seen
+    /// from the side `normals` point to. Empty for a structured `nu × nv` layout.
+    #[serde(default)]
+    pub faces: Vec<[u32; 4]>,
+    /// Unit normals of the vertices of an unstructured layout.
+    #[serde(default)]
+    pub normals: Vec<[f64; 3]>,
     /// Shown in the viewport.
     #[serde(default = "yes")]
     pub visible: bool,
@@ -269,12 +276,32 @@ pub struct QuadObject {
 
 impl QuadObject {
     fn describe(&self) -> String {
+        if self.is_unstructured() {
+            return format!("{} quads (unstructured), {} vertices", self.faces.len(), self.vertices.len());
+        }
         format!("{} × {} quads, {} creases", self.nu, self.nv, self.crease_u.len() + self.crease_v.len())
+    }
+
+    /// Is this an unstructured (field-aligned) layout rather than a grid?
+    #[must_use]
+    pub fn is_unstructured(&self) -> bool {
+        !self.faces.is_empty()
     }
 
     /// Display mesh: two triangles per quad.
     #[must_use]
     pub fn display_mesh(&self) -> Mesh {
+        if self.is_unstructured() {
+            let mut triangles = Vec::with_capacity(self.faces.len() * 2);
+            for f in &self.faces {
+                triangles.push([f[0], f[1], f[2]]);
+                triangles.push([f[0], f[2], f[3]]);
+            }
+            let positions: Vec<Point3> = self.vertices.iter().map(|p| Point3::from(*p)).collect();
+            let n = positions.len() as u32;
+            triangles.retain(|t| t.iter().all(|&i| i < n));
+            return Mesh { positions, triangles };
+        }
         let w = (self.nv + 1) as u32;
         let mut triangles = Vec::with_capacity(self.nu * self.nv * 2);
         for i in 0..self.nu as u32 {

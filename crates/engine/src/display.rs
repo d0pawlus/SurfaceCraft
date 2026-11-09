@@ -234,7 +234,7 @@ impl Session {
         let quads: Vec<_> =
             self.doc.quads.iter().filter(|q| q.visible).map(|q| (q.id, q.vertices.clone(), q.clone())).collect();
         for (id, verts, q) in quads {
-            let mut key = verts.len() as u64;
+            let mut key = verts.len() as u64 ^ ((q.faces.len() as u64) << 40);
             for v in &verts {
                 for c in v {
                     key = key.wrapping_mul(1_099_511_628_211) ^ c.to_bits();
