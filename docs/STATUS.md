@@ -23,7 +23,7 @@ Etapy po MVP ([plan production-readiness](superpowers/plans/2026-11-09-productio
 | P1 | realne skany: pomiar, edycja siatki, odporność segmentacji i szumu | **zamknięty** | [plan](superpowers/plans/2026-11-09-p1-real-scans.md) |
 | P2 | wydajność i skala do 10 mln trójkątów: równoległość, LOD wyświetlania, kolory bez re-uploadu, pomiary | **w toku** (kryterium 3: import, segmentacja, ICP, fps spełnione; patrz tabela) | [plan](superpowers/plans/2026-11-09-p2-performance.md) |
 | P5 | stabilna parametryka (trwałe nazewnictwo topologii) i komplet cech (loft, sweep, draft, mirror, split, wzór po ścieżce), auto-więzy, podpowiedzi osi/kąta | **zamknięty** (luki w długu technicznym) | [plan](superpowers/plans/2026-11-09-p5-parametric.md) |
-| P3 | model hybrydowy: prymitywy + płaty → jedna zamknięta bryła, STEP round-trip | **zamknięty** (PR) | [plan](superpowers/plans/2026-11-09-p3-hybrid.md) |
+| P3 | model hybrydowy: prymitywy + płaty → jedna zamknięta bryła, STEP round-trip | **zamknięty** | [plan](superpowers/plans/2026-11-09-p3-hybrid.md) |
 | P7 | dystrybucja: `cargo xtask dist` (binarki + `SHA256SUMS.txt`), metadane produktu, `wasm-opt`, [docs/distribution.md](distribution.md) | częściowo — kroki poza repo czekają na zgodę | [plan](superpowers/plans/2026-11-09-production-readiness.md) |
 
 ## Jak uruchomić
