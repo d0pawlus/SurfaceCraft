@@ -174,6 +174,9 @@ tokens! {
     ObjectSurface => "object.surface",
     ObjectQuad => "object.quad",
     ObjectSketch => "object.sketch",
+    AxisX => "axis.x",
+    AxisY => "axis.y",
+    AxisZ => "axis.z",
     DeviationBelow => "deviation.below",
     DeviationInTolerance => "deviation.in_tolerance",
     DeviationAbove => "deviation.above",
@@ -193,6 +196,9 @@ fn raw(preset: Preset, token: Token) -> [u8; 4] {
             ObjectSurface => [140, 217, 242, 204],
             ObjectQuad => [230, 102, 230, 89],
             ObjectSketch => [255, 255, 77, 255],
+            AxisX => [230, 51, 51, 255],
+            AxisY => [51, 204, 51, 255],
+            AxisZ => [64, 102, 242, 255],
             DeviationBelow => [66, 110, 214, 255],
             DeviationInTolerance => [64, 180, 110, 255],
             DeviationAbove => [232, 150, 50, 255],
@@ -313,6 +319,13 @@ impl Tokens {
         [f32::from(r) / 255.0, f32::from(g) / 255.0, f32::from(b) / 255.0, f32::from(a) / 255.0]
     }
 
+    /// Start and end colour of each of the three axis lines of the viewport (x, y, z).
+    #[must_use]
+    pub fn axis_vertex_colors(&self) -> [[f32; 4]; 6] {
+        let (x, y, z) = (self.rgba(Token::AxisX), self.rgba(Token::AxisY), self.rgba(Token::AxisZ));
+        [x, x, y, y, z, z]
+    }
+
     /// The viewport clear colour.
     #[must_use]
     pub fn viewport_background(&self) -> [f32; 3] {
@@ -394,4 +407,26 @@ pub fn icon_button_style(t: &Tokens) -> craft_ui::buttons::IconButtonStyle {
         corner_radius: CornerRadius::same(4),
         focus_stroke: Stroke::new(1.5, t.color(Token::FocusRing)),
     }
+}
+
+/// The style of the dock area (tabs, borders, drop previews) from tokens and density.
+#[must_use]
+pub fn dock_style(ui: &egui::Ui, t: &Tokens, m: &Metrics) -> craft_ui::docking::DockStyle {
+    let mut s = craft_ui::docking::DockStyle::from_ui(ui);
+    s.tab_height = m.tab_height;
+    s.min_pane = 96.0;
+    s.background = t.color(Token::SurfaceBase);
+    s.tab_background = t.color(Token::SurfaceSunken);
+    s.active_background = t.color(Token::SurfaceRaised);
+    s.floating_background = t.color(Token::SurfaceRaised);
+    s.floating_stroke = Stroke::new(1.0, t.color(Token::BorderStrong));
+    s.text = t.color(Token::TextPrimary);
+    s.inactive_text = t.color(Token::TextMuted);
+    s.border = Stroke::new(1.0, t.color(Token::BorderSubtle));
+    s.accent = t.color(Token::AccentPrimary);
+    // creative-app arrangement: docks on the window's edges, the viewport takes no tabs
+    s.new_dock_zones = true;
+    s.side_edge_zones = false;
+    s.title_bar_docks = false;
+    s.localized(|key| crate::i18n::find(key).map(str::to_owned))
 }

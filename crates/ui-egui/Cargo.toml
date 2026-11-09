@@ -24,23 +24,20 @@ png = "0.18"
 serde.workspace = true
 craft-ui.workspace = true
 egui_extras.workspace = true
-craft-window.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-rfd.workspace = true
 pollster.workspace = true
 craft-dialogs.workspace = true
 getrandom.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-rfd = { workspace = true }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlAnchorElement", "Blob", "Url"] }
 
 [dev-dependencies]
-egui_kittest = "0.37"
+egui_kittest = { version = "0.37", features = ["wgpu"] }
 surfacecraft-fit.workspace = true
 surfacecraft-kernel.workspace = true
 surfacecraft-ai.workspace = true

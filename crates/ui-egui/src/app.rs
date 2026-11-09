@@ -1,5 +1,10 @@
-//! The application window: menus, toolbar, object list, command palette, log and viewport.
+//! The application state and the panel bodies. The shell around them (menus, toolbar, docking,
+//! settings, dialogs) is in [`crate::shell`]; every colour is a theme token and every text a
+//! catalogue key.
 use crate::camera::Camera;
+use crate::i18n::{t, tf};
+use crate::settings::UiSettings;
+use crate::theme::{Token, Tokens};
 use crate::viewport::{self, DrawItem, Frame, ViewportCallback};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -7,12 +12,6 @@ use std::sync::Arc;
 use surfacecraft_doc::{ObjectId, ObjectKind};
 use surfacecraft_engine::{EngineError, Session};
 use surfacecraft_geom::{Bvh, Point3};
-
-const MESH_COLOR: [f32; 4] = [0.62, 0.66, 0.72, 1.0];
-const BODY_COLOR: [f32; 4] = [0.35, 0.55, 0.85, 1.0];
-const PRIMITIVE_COLOR: [f32; 4] = [0.95, 0.75, 0.2, 0.55];
-const SURFACE_COLOR: [f32; 4] = [0.55, 0.85, 0.95, 0.8];
-const QUAD_COLOR: [f32; 4] = [0.9, 0.4, 0.9, 0.35];
 
 /// The SurfaceCraft UI.
 pub struct SurfaceCraftApp {
@@ -32,9 +31,17 @@ pub struct SurfaceCraftApp {
     pub status: String,
     /// Points picked in the viewport (click: replace, Shift+click: add).
     pub picks: Vec<Pick>,
+    /// Theme, density, language and dock layout, saved between runs.
+    pub settings: UiSettings,
+    /// The dock layout in use (saved into `settings` on exit).
+    pub workspace: crate::dock::Workspace,
+    /// The theme's tokens resolved for the current preset.
+    pub tokens: Tokens,
+    /// Where the viewport was drawn last frame (screen points).
+    pub viewport_rect: Option<egui::Rect>,
     /// Whether a wgpu render state exists (false in headless tests).
     gpu: bool,
-    fit_pending: bool,
+    pub(crate) fit_pending: bool,
     bvh_cache: HashMap<usize, Bvh>,
     highlights: HashMap<ObjectId, Arc<Vec<u32>>>,
     /// The assistant's goal text.
@@ -42,10 +49,15 @@ pub struct SurfaceCraftApp {
     /// Align (true) or workflow mode.
     pub assistant_align: bool,
     provider: Option<Box<dyn surfacecraft_ai::Provider>>,
+    pub(crate) prepared: bool,
+    pub(crate) ctx: Option<egui::Context>,
+    pub(crate) applied: Option<(crate::theme::Theme, crate::i18n::Lang)>,
     #[cfg(not(target_arch = "wasm32"))]
     control: Option<std::sync::mpsc::Receiver<crate::control::Request>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) dialogs: craft_dialogs::Dialogs<crate::shell::DialogThen>,
     #[cfg(target_arch = "wasm32")]
-    inbox: crate::web::Inbox,
+    pub(crate) inbox: crate::web::Inbox,
 }
 
 /// A point picked on an object in the viewport.
@@ -69,6 +81,16 @@ impl SurfaceCraftApp {
     /// An app without a GPU (tests, or a renderer that failed to start).
     #[must_use]
     pub fn headless() -> Self {
+        Self::with_settings(UiSettings::default())
+    }
+
+    /// An app without a GPU that starts with `settings`.
+    #[must_use]
+    pub fn with_settings(settings: UiSettings) -> Self {
+        let side = settings.theme.density.metrics().side_dock_width;
+        let default = crate::dock::default_workspace(side);
+        let mut workspace = settings.workspace.clone().unwrap_or_else(|| default.clone());
+        crate::dock::reconcile(&mut workspace, &default);
         Self {
             session: Session::new(),
             camera: Camera::default(),
@@ -76,8 +98,12 @@ impl SurfaceCraftApp {
             palette_command: None,
             palette_params: "{}".into(),
             palette_filter: String::new(),
-            status: "Ready".into(),
+            status: t("status.ready").to_string(),
             picks: Vec::new(),
+            tokens: Tokens::resolve(settings.theme.preset),
+            workspace,
+            settings,
+            viewport_rect: None,
             gpu: false,
             fit_pending: false,
             bvh_cache: HashMap::new(),
@@ -85,8 +111,13 @@ impl SurfaceCraftApp {
             assistant_goal: String::new(),
             assistant_align: true,
             provider: default_provider(),
+            prepared: false,
+            ctx: None,
+            applied: None,
             #[cfg(not(target_arch = "wasm32"))]
             control: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            dialogs: craft_dialogs::Dialogs::new(std::sync::Arc::new(|| {})),
             #[cfg(target_arch = "wasm32")]
             inbox: Default::default(),
         }
@@ -142,12 +173,12 @@ impl SurfaceCraftApp {
     fn picks_panel(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.horizontal(|ui| {
-            ui.strong(format!("Picks ({})", self.picks.len()));
-            if ui.small_button("Clear").clicked() {
+            ui.strong(tf("picks.title", &[("n", &self.picks.len().to_string())]));
+            if ui.small_button(t("picks.clear")).clicked() {
                 self.clear_picks();
             }
         });
-        ui.weak("Click the model to pick, Shift+click to add. Picks prefill `from`/`points`/`triangles`.");
+        ui.weak(t("picks.hint"));
         for p in self.picks.iter().rev().take(12) {
             ui.monospace(format!(
                 "{} t{} ({:.3}, {:.3}, {:.3})",
@@ -164,10 +195,16 @@ impl SurfaceCraftApp {
         }
     }
 
-    /// The app for an eframe window; installs the viewport renderer when wgpu is available.
+    /// The app for an eframe window: restores the saved settings and installs the viewport
+    /// renderer when wgpu is available.
     #[must_use]
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let mut app = Self::headless();
+        let saved = cc
+            .storage
+            .and_then(|s| s.get_string(crate::settings::STORAGE_KEY))
+            .map(|json| UiSettings::from_json(&json));
+        let settings = saved.unwrap_or_else(|| UiSettings { lang: crate::i18n::Lang::from_system(), ..UiSettings::default() });
+        let mut app = Self::with_settings(settings);
         if let Some(rs) = cc.wgpu_render_state.as_ref() {
             viewport::install(rs);
             app.gpu = true;
@@ -175,7 +212,12 @@ impl SurfaceCraftApp {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let ctx = cc.egui_ctx.clone();
-            app.control = crate::control::start(move || ctx.request_repaint()).map(|(rx, _)| rx);
+            app.control = crate::control::start({
+                let ctx = ctx.clone();
+                move || ctx.request_repaint()
+            })
+            .map(|(rx, _)| rx);
+            app.dialogs = craft_dialogs::Dialogs::new(std::sync::Arc::new(move || ctx.request_repaint()));
         }
         app
     }
@@ -207,14 +249,14 @@ impl SurfaceCraftApp {
     /// Runs the palette's command with its edited parameters.
     pub fn run_palette(&mut self) {
         let Some(id) = self.palette_command else {
-            self.status = "Choose a command first".into();
+            self.status = t("status.choose_command").to_string();
             return;
         };
         match serde_json::from_str::<Value>(&self.palette_params) {
             Ok(v) => {
                 let _ = self.run_command(id, v);
             }
-            Err(e) => self.status = format!("parameters are not JSON: {e}"),
+            Err(e) => self.status = tf("status.params_not_json", &[("error", &e.to_string())]),
         }
     }
 
@@ -231,28 +273,9 @@ impl SurfaceCraftApp {
         json!({ "commands": cmds })
     }
 
-    /// Draws the whole UI (the body of `eframe::App::ui`).
-    pub fn draw(&mut self, ui: &mut egui::Ui) {
-        #[cfg(not(target_arch = "wasm32"))]
-        self.poll_control();
-        #[cfg(target_arch = "wasm32")]
-        self.poll_inbox();
-        self.shortcuts(ui);
-        egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui));
-        egui::Panel::bottom("status").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(&self.status);
-            });
-        });
-        egui::Panel::bottom("log").resizable(true).default_size(140.0).show(ui, |ui| self.log_panel(ui));
-        egui::Panel::left("objects").resizable(true).default_size(230.0).show(ui, |ui| self.objects_panel(ui));
-        egui::Panel::right("palette").resizable(true).default_size(320.0).show(ui, |ui| self.palette_panel(ui));
-        egui::CentralPanel::default().show(ui, |ui| self.viewport_panel(ui));
-    }
-
     /// Answers control-channel requests (bridged MCP) between frames.
     #[cfg(not(target_arch = "wasm32"))]
-    fn poll_control(&mut self) {
+    pub(crate) fn poll_control(&mut self) {
         let Some(rx) = self.control.as_ref() else { return };
         let reqs: Vec<crate::control::Request> = rx.try_iter().collect();
         for r in reqs {
@@ -286,7 +309,7 @@ impl SurfaceCraftApp {
 
     /// Imports files the browser picked (web build).
     #[cfg(target_arch = "wasm32")]
-    fn poll_inbox(&mut self) {
+    pub(crate) fn poll_inbox(&mut self) {
         let files: Vec<(String, Vec<u8>)> = self.inbox.borrow_mut().drain(..).collect();
         for (name, bytes) in files {
             let lower = name.to_lowercase();
@@ -306,16 +329,16 @@ impl SurfaceCraftApp {
 
     /// Downloads the selected object: a mesh as STL, a body or surface as STEP (web build).
     #[cfg(target_arch = "wasm32")]
-    fn download_selected(&mut self) {
+    pub(crate) fn download_selected(&mut self) {
         let Some(id) = self.selected_object else {
-            self.status = "select an object first".into();
+            self.status = t("status.select_first").to_string();
             return;
         };
         let (cmd, params, file) = match self.session.doc.kind_of(id) {
             Some(ObjectKind::Mesh) => ("mesh.export", json!({"object": id.0, "format": "stl"}), "mesh.stl"),
             Some(ObjectKind::Body | ObjectKind::Surface) => ("export.step", json!({"objects": [id.0]}), "model.step"),
             _ => {
-                self.status = "only meshes, bodies and surfaces download".into();
+                self.status = t("status.download_kinds").to_string();
                 return;
             }
         };
@@ -326,7 +349,7 @@ impl SurfaceCraftApp {
         }
     }
 
-    fn shortcuts(&mut self, ui: &mut egui::Ui) {
+    pub(crate) fn shortcuts(&mut self, ui: &mut egui::Ui) {
         let (undo, redo) = ui.input(|i| {
             let z = i.modifiers.command && i.key_pressed(egui::Key::Z);
             (z && !i.modifiers.shift, (z && i.modifiers.shift) || (i.modifiers.command && i.key_pressed(egui::Key::Y)))
@@ -339,167 +362,146 @@ impl SurfaceCraftApp {
         }
     }
 
-    fn menu_bar(&mut self, ui: &mut egui::Ui) {
-        egui::MenuBar::new().ui(ui, |ui| {
-            ui.menu_button("File", |ui| {
-                if ui.button("New").clicked() {
-                    let _ = self.run_command("doc.new", Value::Null);
-                    ui.close();
-                }
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    if ui.button("Open project…").clicked() {
-                        if let Some(p) =
-                            rfd::FileDialog::new().add_filter("SurfaceCraft project", &["scproj"]).pick_file()
-                        {
-                            let _ = self.run_command("doc.open", json!({"path": p.to_string_lossy()}));
-                            self.fit_pending = true;
-                        }
-                        ui.close();
-                    }
-                    if ui.button("Save project…").clicked() {
-                        if let Some(p) =
-                            rfd::FileDialog::new().add_filter("SurfaceCraft project", &["scproj"]).save_file()
-                        {
-                            let _ = self.run_command("doc.save", json!({"path": p.to_string_lossy()}));
-                        }
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button("Import mesh…").clicked() {
-                        if let Some(p) =
-                            rfd::FileDialog::new().add_filter("Mesh", &["stl", "obj", "ply", "xyz", "asc"]).pick_file()
-                        {
-                            let _ = self.run_command("mesh.import", json!({"path": p.to_string_lossy()}));
-                            self.fit_pending = true;
-                        }
-                        ui.close();
-                    }
-                    if ui.button("Export selected as STEP…").clicked() {
-                        if let Some(id) = self.selected_object
-                            && let Some(p) = rfd::FileDialog::new().add_filter("STEP", &["step", "stp"]).save_file()
-                        {
-                            let _ = self
-                                .run_command("export.step", json!({"objects": [id.0], "path": p.to_string_lossy()}));
-                        }
-                        ui.close();
-                    }
-                    if ui.button("Import STEP…").clicked() {
-                        if let Some(p) = rfd::FileDialog::new().add_filter("STEP", &["step", "stp"]).pick_file() {
-                            let _ = self.run_command("import.step", json!({"path": p.to_string_lossy()}));
-                            self.fit_pending = true;
-                        }
-                        ui.close();
-                    }
-                    if ui.button("Export selected mesh…").clicked() {
-                        if let Some(id) = self.selected_object
-                            && let Some(p) =
-                                rfd::FileDialog::new().add_filter("Mesh", &["stl", "obj", "ply"]).save_file()
-                        {
-                            let _ =
-                                self.run_command("mesh.export", json!({"object": id.0, "path": p.to_string_lossy()}));
-                        }
-                        ui.close();
-                    }
-                }
-            });
-            #[cfg(target_arch = "wasm32")]
-            ui.menu_button("Web files", |ui| {
-                if ui.button("Import mesh…").clicked() {
-                    crate::web::pick_file(&self.inbox, &["stl", "obj", "ply"], ui.ctx().clone());
-                    ui.close();
-                }
-                if ui.button("Import STEP…").clicked() {
-                    crate::web::pick_file(&self.inbox, &["step", "stp"], ui.ctx().clone());
-                    ui.close();
-                }
-                if ui.button("Download selected (STL / STEP)").clicked() {
-                    self.download_selected();
-                    ui.close();
-                }
-            });
-            ui.menu_button("Edit", |ui| {
-                if ui.button("Undo").clicked() {
-                    let _ = self.run_command("edit.undo", Value::Null);
-                    ui.close();
-                }
-                if ui.button("Redo").clicked() {
-                    let _ = self.run_command("edit.redo", Value::Null);
-                    ui.close();
-                }
-            });
-            ui.menu_button("View", |ui| {
-                if ui.button("Fit all").clicked() {
-                    self.fit_pending = true;
-                    ui.close();
-                }
-            });
-            // one menu per command group: every command is reachable from the menus too
-            let mut groups: Vec<&'static str> = self.session.commands().iter().map(|c| c.group).collect();
-            groups.sort_unstable();
-            groups.dedup();
-            for g in groups.into_iter().filter(|g| !matches!(*g, "File" | "Edit" | "View" | "App")) {
-                ui.menu_button(g, |ui| {
-                    for c in self.session.commands().iter().filter(|c| c.group == g) {
-                        if ui.button(c.label).on_hover_text(c.summary).clicked() {
-                            self.choose_command(c.id);
-                            ui.close();
-                        }
-                    }
-                });
-            }
-        });
+    /// A small icon toggle for lists: returns the click.
+    fn icon_toggle(&self, ui: &mut egui::Ui, label_key: &str, icon: &str, selected: bool) -> egui::Response {
+        let m = self.settings.theme.density.metrics();
+        let style = crate::theme::icon_button_style(&self.tokens);
+        let size = egui::Vec2::splat(m.icon_button - 6.0);
+        let inset = ((size.x - m.icon) / 2.0).max(0.0);
+        craft_ui::buttons::IconButton::new(t(label_key), size, &style)
+            .selected(selected)
+            .show(ui, |ui, rect, tint| crate::icons::paint(ui, rect.shrink(inset), icon, tint))
+            .on_hover_text(t(label_key))
     }
 
-    fn objects_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Objects");
+    /// The object tree: objects grouped by kind, with visibility and delete controls.
+    pub(crate) fn objects_panel(&mut self, ui: &mut egui::Ui) {
         let summaries = self.session.doc.summaries();
         if summaries.is_empty() {
-            ui.weak("No objects. Import a mesh (File) or run mesh.synth.");
+            ui.weak(t("objects.empty"));
         }
         let mut action: Option<(&str, Value)> = None;
-        egui::ScrollArea::vertical().id_salt("objects").max_height(320.0).show(ui, |ui| {
-            for s in &summaries {
-                ui.horizontal(|ui| {
-                    let mut vis = s.visible;
-                    if ui.checkbox(&mut vis, "").on_hover_text("Show / hide").changed() {
-                        action = Some(("doc.show", json!({"object": s.id.0, "visible": vis})));
-                    }
-                    let kind = match s.kind {
-                        ObjectKind::Mesh => "mesh",
-                        ObjectKind::Body => "body",
-                        ObjectKind::Region => "region",
-                        ObjectKind::Primitive => "primitive",
-                        ObjectKind::Surface => "surface",
-                        ObjectKind::Quad => "quads",
-                        ObjectKind::Sketch => "sketch",
-                        ObjectKind::Feature => "feature",
-                    };
-                    let sel = self.selected_object == Some(s.id);
-                    if ui
-                        .selectable_label(sel, format!("{kind} {} ({})", s.name, s.id))
-                        .on_hover_text(&s.detail)
-                        .clicked()
-                    {
-                        self.selected_object = if sel { None } else { Some(s.id) };
-                    }
-                    if ui.small_button("Delete").on_hover_text("Delete").clicked() {
-                        action = Some(("doc.delete", json!({"object": s.id.0})));
-                    }
-                });
+        for kind in KIND_ORDER {
+            let of_kind: Vec<_> = summaries.iter().filter(|s| s.kind == kind).collect();
+            if of_kind.is_empty() {
+                continue;
             }
-        });
+            let title = tf("objects.group", &[("kind", t(kind_plural_key(kind))), ("n", &of_kind.len().to_string())]);
+            egui::CollapsingHeader::new(title).id_salt(("objects", kind_key(kind))).default_open(true).show(ui, |ui| {
+                for s in of_kind {
+                    ui.horizontal(|ui| {
+                        if self.icon_toggle(ui, "objects.show_hide", if s.visible { "eye" } else { "eye-off" }, !s.visible).clicked()
+                        {
+                            action = Some(("doc.show", json!({"object": s.id.0, "visible": !s.visible})));
+                        }
+                        let sel = self.selected_object == Some(s.id);
+                        if ui
+                            .selectable_label(sel, format!("{} {} ({})", t(kind_key(kind)), s.name, s.id))
+                            .on_hover_text(&s.detail)
+                            .clicked()
+                        {
+                            self.selected_object = if sel { None } else { Some(s.id) };
+                        }
+                        if self.icon_toggle(ui, "objects.delete", "trash", false).clicked() {
+                            action = Some(("doc.delete", json!({"object": s.id.0})));
+                        }
+                    });
+                }
+            });
+        }
         if let Some((id, p)) = action {
             let _ = self.run_command(id, p);
         }
         self.picks_panel(ui);
     }
 
-    fn palette_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Commands");
+    /// The operation history: what undo would step back through, newest first.
+    pub(crate) fn history_panel(&mut self, ui: &mut egui::Ui) {
+        let labels = self.session.history.undo_labels();
+        if labels.is_empty() {
+            ui.weak(t("history.empty"));
+        }
+        for (i, label) in labels.iter().rev().enumerate() {
+            let text = if i == 0 { egui::RichText::new(*label).strong() } else { egui::RichText::new(*label) };
+            ui.label(text);
+        }
+        let redo = self.session.history.redo_len();
+        if redo > 0 {
+            ui.separator();
+            ui.weak(tf("history.redo", &[("n", &redo.to_string())]));
+        }
+    }
+
+    /// Regions of the document: persistent triangle sets of scans.
+    pub(crate) fn regions_panel(&mut self, ui: &mut egui::Ui) {
+        let regions: Vec<_> =
+            self.session.doc.summaries().into_iter().filter(|s| s.kind == ObjectKind::Region).collect();
+        if regions.is_empty() {
+            ui.weak(t("regions.empty"));
+        }
+        for s in &regions {
+            let sel = self.selected_object == Some(s.id);
+            if ui.selectable_label(sel, format!("{} ({})", s.name, s.id)).on_hover_text(&s.detail).clicked() {
+                self.selected_object = if sel { None } else { Some(s.id) };
+            }
+        }
+        ui.separator();
+        if ui.button(t("regions.auto_segment")).clicked() {
+            self.choose_command("region.auto_segment");
+        }
+        if ui.button(t("regions.create")).clicked() {
+            self.choose_command("region.create");
+        }
+    }
+
+    /// Deviation maps: the legend (tokens), the scans that carry a map and the commands.
+    pub(crate) fn deviation_panel(&mut self, ui: &mut egui::Ui) {
+        ui.strong(t("deviation.legend"));
+        for (token, key) in [
+            (Token::DeviationBelow, "deviation.below"),
+            (Token::DeviationInTolerance, "deviation.in_tolerance"),
+            (Token::DeviationAbove, "deviation.above"),
+            (Token::DeviationOutside, "deviation.outside"),
+        ] {
+            ui.horizontal(|ui| {
+                let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(self.settings.theme.density.metrics().icon), egui::Sense::hover());
+                ui.painter().rect_filled(rect, 3.0, self.tokens.color(token));
+                ui.label(t(key));
+            });
+        }
+        ui.separator();
+        let mut mapped: Vec<ObjectId> = self.session.overlays.keys().copied().collect();
+        mapped.sort();
+        if mapped.is_empty() {
+            ui.weak(t("deviation.none"));
+        }
+        let mut clear = None;
+        for id in mapped {
+            ui.horizontal(|ui| {
+                ui.label(format!("{id}"));
+                if ui.small_button(t("deviation.clear")).clicked() {
+                    clear = Some(id);
+                }
+            });
+        }
+        if let Some(id) = clear {
+            let _ = self.run_command("deviation.clear", json!({"object": id.0}));
+        }
+        ui.separator();
+        if ui.button(t("deviation.compute")).clicked() {
+            self.choose_command("deviation.compute");
+        }
+        if ui.button(t("deviation.noise")).clicked() {
+            self.choose_command("deviation.noise");
+        }
+    }
+
+    /// The command palette with its JSON parameter editor and the assistant.
+    pub(crate) fn palette_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let l = ui.label("Filter");
-            ui.add(egui::TextEdit::singleline(&mut self.palette_filter).hint_text("id or label")).labelled_by(l.id);
+            let l = ui.label(t("palette.filter"));
+            ui.add(egui::TextEdit::singleline(&mut self.palette_filter).hint_text(t("palette.filter_hint")))
+                .labelled_by(l.id);
         });
         let filter = self.palette_filter.to_lowercase();
         egui::ScrollArea::vertical().id_salt("cmdlist").max_height(220.0).show(ui, |ui| {
@@ -519,9 +521,9 @@ impl SurfaceCraftApp {
             if let Some(c) = surfacecraft_engine::cmd::find(id) {
                 ui.label(c.summary);
             }
-            let l = ui.label("Parameters (JSON)");
+            let l = ui.label(t("palette.parameters"));
             ui.add(egui::TextEdit::multiline(&mut self.palette_params).code_editor().desired_rows(6)).labelled_by(l.id);
-            if ui.button("Run").clicked() {
+            if ui.button(t("palette.run")).clicked() {
                 self.run_palette();
             }
             if let Some(last) = self.session.log.last()
@@ -534,7 +536,7 @@ impl SurfaceCraftApp {
                 });
             }
         } else {
-            ui.weak("Choose a command to see its parameters.");
+            ui.weak(t("palette.choose"));
         }
         self.assistant_panel(ui);
     }
@@ -547,8 +549,7 @@ impl SurfaceCraftApp {
     /// Runs the assistant on the current goal with a picture of the viewport.
     pub fn ask_assistant(&mut self) {
         let Some(mut p) = self.provider.take() else {
-            self.status =
-                "No AI provider: set SURFACECRAFT_AI_COMMAND (a program answering the assistant's JSON)".into();
+            self.status = t("assistant.no_provider_status").to_string();
             return;
         };
         let mode = if self.assistant_align { surfacecraft_ai::Mode::Align } else { surfacecraft_ai::Mode::Workflow };
@@ -565,32 +566,32 @@ impl SurfaceCraftApp {
 
     fn assistant_panel(&mut self, ui: &mut egui::Ui) {
         ui.separator();
-        ui.strong("Assistant");
+        ui.strong(t("assistant.title"));
         ui.horizontal(|ui| {
-            ui.radio_value(&mut self.assistant_align, true, "Align");
-            ui.radio_value(&mut self.assistant_align, false, "Workflow");
+            ui.radio_value(&mut self.assistant_align, true, t("assistant.align"));
+            ui.radio_value(&mut self.assistant_align, false, t("assistant.workflow"));
         });
-        let l = ui.label("Goal");
-        ui.add(egui::TextEdit::singleline(&mut self.assistant_goal).hint_text("e.g. align the scan to its faces"))
+        let l = ui.label(t("assistant.goal"));
+        ui.add(egui::TextEdit::singleline(&mut self.assistant_goal).hint_text(t("assistant.goal_hint")))
             .labelled_by(l.id);
-        if ui.button("Ask assistant").clicked() {
+        if ui.button(t("assistant.ask")).clicked() {
             self.ask_assistant();
         }
         if self.provider.is_none() {
-            ui.weak("No provider configured (SURFACECRAFT_AI_COMMAND).");
+            ui.weak(t("assistant.no_provider"));
         }
     }
 
-    fn log_panel(&mut self, ui: &mut egui::Ui) {
+    /// The command log: every call as the JSON a script or MCP client would send.
+    pub(crate) fn log_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.strong("Command log");
-            if ui.small_button("Copy as script").clicked() {
+            if ui.small_button(t("log.copy_script")).clicked() {
                 let text = serde_json::to_string_pretty(&self.log_as_script()).unwrap_or_default();
                 ui.ctx().copy_text(text);
-                self.status = "Script copied to the clipboard".into();
+                self.status = t("status.script_copied").to_string();
             }
         });
-        egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("log").auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
             for e in self.session.log.iter().rev().take(200).rev() {
                 let line = format!(
                     "{} {} {}",
@@ -598,13 +599,16 @@ impl SurfaceCraftApp {
                     e.command,
                     truncate(&e.params.to_string(), 300)
                 );
-                ui.monospace(line);
+                let color = self.tokens.color(if e.ok { Token::TextMuted } else { Token::StatusError });
+                ui.label(egui::RichText::new(line).monospace().color(color));
             }
         });
     }
 
-    fn viewport_panel(&mut self, ui: &mut egui::Ui) {
+    /// The 3D viewport: camera gestures, picking and the wgpu draw callback.
+    pub(crate) fn viewport_panel(&mut self, ui: &mut egui::Ui) {
         let rect = ui.available_rect_before_wrap();
+        self.viewport_rect = Some(rect);
         let resp = ui.allocate_rect(rect, egui::Sense::click_and_drag());
         if resp.dragged_by(egui::PointerButton::Primary) {
             let d = resp.drag_delta();
@@ -640,44 +644,75 @@ impl SurfaceCraftApp {
             self.fit_pending = false;
         }
         if !self.gpu {
+            ui.painter().rect_filled(rect, 0.0, self.tokens.color(Token::ViewportBackground));
             ui.painter().text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                format!("viewport (no GPU) — {} objects", self.session.doc.summaries().len()),
+                tf("viewport.no_gpu", &[("n", &self.session.doc.summaries().len().to_string())]),
                 egui::FontId::proportional(14.0),
-                ui.visuals().weak_text_color(),
+                self.tokens.color(Token::TextMuted),
             );
             return;
         }
         let ppp = ui.ctx().pixels_per_point();
         let size = [(rect.width() * ppp).round().max(1.0) as u32, (rect.height() * ppp).round().max(1.0) as u32];
+        let tokens = self.tokens.clone();
         let items: Vec<DrawItem> = self
             .session
             .display_items()
             .into_iter()
             .map(|d| DrawItem {
                 key: d.key,
-                color: kind_color(d.kind),
+                color: tokens.object(d.kind),
                 colors: d.colors.clone(),
                 colors_key: d.colors_key,
                 highlight: self.highlights.get(&d.id).map(|h| Arc::new(d.drawn_triangles(h))),
                 mesh: d.mesh,
             })
             .collect();
-        let bg = if ui.visuals().dark_mode { [0.08, 0.09, 0.11] } else { [0.85, 0.87, 0.9] };
+        let bg = self.tokens.viewport_background().map(f64::from);
         let frame = Frame { size, camera: self.camera.clone(), origin: self.camera.target, items, background: bg };
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(rect, ViewportCallback(frame)));
     }
 }
 
-impl eframe::App for SurfaceCraftApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.draw(ui);
-    }
+/// The order of the kinds in the object tree.
+const KIND_ORDER: [ObjectKind; 8] = [
+    ObjectKind::Mesh,
+    ObjectKind::Region,
+    ObjectKind::Primitive,
+    ObjectKind::Surface,
+    ObjectKind::Quad,
+    ObjectKind::Sketch,
+    ObjectKind::Body,
+    ObjectKind::Feature,
+];
 
-    #[cfg(target_arch = "wasm32")]
-    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
-        Some(&mut *self)
+/// The catalogue key of a kind's singular name.
+fn kind_key(kind: ObjectKind) -> &'static str {
+    match kind {
+        ObjectKind::Mesh => "kind.mesh",
+        ObjectKind::Body => "kind.body",
+        ObjectKind::Region => "kind.region",
+        ObjectKind::Primitive => "kind.primitive",
+        ObjectKind::Surface => "kind.surface",
+        ObjectKind::Quad => "kind.quad",
+        ObjectKind::Sketch => "kind.sketch",
+        ObjectKind::Feature => "kind.feature",
+    }
+}
+
+/// The catalogue key of a kind's plural (the group header of the object tree).
+fn kind_plural_key(kind: ObjectKind) -> &'static str {
+    match kind {
+        ObjectKind::Mesh => "kind.meshes",
+        ObjectKind::Body => "kind.bodies",
+        ObjectKind::Region => "kind.regions",
+        ObjectKind::Primitive => "kind.primitives",
+        ObjectKind::Surface => "kind.surfaces",
+        ObjectKind::Quad => "kind.quads",
+        ObjectKind::Sketch => "kind.sketches",
+        ObjectKind::Feature => "kind.features",
     }
 }
 
@@ -754,17 +789,10 @@ fn example(p: &Value, root: &Value) -> Value {
     }
 }
 
-/// Viewport colour of an object kind.
+/// Viewport colour of an object kind (the Light preset's, used for screenshots).
 #[must_use]
 pub fn kind_color(kind: ObjectKind) -> [f32; 4] {
-    match kind {
-        ObjectKind::Body => BODY_COLOR,
-        ObjectKind::Primitive => PRIMITIVE_COLOR,
-        ObjectKind::Surface => SURFACE_COLOR,
-        ObjectKind::Quad => QUAD_COLOR,
-        ObjectKind::Sketch => [1.0, 1.0, 0.3, 1.0],
-        ObjectKind::Mesh | ObjectKind::Region | ObjectKind::Feature => MESH_COLOR,
-    }
+    Tokens::resolve(crate::theme::Preset::Light).object(kind)
 }
 
 fn default_provider() -> Option<Box<dyn surfacecraft_ai::Provider>> {

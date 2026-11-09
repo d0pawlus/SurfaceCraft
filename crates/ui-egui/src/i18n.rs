@@ -32,6 +32,23 @@ impl Lang {
         }
     }
 
+    /// The language of the desktop session (`LC_ALL`, `LC_MESSAGES`, `LANG`; English on the web
+    /// and when none is set).
+    #[must_use]
+    pub fn from_system() -> Lang {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            for var in ["LC_ALL", "LC_MESSAGES", "LANG"] {
+                if let Ok(v) = std::env::var(var)
+                    && !v.is_empty()
+                {
+                    return Lang::from_locale(&v);
+                }
+            }
+        }
+        Lang::En
+    }
+
     /// The language of a locale tag such as `pl_PL.UTF-8` or `en-US` (English when unknown).
     #[must_use]
     pub fn from_locale(tag: &str) -> Lang {
@@ -84,6 +101,12 @@ pub fn lookup(lang: Lang, key: &str) -> &str {
 #[must_use]
 pub fn t(key: &str) -> &str {
     lookup(lang(), key)
+}
+
+/// The text of `key` in the current language or English, `None` when neither has it.
+#[must_use]
+pub fn find(key: &str) -> Option<&str> {
+    catalog(lang()).get(key).or_else(|| catalog(Lang::En).get(key)).map(String::as_str)
 }
 
 /// The text of `key` with each `{name}` replaced by the matching argument.

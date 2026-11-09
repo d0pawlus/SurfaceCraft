@@ -14,6 +14,12 @@
 
 pub mod app;
 pub mod camera;
+pub mod dock;
+pub mod i18n;
+pub mod icons;
+pub mod settings;
+pub mod shell;
+pub mod theme;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod control;
 pub mod shot;

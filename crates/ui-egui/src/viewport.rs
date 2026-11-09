@@ -290,14 +290,7 @@ impl Renderer {
         });
         let axes_colors = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("axes colours"),
-            contents: bytemuck::cast_slice(&[
-                [0.9f32, 0.2, 0.2, 1.0],
-                [0.9, 0.2, 0.2, 1.0],
-                [0.2, 0.8, 0.2, 1.0],
-                [0.2, 0.8, 0.2, 1.0],
-                [0.25, 0.4, 0.95, 1.0],
-                [0.25, 0.4, 0.95, 1.0],
-            ]),
+            contents: bytemuck::cast_slice(&crate::theme::Tokens::default().axis_vertex_colors()),
             usage: wgpu::BufferUsages::VERTEX,
         });
         Self {
