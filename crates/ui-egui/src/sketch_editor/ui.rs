@@ -370,31 +370,34 @@ impl SurfaceCraftApp {
         let mut cmds: Vec<Cmd> = Vec::new();
         let mut finish = false;
         let mut refit = false;
+        // a strip along the top edge of the viewport: the drawing tools and the status on the
+        // first row, the constraint tools, fit and finish on the second; the details (title,
+        // snap options, hints, the constraint list) fold behind the status button
         let chrome_rect = Rect::from_min_size(
             rect.min + Vec2::splat(8.0),
-            Vec2::new((rect.width() - 16.0).clamp(120.0, 560.0), (rect.height() - 16.0).max(60.0)),
+            Vec2::new((rect.width() - 16.0).max(120.0), (rect.height() - 16.0).max(60.0)),
         );
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(chrome_rect));
         let shown = egui::Frame::NONE
             .fill(tk.color(Token::SurfaceRaised))
             .stroke(Stroke::new(1.0, tk.color(Token::BorderSubtle)))
             .corner_radius(6.0)
-            .inner_margin(egui::Margin::same(8))
+            .inner_margin(egui::Margin::same(4))
             .show(&mut child, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.strong(tf("sketch.title", &[("name", &name)]));
-                    if ui.button(t("sketch.fit")).clicked() {
-                        refit = true;
-                    }
-                    if ui.button(t("sketch.finish")).clicked() {
-                        finish = true;
-                    }
-                });
                 ui.horizontal_wrapped(|ui| {
                     for tool in std::iter::once(Tool::Select).chain(Tool::DRAW) {
                         if ui.selectable_label(ed.tool == tool, t(tool.label_key())).clicked() {
                             ed.set_tool(tool);
                         }
+                    }
+                    let label = egui::RichText::new(tf(
+                        status.key,
+                        &[("dof", &status.dof.to_string()), ("n", &status.conflicting.len().to_string())],
+                    ))
+                    .color(tk.color(status.token))
+                    .strong();
+                    if ui.selectable_label(ed.details_open, label).on_hover_text(t("sketch.details_hint")).clicked() {
+                        ed.details_open = !ed.details_open;
                     }
                 });
                 ui.horizontal_wrapped(|ui| {
@@ -403,101 +406,103 @@ impl SurfaceCraftApp {
                             ed.set_tool(tool);
                         }
                     }
+                    if ui.button(t("sketch.fit")).clicked() {
+                        refit = true;
+                    }
+                    if ui.button(t("sketch.finish")).clicked() {
+                        finish = true;
+                    }
                 });
-                ui.horizontal_wrapped(|ui| {
-                    ui.checkbox(&mut ed.snap.points, t("sketch.snap.points"));
-                    ui.checkbox(&mut ed.snap.midpoints, t("sketch.snap.midpoints"));
-                    ui.checkbox(&mut ed.snap.inference, t("sketch.snap.inference"));
-                    ui.checkbox(&mut ed.snap.grid, t("sketch.snap.grid_on"));
-                });
-                ui.weak(t(ed.tool.hint_key()));
-                let col = tk.color(status.token);
-                ui.label(
-                    egui::RichText::new(tf(
-                        status.key,
-                        &[("dof", &status.dof.to_string()), ("n", &status.conflicting.len().to_string())],
-                    ))
-                    .color(col)
-                    .strong(),
-                );
-                if !status.conflicting.is_empty() {
-                    let list: Vec<String> = status.conflicting.iter().map(|i| format!("#{i}")).collect();
-                    ui.label(
-                        egui::RichText::new(tf("sketch.status.conflicting", &[("list", &list.join(", "))]))
-                            .color(tk.color(Token::StatusError)),
-                    );
-                }
-                if let Some(msg) = report
-                    .as_ref()
-                    .filter(|r| r.status == surfacecraft_sketch::SolveStatus::Failed)
-                    .map(|r| r.message.clone())
-                {
-                    ui.weak(msg);
-                }
-                if let Some(n) = ed.notice {
-                    ui.label(egui::RichText::new(t(n)).color(tk.color(Token::StatusError)));
-                }
-                if let Some(p) = ed.pending.as_mut() {
+                // a dimension being typed in, and the details the user opened
+                if ed.details_open || ed.pending.is_some() {
                     ui.separator();
-                    let mut commit = false;
-                    let mut delete = None;
-                    ui.horizontal(|ui| {
-                        let l = ui.label(t(p.kind.label_key()));
-                        let r = ui.add(egui::TextEdit::singleline(&mut p.text).desired_width(90.0)).labelled_by(l.id);
-                        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                            commit = true;
-                        } else if !r.has_focus() {
-                            r.request_focus();
-                        }
-                        if ui.button(t("sketch.dim.apply")).clicked() {
-                            commit = true;
-                        }
-                        if let Some(i) = p.index
-                            && ui.button(t("sketch.dim.delete")).clicked()
-                        {
-                            delete = Some(i);
-                        }
+                    ui.strong(tf("sketch.title", &[("name", &name)]));
+                    ui.horizontal_wrapped(|ui| {
+                        ui.checkbox(&mut ed.snap.points, t("sketch.snap.points"));
+                        ui.checkbox(&mut ed.snap.midpoints, t("sketch.snap.midpoints"));
+                        ui.checkbox(&mut ed.snap.inference, t("sketch.snap.inference"));
+                        ui.checkbox(&mut ed.snap.grid, t("sketch.snap.grid_on"));
                     });
-                    if commit {
-                        cmds.extend(ed.commit_pending());
-                    }
-                    if let Some(i) = delete {
-                        ed.pending = None;
-                        cmds.extend(ed.delete_constraint(i));
-                    }
-                }
-                egui::CollapsingHeader::new(tf("sketch.constraints", &[("n", &sk.constraints.len().to_string())]))
-                    .id_salt("sketch-constraints")
-                    .show(ui, |ui| {
-                        egui::ScrollArea::vertical().id_salt("sketch-constraint-list").max_height(140.0).show(
-                            ui,
-                            |ui| {
-                                for (i, c) in sk.constraints.iter().enumerate() {
-                                    let token = if status.conflicting.contains(&i) {
-                                        Token::StatusError
-                                    } else if status.redundant.contains(&i) {
-                                        Token::StatusWarning
-                                    } else {
-                                        Token::TextPrimary
-                                    };
-                                    ui.horizontal(|ui| {
-                                        let kind = constraint_kind_name(c);
-                                        let text = format!("#{i} {} {}", kind, constraint_mark(c));
-                                        let r = ui.add(
-                                            egui::Label::new(egui::RichText::new(text).color(tk.color(token)))
-                                                .sense(egui::Sense::click()),
-                                        );
-                                        if r.clicked() {
-                                            ed.begin_edit(&sk, i);
-                                        }
-                                        if ui.small_button("x").on_hover_text(t("sketch.dim.delete")).clicked() {
-                                            cmds.extend(ed.delete_constraint(i));
-                                        }
-                                    });
-                                }
-                            },
+                    ui.weak(t(ed.tool.hint_key()));
+                    if !status.conflicting.is_empty() {
+                        let list: Vec<String> = status.conflicting.iter().map(|i| format!("#{i}")).collect();
+                        ui.label(
+                            egui::RichText::new(tf("sketch.status.conflicting", &[("list", &list.join(", "))]))
+                                .color(tk.color(Token::StatusError)),
                         );
-                    });
+                    }
+                    if let Some(msg) = report
+                        .as_ref()
+                        .filter(|r| r.status == surfacecraft_sketch::SolveStatus::Failed)
+                        .map(|r| r.message.clone())
+                    {
+                        ui.weak(msg);
+                    }
+                    if let Some(n) = ed.notice {
+                        ui.label(egui::RichText::new(t(n)).color(tk.color(Token::StatusError)));
+                    }
+                    if let Some(p) = ed.pending.as_mut() {
+                        let mut commit = false;
+                        let mut delete = None;
+                        ui.horizontal(|ui| {
+                            let l = ui.label(t(p.kind.label_key()));
+                            let r =
+                                ui.add(egui::TextEdit::singleline(&mut p.text).desired_width(90.0)).labelled_by(l.id);
+                            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                commit = true;
+                            } else if !r.has_focus() {
+                                r.request_focus();
+                            }
+                            if ui.button(t("sketch.dim.apply")).clicked() {
+                                commit = true;
+                            }
+                            if let Some(i) = p.index
+                                && ui.button(t("sketch.dim.delete")).clicked()
+                            {
+                                delete = Some(i);
+                            }
+                        });
+                        if commit {
+                            cmds.extend(ed.commit_pending());
+                        }
+                        if let Some(i) = delete {
+                            ed.pending = None;
+                            cmds.extend(ed.delete_constraint(i));
+                        }
+                    }
+                    egui::CollapsingHeader::new(tf("sketch.constraints", &[("n", &sk.constraints.len().to_string())]))
+                        .id_salt("sketch-constraints")
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical().id_salt("sketch-constraint-list").max_height(140.0).show(
+                                ui,
+                                |ui| {
+                                    for (i, c) in sk.constraints.iter().enumerate() {
+                                        let token = if status.conflicting.contains(&i) {
+                                            Token::StatusError
+                                        } else if status.redundant.contains(&i) {
+                                            Token::StatusWarning
+                                        } else {
+                                            Token::TextPrimary
+                                        };
+                                        ui.horizontal(|ui| {
+                                            let kind = constraint_kind_name(c);
+                                            let text = format!("#{i} {} {}", kind, constraint_mark(c));
+                                            let r = ui.add(
+                                                egui::Label::new(egui::RichText::new(text).color(tk.color(token)))
+                                                    .sense(egui::Sense::click()),
+                                            );
+                                            if r.clicked() {
+                                                ed.begin_edit(&sk, i);
+                                            }
+                                            if ui.small_button("x").on_hover_text(t("sketch.dim.delete")).clicked() {
+                                                cmds.extend(ed.delete_constraint(i));
+                                            }
+                                        });
+                                    }
+                                },
+                            );
+                        });
+                }
             });
         ed.chrome = vec![[
             shown.response.rect.min.x,

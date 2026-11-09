@@ -305,6 +305,8 @@ pub struct SketchEditor {
     /// Where the editor's own controls were drawn this frame (screen points, `[x0, y0, x1, y1]`):
     /// clicks there are not clicks on the sketch.
     pub chrome: Vec<[f32; 4]>,
+    /// The strip's details (snap options, hints, the constraint list) are shown.
+    pub details_open: bool,
 }
 
 impl Default for SketchEditor {
@@ -321,6 +323,7 @@ impl Default for SketchEditor {
             notice: None,
             labels: Vec::new(),
             chrome: Vec::new(),
+            details_open: false,
         }
     }
 }

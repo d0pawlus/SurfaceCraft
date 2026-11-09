@@ -215,7 +215,9 @@ pub(crate) fn show(app: &mut SurfaceCraftApp, ui: &mut egui::Ui) {
     }
 }
 
-/// The current map: legend, statistics, histogram and the tolerance control.
+/// The current map, in the order the tab's height shows it: the statistics and the histogram
+/// first (they fit the default height without scrolling), then the tolerance control and the
+/// legend.
 fn map_section(app: &mut SurfaceCraftApp, ui: &mut egui::Ui, tokens: &Tokens, cur: &Current) {
     let tol = cur.stats.tolerance;
     let reference = match cur.params.get("against") {
@@ -223,26 +225,12 @@ fn map_section(app: &mut SurfaceCraftApp, ui: &mut egui::Ui, tokens: &Tokens, cu
         Some(other) => other.to_string(),
         None => String::new(),
     };
-    ui.strong(tf("deviation.map_of", &[("name", &cur.name)]));
-    ui.weak(tf("deviation.against", &[("ref", &reference)]));
+    ui.horizontal_wrapped(|ui| {
+        ui.strong(tf("deviation.map_of", &[("name", &cur.name)]));
+        ui.weak(tf("deviation.against", &[("ref", &reference)]));
+    });
 
-    ui.strong(t("deviation.legend"));
-    gradient_bar(ui, tokens, tol);
-    let icon = app.settings.theme.density.metrics().icon;
-    for row in &LEGEND {
-        ui.horizontal(|ui| {
-            for &token in row.chips {
-                let (rect, _) = ui.allocate_exact_size(Vec2::splat(icon), Sense::hover());
-                ui.painter().rect_filled(rect, 3.0, tokens.color(token));
-            }
-            ui.label(t(row.key));
-            if let Some(range) = row.range {
-                ui.weak(range_text(range, tol));
-            }
-        });
-    }
-    ui.separator();
-
+    // two label-and-value pairs per row: the statistics take four rows
     ui.strong(t("deviation.stats"));
     let s = &cur.stats;
     let rows = [
@@ -254,10 +242,12 @@ fn map_section(app: &mut SurfaceCraftApp, ui: &mut egui::Ui, tokens: &Tokens, cu
         (t("deviation.max_abs").to_string(), num(s.max_abs, 3)),
         (tf("deviation.within", &[("tol", &num(tol, 3))]), format!("{} %", num(s.within * 100.0, 1))),
     ];
-    egui::Grid::new(("deviation-stats", cur.object.0)).num_columns(2).show(ui, |ui| {
-        for (label, value) in rows {
-            ui.label(label);
-            ui.monospace(value);
+    egui::Grid::new(("deviation-stats", cur.object.0)).num_columns(4).spacing([10.0, 2.0]).show(ui, |ui| {
+        for pair in rows.chunks(2) {
+            for (label, value) in pair {
+                ui.label(label.as_str());
+                ui.monospace(value.as_str());
+            }
             ui.end_row();
         }
     });
@@ -279,6 +269,22 @@ fn map_section(app: &mut SurfaceCraftApp, ui: &mut egui::Ui, tokens: &Tokens, cu
     }
     if recompute_now {
         let _ = recompute(app, edit);
+    }
+
+    ui.strong(t("deviation.legend"));
+    gradient_bar(ui, tokens, tol);
+    let icon = app.settings.theme.density.metrics().icon;
+    for row in &LEGEND {
+        ui.horizontal(|ui| {
+            for &token in row.chips {
+                let (rect, _) = ui.allocate_exact_size(Vec2::splat(icon), Sense::hover());
+                ui.painter().rect_filled(rect, 3.0, tokens.color(token));
+            }
+            ui.label(t(row.key));
+            if let Some(range) = row.range {
+                ui.weak(range_text(range, tol));
+            }
+        });
     }
 }
 
@@ -311,7 +317,7 @@ fn histogram(ui: &mut egui::Ui, tokens: &Tokens, stats: &DeviationStats) {
     let bins = bins(stats);
     let max = bins.iter().map(|b| b.count).max().unwrap_or(0).max(1) as f32;
     let width = ui.available_width().max(120.0);
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 96.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 64.0), Sense::hover());
     let painter = ui.painter_at(rect);
     let base = rect.bottom() - 14.0;
     let x_at = |v: f64| rect.left() + ((v / (6.0 * tol)) + 0.5) as f32 * rect.width();

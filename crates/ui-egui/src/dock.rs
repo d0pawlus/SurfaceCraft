@@ -104,34 +104,29 @@ fn dock(side: Side, width: f32, groups: &[&[Panel]]) -> Node<Panel> {
 }
 
 /// The default arrangement for a dock column width (in points): objects over history on the left,
-/// the viewport over the log in the middle, properties over regions and the deviation map in a
-/// column of its own on the right.
+/// the viewport over the log in the middle, and on the right one column with the properties over
+/// a group of two tabs, regions and the deviation map. The viewport keeps most of the window.
 #[must_use]
 pub fn default_workspace(side_width: f32) -> Workspace {
     let centre =
         split(SplitAxis::Vertical, SplitSize::FixedSecond(150.0), tabs(&[Panel::Viewport]), tabs(&[Panel::Log]));
-    // The right dock has two columns: the properties over the regions, and the deviation map
-    // (legend, statistics, histogram: about 600 points tall) in a column of its own, so none of
-    // it needs scrolling.
-    let (col_a, col_b) = (side_width + 40.0, side_width + 20.0);
-    let right = Node::Dock {
-        side: Side::End,
-        columns: vec![
-            Column::new(vec![Group::new(vec![Panel::Properties], 0), Group::new(vec![Panel::Regions], 0)], col_a),
-            Column::new(vec![Group::new(vec![Panel::Deviation], 0)], col_b),
-        ],
-    };
+    let column_width = side_width + 40.0;
+    let right = dock(Side::End, column_width, &[&[Panel::Properties], &[Panel::Regions, Panel::Deviation]]);
     let left = dock(Side::Start, side_width, &[&[Panel::Objects], &[Panel::History]]);
     Workspace::new(Layout {
         root: Some(split(
             SplitAxis::Horizontal,
             SplitSize::FixedFirst(side_width),
             left,
-            split(SplitAxis::Horizontal, SplitSize::FixedSecond(col_a + col_b), centre, right),
+            split(SplitAxis::Horizontal, SplitSize::FixedSecond(column_width), centre, right),
         )),
         floating: Vec::new(),
     })
 }
+
+/// Body height of the deviation tab in the default right dock: with its tab strip about 45 % of
+/// the dock at 1500 x 900 points, which shows the statistics and the histogram without scrolling.
+pub const DEVIATION_BODY_HEIGHT: f32 = 336.0;
 
 /// Fits a loaded workspace to the panels registered now and to the viewport rules: an invalid
 /// file gives the default arrangement; the viewport is always shown.
@@ -150,6 +145,14 @@ pub fn set_visible(workspace: &mut Workspace, panel: Panel, visible: bool) -> Re
         return Ok(());
     }
     workspace.set_visible(panel, visible, None, permissions).map_err(|e| e.to_string())
+}
+
+/// Brings a panel's tab to the front of its group (a panel that is not shown is left alone).
+pub fn show_tab(workspace: &mut Workspace, panel: Panel) {
+    let mut next = workspace.clone();
+    if next.apply_all([Action::Activate { panel }], permissions).is_ok() {
+        *workspace = next;
+    }
 }
 
 /// Applies the actions the dock area emitted (a drag, a menu item of a tab) to the workspace.
@@ -204,12 +207,14 @@ impl DockContent<Panel> for Panels<'_> {
     }
 
     fn dock_heights(&self, panel: &Panel) -> Option<DockHeights> {
-        // The object tree keeps more room than the history under it; the properties (command
-        // list, parameters, assistant) take the right dock's height, regions and deviation the rest.
+        // The object tree keeps more room than the history under it. The right dock's properties
+        // (command, parameters, assistant) take the height the bottom group leaves; the group of
+        // regions and deviation tabs asks for about 45 % of the dock, enough for the statistics.
         match panel {
             Panel::Objects => Some(DockHeights::new(360.0)),
             Panel::Properties => Some(DockHeights::new(640.0).compact(360.0).fill(460.0)),
-            Panel::Regions | Panel::Deviation => Some(DockHeights::new(150.0).compact(110.0)),
+            Panel::Regions => Some(DockHeights::new(150.0).compact(110.0)),
+            Panel::Deviation => Some(DockHeights::new(DEVIATION_BODY_HEIGHT).compact(240.0)),
             _ => None,
         }
     }

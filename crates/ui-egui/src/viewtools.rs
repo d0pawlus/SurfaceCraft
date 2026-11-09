@@ -28,6 +28,8 @@ pub const EDGE_PICK_PX: f64 = 7.0;
 /// Half-size of the view cube (px).
 const CUBE_HALF: f64 = 44.0;
 const CUBE_MARGIN: f64 = 14.0;
+/// Width the view cube takes at the top right of the viewport, margins included (px).
+const CUBE_SPACE: f32 = 2.0 * (CUBE_HALF as f32 + CUBE_MARGIN as f32) + 12.0;
 
 /// The tool the primary mouse button drives in the viewport.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -819,13 +821,16 @@ impl SurfaceCraftApp {
         }
     }
 
-    /// The tool strip in the top-left corner of the viewport.
+    /// The tool strip in the top-left corner of the viewport. It wraps before the view cube's
+    /// corner, so the two never overlap, however narrow the viewport.
     fn tool_strip(&mut self, ctx: &egui::Context, rect: egui::Rect) {
         let pos = rect.min + egui::vec2(8.0, 8.0);
+        let width = (rect.width() - CUBE_SPACE - 8.0).max(160.0);
         egui::Area::new(egui::Id::unique("viewport-tools")).fixed_pos(pos).order(egui::Order::Foreground).show(
             ctx,
             |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_max_width(width);
                     ui.horizontal_wrapped(|ui| {
                         for tool in Tool::ALL {
                             if ui.selectable_label(self.tools.tool == tool, t(tool.key())).clicked() {
