@@ -17,4 +17,6 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # solidcore, pinned by rev in Cargo.toml (design doc §9). Only crates/kernel uses it.
-allow-git = ["https://github.com/tangency-labs/solidcore"]
+# craft-libs (ArtCraft family UI: craft-ui, craft-window, craft-dialogs), pinned by rev; UI layer only
+# (owner's decision 2026-11-09, docs/superpowers/plans/2026-11-09-p6-gui.md).
+allow-git = ["https://github.com/tangency-labs/solidcore", "https://github.com/storytold/craft-libs"]
