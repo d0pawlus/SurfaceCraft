@@ -583,8 +583,10 @@ pub fn fit_torus(pts: &[Point3], normals: &[Vec3]) -> Option<PrimitiveFit> {
     // tube centres for a trial tube radius s lie on a planar circle: score s by that
     // returns (cost, circle centre, axis, major radius, unit direction from the centre to the
     // middle of the arc the tube centres cover)
-    let score = |s: f64| -> Option<(f64, Vec3, Vec3, f64, Vec3)> {
-        let cs: Vec<Point3> = sub.iter().zip(&nsub).map(|(p, n)| p - n * s).collect();
+    // (the sign of the scan normals is not known: they point away from the tube centre on a convex
+    // patch and towards it on a concave one, so `side` = ±1 tries both)
+    let score = |s: f64, side: f64| -> Option<(f64, Vec3, Vec3, f64, Vec3)> {
+        let cs: Vec<Point3> = sub.iter().zip(&nsub).map(|(p, n)| p - n * (s * side)).collect();
         let pl = crate::plane::fit_plane(&cs, None)?;
         let (u, w) = basis(&pl.normal);
         let o = pl.point.coords;
@@ -608,31 +610,34 @@ pub fn fit_torus(pts: &[Point3], normals: &[Vec3]) -> Option<PrimitiveFit> {
     // and the few best distinct trials start the fit.
     let steps = 80;
     // (true torus residual, tube radius, circle centre, axis, major radius)
-    let mut best_per_factor: Vec<Option<(f64, f64, Vec3, Vec3, f64)>> = vec![None; TORUS_FACTORS.len()];
+    // per factor and per side of the normals
+    let mut best_per_factor: Vec<Option<(f64, f64, Vec3, Vec3, f64)>> = vec![None; TORUS_FACTORS.len() * 2];
     for k in 1..=steps {
         // geometric from 1 % to 400 % of the extent: the tube of a partial torus patch can be
         // larger than the patch, so a linear scan up to half the extent never reaches its radius
         let s = ext * 0.01 * 400f64.powf(k as f64 / steps as f64);
-        let Some((_, c0, a, big0, dir)) = score(s) else { continue };
-        let arc_mid = c0 + dir * big0;
-        for (fi, f) in TORUS_FACTORS.iter().enumerate() {
-            let big = big0 * f;
-            let c = arc_mid - dir * big;
-            let geo = sub
-                .iter()
-                .map(|q| {
-                    let x = q.coords - c;
-                    let h = x.dot(&a);
-                    let rho = (x - a * h).norm();
-                    ((rho - big).hypot(h) - s).powi(2)
-                })
-                .sum::<f64>()
-                / sub.len() as f64;
-            if let Some(slot) = best_per_factor.get_mut(fi)
-                && geo.is_finite()
-                && slot.as_ref().is_none_or(|b| geo < b.0)
-            {
-                *slot = Some((geo, s, c, a, big));
+        for (si, side) in [1.0, -1.0].into_iter().enumerate() {
+            let Some((_, c0, a, big0, dir)) = score(s, side) else { continue };
+            let arc_mid = c0 + dir * big0;
+            for (fi, f) in TORUS_FACTORS.iter().enumerate() {
+                let big = big0 * f;
+                let c = arc_mid - dir * big;
+                let geo = sub
+                    .iter()
+                    .map(|q| {
+                        let x = q.coords - c;
+                        let h = x.dot(&a);
+                        let rho = (x - a * h).norm();
+                        ((rho - big).hypot(h) - s).powi(2)
+                    })
+                    .sum::<f64>()
+                    / sub.len() as f64;
+                if let Some(slot) = best_per_factor.get_mut(fi * 2 + si)
+                    && geo.is_finite()
+                    && slot.as_ref().is_none_or(|b| geo < b.0)
+                {
+                    *slot = Some((geo, s, c, a, big));
+                }
             }
         }
     }
@@ -782,6 +787,40 @@ mod tests {
             let Primitive::Torus { major_radius, minor_radius, .. } = f.primitive else { panic!() };
             assert!(f.rms <= 0.1, "torus {k}: rms {} major {major_radius} minor {minor_radius}", f.rms);
             assert!(minor_radius < major_radius, "torus {k}: spindle torus {major_radius} {minor_radius}");
+        }
+    }
+
+    /// The foot fillet of a boss (a quarter round, radius 2, about a ring of radius 10 on a boss of
+    /// radius 8): a full revolution of a short, small tube arc, with the scan normals pointing into
+    /// the void (towards the tube centre) or the other way.
+    #[test]
+    fn boss_foot_quarter_round_is_fitted() {
+        let axis = Vec3::new(0.0, 0.0, 1.0);
+        let center = Point3::new(30.0, 20.0, 10.0);
+        let x = Vec3::x();
+        let y = Vec3::y();
+        for flip in [false, true] {
+            let full = synth::torus(center, axis, 10.0, 2.0, 360, 90);
+            let normals = full.vertex_normals();
+            let mut rng = Rng::new(5);
+            let (mut p, mut n) = (Vec::new(), Vec::new());
+            for (q, nq) in full.positions.iter().zip(&normals) {
+                let d = q - center;
+                let rho = d.dot(&x).hypot(d.dot(&y));
+                // the quadrant inside the corner: towards the axis and down
+                if rho < 9.95 && d.z < -0.05 {
+                    p.push(q + Vec3::new(rng.gauss(), rng.gauss(), rng.gauss()) * 0.03);
+                    let m = if flip { -nq } else { *nq };
+                    n.push((m + Vec3::new(rng.gauss(), rng.gauss(), rng.gauss()) * 0.03).normalize());
+                }
+            }
+            let f = fit(PrimitiveKind::Torus, &p, &n).expect("a torus fit");
+            let Primitive::Torus { major_radius, minor_radius, .. } = f.primitive else { panic!() };
+            eprintln!("flip {flip}: {} pts rms {} major {major_radius} minor {minor_radius}", p.len(), f.rms);
+            assert!(
+                (major_radius - 10.0).abs() < 0.3 && (minor_radius - 2.0).abs() < 0.1,
+                "flip {flip}: major {major_radius} minor {minor_radius}"
+            );
         }
     }
 
