@@ -25,9 +25,12 @@ fn dock_layout_shows_the_viewport_and_every_panel() {
     for panel in Panel::ALL {
         assert!(app.workspace.layout.contains(&panel), "{panel:?} is in the default layout");
     }
-    // the viewport is the biggest thing on screen and sits between the docks
+    // the viewport is the biggest thing on screen and sits between the docks: the right dock is
+    // one column, so the viewport keeps most of the window's width
     let vp = app.viewport_rect.expect("the viewport was drawn");
-    assert!(vp.width() > 600.0 && vp.height() > 400.0, "viewport {vp:?}");
+    assert!(vp.width() > 800.0 && vp.height() > 400.0, "viewport {vp:?}");
+    assert!(h.query_by_label(i18n::lookup(Lang::En, "panel.regions")).is_some());
+    assert!(h.query_by_label(i18n::lookup(Lang::En, "panel.deviation")).is_some(), "the deviation tab");
     // the panels' tabs are on screen under their translated titles
     for key in ["panel.objects", "panel.history", "panel.properties", "panel.regions", "panel.deviation", "panel.log"] {
         let title = i18n::lookup(Lang::En, key);
@@ -57,10 +60,17 @@ fn the_viewport_is_protected_and_the_layout_survives_a_round_trip() {
         theme: Theme { preset: Preset::Light, density: Density::Compact },
         lang: Lang::Pl,
         workspace: Some(ws.clone()),
+        layout_version: surfacecraft_ui_egui::settings::LAYOUT_VERSION,
     };
     let back = UiSettings::from_json(&settings.to_json());
     assert_eq!(back, settings);
     assert_eq!(UiSettings::from_json("{ not json"), UiSettings::default());
+    // a layout saved under an older arrangement is dropped, the theme and language are kept
+    let mut older = settings.clone();
+    older.layout_version = 1;
+    let migrated = UiSettings::from_json(&serde_json::to_string(&older).unwrap());
+    assert_eq!(migrated.workspace, None);
+    assert_eq!(migrated.lang, Lang::Pl);
     // and an app started from them uses them
     let app = SurfaceCraftApp::with_settings(back);
     assert_eq!(app.workspace.layout, ws.layout);

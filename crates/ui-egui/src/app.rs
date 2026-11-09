@@ -27,6 +27,8 @@ pub struct SurfaceCraftApp {
     pub palette_params: String,
     /// Palette filter text.
     pub palette_filter: String,
+    /// The command list is shown in full (it folds to one line once a command is chosen).
+    pub palette_list_open: bool,
     /// The sketch editing mode (G5).
     pub sketch_editor: crate::sketch_editor::SketchEditor,
     /// The Properties panel's form and live preview.
@@ -106,6 +108,7 @@ impl SurfaceCraftApp {
             palette_command: None,
             palette_params: "{}".into(),
             palette_filter: String::new(),
+            palette_list_open: true,
             sketch_editor: crate::sketch_editor::SketchEditor::default(),
             cmd_panel: Default::default(),
             hist_panel: Default::default(),
@@ -254,6 +257,10 @@ impl SurfaceCraftApp {
                 if had == 0 && !self.session.doc.summaries().is_empty() {
                     self.fit_pending = true;
                 }
+                if id == "deviation.compute" {
+                    // a new map is what the Deviation tab shows
+                    crate::dock::show_tab(&mut self.workspace, crate::dock::Panel::Deviation);
+                }
             }
             Err(e) => self.status = format!("{id}: {e}"),
         }
@@ -263,6 +270,8 @@ impl SurfaceCraftApp {
     /// Chooses a command in the palette and prefills its parameters.
     pub fn choose_command(&mut self, id: &'static str) {
         self.palette_command = Some(id);
+        // the form is what the Properties panel shows now: the list folds to one line
+        self.palette_list_open = false;
         let schema = surfacecraft_engine::cmd::find(id).map(|c| (c.input)()).unwrap_or(Value::Null);
         self.palette_params =
             serde_json::to_string_pretty(&template(&schema, &self.pick_context())).unwrap_or_else(|_| "{}".into());
@@ -486,10 +495,29 @@ impl SurfaceCraftApp {
 
     /// The command palette with its JSON parameter editor and the assistant.
     pub(crate) fn palette_panel(&mut self, ui: &mut egui::Ui) {
+        if self.palette_command.is_some() && !self.palette_list_open {
+            self.palette_folded(ui);
+        } else {
+            self.palette_list(ui);
+        }
+        ui.separator();
+        if let Some(id) = self.palette_command {
+            crate::command_panel::command_body(self, ui, id);
+        } else {
+            ui.weak(t("palette.choose"));
+        }
+        self.assistant_panel(ui);
+    }
+
+    /// The full command list with the filter (searchable), the Properties panel's list.
+    fn palette_list(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let l = ui.label(t("palette.filter"));
             ui.add(egui::TextEdit::singleline(&mut self.palette_filter).hint_text(t("palette.filter_hint")))
                 .labelled_by(l.id);
+            if self.palette_command.is_some() && ui.small_button(t("palette.hide_list")).clicked() {
+                self.palette_list_open = false;
+            }
         });
         let filter = self.palette_filter.to_lowercase();
         egui::ScrollArea::vertical().id_salt("cmdlist").max_height(160.0).show(ui, |ui| {
@@ -503,13 +531,35 @@ impl SurfaceCraftApp {
                 }
             }
         });
-        ui.separator();
-        if let Some(id) = self.palette_command {
-            crate::command_panel::command_body(self, ui, id);
-        } else {
-            ui.weak(t("palette.choose"));
-        }
-        self.assistant_panel(ui);
+    }
+
+    /// The chosen command on one line with the filter: the list folds to this once a command is
+    /// chosen, and the button shows the whole list again. Typing in the filter shows the list.
+    fn palette_folded(&mut self, ui: &mut egui::Ui) {
+        let chosen = self
+            .session
+            .commands()
+            .iter()
+            .find(|c| Some(c.id) == self.palette_command)
+            .map(|c| format!("{}  —  {}", c.id, c.label))
+            .unwrap_or_default();
+        ui.horizontal(|ui| {
+            let l = ui.label(t("palette.filter"));
+            let filter = ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.palette_filter)
+                        .hint_text(t("palette.filter_hint"))
+                        .desired_width(96.0),
+                )
+                .labelled_by(l.id);
+            if filter.changed() {
+                self.palette_list_open = true;
+            }
+            ui.add(egui::Label::new(egui::RichText::new(chosen).strong()).truncate());
+            if ui.small_button(t("palette.show_all")).clicked() {
+                self.palette_list_open = true;
+            }
+        });
     }
 
     /// Uses `p` as the assistant's language model.

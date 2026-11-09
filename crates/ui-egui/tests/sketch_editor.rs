@@ -504,7 +504,11 @@ fn constraint_by_mouse_and_the_status_and_conflict_show_on_screen() {
         )
         .expect("constrain");
     h.run();
+    // the status is on the strip's button; the conflicting constraints are in its details
     assert!(h.query_by_label_contains("Over-defined").is_some());
+    assert!(h.query_by_label_contains("Conflicting constraints: #").is_none(), "folded");
+    h.get_by_label_contains("Over-defined").click();
+    h.run();
     assert!(h.query_by_label_contains("Conflicting constraints: #").is_some());
 }
 

@@ -85,10 +85,14 @@ fn render(h: &mut H, dir: &std::path::Path, file: &str) {
     std::fs::write(dir.join(file), png).expect("write the screenshot");
 }
 
-fn harness(mut app: SurfaceCraftApp) -> H {
+fn harness(app: SurfaceCraftApp) -> H {
+    harness_sized(app, (1500.0, 900.0))
+}
+
+fn harness_sized(mut app: SurfaceCraftApp, size: (f32, f32)) -> H {
     app.lay_out_for_gpu();
     let mut h = Harness::builder()
-        .with_size((1500.0, 900.0))
+        .with_size(size)
         .with_pixels_per_point(1.0)
         .wgpu()
         .build_ui_state(|ui, app: &mut SurfaceCraftApp| app.draw(ui), app);
@@ -175,6 +179,16 @@ fn gizmo(dir: &std::path::Path) {
     render(&mut h, dir, "p6-gizmo-viewcube.png");
 }
 
+/// A narrow window: the viewport's tool strip wraps before the view cube's corner.
+fn narrow(dir: &std::path::Path) {
+    let mut app = SurfaceCraftApp::headless();
+    scene(&mut app);
+    app.selected_object = Some(app.session.doc.meshes[0].id);
+    app.tools.tool = Tool::Move;
+    let mut h = harness_sized(app, (980.0, 760.0));
+    render(&mut h, dir, "p6-narrow-viewcube.png");
+}
+
 /// A lasso selection on a sphere scan: the outline and the selected triangles.
 fn lasso(dir: &std::path::Path) {
     let mut app = SurfaceCraftApp::headless();
@@ -218,6 +232,7 @@ fn write_shell_screenshots() {
     sketch(&dir);
     form(&dir);
     gizmo(&dir);
+    narrow(&dir);
     lasso(&dir);
     section(&dir);
 }
