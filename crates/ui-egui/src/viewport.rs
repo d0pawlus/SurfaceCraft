@@ -692,10 +692,26 @@ mod tests {
     use super::*;
     use surfacecraft_geom::synth;
 
+    /// GPU tests are opt-in: set `SURFACECRAFT_GPU_TESTS=1` on a machine with a real GPU. CI
+    /// runners only have software adapters (WARP, lavapipe); creating wgpu devices there, from
+    /// several test threads, intermittently dies with STATUS_ACCESS_VIOLATION on Windows.
+    /// Returns a guard that serialises device creation, or `None` to skip the test.
+    fn gpu_test_guard() -> Option<std::sync::MutexGuard<'static, ()>> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        if std::env::var_os("SURFACECRAFT_GPU_TESTS").is_none_or(|v| v.is_empty() || v == "0") {
+            eprintln!("skipping: set SURFACECRAFT_GPU_TESTS=1 to run GPU tests");
+            return None;
+        }
+        Some(LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+
     /// Renders a sphere offscreen: the centre pixel is the sphere, a corner is background.
-    /// Skipped when the machine has no GPU adapter (CI runners).
+    /// Opt-in (`SURFACECRAFT_GPU_TESTS=1`); skipped without a GPU adapter.
     #[test]
     fn offscreen_render_shows_the_mesh() {
+        let Some(_gpu) = gpu_test_guard() else {
+            return;
+        };
         let mesh = Arc::new(synth::sphere(Point3::origin(), 10.0, 32, 16));
         let mut camera = Camera::default();
         camera.fit(&mesh.bbox());
@@ -726,9 +742,12 @@ mod tests {
     }
 
     /// New colours for the same geometry rewrite the colour buffer only: no second upload, and
-    /// the new colours reach the picture. Skipped without a GPU.
+    /// the new colours reach the picture. Opt-in (`SURFACECRAFT_GPU_TESTS=1`); skipped without a GPU.
     #[test]
     fn colour_change_does_not_reupload_geometry() {
+        let Some(_gpu) = gpu_test_guard() else {
+            return;
+        };
         let mesh = Arc::new(synth::sphere(Point3::origin(), 10.0, 32, 16));
         let mut camera = Camera::default();
         camera.fit(&mesh.bbox());
