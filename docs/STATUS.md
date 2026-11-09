@@ -25,8 +25,8 @@ Etapy po MVP ([plan production-readiness](superpowers/plans/2026-11-09-productio
 | P5 | stabilna parametryka (trwałe nazewnictwo topologii) i komplet cech (loft, sweep, draft, mirror, split, wzór po ścieżce), auto-więzy, podpowiedzi osi/kąta | **zamknięty** (luki w długu technicznym) | [plan](superpowers/plans/2026-11-09-p5-parametric.md) |
 | P3 | model hybrydowy: prymitywy + płaty → jedna zamknięta bryła, STEP round-trip | **zamknięty** | [plan](superpowers/plans/2026-11-09-p3-hybrid.md) |
 | P4 | freeform organiczny: retopologia niestrukturalna (pola kierunków), łaty G1, sieć łat z krzywych cech | **zamknięty** (PR) | [plan](superpowers/plans/2026-11-09-p4-organic.md) |
-| P6 | ergonomia GUI zgodna z rodziną ArtCraft | **w toku: G1–G5 gotowe** (G1 powłoka: `craft-ui` docking, tokeny motywu, ikony SVG, i18n en/pl; G2 formularze komend, podgląd na żywo, edytor historii; G3 narzędzia viewportu: zaznaczanie, wybór ścian/krawędzi B-rep, gizmo, kostka widoku, przekrój; G4 panel odchyłek; G5 edytor szkicu; pomiary i zrzuty w tabeli Pomiary, luki w długu technicznym); G6 czeka | [plan](superpowers/plans/2026-11-09-p6-gui.md) |
-| P7 | dystrybucja: `cargo xtask dist` (binarki + `SHA256SUMS.txt`), metadane produktu, `wasm-opt`, [docs/distribution.md](distribution.md) | częściowo — kroki poza repo czekają na zgodę | [plan](superpowers/plans/2026-11-09-production-readiness.md) |
+| P6 | ergonomia GUI zgodna z rodziną ArtCraft | **w toku: G1–G5 gotowe** (G1 powłoka: `craft-ui` docking, tokeny motywu, ikony SVG, i18n en/pl; G2 formularze komend, podgląd na żywo, edytor historii; G3 narzędzia viewportu: zaznaczanie, wybór ścian/krawędzi B-rep, gizmo, kostka widoku, przekrój; G4 panel odchyłek; G5 edytor szkicu; pomiary i zrzuty w tabeli Pomiary, luki w długu technicznym); G6: kryterium 6 sprawdzone ręcznie przez właściciela 2026-11-09 (import, wyrównanie do osi świata, ICP, automatyczne kolorowanie regionów, szkic z wymiarem dodanym ręcznie, wyciągnięcie z wpisaną wartością, fillet, eksport STEP — działają; luki: wskazywanie punktów 3-2-1 i krawędzi filletu myszą → naprawione w #42, do ponownego sprawdzenia); automatyczny test klikami odwołany na życzenie właściciela | [plan](superpowers/plans/2026-11-09-p6-gui.md) |
+| P7 | dystrybucja: `cargo xtask dist` (binarki + `SHA256SUMS.txt`), metadane produktu, `wasm-opt`, [docs/distribution.md](distribution.md) | wydania: `.github/workflows/release.yml` (tag `v*` → paczki Windows zip, Linux tar.gz, macOS dmg/.app.zip + wspólny `SHA256SUMS.txt`), pierwsze wydanie `v0.1.0`; nightly codziennie o 4:00 czasu warszawskiego (pre-release `nightly`), oficjalne wydania tylko ręcznie przez właściciela; decyzje właściciela 2026-11-09: wydania **niepodpisane** (brak certyfikatów), **bez** wpisu w `craft-launcher` | [plan](superpowers/plans/2026-11-09-production-readiness.md) |
 
 ## Jak uruchomić
 
@@ -126,8 +126,8 @@ Szczegóły w planach milestone'ów.
 - STEP arkuszy bez PCURVE (krawędzie tylko krzywą 3D); importer solidcore odtwarza je bez strat w testach.
 - **Adaptacja (dług):** `crates/io/src/iges.rs` z `iges_out` SolidCrafta — do wymiany, jeśli writer IGES trafi do solidcore (propozycja upstream wymaga zgody użytkownika: działanie poza repo).
 - Szkice w viewporcie przeliczane co klatkę (małe; do cache, gdy urosną).
-- Web: bundle nieoptymalizowany rozmiarowo (59 MB; brak `wasm-opt`), limit 5 mln trójkątów; brak MCP/kanału sterowania i asystenta bez dostawcy po stronie przeglądarki.
-- P7: instalatory, podpisy (Windows, Developer ID), wpis w `craft-launcher`, wydania czekają na zgodę ([docs/distribution.md](distribution.md)). Web: pliki czytane jednym buforem (`rfd` `read`); streaming pominięty — wymaga zmian w `io` i pętli wejścia UI.
+- Web: bundle 45 MB po `wasm-opt -Oz` (binaryen przypięty w `deploy-web.yml`, #40; wersja z apt psuła tablicę externref i strona zostawała na ekranie ładowania), limit 5 mln trójkątów; przy pierwszym starcie po zmianie `LAYOUT_VERSION` pasek stanu pokazuje „Panel layout change not applied: docking geometry is not finite and bounded” (kosmetyczne); brak MCP/kanału sterowania i asystenta bez dostawcy po stronie przeglądarki.
+- P7: wydania niepodpisane (SmartScreen/Gatekeeper ostrzegają; podpis wymaga certyfikatów właściciela), brak MSI/AppImage i macOS Intel; launcher nie zainstalowałby tych paczek (Windows: brak VERSIONINFO w binarkach; macOS: wymaga Developer ID) — bez znaczenia, dopóki nie ma wpisu w `craft-launcher` ([docs/distribution.md](distribution.md)). Web: pliki czytane jednym buforem (`rfd` `read`); streaming pominięty — wymaga zmian w `io` i pętli wejścia UI.
 - Brak osobnego repo `surfacecraft-corpus`: `tangency-labs/models` nie ma jeszcze modeli (2026-11-08), więc korpus
   poziomu 1 w CI to części CAD z kernela „skanowane” w teście (`synth::scanify`); gdy pojawią się modele CC0, dołożyć je.
 - Gizmo manipulatora w viewporcie (§6.1) — w M1 ruch ręczny tylko przez `mesh.transform`.
@@ -199,8 +199,10 @@ Wszystkie milestones M0–M6 są zamknięte. Do decyzji użytkownika:
    tangency-labs/solidcore#3228 („sheet from surface”, `face_on` 1001), #3229 (thicken arkusza wielościennego → `NotSolid`),
    #3230 (propozycja writera IGES nad rekordem). Zapis STEP otwartych powłok jest już przenoszony upstream (#2579) —
    bez dublowania. Reprodukcja: gałąź `repro/surfacecraft-sheets` w forku `d0pawlus/solidcore`. Po decyzji maintainerów:
-   PR-y lub wymiana adaptacji. Wpis w `craft-launcher` — nadal czeka na zgodę.
+   PR-y lub wymiana adaptacji. Wpis w `craft-launcher` — właściciel zdecydował: nie teraz.
 Plan dojścia do pełnoprawnego programu: [`docs/superpowers/plans/2026-11-09-production-readiness.md`](superpowers/plans/2026-11-09-production-readiness.md)
-P1 zamknięty; następny: P2 (wydajność do 10 mln trójkątów) i równolegle P5 (stabilna parametryka).
+P1–P7 wykonane (P7 w zakresie zgód właściciela: wydania niepodpisane, bez launchera). Pozostaje: ponowne ręczne
+sprawdzenie wskazywania 3-2-1 i krawędzi filletu (#42) oraz zbiorczy przebieg sprawdzeń lokalnych z #39 i #42
+(`docs/integration.md`).
 Kandydaci post-MVP z design doc: retopologia niestrukturalna (Instant Meshes), druga strategia freeform (sieć łat
 z krzywych cech), CAD Correct/Refit, trwałe nazewnictwo topologii w cechach, out-of-core/LOD dla 100 mln+ trójkątów.

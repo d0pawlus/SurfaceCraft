@@ -1,22 +1,33 @@
 name: release
 
 # Builds unsigned release packages for Windows, Linux and macOS and attaches them, with one combined
-# SHA256SUMS.txt, to a GitHub Release. It starts on a pushed tag `v*`, or by hand with an existing tag.
-# The package names follow the Craft launcher's asset convention (docs/distribution.md, "Release
-# assets"). No secret is used: GITHUB_TOKEN creates the release. Code signing is not done yet.
+# SHA256SUMS.txt, to a GitHub Release. The package names follow the Craft launcher's asset convention
+# (docs/distribution.md, "Release assets"). No secret is used: GITHUB_TOKEN creates the release.
+# Code signing is not done yet.
+#
+# Two kinds of release:
+# - official: only by hand — the owner pushes a tag `v*` or starts the workflow with an existing tag;
+# - nightly: once a day at 04:00 Warsaw time, from the head of main, published as the pre-release
+#   `nightly` (replaced every night). Skipped when main has not changed since the last nightly or when
+#   `ci` did not pass on that commit. Merges to main never publish anything by themselves.
 
 on:
   push:
     tags: ['v*']
+  schedule:
+    # GitHub cron is UTC; 04:00 in Warsaw is 02:00 UTC in summer and 03:00 UTC in winter. Both run,
+    # and the prepare job keeps the one that falls on 04:00 local time.
+    - cron: '0 2 * * *'
+    - cron: '0 3 * * *'
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing tag to package and release, e.g. v0.1.0 (must match the workspace version)'
+        description: 'Existing tag to release, e.g. v0.1.0 (must match the workspace version), or "nightly"'
         required: true
         type: string
 
 concurrency:
-  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  group: release-${{ github.event_name == 'schedule' && 'nightly' || (github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name) }}
   cancel-in-progress: false
 
 permissions:
@@ -31,25 +42,59 @@ jobs:
     name: check the tag
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
+      ref: ${{ steps.tag.outputs.ref }}
+      nightly: ${{ steps.tag.outputs.nightly }}
+      build: ${{ steps.tag.outputs.build }}
     steps:
       - id: tag
-        name: check the tag name
+        name: check the tag name (or decide whether tonight's nightly runs)
         env:
-          RAW_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          RAW_TAG: ${{ github.event_name == 'schedule' && 'nightly' || (github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name) }}
+          EVENT: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           tag="$RAW_TAG"
-          if [[ ${#tag} -gt 64 || ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::'$tag' is not a release tag (vX.Y.Z or vX.Y.Z-pre)"
-            exit 1
+          if [[ "$tag" != "nightly" ]]; then
+            if [[ ${#tag} -gt 64 || ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+              echo "::error::'$tag' is not a release tag (vX.Y.Z or vX.Y.Z-pre) nor 'nightly'"
+              exit 1
+            fi
+            { echo "tag=$tag"; echo "ref=refs/tags/$tag"; echo "nightly=false"; echo "build=true"; } >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          { echo "tag=nightly"; echo "nightly=true"; } >> "$GITHUB_OUTPUT"
+          if [[ "$EVENT" == "schedule" && "$(TZ=Europe/Warsaw date +%H)" != "04" ]]; then
+            echo "Not 04:00 in Warsaw (the other of the two UTC crons); no nightly."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          sha=$(gh api "repos/$GH_REPO/commits/main" --jq .sha)
+          echo "ref=$sha" >> "$GITHUB_OUTPUT"
+          last=$(gh api "repos/$GH_REPO/git/ref/tags/nightly" --jq .object.sha 2>/dev/null || true)
+          if [[ "$EVENT" == "schedule" && "$last" == "$sha" ]]; then
+            echo "main ($sha) has not changed since the last nightly; skipping."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          ci=$(gh run list --workflow ci.yml --branch main --commit "$sha" --json conclusion --jq '.[0].conclusion // ""')
+          if [[ "$ci" != "success" ]]; then
+            echo "::warning::ci has not passed on main ($sha, conclusion '${ci:-none}'); no nightly tonight."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "build=true" >> "$GITHUB_OUTPUT"
 
   package:
     name: package (${{ matrix.target }})
     needs: prepare
+    if: needs.prepare.outputs.build == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
@@ -65,7 +110,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: refs/tags/${{ needs.prepare.outputs.tag }}
+          ref: ${{ needs.prepare.outputs.ref }}
       - name: System libraries for eframe/rfd
         if: runner.os == 'Linux'
         run: |
@@ -80,7 +125,9 @@ jobs:
         shell: bash
         env:
           TAG: ${{ needs.prepare.outputs.tag }}
-        run: cargo xtask dist --tag "$TAG"
+        # a nightly carries the workspace version in its file names; only official tags are checked
+        run: |
+          if [[ "$TAG" == "nightly" ]]; then cargo xtask dist; else cargo xtask dist --tag "$TAG"; fi
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.target }}
@@ -96,6 +143,7 @@ jobs:
       contents: write
     env:
       TAG: ${{ needs.prepare.outputs.tag }}
+      REF: ${{ needs.prepare.outputs.ref }}
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
@@ -137,7 +185,12 @@ jobs:
         run: |
           set -euo pipefail
           {
-            printf '# SurfaceCraft %s\n\n' "$TAG"
+            if [[ "$TAG" == "nightly" ]]; then
+              printf '# SurfaceCraft nightly, %s\n\n' "$(TZ=Europe/Warsaw date +%F)"
+              printf 'Automatic build of main at %s. Not an official release: it is replaced every night.\n\n' "$REF"
+            else
+              printf '# SurfaceCraft %s\n\n' "$TAG"
+            fi
             cat <<'NOTES'
           These builds are not code-signed yet. Windows SmartScreen warns about an unknown publisher, and
           macOS Gatekeeper blocks the app until it is opened on purpose (right-click, Open, or System
@@ -153,6 +206,14 @@ jobs:
       - name: create the GitHub release
         run: |
           set -euo pipefail
+          if [[ "$TAG" == "nightly" ]]; then
+            # replace last night's pre-release and move the tag to the commit just built
+            gh release delete nightly --cleanup-tag --yes 2>/dev/null || true
+            gh api "repos/$GH_REPO/git/refs/tags/nightly" -X DELETE 2>/dev/null || true
+            gh release create nightly --target "$REF" --prerelease --latest=false \
+              --title "SurfaceCraft nightly $(TZ=Europe/Warsaw date +%F)" --notes-file notes.md assets/*
+            exit 0
+          fi
           flags=()
           case "$TAG" in
             *-*) flags+=(--prerelease) ;;
