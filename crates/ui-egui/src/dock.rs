@@ -104,19 +104,30 @@ fn dock(side: Side, width: f32, groups: &[&[Panel]]) -> Node<Panel> {
 }
 
 /// The default arrangement for a dock column width (in points): objects over history on the left,
-/// the viewport over the log in the middle, properties over regions and deviation on the right.
+/// the viewport over the log in the middle, properties over regions and the deviation map in a
+/// column of its own on the right.
 #[must_use]
 pub fn default_workspace(side_width: f32) -> Workspace {
     let centre =
         split(SplitAxis::Vertical, SplitSize::FixedSecond(150.0), tabs(&[Panel::Viewport]), tabs(&[Panel::Log]));
-    let right = dock(Side::End, side_width + 40.0, &[&[Panel::Properties], &[Panel::Regions, Panel::Deviation]]);
+    // The right dock has two columns: the properties over the regions, and the deviation map
+    // (legend, statistics, histogram: about 600 points tall) in a column of its own, so none of
+    // it needs scrolling.
+    let (col_a, col_b) = (side_width + 40.0, side_width + 20.0);
+    let right = Node::Dock {
+        side: Side::End,
+        columns: vec![
+            Column::new(vec![Group::new(vec![Panel::Properties], 0), Group::new(vec![Panel::Regions], 0)], col_a),
+            Column::new(vec![Group::new(vec![Panel::Deviation], 0)], col_b),
+        ],
+    };
     let left = dock(Side::Start, side_width, &[&[Panel::Objects], &[Panel::History]]);
     Workspace::new(Layout {
         root: Some(split(
             SplitAxis::Horizontal,
             SplitSize::FixedFirst(side_width),
             left,
-            split(SplitAxis::Horizontal, SplitSize::FixedSecond(side_width + 40.0), centre, right),
+            split(SplitAxis::Horizontal, SplitSize::FixedSecond(col_a + col_b), centre, right),
         )),
         floating: Vec::new(),
     })

@@ -614,10 +614,23 @@ impl SurfaceCraftApp {
         }
         let ppp = ui.ctx().pixels_per_point();
         let size = [(rect.width() * ppp).round().max(1.0) as u32, (rect.height() * ppp).round().max(1.0) as u32];
+        let frame = self.viewport_frame(size);
+        ui.painter().add(egui_wgpu::Callback::new_paint_callback(rect, ViewportCallback(frame)));
+        if sketching {
+            self.sketch_overlay(ui, rect);
+        } else {
+            self.paint_view_overlays(ui, rect);
+        }
+    }
+
+    /// What the 3D viewport draws now at `size` pixels: the document's objects (with the
+    /// selection highlights and the section clip), the live preview of a command form and the
+    /// camera. The wgpu callback of the viewport and the offscreen screenshots both render it.
+    pub fn viewport_frame(&mut self, size: [u32; 2]) -> Frame {
         let tokens = self.tokens.clone();
         let display = self.session.display_items();
         let overlay = self.frame_overlay(&display);
-        let items: Vec<DrawItem> = display
+        let mut items: Vec<DrawItem> = display
             .into_iter()
             .map(|d| DrawItem {
                 key: d.key,
@@ -628,17 +641,16 @@ impl SurfaceCraftApp {
                 mesh: d.mesh,
             })
             .collect();
-        let bg = self.tokens.viewport_background().map(f64::from);
-        let mut items = items;
         items.extend(self.cmd_panel.draw_items(&tokens));
-        let frame =
-            Frame { size, camera: self.camera.clone(), origin: self.camera.target, items, background: bg, overlay };
-        ui.painter().add(egui_wgpu::Callback::new_paint_callback(rect, ViewportCallback(frame)));
-        if sketching {
-            self.sketch_overlay(ui, rect);
-        } else {
-            self.paint_view_overlays(ui, rect);
-        }
+        let background = tokens.viewport_background().map(f64::from);
+        Frame { size, camera: self.camera.clone(), origin: self.camera.target, items, background, overlay }
+    }
+
+    /// Lays the viewport out as with a GPU (no "no GPU" notice; the tool overlays are painted
+    /// over an empty viewport) while the test renderer has none. Screenshots use it to
+    /// composite the offscreen 3D image under the overlays the UI paints.
+    pub fn lay_out_for_gpu(&mut self) {
+        self.gpu = true;
     }
 
     /// Camera control while sketching: pan (right/middle drag), zoom (wheel) and Alt+drag
