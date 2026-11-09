@@ -140,6 +140,14 @@ impl SurfaceCraftApp {
     /// The docks and the viewport: draws the layout and applies the actions the user's gestures
     /// emitted (the area itself never changes the layout).
     fn dock_area(&mut self, ui: &mut egui::Ui) {
+        // A window that is not sized yet (the web canvas on its first frame) has nothing to lay
+        // out; the dock area would call that an invalid geometry. The next frame (a resize wakes
+        // the runner) draws it once the size is known.
+        let rect = ui.available_rect_before_wrap();
+        let sized = |v: f32| v.is_finite() && v > 0.0 && v <= 1_000_000.0;
+        if !(rect.is_finite() && sized(rect.width()) && sized(rect.height())) {
+            return;
+        }
         let metrics = self.settings.theme.density.metrics();
         let style = theme::dock_style(ui, &self.tokens, &metrics);
         let layout = self.workspace.layout.clone();
