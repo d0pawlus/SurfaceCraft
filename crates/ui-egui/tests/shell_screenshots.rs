@@ -101,7 +101,7 @@ fn harness_sized(mut app: SurfaceCraftApp, size: (f32, f32)) -> H {
 }
 
 fn shell(dir: &std::path::Path, name: &str, theme: Theme, lang: Lang, log_hidden: bool) {
-    let mut app = SurfaceCraftApp::with_settings(UiSettings { theme, lang, workspace: None });
+    let mut app = SurfaceCraftApp::with_settings(UiSettings { theme, lang, ..UiSettings::default() });
     scene(&mut app);
     if log_hidden {
         let _ =
