@@ -338,6 +338,9 @@ pub fn deviation(set: &PatchSet, points: &[Point3], n: usize) -> Deviation {
             *seam.entry(key(pa, pb)).or_insert(0) += 1;
         }
     }
+    // vertices at the ends of free edges (edges of one patch only), by position
+    let free_vertices: std::collections::BTreeSet<[i64; 3]> =
+        seam.iter().filter(|(_, c)| **c == 1).flat_map(|(k, _)| [[k[0], k[1], k[2]], [k[3], k[4], k[5]]]).collect();
     let bvh = Bvh::build(&tess);
     let (mut max, mut sq, mut measured, mut uncovered) = (0.0f64, 0.0, 0usize, 0usize);
     for p in points {
@@ -356,6 +359,18 @@ pub fn deviation(set: &PatchSet, points: &[Point3], n: usize) -> Deviation {
                 let l2 = e.norm_squared().max(1e-30);
                 let s = ((h.point - pa).dot(&e) / l2).clamp(0.0, 1.0);
                 (pa + e * s - h.point).norm() < 1e-7
+            }) || (0..3).any(|k| {
+                // the hit is a vertex of a free edge that belongs to a neighbouring triangle
+                let (a, b, c) = (t[k], t[(k + 1) % 3], t[(k + 2) % 3]);
+                let _ = (b, c);
+                tess.positions.get(a as usize).is_some_and(|pa| {
+                    (pa - h.point).norm() < 1e-7
+                        && free_vertices.contains(&[
+                            (pa.x * 1e6).round() as i64,
+                            (pa.y * 1e6).round() as i64,
+                            (pa.z * 1e6).round() as i64,
+                        ])
+                })
             })
         });
         if on_free_edge && h.distance > 1e-6 {

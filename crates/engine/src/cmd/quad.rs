@@ -613,6 +613,9 @@ pub struct AutoOut {
     /// Unstructured layouts: the solid body made from a closed network.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub solid: Option<ObjectId>,
+    /// Unstructured layouts: quads of the final layout whose orientation is inverted against the scan normals.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub folded: Option<usize>,
     /// Unstructured layouts: how many times the layout was split to reach the tolerance.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refinements: Option<usize>,
@@ -710,6 +713,7 @@ fn auto_unstructured(s: &mut Session, q: &QuadObject, tol: f64, i: &AutoIn) -> C
             solid,
             refinements: Some(refinements),
             uncovered: Some(dev.uncovered),
+            folded: Some(layout.folded()),
         });
     }
 }
@@ -807,6 +811,7 @@ fn auto(s: &mut Session, i: AutoIn) -> CmdResult<AutoOut> {
         solid: None,
         refinements: None,
         uncovered: None,
+        folded: None,
     })
 }
 
