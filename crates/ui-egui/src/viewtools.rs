@@ -339,7 +339,7 @@ impl SurfaceCraftApp {
         let Some(d) = self.gizmo_mesh() else { return false };
         let cam = self.camera.clone();
         let pivot = self.pivot_of(&d);
-        let mut g = Gizmo { mode, center: pivot, ..Gizmo::default() };
+        let mut g = Gizmo::new(mode, pivot);
         let view = View { camera: &cam, w, h };
         let Some(axis) = g.handle_at(&view, [x, y]) else { return false };
         if !g.begin(&view, axis, [x, y]) {
@@ -575,10 +575,11 @@ impl SurfaceCraftApp {
                 }
             }
             Tool::Lasso => {
-                if primary_drag && let Some(p) = pos {
-                    if self.tools.lasso.last().is_none_or(|l| (l[0] - p[0]).hypot(l[1] - p[1]) >= 2.0) {
-                        self.tools.lasso.push(p);
-                    }
+                if primary_drag
+                    && let Some(p) = pos
+                    && self.tools.lasso.last().is_none_or(|l| (l[0] - p[0]).hypot(l[1] - p[1]) >= 2.0)
+                {
+                    self.tools.lasso.push(p);
                 }
                 if resp.drag_stopped() {
                     let poly = std::mem::take(&mut self.tools.lasso);
@@ -628,7 +629,7 @@ impl SurfaceCraftApp {
         let Some(d) = self.gizmo_mesh() else { return };
         let mode = if self.tools.tool == Tool::Rotate { GizmoMode::Rotate } else { GizmoMode::Translate };
         let pivot = self.pivot_of(&d);
-        let g = Gizmo { mode, center: pivot, ..Gizmo::default() };
+        let g = Gizmo::new(mode, pivot);
         let cam = self.camera.clone();
         self.tools.gizmo_hover = g.handle_at(&View { camera: &cam, w, h }, p);
     }
@@ -737,7 +738,7 @@ impl SurfaceCraftApp {
 
         self.paint_gizmo(&painter, rect);
         self.paint_view_cube(ui, &painter, rect);
-        self.toolbar(ui.ctx(), rect);
+        self.tool_strip(ui.ctx(), rect);
     }
 
     fn paint_gizmo(&mut self, painter: &egui::Painter, rect: egui::Rect) {
@@ -748,11 +749,7 @@ impl SurfaceCraftApp {
         let (w, h) = (f64::from(rect.width()), f64::from(rect.height()));
         let mode = if self.tools.tool == Tool::Rotate { GizmoMode::Rotate } else { GizmoMode::Translate };
         let dragging = self.tools.gizmo.dragging();
-        let g = if dragging {
-            self.tools.gizmo.clone()
-        } else {
-            Gizmo { mode, center: self.pivot_of(&d), ..Gizmo::default() }
-        };
+        let g = if dragging { self.tools.gizmo.clone() } else { Gizmo::new(mode, self.pivot_of(&d)) };
         let cam = self.camera.clone();
         let view = View { camera: &cam, w, h };
         let centre = g.transform().apply(&g.center);
@@ -780,7 +777,9 @@ impl SurfaceCraftApp {
                     }
                 }
                 GizmoMode::Rotate => {
-                    let ring = Gizmo { center: centre, ..g.clone() }.ring(axis, len * 0.8);
+                    let mut moved = g.clone();
+                    moved.center = centre;
+                    let ring = moved.ring(axis, len * 0.8);
                     let pts: Vec<egui::Pos2> =
                         ring.iter().filter_map(|p| cam.project(p, w, h)).map(to_screen).collect();
                     if pts.len() > 1 {
@@ -821,9 +820,9 @@ impl SurfaceCraftApp {
     }
 
     /// The tool strip in the top-left corner of the viewport.
-    fn toolbar(&mut self, ctx: &egui::Context, rect: egui::Rect) {
+    fn tool_strip(&mut self, ctx: &egui::Context, rect: egui::Rect) {
         let pos = rect.min + egui::vec2(8.0, 8.0);
-        egui::Area::new(egui::Id::new("viewport_tools")).fixed_pos(pos).order(egui::Order::Foreground).show(
+        egui::Area::new(egui::Id::unique("viewport-tools")).fixed_pos(pos).order(egui::Order::Foreground).show(
             ctx,
             |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
@@ -838,8 +837,9 @@ impl SurfaceCraftApp {
                     match self.tools.tool {
                         Tool::Brush => {
                             ui.horizontal(|ui| {
-                                ui.label(t("tool.brush_radius"));
-                                ui.add(egui::Slider::new(&mut self.tools.brush_radius, 4.0..=120.0).suffix(" px"));
+                                let l = ui.label(t("tool.brush_radius"));
+                                ui.add(egui::Slider::new(&mut self.tools.brush_radius, 4.0..=120.0).suffix(" px"))
+                                    .labelled_by(l.id);
                                 ui.checkbox(&mut self.tools.through, t("tool.through"));
                             });
                             ui.weak(t("tool.brush_hint"));
@@ -850,11 +850,14 @@ impl SurfaceCraftApp {
                         }
                         Tool::Smart => {
                             ui.horizontal(|ui| {
-                                ui.label(t("tool.smart_angle"));
-                                ui.add(egui::Slider::new(&mut self.tools.smart_angle, 1.0..=90.0).suffix("°"));
+                                let l = ui.label(t("tool.smart_angle"));
+                                ui.add(egui::Slider::new(&mut self.tools.smart_angle, 1.0..=90.0).suffix("°"))
+                                    .labelled_by(l.id);
                             });
                         }
-                        Tool::Faces | Tool::Edges => ui.weak(t("tool.brep_hint")),
+                        Tool::Faces | Tool::Edges => {
+                            ui.weak(t("tool.brep_hint"));
+                        }
                         Tool::Move | Tool::Rotate => {
                             if self.gizmo_mesh().is_none() {
                                 ui.weak(t("tool.gizmo_no_mesh"));
@@ -932,8 +935,8 @@ impl SurfaceCraftApp {
         let (lo, hi) = if b.is_empty() { (-100.0, 100.0) } else { (axis.coord(&b.min), axis.coord(&b.max)) };
         let (lo, hi) = if hi > lo { (lo, hi) } else { (lo - 1.0, lo + 1.0) };
         ui.horizontal(|ui| {
-            ui.label(t("section.offset"));
-            ui.add(egui::Slider::new(&mut self.tools.section.offset, lo..=hi));
+            let l = ui.label(t("section.offset"));
+            ui.add(egui::Slider::new(&mut self.tools.section.offset, lo..=hi)).labelled_by(l.id);
         });
     }
 }

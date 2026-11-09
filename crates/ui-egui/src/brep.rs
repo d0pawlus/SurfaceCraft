@@ -65,18 +65,15 @@ impl BrepSelection {
                 return;
             }
         }
-        match hit {
-            Some(BrepHit::Face(f)) => {
-                if !self.faces.remove(&f) {
-                    self.faces.insert(f);
-                }
-            }
-            Some(BrepHit::Edge(e)) => {
-                if !self.edges.remove(&e) {
-                    self.edges.insert(e);
-                }
-            }
-            None => {}
+        let toggled = match hit {
+            Some(BrepHit::Face(f)) => Some((&mut self.faces, f)),
+            Some(BrepHit::Edge(e)) => Some((&mut self.edges, e)),
+            None => None,
+        };
+        if let Some((set, i)) = toggled
+            && !set.remove(&i)
+        {
+            set.insert(i);
         }
     }
 

@@ -88,6 +88,12 @@ fn wrap_pi(a: f64) -> f64 {
 }
 
 impl Gizmo {
+    /// A gizmo in `mode` around `center`, with no drag.
+    #[must_use]
+    pub fn new(mode: GizmoMode, center: Point3) -> Self {
+        Self { mode, center, drag: None }
+    }
+
     /// Whether a drag is in progress.
     #[must_use]
     pub fn dragging(&self) -> bool {
@@ -315,7 +321,8 @@ mod tests {
         let v = View { camera: &cam, w: W, h: H };
         let mut g = Gizmo { mode: GizmoMode::Rotate, center: cam.target, ..Gizmo::default() };
         let r = g.handle_length(&v) * 0.8;
-        let on_ring = |a: f64| px(&cam, g.center + (Vec3::x() * a.cos() + Vec3::y() * a.sin()) * r);
+        let c = g.center;
+        let on_ring = |a: f64| px(&cam, c + (Vec3::x() * a.cos() + Vec3::y() * a.sin()) * r);
         assert_eq!(g.handle_at(&v, on_ring(0.7)), Some(Axis::Z));
         assert!(g.begin(&v, Axis::Z, on_ring(0.0)));
         g.update(&v, on_ring(std::f64::consts::FRAC_PI_2));
