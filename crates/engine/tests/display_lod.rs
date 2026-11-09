@@ -27,7 +27,8 @@ fn meshes_above_the_budget_are_drawn_coarse_and_cached() {
     assert_eq!(item.key, item2.key);
     assert!(Arc::ptr_eq(&item.mesh, &item2.mesh));
     // a selection of original triangles lands on drawn triangles
-    let drawn = item.drawn_triangles(&[0, 1, 2, (n / 2) as u32, (n - 1) as u32]);
+    let picked: Vec<u32> = (0..n as u32).step_by(97).collect();
+    let drawn = item.drawn_triangles(&picked);
     assert!(!drawn.is_empty() && drawn.iter().all(|&t| (t as usize) < item.mesh.triangle_count()));
 }
 

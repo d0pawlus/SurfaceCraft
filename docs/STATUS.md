@@ -21,6 +21,7 @@ Etapy po MVP ([plan production-readiness](superpowers/plans/2026-11-09-productio
 | P | Zakres | Stan | Plan |
 |---|---|---|---|
 | P1 | realne skany: pomiar, edycja siatki, odporność segmentacji i szumu | **zamknięty** | [plan](superpowers/plans/2026-11-09-p1-real-scans.md) |
+| P2 | wydajność i skala do 10 mln trójkątów: równoległość, LOD wyświetlania, kolory bez re-uploadu, pomiary | **w toku** (kryterium 3: import, segmentacja, ICP, fps spełnione; patrz tabela) | [plan](superpowers/plans/2026-11-09-p2-performance.md) |
 
 ## Jak uruchomić
 
@@ -70,6 +71,9 @@ cargo run -p surfacecraft
 | P1: korpus CAD „skanowany” w CI (rampa gęstości ×2, σ = 0,03, dziury, kolce, śmieci) | blok z zaokrągleniami r = 5: 6 płaszczyzn + 4 walce, promień ± 0,1 (ćwierć łuku); wałek z fazą 3 mm: walec r = 12 ± 0,03, stożek 45° ± 0,5°; po clean: 0 dziur, 1 komponent, każdy wierzchołek < 6σ od CAD; RMS ≤ 0,1 | `p1_scanned_filleted_block`, `p1_scanned_chamfered_cylinder` |
 | P1: edycja siatki | decymacja QEM: pudełko zostaje pudełkiem (wierzchołki na ścianach < 1e-6), sfera 10 % trójkątów < 0,3 mm; Taubin: RMS szumu ×< 0,5 bez skurczu (< 0,05 mm); dziura gładka (cienka płyta) vs płaska na sferze: 1,5 vs 4,0 mm; deterministyczne | `geom::edit::tests`, `p1_mesh_edit_commands` |
 | P1: estymator szumu | bracket σ = 0,05 → 0,052 (było 0,078); skanowany box σ = 0,03 → 0,034 | `noise_estimate_is_robust_to_edges_and_density` |
+| P2: skala (maszyna referencyjna: AMD Ryzen 5 5600, 6 rdzeni / 12 wątków, 32 GB RAM, RTX 5070, Windows 11; pomiar na maszynie współdzielonej z innymi buildami, więc czasy są raczej górne) | 1 M (0,93 M trójkątów): import 0,12 s, clean 0,21 s, segmentacja 4,6 s (28 regionów), ICP 0,28 s, odchyłka 0,27 s. 5 M (4,77 M): import 0,62 s, clean 1,0 s, segmentacja 23,6 s (901 regionów), ICP 1,8 s (100 it.), odchyłka 1,6 s. 10 M (10,12 M): import 1,5 s (cel < 15), clean 2,3 s, segmentacja 54,8 s (cel < 60; 2060 regionów, 17,3 k dopasowań ziaren, 28,6 mln iteracji LM), ICP 3,1 s (cel < 10), odchyłka 4,0 s | `perf_scan_scale` (`--ignored`, `SURFACECRAFT_PERF_SIZES=1,5,10`) |
+| P2: viewport | skan 10 M trójkątów przez LOD (1,6 M narysowanych, przygotowanie 2,5 s jednorazowo): 508 klatek/s w renderze offscreen przy krążącej kamerze (cel ≥ 30), geometria wysłana raz; zmiana kolorów = jeden `write_buffer` | `fps_with_a_large_scan` (`--ignored`, pomija się bez GPU), `colour_change_does_not_reupload_geometry` |
+| P2: korpusy lokalne (dane poza repo) | QS2026 (10 plików): segmentacja 5,8–25,7 s (przed P2: 7,8–41 s), 99/100 największych regionów w progu (C10: 9/10, nie zbadane czy to nie stan z main po P1/relax); Creality: Mesh.ply 484 k trójkątów 21 s, Miata34 2,5 M 137 s (było 330–360 s; 9958 regionów = limit 10 000, kształt organiczny: „10 największych w progu" 10/10, przypisane 69 %), slupek_NB 3 M 145 s (9848 regionów, 71 %); Optimization.ply (chmura bez ścianek) pominięty | `local_corpus_full_pipeline` |
 
 ## Decyzje buildera (z uzasadnieniem)
 
@@ -101,7 +105,10 @@ Szczegóły w planach milestone'ów.
   poziomu 1 w CI to części CAD z kernela „skanowane” w teście (`synth::scanify`); gdy pojawią się modele CC0, dołożyć je.
 - Gizmo manipulatora w viewporcie (§6.1) — w M1 ruch ręczny tylko przez `mesh.transform`.
 - Regiony: brak resegment/insert/separate/enlarge/shrink (§8 dopuszcza później); zaznaczanie w GUI tylko przez wskazanie + `region.grow` (bez pędzla/lasso).
-- Segmentacja jednowątkowa: ~40 s na 650 k trójkątów (cel P2: < 60 s na 10 mln).
+- Segmentacja skanów organicznych (Miata34, slupek: ~10 000 regionów, limit) trwa 140 s na 2,5–3 mln trójkątów; wzrost regionów i refity są sekwencyjne (równolegle tylko ziarna, rodzaje prymitywów, RMS, odchyłki). 10 M syntetycznych: 55 s przy celu 60 s — mały zapas.
+- Import STL 10 M: `weld` sortuje 30 mln kluczy (~1 GB chwilowo); parsowanie binarnego STL jest jednowątkowe. Out-of-core (design doc §9) nadal bez implementacji; `PointSource`/`TriangleSource` to tylko szew.
+- Pomiary P2 robione na maszynie współdzielonej z innymi buildami (OOM rustc przy równoległych kompilacjach solidcore); fps tylko offscreen, bez egui.
+- Fragmentacja pierścieni (płaszczyzny z otworem): `merge_adjacent` dochodzi teraz do punktu stałego (≤ 64 przebiegów, odrzucone pary nie są fitowane ponownie); płaski pierścień syntetyczny i tak wychodził w jednym kawałku, więc przyczyny z walca z fazą i otworem (P3) nie odtworzono — do dalszego zbadania (ziarna na pierścieniu?).
 - Edycja siatki: decymacja QEM i wypełnianie dziur bez równoległości; dziury > 4000 krawędzi pomijane.
 - Fit Surface: jeden płat na region wysokościowy nad płaszczyzną (region zawinięty → odmowa, trzeba podzielić); brzeg płata = prostokąt w parametrach (bez przycinania do konturu regionu).
 - Retopologia niestrukturalna (pole kierunków, regiony zawinięte/zamknięte) — brak; AutoSurface wymaga regionu-mapy wysokości.

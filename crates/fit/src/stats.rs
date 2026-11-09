@@ -24,19 +24,29 @@ pub enum Phase {
     Final,
     /// Merging adjacent regions.
     Merge,
+    /// Moving boundary triangles between regions.
+    Relax,
 }
 
-const PHASES: [(&str, Phase); 6] = [
+const PHASES: [(&str, Phase); 7] = [
     ("prep", Phase::Prep),
     ("seed", Phase::Seed),
     ("grow", Phase::Grow),
     ("refit", Phase::Refit),
     ("final", Phase::Final),
     ("merge", Phase::Merge),
+    ("relax", Phase::Relax),
 ];
 
-static PHASE_NS: [AtomicU64; 6] =
-    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static PHASE_NS: [AtomicU64; 7] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
 
 /// Measures one stretch of a phase (no-op on wasm, which has no clock).
 pub(crate) struct Stopwatch(#[cfg(not(target_arch = "wasm32"))] std::time::Instant);

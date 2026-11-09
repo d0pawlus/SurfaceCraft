@@ -161,6 +161,26 @@ fn fit_tris(mesh: &Mesh, normals: &[Vec3], tris: &[u32]) -> Option<crate::primit
     Some(f)
 }
 
+/// Refit of a region keeping its `kind`: the fit uses an even subsample, the RMS is over every
+/// point (parallel, summed in index order).
+fn refit_kind_all(
+    mesh: &Mesh,
+    normals: &[Vec3],
+    tris: &[u32],
+    kind: PrimitiveKind,
+) -> Option<crate::primitive::PrimitiveFit> {
+    let mut f = fit_kind_tris(mesh, normals, tris, kind)?;
+    let (p, _) = region_points(mesh, normals, tris);
+    if p.is_empty() {
+        return None;
+    }
+    let prim = &f.primitive;
+    let sq: f64 = surfacecraft_geom::par::map_slice(&p, |q| prim.distance(q).powi(2)).iter().sum();
+    f.rms = (sq / p.len() as f64).sqrt();
+    f.count = p.len();
+    Some(f)
+}
+
 /// Fit of one `kind` to a set of triangles on at most [`FIT_POINTS`] / 2 of their vertices; the
 /// RMS is over that subsample (it only steers the growth).
 fn fit_kind_tris(
@@ -169,12 +189,10 @@ fn fit_kind_tris(
     tris: &[u32],
     kind: PrimitiveKind,
 ) -> Option<crate::primitive::PrimitiveFit> {
-    // evenly strided triangles first (growth order is spatially coherent), so the cost does not
-    // grow with the region
-    let budget = FIT_POINTS / 2;
-    let stride = (3 * tris.len()).div_ceil(budget).max(1);
-    let picked: Vec<u32> = if stride > 1 { tris.iter().step_by(stride).copied().collect() } else { tris.to_vec() };
-    let (ps, ns) = region_points(mesh, normals, &picked);
+    let (p, n) = region_points(mesh, normals, tris);
+    let stride = p.len().div_ceil(FIT_POINTS / 2).max(1);
+    let ps: Vec<Point3> = p.iter().step_by(stride).copied().collect();
+    let ns: Vec<Vec3> = n.iter().step_by(stride).copied().collect();
     crate::primitive::fit(kind, &ps, &ns)
 }
 
@@ -420,6 +438,8 @@ pub fn segment(mesh: &Mesh, opts: &SegmentOptions) -> Vec<Segment> {
     }
     let sw = crate::stats::Stopwatch::start();
     let out = relax_boundaries(mesh, &normals, &nb, out, tol);
+    sw.stop(crate::stats::Phase::Relax);
+    let sw = crate::stats::Stopwatch::start();
     let merged = merge_adjacent(mesh, &normals, &nb, out, tol);
     sw.stop(crate::stats::Phase::Merge);
     merged
@@ -497,11 +517,17 @@ fn relax_boundaries(mesh: &Mesh, normals: &[Vec3], nb: &[[u32; 3]], mut segs: Ve
                 members[o as usize].push(t as u32);
             }
         }
-        for (i, tris) in members.into_iter().enumerate() {
-            if !touched[i] {
-                continue;
-            }
-            if let Some(f) = fit_tris(mesh, normals, &tris)
+        // regions keep their kind (a boundary move does not change it); independent refits run in parallel
+        let jobs: Vec<(usize, Vec<u32>, PrimitiveKind)> = members
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| touched[*i])
+            .map(|(i, tris)| (i, tris, segs[i].primitive.kind()))
+            .collect();
+        let fits =
+            surfacecraft_geom::par::map_slice(&jobs, |(_, tris, kind)| refit_kind_all(mesh, normals, tris, *kind));
+        for ((i, tris, _), f) in jobs.into_iter().zip(fits) {
+            if let Some(f) = f
                 && f.rms <= tol
             {
                 segs[i].primitive = f.primitive;
@@ -561,7 +587,18 @@ fn same_surface(a: &Primitive, b: &Primitive, tol: f64) -> bool {
 /// Merges adjacent segments describing the same surface whose union still fits one primitive
 /// about as well as the parts.
 fn merge_adjacent(mesh: &Mesh, normals: &[Vec3], nb: &[[u32; 3]], mut segs: Vec<Segment>, tol: f64) -> Vec<Segment> {
-    for _pass in 0..4 {
+    // pairs whose union was already refused (identified by first triangle and size of both
+    // parts): later passes must not repeat those fits
+    let mut refused: std::collections::HashSet<(u32, u32, usize, usize)> = std::collections::HashSet::new();
+    let key_of = |segs: &[Segment], a: usize, b: usize| {
+        (
+            segs[a].triangles.first().copied().unwrap_or(u32::MAX),
+            segs[b].triangles.first().copied().unwrap_or(u32::MAX),
+            segs[a].triangles.len(),
+            segs[b].triangles.len(),
+        )
+    };
+    for _pass in 0..64 {
         let mut owner = vec![u32::MAX; mesh.triangle_count()];
         for (i, s) in segs.iter().enumerate() {
             for &t in &s.triangles {
@@ -597,16 +634,20 @@ fn merge_adjacent(mesh: &Mesh, normals: &[Vec3], nb: &[[u32; 3]], mut segs: Vec<
         let mut merged_any = false;
         for ((a, b), _) in cand {
             let (a, b) = (a as usize, b as usize);
-            if busy[a] || busy[b] {
+            if busy[a] || busy[b] || refused.contains(&key_of(&segs, a, b)) {
                 continue;
             }
             let mut tris = segs[a].triangles.clone();
             tris.extend_from_slice(&segs[b].triangles);
-            let Some(f) = fit_tris(mesh, normals, &tris) else { continue };
+            let Some(f) = fit_tris(mesh, normals, &tris) else {
+                refused.insert(key_of(&segs, a, b));
+                continue;
+            };
             // the union must fit about as well as its parts did (not merely within the growth
             // tolerance), so merging never trades accuracy for fewer regions
             let limit = (segs[a].rms.max(segs[b].rms) * 1.25).max(0.25 * tol).min(tol);
             if f.rms > limit || f.primitive.kind() != segs[a].primitive.kind() {
+                refused.insert(key_of(&segs, a, b));
                 continue;
             }
             tris.sort_unstable();
@@ -662,6 +703,32 @@ mod tests {
         // nearly every triangle is assigned
         let assigned: usize = segs.iter().map(|s| s.triangles.len()).sum();
         assert!(assigned as f64 >= 0.9 * m.triangle_count() as f64, "{assigned} of {}", m.triangle_count());
+    }
+
+    /// An annular plane (a disc with a hole) is one plane region, not a chain of fragments
+    /// (merging runs to a fixed point).
+    #[test]
+    fn annular_plane_is_one_region() {
+        let full = synth::plane(Point3::new(-12.0, -12.0, 0.0), Vec3::x(), Vec3::y(), 24.0, 24.0, 160, 160);
+        let keep: Vec<u32> = (0..full.triangle_count())
+            .filter(|&i| {
+                full.face_centroid(i).is_some_and(|c| {
+                    let r = c.x.hypot(c.y);
+                    (4.0..=12.0).contains(&r)
+                })
+            })
+            .map(|i| i as u32)
+            .collect();
+        let mut m = full.submesh(&keep);
+        synth::add_noise(&mut m, 0.01, &mut Rng::new(5));
+        let segs = segment(&m, &SegmentOptions::default());
+        let planes: Vec<usize> =
+            segs.iter().filter(|s| s.primitive.kind() == PrimitiveKind::Plane).map(|s| s.triangles.len()).collect();
+        let total = m.triangle_count();
+        assert!(
+            planes.iter().copied().max().unwrap_or(0) as f64 >= 0.95 * total as f64,
+            "annulus fragmented: {planes:?} of {total}"
+        );
     }
 
     #[test]

@@ -62,9 +62,11 @@ fn run_one(path: &std::path::Path) -> Result<Report, String> {
     let n = s.execute("deviation.noise", json!({"object": "scan"})).map_err(e)?;
     r.sigma = n["sigma"].as_f64().unwrap_or(f64::NAN);
 
+    surfacecraft_fit::stats::reset();
     let t = Instant::now();
     let seg = s.execute("region.auto_segment", json!({"mesh": "scan"})).map_err(e)?;
     r.segment_s = t.elapsed().as_secs_f64();
+    eprintln!("  segment phases (s): {:?}", surfacecraft_fit::stats::phase_seconds());
     let regions = seg["regions"].as_array().cloned().unwrap_or_default();
     r.regions = regions.len();
     let assigned: u64 = regions.iter().filter_map(|x| x["triangles"].as_u64()).sum();
