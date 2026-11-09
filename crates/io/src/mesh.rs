@@ -2,7 +2,7 @@
 use crate::{IoError, bad};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use surfacecraft_geom::{Mesh, Point3, tri};
+use surfacecraft_geom::{Mesh, Point3, PointCloud, Vec3, tri};
 
 /// Mesh file formats.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -14,6 +14,8 @@ pub enum MeshFormat {
     Obj,
     /// Stanford PLY (binary little endian on write).
     Ply,
+    /// Plain text points, one `x y z [nx ny nz]` per line (point clouds; `.xyz`, `.asc`, `.txt`, `.pts`).
+    Xyz,
 }
 
 impl MeshFormat {
@@ -24,6 +26,7 @@ impl MeshFormat {
             "stl" => Some(Self::Stl),
             "obj" => Some(Self::Obj),
             "ply" => Some(Self::Ply),
+            "xyz" | "asc" | "txt" | "pts" => Some(Self::Xyz),
             _ => None,
         }
     }
@@ -39,10 +42,92 @@ impl MeshFormat {
         if text.lines().any(|l| l.trim_start().starts_with("v ")) && !text.trim_start().starts_with("solid") {
             return Some(Self::Obj);
         }
+        if looks_like_xyz(&text) {
+            return Some(Self::Xyz);
+        }
         if bytes.len() >= 84 || text.trim_start().starts_with("solid") {
             return Some(Self::Stl);
         }
         None
+    }
+}
+
+/// Do the first data lines of `text` read as `x y z ...` rows? (The last line of a 512-byte sniff
+/// window may be cut, so it is ignored.)
+fn looks_like_xyz(text: &str) -> bool {
+    let mut rows = 0;
+    let lines: Vec<&str> = text.lines().collect();
+    for line in lines.iter().take(lines.len().saturating_sub(1)) {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') || t.starts_with("//") {
+            continue;
+        }
+        if xyz_row(t).is_none() {
+            // a first line may be a header such as a point count
+            if rows == 0 && t.split_whitespace().count() == 1 {
+                continue;
+            }
+            return false;
+        }
+        rows += 1;
+    }
+    rows > 0
+}
+
+/// What a file holds: a mesh, or only points.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Scan {
+    /// Triangles (STL, or OBJ/PLY with faces).
+    Mesh(Mesh),
+    /// Points without faces (XYZ, or OBJ/PLY without faces).
+    Points(PointCloud),
+}
+
+/// Reads a mesh or, when the file has no faces, a point cloud. Meshes are cleaned as in
+/// [`read_mesh`]; the limits of [`Limits`] apply to both.
+pub fn read_scan(bytes: &[u8], format: MeshFormat, limits: &Limits) -> Result<Scan, IoError> {
+    match format {
+        MeshFormat::Stl => read_mesh(bytes, format, limits).map(Scan::Mesh),
+        MeshFormat::Xyz => read_xyz(bytes, limits).map(Scan::Points),
+        MeshFormat::Obj | MeshFormat::Ply => {
+            let (positions, normals, triangles) = if format == MeshFormat::Obj {
+                let (p, t) = parse_obj(bytes, limits)?;
+                (p, None, t)
+            } else {
+                parse_ply(bytes, limits)?
+            };
+            let name = if format == MeshFormat::Obj { "OBJ" } else { "PLY" };
+            if triangles.is_empty() {
+                if positions.is_empty() {
+                    return Err(bad(name, "no faces and no vertices"));
+                }
+                let cloud = PointCloud::new(positions, normals).map_err(|e| bad(name, e.to_string()))?;
+                return Ok(Scan::Points(cloud));
+            }
+            let mut mesh = Mesh { positions, triangles };
+            mesh.validate().map_err(|e| bad("mesh", e.to_string()))?;
+            mesh.remove_degenerate(0.0);
+            Ok(Scan::Mesh(mesh))
+        }
+    }
+}
+
+/// Reads only the points of any file: a point cloud as it is, a mesh by its vertices.
+pub fn read_points(bytes: &[u8], format: MeshFormat, limits: &Limits) -> Result<PointCloud, IoError> {
+    match format {
+        MeshFormat::Xyz => read_xyz(bytes, limits),
+        MeshFormat::Ply => {
+            let (positions, normals, _) = parse_ply(bytes, limits)?;
+            PointCloud::new(positions, normals).map_err(|e| bad("PLY", e.to_string()))
+        }
+        MeshFormat::Obj => {
+            let (positions, _) = parse_obj(bytes, limits)?;
+            PointCloud::new(positions, None).map_err(|e| bad("OBJ", e.to_string()))
+        }
+        MeshFormat::Stl => {
+            let m = read_mesh(bytes, format, limits)?;
+            Ok(PointCloud::from_points(m.positions))
+        }
     }
 }
 
@@ -69,6 +154,7 @@ pub fn read_mesh(bytes: &[u8], format: MeshFormat, limits: &Limits) -> Result<Me
         MeshFormat::Stl => read_stl(bytes, limits)?,
         MeshFormat::Obj => read_obj(bytes, limits)?,
         MeshFormat::Ply => read_ply(bytes, limits)?,
+        MeshFormat::Xyz => return Err(bad("XYZ", "a plain point list has no faces; read it as a point cloud")),
     };
     mesh.validate().map_err(|e| bad("mesh", e.to_string()))?;
     mesh.remove_degenerate(0.0);
@@ -82,6 +168,7 @@ pub fn write_mesh(mesh: &Mesh, format: MeshFormat) -> Vec<u8> {
         MeshFormat::Stl => write_stl(mesh),
         MeshFormat::Obj => write_obj(mesh),
         MeshFormat::Ply => write_ply(mesh),
+        MeshFormat::Xyz => write_xyz(mesh),
     }
 }
 
@@ -216,6 +303,14 @@ fn obj_index(tok: &str, count: usize) -> Option<u32> {
 }
 
 fn read_obj(bytes: &[u8], limits: &Limits) -> Result<Mesh, IoError> {
+    let (positions, triangles) = parse_obj(bytes, limits)?;
+    if triangles.is_empty() {
+        return Err(bad("OBJ", "no faces"));
+    }
+    Ok(Mesh { positions, triangles })
+}
+
+fn parse_obj(bytes: &[u8], limits: &Limits) -> Result<(Vec<Point3>, Vec<[u32; 3]>), IoError> {
     let text = String::from_utf8_lossy(bytes);
     let mut positions = Vec::new();
     let mut triangles = Vec::new();
@@ -251,10 +346,7 @@ fn read_obj(bytes: &[u8], limits: &Limits) -> Result<Mesh, IoError> {
             _ => {}
         }
     }
-    if triangles.is_empty() {
-        return Err(bad("OBJ", "no faces"));
-    }
-    Ok(Mesh { positions, triangles })
+    Ok((positions, triangles))
 }
 
 fn fan(poly: &[u32], out: &mut Vec<[u32; 3]>) {
@@ -276,6 +368,78 @@ fn write_obj(mesh: &Mesh) -> Vec<u8> {
     }
     for t in &mesh.triangles {
         let _ = writeln!(s, "f {} {} {}", t[0] + 1, t[1] + 1, t[2] + 1);
+    }
+    s.into_bytes()
+}
+
+// ---------------------------------------------------------------- XYZ
+
+/// Splits a row on whitespace, commas and semicolons and parses `x y z ...`; `None` unless the
+/// first three columns are finite numbers. Returns the leading columns that parse as numbers.
+fn xyz_row(line: &str) -> Option<Vec<f64>> {
+    let mut v = Vec::with_capacity(6);
+    for tok in line.split(|c: char| c.is_whitespace() || c == ',' || c == ';').filter(|t| !t.is_empty()) {
+        match tok.parse::<f64>() {
+            Ok(x) if x.is_finite() => v.push(x),
+            _ => {
+                if v.len() < 3 {
+                    return None;
+                }
+                break; // trailing text columns (labels) are ignored
+            }
+        }
+        if v.len() >= 9 {
+            break;
+        }
+    }
+    (v.len() >= 3).then_some(v)
+}
+
+fn read_xyz(bytes: &[u8], limits: &Limits) -> Result<PointCloud, IoError> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut positions: Vec<Point3> = Vec::new();
+    let mut normals: Vec<Vec3> = Vec::new();
+    let mut columns = 0usize;
+    let mut header_skipped = false;
+    for (ln, line) in text.lines().enumerate() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') || t.starts_with("//") {
+            continue;
+        }
+        let Some(row) = xyz_row(t) else {
+            // one header line (a count or column names) before the first point is tolerated
+            if positions.is_empty() && !header_skipped {
+                header_skipped = true;
+                continue;
+            }
+            return Err(bad("XYZ", format!("line {}: expected `x y z`", ln + 1)));
+        };
+        if columns == 0 {
+            // exactly six columns are `x y z nx ny nz`; anything else carries no normals
+            columns = if row.len() == 6 { 6 } else { 3 };
+        }
+        if positions.len() >= limits.max_vertices {
+            return Err(IoError::Limit(format!("more than {} points", limits.max_vertices)));
+        }
+        let get = |k: usize| row.get(k).copied().unwrap_or(0.0);
+        positions.push(Point3::new(get(0), get(1), get(2)));
+        if columns == 6 {
+            normals.push(Vec3::new(get(3), get(4), get(5)));
+        }
+    }
+    if positions.is_empty() {
+        return Err(bad("XYZ", "no points"));
+    }
+    let normals = (columns == 6 && normals.len() == positions.len()).then_some(normals);
+    PointCloud::new(positions, normals).map_err(|e| bad("XYZ", e.to_string()))
+}
+
+fn write_xyz(mesh: &Mesh) -> Vec<u8> {
+    use std::fmt::Write;
+    let normals = mesh.vertex_normals();
+    let mut s = String::with_capacity(mesh.vertex_count() * 60);
+    for (p, n) in mesh.positions.iter().zip(&normals) {
+        let _ = writeln!(s, "{} {} {} {} {} {}", p.x, p.y, p.z, n.x, n.y, n.z);
     }
     s.into_bytes()
 }
@@ -368,6 +532,16 @@ impl Cursor<'_> {
 }
 
 fn read_ply(bytes: &[u8], limits: &Limits) -> Result<Mesh, IoError> {
+    let (positions, _, triangles) = parse_ply(bytes, limits)?;
+    if triangles.is_empty() {
+        return Err(bad("PLY", "no faces"));
+    }
+    Ok(Mesh { positions, triangles })
+}
+
+type PlyData = (Vec<Point3>, Option<Vec<Vec3>>, Vec<[u32; 3]>);
+
+fn parse_ply(bytes: &[u8], limits: &Limits) -> Result<PlyData, IoError> {
     // header
     let end = find(bytes, b"end_header").ok_or_else(|| bad("PLY", "no end_header"))?;
     let header = std::str::from_utf8(bytes.get(..end).unwrap_or(&[])).map_err(|_| bad("PLY", "header is not text"))?;
@@ -447,6 +621,10 @@ fn read_ply(bytes: &[u8], limits: &Limits) -> Result<Mesh, IoError> {
         return Err(IoError::Limit(format!("{} vertices exceed the limit of {}", v.count, limits.max_vertices)));
     }
     let mut positions: Vec<Point3> = Vec::new();
+    let mut normals: Vec<Vec3> = Vec::new();
+    let has_normals = elements.iter().find(|e| e.name == "vertex").is_some_and(|e| {
+        ["nx", "ny", "nz"].iter().all(|n| e.props.iter().any(|p| matches!(p, Prop::Scalar(name, _) if name == n)))
+    });
     let mut triangles: Vec<[u32; 3]> = Vec::new();
     let mut tokens = if enc == Encoding::Ascii {
         Some(std::str::from_utf8(body).map_err(|_| bad("PLY", "ASCII body is not text"))?.split_whitespace())
@@ -468,6 +646,7 @@ fn read_ply(bytes: &[u8], limits: &Limits) -> Result<Mesh, IoError> {
         }
         for item in 0..e.count {
             let mut xyz = [f64::NAN; 3];
+            let mut nxyz = [0.0f64; 3];
             let mut poly: Vec<u32> = Vec::new();
             for p in &e.props {
                 match p {
@@ -478,6 +657,9 @@ fn read_ply(bytes: &[u8], limits: &Limits) -> Result<Mesh, IoError> {
                                 "x" => xyz[0] = v,
                                 "y" => xyz[1] = v,
                                 "z" => xyz[2] = v,
+                                "nx" => nxyz[0] = v,
+                                "ny" => nxyz[1] = v,
+                                "nz" => nxyz[2] = v,
                                 _ => {}
                             }
                         }
@@ -505,6 +687,11 @@ fn read_ply(bytes: &[u8], limits: &Limits) -> Result<Mesh, IoError> {
                     return Err(bad("PLY", format!("vertex {item} has no finite x, y, z")));
                 }
                 positions.push(p);
+                if has_normals {
+                    let n = Vec3::new(nxyz[0], nxyz[1], nxyz[2]);
+                    // unusable normals are "unknown", not an error
+                    normals.push(if surfacecraft_geom::finite_vec(&n) { n } else { Vec3::zeros() });
+                }
             }
             if is_face {
                 fan(&poly, &mut triangles);
@@ -514,10 +701,7 @@ fn read_ply(bytes: &[u8], limits: &Limits) -> Result<Mesh, IoError> {
             }
         }
     }
-    if triangles.is_empty() {
-        return Err(bad("PLY", "no faces"));
-    }
-    Ok(Mesh { positions, triangles })
+    Ok((positions, has_normals.then_some(normals), triangles))
 }
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -615,15 +799,168 @@ mod tests {
         ));
     }
 
+    fn cloud_samples() -> Vec<(MeshFormat, Vec<u8>)> {
+        let ascii = "ply
+format ascii 1.0
+element vertex 4
+property float x
+property float y
+property float z
+property float nx
+property float ny
+property float nz
+end_header
+0 0 0 0 0 1
+1 0 0 0 0 1
+1 1 0 0 0 1
+0 1 0 0 0 1
+";
+        let mut bin = b"ply
+format binary_little_endian 1.0
+element vertex 3
+property double x
+property double y
+property double z
+property uchar red
+end_header
+"
+        .to_vec();
+        for v in [0f64, 0., 0., 1., 0., 0., 0., 1., 0.] {
+            bin.extend_from_slice(&v.to_le_bytes());
+        }
+        bin.extend_from_slice(&[1, 2, 3]);
+        vec![
+            (MeshFormat::Ply, ascii.as_bytes().to_vec()),
+            (MeshFormat::Ply, bin),
+            (
+                MeshFormat::Obj,
+                b"v 0 0 0
+v 1 0 0
+v 1 1 0
+"
+                .to_vec(),
+            ),
+            (
+                MeshFormat::Xyz,
+                b"# scan
+3
+0 0 0 0 0 1
+1,0,0,0,0,1
+1;1;0;0;0;1
+"
+                .to_vec(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn point_clouds_are_read_from_every_format() {
+        let lim = Limits::default();
+        let samples = cloud_samples();
+        // PLY ascii with normals
+        let Scan::Points(c) = read_scan(&samples[0].1, MeshFormat::Ply, &lim).unwrap() else { panic!("points") };
+        assert_eq!(c.len(), 4);
+        assert_eq!(c.normals.as_ref().map(Vec::len), Some(4));
+        // PLY binary without normals, extra property ignored
+        let Scan::Points(c) = read_scan(&samples[1].1, MeshFormat::Ply, &lim).unwrap() else { panic!("points") };
+        assert_eq!((c.len(), c.normals.is_none()), (3, true));
+        // OBJ with only vertices
+        let Scan::Points(c) = read_scan(&samples[2].1, MeshFormat::Obj, &lim).unwrap() else { panic!("points") };
+        assert_eq!(c.len(), 3);
+        // XYZ: a count header, comments, three separators, normals in columns 4-6
+        let Scan::Points(c) = read_scan(&samples[3].1, MeshFormat::Xyz, &lim).unwrap() else { panic!("points") };
+        assert_eq!(c.len(), 3);
+        assert_eq!(c.normals.as_ref().and_then(|n| n.first()).copied(), Some(Vec3::z()));
+        assert_eq!(MeshFormat::sniff(&samples[3].1), Some(MeshFormat::Xyz));
+        assert_eq!(MeshFormat::from_extension("ASC"), Some(MeshFormat::Xyz));
+        // four columns (intensity) carry no normals
+        let Scan::Points(c) = read_scan(
+            b"1 2 3 0.5
+4 5 6 0.7
+",
+            MeshFormat::Xyz,
+            &lim,
+        )
+        .unwrap() else {
+            panic!("points")
+        };
+        assert!(c.normals.is_none());
+        // meshes still come back as meshes, and `read_mesh` still refuses a cloud
+        let bytes = write_mesh(&sample(), MeshFormat::Ply);
+        assert!(matches!(read_scan(&bytes, MeshFormat::Ply, &lim).unwrap(), Scan::Mesh(_)));
+        assert!(read_mesh(&samples[0].1, MeshFormat::Ply, &lim).is_err());
+        assert!(read_mesh(&samples[3].1, MeshFormat::Xyz, &lim).is_err());
+        // a mesh read as points gives its vertices; a mesh written as XYZ reads back as points
+        assert_eq!(read_points(&bytes, MeshFormat::Ply, &lim).unwrap().len(), sample().vertex_count());
+        let xyz = write_mesh(&sample(), MeshFormat::Xyz);
+        let c = read_points(&xyz, MeshFormat::Xyz, &lim).unwrap();
+        assert_eq!((c.len(), c.normals.is_some()), (sample().vertex_count(), true));
+    }
+
+    #[test]
+    fn hostile_point_clouds_are_refused() {
+        let lim = Limits::default();
+        for bad in [
+            &b"1 2 3
+4 five 6
+"[..],
+            b"nan 0 0
+",
+            b"1 2
+",
+            b"",
+            b"# only a comment
+",
+            b"1 2 3
+x y z
+",
+        ] {
+            assert!(read_scan(bad, MeshFormat::Xyz, &lim).is_err(), "{:?}", String::from_utf8_lossy(bad));
+        }
+        let small = Limits { max_vertices: 2, ..Limits::default() };
+        assert!(matches!(
+            read_scan(
+                b"0 0 0
+1 0 0
+2 0 0
+",
+                MeshFormat::Xyz,
+                &small
+            ),
+            Err(IoError::Limit(_))
+        ));
+        assert!(matches!(
+            read_scan(&cloud_samples()[0].1, MeshFormat::Ply, &Limits { max_vertices: 3, ..Limits::default() }),
+            Err(IoError::Limit(_))
+        ));
+        // a vertex with a NaN normal is "unknown", one with a NaN position is refused
+        let ply = "ply
+format ascii 1.0
+element vertex 1
+property float x
+property float y
+property float z
+property float nx
+property float ny
+property float nz
+end_header
+0 0 0 nan 0 0
+";
+        let Scan::Points(c) = read_scan(ply.as_bytes(), MeshFormat::Ply, &lim).unwrap() else { panic!("points") };
+        assert_eq!(c.normals.as_ref().and_then(|n| n.first()).copied(), Some(Vec3::zeros()));
+    }
+
     /// Random bytes and random corruptions of valid files never panic (spike §3.2 item 7).
     #[test]
     fn hostile_bytes_never_panic() {
         let mut rng = Rng::new(42);
-        let valid: Vec<(MeshFormat, Vec<u8>)> = [MeshFormat::Stl, MeshFormat::Obj, MeshFormat::Ply]
-            .iter()
-            .map(|&f| (f, write_mesh(&sample(), f)))
-            .collect();
-        for round in 0..3000 {
+        let mut valid: Vec<(MeshFormat, Vec<u8>)> =
+            [MeshFormat::Stl, MeshFormat::Obj, MeshFormat::Ply, MeshFormat::Xyz]
+                .iter()
+                .map(|&f| (f, write_mesh(&sample(), f)))
+                .collect();
+        valid.extend(cloud_samples());
+        for round in 0..6000 {
             let (f, base) = &valid[round % valid.len()];
             let mut bytes = if round % 4 == 0 {
                 (0..rng.index(400)).map(|_| rng.next_u64() as u8).collect::<Vec<u8>>()
@@ -642,9 +979,17 @@ mod tests {
                 let cut = rng.index(bytes.len() + 1);
                 bytes.truncate(cut);
             }
-            for fmt in [*f, MeshFormat::Stl, MeshFormat::Obj, MeshFormat::Ply] {
+            for fmt in [*f, MeshFormat::Stl, MeshFormat::Obj, MeshFormat::Ply, MeshFormat::Xyz] {
                 if let Ok(m) = read_mesh(&bytes, fmt, &Limits::default()) {
                     assert!(m.validate().is_ok());
+                }
+                match read_scan(&bytes, fmt, &Limits::default()) {
+                    Ok(Scan::Mesh(m)) => assert!(m.validate().is_ok()),
+                    Ok(Scan::Points(c)) => assert!(c.validate().is_ok() && !c.is_empty()),
+                    Err(_) => {}
+                }
+                if let Ok(c) = read_points(&bytes, fmt, &Limits::default()) {
+                    assert!(c.validate().is_ok());
                 }
             }
             let _ = MeshFormat::sniff(&bytes);

@@ -21,7 +21,7 @@ pub mod profile;
 pub mod solve;
 
 pub use constraint::Constraint;
-pub use profile::{Segment3, profiles};
+pub use profile::{Segment3, open_paths, path_length, path_samples, profiles};
 pub use solve::{SolveReport, SolveStatus, solve};
 
 use schemars::JsonSchema;
