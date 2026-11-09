@@ -4,6 +4,7 @@
 use crate::Session;
 use std::collections::HashMap;
 use std::sync::Arc;
+use surfacecraft_doc::Document;
 use surfacecraft_doc::{BoolOp, FeatureOp, Mode, ObjectId, Side};
 use surfacecraft_geom::{Transform, Vec3};
 use surfacecraft_kernel::feature::{
@@ -151,13 +152,13 @@ fn path_placements(chain: &[Segment3], count: usize, follow: bool) -> Result<Vec
     Ok(out)
 }
 
-fn run(s: &Session, op: &FeatureOp, bodies: &HashMap<ObjectId, Brep>, own: Option<&Brep>) -> Result<Brep, String> {
+fn run(doc: &Document, op: &FeatureOp, bodies: &HashMap<ObjectId, Brep>, own: Option<&Brep>) -> Result<Brep, String> {
     let body =
         |id: &ObjectId| bodies.get(id).ok_or_else(|| format!("body {id} does not exist at this point of the history"));
     match op {
         FeatureOp::Base { brep } => Ok((**brep).clone()),
         FeatureOp::Extrude { sketch, distance, draft_deg, mode, target } => {
-            let sk = s.doc.sketch(*sketch).ok_or_else(|| format!("sketch {sketch} is gone"))?;
+            let sk = doc.sketch(*sketch).ok_or_else(|| format!("sketch {sketch} is gone"))?;
             let mut loops = profiles(&sk.sketch, 1e-6);
             if loops.is_empty() {
                 return Err("the sketch has no closed profile".into());
@@ -171,7 +172,7 @@ fn run(s: &Session, op: &FeatureOp, bodies: &HashMap<ObjectId, Brep>, own: Optio
             combine(base, made, *mode)
         }
         FeatureOp::Revolve { sketch, axis_origin, axis_direction, angle_deg, mode, target } => {
-            let sk = s.doc.sketch(*sketch).ok_or_else(|| format!("sketch {sketch} is gone"))?;
+            let sk = doc.sketch(*sketch).ok_or_else(|| format!("sketch {sketch} is gone"))?;
             let loops = profiles(&sk.sketch, 1e-6);
             let first = loops.first().ok_or("the sketch has no closed profile")?;
             let made = revolve(&curves(first), *axis_origin, *axis_direction, angle_deg.to_radians())
@@ -202,7 +203,7 @@ fn run(s: &Session, op: &FeatureOp, bodies: &HashMap<ObjectId, Brep>, own: Optio
         FeatureOp::Loft { sketches, degree, mode, target } => {
             let mut secs = Vec::with_capacity(sketches.len());
             for id in sketches {
-                let sk = s.doc.sketch(*id).ok_or_else(|| format!("sketch {id} is gone"))?;
+                let sk = doc.sketch(*id).ok_or_else(|| format!("sketch {id} is gone"))?;
                 secs.push(outer_profile(&sk.sketch)?);
             }
             let deg = degree.unwrap_or_else(|| u32::try_from(secs.len().saturating_sub(1)).unwrap_or(3).clamp(1, 3));
@@ -211,8 +212,8 @@ fn run(s: &Session, op: &FeatureOp, bodies: &HashMap<ObjectId, Brep>, own: Optio
             combine(base, made, *mode)
         }
         FeatureOp::Sweep { profile, path, follow, mode, target } => {
-            let psk = s.doc.sketch(*profile).ok_or_else(|| format!("sketch {profile} is gone"))?;
-            let ksk = s.doc.sketch(*path).ok_or_else(|| format!("sketch {path} is gone"))?;
+            let psk = doc.sketch(*profile).ok_or_else(|| format!("sketch {profile} is gone"))?;
+            let ksk = doc.sketch(*path).ok_or_else(|| format!("sketch {path} is gone"))?;
             let made = sweep(&outer_profile(&psk.sketch)?, &curves(&path_of(&ksk.sketch)?), *follow)
                 .map_err(|e| e.to_string())?;
             let base = target.as_ref().map(body).transpose()?.or(own);
@@ -230,7 +231,7 @@ fn run(s: &Session, op: &FeatureOp, bodies: &HashMap<ObjectId, Brep>, own: Optio
             split(body(target)?, *plane_origin, *plane_normal, *keep == Side::Front).map_err(|e| e.to_string())
         }
         FeatureOp::PathPattern { target, path, count, follow } => {
-            let ksk = s.doc.sketch(*path).ok_or_else(|| format!("sketch {path} is gone"))?;
+            let ksk = doc.sketch(*path).ok_or_else(|| format!("sketch {path} is gone"))?;
             let placements = path_placements(&path_of(&ksk.sketch)?, *count, *follow)?;
             pattern_placed(body(target)?, &placements).map_err(|e| e.to_string())
         }
@@ -247,14 +248,19 @@ fn run(s: &Session, op: &FeatureOp, bodies: &HashMap<ObjectId, Brep>, own: Optio
 
 /// Replays the whole history; returns the number of features that failed.
 pub fn replay(s: &mut Session) -> usize {
-    let feature_bodies: Vec<ObjectId> = s.doc.features.iter().map(|f| f.body).collect();
+    replay_doc(&mut s.doc)
+}
+
+/// [`replay`] on a document alone (a scratch copy, as a refit evaluates trial parameters).
+pub fn replay_doc(doc: &mut Document) -> usize {
+    let feature_bodies: Vec<ObjectId> = doc.features.iter().map(|f| f.body).collect();
     // bodies outside the history keep their geometry; feature bodies start empty
     let mut bodies: HashMap<ObjectId, Brep> =
-        s.doc.bodies.iter().filter(|b| !feature_bodies.contains(&b.id)).map(|b| (b.id, (*b.brep).clone())).collect();
+        doc.bodies.iter().filter(|b| !feature_bodies.contains(&b.id)).map(|b| (b.id, (*b.brep).clone())).collect();
     let mut consumed: Vec<ObjectId> = Vec::new();
     let mut failed = 0;
     let ops: Vec<(usize, FeatureOp, ObjectId, bool)> =
-        s.doc.features.iter().enumerate().map(|(i, f)| (i, f.op.clone(), f.body, f.suppressed)).collect();
+        doc.features.iter().enumerate().map(|(i, f)| (i, f.op.clone(), f.body, f.suppressed)).collect();
     for (i, mut op, out, suppressed) in ops {
         let mut rebound = false;
         let result = if suppressed {
@@ -262,7 +268,7 @@ pub fn replay(s: &mut Session) -> usize {
         } else {
             bind_refs(&mut op, &bodies).and_then(|changed| {
                 rebound = changed;
-                run(s, &op, &bodies, bodies.get(&out)).map(Some)
+                run(doc, &op, &bodies, bodies.get(&out)).map(Some)
             })
         };
         let err = match result {
@@ -279,7 +285,7 @@ pub fn replay(s: &mut Session) -> usize {
                 Some(e)
             }
         };
-        if let Some(f) = s.doc.features.get_mut(i) {
+        if let Some(f) = doc.features.get_mut(i) {
             f.error = err;
             // keep the resolved indices and any newly captured signatures
             if rebound {
@@ -291,14 +297,14 @@ pub fn replay(s: &mut Session) -> usize {
     for id in feature_bodies {
         match bodies.get(&id) {
             Some(b) => {
-                if let Some(obj) = s.doc.body_mut(id) {
+                if let Some(obj) = doc.body_mut(id) {
                     if *obj.brep != *b {
                         obj.brep = Arc::new(b.clone());
                     }
                     obj.visible = !consumed.contains(&id);
                 } else {
                     let name = format!("body {}", id.0);
-                    s.doc.bodies.push(surfacecraft_doc::BodyObject {
+                    doc.bodies.push(surfacecraft_doc::BodyObject {
                         id,
                         name,
                         brep: Arc::new(b.clone()),
@@ -307,7 +313,7 @@ pub fn replay(s: &mut Session) -> usize {
                 }
             }
             None => {
-                s.doc.bodies.retain(|o| o.id != id);
+                doc.bodies.retain(|o| o.id != id);
             }
         }
     }
