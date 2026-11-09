@@ -15,6 +15,105 @@ struct Node {
     leaf: bool,
 }
 
+/// Ranges at least this large are split into two parallel tasks.
+const PAR_MIN: usize = 32_768;
+
+fn tri_axis_sum(tris: &[[Point3; 3]], ti: u32, axis: usize) -> f64 {
+    tris.get(ti as usize).map_or(0.0, |t| t[0][axis] + t[1][axis] + t[2][axis])
+}
+
+fn bounds(tris: &[[Point3; 3]], order: &[u32]) -> (Aabb, Aabb) {
+    let mut bbox = Aabb::empty();
+    let mut cb = Aabb::empty();
+    for &ti in order {
+        let Some(t) = tris.get(ti as usize) else { continue };
+        for p in t {
+            bbox.grow(p);
+        }
+        cb.grow(&Point3::from((t[0].coords + t[1].coords + t[2].coords) / 3.0));
+    }
+    (bbox, cb)
+}
+
+/// Splits `order` at its median along the longest axis of the centroid box; `None` for a leaf.
+fn split<'a>(
+    tris: &[[Point3; 3]],
+    order: &'a mut [u32],
+    cb: &Aabb,
+    depth: usize,
+) -> Option<(&'a mut [u32], &'a mut [u32])> {
+    let n = order.len();
+    if n <= LEAF || depth > 60 {
+        return None;
+    }
+    let size = cb.size();
+    let axis = if size.x >= size.y && size.x >= size.z {
+        0
+    } else if size.y >= size.z {
+        1
+    } else {
+        2
+    };
+    let mid = n / 2;
+    order.select_nth_unstable_by(mid, |&a, &b| tri_axis_sum(tris, a, axis).total_cmp(&tri_axis_sum(tris, b, axis)));
+    Some(order.split_at_mut(mid))
+}
+
+/// Sequential subtree: nodes pushed pre-order into `nodes`; returns the id of the subtree root.
+fn build_seq(tris: &[[Point3; 3]], order: &mut [u32], offset: usize, depth: usize, nodes: &mut Vec<Node>) -> u32 {
+    let n = order.len();
+    let (bbox, cb) = bounds(tris, order);
+    let id = nodes.len() as u32;
+    nodes.push(Node { bbox, start: offset as u32, end: (offset + n) as u32, left: 0, right: 0, leaf: true });
+    if let Some((lo, hi)) = split(tris, order, &cb, depth) {
+        let mid = lo.len();
+        let left = build_seq(tris, lo, offset, depth + 1, nodes);
+        let right = build_seq(tris, hi, offset + mid, depth + 1, nodes);
+        if let Some(x) = nodes.get_mut(id as usize) {
+            x.leaf = false;
+            x.left = left;
+            x.right = right;
+        }
+    }
+    id
+}
+
+/// Nodes of the subtree over `order` (a slice starting at global position `offset`), pre-order,
+/// child ids relative to the returned vector. Subtrees of at least [`PAR_MIN`] triangles are built
+/// as two parallel tasks and stitched; smaller ones sequentially.
+fn build_range(tris: &[[Point3; 3]], order: &mut [u32], offset: usize, depth: usize) -> Vec<Node> {
+    let n = order.len();
+    if n < PAR_MIN {
+        let mut v = Vec::with_capacity(2 * n / LEAF + 2);
+        build_seq(tris, order, offset, depth, &mut v);
+        return v;
+    }
+    let (bbox, cb) = bounds(tris, order);
+    let mut node = Node { bbox, start: offset as u32, end: (offset + n) as u32, left: 0, right: 0, leaf: true };
+    let Some((lo, hi)) = split(tris, order, &cb, depth) else { return vec![node] };
+    let mid = lo.len();
+    let (left, right) = crate::par::join(
+        || build_range(tris, lo, offset, depth + 1),
+        || build_range(tris, hi, offset + mid, depth + 1),
+    );
+    let (l_shift, r_shift) = (1u32, 1 + left.len() as u32);
+    node.leaf = false;
+    node.left = l_shift;
+    node.right = r_shift;
+    let mut nodes = Vec::with_capacity(1 + left.len() + right.len());
+    nodes.push(node);
+    for (sub, shift) in [(left, l_shift), (right, r_shift)] {
+        nodes.extend(sub.into_iter().map(|mut x| {
+            if !x.leaf {
+                x.left += shift;
+                x.right += shift;
+            }
+            x
+        }));
+    }
+    nodes
+}
+
 /// The closest point on a mesh.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SurfaceHit {
@@ -35,18 +134,15 @@ pub struct Bvh {
 }
 
 impl Bvh {
-    /// Builds over every valid triangle of `mesh`.
+    /// Builds over every valid triangle of `mesh`. Large subtrees are built in parallel; the node
+    /// array is the same pre-order layout a sequential build gives.
     #[must_use]
     pub fn build(mesh: &Mesh) -> Self {
         let tris: Vec<[Point3; 3]> =
-            (0..mesh.triangle_count()).map(|i| mesh.triangle(i).unwrap_or([Point3::origin(); 3])).collect();
-        let order: Vec<u32> = (0..tris.len() as u32).collect();
-        let mut b = Bvh { tris, order, nodes: Vec::new() };
-        if !b.order.is_empty() {
-            let n = b.order.len();
-            b.build_node(0, n, 0);
-        }
-        b
+            crate::par::map(mesh.triangle_count(), |i| mesh.triangle(i).unwrap_or([Point3::origin(); 3]));
+        let mut order: Vec<u32> = (0..tris.len() as u32).collect();
+        let nodes = if order.is_empty() { Vec::new() } else { build_range(&tris, &mut order, 0, 0) };
+        Bvh { tris, order, nodes }
     }
 
     /// Number of triangles.
@@ -66,64 +162,6 @@ impl Bvh {
     pub fn triangle_normal(&self, i: usize) -> Option<Vec3> {
         let [a, b, c] = self.tris.get(i)?;
         tri::normal(a, b, c)
-    }
-
-    fn tri_box(&self, oi: usize) -> Aabb {
-        let t = self.order.get(oi).and_then(|&i| self.tris.get(i as usize));
-        t.map_or_else(Aabb::empty, |t| Aabb::from_points(t.iter()))
-    }
-
-    fn centroid(&self, ti: u32) -> Point3 {
-        self.tris
-            .get(ti as usize)
-            .map_or_else(Point3::origin, |t| Point3::from((t[0].coords + t[1].coords + t[2].coords) / 3.0))
-    }
-
-    fn build_node(&mut self, start: usize, end: usize, depth: usize) -> u32 {
-        let mut bbox = Aabb::empty();
-        for oi in start..end {
-            let b = self.tri_box(oi);
-            if !b.is_empty() {
-                bbox.grow(&b.min);
-                bbox.grow(&b.max);
-            }
-        }
-        let id = self.nodes.len() as u32;
-        self.nodes.push(Node { bbox, start: start as u32, end: end as u32, left: 0, right: 0, leaf: true });
-        if end - start <= LEAF || depth > 60 {
-            return id;
-        }
-        let mut cb = Aabb::empty();
-        for oi in start..end {
-            if let Some(&ti) = self.order.get(oi) {
-                cb.grow(&self.centroid(ti));
-            }
-        }
-        let size = cb.size();
-        let axis = if size.x >= size.y && size.x >= size.z {
-            0
-        } else if size.y >= size.z {
-            1
-        } else {
-            2
-        };
-        let mid = start + (end - start) / 2;
-        let tris = &self.tris;
-        if let Some(slice) = self.order.get_mut(start..end) {
-            slice.select_nth_unstable_by(mid - start, |&a, &b| {
-                let ca = tris.get(a as usize).map_or(0.0, |t| t[0][axis] + t[1][axis] + t[2][axis]);
-                let cb = tris.get(b as usize).map_or(0.0, |t| t[0][axis] + t[1][axis] + t[2][axis]);
-                ca.total_cmp(&cb)
-            });
-        }
-        let left = self.build_node(start, mid, depth + 1);
-        let right = self.build_node(mid, end, depth + 1);
-        if let Some(n) = self.nodes.get_mut(id as usize) {
-            n.leaf = false;
-            n.left = left;
-            n.right = right;
-        }
-        id
     }
 
     /// Closest point on the surface to `q` within `max_dist` (∞ for unbounded).

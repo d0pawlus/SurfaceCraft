@@ -15,6 +15,7 @@ pub mod plane;
 pub mod primitive;
 pub mod resample;
 pub mod segment;
+pub mod stats;
 
 pub use auto::{AutoFit, fit_auto};
 pub use plane::{PlaneFit, fit_plane};

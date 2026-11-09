@@ -97,11 +97,12 @@ impl SurfaceCraftApp {
     pub fn pick_at(&mut self, x: f64, y: f64, w: f64, h: f64, add: bool) -> bool {
         let (origin, dir) = self.camera.ray(x, y, w, h);
         let items = self.session.display_items();
-        let live: Vec<usize> = items.iter().map(|d| d.key).collect();
+        let live: Vec<usize> = items.iter().map(|d| d.pick_key).collect();
         self.bvh_cache.retain(|k, _| live.contains(k));
         let mut best: Option<(f64, Pick)> = None;
         for d in &items {
-            let bvh = self.bvh_cache.entry(d.key).or_insert_with(|| Bvh::build(&d.mesh));
+            // pick on the full-resolution mesh: the triangle ids stay the original ones
+            let bvh = self.bvh_cache.entry(d.pick_key).or_insert_with(|| Bvh::build(&d.pick_mesh));
             if let Some((tri, t)) = bvh.ray_cast(&origin, &dir)
                 && best.as_ref().is_none_or(|(bt, _)| t < *bt)
             {
@@ -657,9 +658,10 @@ impl SurfaceCraftApp {
             .map(|d| DrawItem {
                 key: d.key,
                 color: kind_color(d.kind),
+                colors: d.colors.clone(),
+                colors_key: d.colors_key,
+                highlight: self.highlights.get(&d.id).map(|h| Arc::new(d.drawn_triangles(h))),
                 mesh: d.mesh,
-                colors: d.colors,
-                highlight: self.highlights.get(&d.id).cloned(),
             })
             .collect();
         let bg = if ui.visuals().dark_mode { [0.08, 0.09, 0.11] } else { [0.85, 0.87, 0.9] };

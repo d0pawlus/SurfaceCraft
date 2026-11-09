@@ -202,31 +202,12 @@ fn dedupe(cloud: &PointCloud) -> (Vec<Point3>, Option<Vec<Vec3>>) {
 
 // ------------------------------------------------------------------ parallel helper
 
-/// Runs `f` over `0..n` in chunks on all cores (sequentially in the browser) and concatenates the
-/// results in order.
-fn par_collect<T: Send, F: Fn(Range<usize>) -> Vec<T> + Sync>(n: usize, f: F) -> Vec<T> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get).min(16);
-        if threads > 1 && n >= 20_000 {
-            let chunk = n.div_ceil(threads);
-            let f = &f;
-            let parts: Vec<Option<Vec<T>>> = std::thread::scope(|s| {
-                let handles: Vec<_> = (0..threads)
-                    .map(|t| {
-                        let lo = (t * chunk).min(n);
-                        let hi = ((t + 1) * chunk).min(n);
-                        s.spawn(move || f(lo..hi))
-                    })
-                    .collect();
-                handles.into_iter().map(|h| h.join().ok()).collect()
-            });
-            if parts.iter().all(Option::is_some) {
-                return parts.into_iter().flatten().flatten().collect();
-            }
-        }
-    }
-    f(0..n)
+/// Runs `f` over `0..n` in fixed-size chunks through [`crate::par`] (all cores natively,
+/// sequential in the browser) and concatenates the results in order.
+fn par_collect<T: Send, F: Fn(Range<usize>) -> Vec<T> + Sync + Send>(n: usize, f: F) -> Vec<T> {
+    const CHUNK: usize = 2048;
+    let chunks = n.div_ceil(CHUNK);
+    crate::par::map(chunks, |c| f(c * CHUNK..((c + 1) * CHUNK).min(n))).into_iter().flatten().collect()
 }
 
 // ------------------------------------------------------------------ neighbours and normals
