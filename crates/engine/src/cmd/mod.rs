@@ -173,6 +173,7 @@ const HEAVY: &[&str] = &[
     "quad.retopo",
     "region.auto_segment",
     "region.grow",
+    "region.resegment",
     "surface.auto",
     "surface.fit",
     "surface.thicken",
