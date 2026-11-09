@@ -5,6 +5,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use surfacecraft_doc::{ObjectId, ObjectKind, base64};
+use surfacecraft_geom::reduce::{self, DeviationStats, ToleranceOptions, ToleranceReport};
 use surfacecraft_geom::{Mesh, Point3, PointCloud, ReconParams, Rng, Transform, Vec3, edit, reconstruct, synth};
 use surfacecraft_io::{Limits, MeshFormat, Scan, read_points, read_scan, write_mesh};
 
@@ -520,6 +521,64 @@ pub struct EditOut {
     pub max_displacement: Option<f64>,
     /// Regions of the mesh dropped because its triangles changed.
     pub regions_dropped: usize,
+    /// Measured deviation of a tolerance-driven reduction (`mesh.decimate` with `tolerance`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tolerance_report: Option<ToleranceOut>,
+}
+
+/// One direction of the measured deviation, mm.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct DeviationOut {
+    /// Samples measured.
+    pub samples: usize,
+    /// Largest distance.
+    pub max: f64,
+    /// 99th percentile distance.
+    pub p99: f64,
+    /// Share of the samples within the tolerance, in [0, 1].
+    pub share_within: f64,
+}
+
+impl From<DeviationStats> for DeviationOut {
+    fn from(d: DeviationStats) -> Self {
+        Self { samples: d.samples, max: d.max, p99: d.p99, share_within: d.share_within }
+    }
+}
+
+/// What a tolerance-driven reduction measured, both ways.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ToleranceOut {
+    /// Requested tolerance, mm.
+    pub tolerance: f64,
+    /// Requested share of the samples within the tolerance.
+    pub share: f64,
+    /// Original vertices to the reduced surface.
+    pub original_to_reduced: DeviationOut,
+    /// Reduced vertices and triangle centroids to the original surface.
+    pub reduced_to_original: DeviationOut,
+    /// Triangles before.
+    pub triangles_before: usize,
+    /// Triangles after.
+    pub triangles_after: usize,
+    /// Reduction rounds run (1 = the first reduction already met the tolerance).
+    pub iterations: usize,
+    /// Did both directions reach `share` with no sample beyond twice the tolerance?
+    pub met: bool,
+}
+
+impl ToleranceOut {
+    fn new(r: ToleranceReport, tolerance: f64, share: f64) -> Self {
+        Self {
+            tolerance,
+            share,
+            original_to_reduced: r.original_to_reduced.into(),
+            reduced_to_original: r.reduced_to_original.into(),
+            triangles_before: r.triangles_before,
+            triangles_after: r.triangles_after,
+            iterations: r.iterations,
+            met: r.met,
+        }
+    }
 }
 
 /// Runs `f` on a copy of the mesh and stores the result (regions dropped when triangles changed).
@@ -541,6 +600,7 @@ fn edit_mesh(
         holes_left: None,
         max_displacement: None,
         regions_dropped: 0,
+        tolerance_report: None,
     };
     let old_tris = m.triangles.clone();
     f(&mut m, &mut o)?;
@@ -704,6 +764,17 @@ pub struct DecimateIn {
     /// Keep the open boundary in place (default true).
     #[serde(default)]
     pub preserve_boundary: Option<bool>,
+    /// Verified tolerance, mm: reduce, then measure original vertices to the reduced surface and
+    /// reduced vertices and triangle centroids to the original surface, and keep detail where the
+    /// tolerance is exceeded until `share` of the samples is within it in both directions (and none
+    /// is beyond twice the tolerance). Without `target` and `ratio` the mesh is reduced as far as the
+    /// tolerance allows; with one of them it is a floor. The measured numbers are returned in
+    /// `tolerance_report`.
+    #[serde(default)]
+    pub tolerance: Option<f64>,
+    /// Share of the samples that must be within `tolerance`, (0, 1] (default 0.999).
+    #[serde(default)]
+    pub share: Option<f64>,
 }
 
 fn decimate(s: &mut Session, i: DecimateIn) -> CmdResult<EditOut> {
@@ -717,15 +788,40 @@ fn decimate(s: &mut Session, i: DecimateIn) -> CmdResult<EditOut> {
         return Err(CmdError::Params("max_error must be positive".into()));
     }
     let angle = positive(i.feature_angle_deg, "feature_angle_deg", 40.0)?;
+    let tolerance = match i.tolerance {
+        None => None,
+        Some(t) if t.is_finite() && t > 0.0 => Some(t),
+        Some(_) => return Err(CmdError::Params("tolerance must be a positive number".into())),
+    };
+    let share = match (i.share, tolerance) {
+        (None, _) => 0.999,
+        (Some(x), Some(_)) if x.is_finite() && x > 0.0 && x <= 1.0 => x,
+        (Some(_), Some(_)) => return Err(CmdError::Params("share must be in (0, 1]".into())),
+        (Some(_), None) => return Err(CmdError::Params("share needs a tolerance".into())),
+    };
     edit_mesh(s, &i.object, |m, o| {
-        let target = i.target.unwrap_or((m.triangle_count() as f64 * ratio) as usize);
+        let before = m.triangle_count();
+        let target = match (i.target, i.ratio, tolerance) {
+            (Some(t), _, _) => t,
+            (None, Some(r), _) => (before as f64 * r) as usize,
+            (None, None, Some(_)) => 0,
+            (None, None, None) => (before as f64 * ratio) as usize,
+        };
         let opts = edit::DecimateOptions {
             target_triangles: target,
             max_error: i.max_error,
             feature_angle_deg: angle,
             preserve_boundary: i.preserve_boundary.unwrap_or(true),
         };
-        o.removed_triangles = edit::decimate(m, &opts);
+        if let Some(tol) = tolerance {
+            let want = ToleranceOptions { share, ..ToleranceOptions::new(tol) };
+            let report = reduce::reduce_to_tolerance(m, &opts, &want)
+                .ok_or_else(|| CmdError::Params("the mesh is not valid (indices or coordinates)".into()))?;
+            o.removed_triangles = before.saturating_sub(m.triangle_count());
+            o.tolerance_report = Some(ToleranceOut::new(report, tol, share));
+        } else {
+            o.removed_triangles = edit::decimate(m, &opts);
+        }
         Ok(())
     })
 }
@@ -863,7 +959,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         "Decimate",
         "Mesh",
         true,
-        "Reduces to `target` triangles or `ratio`, within `max_error` mm, keeping edges sharper than `feature_angle_deg`.",
+        "Reduces to `target` triangles or `ratio`, within `max_error` mm, keeping edges sharper than `feature_angle_deg`. With `tolerance` (mm) the reduction is measured both ways and refined locally until `share` (default 0.999) of the samples is within it; `tolerance_report` has max, p99 and share per direction, triangle counts and rounds.",
         DecimateIn,
         EditOut,
         decimate
