@@ -86,6 +86,25 @@ pub fn chamfer(body: &Brep, edges: &[usize], distance: f64) -> Result<Brep> {
     encode(&b)
 }
 
+/// Bevels edges with `distance` back along the face `along[i]` (one of edge i's two faces, a
+/// record face index) and `second` back along the other face.
+pub fn chamfer_sides(body: &Brep, edges: &[usize], along: &[usize], distance: f64, second: f64) -> Result<Brep> {
+    if !(distance > 0.0) || !distance.is_finite() || !(second > 0.0) || !second.is_finite() {
+        return Err(KernelError::Argument("chamfer distances must be positive".into()));
+    }
+    if edges.is_empty()
+        || along.len() != edges.len()
+        || edges.iter().any(|&e| e >= body.edges.len())
+        || along.iter().any(|&f| f >= body.faces.len())
+    {
+        return Err(KernelError::Argument("edge or face indices out of range".into()));
+    }
+    let b = decode(body)?;
+    ops::chamfer_sides(&b, edges, along, distance, ops::ChamferSecond::Distance(second))
+        .map_err(|e| op_err("chamfer_sides", e))?;
+    encode(&b)
+}
+
 /// Thickens a sheet into a solid (`ops::offset::thicken`, design doc §8 M4): `thickness` along
 /// the face normals, or half each way when `symmetric`.
 pub fn thicken(sheet: &Brep, thickness: f64, symmetric: bool) -> Result<Brep> {

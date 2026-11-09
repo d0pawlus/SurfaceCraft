@@ -7,10 +7,13 @@
   <style>
     html, body { margin: 0; height: 100%; background: #15171b; overflow: hidden; }
     canvas { width: 100%; height: 100%; display: block; }
+    #loading { position: fixed; inset: 0; display: grid; place-items: center; color: #9aa3ad;
+               font: 14px system-ui, sans-serif; pointer-events: none; }
   </style>
   <link data-trunk rel="rust" data-bin="surfacecraft-web" data-wasm-opt="z" />
 </head>
 <body>
   <canvas id="surfacecraft"></canvas>
+  <div id="loading">Loading SurfaceCraft… (first visit downloads the app, ~15 MB)</div>
 </body>
 </html>

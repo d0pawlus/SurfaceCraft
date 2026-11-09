@@ -1,6 +1,6 @@
 //! `cargo xtask <task>`: the repository's checks.
 //!
-//! `ci` runs, in order: fmt → assets → licences → layers → app-geometry → clippy → wasm → test.
+//! `ci` runs, in order: fmt → assets → licences → layers → ui-containers → app-geometry → clippy → wasm → test.
 //! `dist` (not in ci) builds the host-target release binaries and `dist/<target>/SHA256SUMS.txt`.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -8,6 +8,7 @@ mod assets;
 mod dist;
 mod layers;
 mod licences;
+mod ui_containers;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -73,16 +74,21 @@ fn web() -> Result<(), String> {
     run(c, "web build")?;
     let dist = root().join("apps").join("surfacecraft-web").join("dist");
     std::fs::create_dir_all(&dist).map_err(|e| format!("create dist: {e}"))?;
-    let wasm = root().join("target").join("wasm32-unknown-unknown").join("release").join("surfacecraft-web.wasm");
+    let target = std::env::var_os("CARGO_TARGET_DIR").map_or_else(|| root().join("target"), std::path::PathBuf::from);
+    let wasm = target.join("wasm32-unknown-unknown").join("release").join("surfacecraft-web.wasm");
     let mut b = Command::new("wasm-bindgen");
     b.arg(&wasm).args(["--target", "web", "--no-typescript", "--out-dir"]).arg(&dist);
     run(b, "wasm-bindgen")?;
     optimise_wasm(&dist.join("surfacecraft-web_bg.wasm"));
     let html = include_str!("../../apps/surfacecraft-web/index.html").replace(
         "<link data-trunk rel=\"rust\" data-bin=\"surfacecraft-web\" data-wasm-opt=\"z\" />",
-        "<script type=\"module\">import init from './surfacecraft-web.js'; init();</script>",
+        "<script type=\"module\">import init from './surfacecraft-web.js'; init().then(() => document.getElementById('loading')?.remove());</script>",
     );
     std::fs::write(dist.join("index.html"), html).map_err(|e| format!("write index.html: {e}"))?;
+    // a public bundle carries its licences and the third-party notices
+    for f in ["LICENSE-MIT", "LICENSE-APACHE", "NOTICE", "THIRD-PARTY-LICENSES.txt"] {
+        std::fs::copy(root().join(f), dist.join(f)).map_err(|e| format!("copy {f}: {e}"))?;
+    }
     eprintln!("==> web bundle in {}", dist.display());
     Ok(())
 }
@@ -183,6 +189,7 @@ fn ci() -> Result<(), String> {
     assets::check()?;
     licences::run(true)?;
     layers::check()?;
+    ui_containers::check()?;
     app_geometry()?;
     clippy()?;
     wasm()?;
@@ -200,6 +207,7 @@ fn quick(packages: &[String], with_tests: bool) -> Result<(), String> {
     assets::check()?;
     licences::run(true)?;
     layers::check()?;
+    ui_containers::check()?;
     app_geometry()?;
     if !packages.is_empty() {
         let mut c = cargo();
@@ -237,13 +245,14 @@ fn main() -> ExitCode {
             "assets" => assets::check(),
             "licences" | "licenses" => licences::run(check),
             "layers" => layers::check(),
+            "ui-containers" => ui_containers::check(),
             "app-geometry" => app_geometry(),
             "clippy" => clippy(),
             "wasm" => wasm(),
             "test" => test(),
             "web" => web(),
             "dist" => dist::run(),
-            _ => Err("tasks: ci, quick [--tests] [packages], fmt, assets, licences [--check], layers, app-geometry, clippy, wasm, test, web, dist"
+            _ => Err("tasks: ci, quick [--tests] [packages], fmt, assets, licences [--check], layers, ui-containers, app-geometry, clippy, wasm, test, web, dist"
                 .into()),
         };
     match r {

@@ -22,6 +22,7 @@ pub mod exchange;
 pub mod feature;
 pub mod hybrid;
 pub mod mesh;
+pub mod plan;
 pub mod primitive;
 pub mod quad;
 pub mod region;

@@ -46,11 +46,17 @@ rayon = "1"
 egui = { version = "0.37", features = ["default_fonts"] }
 eframe = { version = "0.37", default-features = false, features = ["persistence", "wgpu", "default_fonts", "x11", "wayland"] }
 egui-wgpu = "0.37"
+egui_extras = { version = "0.37", default-features = false, features = ["svg"] }
 wgpu = { version = "30", default-features = false, features = ["std", "wgsl", "webgpu", "webgl"] }
 bytemuck = { version = "1", features = ["derive"] }
 web-time = "1"
 pollster = "0.4"
 rfd = "0.17"
+
+# Craft family UI libraries (storytold/craft-libs), one reviewed rev; UI layer only (xtask layers).
+craft-ui = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "acf6f7973920d3c5cd5272a6bd3bd5eaa9699717", features = ["serde"] }
+craft-window = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "acf6f7973920d3c5cd5272a6bd3bd5eaa9699717", features = ["egui"] }
+craft-dialogs = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "1a11a4897865f7410c40d25ca6e452ce399a1a2c" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

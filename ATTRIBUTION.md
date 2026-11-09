@@ -25,6 +25,9 @@ Policy:
 | examples/** | SurfaceCraft contributors | this repository | MIT OR Apache-2.0 |
 | apps/surfacecraft-web/index.html | SurfaceCraft contributors | this repository | MIT OR Apache-2.0 |
 | crates/ui-egui/src/shaders/*.wgsl | SurfaceCraft contributors | this repository | MIT OR Apache-2.0 |
+| crates/ui-egui/assets/icons/*.svg | SurfaceCraft contributors | own monochrome line icons drawn for SurfaceCraft on a 24-unit grid (no icon from any other application or icon set) | MIT OR Apache-2.0 |
+| crates/ui-egui/assets/locales/*.json | SurfaceCraft contributors | own interface strings (English, Polish) | MIT OR Apache-2.0 |
+| docs/screenshots/*.png | SurfaceCraft contributors | rendered by the SurfaceCraft test suite from synthetic scans (`crates/ui-egui/tests/shell_screenshots.rs`) | MIT OR Apache-2.0 |
 
 ## Algorithm references (no source copied)
 
