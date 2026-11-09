@@ -5,8 +5,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use surfacecraft_doc::{ObjectId, ObjectKind, base64};
-use surfacecraft_geom::{Mesh, Point3, Rng, Transform, Vec3, edit, synth};
-use surfacecraft_io::{Limits, MeshFormat, read_mesh, write_mesh};
+use surfacecraft_geom::{Mesh, Point3, PointCloud, ReconParams, Rng, Transform, Vec3, edit, reconstruct, synth};
+use surfacecraft_io::{Limits, MeshFormat, Scan, read_points, read_scan, write_mesh};
 
 /// Facts about a mesh.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -42,6 +42,39 @@ pub(crate) fn mesh_info(s: &Session, id: ObjectId) -> CmdResult<MeshInfo> {
     })
 }
 
+/// Point-cloud reconstruction settings (every field optional).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReconstructOpts {
+    /// First ball radius as a multiple of the mean point spacing (0.5 - 50, default 2.5); two
+    /// more passes double it each time. Larger closes bigger gaps, smaller keeps thin features.
+    #[serde(default)]
+    pub radius_scale: Option<f64>,
+    /// Neighbours used for normal estimation (3 - 64, default 12).
+    #[serde(default)]
+    pub normals_k: Option<usize>,
+    /// Ball-pivoting passes (1 - 6, default 3).
+    #[serde(default)]
+    pub passes: Option<usize>,
+    /// Holes up to this many boundary edges are filled afterwards (default 24, 0 = none).
+    #[serde(default)]
+    pub fill_holes_max_edges: Option<usize>,
+}
+
+impl ReconstructOpts {
+    fn params(&self) -> ReconParams {
+        let d = ReconParams::default();
+        let max_points = if cfg!(target_arch = "wasm32") { 5_000_000 } else { d.max_points };
+        ReconParams {
+            normals_k: self.normals_k.unwrap_or(d.normals_k),
+            radius_scale: self.radius_scale.unwrap_or(d.radius_scale),
+            passes: self.passes.unwrap_or(d.passes),
+            fill_holes_max_edges: self.fill_holes_max_edges.unwrap_or(d.fill_holes_max_edges),
+            max_points,
+        }
+    }
+}
+
 /// Import parameters: a `path`, or inline base64 `data` with its `format`.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -52,19 +85,61 @@ pub struct ImportIn {
     /// File contents, base64 (for the web and MCP).
     #[serde(default)]
     pub data: Option<String>,
-    /// `stl`, `obj` or `ply` (default: from the extension, else sniffed).
+    /// `stl`, `obj`, `ply` or `xyz` (default: from the extension, else sniffed).
     #[serde(default)]
     pub format: Option<MeshFormat>,
-    /// Scale applied on import (e.g. 25.4 for inches → mm). Default 1.
+    /// Scale applied on import (e.g. 25.4 for inches to mm). Default 1.
     #[serde(default)]
     pub scale: Option<f64>,
     /// Object name (default: the file name).
     #[serde(default)]
     pub name: Option<String>,
+    /// Settings used when the file is a point cloud (PLY/OBJ without faces, XYZ): it is
+    /// reconstructed into a mesh on import.
+    #[serde(default)]
+    pub reconstruct: Option<ReconstructOpts>,
 }
 
-fn import(s: &mut Session, i: ImportIn) -> CmdResult<MeshInfo> {
-    let (bytes, default_name, ext_fmt) = match (&i.path, &i.data) {
+/// What reconstructing a point cloud did.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct CloudInfo {
+    /// Points in the file.
+    pub points: usize,
+    /// Exact duplicate points dropped.
+    pub duplicates_removed: usize,
+    /// Mean nearest-neighbour spacing, mm.
+    pub spacing: f64,
+    /// Ball radii used, mm.
+    pub radii: Vec<f64>,
+    /// `given` (normals from the file) or `estimated`.
+    pub normals: String,
+    /// Triangles built by ball pivoting.
+    pub pivoted_triangles: usize,
+    /// Points no ball rested on (left out).
+    pub unused_points: usize,
+    /// Isolated specks removed, triangles.
+    pub specks_removed: usize,
+    /// Holes filled.
+    pub holes_filled: usize,
+    /// Boundary loops left.
+    pub holes_left: usize,
+}
+
+/// Result of `mesh.import` / `mesh.reconstruct`: the mesh, plus how it came from points.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ImportOut {
+    /// The mesh object.
+    #[serde(flatten)]
+    pub mesh: MeshInfo,
+    /// Present when the input was a point cloud.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub point_cloud: Option<CloudInfo>,
+}
+
+type Loaded = (Vec<u8>, String, MeshFormat);
+
+fn load(s: &Session, path: &Option<String>, data: &Option<String>, format: Option<MeshFormat>) -> CmdResult<Loaded> {
+    let (bytes, default_name, ext_fmt) = match (path, data) {
         (Some(p), None) => {
             let path = std::path::Path::new(p);
             let ext = path.extension().and_then(|e| e.to_str()).and_then(MeshFormat::from_extension);
@@ -74,26 +149,117 @@ fn import(s: &mut Session, i: ImportIn) -> CmdResult<MeshInfo> {
         (None, Some(d)) => (base64::decode(d).map_err(CmdError::Params)?, "mesh".to_string(), None),
         _ => return Err(CmdError::Params("give exactly one of `path` or `data`".into())),
     };
-    let fmt = i
-        .format
+    let fmt = format
         .or(ext_fmt)
         .or_else(|| MeshFormat::sniff(&bytes))
         .ok_or_else(|| CmdError::Params("cannot tell the mesh format; pass `format`".into()))?;
-    // the browser has far less memory (design doc §11): smaller meshes on the web
-    let limits = if cfg!(target_arch = "wasm32") {
+    Ok((bytes, default_name, fmt))
+}
+
+/// The browser has far less memory (design doc section 11): smaller meshes on the web.
+fn read_limits() -> Limits {
+    if cfg!(target_arch = "wasm32") {
         Limits { max_triangles: 5_000_000, max_vertices: 5_000_000, ..Limits::default() }
     } else {
         Limits::default()
-    };
-    let mut mesh = read_mesh(&bytes, fmt, &limits)?;
-    if let Some(sc) = i.scale {
+    }
+}
+
+fn scaled(mut mesh: Mesh, scale: Option<f64>) -> CmdResult<Mesh> {
+    if let Some(sc) = scale {
         if !(sc.is_finite() && sc > 0.0) {
             return Err(CmdError::Params("scale must be positive".into()));
         }
         mesh.scale(sc);
     }
+    Ok(mesh)
+}
+
+fn from_cloud(mut cloud: PointCloud, scale: Option<f64>, opts: &ReconstructOpts) -> CmdResult<(Mesh, CloudInfo)> {
+    if let Some(sc) = scale {
+        if !(sc.is_finite() && sc > 0.0) {
+            return Err(CmdError::Params("scale must be positive".into()));
+        }
+        for p in &mut cloud.positions {
+            *p = Point3::from(p.coords * sc);
+        }
+    }
+    let (mesh, r) = reconstruct(&cloud, &opts.params()).map_err(|e| CmdError::Failed(format!("point cloud: {e}")))?;
+    let info = CloudInfo {
+        points: r.points,
+        duplicates_removed: r.duplicates_removed,
+        spacing: r.spacing,
+        radii: r.radii,
+        normals: if r.normals_given { "given" } else { "estimated" }.to_string(),
+        pivoted_triangles: r.pivoted_triangles,
+        unused_points: r.unused_points,
+        specks_removed: r.specks_removed,
+        holes_filled: r.holes_filled,
+        holes_left: r.holes_left,
+    };
+    Ok((mesh, info))
+}
+
+fn import(s: &mut Session, i: ImportIn) -> CmdResult<ImportOut> {
+    let (bytes, default_name, fmt) = load(s, &i.path, &i.data, i.format)?;
+    let name = i.name.clone().unwrap_or(default_name);
+    let (mesh, cloud) = match read_scan(&bytes, fmt, &read_limits())? {
+        Scan::Mesh(m) => (scaled(m, i.scale)?, None),
+        Scan::Points(c) => {
+            let (m, info) = from_cloud(c, i.scale, &i.reconstruct.clone().unwrap_or_default())?;
+            (m, Some(info))
+        }
+    };
+    let id = s.doc.add_mesh(&name, mesh);
+    Ok(ImportOut { mesh: mesh_info(s, id)?, point_cloud: cloud })
+}
+
+/// Reconstruction parameters: a file as for `mesh.import`, whose points (vertices, when it has
+/// faces) become a new mesh.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReconstructIn {
+    /// File path (format from the extension unless `format` is given).
+    #[serde(default)]
+    pub path: Option<String>,
+    /// File contents, base64.
+    #[serde(default)]
+    pub data: Option<String>,
+    /// `stl`, `obj`, `ply` or `xyz` (default: from the extension, else sniffed).
+    #[serde(default)]
+    pub format: Option<MeshFormat>,
+    /// Scale applied to the points. Default 1.
+    #[serde(default)]
+    pub scale: Option<f64>,
+    /// Object name (default: the file name).
+    #[serde(default)]
+    pub name: Option<String>,
+    /// First ball radius as a multiple of the mean point spacing (0.5 - 50, default 2.5).
+    #[serde(default)]
+    pub radius_scale: Option<f64>,
+    /// Neighbours used for normal estimation (3 - 64, default 12).
+    #[serde(default)]
+    pub normals_k: Option<usize>,
+    /// Ball-pivoting passes (1 - 6, default 3).
+    #[serde(default)]
+    pub passes: Option<usize>,
+    /// Holes up to this many boundary edges are filled afterwards (default 24, 0 = none).
+    #[serde(default)]
+    pub fill_holes_max_edges: Option<usize>,
+}
+
+fn reconstruct_cmd(s: &mut Session, i: ReconstructIn) -> CmdResult<ImportOut> {
+    let (bytes, default_name, fmt) = load(s, &i.path, &i.data, i.format)?;
+    let cloud = read_points(&bytes, fmt, &read_limits())?;
+    let opts = ReconstructOpts {
+        radius_scale: i.radius_scale,
+        normals_k: i.normals_k,
+        passes: i.passes,
+        fill_holes_max_edges: i.fill_holes_max_edges,
+    };
+    let (mesh, info) = from_cloud(cloud, i.scale, &opts)?;
     let id = s.doc.add_mesh(i.name.as_deref().unwrap_or(&default_name), mesh);
-    mesh_info(s, id)
+    Ok(ImportOut { mesh: mesh_info(s, id)?, point_cloud: Some(info) })
 }
 
 /// Export parameters.
@@ -597,10 +763,20 @@ pub static COMMANDS: &[CommandSpec] = &[
         "Import mesh…",
         "Mesh",
         true,
-        "Imports STL/OBJ/PLY from `path` or base64 `data` (+`format`), optional `scale`, `name`.",
+        "Imports STL/OBJ/PLY/XYZ from `path` or base64 `data` (+`format`), optional `scale`, `name`; a point cloud (no faces) is reconstructed into a mesh (`reconstruct` settings).",
         ImportIn,
-        MeshInfo,
+        ImportOut,
         import
+    ),
+    command!(
+        "mesh.reconstruct",
+        "Reconstruct from points...",
+        "Mesh",
+        true,
+        "Builds a mesh from the points of a file (PLY/OBJ/XYZ point cloud, or a mesh's vertices): normals by PCA, ball pivoting with `radius_scale` x point spacing, small holes filled.",
+        ReconstructIn,
+        ImportOut,
+        reconstruct_cmd
     ),
     command!(
         "mesh.export",
