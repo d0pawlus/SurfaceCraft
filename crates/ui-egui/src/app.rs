@@ -27,6 +27,8 @@ pub struct SurfaceCraftApp {
     pub palette_params: String,
     /// Palette filter text.
     pub palette_filter: String,
+    /// The sketch editing mode (G5).
+    pub sketch_editor: crate::sketch_editor::SketchEditor,
     /// Last status line.
     pub status: String,
     /// Points picked in the viewport (click: replace, Shift+click: add).
@@ -98,6 +100,7 @@ impl SurfaceCraftApp {
             palette_command: None,
             palette_params: "{}".into(),
             palette_filter: String::new(),
+            sketch_editor: crate::sketch_editor::SketchEditor::default(),
             status: t("status.ready").to_string(),
             picks: Vec::new(),
             tokens: Tokens::resolve(settings.theme.preset),
@@ -577,7 +580,11 @@ impl SurfaceCraftApp {
         let rect = ui.available_rect_before_wrap();
         self.viewport_rect = Some(rect);
         let resp = ui.allocate_rect(rect, egui::Sense::click_and_drag());
-        if resp.dragged_by(egui::PointerButton::Primary) {
+        let sketching = self.sketch_editing();
+        if sketching {
+            self.sketch_input(ui, &resp, rect);
+        }
+        if !sketching && resp.dragged_by(egui::PointerButton::Primary) {
             let d = resp.drag_delta();
             self.camera.orbit(f64::from(d.x), f64::from(d.y));
         }
@@ -591,7 +598,9 @@ impl SurfaceCraftApp {
                 self.camera.zoom(f64::from(scroll));
             }
         }
-        if resp.double_clicked() {
+        if sketching {
+            // the sketch editor owns clicks
+        } else if resp.double_clicked() {
             self.fit_pending = true;
         } else if resp.clicked()
             && let Some(pos) = resp.interact_pointer_pos()
@@ -612,6 +621,10 @@ impl SurfaceCraftApp {
         }
         if !self.gpu {
             ui.painter().rect_filled(rect, 0.0, self.tokens.color(Token::ViewportBackground));
+            if sketching {
+                self.sketch_overlay(ui, rect);
+                return;
+            }
             ui.painter().text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -640,6 +653,9 @@ impl SurfaceCraftApp {
         let bg = self.tokens.viewport_background().map(f64::from);
         let frame = Frame { size, camera: self.camera.clone(), origin: self.camera.target, items, background: bg };
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(rect, ViewportCallback(frame)));
+        if sketching {
+            self.sketch_overlay(ui, rect);
+        }
     }
 }
 
