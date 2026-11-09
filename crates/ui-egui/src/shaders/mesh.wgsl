@@ -4,9 +4,12 @@ struct Globals {
     view_proj: mat4x4<f32>,
     eye: vec4<f32>,
     light: vec4<f32>,
+    clip: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
+// preview motion of one object (identity when it is not being dragged)
+@group(1) @binding(0) var<uniform> model: mat4x4<f32>;
 
 struct VsIn {
     @location(0) pos: vec3<f32>,
@@ -24,15 +27,20 @@ struct VsOut {
 @vertex
 fn vs_main(v: VsIn) -> VsOut {
     var o: VsOut;
-    o.clip = globals.view_proj * vec4<f32>(v.pos, 1.0);
-    o.world = v.pos;
-    o.normal = v.normal;
+    let world = model * vec4<f32>(v.pos, 1.0);
+    o.clip = globals.view_proj * world;
+    o.world = world.xyz;
+    o.normal = (model * vec4<f32>(v.normal, 0.0)).xyz;
     o.color = v.color;
     return o;
 }
 
 @fragment
 fn fs_main(i: VsOut) -> @location(0) vec4<f32> {
+    // section plane: the far side of it is clipped away (all-zero plane = off)
+    if (dot(globals.clip.xyz, i.world) - globals.clip.w > 0.0) {
+        discard;
+    }
     let n_len = length(i.normal);
     if (n_len < 0.001) {
         return i.color;

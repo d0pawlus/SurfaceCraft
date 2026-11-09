@@ -54,6 +54,7 @@ fn viewport_image(app: &mut SurfaceCraftApp, tokens: &Tokens, w: u32, h: u32) ->
         camera,
         items,
         background: tokens.viewport_background().map(f64::from),
+        overlay: Default::default(),
     };
     viewport::render_offscreen(&frame)
 }

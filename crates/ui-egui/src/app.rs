@@ -48,8 +48,10 @@ pub struct SurfaceCraftApp {
     /// Whether a wgpu render state exists (false in headless tests).
     gpu: bool,
     pub(crate) fit_pending: bool,
-    bvh_cache: HashMap<usize, Bvh>,
-    highlights: HashMap<ObjectId, Arc<Vec<u32>>>,
+    pub(crate) bvh_cache: HashMap<usize, Bvh>,
+    pub(crate) highlights: HashMap<ObjectId, Arc<Vec<u32>>>,
+    /// The viewport tools: selection, face/edge picking, gizmo, section plane, view animation.
+    pub tools: crate::viewtools::ViewTools,
     /// The assistant's goal text.
     pub assistant_goal: String,
     /// Align (true) or workflow mode.
@@ -117,6 +119,7 @@ impl SurfaceCraftApp {
             fit_pending: false,
             bvh_cache: HashMap::new(),
             highlights: HashMap::new(),
+            tools: crate::viewtools::ViewTools::default(),
             assistant_goal: String::new(),
             assistant_align: true,
             provider: default_provider(),
@@ -171,7 +174,8 @@ impl SurfaceCraftApp {
         self.refresh_highlights();
     }
 
-    fn refresh_highlights(&mut self) {
+    pub(crate) fn refresh_highlights(&mut self) {
+        self.tools.touch();
         let mut by: HashMap<ObjectId, Vec<u32>> = HashMap::new();
         for p in &self.picks {
             by.entry(p.object).or_default().push(p.triangle);
@@ -200,8 +204,15 @@ impl SurfaceCraftApp {
         PickContext {
             selected: self.selected_object,
             points: self.picks.iter().map(|p| [p.point.x, p.point.y, p.point.z]).collect(),
-            triangles: self.picks.iter().map(|p| p.triangle).collect(),
             objects: self.session.doc.summaries().iter().map(|o| (o.id, o.kind)).collect(),
+            // a brush/lasso/smart selection wins over single picked triangles
+            triangles: if self.tools.selection.is_empty() {
+                self.picks.iter().map(|p| p.triangle).collect()
+            } else {
+                self.tools.selection.to_vec()
+            },
+            faces: self.tools.brep.face_list(),
+            edges: self.tools.brep.edge_list(),
         }
     }
 
@@ -570,40 +581,16 @@ impl SurfaceCraftApp {
         let rect = ui.available_rect_before_wrap();
         self.viewport_rect = Some(rect);
         let resp = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+        // Sketch mode takes precedence over the viewport tools: the sketch editor owns the
+        // primary button and Esc (the innermost gesture); navigation stays (Alt+drag orbits).
         let sketching = self.sketch_editing();
         if sketching {
+            self.cancel_interaction();
             self.sketch_input(ui, &resp, rect);
-        }
-        if !sketching && resp.dragged_by(egui::PointerButton::Primary) {
-            let d = resp.drag_delta();
-            self.camera.orbit(f64::from(d.x), f64::from(d.y));
-        }
-        if resp.dragged_by(egui::PointerButton::Secondary) || resp.dragged_by(egui::PointerButton::Middle) {
-            let d = resp.drag_delta();
-            self.camera.pan(f64::from(d.x), f64::from(d.y), f64::from(rect.height()));
-        }
-        if resp.hovered() {
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            if scroll != 0.0 {
-                self.camera.zoom(f64::from(scroll));
-            }
-        }
-        if sketching {
-            // the sketch editor owns clicks
-        } else if resp.double_clicked() {
-            self.fit_pending = true;
-        } else if resp.clicked()
-            && let Some(pos) = resp.interact_pointer_pos()
-        {
-            let local = pos - rect.min;
-            let add = ui.input(|i| i.modifiers.shift);
-            self.pick_at(
-                f64::from(local.x),
-                f64::from(local.y),
-                f64::from(rect.width()),
-                f64::from(rect.height()),
-                add,
-            );
+            self.sketch_navigation(ui, &resp, rect);
+        } else {
+            // navigation, the view cube and the active tool (selection, gizmo, ...): viewtools.rs
+            self.view_input(ui, &resp, rect);
         }
         if self.fit_pending {
             self.camera.fit(&self.session.doc.bbox());
@@ -622,31 +609,54 @@ impl SurfaceCraftApp {
                 egui::FontId::proportional(14.0),
                 self.tokens.color(Token::TextMuted),
             );
+            self.paint_view_overlays(ui, rect);
             return;
         }
         let ppp = ui.ctx().pixels_per_point();
         let size = [(rect.width() * ppp).round().max(1.0) as u32, (rect.height() * ppp).round().max(1.0) as u32];
         let tokens = self.tokens.clone();
-        let items: Vec<DrawItem> = self
-            .session
-            .display_items()
+        let display = self.session.display_items();
+        let overlay = self.frame_overlay(&display);
+        let items: Vec<DrawItem> = display
             .into_iter()
             .map(|d| DrawItem {
                 key: d.key,
                 color: tokens.object(d.kind),
                 colors: d.colors.clone(),
                 colors_key: d.colors_key,
-                highlight: self.highlights.get(&d.id).map(|h| Arc::new(d.drawn_triangles(h))),
+                highlight: self.highlight_for(&d),
                 mesh: d.mesh,
             })
             .collect();
         let bg = self.tokens.viewport_background().map(f64::from);
         let mut items = items;
         items.extend(self.cmd_panel.draw_items(&tokens));
-        let frame = Frame { size, camera: self.camera.clone(), origin: self.camera.target, items, background: bg };
+        let frame =
+            Frame { size, camera: self.camera.clone(), origin: self.camera.target, items, background: bg, overlay };
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(rect, ViewportCallback(frame)));
         if sketching {
             self.sketch_overlay(ui, rect);
+        } else {
+            self.paint_view_overlays(ui, rect);
+        }
+    }
+
+    /// Camera control while sketching: pan (right/middle drag), zoom (wheel) and Alt+drag
+    /// orbit. The primary button belongs to the sketch editor, so orbiting needs Alt.
+    fn sketch_navigation(&mut self, ui: &egui::Ui, resp: &egui::Response, rect: egui::Rect) {
+        if resp.dragged_by(egui::PointerButton::Secondary) || resp.dragged_by(egui::PointerButton::Middle) {
+            let d = resp.drag_delta();
+            self.camera.pan(f64::from(d.x), f64::from(d.y), f64::from(rect.height()));
+        }
+        if resp.dragged_by(egui::PointerButton::Primary) && ui.input(|i| i.modifiers.alt) {
+            let d = resp.drag_delta();
+            self.camera.orbit(f64::from(d.x), f64::from(d.y));
+        }
+        if resp.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll != 0.0 {
+                self.camera.zoom(f64::from(scroll));
+            }
         }
     }
 }
@@ -702,11 +712,15 @@ pub struct PickContext {
     pub selected: Option<ObjectId>,
     /// Picked points.
     pub points: Vec<[f64; 3]>,
-    /// Picked triangles.
+    /// Picked triangles (original ids of the scan).
     pub triangles: Vec<u32>,
     /// Every object of the document (id, kind), so object references can be prefilled with a
     /// real object instead of a made-up id.
     pub objects: Vec<(ObjectId, ObjectKind)>,
+    /// Picked B-rep faces (indices in the body record).
+    pub faces: Vec<usize>,
+    /// Picked B-rep edges (indices in the body record).
+    pub edges: Vec<usize>,
 }
 
 impl PickContext {
@@ -769,6 +783,8 @@ pub fn template(schema: &Value, ctx: &PickContext) -> Value {
                 }
                 "from" | "points" if !ctx.points.is_empty() => json!(ctx.points),
                 "triangles" if !ctx.triangles.is_empty() => json!(ctx.triangles),
+                "faces" if !ctx.faces.is_empty() => json!(ctx.faces),
+                "edges" if !ctx.edges.is_empty() => json!(ctx.edges),
                 _ => example(&p, schema),
             };
             out.insert(name.to_string(), v);

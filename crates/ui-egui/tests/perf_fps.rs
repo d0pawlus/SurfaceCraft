@@ -26,7 +26,14 @@ fn fps_with_a_large_scan() {
     let drawn: usize = items.iter().map(|i| i.mesh.triangle_count()).sum();
     let mut camera = Camera::default();
     camera.fit(&s.doc.bbox());
-    let frame = Frame { size: [1280, 800], origin: camera.target, camera, items, background: [0.1, 0.1, 0.12] };
+    let frame = Frame {
+        size: [1280, 800],
+        origin: camera.target,
+        camera,
+        items,
+        background: [0.1, 0.1, 0.12],
+        overlay: Default::default(),
+    };
     let Some(b) = bench_offscreen(&frame, 60) else {
         eprintln!("skipping: no GPU adapter");
         return;

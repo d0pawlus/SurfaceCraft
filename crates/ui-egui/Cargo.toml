@@ -10,6 +10,7 @@ publish.workspace = true
 
 [dependencies]
 surfacecraft-geom.workspace = true
+surfacecraft-fit.workspace = true
 surfacecraft-doc.workspace = true
 surfacecraft-sketch.workspace = true
 surfacecraft-engine.workspace = true
@@ -41,7 +42,6 @@ web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlA
 
 [dev-dependencies]
 egui_kittest = { version = "0.37", features = ["wgpu"] }
-surfacecraft-fit.workspace = true
 surfacecraft-kernel.workspace = true
 surfacecraft-ai.workspace = true
 
