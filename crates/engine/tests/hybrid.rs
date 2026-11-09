@@ -270,24 +270,10 @@ fn gate_p3_chamfered_cylinder_with_hole() {
     let mut kinds: Vec<&str> = big.iter().map(|r| r["kind"].as_str().unwrap_or("none")).collect();
     kinds.sort_unstable();
     eprintln!("part B regions: {kinds:?}");
-    assert_eq!(kinds, ["cone", "cylinder", "cylinder"]);
-    let mut prims: Vec<Value> =
+    // the annular planes come out whole now (merging runs to a fixed point), no manual selection
+    assert_eq!(kinds, ["cone", "cylinder", "cylinder", "plane", "plane"]);
+    let prims: Vec<Value> =
         big.iter().map(|r| s.execute("primitive.fit", json!({"region": r["id"]})).unwrap()["id"].clone()).collect();
-    // the two annular planes: auto_segment splits them into many small flat pieces (a P1
-    // follow-up), so each is selected as the flat triangles at its height
-    let scan_id = s.doc.find_by_name("scan").unwrap().0;
-    let scan = s.doc.mesh(scan_id).unwrap().mesh.clone();
-    for (name, z, nz) in [("top plane", 30.0, 1.0), ("bottom plane", 0.0, -1.0)] {
-        let tris: Vec<u32> = (0..scan.triangle_count() as u32)
-            .filter(|&t| {
-                (scan.face_centroid(t as usize).unwrap().z - z).abs() < 0.12
-                    && scan.face_normal(t as usize).is_some_and(|n| n.z * nz > 0.8)
-            })
-            .collect();
-        assert!(tris.len() > 1000, "{name}: {} triangles", tris.len());
-        let r = s.execute("region.create", json!({"mesh": "scan", "triangles": tris, "name": name})).unwrap();
-        prims.push(s.execute("primitive.fit", json!({"region": r["id"], "kind": "plane"})).unwrap()["id"].clone());
-    }
     let built = s.execute("body.from_regions", json!({"primitives": prims, "name": "hybrid"})).unwrap();
     eprintln!("from_regions: {}", built["faces_of"]);
     let (vol, max) = check_solid(&mut s, &built, v_cad, cad_faces);
