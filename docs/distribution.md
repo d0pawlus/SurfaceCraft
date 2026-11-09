@@ -79,10 +79,21 @@ packager already maps its token (`macos-x86_64`).
 
 ## Release workflow
 
-`.github/workflows/release.yml` builds the packages above and publishes them. It starts on a pushed tag
-`v*`, or by hand (Actions > release > Run workflow, with an existing tag such as `v0.1.0`).
+`.github/workflows/release.yml` builds the packages above and publishes them. A merge to `main` never
+publishes a release by itself (the web app is a separate matter: it is deployed after every green `ci`
+on `main`, see below). There are two kinds of release (owner's decision, 2026-11-09):
 
-1. **prepare:** checks the tag form (`vX.Y.Z` or `vX.Y.Z-pre`, at most 64 characters).
+- **Official:** only by hand, by the owner: a pushed tag `v*`, or Actions > release > Run workflow
+  with an existing tag such as `v0.1.0`.
+- **Nightly:** every day at 04:00 Warsaw time from the head of `main`, published as the pre-release
+  `nightly` (not marked latest), which replaces the previous night's release and moves the `nightly`
+  tag. GitHub cron runs in UTC, so the workflow is scheduled at 02:00 and 03:00 UTC and keeps the run
+  that falls on 04:00 in `Europe/Warsaw` (this follows summer time). A night is skipped when `main` has
+  not changed since the last nightly or when `ci` did not pass on that commit. A nightly can also be
+  started by hand with the tag input `nightly`. Its file names carry the workspace version.
+
+1. **prepare:** checks the tag form (`vX.Y.Z` or `vX.Y.Z-pre`, at most 64 characters), or for a
+   nightly decides whether tonight's build runs.
 2. **package (matrix):** `windows-latest` (`x86_64-pc-windows-msvc`), `ubuntu-latest`
    (`x86_64-unknown-linux-gnu`), `macos-latest` (`aarch64-apple-darwin`). Each runs
    `cargo xtask dist --tag <tag>` and uploads `dist/<target>/release/`. The build fails when the tag
