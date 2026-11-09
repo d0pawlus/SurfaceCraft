@@ -1,7 +1,7 @@
 //! Semantic theme tokens: the only place of the UI that knows colours and pixel sizes.
 //!
 //! The rest of the UI asks for a meaning (`Token::SurfaceRaised`, `Token::TextMuted`,
-//! `Token::AccentPrimary`, `Token::DeviationOutside`), never for a colour or a size; a preset
+//! `Token::AccentPrimary`, `Token::DeviationAboveFar`), never for a colour or a size; a preset
 //! resolves every token to a colour and a density resolves the spacing, so one layout serves all
 //! presets (Craft framework principle "apps ask for meaning"; `cargo xtask ui-containers` rejects
 //! raw colours elsewhere). Presets are data: Dark (the default of a creative app), Light and High
@@ -182,10 +182,28 @@ tokens! {
     AxisX => "axis.x",
     AxisY => "axis.y",
     AxisZ => "axis.z",
-    DeviationBelow => "deviation.below",
+    DeviationBelowNear => "deviation.below_near",
+    DeviationBelowFar => "deviation.below_far",
     DeviationInTolerance => "deviation.in_tolerance",
-    DeviationAbove => "deviation.above",
-    DeviationOutside => "deviation.outside",
+    DeviationAboveNear => "deviation.above_near",
+    DeviationAboveFar => "deviation.above_far",
+    DeviationUnmeasured => "deviation.unmeasured",
+}
+
+/// One linear channel in 0..1 as a byte (the rounding every deviation colour goes through).
+fn channel(v: f32) -> u8 {
+    (v.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+/// A linear RGBA colour of the deviation map as the byte colour the theme resolves to.
+#[must_use]
+pub fn to_color32(c: [f32; 4]) -> Color32 {
+    Color32::from_rgba_unmultiplied(channel(c[0]), channel(c[1]), channel(c[2]), channel(c[3]))
+}
+
+/// The deviation colours, shared with `surfacecraft_deviation::colorize` (the viewport).
+fn deviation_bytes(c: [f32; 4]) -> [u8; 4] {
+    [channel(c[0]), channel(c[1]), channel(c[2]), channel(c[3])]
 }
 
 /// `[r, g, b, a]` of a token in one preset (straight alpha).
@@ -205,10 +223,12 @@ fn raw(preset: Preset, token: Token) -> [u8; 4] {
             AxisX => [230, 51, 51, 255],
             AxisY => [51, 204, 51, 255],
             AxisZ => [64, 102, 242, 255],
-            DeviationBelow => [66, 110, 214, 255],
-            DeviationInTolerance => [64, 180, 110, 255],
-            DeviationAbove => [232, 150, 50, 255],
-            DeviationOutside => [226, 66, 66, 255],
+            DeviationBelowNear => deviation_bytes(surfacecraft_deviation::palette::BELOW_NEAR),
+            DeviationBelowFar => deviation_bytes(surfacecraft_deviation::palette::BELOW_FAR),
+            DeviationInTolerance => deviation_bytes(surfacecraft_deviation::palette::IN_TOLERANCE),
+            DeviationAboveNear => deviation_bytes(surfacecraft_deviation::palette::ABOVE_NEAR),
+            DeviationAboveFar => deviation_bytes(surfacecraft_deviation::palette::ABOVE_FAR),
+            DeviationUnmeasured => deviation_bytes(surfacecraft_deviation::palette::UNMEASURED),
             _ => [0, 0, 0, 255],
         }
     };

@@ -458,49 +458,9 @@ impl SurfaceCraftApp {
         }
     }
 
-    /// Deviation maps: the legend (tokens), the scans that carry a map and the commands.
+    /// The Deviation panel: legend, statistics, histogram and the maps (see [`crate::deviation_panel`]).
     pub(crate) fn deviation_panel(&mut self, ui: &mut egui::Ui) {
-        ui.strong(t("deviation.legend"));
-        for (token, key) in [
-            (Token::DeviationBelow, "deviation.below"),
-            (Token::DeviationInTolerance, "deviation.in_tolerance"),
-            (Token::DeviationAbove, "deviation.above"),
-            (Token::DeviationOutside, "deviation.outside"),
-        ] {
-            ui.horizontal(|ui| {
-                let (rect, _) = ui.allocate_exact_size(
-                    egui::Vec2::splat(self.settings.theme.density.metrics().icon),
-                    egui::Sense::hover(),
-                );
-                ui.painter().rect_filled(rect, 3.0, self.tokens.color(token));
-                ui.label(t(key));
-            });
-        }
-        ui.separator();
-        let mut mapped: Vec<ObjectId> = self.session.overlays.keys().copied().collect();
-        mapped.sort();
-        if mapped.is_empty() {
-            ui.weak(t("deviation.none"));
-        }
-        let mut clear = None;
-        for id in mapped {
-            ui.horizontal(|ui| {
-                ui.label(format!("{id}"));
-                if ui.small_button(t("deviation.clear")).clicked() {
-                    clear = Some(id);
-                }
-            });
-        }
-        if let Some(id) = clear {
-            let _ = self.run_command("deviation.clear", json!({"object": id.0}));
-        }
-        ui.separator();
-        if ui.button(t("deviation.compute")).clicked() {
-            self.choose_command("deviation.compute");
-        }
-        if ui.button(t("deviation.noise")).clicked() {
-            self.choose_command("deviation.noise");
-        }
+        crate::deviation_panel::show(self, ui);
     }
 
     /// The command palette with its JSON parameter editor and the assistant.

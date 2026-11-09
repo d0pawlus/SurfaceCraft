@@ -12,6 +12,7 @@ publish.workspace = true
 surfacecraft-geom.workspace = true
 surfacecraft-doc.workspace = true
 surfacecraft-engine.workspace = true
+surfacecraft-deviation.workspace = true
 surfacecraft-ai.workspace = true
 serde_json.workspace = true
 egui.workspace = true
