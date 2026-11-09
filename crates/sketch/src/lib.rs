@@ -15,6 +15,7 @@
     clippy::unreachable
 )]
 
+pub mod chains;
 pub mod constraint;
 pub mod fit2d;
 pub mod profile;
@@ -22,7 +23,7 @@ pub mod solve;
 
 pub use constraint::Constraint;
 pub use profile::{Segment3, open_paths, path_length, path_samples, profiles};
-pub use solve::{SolveReport, SolveStatus, solve};
+pub use solve::{SolveReport, SolveStatus, polish, solve};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
