@@ -418,15 +418,15 @@ fn convexity(sides: &[Side], tiny: f64) -> Option<bool> {
     signs.iter().all(|s| *s == convex).then_some(convex)
 }
 
-/// Reads the surface around the hole as a wedge of two or three sides; `None` when it is one
-/// smooth surface or cannot be read (`edge` is the mean loop edge length).
-fn read_wedge(mesh: &Mesh, around: &Around, lp: &[u32], edge: f64) -> Option<Wedge> {
+/// Reads the surface around the hole as a wedge of two or three sides; the reason when it is
+/// one smooth surface or cannot be read (`edge` is the mean loop edge length).
+fn read_wedge(mesh: &Mesh, around: &Around, lp: &[u32], edge: f64) -> Result<Wedge, &'static str> {
     let mut near = triangles_near(mesh, around, lp);
-    let means = group_by_normal(&mut near)?;
-    let normals = split_sides(&mut near, &means, edge)?;
+    let means = group_by_normal(&mut near).ok_or("one group of normals")?;
+    let normals = split_sides(&mut near, &means, edge).ok_or("not two or three sides")?;
     let by_edge = edges_of(&near);
     if !meets_sharply(&near, &by_edge) {
-        return None;
+        return Err("the sides do not meet sharply");
     }
     let mut sides: Vec<Side> = Vec::with_capacity(normals.len());
     for (k, n) in normals.iter().enumerate() {
@@ -434,14 +434,14 @@ fn read_wedge(mesh: &Mesh, around: &Around, lp: &[u32], edge: f64) -> Option<Wed
         ids.sort_unstable();
         ids.dedup();
         let points: Vec<Point3> = ids.iter().filter_map(|&v| mesh.positions.get(v as usize).copied()).collect();
-        let (side, rms) = Side::fit(&points, *n)?;
+        let (side, rms) = Side::fit(&points, *n).ok_or("a side has no fit")?;
         if !(rms <= MAX_SIDE_RMS * edge) {
-            return None;
+            return Err("a side is not one surface");
         }
         sides.push(side);
     }
-    let convex = convexity(&sides, MIN_WEDGE * edge)?;
-    Some(Wedge { sides, convex })
+    let convex = convexity(&sides, MIN_WEDGE * edge).ok_or("neither convex nor concave")?;
+    Ok(Wedge { sides, convex })
 }
 
 /// Area of the smallest patch triangle (from `first_tri` on) at vertex `v`.
@@ -614,8 +614,8 @@ fn tangled(mesh: &Mesh, hole: &Hole, wedge: &Wedge, min_area: f64) -> Vec<usize>
 /// Untangles the patch after its vertices moved: the patch vertices of every turned-over or
 /// squashed triangle go to the middle of their neighbours and back onto the wedge, for up to
 /// [`UNTANGLE_ROUNDS`] rounds. Returns whether the patch is sound.
-fn untangle(mesh: &mut Mesh, hole: &Hole, wedge: &Wedge, min_area: f64) -> bool {
-    let (snap, on_side) = (EDGE_SNAP * hole.edge, ON_SIDE * hole.edge);
+fn untangle(mesh: &mut Mesh, hole: &Hole, wedge: &Wedge, min_area: f64, snap: f64) -> bool {
+    let on_side = ON_SIDE * hole.edge;
     for _ in 0..UNTANGLE_ROUNDS {
         let bad = tangled(mesh, hole, wedge, min_area);
         if bad.is_empty() {
@@ -650,8 +650,8 @@ fn untangle(mesh: &mut Mesh, hole: &Hole, wedge: &Wedge, min_area: f64) -> bool 
 }
 
 /// Moves the patch vertices onto the wedge; false when a vertex would leave the hole's reach.
-fn move_onto(mesh: &mut Mesh, hole: &Hole, wedge: &Wedge) -> bool {
-    let (snap, on_side) = (EDGE_SNAP * hole.edge, ON_SIDE * hole.edge);
+fn move_onto(mesh: &mut Mesh, hole: &Hole, wedge: &Wedge, snap: f64) -> bool {
+    let on_side = ON_SIDE * hole.edge;
     let moved: Vec<(Point3, Option<Point3>)> =
         mesh.positions.iter().skip(hole.first_vertex).map(|p| wedge.onto(snap, on_side, *p)).collect();
     let reach = 2.0 * hole.radius;
@@ -687,25 +687,78 @@ pub(crate) fn sharpen_patch(
     first_vertex: usize,
     lp: &[u32],
 ) -> bool {
-    let Some(hole) = Hole::new(mesh, first_tri, first_vertex, lp) else { return false };
-    let Some(wedge) = read_wedge(mesh, around, lp, hole.edge) else { return false };
-    let positions: Vec<Point3> = mesh.positions.iter().skip(first_vertex).copied().collect();
-    let triangles: Vec<[u32; 3]> = mesh.triangles.iter().skip(first_tri).copied().collect();
+    let done = sharpen(mesh, around, first_tri, first_vertex, lp);
+    #[cfg(test)]
+    LAST_REASON.with(|r| r.set(done.err()));
+    done.is_ok()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Why the last patch on this thread was left as it was (`None`: it was sharpened).
+    static LAST_REASON: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+/// [`sharpen_patch`], with the reason when the patch is left as it was.
+fn sharpen(
+    mesh: &mut Mesh,
+    around: &Around,
+    first_tri: usize,
+    first_vertex: usize,
+    lp: &[u32],
+) -> Result<(), &'static str> {
+    let hole = Hole::new(mesh, first_tri, first_vertex, lp).ok_or("no patch vertices")?;
+    let wedge = read_wedge(mesh, around, lp, hole.edge)?;
+    let before = patch_of(mesh, &hole);
     let min_area = (MIN_AREA_KEPT * thinnest(mesh, first_tri)).min(hole.min_area());
-    let kept = move_onto(mesh, &hole, &wedge) && untangle(mesh, &hole, &wedge, min_area) && {
-        pin_corner(mesh, &hole, &wedge);
-        align_edges(mesh, &hole, &wedge);
-        untangle(mesh, &hole, &wedge, min_area)
-    };
-    if !kept {
-        for (p, q) in mesh.positions.iter_mut().skip(first_vertex).zip(positions) {
-            *p = q;
-        }
-        for (t, u) in mesh.triangles.iter_mut().skip(first_tri).zip(triangles) {
-            *t = u;
+    let done = shape_patch(mesh, &hole, &wedge, min_area);
+    if done.is_err() {
+        restore(mesh, &hole, before);
+    }
+    done
+}
+
+/// The patch as it is: its vertices and triangles.
+fn patch_of(mesh: &Mesh, hole: &Hole) -> (Vec<Point3>, Vec<[u32; 3]>) {
+    (
+        mesh.positions.iter().skip(hole.first_vertex).copied().collect(),
+        mesh.triangles.iter().skip(hole.first_tri).copied().collect(),
+    )
+}
+
+/// Puts the patch back as [`patch_of`] saw it.
+fn restore(mesh: &mut Mesh, hole: &Hole, (positions, triangles): (Vec<Point3>, Vec<[u32; 3]>)) {
+    for (p, q) in mesh.positions.iter_mut().skip(hole.first_vertex).zip(positions) {
+        *p = q;
+    }
+    for (t, u) in mesh.triangles.iter_mut().skip(hole.first_tri).zip(triangles) {
+        *t = u;
+    }
+}
+
+/// Moves the patch onto the wedge and untangles it, with the vertices next to an edge on the
+/// edge or, when that tangles the patch, without. Then pins the corner and aligns the edges,
+/// which is undone when it tangles the patch again (the vertices stay on the sides).
+fn shape_patch(mesh: &mut Mesh, hole: &Hole, wedge: &Wedge, min_area: f64) -> Result<(), &'static str> {
+    let faired = patch_of(mesh, hole);
+    let mut snap = EDGE_SNAP * hole.edge;
+    if !move_onto(mesh, hole, wedge, snap) {
+        return Err("a vertex would leave the hole");
+    }
+    if !untangle(mesh, hole, wedge, min_area, snap) {
+        restore(mesh, hole, faired);
+        snap = 0.0;
+        if !(move_onto(mesh, hole, wedge, snap) && untangle(mesh, hole, wedge, min_area, snap)) {
+            return Err("tangled after the move");
         }
     }
-    kept
+    let sound = patch_of(mesh, hole);
+    pin_corner(mesh, hole, wedge);
+    align_edges(mesh, hole, wedge);
+    if !untangle(mesh, hole, wedge, min_area, snap) {
+        restore(mesh, hole, sound);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -863,5 +916,59 @@ mod tests {
                 assert!(thinnest(&sharp) >= 0.5 * thinnest(&faired).min(0.02), "a sliver of {} mm²", thinnest(&sharp));
             }
         }
+    }
+
+    /// A hundred holes of 0.8 to 2.5 mm over the edges of an irregular scan of a cube (0.7 to
+    /// 1.4 mm triangles, σ = 0.03 mm): every patch stays within 0.12 mm of the cube, none is
+    /// worse than the faired one, and nine in ten are sharpened.
+    #[test]
+    fn holes_over_the_edges_of_a_noisy_scan_keep_the_edges() {
+        let mut cad = synth::cuboid(Point3::origin(), Vec3::new(SIDE, SIDE, SIDE), 1);
+        cad.weld(1e-9);
+        let d =
+            synth::ScanDefects { spacing: 0.7, noise: 0.03, holes: 0, spikes: 0.0, debris: 0, ..Default::default() };
+        let (mut bad, mut worse, mut n) = (0, 0, 0);
+        let mut reasons = std::collections::BTreeMap::new();
+        for seed in 1..=20u64 {
+            let scan = synth::scanify(&cad, &d, &mut Rng::new(seed));
+            let mut rng = Rng::new(seed + 1000);
+            for _ in 0..5 {
+                // a point on one of the edges of the top face, away from the corners
+                let t = rng.range(4.0, SIDE - 4.0);
+                let at = match rng.index(4) {
+                    0 => Point3::new(t, 0.0, SIDE),
+                    1 => Point3::new(t, SIDE, SIDE),
+                    2 => Point3::new(0.0, t, SIDE),
+                    _ => Point3::new(SIDE, t, SIDE),
+                };
+                let at = at + Vec3::new(rng.range(-0.8, 0.8), rng.range(-0.8, 0.8), 0.0);
+                let r = rng.range(0.8, 2.5);
+                let keep: Vec<u32> = (0..scan.triangle_count() as u32)
+                    .filter(|&t| scan.face_centroid(t as usize).is_some_and(|c| (c - at).norm() > r))
+                    .collect();
+                let cut = scan.submesh(&keep);
+                if boundary_loops(&cut).len() != 1 {
+                    continue;
+                }
+                let first = cut.positions.len();
+                let worst = |mm: &Mesh| mm.positions.iter().skip(first).map(to_cube).fold(0.0, f64::max);
+                let (mut faired, mut sharp) = (cut.clone(), cut.clone());
+                fill_holes_with(&mut faired, 1000, true, false);
+                fill_holes_with(&mut sharp, 1000, true, true);
+                n += 1;
+                let why = super::LAST_REASON.with(std::cell::Cell::get).unwrap_or("sharpened");
+                *reasons.entry(why).or_insert(0usize) += 1;
+                if worst(&sharp) > 0.12 {
+                    bad += 1;
+                }
+                if worst(&sharp) > worst(&faired) + 1e-9 {
+                    worse += 1;
+                }
+            }
+        }
+        let sharpened = reasons.get("sharpened").copied().unwrap_or(0);
+        assert!(n >= 90, "only {n} holes were cut");
+        assert_eq!((bad, worse), (0, 0), "over 0.12 mm, worse than faired, of {n} holes: {reasons:?}");
+        assert!(sharpened * 10 >= n * 9, "{sharpened} of {n} sharpened: {reasons:?}");
     }
 }
