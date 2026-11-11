@@ -44,7 +44,7 @@ pub fn latest(app: &SurfaceCraftApp, cur: &Current) -> Option<HotspotsOut> {
 pub(crate) fn section(app: &mut SurfaceCraftApp, ui: &mut egui::Ui, cur: &Current) {
     ui.strong(t("deviation.hotspots"));
     if ui.button(t("deviation.find_hotspots")).clicked() {
-        let _ = app.run_command("deviation.hotspots", params(cur));
+        app.launch("deviation.hotspots", params(cur), crate::jobs::After::Nothing);
     }
     if let Some(found) = latest(app, cur) {
         listing(app, ui, &found);

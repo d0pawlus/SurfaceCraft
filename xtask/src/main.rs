@@ -1,6 +1,7 @@
 //! `cargo xtask <task>`: the repository's checks.
 //!
 //! `ci` runs, in order: fmt → assets → licences → layers → ui-containers → app-geometry → clippy → wasm → test.
+//! `web [--no-threads]` (not in ci) builds the browser bundle; `web-toolchain` prints the nightly it needs.
 //! `dist [--tag vX.Y.Z]` (not in ci) builds the host-target release packages in `dist/<target>/release/`.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -9,6 +10,7 @@ mod dist;
 mod layers;
 mod licences;
 mod ui_containers;
+mod web;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -34,13 +36,13 @@ pub(crate) fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn cargo() -> Command {
+pub(crate) fn cargo() -> Command {
     let mut c = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
     c.current_dir(root());
     c
 }
 
-fn run(mut c: Command, what: &str) -> Result<(), String> {
+pub(crate) fn run(mut c: Command, what: &str) -> Result<(), String> {
     eprintln!("==> {what}");
     let st = c.status().map_err(|e| format!("{what}: cannot start: {e}"))?;
     if st.success() { Ok(()) } else { Err(format!("{what} failed")) }
@@ -65,69 +67,6 @@ fn wasm() -> Result<(), String> {
         c.args(["-p", k]);
     }
     run(c, "wasm check")
-}
-
-/// Builds the browser bundle into apps/surfacecraft-web/dist (needs `wasm-bindgen` on PATH).
-fn web() -> Result<(), String> {
-    let mut c = cargo();
-    c.args(["build", "--release", "--target", "wasm32-unknown-unknown", "-p", "surfacecraft-web"]);
-    run(c, "web build")?;
-    let dist = root().join("apps").join("surfacecraft-web").join("dist");
-    std::fs::create_dir_all(&dist).map_err(|e| format!("create dist: {e}"))?;
-    let target = std::env::var_os("CARGO_TARGET_DIR").map_or_else(|| root().join("target"), std::path::PathBuf::from);
-    let wasm = target.join("wasm32-unknown-unknown").join("release").join("surfacecraft-web.wasm");
-    let mut b = Command::new("wasm-bindgen");
-    b.arg(&wasm).args(["--target", "web", "--no-typescript", "--out-dir"]).arg(&dist);
-    run(b, "wasm-bindgen")?;
-    optimise_wasm(&dist.join("surfacecraft-web_bg.wasm"));
-    let html = include_str!("../../apps/surfacecraft-web/index.html").replace(
-        "<link data-trunk rel=\"rust\" data-bin=\"surfacecraft-web\" data-wasm-opt=\"z\" />",
-        "<script type=\"module\">import init from './surfacecraft-web.js'; init().then(() => document.getElementById('loading')?.remove());</script>",
-    );
-    std::fs::write(dist.join("index.html"), html).map_err(|e| format!("write index.html: {e}"))?;
-    // a public bundle carries its licences and the third-party notices
-    for f in ["LICENSE-MIT", "LICENSE-APACHE", "NOTICE", "THIRD-PARTY-LICENSES.txt"] {
-        std::fs::copy(root().join(f), dist.join(f)).map_err(|e| format!("copy {f}: {e}"))?;
-    }
-    eprintln!("==> web bundle in {}", dist.display());
-    Ok(())
-}
-
-/// Runs `wasm-opt -Oz` on the bundle when it is on PATH; otherwise (or on failure) keeps the
-/// unoptimised file, so the build never depends on binaryen being installed.
-fn optimise_wasm(path: &Path) {
-    let size = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-    let available = Command::new("wasm-opt").arg("--version").output().is_ok_and(|o| o.status.success());
-    let before = size(path);
-    if !available {
-        eprintln!(
-            "==> wasm-opt not on PATH: bundle left unoptimised at {before} bytes (install binaryen to shrink it)"
-        );
-        return;
-    }
-    let tmp = path.with_extension("opt.wasm");
-    let mut c = Command::new("wasm-opt");
-    // The wasm features rustc enables by default for wasm32-unknown-unknown; without them an older
-    // wasm-opt mangles the externref table wasm-bindgen emits and the bundle fails at start-up.
-    c.arg("-Oz")
-        .args([
-            "--enable-reference-types",
-            "--enable-bulk-memory",
-            "--enable-mutable-globals",
-            "--enable-sign-ext",
-            "--enable-nontrapping-float-to-int",
-            "--enable-multivalue",
-        ])
-        .arg(path)
-        .arg("-o")
-        .arg(&tmp);
-    let ok = c.status().is_ok_and(|s| s.success());
-    if ok && std::fs::rename(&tmp, path).is_ok() {
-        eprintln!("==> wasm-opt -Oz: {before} -> {} bytes", size(path));
-    } else {
-        let _ = std::fs::remove_file(&tmp);
-        eprintln!("==> wasm-opt failed: bundle left unoptimised ({before} bytes)");
-    }
 }
 
 fn test() -> Result<(), String> {
@@ -263,9 +202,13 @@ fn main() -> ExitCode {
             "clippy" => clippy(),
             "wasm" => wasm(),
             "test" => test(),
-            "web" => web(),
+            "web" => web::build(!args.iter().any(|a| a == "--no-threads")),
+            "web-toolchain" => {
+                println!("{}", web::NIGHTLY);
+                Ok(())
+            }
             "dist" => dist::run(&args),
-            _ => Err("tasks: ci, quick [--tests] [packages], fmt, assets, licences [--check], layers, ui-containers, app-geometry, clippy, wasm, test, web, dist [--tag vX.Y.Z]"
+            _ => Err("tasks: ci, quick [--tests] [packages], fmt, assets, licences [--check], layers, ui-containers, app-geometry, clippy, wasm, test, web [--no-threads], web-toolchain, dist [--tag vX.Y.Z]"
                 .into()),
         };
     match r {

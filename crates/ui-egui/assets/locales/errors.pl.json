@@ -515,6 +515,8 @@
   "{} is not a surface or sheet body": "{} nie jest powierzchnią ani bryłą powierzchniową",
   "{} is not geometry to align to; use a mesh, body or primitive": "{} nie jest geometrią, do której można wyrównać; użyj siatki, bryły lub prymitywu",
   "{} is too heavy to preview": "{} jest zbyt czasochłonne na podgląd",
+  "{} is running": "trwa polecenie {}",
+  "cancelled": "anulowano",
   "{} knots for {} control points": "{} węzłów przy {} punktach kontrolnych",
   "{} must be 1..=500": "{} musi być w zakresie 1..=500",
   "{} must be a positive number": "{} musi być liczbą dodatnią",

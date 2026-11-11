@@ -244,6 +244,14 @@ pub fn is_heavy(id: &str) -> bool {
     HEAVY.contains(&id)
 }
 
+/// The message of a command that stopped because its session's cancellation flag was set.
+pub const CANCELLED: &str = "cancelled";
+
+/// The error of a command that was cancelled while it ran.
+pub(crate) fn cancelled() -> CmdError {
+    CmdError::Failed(CANCELLED.into())
+}
+
 /// No parameters.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

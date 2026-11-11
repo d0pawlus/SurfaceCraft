@@ -14,6 +14,7 @@
 
 pub mod aabb;
 pub mod bvh;
+pub mod cancel;
 pub mod cap;
 pub mod chunked;
 pub mod cloud;
@@ -34,6 +35,7 @@ pub mod tri;
 
 pub use aabb::Aabb;
 pub use bvh::{Bvh, SurfaceHit};
+pub use cancel::Cancel;
 pub use cloud::{CloudError, PointCloud};
 pub use kdtree::KdTree;
 pub use mesh::{Mesh, MeshError, PointSource, TriangleSource};

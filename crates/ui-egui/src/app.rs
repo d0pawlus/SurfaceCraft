@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use surfacecraft_doc::{ObjectId, ObjectKind};
-use surfacecraft_engine::{EngineError, Session};
+use surfacecraft_engine::Session;
 use surfacecraft_geom::{Bvh, Point3};
 
 /// The SurfaceCraft UI.
@@ -43,6 +43,12 @@ pub struct SurfaceCraftApp {
     pub hist_panel: crate::history_panel::HistoryPanel,
     /// The deviation readings in the viewport: pinned ones and the one under the pointer.
     pub deviation: crate::deviation_panel::readout::State,
+    /// Whether heavy commands launched from the UI run in the background (see [`crate::jobs`]).
+    /// On in a window; off in a headless app, whose callers expect every command to have run
+    /// when the call returns.
+    pub background_jobs: bool,
+    /// The command running now, if one is.
+    pub(crate) busy: Option<crate::jobs::Busy>,
     /// Last status line.
     pub status: String,
     /// Points picked in the viewport (click: replace, Shift+click: add).
@@ -125,6 +131,8 @@ impl SurfaceCraftApp {
             cmd_panel: Default::default(),
             hist_panel: Default::default(),
             deviation: Default::default(),
+            background_jobs: false,
+            busy: None,
             status: t("status.ready").to_string(),
             picks: Vec::new(),
             field_pick: None,
@@ -251,6 +259,7 @@ impl SurfaceCraftApp {
         let settings =
             saved.unwrap_or_else(|| UiSettings { lang: crate::i18n::Lang::from_system(), ..UiSettings::default() });
         let mut app = Self::with_settings(settings);
+        app.background_jobs = true;
         if let Some(rs) = cc.wgpu_render_state.as_ref() {
             viewport::install(rs);
             app.gpu = true;
@@ -266,31 +275,6 @@ impl SurfaceCraftApp {
             app.dialogs = craft_dialogs::Dialogs::new(std::sync::Arc::new(move || ctx.request_repaint()));
         }
         app
-    }
-
-    /// Executes a command the way every UI control does, updating the status line.
-    pub fn run_command(&mut self, id: &str, params: Value) -> Result<Value, EngineError> {
-        let had = self.session.doc.summaries().len();
-        let r = self.session.execute(id, params);
-        // the status line names the tool the way the ribbon does
-        let name = surfacecraft_engine::cmd::find(id).map_or_else(|| id.to_string(), crate::workflow::label_of);
-        match &r {
-            Ok(_) => {
-                self.status = tf("status.done", &[("name", &name)]);
-                if had == 0 && !self.session.doc.summaries().is_empty() {
-                    self.fit_pending = true;
-                }
-                if id == "deviation.compute" {
-                    // a new map is what the Deviation tab shows
-                    crate::dock::show_tab(&mut self.workspace, crate::dock::Panel::Deviation);
-                }
-            }
-            Err(e) => {
-                let error = crate::i18n::engine_message(&e.to_string());
-                self.status = tf("status.failed", &[("name", &name), ("error", &error)]);
-            }
-        }
-        r
     }
 
     /// Opens a command in the tool panel and prefills its parameters; the ribbon follows to the
@@ -314,31 +298,6 @@ impl SurfaceCraftApp {
         self.palette_command = None;
         self.field_pick = None;
         self.cmd_panel.cancel_preview();
-    }
-
-    /// Runs the open tool with its edited parameters. A command that changed the document closes
-    /// its tool (the guide shows what comes next); a failed one, or one that only reports
-    /// (statistics, information), stays open with its message or result. Returns whether it ran
-    /// without an error.
-    pub fn run_palette(&mut self) -> bool {
-        self.field_pick = None;
-        let Some(id) = self.palette_command else {
-            self.status = t("status.choose_command").to_string();
-            return false;
-        };
-        match serde_json::from_str::<Value>(&self.palette_params) {
-            Ok(v) => {
-                let ok = self.run_command(id, v).is_ok();
-                if ok && surfacecraft_engine::cmd::find(id).is_some_and(|c| c.undoable) {
-                    self.close_tool();
-                }
-                ok
-            }
-            Err(e) => {
-                self.status = tf("status.params_not_json", &[("error", &e.to_string())]);
-                false
-            }
-        }
     }
 
     /// What the guide reads from the session: the kinds in the document and what ran.
@@ -366,17 +325,16 @@ impl SurfaceCraftApp {
     /// Answers control-channel requests (bridged MCP) between frames.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn poll_control(&mut self) {
-        let Some(rx) = self.control.as_ref() else { return };
-        let reqs: Vec<crate::control::Request> = rx.try_iter().collect();
-        for r in reqs {
+        // one request at a time: a heavy command runs in the background and the requests behind
+        // it wait in the channel until it has answered
+        while !self.is_busy() {
+            let Some(r) = self.control.as_ref().and_then(|rx| rx.try_recv().ok()) else { return };
             let reply = match r.method.as_str() {
                 "engine.execute" => {
                     let cmd = r.params.get("command").and_then(Value::as_str).unwrap_or("").to_string();
                     let params = r.params.get("params").cloned().unwrap_or(Value::Null);
-                    match self.run_command(&cmd, params) {
-                        Ok(v) => json!({"ok": v}),
-                        Err(e) => json!({"err": e}),
-                    }
+                    self.launch(&cmd, params, crate::jobs::After::Reply(r.reply));
+                    continue;
                 }
                 "ui.screenshot" => {
                     let dim = |k: &str, d: u64| r.params.get(k).and_then(Value::as_u64).unwrap_or(d) as u32;
@@ -400,20 +358,24 @@ impl SurfaceCraftApp {
     /// Imports files the browser picked (web build).
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn poll_inbox(&mut self) {
-        let files: Vec<(String, Vec<u8>)> = self.inbox.borrow_mut().drain(..).collect();
-        for (name, bytes) in files {
+        // one file at a time: an import may run in the background, and the next waits for it
+        while !self.is_busy() {
+            let mut inbox = self.inbox.borrow_mut();
+            if inbox.is_empty() {
+                return;
+            }
+            let (name, bytes) = inbox.remove(0);
+            drop(inbox);
             let lower = name.to_lowercase();
             let ext = lower.rsplit('.').next().unwrap_or("").to_string();
             let stem = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s).to_string();
             let data = surfacecraft_doc::base64::encode(&bytes);
-            let r = if ext == "step" || ext == "stp" {
-                self.run_command("import.step", json!({"data": data, "name": stem}))
+            let (id, params) = if ext == "step" || ext == "stp" {
+                ("import.step", json!({"data": data, "name": stem}))
             } else {
-                self.run_command("mesh.import", json!({"data": data, "format": ext, "name": stem}))
+                ("mesh.import", json!({"data": data, "format": ext, "name": stem}))
             };
-            if r.is_ok() {
-                self.fit_pending = true;
-            }
+            self.launch(id, params, crate::jobs::After::Fit);
         }
     }
 
@@ -432,14 +394,13 @@ impl SurfaceCraftApp {
                 return;
             }
         };
-        if let Ok(v) = self.run_command(cmd, params)
-            && let Some(Ok(bytes)) = v.get("data").and_then(Value::as_str).map(surfacecraft_doc::base64::decode)
-        {
-            crate::web::download(file, &bytes);
-        }
+        self.launch(cmd, params, crate::jobs::After::Download(file));
     }
 
     pub(crate) fn shortcuts(&mut self, ui: &mut egui::Ui) {
+        if self.is_busy() {
+            return;
+        }
         let (undo, redo, search) = ui.input(|i| {
             let z = i.modifiers.command && i.key_pressed(egui::Key::Z);
             (

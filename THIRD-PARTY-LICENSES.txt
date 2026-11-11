@@ -1324,6 +1324,10 @@ wasm-bindgen-shared 0.2.130
     licence: MIT OR Apache-2.0
     source: https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/shared
 
+wasm_sync 0.1.2
+    licence: MIT OR Apache-2.0
+    source: https://github.com/DouglasDwyer/wasm_sync
+
 wayland-backend 0.3.17
     licence: MIT
     source: https://github.com/smithay/wayland-rs

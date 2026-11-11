@@ -913,5 +913,14 @@
   "param.sketch.constrain.at": "Położenie",
   "param.sketch.edit_constraint.at": "Położenie",
   "assistant.done": "Asystent: {summary} (wykonane komendy: {n})",
-  "assistant.failed": "Asystent nie dał rady: {error}"
+  "assistant.failed": "Asystent nie dał rady: {error}",
+  "busy.running": "Trwa: {name}",
+  "busy.elapsed": "{seconds} s",
+  "busy.hint": "Widok pokazuje dokument sprzed tego polecenia.",
+  "busy.cancel": "Anuluj polecenie",
+  "busy.cancel_hint": "Nie czekaj na to polecenie i zostaw dokument bez zmian",
+  "busy.in_place": "Ta strona przeglądarki nie ma wątków w tle, więc nie będzie odpowiadać, dopóki polecenie się nie skończy.",
+  "status.running": "{name}: trwa…",
+  "status.busy": "{name} jeszcze trwa",
+  "status.cancelled": "{name}: anulowano"
 }

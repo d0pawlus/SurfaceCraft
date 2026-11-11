@@ -136,6 +136,24 @@ the Windows application id.
 the size before and after. Without it the bundle is left unoptimised and the build still succeeds.
 CI does not install binaryen.
 
+## Web build: threads
+
+`cargo xtask web` builds the bundle with shared wasm memory (`+atomics,+bulk-memory,+mutable-globals`)
+so that heavy commands run in web workers and `surfacecraft_geom::par` spreads over them. That needs
+a standard library built with the same features (`-Z build-std=std,panic_abort`), so this one build
+uses a nightly toolchain, pinned by date in `xtask/src/web.rs` (`cargo xtask web-toolchain` prints
+it; install it with the `rust-src` component). Everything else stays on stable, and
+`cargo xtask wasm` (in CI) keeps checking the crates for a browser without threads.
+`cargo xtask web --no-threads` builds the bundle on stable, without threads.
+
+The browser gives a page shared memory only when it is cross-origin isolated, so `cargo xtask web`
+writes a `vercel.json` into `dist` with `Cross-Origin-Opener-Policy: same-origin` and
+`Cross-Origin-Embedder-Policy: require-corp` for every path (every resource of the page is
+same-origin). `vercel build` copies them into `.vercel/output/config.json`; the deploy workflow
+fails before uploading if they are missing. On a page without the headers (or with `?threads=0`)
+the same bundle runs on one thread: a heavy command then runs on the page's thread after a warning.
+`?threads=N` sets the number of workers (default: logical cores minus one, at most 16).
+
 ## Web deployment (surfacecraft.pawlus.dev)
 
 The browser app is served by the Vercel project `surfacecraft` (team of the `pawlus.dev` domain)
