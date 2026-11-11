@@ -14,5 +14,11 @@ nalgebra.workspace = true
 serde.workspace = true
 schemars.workspace = true
 
+[dev-dependencies]
+serde_json.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+rayon.workspace = true
+
 [lints]
 workspace = true
