@@ -46,7 +46,7 @@ fn the_panel_shows_the_statistics_and_the_histogram_adds_up_to_the_count() {
     assert!(cur.stats.count > 1000, "points measured: {}", cur.stats.count);
     // the bins of the histogram hold every measured point
     let bins = deviation_panel::bins(&cur.report.histogram, cur.stats.tolerance);
-    assert_eq!(bins.len(), 20, "the report's default bins");
+    assert_eq!(bins.len(), 10, "the report's bins are the stats' ten bins");
     assert_eq!(bins.iter().map(|b| b.count).sum::<usize>(), cur.stats.count);
     // statistics are ordered and the noise sits inside the tolerance
     assert!(cur.stats.min <= cur.stats.mean && cur.stats.mean <= cur.stats.max);
@@ -200,8 +200,8 @@ fn a_click_on_the_scan_pins_its_reading_until_it_is_removed() {
     let scan = scan_id(&app);
     let (vw, vh) = VIEW;
     let at_centre = readout::spot_at(&mut app, scan, vw / 2.0, vh / 2.0, vw, vh).expect("the scan at the centre");
-    readout::pin_click(&mut app, vw / 2.0, vh / 2.0, vw, vh);
-    readout::pin_click(&mut app, vw / 2.0, vh / 2.0, vw, vh);
+    readout::pin_click(&mut app, vw / 2.0, vh / 2.0, vw, vh, true);
+    readout::pin_click(&mut app, vw / 2.0, vh / 2.0, vw, vh, true);
     assert_eq!(app.deviation.pins, vec![at_centre], "the same triangle is pinned once");
     let mut ui = tall_harness(app);
     ui.run();
@@ -215,6 +215,73 @@ fn a_click_on_the_scan_pins_its_reading_until_it_is_removed() {
     ui.state_mut().deviation.pins = remaining;
     ui.run();
     assert!(ui.state().deviation.pins.is_empty(), "a removed pin is gone");
+}
+
+#[test]
+fn a_plain_click_on_the_scan_only_selects_and_an_alt_click_pins() {
+    let mut app = offset_map();
+    let (vw, vh) = VIEW;
+    readout::pin_click(&mut app, vw / 2.0, vh / 2.0, vw, vh, false);
+    assert!(app.deviation.pins.is_empty(), "a plain click pins nothing");
+    readout::pin_click(&mut app, vw / 2.0, vh / 2.0, vw, vh, true);
+    assert_eq!(app.deviation.pins.len(), 1, "Alt-click pins the reading");
+}
+
+#[test]
+fn clearing_a_scans_map_drops_its_pins() {
+    let mut app = offset_map();
+    let (vw, vh) = VIEW;
+    readout::pin_click(&mut app, vw / 2.0, vh / 2.0, vw, vh, true);
+    app.run_command("deviation.clear", json!({"object": "scan"})).expect("the map is cleared");
+    let mut ui = harness(app);
+    ui.run();
+    assert!(ui.state().deviation.pins.is_empty(), "a pin without a map is dropped");
+}
+
+#[test]
+fn a_new_document_drops_the_maps_and_the_pins() {
+    let mut app = offset_map();
+    let (vw, vh) = VIEW;
+    readout::pin_click(&mut app, vw / 2.0, vh / 2.0, vw, vh, true);
+    app.run_command("doc.new", json!({})).expect("a new document");
+    let mut ui = harness(app);
+    ui.run();
+    assert!(ui.state().session.maps.is_empty(), "the maps are gone");
+    assert!(ui.state().deviation.pins.is_empty(), "the pins are gone");
+}
+
+#[test]
+fn a_moved_scan_has_no_current_map_for_the_panel() {
+    let mut app = offset_map();
+    app.run_command("mesh.transform", json!({"object": "scan", "translate": [0.0, 0.0, 1.0]})).expect("moved");
+    assert!(deviation_panel::current(&app).is_none(), "the panel does not show the old map of a moved scan");
+}
+
+/// Gate: the per-frame work is cached. With a pin and a map, the first frame reads the pinned
+/// reading; idle frames (no pointer, no command, no camera move) make no engine query at all.
+#[test]
+fn idle_frames_make_no_engine_queries() {
+    let mut app = offset_map();
+    let (vw, vh) = VIEW;
+    readout::pin_click(&mut app, vw / 2.0, vh / 2.0, vw, vh, true);
+    let mut ui = harness(app);
+    ui.run();
+    let after_first = ui.state().deviation.queries;
+    assert!(after_first >= 1, "the first frame reads the pinned reading");
+    for _ in 0..5 {
+        ui.run();
+    }
+    assert_eq!(ui.state().deviation.queries, after_first, "idle frames read nothing");
+}
+
+#[test]
+fn the_histogram_axis_is_the_legend_range() {
+    let app = scanned();
+    let cur = deviation_panel::current(&app).expect("a map");
+    let tol = cur.stats.tolerance;
+    let hist = &cur.report.histogram;
+    assert!((hist.lo + 3.0 * tol).abs() < 1e-12 && (hist.hi - 3.0 * tol).abs() < 1e-12, "{hist:?}");
+    assert_eq!(hist.counts.len(), 10, "the stats' ten bins");
 }
 
 #[test]

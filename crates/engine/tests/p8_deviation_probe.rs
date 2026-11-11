@@ -132,7 +132,7 @@ fn gate_the_map_reports_its_histogram_and_cumulative_bands() {
     let counted = report["count"].as_u64().expect("the counted points");
     assert_eq!(counted, out["stats"]["count"].as_u64().unwrap(), "{out}");
     let counts = report["histogram"]["counts"].as_array().expect("bins");
-    assert_eq!(counts.len(), 20, "{out}");
+    assert_eq!(counts.len(), 10, "{out}");
     assert_eq!(counts.iter().filter_map(Value::as_u64).sum::<u64>(), counted, "{out}");
     let bands = report["bands"].as_array().expect("bands");
     let tolerances: Vec<f64> = bands.iter().map(|b| b["tolerance"].as_f64().unwrap()).collect();
@@ -141,4 +141,89 @@ fn gate_the_map_reports_its_histogram_and_cumulative_bands() {
     }
     let shares: Vec<f64> = bands.iter().map(|b| b["share"].as_f64().unwrap()).collect();
     assert_eq!(shares, vec![0.0, 0.0, 0.0, 1.0], "{out}");
+}
+
+/// Gate: the report's histogram spans ±3 tolerances (the legend's range) in the stats' own ten bins,
+/// so it is the same histogram, computed in the same pass without sorting.
+#[test]
+fn gate_the_report_histogram_is_the_stats_histogram_over_three_tolerances() {
+    let mut s = offset_plane(false);
+    let out = map(&mut s, 0.02);
+    assert_eq!(out["report"]["histogram"]["counts"], out["stats"]["histogram"], "{out}");
+    let lo = out["report"]["histogram"]["lo"].as_f64().unwrap();
+    let hi = out["report"]["histogram"]["hi"].as_f64().unwrap();
+    assert!((lo + 0.06).abs() < 1e-12 && (hi - 0.06).abs() < 1e-12, "{out}");
+}
+
+/// Gate: a map is tied to the geometry it was computed on. Moving the scan drops it, so the reading
+/// is an error rather than the old number, and undoing the move does not bring the map back.
+#[test]
+fn a_map_is_dropped_when_its_scan_moves_and_undo_does_not_restore_it() {
+    let mut s = offset_plane(false);
+    map(&mut s, 0.02);
+    s.execute("mesh.transform", json!({"object": "scan", "translate": [0.0, 0.0, 1.0]})).expect("the move");
+    assert!(s.maps.is_empty(), "the moved scan has no map");
+    assert!(s.query("deviation.at", json!({"object": "scan", "triangle": 7})).is_err());
+    s.execute("edit.undo", json!({})).expect("the move is undone");
+    let back = s.query("deviation.at", json!({"object": "scan", "triangle": 7}));
+    assert!(back.is_err(), "undo gives the old geometry, but no stale reading: {back:?}");
+}
+
+#[test]
+fn doc_new_clears_the_maps() {
+    let mut s = offset_plane(false);
+    map(&mut s, 0.02);
+    s.execute("doc.new", json!({})).expect("a new document");
+    assert!(s.maps.is_empty());
+    assert!(s.query("deviation.at", json!({"object": "scan", "triangle": 0})).is_err());
+}
+
+#[test]
+fn doc_open_clears_the_maps() {
+    let mut s = offset_plane(false);
+    map(&mut s, 0.02);
+    let path = std::env::temp_dir().join(format!("p8-a3-probe-{}.json", std::process::id()));
+    let path_text = path.to_string_lossy().to_string();
+    s.execute("doc.save", json!({"path": path_text})).expect("saved");
+    map(&mut s, 0.02);
+    s.execute("doc.open", json!({"path": path_text})).expect("opened");
+    std::fs::remove_file(&path).ok();
+    assert!(s.maps.is_empty(), "opening a document clears its maps");
+}
+
+#[test]
+fn deleting_the_scan_drops_its_map() {
+    let mut s = offset_plane(false);
+    map(&mut s, 0.02);
+    s.execute("doc.delete", json!({"object": "scan"})).expect("deleted");
+    assert!(s.maps.is_empty());
+}
+
+/// Gate: the read path takes a shared session and runs only the listed reads: a command that
+/// changes the document is refused, and the document is left alone.
+#[test]
+fn query_takes_a_shared_session_and_refuses_anything_but_the_listed_reads() {
+    let mut s = offset_plane(false);
+    map(&mut s, 0.02);
+    let shared: &Session = &s;
+    assert!(shared.query("deviation.at", json!({"object": "scan", "triangle": 0})).is_ok());
+    assert!(matches!(shared.query("doc.delete", json!({"object": "scan"})), Err(EngineError::Unavailable(_))));
+    assert!(matches!(
+        shared.query("mesh.transform", json!({"object": "scan", "translate": [0.0, 0.0, 1.0]})),
+        Err(EngineError::Unavailable(_))
+    ));
+    assert_eq!(s.doc.summaries().len(), 2, "the refused commands changed nothing");
+    assert!(!s.maps.is_empty(), "the map is still there");
+}
+
+/// Gate: an output logged before the report existed still parses; its report is empty.
+#[test]
+fn a_compute_output_without_a_report_still_parses() {
+    let mut s = offset_plane(false);
+    let mut out = map(&mut s, 0.02);
+    out.as_object_mut().expect("an object").remove("report");
+    let old: surfacecraft_engine::cmd::deviation::ComputeOut =
+        serde_json::from_value(out).expect("an output without a report parses");
+    assert!(old.report.histogram.counts.is_empty() && old.report.bands.is_empty());
+    assert!(old.stats.count > 0, "the statistics are kept");
 }

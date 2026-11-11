@@ -30,7 +30,7 @@
   "deviation.hotspots_none": "Brak miejsc powyżej tolerancji.",
   "deviation.hotspots_shown": "{shown} z {total} grup, od największej.",
   "deviation.missing": "Niedomiar materiału",
-  "deviation.pin_hint": "Kliknij skan w widoku, aby przypiąć odczyt.",
+  "deviation.pin_hint": "Kliknij skan w widoku z Alt, aby przypiąć odczyt.",
   "deviation.pinned": "Przypięte odczyty",
   "deviation.readout": "Odchyłka {value} mm",
   "deviation.readout_none": "Tu nie zmierzono",

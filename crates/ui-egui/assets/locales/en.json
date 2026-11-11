@@ -30,7 +30,7 @@
   "deviation.hotspots_none": "No hotspots above the tolerance.",
   "deviation.hotspots_shown": "{shown} of {total} groups, largest first.",
   "deviation.missing": "Missing material",
-  "deviation.pin_hint": "Click the scan in the viewport to pin a reading.",
+  "deviation.pin_hint": "Alt-click the scan in the viewport to pin a reading.",
   "deviation.pinned": "Pinned readings",
   "deviation.readout": "Deviation {value} mm",
   "deviation.readout_none": "Not measured here",

@@ -1,13 +1,13 @@
 //! `deviation.*`: how far a scan is from a reference, as a colour map, statistics, hotspots and
 //! the deviation from one fitted primitive.
 use super::{CmdError, CmdResult, CommandSpec, ObjRef};
-use crate::{Session, command};
+use crate::{Session, command, read_command};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use surfacecraft_deviation::{
-    DeviationStats, Hotspot, Report, ReportOptions, Sample, Volume, colorize, counted_values, estimate_noise, hotspots,
-    oriented_plane, report, samples_mesh, samples_primitive, stats_of,
+    DeviationStats, Distribution, Hotspot, Report, ReportOptions, Sample, Volume, colorize, counted_values,
+    distribution, estimate_noise, hotspots, oriented_plane, report, samples_mesh, samples_primitive, stats_of,
 };
 use surfacecraft_doc::{ObjectId, ObjectKind};
 use surfacecraft_fit::Primitive;
@@ -73,9 +73,10 @@ pub struct ComputeOut {
     pub id: ObjectId,
     /// Statistics.
     pub stats: DeviationStats,
-    /// Histogram and tolerance bands of the signed deviation (the bands are at ½, 1, 2 and 3 times
-    /// the tolerance, cumulative: the share of points with |deviation| within each).
-    pub report: Report,
+    /// Histogram over ±3 tolerances and the cumulative shares within ½, 1, 2 and 3 tolerances, in
+    /// one pass. An output logged without it (before it existed) reads as empty.
+    #[serde(default)]
+    pub report: Distribution,
     /// Warning when the tolerance is below the estimated scan noise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
@@ -381,13 +382,15 @@ fn compute(s: &mut Session, i: ComputeIn) -> CmdResult<ComputeOut> {
     let (against, _) = i.against.resolve_any(s)?;
     let m = measure(s, id, region, against, maxd, tol * 0.05, i.facing)?;
     let stats = stats_of(&m.samples, tol);
-    let opts =
-        ReportOptions { bins: default_bins(), range: None, bands: BAND_SCALES.iter().map(|k| k * tol).collect() };
-    let rep = report(&m.samples, &opts).map_err(CmdError::Params)?;
+    let band_tolerances: Vec<f64> = BAND_SCALES.iter().map(|k| k * tol).collect();
+    let rep = distribution(&m.samples, tol, &band_tolerances);
     let values = counted_values(&m.samples);
     if i.show {
-        s.overlays.insert(id, Arc::new(colorize(&values, tol)));
-        s.deviations.insert(id, Arc::new(values.iter().map(|&d| d as f32).collect()));
+        let colours = colorize(&values, tol);
+        let stored: Vec<f32> = values.iter().map(|&d| d as f32).collect();
+        if !s.insert_map(id, colours, stored) {
+            return Err(CmdError::Params(format!("no mesh {id}")));
+        }
     }
     let noise = estimate_noise(&m.mesh);
     let warning =
@@ -444,20 +447,20 @@ fn to_primitive_cmd(s: &Session, i: ToPrimitiveIn) -> CmdResult<ToPrimitiveOut> 
 /// One mesh: its colour map is removed.
 fn clear(s: &mut Session, i: MeshIn) -> CmdResult<ClearOut> {
     let id = i.object.resolve(s, ObjectKind::Mesh)?;
-    s.deviations.remove(&id);
-    Ok(ClearOut { id, cleared: s.overlays.remove(&id).is_some() })
+    Ok(ClearOut { id, cleared: s.drop_map(id) })
 }
 
-/// The mean signed deviation of the counted corners of one triangle of a mapped scan.
+/// The mean signed deviation of the counted corners of one triangle of a mapped scan. The map must
+/// still be valid for the scan's geometry (see `Session::live_map`).
 fn at_cmd(s: &Session, i: AtIn) -> CmdResult<AtOut> {
     let id = i.object.resolve(s, ObjectKind::Mesh)?;
-    let values = s
-        .deviations
-        .get(&id)
-        .ok_or_else(|| CmdError::Failed(format!("{id} has no deviation map: run deviation.compute with show")))?;
+    let map = s.live_map(id).ok_or_else(|| {
+        CmdError::Failed(format!("{id} has no current deviation map: run deviation.compute with show"))
+    })?;
+    let values = &map.values;
     let mesh = s.doc.mesh(id).ok_or_else(|| CmdError::Params(format!("no mesh {id}")))?;
     if values.len() != mesh.mesh.vertex_count() {
-        return Err(CmdError::Failed(format!("the deviation map of {id} is stale: compute it again")));
+        return Err(CmdError::Failed(format!("the deviation map of {id} does not fit its mesh")));
     }
     let corners = mesh
         .mesh
@@ -510,11 +513,10 @@ pub static COMMANDS: &[CommandSpec] = &[
         ClearOut,
         clear
     ),
-    command!(
+    read_command!(
         "deviation.at",
         "Deviation at a triangle",
         "Analyze",
-        false,
         "Signed deviation of triangle `triangle` of the scan `object` from its deviation map: the mean of its counted corners in mm, null when none is counted. Needs a map made with `show`.",
         AtIn,
         AtOut,

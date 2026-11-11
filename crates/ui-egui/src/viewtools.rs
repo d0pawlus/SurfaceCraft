@@ -619,7 +619,7 @@ impl SurfaceCraftApp {
                 } else if resp.clicked()
                     && let Some(p) = pos
                 {
-                    crate::deviation_panel::readout::pin_click(self, p[0], p[1], w, h);
+                    crate::deviation_panel::readout::pin_click(self, p[0], p[1], w, h, mods.alt);
                     self.pick_at(p[0], p[1], w, h, mods.shift);
                 }
             }

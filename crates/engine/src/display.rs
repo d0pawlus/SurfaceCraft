@@ -238,8 +238,8 @@ impl Session {
         let mut out = Vec::new();
         for (id, mesh) in meshes {
             let pick_key = Arc::as_ptr(&mesh) as usize;
-            let colors = match self.overlays.get(&id) {
-                Some(c) if c.len() == mesh.vertex_count() => Some(c.clone()),
+            let colors = match self.live_map(id) {
+                Some(map) if map.colours.len() == mesh.vertex_count() => Some(map.colours.clone()),
                 _ => self.region_overlay(id, &mesh, pick_key),
             };
             let budget = if self.tess.budget == 0 { LOD_BUDGET } else { self.tess.budget };

@@ -1,8 +1,10 @@
 //! The deviation readings in the viewport. The reading under the pointer is the deviation of the
-//! scan triangle the pointer is on. A click on the mapped scan pins the reading of its triangle;
-//! pinned readings stay until the panel removes them. Both come from `deviation.at`, asked of the
-//! engine without a log entry (see `Session::query`), and only when the pointer moves to another
-//! triangle, so hovering does not flood the command log.
+//! scan triangle the pointer is on. Alt-click on the mapped scan pins the reading of its triangle;
+//! pinned readings stay until the panel removes them or their map goes.
+//!
+//! Readings come from `deviation.at` through `Session::query`, which logs nothing. They are cached:
+//! the engine is asked only when the map, the selection, the pointer or the view changed, and not
+//! at all on idle frames.
 use crate::app::SurfaceCraftApp;
 use crate::deviation_panel::current;
 use crate::i18n::{t, tf};
@@ -25,6 +27,9 @@ const LABEL_RADIUS: f32 = 3.0;
 const LABEL_FONT_SIZE: f32 = 12.0;
 /// Decimals of a reading (mm).
 const READING_DECIMALS: usize = 3;
+/// Values of the view that a frame key holds: orbit target, distance, angles, field of view and the
+/// size of the viewport.
+const VIEW_KEY_LEN: usize = 9;
 
 /// A triangle of the scan and the point it was read at (model mm).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -44,8 +49,32 @@ pub enum Reading {
     Measured(f64),
     /// Not measured, or not facing the reference: the grey of the colour map.
     NotMeasured,
-    /// The scan has no deviation map (any more), so there is nothing to read.
+    /// The scan has no current deviation map, so there is nothing to read.
     NoMap,
+}
+
+/// What the readout drew last frame. When it changes, the reading under the pointer is asked again.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FrameKey {
+    epoch: u64,
+    selected: Option<ObjectId>,
+    pointer: Option<[f32; 2]>,
+    view: [u64; VIEW_KEY_LEN],
+}
+
+/// The reading under the pointer, with the epoch it was read at.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Hover {
+    spot: Spot,
+    reading: Reading,
+    epoch: u64,
+}
+
+/// The readings of the pinned triangles, read at one epoch.
+#[derive(Clone, Debug, PartialEq)]
+struct PinReadings {
+    epoch: u64,
+    readings: Vec<(Spot, Reading)>,
 }
 
 /// The readings of the Deviation panel in the viewport.
@@ -53,8 +82,14 @@ pub enum Reading {
 pub struct State {
     /// Pinned readings, oldest first.
     pub pins: Vec<Spot>,
-    /// The triangle under the pointer last time, with its reading.
-    hover: Option<(Spot, Reading)>,
+    /// The readings of `pins`, as read at the last epoch.
+    pin_readings: Option<PinReadings>,
+    /// The inputs of the last frame's hover reading.
+    frame: Option<FrameKey>,
+    /// The reading under the pointer.
+    hover: Option<Hover>,
+    /// Engine queries made so far: idle frames make none.
+    pub queries: usize,
 }
 
 /// `pins` with `spot` added. A triangle is pinned once; past `MAX_PINS` the oldest pin goes.
@@ -86,6 +121,7 @@ pub fn reading_of(answer: Result<Value, EngineError>) -> Reading {
 
 /// The reading at `spot`, asked of the engine without a log entry.
 pub fn read(app: &mut SurfaceCraftApp, spot: Spot) -> Reading {
+    app.deviation.queries += 1;
     reading_of(app.session.query("deviation.at", json!({"object": spot.object.0, "triangle": spot.triangle})))
 }
 
@@ -110,60 +146,120 @@ pub fn spot_at(app: &mut SurfaceCraftApp, object: ObjectId, x: f64, y: f64, w: f
     })
 }
 
-/// A click at viewport pixel `(x, y)` on the mapped scan pins the reading of the triangle under
-/// it. The click's own pick (selection) happens as before.
-pub fn pin_click(app: &mut SurfaceCraftApp, x: f64, y: f64, w: f64, h: f64) {
+/// A click at viewport pixel `(x, y)` pins the reading of the mapped scan's triangle under it, but
+/// only with Alt held: a plain click only selects, as before.
+pub fn pin_click(app: &mut SurfaceCraftApp, x: f64, y: f64, w: f64, h: f64, alt: bool) {
+    if !alt {
+        return;
+    }
     let Some(object) = current(app).map(|c| c.object) else { return };
     if let Some(spot) = spot_at(app, object, x, y, w, h) {
         app.deviation.pins = with_pin(&app.deviation.pins, spot);
     }
 }
 
-/// Paints the readings over the viewport: the one under the pointer, then each pinned reading at
-/// its point.
+/// Keeps the pinned readings current. A pin whose map is gone is dropped. The readings are read
+/// again only when the epoch moved or the pins changed; a pin read at this epoch keeps its reading.
+pub(crate) fn sync_pins(app: &mut SurfaceCraftApp) {
+    app.deviation.pins.retain(|pin| app.session.live_map(pin.object).is_some());
+    let epoch = app.session.epoch();
+    let previous = match app.deviation.pin_readings.take() {
+        Some(cached) if cached.epoch == epoch => cached.readings,
+        _ => Vec::new(),
+    };
+    let unchanged = previous.len() == app.deviation.pins.len()
+        && previous.iter().map(|(spot, _)| *spot).eq(app.deviation.pins.iter().copied());
+    if unchanged {
+        app.deviation.pin_readings = Some(PinReadings { epoch, readings: previous });
+        return;
+    }
+    let pins = app.deviation.pins.clone();
+    let mut readings = Vec::with_capacity(pins.len());
+    for pin in pins {
+        let reading = match previous.iter().find(|(spot, _)| *spot == pin) {
+            Some((_, reading)) => *reading,
+            None => read(app, pin),
+        };
+        readings.push((pin, reading));
+    }
+    app.deviation.pin_readings = Some(PinReadings { epoch, readings });
+}
+
+/// Paints the readings over the viewport: the reading under the pointer, then each pinned reading at
+/// its point. The engine is asked only when the inputs of the readout changed.
 pub(crate) fn paint(app: &mut SurfaceCraftApp, ui: &egui::Ui, rect: Rect) {
     let painter = ui.painter_at(rect);
-    update_hover(app, ui, rect);
-    if let (Some((_, reading)), Some(pointer)) = (app.deviation.hover, ui.input(|i| i.pointer.hover_pos())) {
-        label_at(app, &painter, pointer + Vec2::splat(POINTER_GAP), &label(reading));
+    let pointer = ui.input(|i| i.pointer.hover_pos()).filter(|p| rect.contains(*p));
+    update_hover(app, pointer, rect);
+    sync_pins(app);
+    if let (Some(hover), Some(pointer)) = (app.deviation.hover, pointer) {
+        label_at(app, &painter, pointer + Vec2::splat(POINTER_GAP), &label(hover.reading));
     }
     paint_pins(app, &painter, rect);
 }
 
-/// Sets the reading under the pointer while it is on the mapped scan, and clears it otherwise.
-fn update_hover(app: &mut SurfaceCraftApp, ui: &egui::Ui, rect: Rect) {
-    let pointer = ui.input(|i| i.pointer.hover_pos()).filter(|p| rect.contains(*p));
+/// Sets the reading under the pointer when the map, the selection, the pointer or the view changed;
+/// otherwise the last reading stands.
+fn update_hover(app: &mut SurfaceCraftApp, pointer: Option<Pos2>, rect: Rect) {
+    let key = frame_key(app, pointer, rect);
+    if app.deviation.frame == Some(key) {
+        return;
+    }
+    app.deviation.frame = Some(key);
     let object = current(app).map(|c| c.object);
+    let (w, h) = (f64::from(rect.width()), f64::from(rect.height()));
     let spot = match (pointer, object) {
         (Some(p), Some(object)) => {
             let local = p - rect.min;
-            let (w, h) = (f64::from(rect.width()), f64::from(rect.height()));
             spot_at(app, object, f64::from(local.x), f64::from(local.y), w, h)
         }
         _ => None,
     };
-    app.deviation.hover = spot.map(|spot| hover_reading(app, spot));
+    let hover = spot.map(|spot| hover_for(app, spot));
+    app.deviation.hover = hover;
 }
 
-/// The reading of `spot`, kept when the pointer is still on the same triangle.
-fn hover_reading(app: &mut SurfaceCraftApp, spot: Spot) -> (Spot, Reading) {
-    match app.deviation.hover {
-        Some((last, reading)) if last.object == spot.object && last.triangle == spot.triangle => (spot, reading),
-        _ => (spot, read(app, spot)),
+/// The hover reading of `spot`: the last one is kept while the pointer stays on the same triangle
+/// of the same map, otherwise the engine is asked.
+fn hover_for(app: &mut SurfaceCraftApp, spot: Spot) -> Hover {
+    let epoch = app.session.epoch();
+    let kept = app
+        .deviation
+        .hover
+        .filter(|h| h.epoch == epoch && h.spot.object == spot.object && h.spot.triangle == spot.triangle);
+    match kept {
+        Some(h) => Hover { spot, reading: h.reading, epoch },
+        None => Hover { spot, reading: read(app, spot), epoch },
     }
 }
 
+fn frame_key(app: &SurfaceCraftApp, pointer: Option<Pos2>, rect: Rect) -> FrameKey {
+    let c = &app.camera;
+    let view = [
+        c.target.x,
+        c.target.y,
+        c.target.z,
+        c.distance,
+        c.yaw,
+        c.pitch,
+        c.fov,
+        f64::from(rect.width()),
+        f64::from(rect.height()),
+    ]
+    .map(f64::to_bits);
+    FrameKey { epoch: app.session.epoch(), selected: app.selected_object, pointer: pointer.map(|p| [p.x, p.y]), view }
+}
+
 /// Marks each pinned reading at its point and labels it.
-fn paint_pins(app: &mut SurfaceCraftApp, painter: &egui::Painter, rect: Rect) {
+fn paint_pins(app: &SurfaceCraftApp, painter: &egui::Painter, rect: Rect) {
+    let Some(cached) = &app.deviation.pin_readings else { return };
     let (w, h) = (f64::from(rect.width()), f64::from(rect.height()));
-    let pins = app.deviation.pins.clone();
-    for pin in pins {
+    for (pin, reading) in &cached.readings {
         let [x, y, z] = pin.point;
         let Some([sx, sy, _]) = app.camera.project(&Point3::new(x, y, z), w, h) else { continue };
         let at = rect.min + Vec2::new(sx as f32, sy as f32);
-        let reading = read(app, pin);
         painter.circle_filled(at, MARKER_RADIUS, app.token_color(Token::Highlight));
-        label_at(app, painter, at + Vec2::splat(POINTER_GAP / 2.0), &label(reading));
+        label_at(app, painter, at + Vec2::splat(POINTER_GAP / 2.0), &label(*reading));
     }
 }
 
@@ -178,15 +274,16 @@ fn label_at(app: &SurfaceCraftApp, painter: &egui::Painter, anchor: Pos2, text: 
 
 /// The pinned readings of the panel: each with its triangle, its reading and a Remove button.
 pub(crate) fn pins_section(app: &mut SurfaceCraftApp, ui: &mut egui::Ui) {
+    sync_pins(app);
     ui.strong(t("deviation.pinned"));
-    if app.deviation.pins.is_empty() {
+    let rows = app.deviation.pin_readings.as_ref().map(|cached| cached.readings.clone()).unwrap_or_default();
+    if rows.is_empty() {
         ui.weak(t("deviation.pin_hint"));
         return;
     }
-    let pins = app.deviation.pins.clone();
     let mut remove = None;
-    for (index, pin) in pins.iter().enumerate() {
-        let text = label(read(app, *pin));
+    for (index, (pin, reading)) in rows.iter().enumerate() {
+        let text = label(*reading);
         let triangle = tf("deviation.triangle", &[("n", &pin.triangle.to_string())]);
         ui.horizontal(|ui| {
             ui.monospace(triangle);

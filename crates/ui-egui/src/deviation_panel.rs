@@ -16,7 +16,7 @@ use crate::i18n::{t, tf};
 use crate::theme::{Token, Tokens, to_color32};
 use egui::{Color32, Sense, Stroke, Vec2};
 use serde_json::{Value, json};
-use surfacecraft_deviation::{Band, DeviationStats, Histogram, Report, colorize, palette};
+use surfacecraft_deviation::{Band, DeviationStats, Distribution, Histogram, colorize, palette};
 use surfacecraft_doc::ObjectId;
 use surfacecraft_engine::EngineError;
 use surfacecraft_engine::cmd::deviation::ComputeOut;
@@ -100,7 +100,7 @@ pub struct Current {
     /// Statistics of the map.
     pub stats: DeviationStats,
     /// Histogram and tolerance bands of the signed deviation, from the same command.
-    pub report: Report,
+    pub report: Distribution,
     /// The engine's warning (tolerance below the estimated scan noise), if any.
     pub warning: Option<String>,
 }
@@ -108,7 +108,7 @@ pub struct Current {
 /// The map shown: the selected scan's if it has one, else the most recent mapped scan's.
 #[must_use]
 pub fn current(app: &SurfaceCraftApp) -> Option<Current> {
-    let selected = app.selected_object.filter(|id| app.session.overlays.contains_key(id));
+    let selected = app.selected_object.filter(|id| app.session.live_map(*id).is_some());
     selected.and_then(|id| latest(app, Some(id))).or_else(|| latest(app, None))
 }
 
@@ -120,7 +120,7 @@ fn latest(app: &SurfaceCraftApp, only: Option<ObjectId>) -> Option<Current> {
             return None;
         }
         let out: ComputeOut = serde_json::from_value(e.outcome.clone()).ok()?;
-        if !app.session.overlays.contains_key(&out.id) || only.is_some_and(|s| s != out.id) {
+        if app.session.live_map(out.id).is_none() || only.is_some_and(|s| s != out.id) {
             return None;
         }
         let name = app.session.doc.summaries().into_iter().find(|s| s.id == out.id).map(|s| s.name).unwrap_or_default();
@@ -232,7 +232,7 @@ pub(crate) fn show(app: &mut SurfaceCraftApp, ui: &mut egui::Ui) {
     let tokens = app.tokens.clone();
     match current(app) {
         Some(cur) => map_section(app, ui, &tokens, &cur),
-        None if app.session.overlays.is_empty() => {
+        None if app.session.maps.is_empty() => {
             ui.weak(t("deviation.none"));
         }
         None => {
@@ -252,7 +252,8 @@ pub(crate) fn show(app: &mut SurfaceCraftApp, ui: &mut egui::Ui) {
 
 /// The mapped scans, each with its Clear button.
 fn maps_list(app: &mut SurfaceCraftApp, ui: &mut egui::Ui) {
-    let mut mapped: Vec<ObjectId> = app.session.overlays.keys().copied().collect();
+    let mut mapped: Vec<ObjectId> =
+        app.session.maps.keys().copied().filter(|id| app.session.live_map(*id).is_some()).collect();
     mapped.sort();
     let mut clear = None;
     for id in mapped {
@@ -422,6 +423,8 @@ fn histogram(ui: &mut egui::Ui, tokens: &Tokens, hist: &Histogram, tol: f64) {
     }
     let font = egui::FontId::proportional(AXIS_FONT_SIZE);
     let muted = tokens.color(Token::TextMuted);
-    painter.text(egui::pos2(x_at(-tol), rect.bottom()), egui::Align2::CENTER_BOTTOM, num(-tol, 3), font.clone(), muted);
-    painter.text(egui::pos2(x_at(tol), rect.bottom()), egui::Align2::CENTER_BOTTOM, num(tol, 3), font, muted);
+    // the ticks stay on the plot even if the range were narrower than the tolerance
+    let tick = |v: f64| x_at(v).clamp(rect.left(), rect.right());
+    painter.text(egui::pos2(tick(-tol), rect.bottom()), egui::Align2::CENTER_BOTTOM, num(-tol, 3), font.clone(), muted);
+    painter.text(egui::pos2(tick(tol), rect.bottom()), egui::Align2::CENTER_BOTTOM, num(tol, 3), font, muted);
 }

@@ -56,7 +56,7 @@ fn merge_split_and_deviation() {
     let rms = d["stats"]["rms"].as_f64().unwrap();
     assert!((rms - f["rms"].as_f64().unwrap()).abs() < 0.01, "{d}");
     assert!(d["stats"]["within"].as_f64().unwrap() > 0.9);
-    assert_eq!(s.overlays.len(), 1);
+    assert_eq!(s.maps.len(), 1);
     let items = s.display_items();
     assert!(items.iter().any(|i| i.colors.is_some()));
     s.execute("deviation.clear", json!({"object": "scan"})).unwrap();

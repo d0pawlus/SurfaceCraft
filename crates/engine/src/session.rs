@@ -1,9 +1,12 @@
 //! The session: a document, its history and command execution.
 use crate::EngineError;
-use crate::cmd::{self, CmdError, CommandSpec};
+use crate::cmd::{self, CmdError, CmdResult, CommandSpec};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use surfacecraft_doc::{Document, History};
+use std::collections::HashMap;
+use std::sync::{Arc, Weak};
+use surfacecraft_doc::{Document, History, ObjectId};
+use surfacecraft_geom::Mesh;
 
 /// One executed command, for the UI log and macro recording.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -42,6 +45,20 @@ pub struct ScriptReport {
     pub steps: Vec<ScriptStep>,
 }
 
+/// A deviation map of one mesh: its colours and its signed deviation per vertex. The map is valid
+/// only for the geometry it was computed on, so it is dropped once the object takes another mesh
+/// (a move, an edit, a delete, or a new document).
+#[derive(Clone, Debug)]
+pub struct DeviationMap {
+    /// The geometry the map was computed on. A weak handle: the map does not keep the mesh alive,
+    /// and the allocation is not reused while the handle exists, so pointer identity is exact.
+    geometry: Weak<Mesh>,
+    /// Colour of each vertex (`colorize`), for the viewport.
+    pub colours: Arc<Vec<[f32; 4]>>,
+    /// Signed deviation of each vertex in mm (NaN where not counted), for `deviation.at`.
+    pub values: Arc<Vec<f32>>,
+}
+
 /// A modelling session.
 #[derive(Debug, Default)]
 pub struct Session {
@@ -55,19 +72,18 @@ pub struct Session {
     pub allow_files: bool,
     /// Body display meshes.
     pub tess: crate::display::TessCache,
-    /// Per-vertex colour overlays on meshes (deviation maps), keyed by mesh id.
-    pub overlays: std::collections::HashMap<surfacecraft_doc::ObjectId, std::sync::Arc<Vec<[f32; 4]>>>,
-    /// Per-vertex signed deviation behind each overlay (NaN where the point is not counted), keyed
-    /// by mesh id: what `deviation.at` reads. Stored and dropped together with the overlay.
-    pub deviations: std::collections::HashMap<surfacecraft_doc::ObjectId, std::sync::Arc<Vec<f32>>>,
+    /// Deviation maps by mesh id. Only valid ones are kept: see [`Session::live_map`].
+    pub maps: HashMap<ObjectId, DeviationMap>,
+    /// Moves on with every executed command (see [`Session::epoch`]).
+    epoch: u64,
 }
 
 const LOG_CAP: usize = 1000;
 
-/// Read-only commands a front end may run without a log entry (the viewport readout asks on every
-/// pointer move; logging those would evict the user's own commands). Nothing outside this list is
-/// run by [`Session::query`].
-pub const QUERY_COMMANDS: &[&str] = &["deviation.at"];
+/// Read-only commands a front end may run without a log entry, through [`Session::query`]: the
+/// viewport readout asks on pointer moves, and logging those would evict the user's own commands.
+/// Nothing else is run by `query`.
+const QUERY_COMMANDS: &[&str] = &["deviation.at"];
 
 impl Session {
     /// A new, empty session; file access allowed except on wasm.
@@ -101,6 +117,9 @@ impl Session {
                 Err(e)
             }
         };
+        // a command may have moved geometry: maps that no longer match their mesh go
+        self.epoch = self.epoch.wrapping_add(1);
+        self.prune_maps();
         let outcome = match &mapped {
             Ok(v) => v.clone(),
             Err(e) => serde_json::to_value(e).unwrap_or(Value::Null),
@@ -112,17 +131,58 @@ impl Session {
         mapped
     }
 
-    /// Runs read-only command `id` without a log entry or a history step. Only the commands in
-    /// [`QUERY_COMMANDS`] may run this way; any other id is refused as unavailable.
-    pub fn query(&mut self, id: &str, params: Value) -> Result<Value, EngineError> {
+    /// Runs read-only command `id` on a shared session, without a log entry or a history step. Only
+    /// the ids in `QUERY_COMMANDS` run here, and only if they are read commands with a read form,
+    /// not undoable and not heavy; anything else is refused as unavailable. This is for the UI's
+    /// per-frame reads and is not reachable from the MCP, the CLI or scripts.
+    pub fn query(&self, id: &str, params: Value) -> Result<Value, EngineError> {
         if !QUERY_COMMANDS.contains(&id) {
             return Err(EngineError::Unavailable(format!("{id} is not a query")));
         }
         let spec = cmd::find(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
-        if spec.undoable {
-            return Err(EngineError::Unavailable(format!("{id} changes the document")));
+        let read = spec
+            .read
+            .filter(|_| !spec.undoable && !cmd::is_heavy(id))
+            .ok_or_else(|| EngineError::Unavailable(format!("{id} has no read-only form")))?;
+        run_read_guarded(spec, read, self, params)
+    }
+
+    /// Moves on with every executed command, so that a front end knows whether what it cached
+    /// about the session (maps, selections of maps) may be out of date.
+    #[must_use]
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// The deviation map of mesh `id` if it is still valid: the object still holds the geometry the
+    /// map was computed on.
+    #[must_use]
+    pub fn live_map(&self, id: ObjectId) -> Option<&DeviationMap> {
+        let map = self.maps.get(&id)?;
+        let current = self.doc.mesh(id)?;
+        std::ptr::eq(map.geometry.as_ptr(), Arc::as_ptr(&current.mesh)).then_some(map)
+    }
+
+    /// Stores the map of mesh `id` for the geometry the object holds now. False when there is no
+    /// such mesh.
+    pub fn insert_map(&mut self, id: ObjectId, colours: Vec<[f32; 4]>, values: Vec<f32>) -> bool {
+        let Some(object) = self.doc.mesh(id) else { return false };
+        let geometry = Arc::downgrade(&object.mesh);
+        self.maps.insert(id, DeviationMap { geometry, colours: Arc::new(colours), values: Arc::new(values) });
+        true
+    }
+
+    /// Removes the map of mesh `id`; true when there was one.
+    pub fn drop_map(&mut self, id: ObjectId) -> bool {
+        self.maps.remove(&id).is_some()
+    }
+
+    /// Drops every map whose geometry is no longer the object's.
+    fn prune_maps(&mut self) {
+        let stale: Vec<ObjectId> = self.maps.keys().copied().filter(|id| self.live_map(*id).is_none()).collect();
+        for id in stale {
+            self.maps.remove(&id);
         }
-        run_guarded(spec, self, params)
     }
 
     /// Runs command `id` on a copy of the document and returns the copy: the preview of what
@@ -194,4 +254,28 @@ fn run_guarded(spec: &CommandSpec, s: &mut Session, params: Value) -> Result<Val
 #[cfg(target_arch = "wasm32")]
 fn run_guarded(spec: &CommandSpec, s: &mut Session, params: Value) -> Result<Value, EngineError> {
     (spec.run)(s, params).map_err(map_err)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn run_read_guarded(
+    spec: &CommandSpec,
+    read: fn(&Session, Value) -> CmdResult<Value>,
+    s: &Session,
+    params: Value,
+) -> Result<Value, EngineError> {
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read(s, params)));
+    match r {
+        Ok(v) => v.map_err(map_err),
+        Err(_) => Err(EngineError::Internal(spec.id.to_string())),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn run_read_guarded(
+    _spec: &CommandSpec,
+    read: fn(&Session, Value) -> CmdResult<Value>,
+    s: &Session,
+    params: Value,
+) -> Result<Value, EngineError> {
+    read(s, params).map_err(map_err)
 }
