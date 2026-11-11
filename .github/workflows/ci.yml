@@ -9,6 +9,9 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
@@ -49,14 +52,8 @@ jobs:
     timeout-minutes: 90
     env:
       DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
-      # experiment: link the native target with mold (the wasm target keeps its own flags)
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C linker-features=-lld -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
-      - uses: rui314/setup-mold@v1
-        if: env.DOCS_ONLY != 'true'
-        with:
-          make-default: false
       - name: System libraries for eframe/rfd
         if: env.DOCS_ONLY != 'true'
         # Best effort: when the Ubuntu package mirrors are unreachable (2026-11-11: every Linux job
@@ -78,16 +75,16 @@ jobs:
         if: env.DOCS_ONLY != 'true'
         with:
           cache-all-crates: true
-      - uses: taiki-e/install-action@v2
+          # pull requests restore the cache of main (same key: job, toolchain, lock file) and
+          # never write their own, so the cache quota is not churned by every branch
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         if: env.DOCS_ONLY != 'true'
         with:
           tool: cargo-nextest
       - name: cargo xtask ci
         if: env.DOCS_ONLY != 'true'
         run: cargo xtask ci
-      - name: Which linker (experiment)
-        if: env.DOCS_ONLY != 'true'
-        run: readelf -p .comment "$(ls target/ci/deps/commands-* | grep -v '\.d$' | head -1)"
       - name: cargo xtask assets (documentation-only change)
         if: env.DOCS_ONLY == 'true'
         run: cargo xtask assets
@@ -109,7 +106,10 @@ jobs:
         if: env.DOCS_ONLY != 'true'
         with:
           cache-all-crates: true
-      - uses: taiki-e/install-action@v2
+          # pull requests restore the cache of main (same key: job, toolchain, lock file) and
+          # never write their own, so the cache quota is not churned by every branch
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         if: env.DOCS_ONLY != 'true'
         with:
           tool: cargo-nextest
