@@ -23,6 +23,7 @@ pub mod feature;
 pub mod hybrid;
 pub mod mesh;
 pub mod mesh_edit;
+pub mod pipeline;
 pub mod plan;
 pub mod primitive;
 pub mod qa;
@@ -167,6 +168,7 @@ static REGISTRY: LazyLock<Vec<CommandSpec>> = LazyLock::new(|| {
     v.extend_from_slice(deviation::COMMANDS);
     v.extend_from_slice(mesh::COMMANDS);
     v.extend_from_slice(mesh_edit::COMMANDS);
+    v.extend_from_slice(pipeline::COMMANDS);
     v.extend_from_slice(primitive::COMMANDS);
     v.extend_from_slice(qa::COMMANDS);
     v.extend_from_slice(quad::COMMANDS);
@@ -226,6 +228,7 @@ const HEAVY: &[&str] = &[
     "primitive.fit",
     "primitive.symmetry",
     "scan.qa",
+    "scan.to_solid",
     "quad.retopo",
     "region.auto_segment",
     "region.grow",

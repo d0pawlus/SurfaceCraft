@@ -569,6 +569,8 @@
   "cmd.deviation.stats.hint": "Pokazuje średnią i największą odchyłkę w liczbach.",
   "cmd.scan.qa": "Jakość skanu",
   "cmd.scan.qa.hint": "Wypisuje, co najpierw oczyścić w skanie: dziury, okruchy, złe trójkąty i szum.",
+  "cmd.scan.to_solid": "Skan na bryłę",
+  "cmd.scan.to_solid.hint": "Zamienia skan w zamkniętą bryłę jednym krokiem i mierzy ją względem skanu.",
   "cmd.mesh.import_stream": "Import dużego skanu",
   "cmd.mesh.import_stream.hint": "Wczytuje bardzo duży skan z dysku kawałek po kawałku do folderu, bez zapełniania pamięci.",
   "cmd.mesh.store_info": "Informacje o dużym skanie",

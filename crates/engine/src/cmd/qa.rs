@@ -277,7 +277,7 @@ fn hole_list(mesh: &Mesh, loops: &[Vec<u32>]) -> Vec<HoleOut> {
     holes
 }
 
-fn scan_qa(s: &Session, i: QaIn) -> CmdResult<QaOut> {
+pub(crate) fn scan_qa(s: &Session, i: QaIn) -> CmdResult<QaOut> {
     let id = i.object.resolve(s, ObjectKind::Mesh)?;
     let mesh = s.doc.mesh(id).map(|m| m.mesh.clone()).ok_or_else(|| CmdError::Params(format!("no mesh {id}")))?;
     let valid = mesh.validate().is_ok();
@@ -340,7 +340,7 @@ fn face_of(topo: &TopoMesh, t: Option<usize>) -> Option<usize> {
     t.and_then(|t| topo.tri_face.get(t)).map(|&f| f as usize)
 }
 
-fn compare(s: &Session, i: CompareIn) -> CmdResult<CompareOut> {
+pub(crate) fn compare(s: &Session, i: CompareIn) -> CmdResult<CompareOut> {
     let tol = positive(i.tolerance.unwrap_or(TOLERANCE), "tolerance")?;
     let maxd = positive(i.max_distance.unwrap_or(REACH), "max_distance")?;
     let chord = chord_of(i.chord, tol)?;

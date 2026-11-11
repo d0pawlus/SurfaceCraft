@@ -89,11 +89,16 @@ cargo run --release -p surfacecraft-cli -- exec region.auto_segment '{…}'  # o
 cargo run --release -p surfacecraft-cli -- assist align "put the part on the world axes"
 ```
 
-- **MCP server.** Exposes every registry command as a tool (104+ tools), plus general tools to
-  list and describe commands, run batches (rolled back on the first failure), undo and redo,
-  inspect the design and take viewport screenshots. When the desktop app is running, the server **bridges to it**,
-  so an agent works in the same session you are looking at; otherwise it runs headless
-  (`--local`, files only with `--allow-files`).
+- **MCP server.** Scan to STEP in three calls: `mesh_import`, `scan_to_solid`, `export_step`.
+  `scan_to_solid` cleans, segments, fits, builds the solid and measures it against the scan; it
+  answers with a verdict (`pass`, `review`, `fail`), the deviation and the next steps to take.
+  Every registry command is callable as a tool. The default listing is compact (42 KB: one tool
+  per command area plus the workflow commands); `--tools full` lists one tool per command.
+  There are general tools to list and describe commands, run batches (rolled back on the first
+  failure), undo and redo, inspect the design and take viewport screenshots. When the desktop
+  app is running, the server **bridges to it**, so an agent works in the same session you are
+  looking at; otherwise it runs headless (`--local`, files only with `--allow-files`).
+  Add it to an MCP client as the command `surfacecraft-cli mcp --allow-files`.
 - **Scripts.** A script is a list of commands:
   `{"commands": [{"command": "mesh.import", "params": {"path": "scan.stl"}}, …]}`.
   Programmatic calls never open dialogs.

@@ -375,7 +375,7 @@ fn kind_name(p: &Primitive) -> &'static str {
     }
 }
 
-fn from_regions(s: &mut Session, i: FromRegionsIn) -> CmdResult<FromRegionsOut> {
+pub(crate) fn from_regions(s: &mut Session, i: FromRegionsIn) -> CmdResult<FromRegionsOut> {
     if i.primitives.is_empty() && i.surfaces.is_empty() {
         return Err(CmdError::Params("give `primitives` and/or `surfaces`".into()));
     }

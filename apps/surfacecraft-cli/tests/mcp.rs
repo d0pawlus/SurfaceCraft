@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 #[test]
 fn gate_m6_mcp_stdio_exposes_and_runs_every_command() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_surfacecraft-cli"))
-        .args(["mcp", "--local"])
+        .args(["mcp", "--local", "--tools", "full"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -87,7 +87,9 @@ fn gate_p8_compact_mode_and_queued_jobs_over_stdio() {
     let (mut child, mut stdin, mut out) = start_mcp(&["--tools", "compact", "--areas", "mesh,app,guide"], &[]);
     let names = listed(&exchange(&mut stdin, &mut out, list.clone()));
     assert!(names.iter().any(|n| n == "mesh") && names.iter().any(|n| n == "guide"), "{names:?}");
-    assert!(!names.iter().any(|n| n.starts_with("mesh_") || n == "body"), "{names:?}");
+    // of the commands only the featured ones of the chosen areas are listed by name
+    assert!(names.iter().any(|n| n == "mesh_import"), "{names:?}");
+    assert!(!names.iter().any(|n| n == "mesh_clean" || n == "body" || n == "scan_to_solid"), "{names:?}");
     assert!(names.iter().any(|n| n == "job_wait") && names.iter().any(|n| n == "set_tool_mode"));
     let call = |name: &str, args: Value| json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": name, "arguments": args}});
     // a queued call answers at once with its job id; job_wait returns the result
@@ -122,9 +124,75 @@ fn gate_p8_compact_mode_and_queued_jobs_over_stdio() {
     let _ = child.wait();
 
     // without arguments the environment chooses
-    let (mut child, mut stdin, mut out) = start_mcp(&[], &[("SURFACECRAFT_MCP_TOOLS", "compact")]);
+    let (mut child, mut stdin, mut out) = start_mcp(&[], &[("SURFACECRAFT_MCP_TOOLS", "full")]);
+    let names = listed(&exchange(&mut stdin, &mut out, list.clone()));
+    assert!(names.iter().any(|n| n == "mesh_clean") && !names.iter().any(|n| n == "mesh"), "{names:?}");
+    drop(stdin);
+    let _ = child.wait();
+
+    // without either the listing is compact with the workflow commands in full
+    let (mut child, mut stdin, mut out) = start_mcp(&[], &[]);
     let names = listed(&exchange(&mut stdin, &mut out, list));
-    assert!(names.iter().any(|n| n == "mesh") && !names.iter().any(|n| n == "mesh_import"), "{names:?}");
+    assert!(names.iter().any(|n| n == "mesh") && names.iter().any(|n| n == "scan_to_solid"), "{names:?}");
+    assert!(!names.iter().any(|n| n == "mesh_clean"), "{names:?}");
+    drop(stdin);
+    let _ = child.wait();
+}
+
+/// A raw scan of a chamfered pin (r = 12, h = 30, 3 mm chamfer) as base64 STL: tessellated CAD
+/// made to look like a scan (sigma = 0.03 mm, holes, spikes, debris). Returns it with the CAD
+/// volume.
+fn scanned_pin_stl() -> (String, f64) {
+    use surfacecraft_engine::Session;
+    use surfacecraft_geom::{Rng, synth};
+    let mut s = Session::new();
+    let pin = s.execute("body.cylinder", json!({"radius": 12.0, "height": 30.0, "name": "pin"})).unwrap();
+    let brep = s.doc.body(surfacecraft_doc::ObjectId(pin["id"].as_u64().unwrap())).unwrap().brep.clone();
+    let top = brep
+        .edges
+        .iter()
+        .position(|e| e.vertices.iter().all(|&v| (brep.vertices[v as usize].point[2] - 30.0).abs() < 1e-9))
+        .unwrap();
+    let cad = s.execute("body.chamfer", json!({"object": "pin", "edges": [top], "size": 3.0})).unwrap();
+    s.execute("body.to_mesh", json!({"object": "pin", "chord": 0.01, "name": "cad"})).unwrap();
+    let id = s.doc.find_by_name("cad").unwrap().0;
+    let mut mesh = (*s.doc.mesh(id).unwrap().mesh).clone();
+    mesh.weld(1e-6);
+    let defects = synth::ScanDefects { spacing: 0.7, noise: 0.03, ..synth::ScanDefects::default() };
+    s.doc.add_mesh("scan", synth::scanify(&mesh, &defects, &mut Rng::new(5)));
+    let stl = s.execute("mesh.export", json!({"object": "scan", "format": "stl"})).unwrap();
+    (stl["data"].as_str().unwrap().to_string(), cad["volume"].as_f64().unwrap())
+}
+
+/// Largest reply to `scan_to_solid` an agent should have to read (bytes).
+const MAX_VERDICT_REPLY: usize = 8_000;
+
+#[test]
+fn gate_agent_goes_from_a_scan_to_a_step_file_in_three_calls() {
+    // Arrange: the default server, as an agent gets it, and a scan it has never seen
+    let (stl, cad_volume) = scanned_pin_stl();
+    let (mut child, mut stdin, mut out) = start_mcp(&[], &[]);
+    let call = |name: &str, args: Value| json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": name, "arguments": args}});
+
+    // Act: import, model, export
+    let imported =
+        exchange(&mut stdin, &mut out, call("mesh_import", json!({"data": stl, "format": "stl", "name": "scan"})));
+    let modelled = exchange(&mut stdin, &mut out, call("scan_to_solid", json!({"scan": "scan"})));
+    let result = &modelled["result"]["structuredContent"];
+    let exported = exchange(&mut stdin, &mut out, call("export_step", result["next_steps"][0]["params"].clone()));
+
+    // Assert
+    assert_eq!(imported["result"]["isError"], false, "{imported}");
+    assert_eq!(modelled["result"]["isError"], false, "{modelled}");
+    assert_eq!(result["verdict"], "pass", "{result}");
+    assert_eq!(result["body"]["faces"], 4, "{result}");
+    let volume = result["body"]["volume"].as_f64().unwrap();
+    assert!((volume - cad_volume).abs() / cad_volume < 0.005, "volume {volume} vs CAD {cad_volume}");
+    assert!(result["deviation"]["within"].as_f64().unwrap() >= 0.99, "{result}");
+    let size = modelled.to_string().len();
+    assert!(size < MAX_VERDICT_REPLY, "the verdict reply is {size} bytes");
+    assert_eq!(exported["result"]["structuredContent"]["content"], "solids", "{exported}");
+    assert!(exported["result"]["structuredContent"]["bytes"].as_u64().unwrap() > 1000, "{exported}");
     drop(stdin);
     let _ = child.wait();
 }
