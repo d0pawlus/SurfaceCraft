@@ -69,6 +69,7 @@ impl<'a> ShellWriter<'a> {
             return Ok(FaceGeometry {
                 surface,
                 flip: a.flip_sense,
+                periodic: true,
                 pcurves: a.pcurves,
                 #[cfg(test)]
                 written: a.surface,
@@ -88,6 +89,7 @@ impl<'a> ShellWriter<'a> {
                 Ok(FaceGeometry {
                     surface,
                     flip: false,
+                    periodic: false,
                     pcurves,
                     #[cfg(test)]
                     written: plane.surface,
@@ -98,6 +100,7 @@ impl<'a> ShellWriter<'a> {
                 Ok(FaceGeometry {
                     surface,
                     flip: false,
+                    periodic: false,
                     pcurves: record_pcurves(&face.loops),
                     #[cfg(test)]
                     written: face.surface.clone(),
@@ -133,9 +136,11 @@ impl<'a> ShellWriter<'a> {
             return Ok(curve_3d);
         }
         let mut pcurves = Vec::with_capacity(edge.uses.len());
+        let mut on_periodic = true;
         for u in &edge.uses {
             let fg = self.geometry(u.face as usize)?;
             let surface = fg.surface;
+            on_periodic &= fg.periodic;
             let pc = fg
                 .pcurves
                 .get(u.r#loop as usize)
@@ -147,7 +152,11 @@ impl<'a> ShellWriter<'a> {
         if pcurves.is_empty() {
             return Ok(curve_3d);
         }
-        let seam = matches!(edge.uses.as_slice(), [a, c] if a.face == c.face);
+        // ISO 10303-42 SEAM_CURVE: two pcurves on one surface, the two sides of its seam. Its rules
+        // (WR1 to WR4) do not order them; they follow the edge's uses, the primary use first, which
+        // on a closed surface is the side the loop meets first. A planar or spline face using an
+        // edge twice (a slit) has no seam: its edge is a SURFACE_CURVE with two pcurves.
+        let seam = on_periodic && matches!(edge.uses.as_slice(), [a, c] if a.face == c.face);
         let kind = if seam { "SEAM_CURVE" } else { "SURFACE_CURVE" };
         Ok(self.w.add_distinct(kind, &[s(), r(curve_3d), Param::List(pcurves), e("CURVE_3D")]))
     }
@@ -157,6 +166,10 @@ impl<'a> ShellWriter<'a> {
             return Ok(*id);
         }
         let edge = self.b.edges.get(e_idx as usize).ok_or_else(|| bad(format!("edge {e_idx} missing")))?;
+        let [t0, t1] = edge.interval;
+        if !(t0.is_finite() && t1.is_finite() && t1 > t0) {
+            return Err(bad(format!("edge {e_idx} has an empty or non-finite interval [{t0}, {t1}]")));
+        }
         let curve = edge.nurbs.as_ref().unwrap_or(&edge.curve).clone();
         let (a, b) = (self.vertex(edge.vertices[0])?, self.vertex(edge.vertices[1])?);
         let g = self.curve(&curve)?;

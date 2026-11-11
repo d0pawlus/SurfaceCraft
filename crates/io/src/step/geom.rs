@@ -39,6 +39,39 @@ pub(super) fn degree(knots: &[f64], count: usize) -> Result<usize, IoError> {
         .ok_or_else(|| bad(format!("{} knots for {count} control points", knots.len())))
 }
 
+/// `x` when it is finite and positive.
+fn positive(x: f64, what: &str) -> Result<f64, IoError> {
+    if x.is_finite() && x > 0.0 { Ok(x) } else { Err(bad(format!("{what} must be finite and positive, got {x}"))) }
+}
+
+/// A knot vector the writer can express: finite, non-decreasing, with at least two distinct values.
+fn check_knots(knots: &[f64], entity: &str) -> Result<(), IoError> {
+    let ordered = knots.iter().all(|k| k.is_finite()) && knots.windows(2).all(|w| w[0] <= w[1]);
+    let spans = matches!((knots.first(), knots.last()), (Some(a), Some(b)) if b > a);
+    if ordered && spans {
+        Ok(())
+    } else {
+        Err(bad(format!("{entity} knots must be finite, non-decreasing and span a range: {knots:?}")))
+    }
+}
+
+/// How far from unit length and square a frame may be before STEP's derived y axis would differ
+/// from the record's.
+const FRAME_TOLERANCE: f64 = 1e-6;
+
+fn check_frame(f: &Frame) -> Result<(), IoError> {
+    let (x, y) = (f.x_axis, f.y_axis);
+    let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let square = (dot(x, x) - 1.0).abs() <= FRAME_TOLERANCE
+        && (dot(y, y) - 1.0).abs() <= FRAME_TOLERANCE
+        && dot(x, y).abs() <= FRAME_TOLERANCE;
+    if square {
+        Ok(())
+    } else {
+        Err(bad(format!("frame axes {x:?}, {y:?} are not orthonormal (AXIS2_PLACEMENT_3D derives y)")))
+    }
+}
+
 fn finite(p: &[f64]) -> Result<(), IoError> {
     if p.iter().all(|v| v.is_finite()) { Ok(()) } else { Err(bad("non-finite coordinate")) }
 }
@@ -82,6 +115,7 @@ impl ShellWriter<'_> {
 
     /// `AXIS2_PLACEMENT_3D` of a right-handed frame: z = x × y, x the reference direction.
     pub(super) fn placement(&mut self, f: &Frame) -> Result<u64, IoError> {
+        check_frame(f)?;
         let o = self.point(f.origin)?;
         let z = self.direction(cross(f.x_axis, f.y_axis))?;
         let x = self.direction(f.x_axis)?;
@@ -96,6 +130,7 @@ impl ShellWriter<'_> {
         points: Vec<Param>,
         weights: Option<&[f64]>,
     ) -> Result<u64, IoError> {
+        check_knots(knots, "B_SPLINE_CURVE")?;
         let deg = degree(knots, points.len())?;
         let (k, m) = knots_of(knots);
         let Some(ws) = weights else {
@@ -135,18 +170,20 @@ impl ShellWriter<'_> {
             Curve::Line { start, end } => {
                 let p = self.point(*start)?;
                 let d = [end[0] - start[0], end[1] - start[1], end[2] - start[2]];
-                let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                let len = positive((d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt(), "LINE length")?;
                 let dir = self.direction(d)?;
                 let v = self.w.add("VECTOR", &[s(), r(dir), Param::Real(len)]);
                 Ok(self.w.add("LINE", &[s(), r(p), r(v)]))
             }
             Curve::Circle { frame, radius } => {
+                let radius = positive(*radius, "CIRCLE radius")?;
                 let ax = self.placement(frame)?;
-                Ok(self.w.add("CIRCLE", &[s(), r(ax), Param::Real(*radius)]))
+                Ok(self.w.add("CIRCLE", &[s(), r(ax), Param::Real(radius)]))
             }
             Curve::Ellipse { frame, radii } => {
+                let (a, b) = (positive(radii[0], "ELLIPSE semi axis 1")?, positive(radii[1], "ELLIPSE semi axis 2")?);
                 let ax = self.placement(frame)?;
-                Ok(self.w.add("ELLIPSE", &[s(), r(ax), Param::Real(radii[0]), Param::Real(radii[1])]))
+                Ok(self.w.add("ELLIPSE", &[s(), r(ax), Param::Real(a), Param::Real(b)]))
             }
             Curve::Spline { knots, points } => {
                 let ids = self.point_refs(points)?;
@@ -173,6 +210,8 @@ impl ShellWriter<'_> {
     }
 
     fn spline_surface(&mut self, u_knots: &[f64], v_knots: &[f64], points: &[Vec<[f64; 3]>]) -> Result<u64, IoError> {
+        check_knots(u_knots, "B_SPLINE_SURFACE u")?;
+        check_knots(v_knots, "B_SPLINE_SURFACE v")?;
         let nv = points.first().map_or(0, Vec::len);
         let (p, q) = (degree(u_knots, points.len())?, degree(v_knots, nv)?);
         let rows = self.net_refs(points, nv)?;
@@ -199,6 +238,8 @@ impl ShellWriter<'_> {
     }
 
     fn rational_surface(&mut self, u_knots: &[f64], v_knots: &[f64], h: &[Vec<[f64; 4]>]) -> Result<u64, IoError> {
+        check_knots(u_knots, "B_SPLINE_SURFACE u")?;
+        check_knots(v_knots, "B_SPLINE_SURFACE v")?;
         let nv = h.first().map_or(0, Vec::len);
         let (p, q) = (degree(u_knots, h.len())?, degree(v_knots, nv)?);
         let (mut rows, mut wrows) = (Vec::with_capacity(h.len()), Vec::with_capacity(h.len()));
@@ -247,24 +288,30 @@ impl ShellWriter<'_> {
                 Ok(self.w.add("PLANE", &[s(), r(ax)]))
             }
             Surface::Cylinder { frame, radius } => {
+                let radius = positive(*radius, "CYLINDRICAL_SURFACE radius")?;
                 let ax = self.placement(frame)?;
-                Ok(self.w.add("CYLINDRICAL_SURFACE", &[s(), r(ax), Param::Real(*radius)]))
+                Ok(self.w.add("CYLINDRICAL_SURFACE", &[s(), r(ax), Param::Real(radius)]))
             }
             Surface::Cone { frame, radius_at_origin, half_angle } => {
+                let semi = positive(*half_angle, "CONICAL_SURFACE semi-angle")?;
+                if !(radius_at_origin.is_finite() && *radius_at_origin >= 0.0) {
+                    return Err(bad(format!(
+                        "CONICAL_SURFACE radius must be finite and not negative, got {radius_at_origin}"
+                    )));
+                }
                 let ax = self.placement(frame)?;
-                Ok(self
-                    .w
-                    .add("CONICAL_SURFACE", &[s(), r(ax), Param::Real(*radius_at_origin), Param::Real(*half_angle)]))
+                Ok(self.w.add("CONICAL_SURFACE", &[s(), r(ax), Param::Real(*radius_at_origin), Param::Real(semi)]))
             }
             Surface::Sphere { frame, radius } => {
+                let radius = positive(*radius, "SPHERICAL_SURFACE radius")?;
                 let ax = self.placement(frame)?;
-                Ok(self.w.add("SPHERICAL_SURFACE", &[s(), r(ax), Param::Real(*radius)]))
+                Ok(self.w.add("SPHERICAL_SURFACE", &[s(), r(ax), Param::Real(radius)]))
             }
             Surface::Torus { frame, major_radius, minor_radius, .. } => {
+                let big = positive(*major_radius, "TOROIDAL_SURFACE major radius")?;
+                let small = positive(*minor_radius, "TOROIDAL_SURFACE minor radius")?;
                 let ax = self.placement(frame)?;
-                Ok(self
-                    .w
-                    .add("TOROIDAL_SURFACE", &[s(), r(ax), Param::Real(*major_radius), Param::Real(*minor_radius)]))
+                Ok(self.w.add("TOROIDAL_SURFACE", &[s(), r(ax), Param::Real(big), Param::Real(small)]))
             }
             other => {
                 Err(bad(format!("not supported yet: STEP export of a {} surface in a sheet", surface_name(other))))

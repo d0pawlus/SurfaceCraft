@@ -242,8 +242,12 @@ fn kernel_cylinder_side_has_a_seam_one_period_apart() {
     let uv = |i: usize, t: f64| solidcore_convert::curve2(&row[i]).eval(t).unwrap();
     // the loop is seam ↓ (edge 0 reversed), bottom circle →, seam ↑, top circle ←: the two seam
     // uses sit a turn apart
+    // The loop runs counter-clockwise in (u, v) seen along the normal: up the seam at the larger
+    // u (the forward use, position 2), down it at the smaller (the reversed use, position 0). The
+    // frame's x axis meets the seam, so the two sides are exactly u = 0 and u = 2π.
     let (s0, s1) = (uv(0, 5.0), uv(2, 5.0));
-    assert!((s1[0] - s0[0] - std::f64::consts::TAU).abs() < TOL, "{s0:?} {s1:?}");
+    assert!(s0[0].abs() < TOL, "reversed use at u = 0: {s0:?}");
+    assert!((s1[0] - std::f64::consts::TAU).abs() < TOL, "forward use at u = 2π: {s1:?}");
     for (i, pc) in row.iter().enumerate() {
         let Loop::Edges { edges: uses } = &face.loops[0] else { panic!() };
         let e = &b.edges[uses[i].edge as usize];
@@ -262,7 +266,10 @@ fn kernel_sphere_seam_uses_are_a_turn_apart() {
     let row = &a.pcurves[0];
     assert_eq!(row.len(), 2);
     let u_of = |i: usize| mid_of(&row[i]).unwrap()[0];
-    assert!(((u_of(1) - u_of(0)).abs() - std::f64::consts::TAU).abs() < TOL, "{} {}", u_of(0), u_of(1));
+    // the loop is [reversed use, forward use]: down the meridian on the left, up it on the right,
+    // so the forward use is the later one, a turn after the reversed one (signed, not absolute)
+    assert!((u_of(1) - u_of(0) - std::f64::consts::TAU).abs() < TOL, "{} {}", u_of(0), u_of(1));
+    assert!(u_of(0).abs() <= std::f64::consts::PI, "the first side starts in the principal range");
     let Loop::Edges { edges: uses } = &face.loops[0] else { panic!() };
     for (i, pc) in row.iter().enumerate() {
         let e = &b.edges[uses[i].edge as usize];
@@ -270,4 +277,30 @@ fn kernel_sphere_seam_uses_are_a_turn_apart() {
         eprintln!("h1 kernel sphere use {i}: gap {gap:e} mm");
         assert!(gap <= 1e-9, "{gap}");
     }
+}
+
+/// A record's tolerance is input: a huge one must not make an off-surface edge "lie on" the
+/// surface, and a NaN one counts as the least.
+#[test]
+fn a_hostile_edge_tolerance_is_capped() {
+    for tolerance in [1e6, f64::INFINITY, f64::NAN, -1.0] {
+        let mut p = cylinder_patch();
+        if let Some(e) = p.edges.get_mut(0) {
+            e.curve = circle([1.0, -2.0, 1.0], [1.0, 0.0, 0.0], [0.0, 0.6, 0.8], 3.0);
+            e.tolerance = tolerance;
+        }
+        assert!(analytic_face(&p.face, &p.edges).is_err(), "tolerance {tolerance}");
+    }
+    let mut p = cylinder_patch();
+    p.edges[0].tolerance = 1e6;
+    assert!(analytic_face(&p.face, &p.edges).is_ok(), "an honest edge is still accepted");
+    assert!(edge_tolerance(&p.edges[0]) <= MAX_TOLERANCE_MM);
+}
+
+#[test]
+fn an_empty_edge_interval_is_refused() {
+    let mut p = cylinder_patch();
+    let t = p.edges[1].interval[0];
+    p.edges[1].interval = [t, t];
+    assert!(analytic_face(&p.face, &p.edges).is_err());
 }

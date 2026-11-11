@@ -56,40 +56,31 @@ pub fn is_sheet(b: &Brep) -> bool {
     b.regions.iter().skip(1).all(|reg| reg.void || reg.shells.is_empty()) && !b.faces.is_empty()
 }
 
-/// Writes sheet bodies as one AP214 file: each body's face shells become OPEN_SHELLs of one
-/// SHELL_BASED_SURFACE_MODEL, all in a MANIFOLD_SURFACE_SHAPE_REPRESENTATION, millimetres.
-pub fn write_sheets(name: &str, bodies: &[&Brep]) -> Result<String, IoError> {
-    if bodies.is_empty() {
-        return Err(bad("nothing to export"));
-    }
-    let mut w = Writer::new();
-    let mut models = Vec::new();
-    for (bi, b) in bodies.iter().enumerate() {
-        if !is_sheet(b) {
-            return Err(bad(format!(
-                "body {bi} is a solid; sheets only here (solids are written by the solid exporter)"
-            )));
-        }
-        let mut sw = ShellWriter::new(w, b);
-        let mut shells = Vec::new();
-        for sh in &b.shells {
-            if let Shell::Faces { faces, .. } = sh {
-                let mut entries = Vec::with_capacity(faces.len());
-                for of in faces {
-                    entries.push(r(sw.face(of.face, of.forward)?));
-                }
-                shells.push(r(sw.w.add_distinct("OPEN_SHELL", &[s(), Param::List(entries)])));
+/// The OPEN_SHELLs of one body, as one SHELL_BASED_SURFACE_MODEL (`None` for a body without face
+/// shells); the writer is handed back with them.
+fn write_body(w: Writer, b: &Brep, index: usize) -> Result<(Writer, Option<Param>), IoError> {
+    let mut sw = ShellWriter::new(w, b);
+    let mut shells = Vec::new();
+    for sh in &b.shells {
+        if let Shell::Faces { faces, .. } = sh {
+            let mut entries = Vec::with_capacity(faces.len());
+            for of in faces {
+                entries.push(r(sw.face(of.face, of.forward)?));
             }
-        }
-        w = sw.w;
-        if !shells.is_empty() {
-            models.push(r(w.add_distinct(
-                "SHELL_BASED_SURFACE_MODEL",
-                &[Param::Str(format!("sheet {}", bi + 1)), Param::List(shells)],
-            )));
+            shells.push(r(sw.w.add_distinct("OPEN_SHELL", &[s(), Param::List(entries)])));
         }
     }
-    // units and context
+    let mut w = sw.w;
+    if shells.is_empty() {
+        return Ok((w, None));
+    }
+    let model =
+        w.add_distinct("SHELL_BASED_SURFACE_MODEL", &[Param::Str(format!("sheet {}", index + 1)), Param::List(shells)]);
+    Ok((w, Some(r(model))))
+}
+
+/// Millimetres, radians and steradians, the uncertainty, and the context of the representation.
+fn units_and_context(w: &mut Writer) -> u64 {
     let len = w.add_complex(&[
         ("LENGTH_UNIT", vec![]),
         ("NAMED_UNIT", vec![Param::Derived]),
@@ -114,21 +105,16 @@ pub fn write_sheets(name: &str, bodies: &[&Brep]) -> Result<String, IoError> {
             s(),
         ],
     );
-    let ctx = w.add_complex(&[
+    w.add_complex(&[
         ("GEOMETRIC_REPRESENTATION_CONTEXT", vec![Param::Int(3)]),
         ("GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT", vec![Param::List(vec![r(unc)])]),
         ("GLOBAL_UNIT_ASSIGNED_CONTEXT", vec![Param::List(vec![r(len), r(ang), r(sol)])]),
         ("REPRESENTATION_CONTEXT", vec![s(), s()]),
-    ]);
-    let o = w.add("CARTESIAN_POINT", &[s(), reals(&[0.0, 0.0, 0.0])]);
-    let z = w.add("DIRECTION", &[s(), reals(&[0.0, 0.0, 1.0])]);
-    let x = w.add("DIRECTION", &[s(), reals(&[1.0, 0.0, 0.0])]);
-    let axis = w.add("AXIS2_PLACEMENT_3D", &[s(), r(o), r(z), r(x)]);
-    let mut items = models;
-    items.push(r(axis));
-    let rep =
-        w.add_distinct("MANIFOLD_SURFACE_SHAPE_REPRESENTATION", &[Param::Str(name.into()), Param::List(items), r(ctx)]);
-    // product structure (AP214)
+    ])
+}
+
+/// The AP214 product structure around the shape representation `rep`.
+fn product_structure(w: &mut Writer, name: &str, rep: u64) {
     let app =
         w.add("APPLICATION_CONTEXT", &[Param::Str("core data for automotive mechanical design processes".into())]);
     w.add(
@@ -151,5 +137,35 @@ pub fn write_sheets(name: &str, bodies: &[&Brep]) -> Result<String, IoError> {
     let pd = w.add_distinct("PRODUCT_DEFINITION", &[Param::Str("design".into()), s(), r(pdf), r(pdc)]);
     let pds = w.add_distinct("PRODUCT_DEFINITION_SHAPE", &[s(), s(), r(pd)]);
     w.add_distinct("SHAPE_DEFINITION_REPRESENTATION", &[r(pds), r(rep)]);
-    Ok(w.file(name, "AUTOMOTIVE_DESIGN { 1 0 10303 214 1 1 1 1 }"))
+}
+
+/// Writes sheet bodies as one AP214 file: each body's face shells become OPEN_SHELLs of one
+/// SHELL_BASED_SURFACE_MODEL, all in a MANIFOLD_SURFACE_SHAPE_REPRESENTATION, millimetres. A
+/// record the file cannot say faithfully (a number that is not finite, an empty interval, a
+/// non-positive radius, knots out of order) is an error, never a file.
+pub fn write_sheets(name: &str, bodies: &[&Brep]) -> Result<String, IoError> {
+    if bodies.is_empty() {
+        return Err(bad("nothing to export"));
+    }
+    let mut w = Writer::new();
+    let mut models = Vec::new();
+    for (bi, b) in bodies.iter().enumerate() {
+        if !is_sheet(b) {
+            return Err(bad(format!(
+                "body {bi} is a solid; sheets only here (solids are written by the solid exporter)"
+            )));
+        }
+        let (next, model) = write_body(w, b, bi)?;
+        w = next;
+        models.extend(model);
+    }
+    let ctx = units_and_context(&mut w);
+    let o = w.add("CARTESIAN_POINT", &[s(), reals(&[0.0, 0.0, 0.0])]);
+    let z = w.add("DIRECTION", &[s(), reals(&[0.0, 0.0, 1.0])]);
+    let x = w.add("DIRECTION", &[s(), reals(&[1.0, 0.0, 0.0])]);
+    models.push(r(w.add("AXIS2_PLACEMENT_3D", &[s(), r(o), r(z), r(x)])));
+    let rep = w
+        .add_distinct("MANIFOLD_SURFACE_SHAPE_REPRESENTATION", &[Param::Str(name.into()), Param::List(models), r(ctx)]);
+    product_structure(&mut w, name, rep);
+    w.file(name, "AUTOMOTIVE_DESIGN { 1 0 10303 214 1 1 1 1 }").map_err(bad)
 }

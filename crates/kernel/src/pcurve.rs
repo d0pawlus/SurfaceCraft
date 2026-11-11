@@ -25,6 +25,9 @@ use std::collections::BTreeMap;
 const TRACE_SAMPLES: usize = 33;
 /// The least tolerance an edge is held to (mm): the record's own is used when larger.
 const MIN_TOLERANCE_MM: f64 = 1e-6;
+/// The most: a record's own tolerance is hostile input, and a large one would make any edge lie
+/// on any surface (mm).
+const MAX_TOLERANCE_MM: f64 = 1e-3;
 /// How far a point may lie from its surface to be projected onto it, in edge tolerances.
 const ACCEPT_TOLERANCES: f64 = 10.0;
 /// Samples of a pcurve when its gap to the 3-D curve is measured.
@@ -303,6 +306,12 @@ fn iso_line(k: usize, c: f64, [w_first, w_last]: [f64; 2], [t0, t1]: [f64; 2], f
     Curve2::Spline { knots: vec![t0, t0, t1, t1], points: vec![at(a), at(b)] }
 }
 
+/// The distance the edge's samples may lie from the surface: the record's tolerance, held between
+/// `MIN_TOLERANCE_MM` and `MAX_TOLERANCE_MM` (NaN counts as the least).
+fn edge_tolerance(edge: &Edge) -> f64 {
+    if edge.tolerance.is_nan() { MIN_TOLERANCE_MM } else { edge.tolerance.clamp(MIN_TOLERANCE_MM, MAX_TOLERANCE_MM) }
+}
+
 fn use_pcurve(
     tracer: &UseTracer<'_>,
     eval: &SurfaceEval,
@@ -310,6 +319,10 @@ fn use_pcurve(
     forward: bool,
     start: Option<[f64; 2]>,
 ) -> Result<(Curve2, [f64; 2])> {
+    let [t0, t1] = edge.interval;
+    if !(t0.is_finite() && t1.is_finite() && t1 > t0) {
+        return Err(KernelError::Argument(format!("an edge has an empty or non-finite interval [{t0}, {t1}]")));
+    }
     let curve = curve_eval(edge.nurbs.as_ref().unwrap_or(&edge.curve))?;
     let trace = tracer.trace(&curve, edge.interval, forward, start)?;
     let (first, last) = first_last(&trace)?;
@@ -379,7 +392,7 @@ fn separate_seam_uses(face: &Face, written: &SurfaceEval, rows: &mut [Vec<Curve2
             return Err(unsupported("STEP export of a face whose seam uses cannot be told apart"));
         }
         let (mid_a, mid_b) = (row_mid(rows, a)?, row_mid(rows, b)?);
-        let runs_with = u_runs_with_form(face, written, mid_a)?;
+        let runs_with = u_runs_with_form(face, written, form_a)?;
         let b_is_later = (form_b[0] > form_a[0]) == runs_with;
         let turns = ((mid_b[0] - mid_a[0]) / period).round();
         let (later, shift) = if b_is_later { (b, 1.0 - turns) } else { (a, 1.0 + turns) };
@@ -430,7 +443,7 @@ pub fn analytic_face(face: &Face, edges: &[Edge]) -> Result<AnalyticFace> {
         for u in uses {
             let edge =
                 edges.get(u.edge as usize).ok_or_else(|| KernelError::Argument(format!("edge {} missing", u.edge)))?;
-            let tracer = UseTracer { surface: &eval, periods, tolerance: edge.tolerance.max(MIN_TOLERANCE_MM) };
+            let tracer = UseTracer { surface: &eval, periods, tolerance: edge_tolerance(edge) };
             let (pc, to) = use_pcurve(&tracer, &eval, edge, u.forward, end)?;
             row.push(pc);
             end = Some(to);

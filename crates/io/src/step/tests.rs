@@ -66,28 +66,34 @@ fn numbers(list: &str) -> Vec<f64> {
         .collect()
 }
 
-/// The 2-D control points and distinct knots of every PCURVE in the file, in file order.
-fn written_pcurves(text: &str) -> Vec<(Vec<[f64; 2]>, Vec<f64>)> {
-    let last_ref = |s: &str| s.rsplit('#').next().unwrap().trim_matches(|c: char| !c.is_ascii_digit()).to_string();
-    text.lines()
-        .filter(|l| l.contains("=PCURVE("))
-        .map(|l| {
-            // PCURVE('',#surface,#rep) -> DEFINITIONAL_REPRESENTATION('',(#curve),#ctx) -> curve
-            let rep = entity(text, &last_ref(l));
-            let curve_ref = last_ref(rep.split(",#").next().unwrap());
-            let curve = entity(text, &curve_ref);
-            let ids = curve.split("(#").nth(1).unwrap().split(')').next().unwrap().to_string();
-            let points = ids
-                .split(",#")
-                .map(|id| {
-                    let v = numbers(entity(text, id.trim_start_matches('#')).split("',(").nth(1).unwrap());
-                    [v[0], v[1]]
-                })
-                .collect();
-            let knots = numbers(curve.split("),(").last().unwrap());
-            (points, knots)
+fn last_ref(s: &str) -> String {
+    s.rsplit('#').next().unwrap().trim_matches(|c: char| !c.is_ascii_digit()).to_string()
+}
+
+/// The 2-D control points and distinct knots of the PCURVE on `line`.
+fn pcurve_of_line(text: &str, line: &str) -> (Vec<[f64; 2]>, Vec<f64>) {
+    // PCURVE('',#surface,#rep) -> DEFINITIONAL_REPRESENTATION('',(#curve),#ctx) -> curve
+    let rep = entity(text, &last_ref(line));
+    let curve = entity(text, &last_ref(rep.split(",#").next().unwrap()));
+    let ids = curve.split("(#").nth(1).unwrap().split(')').next().unwrap().to_string();
+    let points = ids
+        .split(",#")
+        .map(|id| {
+            let v = numbers(entity(text, id.trim_start_matches('#')).split("',(").nth(1).unwrap());
+            [v[0], v[1]]
         })
-        .collect()
+        .collect();
+    (points, numbers(curve.split("),(").last().unwrap()))
+}
+
+/// Every PCURVE of the file, in file order.
+fn written_pcurves(text: &str) -> Vec<(Vec<[f64; 2]>, Vec<f64>)> {
+    text.lines().filter(|l| l.contains("=PCURVE(")).map(|l| pcurve_of_line(text, l)).collect()
+}
+
+/// The ids in the first parenthesised list of references on `line`: `(#a,#b)`.
+fn listed_refs(line: &str) -> Vec<String> {
+    line.split(",(#").nth(1).unwrap().split(')').next().unwrap().split(",#").map(str::to_string).collect()
 }
 
 #[test]
@@ -187,6 +193,11 @@ fn gate_m3_seam_sheet_step_roundtrip() {
     assert_eq!(count(&text, "=SURFACE_CURVE("), 2);
     assert_eq!(count(&text, "=PCURVE("), 5, "seam 2, shared bottom circle 2, free top circle 1");
     assert!(text.contains("CYLINDRICAL_SURFACE(") && text.contains("PLANE(") && !text.contains("=CIRCLE("));
+    // the SEAM_CURVE lists its pcurves in the order of the edge's uses (no rule of ISO 10303-42
+    // orders them): the loop's downward use at u = 0 first, the upward one at u = 2π second
+    let seam = text.lines().find(|l| l.contains("=SEAM_CURVE(")).unwrap();
+    let us: Vec<f64> = listed_refs(seam).iter().map(|id| pcurve_of_line(&text, &entity(&text, id)).0[0][0]).collect();
+    assert!(us[0].abs() < 1e-9 && (us[1] - std::f64::consts::TAU).abs() < 1e-9, "{us:?}");
     let gaps = pcurve_gaps(&b).unwrap();
     let worst = gaps.iter().copied().fold(0.0, f64::max);
     eprintln!("h1 cup: {} edge uses, worst pcurve gap {worst:e} mm", gaps.len());
@@ -385,8 +396,14 @@ fn analytic_patches_write_pcurves_that_lie_on_their_edges() {
         assert_eq!(back.iter().map(|b| b.faces.len()).sum::<usize>(), 1, "{name}");
         assert_eq!(report.fallback_faces, 0, "{name}: {report:?}");
         if matches!(name, "sphere" | "torus") {
-            // the importer validated these pcurves (they passed its candidate checks) but its
-            // UV-trim matching re-projected the edges instead of taking them
+            // Not taken, and not a fault of the file: the pcurves pass the importer's own checks
+            // (no fallback: each lies on its edge, the loop chains, inside the face's domain) and
+            // `analytic_patch_pcurves_in_the_file_agree_with_the_standards_formulas` evaluates them
+            // with the standard's closed forms. What leaves them unused is the importer's matching
+            // of its converted trim candidates to the face's edge uses (`create_uv_trim_curves`);
+            // solidcore's own `exported_cone_torus_and_sphere_pcurves_are_on_their_edges` asserts
+            // only that no pcurve is found off its edge, never that a sphere or torus face takes
+            // them. Why the matching fails was not established.
             assert_eq!((report.uses, report.uses_projected), (0, 4), "{name}: {report:?}");
         } else {
             assert_eq!((report.uses, report.curved_uses), (4, 4), "{name}: {report:?}");
@@ -432,4 +449,198 @@ fn an_edge_on_a_cylinder_that_is_not_an_iso_curve_makes_the_export_fail_not_lie(
     };
     let err = write_sheets("slanted", &[&b]).unwrap_err().to_string();
     assert!(err.contains("not supported yet") || err.contains("does not lie"), "{err}");
+}
+
+mod hostile {
+    //! Records the writer must refuse rather than write a file that says something else.
+    use super::*;
+    use surfacecraft_kernel::record::brep::{Curve, Curve2, Frame};
+
+    fn circle(radius: f64) -> Curve {
+        Curve::Circle { frame: Frame { origin: [0.0; 3], x_axis: [1.0, 0.0, 0.0], y_axis: [0.0, 1.0, 0.0] }, radius }
+    }
+
+    /// Replaces the knots of the first edge use's pcurve on the first face.
+    fn set_pcurve_knots(b: &mut Brep, f: impl FnOnce(&mut Vec<f64>)) {
+        let Some(Loop::Edges { edges }) = b.faces[0].loops.first_mut() else { panic!("no edge loop") };
+        let Curve2::Spline { knots, .. } = &mut edges[0].pcurve else { panic!("not a spline pcurve") };
+        f(knots);
+    }
+
+    fn refused(b: &Brep, entity: &str) {
+        let err = write_sheets("bad", &[b]).expect_err("the writer must refuse this record").to_string();
+        assert!(err.contains(entity), "{err}");
+    }
+
+    #[test]
+    fn circle_radius_not_finite_or_not_positive_is_refused() {
+        for radius in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
+            let mut b = wave();
+            b.edges[0].curve = circle(radius);
+            refused(&b, "CIRCLE");
+        }
+    }
+
+    #[test]
+    fn ellipse_radii_must_be_positive() {
+        let mut b = wave();
+        b.edges[0].curve = Curve::Ellipse {
+            frame: Frame { origin: [0.0; 3], x_axis: [1.0, 0.0, 0.0], y_axis: [0.0, 1.0, 0.0] },
+            radii: [1.0, 0.0],
+        };
+        refused(&b, "ELLIPSE");
+    }
+
+    #[test]
+    fn zero_length_line_is_refused() {
+        let mut b = wave();
+        b.edges[0].curve = Curve::Line { start: [1.0; 3], end: [1.0; 3] };
+        assert!(write_sheets("bad", &[&b]).is_err());
+    }
+
+    #[test]
+    fn nan_pcurve_knot_is_refused() {
+        let mut b = wave();
+        set_pcurve_knots(&mut b, |k| k[1] = f64::NAN);
+        refused(&b, "B_SPLINE_CURVE");
+    }
+
+    #[test]
+    fn decreasing_knots_and_one_distinct_knot_are_refused() {
+        let mut b = wave();
+        set_pcurve_knots(&mut b, |k| *k = vec![1.0, 1.0, 0.0, 0.0]);
+        refused(&b, "B_SPLINE_CURVE");
+        let mut b = wave();
+        set_pcurve_knots(&mut b, |k| *k = vec![0.5; 4]);
+        refused(&b, "B_SPLINE_CURVE");
+    }
+
+    #[test]
+    fn zero_length_edge_interval_is_refused() {
+        let mut b = wave();
+        let t = b.edges[0].interval[0];
+        b.edges[0].interval = [t, t];
+        refused(&b, "edge 0");
+    }
+
+    #[test]
+    fn non_finite_coordinate_never_reaches_the_file() {
+        let mut b = wave();
+        b.vertices[0].point[1] = f64::NAN;
+        assert!(write_sheets("bad", &[&b]).is_err());
+    }
+
+    #[test]
+    fn a_frame_that_is_not_orthonormal_is_refused() {
+        let mut b = wave();
+        b.edges[0].curve = Curve::Circle {
+            frame: Frame { origin: [0.0; 3], x_axis: [1.0, 0.0, 0.0], y_axis: [1.0, 1.0, 0.0] },
+            radius: 1.0,
+        };
+        refused(&b, "frame");
+    }
+
+    /// A slit (one planar face using an edge twice) is not a seam: two pcurves on a SURFACE_CURVE.
+    #[test]
+    fn an_edge_used_twice_by_a_plane_is_no_seam_curve() {
+        let mut b = surfacecraft_kernel::solid::make_box([0.0; 3], [1.0, 1.0, 1.0]).unwrap();
+        // one planar face, its loop run once more along its first edge back and forth
+        let face = 0;
+        let (edge, pcurve) = match &b.faces[face].loops[0] {
+            Loop::Edges { edges } => (edges[0].edge, edges[0].pcurve.clone()),
+            _ => panic!(),
+        };
+        let position = match &mut b.faces[face].loops[0] {
+            Loop::Edges { edges } => {
+                edges.push(surfacecraft_kernel::record::brep::OrientedEdge { edge, forward: false, pcurve });
+                edges.len() as u32 - 1
+            }
+            _ => panic!(),
+        };
+        b.edges[edge as usize].uses.retain(|u| u.face as usize == face);
+        b.edges[edge as usize].uses.push(EdgeUseRef { face: face as u32, r#loop: 0, position, upper: true });
+        b.shells = vec![Shell::Faces {
+            faces: vec![surfacecraft_kernel::record::brep::OrientedFace { face: face as u32, forward: true }],
+            wires: vec![],
+        }];
+        b.regions = vec![Region { shells: vec![0], void: false }];
+        let text = write_sheets("slit", &[&b]).unwrap();
+        assert_eq!(count(&text, "=SEAM_CURVE("), 0);
+        let two_pcurves = |l: &str| {
+            l.contains("=SURFACE_CURVE(")
+                && l.split(",(").nth(1).is_some_and(|t| t.split(')').next().unwrap().contains(','))
+        };
+        assert!(text.lines().any(two_pcurves), "a SURFACE_CURVE with two pcurves");
+    }
+}
+
+/// Numbers of the entity `id`'s own parameters after its placement reference.
+fn surface_in_file(text: &str, id: &str) -> (String, [[f64; 3]; 4], Vec<f64>) {
+    let line = entity(text, id);
+    let name = line.split('=').nth(1).unwrap().split('(').next().unwrap().to_string();
+    let args = line.split("('',").nth(1).unwrap();
+    let placement = entity(text, args.split(',').next().unwrap().trim_start_matches('#'));
+    let refs: Vec<String> = placement.split(",#").skip(1).map(|r| r.trim_end_matches(");").to_string()).collect();
+    let vec3 = |id: &str| -> [f64; 3] {
+        let v = numbers(entity(text, id).split("',(").nth(1).unwrap());
+        [v[0], v[1], v[2]]
+    };
+    let (o, z, x) = (vec3(&refs[0]), vec3(&refs[1]), vec3(&refs[2]));
+    let y = [z[1] * x[2] - z[2] * x[1], z[2] * x[0] - z[0] * x[2], z[0] * x[1] - z[1] * x[0]];
+    let rest: Vec<f64> = numbers(args.split(',').skip(1).collect::<Vec<_>>().join(",").as_str());
+    (name, [o, x, y, z], rest)
+}
+
+/// ISO 10303-42 surface points, written here from the standard's formulas.
+fn iso_point(name: &str, [o, x, y, z]: [[f64; 3]; 4], p: &[f64], u: f64, v: f64) -> [f64; 3] {
+    let radial = |s: f64| -> [f64; 3] { std::array::from_fn(|i| s * (u.cos() * x[i] + u.sin() * y[i])) };
+    let at = |a: [f64; 3], b: [f64; 3], k: f64| -> [f64; 3] { std::array::from_fn(|i| a[i] + k * b[i]) };
+    match name {
+        "CYLINDRICAL_SURFACE" => at(at(o, radial(1.0), p[0]), z, v),
+        "CONICAL_SURFACE" => at(at(o, radial(1.0), p[0] + v * p[1].tan()), z, v),
+        "SPHERICAL_SURFACE" => at(at(o, radial(1.0), p[0] * v.cos()), z, p[0] * v.sin()),
+        "TOROIDAL_SURFACE" => at(at(o, radial(1.0), p[0] + p[1] * v.cos()), z, p[1] * v.sin()),
+        other => panic!("{other}"),
+    }
+}
+
+fn record_point(c: &surfacecraft_kernel::record::brep::Curve, t: f64) -> [f64; 3] {
+    use surfacecraft_kernel::record::brep::Curve;
+    match c {
+        Curve::Line { start, end } => std::array::from_fn(|i| start[i] + t * (end[i] - start[i])),
+        Curve::Circle { frame, radius } => {
+            std::array::from_fn(|i| frame.origin[i] + radius * (t.cos() * frame.x_axis[i] + t.sin() * frame.y_axis[i]))
+        }
+        _ => panic!(),
+    }
+}
+
+/// The pcurves of every analytic patch, read back from the file and evaluated with the standard's
+/// closed-form surface formulas (not solidcore's evaluator, which produced them), land on the
+/// record's edge at the same parameter.
+#[test]
+fn analytic_patch_pcurves_in_the_file_agree_with_the_standards_formulas() {
+    for name in ["cylinder", "cone", "narrowing cone", "sphere", "torus"] {
+        let b = patches::sheet(name);
+        let text = write_sheets(name, &[&b]).unwrap();
+        let lines: Vec<&str> = text.lines().filter(|l| l.contains("=PCURVE(")).collect();
+        assert_eq!(lines.len(), 4);
+        let mut worst: f64 = 0.0;
+        for (edge, line) in b.edges.iter().zip(&lines) {
+            let (pts, knots) = pcurve_of_line(&text, line);
+            let surface = line.split(",#").nth(1).unwrap().to_string();
+            let (kind, frame, params) = surface_in_file(&text, &surface);
+            let (t0, t1) = (knots[0], knots[1]);
+            assert!((t0 - edge.interval[0]).abs() < 1e-12 && (t1 - edge.interval[1]).abs() < 1e-12, "{name}");
+            for k in 0..=6 {
+                let f = f64::from(k) / 6.0;
+                let t = t0 + f * (t1 - t0);
+                let (u, v) = (pts[0][0] + f * (pts[1][0] - pts[0][0]), pts[0][1] + f * (pts[1][1] - pts[0][1]));
+                let (s, c) = (iso_point(&kind, frame, &params, u, v), record_point(&edge.curve, t));
+                worst = worst.max(((s[0] - c[0]).powi(2) + (s[1] - c[1]).powi(2) + (s[2] - c[2]).powi(2)).sqrt());
+            }
+        }
+        eprintln!("h1 {name} patch: file pcurves vs closed-form surface, worst distance {worst:e} mm");
+        assert!(worst < 1e-9, "{name}: {worst}");
+    }
 }

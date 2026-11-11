@@ -14,6 +14,9 @@ pub(super) struct FaceGeometry {
     pub(super) surface: u64,
     /// The written surface's natural normal opposes the record's: the ADVANCED_FACE's sense flips.
     pub(super) flip: bool,
+    /// The surface is closed in a direction (a cylinder, cone, sphere or torus), so an edge a face
+    /// uses twice may be a seam; on any other surface it is a slit.
+    pub(super) periodic: bool,
     pub(super) pcurves: Vec<Vec<Curve2>>,
     /// The surface in STEP's parameters, for the tests' gap measurements.
     #[cfg(test)]
