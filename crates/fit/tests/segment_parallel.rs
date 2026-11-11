@@ -6,7 +6,7 @@
 //! picks the size in thousands of triangles (default 500); `SURFACECRAFT_PERF_SEG_THREADS=1,8`
 //! lists the thread counts to compare (default: 1 and every core).
 use std::time::Instant;
-use surfacecraft_fit::segment::{Segment, SegmentOptions, segment};
+use surfacecraft_fit::segment::{Segment, SegmentOptions, SegmentStats, segment_with_stats};
 use surfacecraft_geom::{Mesh, Point3, Rng, Vec3, synth};
 
 /// A bumpy closed sphere-like shape: radius and bump amplitude (mm), and a scale on the wave
@@ -46,8 +46,13 @@ fn organic_scan(triangles: usize, shape: Shape) -> Mesh {
 
 /// Runs `segment` on a pool of `threads` threads.
 fn segment_on(threads: usize, mesh: &Mesh, opts: &SegmentOptions) -> Vec<Segment> {
+    segment_stats_on(threads, mesh, opts).0
+}
+
+/// [`segment_on`] with the per-run counters.
+fn segment_stats_on(threads: usize, mesh: &Mesh, opts: &SegmentOptions) -> (Vec<Segment>, SegmentStats) {
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().expect("thread pool");
-    pool.install(|| segment(mesh, opts))
+    pool.install(|| segment_with_stats(mesh, opts))
 }
 
 /// One digest of everything a segmentation returns (triangles, primitive parameters, RMS bits).
@@ -69,8 +74,13 @@ fn organic_segmentation_is_identical_on_one_thread_and_many() {
     let mesh = organic_scan(25_000, MEDIUM);
     let opts = SegmentOptions::default();
     let many = std::thread::available_parallelism().map_or(4, usize::from).max(4);
-    let one = segment_on(1, &mesh, &opts);
-    let par = segment_on(many, &mesh, &opts);
+    let (one, one_stats) = segment_stats_on(1, &mesh, &opts);
+    let (par, par_stats) = segment_stats_on(many, &mesh, &opts);
+    assert_eq!(one_stats.speculative_jobs, 0, "one thread runs nothing ahead of its turn");
+    // speculation ran, was used, and some of it was discarded and recomputed (a test that never
+    // sees a discarded job would pass even if the commit rule were wrong)
+    assert!(par_stats.speculative_used > 0, "{par_stats:?}");
+    assert!(par_stats.speculative_used < par_stats.speculative_jobs, "{par_stats:?}");
     assert!(one.len() >= 100, "too few regions to mean anything: {}", one.len());
     assert_eq!(one.len(), par.len());
     assert_eq!(digest(&one), digest(&par), "{} regions", one.len());

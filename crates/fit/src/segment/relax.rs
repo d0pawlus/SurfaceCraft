@@ -20,13 +20,23 @@ fn better_owner(mesh: &Mesh, nb: &[[u32; 3]], segs: &[Segment], owner: &[u32], t
     if a == u32::MAX {
         return None;
     }
-    let mut cands: Vec<u32> = nb[t].iter().filter(|&&o| o != u32::MAX).map(|&o| owner[o as usize]).collect();
-    cands.retain(|&b| b != a && b != u32::MAX);
-    cands.sort_unstable();
-    cands.dedup();
+    // owners of the neighbours that differ from this triangle's own (at most three, no allocation)
+    let mut cands = [u32::MAX; 3];
+    let mut count = 0;
+    for &o in &nb[t] {
+        let b = if o == u32::MAX { u32::MAX } else { owner[o as usize] };
+        if b != a && b != u32::MAX && !cands[..count].contains(&b) {
+            cands[count] = b;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return None;
+    }
+    cands[..count].sort_unstable();
     let mut best_cost = segs.get(a as usize).and_then(|s| boundary_cost(mesh, &s.primitive, t, tol))?;
     let mut best = a;
-    for b in cands {
+    for &b in &cands[..count] {
         let cost = segs.get(b as usize).and_then(|s| boundary_cost(mesh, &s.primitive, t, tol));
         if let Some(c) = cost
             && c < best_cost

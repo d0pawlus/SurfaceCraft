@@ -44,10 +44,16 @@ struct Seeder<'a, 'b> {
     max_batch: usize,
     spec_made: usize,
     spec_used: usize,
+    /// Totals of the whole run (the two above restart when the batch size is adapted).
+    totals: super::SegmentStats,
 }
 
 /// Regions of the mesh, grown from the seeds of `order` (`(flatness key, triangle)`).
-pub(super) fn grow_regions(ctx: &Ctx<'_>, order: &[(u64, u32)], min_triangles: usize) -> Vec<Segment> {
+pub(super) fn grow_regions(
+    ctx: &Ctx<'_>,
+    order: &[(u64, u32)],
+    min_triangles: usize,
+) -> (Vec<Segment>, super::SegmentStats) {
     let threads = surfacecraft_geom::par::threads();
     let (lo, hi) = BATCH_LIMITS;
     let mut s = Seeder {
@@ -62,6 +68,7 @@ pub(super) fn grow_regions(ctx: &Ctx<'_>, order: &[(u64, u32)], min_triangles: u
         max_batch: if threads > 1 { (MAX_BATCH_PER_THREAD * threads).clamp(lo, hi) } else { 1 },
         spec_made: 0,
         spec_used: 0,
+        totals: super::SegmentStats::default(),
     };
     for (idx, &(_, seed)) in order.iter().enumerate() {
         if s.out.len() >= MAX_REGIONS {
@@ -69,7 +76,7 @@ pub(super) fn grow_regions(ctx: &Ctx<'_>, order: &[(u64, u32)], min_triangles: u
         }
         s.step(idx, seed);
     }
-    s.out
+    (s.out, s.totals)
 }
 
 impl Seeder<'_, '_> {
@@ -91,6 +98,7 @@ impl Seeder<'_, '_> {
         let job = match self.spec.remove(&seed) {
             Some(job) if self.still_valid(&job, &patch) => {
                 self.spec_used += 1;
+                self.totals.speculative_used += 1;
                 crate::stats::speculation(0, 1);
                 job
             }
@@ -146,6 +154,7 @@ impl Seeder<'_, '_> {
             self.ctx.run(sd, &self.owner, if sd == seed { None } else { cap })
         });
         self.spec_made += seeds.len() - 1;
+        self.totals.speculative_jobs += seeds.len() - 1;
         crate::stats::speculation(seeds.len() - 1, 0);
         let mut own = None;
         for (sd, job) in seeds.into_iter().zip(jobs) {

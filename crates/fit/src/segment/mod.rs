@@ -179,9 +179,24 @@ fn seed_patch_area(areas: &[f64], seed_tris: usize) -> f64 {
 /// other (see `seeds`), and every later step is independent per region or per triangle.
 #[must_use]
 pub fn segment(mesh: &Mesh, opts: &SegmentOptions) -> Vec<Segment> {
+    segment_with_stats(mesh, opts).0
+}
+
+/// Work of one [`segment`] run that does not show in its result.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SegmentStats {
+    /// Region jobs run ahead of their turn.
+    pub speculative_jobs: usize,
+    /// Speculative jobs whose result was used (the rest was discarded or recomputed).
+    pub speculative_used: usize,
+}
+
+/// [`segment`] and what the run did besides (per run, unlike the global counters of `stats`).
+#[must_use]
+pub fn segment_with_stats(mesh: &Mesh, opts: &SegmentOptions) -> (Vec<Segment>, SegmentStats) {
     let nt = mesh.triangle_count();
     if nt == 0 || mesh.validate().is_err() {
-        return Vec::new();
+        return (Vec::new(), SegmentStats::default());
     }
     let tol = if opts.tolerance.is_finite() && opts.tolerance > 0.0 { opts.tolerance } else { FALLBACK_TOLERANCE };
     let cos = opts.max_angle_deg.clamp(1.0, 89.0).to_radians().cos();
@@ -204,7 +219,7 @@ pub fn segment(mesh: &Mesh, opts: &SegmentOptions) -> Vec<Segment> {
         cos,
     };
     let sw = crate::stats::Stopwatch::start();
-    let found = seeds::grow_regions(&ctx, &order, opts.min_triangles);
+    let (found, stats) = seeds::grow_regions(&ctx, &order, opts.min_triangles);
     sw.stop(crate::stats::Phase::Regions);
     let out = final_fits(mesh, &normals, found, tol);
     let sw = crate::stats::Stopwatch::start();
@@ -213,7 +228,7 @@ pub fn segment(mesh: &Mesh, opts: &SegmentOptions) -> Vec<Segment> {
     let sw = crate::stats::Stopwatch::start();
     let merged = merge::merge_adjacent(mesh, &normals, &nb, out, tol);
     sw.stop(crate::stats::Phase::Merge);
-    merged
+    (merged, stats)
 }
 
 /// The automatic fit of every region on its final triangles (the growth fit saw fewer); one that
