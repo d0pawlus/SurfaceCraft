@@ -1,6 +1,7 @@
-//! The planner of the hybrid model (plan P3b, Z1 and Z2): which fitted regions are *global* cuts of
-//! the stock (the outer envelope of the part) and which are *local* (a pocket floor and walls, a
-//! blind hole's wall and bottom, a slot's walls), and the local tools the latter form.
+//! The planner of the hybrid model (plan P3b, Z1 and Z2; P8-B2): which fitted regions are *global*
+//! cuts of the stock (the outer envelope of the part) and which are *local* (a pocket floor and
+//! walls, a blind hole's wall and bottom, a slot's walls, a step's riser, a rib's sides), and the
+//! local tools the latter form (see `pocket`, `slot` and `loops`).
 //!
 //! The test for a plane is the one a person would make: is there scan in front of it? A global
 //! plane has none (the part lies wholly behind it); a pocket floor has the rim of the pocket in
@@ -8,12 +9,21 @@
 //! and `body.plan_regions` (which only reports it), so the diagnostic never disagrees with the
 //! build. Everything here is mesh-side geometry on the points of the regions; the solids of the
 //! tools are the kernel's (`surfacecraft_kernel::local`).
+mod extent;
+mod joint;
+mod loops;
+mod pocket;
+mod profile;
+mod scan;
+mod slot;
+mod void;
+use pocket::{Env, plan_pockets};
+pub use scan::Scan;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::f64::consts::{PI, TAU};
+use slot::plan_slots;
 use surfacecraft_doc::ObjectId;
-use surfacecraft_geom::{KdTree, Point3, Vec3, any_perpendicular, normalize};
-use surfacecraft_kernel::feature::ProfileCurve;
+use surfacecraft_geom::{KdTree, Point3, Vec3, normalize};
 use surfacecraft_kernel::hybrid::{Cut, Shape};
 use surfacecraft_kernel::local::{HoleBottom, LocalAdd, LocalTool};
 
@@ -44,7 +54,7 @@ pub enum RoleKind {
     Blend,
     /// Wall, floor or bottom of a tool that is subtracted (hole, pocket, slot).
     LocalSubtract,
-    /// A boss or dome that adds material (a step is not built yet).
+    /// A boss or dome that adds material.
     LocalAdd,
     /// Not used, with the reason.
     Skipped,
@@ -99,7 +109,8 @@ pub struct Contact {
 pub struct PlannedTool {
     /// The tool for the kernel.
     pub tool: LocalTool,
-    /// `blind_hole`, `pocket` or `through_slot`.
+    /// `blind_hole`, `pocket` (walls round a floor, with the islands it leaves), `step` (walls with a
+    /// floor that run out of the part), `rib` (a face cut down round raised islands) or `through_slot`.
     pub kind: &'static str,
     /// Items that form it.
     pub members: Vec<usize>,
@@ -380,300 +391,6 @@ fn snap_direction(d: Vec3, anchors: &[Vec3], deg: f64) -> Vec3 {
 }
 
 // ---------------------------------------------------------------------------------------------
-// profiles
-
-struct Wall {
-    /// Unit normal in the plane, towards the void.
-    n: [f64; 2],
-    /// `n · x = c` on the wall.
-    c: f64,
-    mean: [f64; 2],
-    pts: Vec<[f64; 2]>,
-}
-
-struct Corner {
-    center: [f64; 2],
-    r: f64,
-    mean: [f64; 2],
-    pts: Vec<[f64; 2]>,
-}
-
-enum Seg {
-    Line([f64; 2], [f64; 2]),
-    Arc { c: [f64; 2], r: f64, a0: f64, a1: f64 },
-}
-
-struct Profile {
-    segs: Vec<Seg>,
-    polygon: Vec<[f64; 2]>,
-    closed: bool,
-}
-
-fn d2(a: [f64; 2], b: [f64; 2]) -> f64 {
-    (a[0] - b[0]).hypot(a[1] - b[1])
-}
-
-fn dist_to(pts: &[[f64; 2]], p: [f64; 2]) -> f64 {
-    pts.iter().map(|q| d2(*q, p)).fold(f64::INFINITY, f64::min)
-}
-
-/// Tangent direction of a wall in counter-clockwise travel (the void on the left).
-fn tangent(n: [f64; 2]) -> [f64; 2] {
-    [n[1], -n[0]]
-}
-
-fn solve(n1: [f64; 2], c1: f64, n2: [f64; 2], c2: f64) -> Option<[f64; 2]> {
-    let det = n1[0] * n2[1] - n1[1] * n2[0];
-    if det.abs() < 0.1 {
-        return None;
-    }
-    Some([(c1 * n2[1] - c2 * n1[1]) / det, (n1[0] * c2 - n2[0] * c1) / det])
-}
-
-enum Junction {
-    /// The two walls meet in a sharp corner at the point.
-    Direct([f64; 2]),
-    /// A rounded corner: arc from `t1` (on the first wall) to `t2`.
-    Round { center: [f64; 2], r: f64, t1: [f64; 2], t2: [f64; 2] },
-}
-
-impl Junction {
-    fn enter(&self) -> [f64; 2] {
-        match self {
-            Junction::Direct(p) => *p,
-            Junction::Round { t1, .. } => *t1,
-        }
-    }
-    fn exit(&self) -> [f64; 2] {
-        match self {
-            Junction::Direct(p) => *p,
-            Junction::Round { t2, .. } => *t2,
-        }
-    }
-}
-
-fn junction(a: &Wall, b: &Wall, corner: Option<&Corner>) -> Result<Junction, String> {
-    let gap = NEIGHBOUR_GAP;
-    let cross = a.n[0] * b.n[1] - a.n[1] * b.n[0];
-    match corner {
-        None => {
-            let p = solve(a.n, a.c, b.n, b.c).ok_or("two parallel walls with no corner between them")?;
-            if dist_to(&a.pts, p) > gap || dist_to(&b.pts, p) > gap {
-                return Err("the walls do not meet".into());
-            }
-            Ok(Junction::Direct(p))
-        }
-        Some(k) => {
-            if cross.abs() < 0.1 {
-                // a half round between two parallel walls facing each other (a slot's end)
-                if a.n[0] * b.n[0] + a.n[1] * b.n[1] > -0.9 {
-                    return Err("a rounded corner between parallel walls that do not face each other".into());
-                }
-                let width = -b.c - a.c;
-                if width < 0.2 || (k.r - 0.5 * width).abs() > 0.6 {
-                    return Err(format!("the end round r = {:.2} does not span the walls ({width:.2} apart)", k.r));
-                }
-                let r = 0.5 * width;
-                let mid = 0.5 * (a.c - b.c);
-                let s = mid - (a.n[0] * k.center[0] + a.n[1] * k.center[1]);
-                let center = [k.center[0] + a.n[0] * s, k.center[1] + a.n[1] * s];
-                let t1 = [center[0] - a.n[0] * r, center[1] - a.n[1] * r];
-                let t2 = [center[0] - b.n[0] * r, center[1] - b.n[1] * r];
-                return Ok(Junction::Round { center, r, t1, t2 });
-            }
-            let r = k.r;
-            let center = solve(a.n, a.c + r, b.n, b.c + r).ok_or("the corner's walls are parallel")?;
-            if d2(center, k.center) > (0.3 * r).max(1.0) {
-                return Err(format!("the corner round r = {r:.2} is not tangent to its two walls"));
-            }
-            let t1 = [center[0] - a.n[0] * r, center[1] - a.n[1] * r];
-            let t2 = [center[0] - b.n[0] * r, center[1] - b.n[1] * r];
-            if dist_to(&a.pts, t1) > gap
-                || dist_to(&b.pts, t2) > gap
-                || dist_to(&k.pts, t1) > gap
-                || dist_to(&k.pts, t2) > gap
-            {
-                return Err("the corner round does not touch its walls".into());
-            }
-            let sweep = ((t2[1] - center[1]).atan2(t2[0] - center[0]) - (t1[1] - center[1]).atan2(t1[0] - center[0]))
-                .rem_euclid(TAU);
-            if !(0.05..=PI + 0.2).contains(&sweep) {
-                return Err("the corner round turns the wrong way (a reflex corner)".into());
-            }
-            Ok(Junction::Round { center, r, t1, t2 })
-        }
-    }
-}
-
-/// The closed profile of walls (and rounded corners) in the plane, in counter-clockwise order.
-/// When the walls do not close (a slot open to the outside) the two free walls are extended by
-/// `ext` and joined by a closing line far outside.
-fn build_profile(walls: &[Wall], corners: &[Corner], ext: f64) -> Result<Profile, String> {
-    if walls.len() < 2 {
-        return Err("a profile needs at least two walls".into());
-    }
-    // sort by angle around the centroid of the walls
-    let mut all: Vec<(bool, usize, [f64; 2])> = walls
-        .iter()
-        .enumerate()
-        .map(|(i, w)| (false, i, w.mean))
-        .chain(corners.iter().enumerate().map(|(i, c)| (true, i, c.mean)))
-        .collect();
-    let g = {
-        let n = all.len() as f64;
-        [all.iter().map(|a| a.2[0]).sum::<f64>() / n, all.iter().map(|a| a.2[1]).sum::<f64>() / n]
-    };
-    all.sort_by(|a, b| (a.2[1] - g[1]).atan2(a.2[0] - g[0]).total_cmp(&(b.2[1] - g[1]).atan2(b.2[0] - g[0])));
-    let wall_pos: Vec<usize> = all.iter().enumerate().filter(|(_, a)| !a.0).map(|(p, _)| p).collect();
-    let m = wall_pos.len();
-    // the item between consecutive walls (cyclically): nothing or one corner
-    let mut links: Vec<(usize, usize, Option<usize>)> = Vec::new();
-    for k in 0..m {
-        let (p, q) = (wall_pos[k], wall_pos[(k + 1) % m]);
-        let between: Vec<usize> = if q > p { (p + 1..q).collect() } else { (p + 1..all.len()).chain(0..q).collect() };
-        let corner = match between.as_slice() {
-            [] => None,
-            [one] => Some(all[*one].1),
-            _ => return Err("two corners follow each other with no wall between them".into()),
-        };
-        links.push((all[p].1, all[q].1, corner));
-    }
-    let mut js: Vec<Result<Junction, String>> = links
-        .iter()
-        .map(|&(a, b, c)| match (walls.get(a), walls.get(b)) {
-            (Some(a), Some(b)) => junction(a, b, c.and_then(|c| corners.get(c))),
-            _ => Err("index".into()),
-        })
-        .collect();
-    let bad: Vec<usize> = js.iter().enumerate().filter(|(_, j)| j.is_err()).map(|(i, _)| i).collect();
-    if bad.len() > 1 {
-        return Err(js.swap_remove(bad[0]).err().unwrap_or_default());
-    }
-    let gap_at = bad.first().copied();
-    // walls in travel order; for an open chain start after the gap
-    let start = gap_at.map_or(0, |g| (g + 1) % m);
-    let order: Vec<usize> = (0..m).map(|k| (start + k) % m).collect();
-    let mut segs: Vec<Seg> = Vec::new();
-    let mut closing: Option<([f64; 2], [f64; 2])> = None;
-    let mut first_start = [0.0; 2];
-    let mut last_end = [0.0; 2];
-    for (pos, &k) in order.iter().enumerate() {
-        let wall = links.get(k).and_then(|l| walls.get(l.0)).ok_or("index")?;
-        let prev = (k + m - 1) % m;
-        let t = tangent(wall.n);
-        let out_j = js.get(k).and_then(|j| j.as_ref().ok());
-        let in_j = js.get(prev).and_then(|j| j.as_ref().ok());
-        let open_first = pos == 0 && gap_at.is_some();
-        let open_last = pos + 1 == m && gap_at.is_some();
-        let end = if open_last { None } else { out_j.map(Junction::enter) };
-        let beg = if open_first { None } else { in_j.map(Junction::exit) };
-        let (b, e) = match (beg, end) {
-            (Some(b), Some(e)) => (b, e),
-            (None, Some(e)) => ([e[0] - t[0] * ext, e[1] - t[1] * ext], e),
-            (Some(b), None) => (b, [b[0] + t[0] * ext, b[1] + t[1] * ext]),
-            (None, None) => return Err("a wall with no neighbour".into()),
-        };
-        if (e[0] - b[0]) * t[0] + (e[1] - b[1]) * t[1] < 0.05 {
-            return Err("a wall has no length between its corners".into());
-        }
-        if pos == 0 {
-            first_start = b;
-        }
-        last_end = e;
-        segs.push(Seg::Line(b, e));
-        if let Some(Junction::Round { center, r, t1, t2 }) = out_j
-            && !open_last
-        {
-            let a0 = (t1[1] - center[1]).atan2(t1[0] - center[0]);
-            let a1 = (t2[1] - center[1]).atan2(t2[0] - center[0]);
-            let sweep = (a1 - a0).rem_euclid(TAU);
-            segs.push(Seg::Arc { c: *center, r: *r, a0, a1: a0 + sweep });
-        }
-    }
-    if gap_at.is_some() {
-        closing = Some((last_end, first_start));
-    }
-    if let Some((a, b)) = closing {
-        segs.push(Seg::Line(a, b));
-    }
-    let mut polygon: Vec<[f64; 2]> = Vec::new();
-    for s in &segs {
-        match s {
-            Seg::Line(a, _) => polygon.push(*a),
-            Seg::Arc { c, r, a0, a1 } => {
-                for k in 0..=8 {
-                    let th = a0 + (a1 - a0) * k as f64 / 8.0;
-                    polygon.push([c[0] + r * th.cos(), c[1] + r * th.sin()]);
-                }
-            }
-        }
-    }
-    Ok(Profile { segs, polygon, closed: gap_at.is_none() })
-}
-
-fn inside_polygon(poly: &[[f64; 2]], p: [f64; 2]) -> bool {
-    let mut inside = false;
-    let n = poly.len();
-    for i in 0..n {
-        let (a, b) = (poly[i], poly[(i + 1) % n]);
-        if (a[1] > p[1]) != (b[1] > p[1]) && p[0] < (b[0] - a[0]) * (p[1] - a[1]) / (b[1] - a[1]) + a[0] {
-            inside = !inside;
-        }
-    }
-    inside
-}
-
-fn polygon_distance(poly: &[[f64; 2]], p: [f64; 2]) -> f64 {
-    let n = poly.len();
-    let mut best = f64::INFINITY;
-    for i in 0..n {
-        let (a, b) = (poly[i], poly[(i + 1) % n]);
-        let ab = [b[0] - a[0], b[1] - a[1]];
-        let l2 = ab[0] * ab[0] + ab[1] * ab[1];
-        let t = if l2 > 0.0 { (((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1]) / l2).clamp(0.0, 1.0) } else { 0.0 };
-        best = best.min(d2(p, [a[0] + ab[0] * t, a[1] + ab[1] * t]));
-    }
-    best
-}
-
-/// A frame in the profile's plane: origin, two in-plane axes, normal `d` (e1 × e2 = d).
-struct Frame {
-    o: Vec3,
-    e1: Vec3,
-    e2: Vec3,
-    d: Vec3,
-}
-
-impl Frame {
-    fn new(o: Vec3, d: Vec3) -> Frame {
-        let e1 = any_perpendicular(&d);
-        Frame { o, e1, e2: d.cross(&e1), d }
-    }
-    fn to2(&self, p: &Point3) -> [f64; 2] {
-        let v = p.coords - self.o;
-        [v.dot(&self.e1), v.dot(&self.e2)]
-    }
-    fn to3(&self, p: [f64; 2]) -> Vec3 {
-        self.o + self.e1 * p[0] + self.e2 * p[1]
-    }
-    fn curves(&self, segs: &[Seg]) -> Vec<ProfileCurve> {
-        segs.iter()
-            .map(|s| match s {
-                Seg::Line(a, b) => ProfileCurve::Line { start: arr(self.to3(*a)), end: arr(self.to3(*b)) },
-                Seg::Arc { c, r, a0, a1 } => ProfileCurve::Arc {
-                    center: arr(self.to3(*c)),
-                    axis: arr(self.d),
-                    reference: arr(self.e1),
-                    radius: *r,
-                    start: *a0,
-                    end: *a1,
-                },
-            })
-            .collect()
-    }
-}
-
-// ---------------------------------------------------------------------------------------------
 // bosses
 
 /// Scan that is in front of a plane only because a boss stands on it.
@@ -943,7 +660,9 @@ impl State {
 /// Plans the build: classifies every region and forms the local tools. `scan` is the whole
 /// scanned cloud the regions come from (the "is there scan in front of it?" test).
 #[must_use]
-pub fn plan(items: &[Item], scan: &[Point3], square_deg: f64) -> Plan {
+pub fn plan(items: &[Item], cloud: &Scan, square_deg: f64) -> Plan {
+    let scan: &[Point3] = &cloud.points;
+    let sc = cloud.scale();
     let nodes = make_nodes(items);
     let contacts = contacts(&nodes);
     let mut st = State {
@@ -984,7 +703,7 @@ pub fn plan(items: &[Item], scan: &[Point3], square_deg: f64) -> Plan {
             continue;
         }
         let (o, a) = (v3(*point), v3(*axis));
-        let tol = 0.1 + 0.05 * radius.min(2.0);
+        let tol = sc.mm(0.1) + 0.05 * radius.min(sc.mm(2.0));
         let out = scan.iter().filter(|p| radial_axial(p, o, a).0 > radius + tol).count() as f64 / total;
         front_of[ci] = Some(out);
         if out <= ENVELOPE_FRACTION {
@@ -1011,7 +730,7 @@ pub fn plan(items: &[Item], scan: &[Point3], square_deg: f64) -> Plan {
                 let rms = (nd.pts.iter().map(|p| (p.coords - p0).dot(&n).powi(2)).sum::<f64>()
                     / nd.pts.len().max(1) as f64)
                     .sqrt();
-                let tol = (0.1 + 3.0 * rms).min(0.4);
+                let tol = (sc.mm(0.1) + 3.0 * rms).min(sc.mm(0.4));
                 let (mut in_front, mut by_boss) = (0usize, 0usize);
                 for p in scan {
                     if (p.coords - p0).dot(&n) > tol {
@@ -1042,7 +761,7 @@ pub fn plan(items: &[Item], scan: &[Point3], square_deg: f64) -> Plan {
             }
             Shape::Cylinder { point, axis, radius } if nd.full && nd.convex => {
                 let (o, a) = (v3(*point), v3(*axis));
-                let tol = 0.1 + 0.05 * radius.min(2.0);
+                let tol = sc.mm(0.1) + 0.05 * radius.min(sc.mm(2.0));
                 let out = scan.iter().filter(|p| radial_axial(p, o, a).0 > radius + tol).count() as f64 / total;
                 front_of[ni] = Some(out);
                 if out <= ENVELOPE_FRACTION {
@@ -1051,21 +770,9 @@ pub fn plan(items: &[Item], scan: &[Point3], square_deg: f64) -> Plan {
                         RoleKind::Global,
                         format!("global cylinder: {:.3} % of the scan lies outside it", out * 100.0),
                     );
-                } else {
-                    let note = st.notes.get(ni).filter(|n| !n.is_empty()).map_or(String::new(), |n| format!(": {n}"));
-                    st.set(
-                        ni,
-                        RoleKind::Skipped,
-                        format!(
-                            "boss or step: {:.1} % of the scan lies outside this convex cylinder and it is no boss on a plane{note}",
-                            out * 100.0
-                        ),
-                    );
-                }
+                } // else pending: a post of a pocket (an island), or no tool at all (step 5)
             }
-            Shape::Cylinder { .. } if !nd.full && nd.convex => {
-                st.set(ni, RoleKind::Blend, "partial convex cylinder: a fillet if it is tangent to two global planes");
-            }
+            Shape::Cylinder { .. } if !nd.full && nd.convex => {} // pending: a reflex round of a profile, or a fillet (step 6)
             Shape::Cylinder { .. } | Shape::Cone { .. } if !nd.full && !nd.convex => {} // pending: pocket corner or floor fillet
             Shape::Cylinder { .. } => {} // full concave: hole analysis below
             Shape::Cone { .. } if nd.full && !nd.convex => {} // pending: drill point or countersink
@@ -1226,322 +933,30 @@ pub fn plan(items: &[Item], scan: &[Point3], square_deg: f64) -> Plan {
         }
     }
 
-    // --- 3. pockets: a local floor plane with walls (planes) and rounded corners (cylinders)
-    for fi in 0..nodes.len() {
-        let Some(fl) = nodes.get(fi) else { continue };
-        let Shape::Plane { point, normal } = &fl.shape else { continue };
-        if !st.pending(fi) {
-            continue;
-        }
-        let d = snap_direction(v3(*normal), &global_normals, 0.3);
-        let (p0, nf) = (v3(*point), d);
-        // wall and corner candidates touching the floor
-        let height = |nd: &Node| nd.pts.iter().map(|p| (p.coords - p0).dot(&nf)).fold(f64::INFINITY, f64::min);
-        let mut cand: Vec<usize> = Vec::new();
-        for ci in 0..nodes.len() {
-            let Some(c) = nodes.get(ci) else { continue };
-            if ci == fi || !st.pending(ci) {
-                continue;
-            }
-            let ok = match &c.shape {
-                Shape::Plane { normal, .. } => normalize(v3(*normal)).is_some_and(|n| n.dot(&nf).abs() < 0.05),
-                Shape::Cylinder { axis, .. } if !c.full && !c.convex => {
-                    normalize(v3(*axis)).is_some_and(|a| a.dot(&nf).abs() > 0.99 || a.dot(&nf).abs() < 0.1)
-                }
-                Shape::Torus { .. } if !c.full && !c.convex => true,
-                _ => false,
-            };
-            if ok && (-0.6..=3.0).contains(&height(c)) && near(fl, c, NEIGHBOUR_GAP).is_some() {
-                cand.push(ci);
-            }
-        }
-        // floor fillet (cylinders along the walls, tori round the corners)
-        let is_fillet = |c: &Node| match &c.shape {
-            Shape::Cylinder { axis, .. } => normalize(v3(*axis)).is_some_and(|a| a.dot(&nf).abs() < 0.1),
-            Shape::Torus { axis, .. } => normalize(v3(*axis)).is_some_and(|a| a.dot(&nf).abs() > 0.99),
-            _ => false,
-        };
-        let wall_like: Vec<usize> =
-            cand.iter().copied().filter(|&c| nodes.get(c).is_some_and(|c| !is_fillet(c))).collect();
-        let fillets: Vec<usize> = cand.iter().copied().filter(|c| !wall_like.contains(c)).collect();
-        // connected components of the walls by proximity
-        let mut comp: Vec<usize> = (0..wall_like.len()).collect();
-        for x in 0..wall_like.len() {
-            for y in (x + 1)..wall_like.len() {
-                if let (Some(a), Some(b)) = (nodes.get(wall_like[x]), nodes.get(wall_like[y]))
-                    && near(a, b, NEIGHBOUR_GAP).is_some()
-                {
-                    let (cx, cy) = (comp[x], comp[y]);
-                    for c in comp.iter_mut() {
-                        if *c == cy {
-                            *c = cx;
-                        }
-                    }
-                }
-            }
-        }
-        let mut seen: Vec<usize> = Vec::new();
-        for &c in &comp {
-            if !seen.contains(&c) {
-                seen.push(c);
-            }
-        }
-        let mut pockets_made = 0;
-        for cid in seen {
-            let members: Vec<usize> = (0..wall_like.len()).filter(|&k| comp[k] == cid).map(|k| wall_like[k]).collect();
-            if !members.iter().any(|&m| nodes.get(m).is_some_and(|n| matches!(n.shape, Shape::Plane { .. }))) {
-                continue;
-            }
-            let frame = Frame::new(p0, nf);
-            match walls_and_corners(&nodes, &members, &frame, &global_normals) {
-                Ok((walls, corners)) => match build_profile(&walls, &corners, 2.0 * diag + 10.0) {
-                    Ok(pr) if pr.closed => {
-                        let used: Vec<usize> = members.clone();
-                        // fillets of this pocket: radius from the cylinders tangent to the floor
-                        let mut fr: Vec<f64> = Vec::new();
-                        let mut fmembers: Vec<usize> = Vec::new();
-                        for &f in &fillets {
-                            let Some(c) = nodes.get(f) else { continue };
-                            if !used.iter().any(|&u| nodes.get(u).is_some_and(|w| near(w, c, NEIGHBOUR_GAP).is_some()))
-                            {
-                                continue;
-                            }
-                            match &c.shape {
-                                Shape::Cylinder { point, radius, .. } => {
-                                    let h = (v3(*point) - p0).dot(&nf);
-                                    if (h - radius).abs() < 0.4 && *radius < 6.0 {
-                                        fr.push(*radius);
-                                        fmembers.push(f);
-                                    }
-                                }
-                                Shape::Torus { minor_radius, .. } if *minor_radius < 6.0 => fmembers.push(f),
-                                _ => {}
-                            }
-                        }
-                        fr.sort_by(f64::total_cmp);
-                        let fillet = fr.get(fr.len() / 2).copied();
-                        let ti = tools.len();
-                        let mut all: Vec<usize> = vec![fl.base];
-                        all.extend(used.iter().filter_map(|&u| nodes.get(u).map(|n| n.base)));
-                        all.extend(fmembers.iter().filter_map(|&u| nodes.get(u).map(|n| n.base)));
-                        tools.push(PlannedTool {
-                            tool: LocalTool::Prism {
-                                profile: frame.curves(&pr.segs),
-                                direction: arr(nf),
-                                through: false,
-                                floor_fillet: fillet,
-                            },
-                            kind: "pocket",
-                            members: all,
-                            detail: format!(
-                                "{} walls, {} corners{}",
-                                walls.len(),
-                                corners.len(),
-                                fillet.map_or(String::new(), |r| format!(", floor fillet r = {r:.2}"))
-                            ),
-                        });
-                        pockets_made += 1;
-                        for &u in used.iter().chain(&fmembers) {
-                            st.set(
-                                u,
-                                RoleKind::LocalSubtract,
-                                "wall or corner of a pocket (concave contact with its floor)",
-                            );
-                            if let Some(t) = st.tools.get_mut(u) {
-                                t.push(ti);
-                            }
-                            if let (Some(Shape::Plane { .. }), Some(nd)) =
-                                (nodes.get(u).map(|n| &n.shape), nodes.get(u))
-                            {
-                                // walls are exactly perpendicular to the floor in the planned shape
-                                if let (Shape::Plane { point, normal }, Some(sh)) = (&nd.shape, st.shape.get_mut(u))
-                                    && let Some(m) = wall_normal(v3(*normal), nf, &global_normals)
-                                {
-                                    *sh = Shape::Plane { point: *point, normal: arr(m) };
-                                }
-                            }
-                        }
-                        st.set(
-                            fi,
-                            RoleKind::LocalSubtract,
-                            format!(
-                                "floor of a pocket ({} walls), {:.1} % of the scan lies in front of it",
-                                walls.len(),
-                                front_of.get(fi).copied().flatten().unwrap_or(0.0) * 100.0
-                            ),
-                        );
-                        if let Some(t) = st.tools.get_mut(fi) {
-                            t.push(ti);
-                        }
-                    }
-                    Ok(_) => {
-                        for &u in &members {
-                            st.note(u, "its pocket's walls do not close into a profile (an open chain with a floor is not built)");
-                        }
-                    }
-                    Err(why) => {
-                        for &u in &members {
-                            st.note(u, format!("pocket profile: {why}"));
-                        }
-                    }
-                },
-                Err(why) => {
-                    for &u in &members {
-                        st.note(u, format!("pocket profile: {why}"));
-                    }
-                }
-            }
-        }
-        if pockets_made == 0 {
-            st.note(fi, "no pocket walls close around it (a step or an island: not built yet)");
-        }
-    }
-
-    // --- 4. through slots: walls (and rounds) with no floor, all parallel to one direction
-    let direction = |st: &State| -> Option<Vec3> {
-        let pend: Vec<usize> = (0..nodes.len()).filter(|&i| st.pending(i)).collect();
-        for &i in &pend {
-            if let Some(Node { shape: Shape::Cylinder { axis, .. }, full: false, convex: false, .. }) = nodes.get(i) {
-                return normalize(v3(*axis));
-            }
-        }
-        for &i in &pend {
-            for &j in &pend {
-                if let (
-                    Some(Node { shape: Shape::Plane { normal: n1, .. }, .. }),
-                    Some(Node { shape: Shape::Plane { normal: n2, .. }, .. }),
-                ) = (nodes.get(i), nodes.get(j))
-                {
-                    let c = v3(*n1).cross(&v3(*n2));
-                    if c.norm() > 0.3 {
-                        return normalize(c);
-                    }
-                }
-            }
-        }
-        None
+    // --- 3. pockets, steps and ribs: a local floor plane with walls and rounds; 4. through slots
+    let env = Env {
+        nodes: &nodes,
+        cloud,
+        diag,
+        anchors: &global_normals,
+        explained: &explained,
+        front_of: &front_of,
+        scale: cloud.scale(),
     };
-    for _ in 0..8 {
-        let Some(d0) = direction(&st) else { break };
-        let d = snap_direction(d0, &global_normals, 0.5);
-        let members: Vec<usize> = (0..nodes.len())
-            .filter(|&i| {
-                st.pending(i)
-                    && nodes.get(i).is_some_and(|n| match &n.shape {
-                        Shape::Plane { normal, .. } => normalize(v3(*normal)).is_some_and(|m| m.dot(&d).abs() < 0.05),
-                        Shape::Cylinder { axis, .. } => {
-                            !n.full && !n.convex && normalize(v3(*axis)).is_some_and(|a| a.dot(&d).abs() > 0.99)
-                        }
-                        _ => false,
-                    })
-            })
-            .collect();
-        if members.len() < 2 {
-            for &i in &members {
-                st.set(i, RoleKind::Skipped, "a lone local wall: no slot or pocket around it");
-            }
-            if members.is_empty() {
-                break;
-            }
-            continue;
-        }
-        // connected components by proximity; take the component of the first member
-        let mut comp_set = vec![members[0]];
-        let mut grew = true;
-        while grew {
-            grew = false;
-            for &m in &members {
-                if comp_set.contains(&m) {
-                    continue;
-                }
-                let touches = comp_set.iter().any(|&c| match (nodes.get(c), nodes.get(m)) {
-                    (Some(a), Some(b)) => near(a, b, NEIGHBOUR_GAP).is_some(),
-                    _ => false,
-                });
-                if touches {
-                    comp_set.push(m);
-                    grew = true;
-                }
-            }
-        }
-        let mut sum = Vec3::zeros();
-        let mut cnt: f64 = 0.0;
-        for &c in &comp_set {
-            if let Some(n) = nodes.get(c) {
-                for p in n.pts.iter().step_by((n.pts.len() / 200).max(1)) {
-                    sum += p.coords;
-                    cnt += 1.0;
-                }
-            }
-        }
-        let frame = Frame::new(sum / cnt.max(1.0), d);
-        let mut reason: Option<String> = None;
-        match walls_and_corners(&nodes, &comp_set, &frame, &global_normals)
-            .and_then(|(w, c)| build_profile(&w, &c, 2.0 * diag + 10.0).map(|p| (w.len(), c.len(), p)))
-        {
-            Ok((nw, nc, pr)) => {
-                // through: the interior of the profile holds no scan
-                let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
-                for q in &pr.polygon {
-                    for k in 0..2 {
-                        lo[k] = lo[k].min(q[k]);
-                        hi[k] = hi[k].max(q[k]);
-                    }
-                }
-                let mut inside = 0usize;
-                for p in scan {
-                    let q = frame.to2(p);
-                    if q[0] < lo[0] || q[0] > hi[0] || q[1] < lo[1] || q[1] > hi[1] {
-                        continue;
-                    }
-                    if inside_polygon(&pr.polygon, q) && polygon_distance(&pr.polygon, q) > 0.5 {
-                        inside += 1;
-                    }
-                }
-                if inside > 3 {
-                    reason = Some(format!(
-                        "slot walls with scan inside them ({inside} points): a floor that was not given, or an island"
-                    ));
-                } else {
-                    let ti = tools.len();
-                    tools.push(PlannedTool {
-                        tool: LocalTool::Prism {
-                            profile: frame.curves(&pr.segs),
-                            direction: arr(d),
-                            through: true,
-                            floor_fillet: None,
-                        },
-                        kind: "through_slot",
-                        members: comp_set.iter().filter_map(|&c| nodes.get(c).map(|n| n.base)).collect(),
-                        detail: format!(
-                            "{nw} walls, {nc} rounded corners, {}",
-                            if pr.closed { "closed window" } else { "open to the outside" }
-                        ),
-                    });
-                    for &c in &comp_set {
-                        st.set(
-                            c,
-                            RoleKind::LocalSubtract,
-                            format!("wall of a through {} ({nw} walls)", if pr.closed { "window" } else { "slot" }),
-                        );
-                        if let Some(t) = st.tools.get_mut(c) {
-                            t.push(ti);
-                        }
-                    }
-                }
-            }
-            Err(why) => reason = Some(format!("slot profile: {why}")),
-        }
-        if let Some(why) = reason {
-            for &c in &comp_set {
-                st.set(c, RoleKind::Skipped, why.clone());
-            }
-        }
-    }
+    plan_pockets(&env, &mut st, &mut tools);
+    plan_slots(&env, &mut st, &mut tools);
 
     // --- 6. rounds, chamfers and corner patches: concave partial cylinders between planes, tori,
     // partial cones and spheres (a corner of equal fillets, or a dome)
     let kind_of = |st: &State, i: usize| st.kind.get(i).copied().flatten();
+    // (0) a partial convex cylinder no profile took is a fillet if it is tangent to two global planes
+    for ci in 0..nodes.len() {
+        if st.pending(ci)
+            && matches!(nodes.get(ci), Some(Node { shape: Shape::Cylinder { .. }, full: false, convex: true, .. }))
+        {
+            st.set(ci, RoleKind::Blend, "partial convex cylinder: a fillet if it is tangent to two global planes");
+        }
+    }
     // (a) a concave partial cylinder tangent to two planes (its centre in front of both by r)
     for ci in 0..nodes.len() {
         let Some(nd) = nodes.get(ci) else { continue };
@@ -1750,6 +1165,14 @@ pub fn plan(items: &[Item], scan: &[Point3], square_deg: f64) -> Plan {
             Shape::Torus { .. } | Shape::Sphere { .. } => {
                 st.set(ni, RoleKind::Skipped, format!("a partial torus or sphere that is no fillet, corner patch or dome{note}"));
             }
+            Shape::Cylinder { .. } if nd.full && nd.convex => st.set(
+                ni,
+                RoleKind::Skipped,
+                format!(
+                    "boss or step: {:.1} % of the scan lies outside this convex cylinder and it is no boss on a plane or post in a pocket{note}",
+                    front_of.get(ni).copied().flatten().unwrap_or(0.0) * 100.0
+                ),
+            ),
             Shape::Plane { .. } => st.set(
                 ni,
                 RoleKind::Skipped,
@@ -1790,7 +1213,7 @@ pub fn plan(items: &[Item], scan: &[Point3], square_deg: f64) -> Plan {
                 let rms = (nd.pts.iter().map(|p| (p.coords - p0).dot(&n).powi(2)).sum::<f64>()
                     / nd.pts.len().max(1) as f64)
                     .sqrt();
-                let limit = (2.0 * rms).max(0.05);
+                let limit = (2.0 * rms).max(sc.mm(0.05));
                 let shift = nd.pts.iter().map(|p| (p.coords - p0).dot(&(snapped - n)).abs()).fold(0.0, f64::max);
                 let applied = shift <= limit;
                 squared.push(SquaredPlane { item: nd.base, angle_deg: angle, max_shift: shift, limit, applied });
@@ -1844,47 +1267,6 @@ pub fn plan(items: &[Item], scan: &[Point3], square_deg: f64) -> Plan {
     Plan { cuts, cut_members, tools, adds, roles, contacts, squared }
 }
 
-/// A wall's normal made exactly square to the profile's direction `d` and, within 0.3°, exactly
-/// along one of the part's axes.
-fn wall_normal(n: Vec3, d: Vec3, anchors: &[Vec3]) -> Option<Vec3> {
-    let flat = normalize(n - d * n.dot(&d))?;
-    let snapped = snap_direction(flat, anchors, 0.3);
-    normalize(snapped - d * snapped.dot(&d))
-}
-
-/// The walls (planes) and rounded corners (cylinders along `frame.d`) of `members` in 2-D.
-fn walls_and_corners(
-    nodes: &[Node],
-    members: &[usize],
-    frame: &Frame,
-    anchors: &[Vec3],
-) -> Result<(Vec<Wall>, Vec<Corner>), String> {
-    let mut walls = Vec::new();
-    let mut corners = Vec::new();
-    for &m in members {
-        let nd = nodes.get(m).ok_or("index")?;
-        let pts: Vec<[f64; 2]> = nd.pts.iter().step_by((nd.pts.len() / 400).max(1)).map(|p| frame.to2(p)).collect();
-        let mean = {
-            let n = pts.len().max(1) as f64;
-            [pts.iter().map(|p| p[0]).sum::<f64>() / n, pts.iter().map(|p| p[1]).sum::<f64>() / n]
-        };
-        match &nd.shape {
-            Shape::Plane { point, normal } => {
-                let flat = wall_normal(v3(*normal), frame.d, anchors).ok_or("a wall parallel to the floor")?;
-                let n = [flat.dot(&frame.e1), flat.dot(&frame.e2)];
-                let q = frame.to2(&pt(*point));
-                // a wall plane's own point may be anywhere on it: the line is n · x = n · q
-                walls.push(Wall { n, c: n[0] * q[0] + n[1] * q[1], mean, pts });
-            }
-            Shape::Cylinder { point, radius, .. } => {
-                corners.push(Corner { center: frame.to2(&pt(*point)), r: *radius, mean, pts });
-            }
-            _ => return Err("only planes and cylinders form a profile".into()),
-        }
-    }
-    Ok((walls, corners))
-}
-
 // ---------------------------------------------------------------------------------------------
 // reports
 
@@ -1911,7 +1293,8 @@ pub struct PlannedRegion {
 pub struct PlannedToolOut {
     /// Index.
     pub index: usize,
-    /// `blind_hole`, `pocket` or `through_slot`.
+    /// `blind_hole`, `pocket` (walls round a floor, with the islands it leaves), `step` (walls with a
+    /// floor that run out of the part), `rib` (a face cut down round raised islands) or `through_slot`.
     pub kind: String,
     /// The primitive objects that form it.
     pub members: Vec<ObjectId>,
@@ -2033,92 +1416,10 @@ pub fn report(items: &[Item], plan: &Plan) -> PlanOut {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn wall(x0: [f64; 2], x1: [f64; 2], toward: [f64; 2]) -> Wall {
-        // line through x0, x1 with the void on the side of `toward`
-        let t = [x1[0] - x0[0], x1[1] - x0[1]];
-        let l = t[0].hypot(t[1]);
-        let mut n = [-t[1] / l, t[0] / l];
-        if n[0] * (toward[0] - x0[0]) + n[1] * (toward[1] - x0[1]) < 0.0 {
-            n = [-n[0], -n[1]];
-        }
-        let pts: Vec<[f64; 2]> =
-            (0..=20).map(|k| [x0[0] + t[0] * k as f64 / 20.0, x0[1] + t[1] * k as f64 / 20.0]).collect();
-        Wall { n, c: n[0] * x0[0] + n[1] * x0[1], mean: [0.5 * (x0[0] + x1[0]), 0.5 * (x0[1] + x1[1])], pts }
-    }
-
-    fn arc_corner(c: [f64; 2], r: f64, a0: f64) -> Corner {
-        let pts: Vec<[f64; 2]> = (0..=10)
-            .map(|k| {
-                let a = a0 + 0.5 * PI * k as f64 / 10.0;
-                [c[0] + r * a.cos(), c[1] + r * a.sin()]
-            })
-            .collect();
-        let mid = a0 + 0.25 * PI;
-        Corner { center: c, r, mean: [c[0] + r * mid.cos(), c[1] + r * mid.sin()], pts }
-    }
-
-    #[test]
-    fn rounded_rectangle_closes_into_eight_segments() {
-        let (w, h, r) = (30.0, 20.0, 4.0);
-        let c = [15.0, 10.0];
-        let walls = vec![
-            wall([r, 0.0], [w - r, 0.0], c),
-            wall([w, r], [w, h - r], c),
-            wall([w - r, h], [r, h], c),
-            wall([0.0, h - r], [0.0, r], c),
-        ];
-        let corners = vec![
-            arc_corner([w - r, r], r, -0.5 * PI),
-            arc_corner([w - r, h - r], r, 0.0),
-            arc_corner([r, h - r], r, 0.5 * PI),
-            arc_corner([r, r], r, PI),
-        ];
-        let p = build_profile(&walls, &corners, 100.0).unwrap();
-        assert!(p.closed);
-        assert_eq!(p.segs.len(), 8);
-        // the polygon encloses the rounded rectangle's area
-        let a: f64 = (0..p.polygon.len())
-            .map(|i| {
-                let (q, s) = (p.polygon[i], p.polygon[(i + 1) % p.polygon.len()]);
-                q[0] * s[1] - s[0] * q[1]
-            })
-            .sum::<f64>()
-            * 0.5;
-        let exact = w * h - (4.0 - PI) * r * r;
-        assert!((a - exact).abs() < 0.5, "area {a} vs {exact}");
-    }
-
-    #[test]
-    fn open_slot_is_extended_and_closed_outside() {
-        // a U slot open towards -x: walls y = 0 and y = 8 from x = 0.., a half round at x = 0..4 side
-        let walls = vec![wall([4.0, 0.0], [30.0, 0.0], [10.0, 4.0]), wall([30.0, 8.0], [4.0, 8.0], [10.0, 4.0])];
-        // half round at the closed end x = 4 (centre (4, 4), r = 4), mean on the arc
-        let pts: Vec<[f64; 2]> = (0..=10)
-            .map(|k| {
-                let a = 0.5 * PI + PI * k as f64 / 10.0;
-                [4.0 + 4.0 * a.cos(), 4.0 + 4.0 * a.sin()]
-            })
-            .collect();
-        let corners = vec![Corner { center: [4.0, 4.0], r: 4.0, mean: [0.0, 4.0], pts }];
-        // the slot opens towards +x here: walls end at x = 30 with nothing there
-        let p = build_profile(&walls, &corners, 100.0).unwrap();
-        assert!(!p.closed);
-        assert_eq!(p.segs.len(), 4, "two walls, the round, the closing line");
-    }
-
-    #[test]
-    fn walls_that_do_not_meet_are_refused() {
-        let walls = vec![
-            wall([0.0, 0.0], [10.0, 0.0], [5.0, 5.0]),
-            wall([30.0, 30.0], [30.0, 40.0], [5.0, 5.0]),
-            wall([0.0, 50.0], [10.0, 50.0], [5.0, 25.0]),
-        ];
-        assert!(build_profile(&walls, &[], 100.0).is_err());
-    }
+    use std::f64::consts::PI;
 
     /// Box 100 x 40 x 10 as six plane items; the top plane is tilted by `tilt_deg` about y.
-    fn slab(tilt_deg: f64) -> (Vec<Item>, Vec<Point3>) {
+    fn slab(tilt_deg: f64) -> (Vec<Item>, Scan) {
         let t = tilt_deg.to_radians();
         let grid = |f: &dyn Fn(f64, f64) -> [f64; 3]| -> Vec<Point3> {
             let mut v = Vec::new();
@@ -2154,7 +1455,7 @@ mod tests {
                 }
             })
             .collect();
-        (items, scan)
+        (items, Scan::from_points(scan, 1.0))
     }
 
     #[test]
@@ -2175,5 +1476,61 @@ mod tests {
         assert!(p.squared.iter().any(|q| q.item == 1 && q.applied), "{:?}", p.squared);
         assert!(matches!(&p.roles[1].shape, Shape::Plane { normal, .. } if normal[0] == 0.0));
         assert!(plan(&items, &scan, 0.0).squared.is_empty());
+    }
+
+    /// A scan of `pts` with a floor under the walls (which the group of walls does not know).
+    fn walls_with_a_round_and_a_floor() -> (Vec<Item>, Scan) {
+        let grid = |f: &dyn Fn(f64, f64) -> [f64; 3]| -> Vec<Point3> {
+            (0..=20)
+                .flat_map(|i| (0..=20).map(move |j| (i as f64 / 20.0, j as f64 / 20.0)))
+                .map(|(u, v)| {
+                    let p = f(u, v);
+                    Point3::new(p[0], p[1], p[2])
+                })
+                .collect()
+        };
+        let wall_x = grid(&|u, v| [10.0, 10.0 + 20.0 * u, 4.0 + 4.0 * v]);
+        let wall_y = grid(&|u, v| [10.0 + 20.0 * u, 10.0, 4.0 + 4.0 * v]);
+        // the convex round of the plate's corner, a little off the walls' corner
+        let round: Vec<Point3> = (0..=20)
+            .flat_map(|i| (0..=10).map(move |j| (i as f64 / 20.0, j as f64 / 10.0)))
+            .map(|(u, v)| {
+                let a = PI * (1.0 + 0.5 * u);
+                Point3::new(8.0 + 2.0 * a.cos(), 8.0 + 2.0 * a.sin(), 4.0 + 4.0 * v)
+            })
+            .collect();
+        // the floor the walls stand on (not among the regions)
+        let floor = grid(&|u, v| [10.0 + 20.0 * u, 10.0 + 20.0 * v, 4.0]);
+        let item = |id: u64, kind: &'static str, shape: Shape, convex: bool, pts: Vec<Point3>| Item {
+            id: ObjectId(id),
+            kind,
+            cut: Cut { shape, convex, full: false },
+            pts,
+        };
+        let items = vec![
+            item(0, "plane", Shape::Plane { point: [10.0, 20.0, 6.0], normal: [1.0, 0.0, 0.0] }, true, wall_x.clone()),
+            item(1, "plane", Shape::Plane { point: [20.0, 10.0, 6.0], normal: [0.0, 1.0, 0.0] }, true, wall_y.clone()),
+            item(
+                2,
+                "cylinder",
+                Shape::Cylinder { point: [8.0, 8.0, 6.0], axis: [0.0, 0.0, 1.0], radius: 2.0 },
+                true,
+                round.clone(),
+            ),
+        ];
+        let scan: Vec<Point3> = [wall_x, wall_y, round, floor].concat();
+        (items, Scan::from_points(scan, 1.0))
+    }
+
+    #[test]
+    fn a_failed_slot_group_leaves_a_convex_round_its_fillet_role() {
+        let (items, scan) = walls_with_a_round_and_a_floor();
+        let p = plan(&items, &scan, 0.3);
+        // the walls have scan inside them (their floor): no slot, no step
+        assert!(p.tools.is_empty(), "{:?}", p.tools.iter().map(|t| t.kind).collect::<Vec<_>>());
+        assert_eq!(p.roles[0].kind, RoleKind::Skipped, "{}", p.roles[0].how);
+        assert_eq!(p.roles[1].kind, RoleKind::Skipped, "{}", p.roles[1].how);
+        // the convex round was in the group, but is not lost with it
+        assert_eq!(p.roles[2].kind, RoleKind::Blend, "{}", p.roles[2].how);
     }
 }
