@@ -19,6 +19,7 @@ fn list(s: &mut Session, _: NoParams) -> CmdResult<ListOut> {
 fn new(s: &mut Session, _: NoParams) -> CmdResult<ListOut> {
     s.doc = surfacecraft_doc::Document::new();
     s.history.clear();
+    s.maps.clear();
     Ok(ListOut { objects: Vec::new() })
 }
 
@@ -50,6 +51,7 @@ fn open(s: &mut Session, i: PathIn) -> CmdResult<ListOut> {
     let text = String::from_utf8(bytes).map_err(|_| CmdError::Failed("project file is not UTF-8".into()))?;
     s.doc = format::from_json(&text).map_err(CmdError::Failed)?;
     s.history.clear();
+    s.maps.clear();
     Ok(ListOut { objects: s.doc.summaries() })
 }
 

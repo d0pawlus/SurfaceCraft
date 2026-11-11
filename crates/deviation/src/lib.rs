@@ -83,8 +83,7 @@ pub fn stats(values: &[f64], tolerance: f64) -> DeviationStats {
         if d.abs() <= tol {
             within += 1;
         }
-        let bin = (((d / (3.0 * tol)) + 1.0) * 5.0).floor().clamp(0.0, 9.0) as usize;
-        if let Some(b) = h.get_mut(bin) {
+        if let Some(b) = h.get_mut(hist_bin(d, tol)) {
             *b += 1;
         }
     }
@@ -102,6 +101,60 @@ pub fn stats(values: &[f64], tolerance: f64) -> DeviationStats {
         within: within as f64 / nf,
         histogram: h,
     }
+}
+
+/// Bins of the colour map's histogram: equal bins over −3·tol … +3·tol (the legend's range).
+pub const HISTOGRAM_BINS: usize = 10;
+/// Half-width of the histogram, in tolerances.
+const HISTOGRAM_RANGE_TOLERANCES: f64 = 3.0;
+
+/// The histogram bin of signed deviation `d` at tolerance `tol`. Values outside the range fall in
+/// the end bins.
+#[must_use]
+pub fn hist_bin(d: f64, tol: f64) -> usize {
+    let half = HISTOGRAM_BINS as f64 / 2.0;
+    let scaled = (d / (HISTOGRAM_RANGE_TOLERANCES * tol) + 1.0) * half;
+    scaled.floor().clamp(0.0, HISTOGRAM_BINS as f64 - 1.0) as usize
+}
+
+/// The histogram and the cumulative tolerance bands of the counted points.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Distribution {
+    /// Counted points.
+    pub count: usize,
+    /// Histogram over −3·tol … +3·tol: the bins of [`DeviationStats::histogram`].
+    pub histogram: Histogram,
+    /// Share of the counted points with |deviation| within each tolerance.
+    pub bands: Vec<Band>,
+}
+
+/// The distribution of the counted samples at tolerance `tol`, with the share within each band
+/// tolerance. One pass over the samples and no sorting, so it is cheap next to the measurement.
+#[must_use]
+pub fn distribution(samples: &[Sample], tol: f64, band_tolerances: &[f64]) -> Distribution {
+    let mut counts = vec![0usize; HISTOGRAM_BINS];
+    let mut within = vec![0usize; band_tolerances.len()];
+    let mut count = 0usize;
+    for s in samples.iter().filter(|s| s.counted()) {
+        count += 1;
+        if let Some(c) = counts.get_mut(hist_bin(s.d, tol)) {
+            *c += 1;
+        }
+        let magnitude = s.d.abs();
+        for (w, &t) in within.iter_mut().zip(band_tolerances) {
+            if magnitude <= t {
+                *w += 1;
+            }
+        }
+    }
+    let n = count.max(1) as f64;
+    let range = HISTOGRAM_RANGE_TOLERANCES * tol;
+    let bands = band_tolerances
+        .iter()
+        .zip(within)
+        .map(|(&tolerance, w)| Band { tolerance, count: w, share: w as f64 / n })
+        .collect();
+    Distribution { count, histogram: Histogram { lo: -range, hi: range, counts }, bands }
 }
 
 /// Signed deviation of each point from a primitive.

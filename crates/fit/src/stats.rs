@@ -8,19 +8,23 @@ static LM_ITERATIONS: AtomicU64 = AtomicU64::new(0);
 static SEED_FITS: AtomicU64 = AtomicU64::new(0);
 static GROW_REFITS: AtomicU64 = AtomicU64::new(0);
 static FINAL_FITS: AtomicU64 = AtomicU64::new(0);
+static SPEC_JOBS: AtomicU64 = AtomicU64::new(0);
+static SPEC_USED: AtomicU64 = AtomicU64::new(0);
 
 /// Segmentation phases timed by [`Stopwatch`].
 #[derive(Clone, Copy, Debug)]
 pub enum Phase {
     /// Neighbours, smoothed normals, areas, seed order.
     Prep,
-    /// Seed patches and their fits.
+    /// Finding regions, wall time of the whole seed loop (jobs run in parallel inside it).
+    Regions,
+    /// Seed patches and their fits (summed over the jobs, speculative ones included).
     Seed,
-    /// Region growth (breadth first search and acceptance tests).
+    /// Region growth including its refits (summed over jobs).
     Grow,
-    /// Refits while growing.
+    /// Refits while growing (summed over jobs; part of `Grow`).
     Refit,
-    /// Final fits.
+    /// Final fits (wall time of the parallel pass).
     Final,
     /// Merging adjacent regions.
     Merge,
@@ -28,8 +32,9 @@ pub enum Phase {
     Relax,
 }
 
-const PHASES: [(&str, Phase); 7] = [
+const PHASES: [(&str, Phase); 8] = [
     ("prep", Phase::Prep),
+    ("regions", Phase::Regions),
     ("seed", Phase::Seed),
     ("grow", Phase::Grow),
     ("refit", Phase::Refit),
@@ -38,7 +43,8 @@ const PHASES: [(&str, Phase); 7] = [
     ("relax", Phase::Relax),
 ];
 
-static PHASE_NS: [AtomicU64; 7] = [
+static PHASE_NS: [AtomicU64; 8] = [
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -95,6 +101,10 @@ pub struct Counters {
     pub grow_refits: u64,
     /// Final fits of finished regions.
     pub final_fits: u64,
+    /// Speculative region jobs run ahead of their turn (their fits are counted above too).
+    pub speculative_jobs: u64,
+    /// Speculative jobs whose result was used.
+    pub speculative_used: u64,
 }
 
 pub(crate) fn lm_run(iterations: usize) {
@@ -110,6 +120,11 @@ pub(crate) fn grow_refit() {
     GROW_REFITS.fetch_add(1, Ordering::Relaxed);
 }
 
+pub(crate) fn speculation(jobs: usize, used: usize) {
+    SPEC_JOBS.fetch_add(jobs as u64, Ordering::Relaxed);
+    SPEC_USED.fetch_add(used as u64, Ordering::Relaxed);
+}
+
 pub(crate) fn final_fit() {
     FINAL_FITS.fetch_add(1, Ordering::Relaxed);
 }
@@ -123,12 +138,14 @@ pub fn snapshot() -> Counters {
         seed_fits: SEED_FITS.load(Ordering::Relaxed),
         grow_refits: GROW_REFITS.load(Ordering::Relaxed),
         final_fits: FINAL_FITS.load(Ordering::Relaxed),
+        speculative_jobs: SPEC_JOBS.load(Ordering::Relaxed),
+        speculative_used: SPEC_USED.load(Ordering::Relaxed),
     }
 }
 
 /// Sets every counter to zero.
 pub fn reset() {
-    for c in [&LM_RUNS, &LM_ITERATIONS, &SEED_FITS, &GROW_REFITS, &FINAL_FITS] {
+    for c in [&LM_RUNS, &LM_ITERATIONS, &SEED_FITS, &GROW_REFITS, &FINAL_FITS, &SPEC_JOBS, &SPEC_USED] {
         c.store(0, Ordering::Relaxed);
     }
     for c in &PHASE_NS {

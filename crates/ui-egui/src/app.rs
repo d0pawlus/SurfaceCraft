@@ -41,6 +41,8 @@ pub struct SurfaceCraftApp {
     pub cmd_panel: crate::command_panel::CommandPanel,
     /// The feature history's editor.
     pub hist_panel: crate::history_panel::HistoryPanel,
+    /// The deviation readings in the viewport: pinned ones and the one under the pointer.
+    pub deviation: crate::deviation_panel::readout::State,
     /// Last status line.
     pub status: String,
     /// Points picked in the viewport (click: replace, Shift+click: add).
@@ -122,6 +124,7 @@ impl SurfaceCraftApp {
             sketch_editor: crate::sketch_editor::SketchEditor::default(),
             cmd_panel: Default::default(),
             hist_panel: Default::default(),
+            deviation: Default::default(),
             status: t("status.ready").to_string(),
             picks: Vec::new(),
             field_pick: None,
@@ -860,10 +863,10 @@ pub fn template(schema: &Value, ctx: &PickContext) -> Value {
                 "triangles" if !ctx.triangles.is_empty() => json!(ctx.triangles),
                 "faces" if !ctx.faces.is_empty() => json!(ctx.faces),
                 "edges" if !ctx.edges.is_empty() => json!(ctx.edges),
-                "primary" | "secondary" | "tertiary" => {
-                    crate::fieldpick::datum_default(name).unwrap_or_else(|| example(&p, schema))
-                }
-                _ => example(&p, schema),
+                _ => match crate::fieldpick::PickMode::of(&p).and_then(crate::fieldpick::PickMode::default_value) {
+                    Some(datum) => datum,
+                    None => example(&p, schema),
+                },
             };
             out.insert(name.to_string(), v);
         }

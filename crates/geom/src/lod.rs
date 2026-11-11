@@ -18,6 +18,18 @@ pub struct Lod {
 }
 
 impl Lod {
+    /// The largest distance from an original vertex of `original` to its coarse vertex: the
+    /// measured counterpart of the `√3·h` bound of [`cluster_on_grid`].
+    #[must_use]
+    pub fn max_displacement(&self, original: &Mesh) -> f64 {
+        original
+            .positions
+            .iter()
+            .zip(&self.vertex_map)
+            .filter_map(|(p, &c)| self.mesh.positions.get(c as usize).map(|q| (p - q).norm()))
+            .fold(0.0, f64::max)
+    }
+
     /// Coarse per-vertex colours: the mean of the original vertices of each cluster.
     #[must_use]
     pub fn map_colors(&self, colors: &[[f32; 4]]) -> Vec<[f32; 4]> {
@@ -80,16 +92,28 @@ pub fn cluster(mesh: &Mesh, budget: usize) -> Option<Lod> {
     let area = crate::mesh::source_area(mesh).max(1e-12);
     let mut h = (2.0 * area / budget.max(4) as f64).sqrt();
     for _attempt in 0..6 {
-        let lod = cluster_with(mesh, h, &b.min);
+        let lod = cluster_on_grid(mesh, &b.min, h);
         if lod.mesh.triangles.len() <= budget.max(4) {
             return Some(lod);
         }
         h *= 1.25;
     }
-    Some(cluster_with(mesh, h, &b.min))
+    Some(cluster_on_grid(mesh, &b.min, h))
 }
 
-fn cluster_with(mesh: &Mesh, h: f64, origin: &Point3) -> Lod {
+/// Clusters the vertices of `mesh` on the uniform grid of cell size `h` anchored at `origin`; each
+/// coarse vertex is the mean of its cell. Triangles whose corners fall in fewer than three cells
+/// disappear (`triangle_map` holds `u32::MAX`), equal coarse triangles are kept once.
+///
+/// Error bound: a cell has diagonal `√3·h` and the mean of its vertices lies in it, so every
+/// original vertex ends up within `√3·h` of its coarse vertex ([`Lod::max_displacement`] measures
+/// the actual worst case). A point of an original triangle is a barycentric mix of its corners; the
+/// same mix of their coarse vertices is a point of the coarse triangle (or its edge, or vertex) at
+/// most `√3·h` away, so every point of the *coarse* surface lies within `√3·h` of the original
+/// surface. The reverse direction holds for every triangle that survives; a triangle that
+/// collapsed keeps its corners covered by coarse vertices but its interior is not bounded.
+#[must_use]
+pub fn cluster_on_grid(mesh: &Mesh, origin: &Point3, h: f64) -> Lod {
     let inv = 1.0 / h.max(1e-12);
     let mut cell_id: HashMap<[i64; 3], u32> = HashMap::with_capacity(mesh.positions.len() / 4);
     let mut sum: Vec<(Vec3, u32)> = Vec::new();
@@ -169,5 +193,28 @@ mod tests {
         assert!(!mapped.is_empty());
         assert!(mapped.iter().all(|&t| lod.mesh.face_centroid(t as usize).unwrap().z > 3.0));
         assert!(cluster(&Mesh { positions: vec![], triangles: vec![[0, 1, 2]] }, 10).is_none());
+    }
+
+    #[test]
+    fn grid_clustering_stays_within_the_stated_bound() {
+        let mut s = synth::torus(Point3::origin(), Vec3::z(), 30.0, 8.0, 96, 48);
+        s.weld(1e-9);
+        let origin = s.bbox().min;
+        let bvh = crate::Bvh::build(&s);
+        for h in [1.0, 2.5, 6.0] {
+            let lod = cluster_on_grid(&s, &origin, h);
+            let bound = 3f64.sqrt() * h;
+            let measured = lod.max_displacement(&s);
+            assert!(measured > 0.0 && measured <= bound + 1e-9, "h {h}: {measured} vs {bound}");
+            // every point of the coarse surface (corners and centroids) lies within the bound of the original
+            for i in 0..lod.mesh.triangle_count() {
+                let [a, b, c] = lod.mesh.triangle(i).unwrap();
+                let mid = Point3::from((a.coords + b.coords + c.coords) / 3.0);
+                for q in [a, b, c, mid] {
+                    let d = bvh.closest(&q, f64::INFINITY).unwrap().distance;
+                    assert!(d <= bound + 1e-9, "h {h}: coarse point {d} from the original, bound {bound}");
+                }
+            }
+        }
     }
 }

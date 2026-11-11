@@ -15,6 +15,9 @@ use solidcore::nurbs::srf_basic::Surface as Nurb;
 use solidcore::query::api_queries::surface_closest_point;
 use solidcore::surface::surface::{Surface as KSurface, SurfaceKind};
 
+mod trim;
+pub use trim::{MAX_OUTLINE_CORNERS, trimmed_sheet};
+
 /// Largest control net accepted (per direction).
 pub const MAX_CONTROL: usize = 200;
 
@@ -124,6 +127,18 @@ impl SurfaceProbe {
             .map_err(|e| op_err("surface_closest_point", format!("{e:?}")))?;
         let q = r.closest.point;
         Ok((r.closest.distance, [q.x, q.y, q.z]))
+    }
+
+    /// Closest point on the surface with its parameters: `(distance, point, [u, v])`.
+    pub fn closest_uv(&self, p: [f64; 3]) -> Result<(f64, [f64; 3], [f64; 2])> {
+        if p.iter().any(|v| !v.is_finite()) {
+            return Err(KernelError::Argument("point must be finite".into()));
+        }
+        let r = surface_closest_point(&self.kernel, &self.surface, KPoint::new(p[0], p[1], p[2]))
+            .map_err(|e| op_err("surface_closest_point", format!("{e:?}")))?;
+        let uv = r.uvs.first().ok_or_else(|| op_err("surface_closest_point", "no parameters returned"))?;
+        let q = r.closest.point;
+        Ok((r.closest.distance, [q.x, q.y, q.z], [uv.x, uv.y]))
     }
 
     /// The point at `(u, v)`.
