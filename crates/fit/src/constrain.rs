@@ -218,7 +218,7 @@ fn push_vec(coef: &mut Vec<(usize, f64)>, prim: usize, v: &Vec3, scale: f64) {
 /// Sorted, duplicate-free coefficients.
 fn merge_row(row: &Row) -> Row {
     let mut c = row.coef.clone();
-    c.sort_by(|a, b| a.0.cmp(&b.0));
+    c.sort_by_key(|a| a.0);
     let mut out: Vec<(usize, f64)> = Vec::with_capacity(c.len());
     for (v, x) in c {
         if out.last().is_some_and(|l| l.0 == v) {
@@ -261,7 +261,7 @@ fn plane_round(ip: usize, ir: usize, plane: &Primitive, round: &Primitive) -> Op
     push_vec(&mut coef, ir, &n, 1.0);
     push_vec(&mut coef, ip, &n, -1.0);
     coef.push((var(ir, 3 + slot), -s));
-    Some((vec![Row { coef, rhs: s * r - sigma }], sigma.abs() - r, angle))
+    Some((vec![Row { coef, rhs: s * r - sigma }], (sigma.abs() - r).abs(), angle))
 }
 
 /// Two parallel cylinders touching on the outside (distance = sum of radii) or the inside
@@ -294,7 +294,7 @@ fn cyl_cyl(ia: usize, ib: usize, pa: &Primitive, pb: &Primitive) -> Option<(Vec<
         coef.push((var(ib, 3), sign));
         (int, sign * (ra - rb) - dist)
     };
-    Some((vec![Row { coef, rhs }], gap, angle_unsigned(&da, &db)))
+    Some((vec![Row { coef, rhs }], gap.abs(), angle_unsigned(&da, &db)))
 }
 
 /// A cylinder coaxial with a torus whose radius is the torus's outer or inner equator.
