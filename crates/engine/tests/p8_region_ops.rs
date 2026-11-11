@@ -160,7 +160,18 @@ fn resegment_of_two_merged_faces_gives_two_planes() {
     }
 }
 
-/// Bad parameters are errors, never panics; a huge ring count stops where the mesh ends.
+/// A region too small to hold any segment is refused and kept, not deleted.
+#[test]
+fn resegment_keeps_a_region_it_cannot_segment() {
+    let mut s = Session::new();
+    box_scan(&mut s);
+    let few: Vec<u32> = tris_where(&s, |c| c.z > 19.999).into_iter().take(10).collect();
+    let id = id_of(&s.execute("region.create", json!({"mesh": "scan", "triangles": few, "name": "few"})).unwrap());
+    let err = s.execute("region.resegment", json!({"regions": [id]})).unwrap_err();
+    assert!(err.to_string().contains("kept"), "{err}");
+    assert_eq!(tris(&s, id), few);
+}
+
 #[test]
 fn region_ops_refuse_bad_parameters() {
     let mut s = Session::new();

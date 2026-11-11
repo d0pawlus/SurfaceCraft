@@ -726,6 +726,13 @@ fn resegment(s: &mut Session, i: ResegmentIn) -> CmdResult<RegionChangeOut> {
     }
     // the triangles alone form the sub-mesh, so its outer edges bound the growth
     let segs = segment(&m.submesh(&all), o);
+    if segs.is_empty() {
+        return Err(CmdError::Failed(format!(
+            "no surface of at least {} triangles was found in the {} triangles of the regions; they are kept as they were",
+            o.min_triangles,
+            all.len()
+        )));
+    }
     let mut touched: Vec<(ObjectId, bool)> = Vec::new();
     for (k, seg) in segs.into_iter().enumerate() {
         let kind = seg.primitive.kind();
