@@ -490,5 +490,8 @@
   "`size[0] × size[1]` rectangle in XY.": "Prostokąt w płaszczyźnie XY; dwa pierwsze wymiary to jego boki.",
   "`stl`, `obj`, `ply` or `xyz` (default: from the extension, else sniffed).": "„STL”, „OBJ”, „PLY” lub „Punkty XYZ” (domyślnie według rozszerzenia pliku, a gdy to nie wystarcza: rozpoznawany po zawartości).",
   "`union`, `subtract` or `intersect`.": "„Połącz”, „Odejmij” lub „Część wspólna”.",
-  "`{\"plane\": {...}}`, `{\"axis\": {...}}` or `{\"point\": {...}}`.": "Płaszczyzna, oś albo punkt."
+  "`{\"plane\": {...}}`, `{\"axis\": {...}}` or `{\"point\": {...}}`.": "Płaszczyzna, oś albo punkt.",
+  "One triangle of a scan that has a deviation map.": "Jeden trójkąt skanu, który ma mapę odchyłek.",
+  "Scan mesh with a deviation map (`deviation.compute` with `show`).": "Siatka skanu z mapą odchyłek (`deviation.compute` z `show`).",
+  "Triangle of the scan mesh (the triangle a pick reports).": "Trójkąt siatki skanu (ten, który wskazuje kliknięcie w widoku)."
 }

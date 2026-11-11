@@ -619,6 +619,7 @@ impl SurfaceCraftApp {
                 } else if resp.clicked()
                     && let Some(p) = pos
                 {
+                    crate::deviation_panel::readout::pin_click(self, p[0], p[1], w, h);
                     self.pick_at(p[0], p[1], w, h, mods.shift);
                 }
             }
@@ -778,6 +779,7 @@ impl SurfaceCraftApp {
         }
 
         self.paint_field_marks(&painter, rect);
+        crate::deviation_panel::readout::paint(self, ui, rect);
 
         // brush cursor and lasso outline
         if self.tools.tool == Tool::Brush
