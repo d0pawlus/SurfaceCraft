@@ -610,7 +610,6 @@ fn edit_mesh(
     } else if let Some(obj) = s.doc.mesh_mut(id) {
         obj.mesh = Arc::new(m);
     }
-    s.overlays.remove(&id);
     Ok(o)
 }
 

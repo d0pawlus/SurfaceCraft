@@ -41,6 +41,8 @@ pub struct SurfaceCraftApp {
     pub cmd_panel: crate::command_panel::CommandPanel,
     /// The feature history's editor.
     pub hist_panel: crate::history_panel::HistoryPanel,
+    /// The deviation readings in the viewport: pinned ones and the one under the pointer.
+    pub deviation: crate::deviation_panel::readout::State,
     /// Last status line.
     pub status: String,
     /// Points picked in the viewport (click: replace, Shift+click: add).
@@ -122,6 +124,7 @@ impl SurfaceCraftApp {
             sketch_editor: crate::sketch_editor::SketchEditor::default(),
             cmd_panel: Default::default(),
             hist_panel: Default::default(),
+            deviation: Default::default(),
             status: t("status.ready").to_string(),
             picks: Vec::new(),
             field_pick: None,

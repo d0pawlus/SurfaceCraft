@@ -1,13 +1,13 @@
 //! `deviation.*`: how far a scan is from a reference, as a colour map, statistics, hotspots and
 //! the deviation from one fitted primitive.
 use super::{CmdError, CmdResult, CommandSpec, ObjRef};
-use crate::{Session, command};
+use crate::{Session, command, read_command};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use surfacecraft_deviation::{
-    DeviationStats, Hotspot, Report, ReportOptions, Sample, Volume, colorize, counted_values, estimate_noise, hotspots,
-    oriented_plane, report, samples_mesh, samples_primitive, stats_of,
+    DeviationStats, Distribution, Hotspot, Report, ReportOptions, Sample, Volume, colorize, counted_values,
+    distribution, estimate_noise, hotspots, oriented_plane, report, samples_mesh, samples_primitive, stats_of,
 };
 use surfacecraft_doc::{ObjectId, ObjectKind};
 use surfacecraft_fit::Primitive;
@@ -19,6 +19,8 @@ pub(crate) const TOLERANCE: f64 = 0.1;
 pub(crate) const REACH: f64 = 5.0;
 /// Most hotspot groups one answer lists.
 const MAX_LIMIT: usize = 10_000;
+/// Multiples of the map's tolerance at which the report's cumulative bands are taken.
+const BAND_SCALES: [f64; 4] = [0.5, 1.0, 2.0, 3.0];
 /// Scanner noise σ (mm) above which a warning is due, and above which the primitive tolerance is
 /// not met (design doc §10).
 pub(crate) const NOISE_WARNING_MM: f64 = 0.05;
@@ -71,6 +73,10 @@ pub struct ComputeOut {
     pub id: ObjectId,
     /// Statistics.
     pub stats: DeviationStats,
+    /// Histogram over ±3 tolerances and the cumulative shares within ½, 1, 2 and 3 tolerances, in
+    /// one pass. An output logged without it (before it existed) reads as empty.
+    #[serde(default)]
+    pub report: Distribution,
     /// Warning when the tolerance is below the estimated scan noise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
@@ -196,6 +202,29 @@ pub struct ToPrimitiveOut {
 pub struct MeshIn {
     /// Mesh id or name.
     pub object: ObjRef,
+}
+
+/// One triangle of a scan that has a deviation map.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AtIn {
+    /// Scan mesh with a deviation map (`deviation.compute` with `show`).
+    pub object: ObjRef,
+    /// Triangle of the scan mesh (the triangle a pick reports).
+    pub triangle: u32,
+}
+
+/// The deviation at one triangle.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct AtOut {
+    /// Scan mesh.
+    pub id: ObjectId,
+    /// Triangle.
+    pub triangle: u32,
+    /// Mean signed deviation of its counted corners (mm); null when no corner is counted.
+    pub deviation: Option<f64>,
+    /// Corners counted (0 to 3); the others are not measured or not facing the reference.
+    pub counted_corners: usize,
 }
 
 /// Cleared.
@@ -353,13 +382,20 @@ fn compute(s: &mut Session, i: ComputeIn) -> CmdResult<ComputeOut> {
     let (against, _) = i.against.resolve_any(s)?;
     let m = measure(s, id, region, against, maxd, tol * 0.05, i.facing)?;
     let stats = stats_of(&m.samples, tol);
+    let band_tolerances: Vec<f64> = BAND_SCALES.iter().map(|k| k * tol).collect();
+    let rep = distribution(&m.samples, tol, &band_tolerances);
+    let values = counted_values(&m.samples);
     if i.show {
-        s.overlays.insert(id, Arc::new(colorize(&counted_values(&m.samples), tol)));
+        let colours = colorize(&values, tol);
+        let stored: Vec<f32> = values.iter().map(|&d| d as f32).collect();
+        if !s.insert_map(id, colours, stored) {
+            return Err(CmdError::Params(format!("no mesh {id}")));
+        }
     }
     let noise = estimate_noise(&m.mesh);
     let warning =
         (noise > tol).then(|| format!("tolerance {tol} mm is below the estimated scan noise σ ≈ {noise:.3} mm"));
-    Ok(ComputeOut { id, stats, warning })
+    Ok(ComputeOut { id, stats, report: rep, warning })
 }
 
 fn stats_cmd(s: &Session, i: StatsIn) -> CmdResult<StatsOut> {
@@ -411,7 +447,34 @@ fn to_primitive_cmd(s: &Session, i: ToPrimitiveIn) -> CmdResult<ToPrimitiveOut> 
 /// One mesh: its colour map is removed.
 fn clear(s: &mut Session, i: MeshIn) -> CmdResult<ClearOut> {
     let id = i.object.resolve(s, ObjectKind::Mesh)?;
-    Ok(ClearOut { id, cleared: s.overlays.remove(&id).is_some() })
+    Ok(ClearOut { id, cleared: s.drop_map(id) })
+}
+
+/// The mean signed deviation of the counted corners of one triangle of a mapped scan. The map must
+/// still be valid for the scan's geometry (see `Session::live_map`).
+fn at_cmd(s: &Session, i: AtIn) -> CmdResult<AtOut> {
+    let id = i.object.resolve(s, ObjectKind::Mesh)?;
+    let map = s.live_map(id).ok_or_else(|| {
+        CmdError::Failed(format!("{id} has no current deviation map: run deviation.compute with show"))
+    })?;
+    let values = &map.values;
+    let mesh = s.doc.mesh(id).ok_or_else(|| CmdError::Params(format!("no mesh {id}")))?;
+    if values.len() != mesh.mesh.vertex_count() {
+        return Err(CmdError::Failed(format!("the deviation map of {id} does not fit its mesh")));
+    }
+    let corners = mesh
+        .mesh
+        .triangles
+        .get(i.triangle as usize)
+        .ok_or_else(|| CmdError::Params(format!("triangle {} is not on {id}", i.triangle)))?;
+    let counted: Vec<f64> = corners
+        .iter()
+        .filter_map(|&vi| values.get(vi as usize))
+        .map(|&d| f64::from(d))
+        .filter(|d| d.is_finite())
+        .collect();
+    let deviation = (!counted.is_empty()).then(|| counted.iter().sum::<f64>() / counted.len() as f64);
+    Ok(AtOut { id, triangle: i.triangle, deviation, counted_corners: counted.len() })
 }
 
 fn noise(s: &mut Session, i: MeshIn) -> CmdResult<NoiseOut> {
@@ -449,6 +512,15 @@ pub static COMMANDS: &[CommandSpec] = &[
         MeshIn,
         ClearOut,
         clear
+    ),
+    read_command!(
+        "deviation.at",
+        "Deviation at a triangle",
+        "Analyze",
+        "Signed deviation of triangle `triangle` of the scan `object` from its deviation map: the mean of its counted corners in mm, null when none is counted. Needs a map made with `show`.",
+        AtIn,
+        AtOut,
+        at_cmd
     ),
     command!(
         "deviation.noise",
