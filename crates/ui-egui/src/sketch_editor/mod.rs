@@ -110,6 +110,30 @@ impl Tool {
         }
     }
 
+    /// The icon of the tool in the sketch toolbar.
+    #[must_use]
+    pub fn icon(self) -> &'static str {
+        match self {
+            Tool::Select => "tool-navigate",
+            Tool::Line => "sk-line",
+            Tool::Polyline => "sk-polyline",
+            Tool::Arc3 => "sk-arc3",
+            Tool::ArcCentre => "sk-arc-centre",
+            Tool::Circle => "sk-circle",
+            Tool::Rect => "sk-rect",
+            Tool::Horizontal => "sk-horizontal",
+            Tool::Vertical => "sk-vertical",
+            Tool::Parallel => "sk-parallel",
+            Tool::Perpendicular => "sk-perpendicular",
+            Tool::Tangent => "sk-tangent",
+            Tool::Coincident => "sk-coincident",
+            Tool::Equal => "sk-equal",
+            Tool::Fix => "sk-fix",
+            Tool::Dimension => "sk-dimension",
+            Tool::Angle => "sk-angle",
+        }
+    }
+
     /// The catalogue key of the hint shown while the tool is active.
     #[must_use]
     pub fn hint_key(self) -> &'static str {

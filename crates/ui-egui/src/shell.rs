@@ -1,12 +1,11 @@
-//! The window shell: menu bar, toolbar, status bar, the dock area and the settings the shell
-//! saves. Controls ask for meaning (theme tokens, catalogue keys, density metrics); the shell
+//! The window shell: the menu bar with its quick-access buttons, the ribbon ([`crate::ribbon`]),
+//! the status bar, the dock area and the settings the shell saves. Controls ask for meaning (theme tokens, catalogue keys, density metrics); the shell
 //! turns a click into an [`AppAction`] and performs it as engine commands.
 use crate::app::SurfaceCraftApp;
 use crate::dock::{self, Panel};
 use crate::i18n::{self, Lang, t};
 use crate::theme::{self, Density, Preset};
 use craft_ui::docking::DockArea;
-use craft_ui::layout::fit_toolbar;
 use serde_json::Value;
 #[cfg(not(target_arch = "wasm32"))]
 use serde_json::json;
@@ -37,6 +36,14 @@ pub enum AppAction {
     FitAll,
     /// Restore the default dock layout.
     ResetLayout,
+    /// Load a small sample part to try the tools on.
+    SampleScan,
+    /// Put the keyboard in the ribbon's search field.
+    SearchTools,
+    /// Close the open tool and show the guide.
+    ShowGuide,
+    /// Show or hide the command log.
+    ToggleLog,
 }
 
 impl AppAction {
@@ -55,6 +62,65 @@ impl AppAction {
             AppAction::Redo => "action.redo",
             AppAction::FitAll => "action.fit_all",
             AppAction::ResetLayout => "action.reset_layout",
+            AppAction::SampleScan => "action.sample_scan",
+            AppAction::SearchTools => "action.search_tools",
+            AppAction::ShowGuide => "action.show_guide",
+            AppAction::ToggleLog => "action.toggle_log",
+        }
+    }
+
+    /// Every action (catalogue checks).
+    pub const ALL: [AppAction; 15] = [
+        AppAction::New,
+        AppAction::Open,
+        AppAction::Save,
+        AppAction::ImportMesh,
+        AppAction::ImportStep,
+        AppAction::ExportStep,
+        AppAction::ExportMesh,
+        AppAction::Undo,
+        AppAction::Redo,
+        AppAction::FitAll,
+        AppAction::ResetLayout,
+        AppAction::SampleScan,
+        AppAction::SearchTools,
+        AppAction::ShowGuide,
+        AppAction::ToggleLog,
+    ];
+
+    /// The catalogue key of the action's short name (a ribbon button, a welcome button).
+    #[must_use]
+    pub fn short_key(self) -> &'static str {
+        match self {
+            AppAction::ImportMesh => "action.import_mesh.short",
+            AppAction::ImportStep => "action.import_step.short",
+            AppAction::ExportStep => "action.export_step.short",
+            AppAction::ExportMesh => "action.export_mesh.short",
+            AppAction::Open => "action.open.short",
+            AppAction::Save => "action.save.short",
+            other => other.label_key(),
+        }
+    }
+
+    /// The catalogue key of the sentence that says what the action does (its tooltip).
+    #[must_use]
+    pub fn hint_key(self) -> &'static str {
+        match self {
+            AppAction::New => "action.new.hint",
+            AppAction::Open => "action.open.hint",
+            AppAction::Save => "action.save.hint",
+            AppAction::ImportMesh => "action.import_mesh.hint",
+            AppAction::ImportStep => "action.import_step.hint",
+            AppAction::ExportStep => "action.export_step.hint",
+            AppAction::ExportMesh => "action.export_mesh.hint",
+            AppAction::Undo => "action.undo.hint",
+            AppAction::Redo => "action.redo.hint",
+            AppAction::FitAll => "action.fit_all.hint",
+            AppAction::ResetLayout => "action.reset_layout.hint",
+            AppAction::SampleScan => "action.sample_scan.hint",
+            AppAction::SearchTools => "action.search_tools.hint",
+            AppAction::ShowGuide => "action.show_guide.hint",
+            AppAction::ToggleLog => "action.toggle_log.hint",
         }
     }
 
@@ -70,6 +136,10 @@ impl AppAction {
             AppAction::Undo => Some("undo"),
             AppAction::Redo => Some("redo"),
             AppAction::FitAll => Some("fit"),
+            AppAction::SampleScan => Some("sample"),
+            AppAction::SearchTools => Some("search"),
+            AppAction::ShowGuide => Some("guide"),
+            AppAction::ToggleLog => Some("log"),
             AppAction::ResetLayout => None,
         }
     }
@@ -93,18 +163,18 @@ pub enum DialogThen {
     ExportMesh(surfacecraft_doc::ObjectId),
 }
 
-/// The toolbar's groups, in order; a group is never split by the overflow menu.
-const TOOLBAR: [&[AppAction]; 4] = [
-    &[AppAction::New, AppAction::Open, AppAction::Save],
-    &[AppAction::ImportMesh, AppAction::ExportMesh],
-    &[AppAction::Undo, AppAction::Redo],
-    &[AppAction::FitAll],
-];
+/// The quick-access buttons beside the menus: what is used all the time, whatever the stage.
+const QUICK_ACCESS: [AppAction; 3] = [AppAction::Save, AppAction::Undo, AppAction::Redo];
+
+/// The sample part of the welcome card: the synthetic bracket (a block with a boss and a dome).
+const SAMPLE_SHAPE: &str = "bracket";
 
 impl SurfaceCraftApp {
     /// Installs fonts-independent context state once and re-applies the theme when it changed.
     pub fn prepare(&mut self, ctx: &egui::Context) {
         i18n::set_lang(self.settings.lang);
+        // the browser says which keyboard it runs on; the desktop build knows from its target
+        i18n::set_mac_keys(matches!(ctx.os(), egui::os::OperatingSystem::Mac | egui::os::OperatingSystem::IOS));
         if self.ctx.is_none() {
             self.ctx = Some(ctx.clone());
         }
@@ -114,6 +184,14 @@ impl SurfaceCraftApp {
         }
         let key = (self.settings.theme, self.settings.lang);
         if self.applied != Some(key) {
+            // The status line follows the language: the idle text is translated (the app starts
+            // before the language is known), and a message written in the language just left
+            // gives way to the idle text instead of staying on screen in the wrong language.
+            let was = self.applied.map(|(_, lang)| lang);
+            let idle = Lang::ALL.iter().any(|l| self.status == i18n::lookup(*l, "status.ready"));
+            if idle || was.is_some_and(|lang| lang != self.settings.lang) {
+                self.status = t("status.ready").to_string();
+            }
             theme::apply(ctx, &self.settings.theme);
             self.tokens = theme::Tokens::resolve(self.settings.theme.preset);
             self.applied = Some(key);
@@ -131,9 +209,19 @@ impl SurfaceCraftApp {
         #[cfg(target_arch = "wasm32")]
         self.poll_inbox();
         self.shortcuts(ui);
-        egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui));
-        egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
-        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
+        // decided before anything is drawn, so a key that ends a pick or leaves a text field
+        // this frame does not also confirm or close the tool
+        self.keys_free = !(ui.memory(|m| m.focused().is_some())
+            || egui::Popup::is_any_open(ui.ctx())
+            || ui.input(|i| i.pointer.any_down())
+            || self.field_pick.is_some()
+            || self.sketch_editing()
+            || !self.tools.lasso.is_empty());
+        let tokens = self.tokens.clone();
+        let chrome = |x: i8, y: i8| theme::chrome_frame(&tokens, egui::Margin::symmetric(x, y));
+        egui::Panel::top("menu").frame(chrome(6, 2)).show_separator_line(false).show(ui, |ui| self.menu_bar(ui));
+        egui::Panel::top("ribbon").frame(chrome(6, 3)).show(ui, |ui| self.ribbon(ui));
+        egui::Panel::bottom("status").frame(chrome(8, 3)).show(ui, |ui| self.status_bar(ui));
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.dock_area(ui));
     }
 
@@ -199,6 +287,18 @@ impl SurfaceCraftApp {
             AppAction::FitAll => self.fit_pending = true,
             AppAction::ResetLayout => {
                 self.workspace = dock::default_workspace(self.settings.theme.density.metrics().side_dock_width);
+            }
+            AppAction::SampleScan => {
+                let _ = self.run_command("mesh.synth", serde_json::json!({"shape": SAMPLE_SHAPE, "name": "sample"}));
+                self.fit_pending = true;
+            }
+            AppAction::SearchTools => self.focus_search = true,
+            AppAction::ShowGuide => self.close_tool(),
+            AppAction::ToggleLog => {
+                let shown = self.workspace.layout.contains(&Panel::Log);
+                if let Err(e) = dock::set_visible(&mut self.workspace, Panel::Log, !shown) {
+                    self.status = crate::i18n::tf("status.dock_rejected", &[("error", &e)]);
+                }
             }
             other => self.perform_file_action(other),
         }
@@ -293,6 +393,8 @@ impl SurfaceCraftApp {
         }
     }
 
+    /// The menu bar: File, Edit, View, Tools (every tool, by stage) and Help, then the
+    /// quick-access buttons.
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button(t("menu.file"), |ui| {
@@ -305,6 +407,8 @@ impl SurfaceCraftApp {
                 ui.separator();
                 self.action_item(ui, AppAction::ImportMesh);
                 self.action_item(ui, AppAction::ImportStep);
+                self.action_item(ui, AppAction::SampleScan);
+                ui.separator();
                 self.action_item(ui, AppAction::ExportStep);
                 self.action_item(ui, AppAction::ExportMesh);
             });
@@ -313,29 +417,71 @@ impl SurfaceCraftApp {
                 self.action_item(ui, AppAction::Redo);
             });
             ui.menu_button(t("menu.view"), |ui| self.view_menu(ui));
-            // one menu per command group: every command is reachable from the menus too
-            let mut groups: Vec<&'static str> = self.session.commands().iter().map(|c| c.group).collect();
-            groups.sort_unstable();
-            groups.dedup();
-            for g in groups.into_iter().filter(|g| !matches!(*g, "File" | "Edit" | "View" | "App")) {
-                let label = i18n::find(&format!("group.{g}")).unwrap_or(g).to_string();
-                ui.menu_button(label, |ui| {
-                    if g == "Sketch" {
-                        self.sketch_menu_items(ui);
-                    }
-                    for c in self.session.commands().iter().filter(|c| c.group == g) {
-                        if ui.button(c.label).on_hover_text(c.summary).clicked() {
-                            self.choose_command(c.id);
-                            ui.close();
-                        }
-                    }
-                });
-            }
+            ui.menu_button(t("menu.tools"), |ui| self.tools_menu(ui));
+            ui.menu_button(t("menu.help"), |ui| {
+                self.action_item(ui, AppAction::ShowGuide);
+                self.action_item(ui, AppAction::SearchTools);
+                ui.separator();
+                ui.label(t("help.mouse"));
+                ui.weak(t("help.mouse.orbit"));
+                ui.weak(t("help.mouse.pan"));
+                ui.weak(t("help.mouse.zoom"));
+                ui.weak(t("help.mouse.pick"));
+            });
+            ui.add_space(8.0);
+            ui.separator();
+            self.quick_access(ui);
         });
+    }
+
+    /// The Tools menu: every tool of the engine, one submenu per stage in the order of the work
+    /// (what the ribbon shows, in list form).
+    fn tools_menu(&mut self, ui: &mut egui::Ui) {
+        self.action_item(ui, AppAction::SearchTools);
+        ui.separator();
+        for stage in crate::workflow::Stage::ALL {
+            ui.menu_button(t(stage.title_key()), |ui| {
+                if stage == crate::workflow::Stage::Sketch {
+                    self.sketch_menu_items(ui);
+                }
+                for c in stage.all(self.session.commands()) {
+                    let name = crate::workflow::label_of(c);
+                    if ui.button(name).on_hover_text(crate::workflow::hint_of(c)).clicked() {
+                        self.choose_command(c.id);
+                        ui.close();
+                    }
+                }
+            });
+        }
+    }
+
+    /// The quick-access buttons beside the menus.
+    fn quick_access(&mut self, ui: &mut egui::Ui) {
+        let m = self.settings.theme.density.metrics();
+        let style = theme::icon_button_style(&self.tokens);
+        let side = m.icon_button - 4.0;
+        let inset = ((side - m.icon) / 2.0).max(0.0);
+        let mut clicked: Option<AppAction> = None;
+        for action in QUICK_ACCESS {
+            let Some(icon) = action.icon() else { continue };
+            ui.add_enabled_ui(self.enabled(action), |ui| {
+                let label = t(action.label_key());
+                let r = craft_ui::buttons::IconButton::new(label, egui::Vec2::splat(side), &style)
+                    .show(ui, |ui, rect, tint| crate::icons::paint(ui, rect.shrink(inset), icon, tint))
+                    .on_hover_text(t(action.hint_key()));
+                if r.clicked() {
+                    clicked = Some(action);
+                }
+            });
+        }
+        if let Some(action) = clicked {
+            self.perform(action);
+        }
     }
 
     fn view_menu(&mut self, ui: &mut egui::Ui) {
         self.action_item(ui, AppAction::FitAll);
+        self.action_item(ui, AppAction::ToggleLog);
         ui.separator();
         ui.menu_button(t("menu.panels"), |ui| {
             for panel in Panel::ALL.into_iter().filter(|p| p.closable()) {
@@ -366,64 +512,38 @@ impl SurfaceCraftApp {
         self.action_item(ui, AppAction::ResetLayout);
     }
 
-    /// The toolbar: icon buttons from the catalogue, grouped, with an overflow menu for the groups
-    /// that do not fit.
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
-        let m = self.settings.theme.density.metrics();
-        let spacing = m.item_spacing.x;
-        let sep = spacing * 3.0;
-        let natural: Vec<f32> =
-            TOOLBAR.iter().map(|g| g.len() as f32 * m.icon_button + (g.len() as f32 - 1.0) * spacing + sep).collect();
-        let overflow_width = 70.0;
-        let fit = fit_toolbar(&natural, ui.available_width(), spacing, overflow_width);
-        let shown = fit.as_ref().map_or(TOOLBAR.len(), |f| f.shown.len());
-        let style = theme::icon_button_style(&self.tokens);
-        let inset = ((m.icon_button - m.icon) / 2.0).max(0.0);
-        let mut clicked: Option<AppAction> = None;
-        ui.horizontal(|ui| {
-            for group in TOOLBAR.iter().take(shown) {
-                for &action in *group {
-                    let Some(icon) = action.icon() else { continue };
-                    ui.add_enabled_ui(self.enabled(action), |ui| {
-                        let label = t(action.label_key());
-                        let r = craft_ui::buttons::IconButton::new(label, egui::Vec2::splat(m.icon_button), &style)
-                            .show(ui, |ui, rect, tint| crate::icons::paint(ui, rect.shrink(inset), icon, tint))
-                            .on_hover_text(label);
-                        if r.clicked() {
-                            clicked = Some(action);
-                        }
-                    });
-                }
-                ui.add_space(sep - spacing);
-                ui.separator();
-            }
-            if shown < TOOLBAR.len() {
-                ui.menu_button(t("toolbar.more"), |ui| {
-                    for group in TOOLBAR.iter().skip(shown) {
-                        for &action in *group {
-                            if ui.add_enabled(self.enabled(action), egui::Button::new(t(action.label_key()))).clicked()
-                            {
-                                clicked = Some(action);
-                                ui.close();
-                            }
-                        }
-                    }
-                });
-            }
-        });
-        if let Some(action) = clicked {
-            self.perform(action);
-        }
-    }
-
+    /// The status bar: the last message, what the pointer does in the viewport now, and the
+    /// number of objects.
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(&self.status);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let n = self.session.doc.summaries().len();
                 ui.weak(crate::i18n::tf("status.objects", &[("n", &n.to_string())]));
+                ui.separator();
+                ui.add(egui::Label::new(egui::RichText::new(t(self.pointer_hint_key())).weak()).truncate());
             });
         });
+    }
+
+    /// The catalogue key of the sentence that says what the mouse does in the viewport now.
+    #[must_use]
+    pub fn pointer_hint_key(&self) -> &'static str {
+        use crate::viewtools::Tool;
+        if self.sketch_editing() {
+            return "hint.sketch";
+        }
+        if self.field_pick.is_some() {
+            return "hint.field_pick";
+        }
+        match self.tools.tool {
+            Tool::Navigate => "hint.navigate",
+            Tool::Brush => "hint.brush",
+            Tool::Lasso => "hint.lasso",
+            Tool::Smart => "hint.smart",
+            Tool::Faces | Tool::Edges => "hint.brep",
+            Tool::Move | Tool::Rotate => "hint.gizmo",
+        }
     }
 }
 
