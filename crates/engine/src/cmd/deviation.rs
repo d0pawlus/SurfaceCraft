@@ -14,13 +14,20 @@ use surfacecraft_fit::Primitive;
 use surfacecraft_geom::{Bvh, Mesh, Point3, Vec3};
 
 /// Default colour-map tolerance and hotspot tolerance (mm).
-const TOLERANCE: f64 = 0.1;
+pub(crate) const TOLERANCE: f64 = 0.1;
 /// Default reach of a mesh or body reference: points farther away are not measured (mm).
-const REACH: f64 = 5.0;
+pub(crate) const REACH: f64 = 5.0;
 /// Most hotspot groups one answer lists.
 const MAX_LIMIT: usize = 10_000;
+/// Scanner noise σ (mm) above which a warning is due, and above which the primitive tolerance is
+/// not met (design doc §10).
+pub(crate) const NOISE_WARNING_MM: f64 = 0.05;
+pub(crate) const NOISE_PRIMITIVE_MM: f64 = 0.1;
+/// Chord tolerance bounds (mm) of a body reference: a hostile tolerance cannot ask for an enormous
+/// tessellation.
+pub(crate) const CHORD_BOUNDS: (f64, f64) = (1e-4, 10.0);
 
-fn yes() -> bool {
+pub(crate) fn yes() -> bool {
     true
 }
 
@@ -211,7 +218,7 @@ pub struct NoiseOut {
     pub advice: String,
 }
 
-fn positive(v: f64, what: &str) -> CmdResult<f64> {
+pub(crate) fn positive(v: f64, what: &str) -> CmdResult<f64> {
     if v.is_finite() && v > 0.0 { Ok(v) } else { Err(CmdError::Params(format!("{what} must be positive"))) }
 }
 
@@ -309,7 +316,7 @@ fn measure(
         Some(ObjectKind::Body) => {
             let b = s.doc.body(against).ok_or_else(|| CmdError::Params(format!("no body {against}")))?;
             // bounded, so that a hostile tolerance cannot ask for an enormous tessellation
-            let chord = tess.clamp(1e-4, 10.0);
+            let chord = tess.clamp(CHORD_BOUNDS.0, CHORD_BOUNDS.1);
             let t = surfacecraft_kernel::tess::tessellate(&b.brep, Some(chord))?;
             samples_mesh(&pts, ns, &Bvh::build(&t), max_distance)
         }
@@ -411,10 +418,10 @@ fn noise(s: &mut Session, i: MeshIn) -> CmdResult<NoiseOut> {
     let id = i.object.resolve(s, ObjectKind::Mesh)?;
     let m = s.doc.mesh(id).map(|m| m.mesh.clone()).ok_or_else(|| CmdError::Params(format!("no mesh {id}")))?;
     let sigma = estimate_noise(&m);
-    let advice = if sigma > 0.1 {
-        "noise is above the 0.1 mm primitive tolerance: expect RMS above it".to_string()
-    } else if sigma > 0.05 {
-        "noise is above the 0.05 mm warning level".to_string()
+    let advice = if sigma > NOISE_PRIMITIVE_MM {
+        format!("noise is above the {NOISE_PRIMITIVE_MM} mm primitive tolerance: expect RMS above it")
+    } else if sigma > NOISE_WARNING_MM {
+        format!("noise is above the {NOISE_WARNING_MM} mm warning level")
     } else {
         "noise is below the default tolerances".to_string()
     };
