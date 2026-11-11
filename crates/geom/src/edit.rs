@@ -111,9 +111,69 @@ pub(crate) fn vertex_rings(mesh: &Mesh) -> Vec<Vec<u32>> {
     ring
 }
 
+/// A ring point this many times the median distance from the ring's middle may be a spike
+/// itself.
+const RING_STRAY_FACTOR: f64 = 2.0;
+/// The points a plane is fitted to are spread enough when their second principal extent is at
+/// least this share of the first (points nearly in a line give no plane).
+const RING_MIN_SPREAD: f64 = 0.2;
+
+/// Least-squares plane of `pts` as (centroid, unit normal, mean distance to the centroid, ratio
+/// of the second to the first principal extent).
+fn ring_plane(pts: &[Point3]) -> Option<(Vec3, Vec3, f64, f64)> {
+    if pts.len() < 3 {
+        return None;
+    }
+    let c = pts.iter().fold(Vec3::zeros(), |a, p| a + p.coords) / pts.len() as f64;
+    let mut cov = Matrix3::zeros();
+    let mut radius = 0.0;
+    for p in pts {
+        let d = p.coords - c;
+        cov += d * d.transpose();
+        radius += d.norm();
+    }
+    radius /= pts.len() as f64;
+    if !(radius > 0.0) {
+        return None;
+    }
+    let e = cov.symmetric_eigen();
+    let mut order = [0usize, 1, 2];
+    order.sort_by(|&a, &b| e.eigenvalues[a].total_cmp(&e.eigenvalues[b]));
+    let [least, mid, most] = order;
+    let spread = (e.eigenvalues[mid].max(0.0) / e.eigenvalues[most].max(f64::MIN_POSITIVE)).sqrt();
+    Some((c, e.eigenvectors.column(least).into_owned(), radius, spread))
+}
+
+/// Is `p` a spike that another spike in its ring `pts` hides? The other spike is a ring point
+/// far from the rest (more than [`RING_STRAY_FACTOR`] × the median distance from the ring's
+/// middle, the median of each coordinate). With it left out the rest must still span a plane,
+/// `p` must be farther from that plane than `ratio` × the whole ring's radius, and the point
+/// left out must be off the plane as well (a far point that lies in the plane is no spike: rings
+/// of thin triangles have those).
+fn hidden_spike(pts: &[Point3], p: &Point3, ratio: f64, ring_radius: f64) -> bool {
+    let median = |mut v: Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v.get(v.len() / 2).copied().unwrap_or(0.0)
+    };
+    let mid = Point3::new(
+        median(pts.iter().map(|q| q.x).collect()),
+        median(pts.iter().map(|q| q.y).collect()),
+        median(pts.iter().map(|q| q.z).collect()),
+    );
+    let reach = RING_STRAY_FACTOR * median(pts.iter().map(|q| (q - mid).norm()).collect());
+    pts.iter().enumerate().filter(|(_, q)| (*q - mid).norm() > reach).any(|(j, q)| {
+        let rest: Vec<Point3> = pts.iter().enumerate().filter(|(k, _)| *k != j).map(|(_, r)| *r).collect();
+        let Some((c, n, radius, spread)) = ring_plane(&rest) else { return false };
+        spread >= RING_MIN_SPREAD
+            && (p.coords - c).dot(&n).abs() > ratio * ring_radius
+            && (q.coords - c).dot(&n).abs() > ratio * radius
+    })
+}
+
 /// Removes spikes: vertices farther from the least-squares plane of their one ring than
-/// `ratio` × the ring's radius. Triangles touching them are removed (the holes left behind can
-/// be filled with [`fill_holes`]). Returns the number of triangles removed.
+/// `ratio` × the ring's radius, and spikes that a spike next to them hides from that test (see
+/// [`hidden_spike`]). Triangles touching them are removed (the holes
+/// left behind can be filled with [`fill_holes`]). Returns the number of triangles removed.
 pub fn remove_outliers(mesh: &mut Mesh, ratio: f64) -> usize {
     if mesh.validate().is_err() {
         return 0;
@@ -123,35 +183,9 @@ pub fn remove_outliers(mesh: &mut Mesh, ratio: f64) -> usize {
     let positions = &mesh.positions;
     let bad: Vec<bool> = crate::par::map(ring.len(), |i| {
         let Some(r) = ring.get(i) else { return false };
-        if r.len() < 3 {
-            return false;
-        }
         let pts: Vec<Point3> = r.iter().filter_map(|&j| positions.get(j as usize).copied()).collect();
-        if pts.len() < 3 {
-            return false;
-        }
-        let c = pts.iter().fold(Vec3::zeros(), |a, p| a + p.coords) / pts.len() as f64;
-        let mut cov = Matrix3::zeros();
-        let mut radius = 0.0;
-        for p in &pts {
-            let d = p.coords - c;
-            cov += d * d.transpose();
-            radius += d.norm();
-        }
-        radius /= pts.len() as f64;
-        if !(radius > 0.0) {
-            return false;
-        }
-        let e = cov.symmetric_eigen();
-        let mut k = 0;
-        for j in 1..3 {
-            if e.eigenvalues[j] < e.eigenvalues[k] {
-                k = j;
-            }
-        }
-        let n = e.eigenvectors.column(k).into_owned();
-        let Some(p) = positions.get(i) else { return false };
-        (p.coords - c).dot(&n).abs() > ratio * radius
+        let (Some((c, n, radius, _)), Some(p)) = (ring_plane(&pts), positions.get(i)) else { return false };
+        (p.coords - c).dot(&n).abs() > ratio * radius || hidden_spike(&pts, p, ratio, radius)
     });
     let before = mesh.triangles.len();
     mesh.triangles.retain(|t| !t.iter().any(|&v| bad[v as usize]));
@@ -227,11 +261,22 @@ pub struct FillReport {
 }
 
 /// Fills boundary loops with at most `max_edges` edges. `smooth` refines and fairs the patch so
-/// it follows the surrounding curvature; otherwise the patch is flat (ear clipping only).
+/// it follows the surrounding curvature, and keeps the sharp edges and corners the hole lies
+/// over; otherwise the patch is flat (ear clipping only).
 pub fn fill_holes(mesh: &mut Mesh, max_edges: usize, smooth: bool) -> FillReport {
+    fill_holes_with(mesh, max_edges, smooth, smooth)
+}
+
+/// [`fill_holes`], with the keeping of sharp edges (`sharpen`, only with `smooth`) on its own
+/// switch.
+pub(crate) fn fill_holes_with(mesh: &mut Mesh, max_edges: usize, smooth: bool, sharpen: bool) -> FillReport {
     let mut rep = FillReport::default();
     let max_edges = max_edges.clamp(3, 4000);
-    for lp in boundary_loops(mesh) {
+    let loops = boundary_loops(mesh);
+    // the surface around every hole is read from the mesh as it is before any is filled
+    let around =
+        (smooth && sharpen && loops.iter().any(|lp| lp.len() <= max_edges)).then(|| crate::crease::Around::new(mesh));
+    for lp in loops {
         if lp.len() > max_edges {
             rep.skipped += 1;
             continue;
@@ -239,12 +284,16 @@ pub fn fill_holes(mesh: &mut Mesh, max_edges: usize, smooth: bool) -> FillReport
         // fill triangles run against the loop direction
         let rev: Vec<u32> = lp.iter().rev().copied().collect();
         let first_new = mesh.triangles.len();
+        let first_vertex = mesh.positions.len();
         let ok = ear_clip(mesh, &rev);
         if !ok {
             fan_fill(mesh, &rev);
         }
         if smooth {
             refine_and_fair(mesh, first_new, &lp);
+            if let Some(around) = &around {
+                crate::crease::sharpen_patch(mesh, around, first_new, first_vertex, &lp);
+            }
         }
         rep.filled += 1;
         rep.added_triangles += mesh.triangles.len() - first_new;
@@ -996,6 +1045,28 @@ mod tests {
         assert_eq!(r.filled, 1);
         assert!(boundary_loops(&m).is_empty());
         assert!((m.area() - 6.0 * 400.0).abs() < 1e-6, "{}", m.area());
+    }
+
+    /// Two spikes next to each other are in each other's ring; neither may hide the other.
+    #[test]
+    fn neighbouring_spikes_both_go() {
+        let mut m = synth::cuboid(Point3::origin(), Vec3::new(20.0, 20.0, 20.0), 8);
+        m.weld(1e-9);
+        for (x, lift) in [(10.0, 10.4), (12.5, 7.8)] {
+            let i = m
+                .positions
+                .iter()
+                .position(|p| (p.z - 20.0).abs() < 1e-9 && (p.x - x).abs() < 1e-9 && (p.y - 10.0).abs() < 1e-9)
+                .unwrap();
+            m.positions[i].z += lift;
+        }
+        assert!(remove_outliers(&mut m, 1.5) > 0);
+        let high = m.positions.iter().filter(|p| p.z > 20.5).count();
+        assert_eq!(high, 0, "{high} spike vertices are left");
+        // creases and corners of the clean box are still not outliers
+        let mut clean = synth::cuboid(Point3::origin(), Vec3::new(20.0, 20.0, 20.0), 8);
+        clean.weld(1e-9);
+        assert_eq!(remove_outliers(&mut clean, 1.5), 0);
     }
 
     #[test]
