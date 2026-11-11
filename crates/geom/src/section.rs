@@ -519,57 +519,88 @@ pub fn stack(mesh: &Mesh, frame: &PlaneFrame, start: f64, step: f64, count: usiz
     StackReport { frame: frame.clone(), levels, trend }
 }
 
-/// Is `p` within `tol` of the segment `a`–`b`?
-fn near_segment(p: [f64; 2], a: [f64; 2], b: [f64; 2], tol: f64) -> bool {
+/// Distance from `p` to the segment `a`–`b`.
+fn segment_distance(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
     let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
     let len2 = dx * dx + dy * dy;
     let t = if len2 > 0.0 { (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
-    let (ex, ey) = (a[0] + t * dx - p[0], a[1] + t * dy - p[1]);
-    ex.hypot(ey) <= tol
+    (a[0] + t * dx - p[0]).hypot(a[1] + t * dy - p[1])
 }
 
-/// Drops the vertices of a plane chain that lie within `tol` (mm) of the segment joining their
-/// neighbours, so the collinear runs a section of a planar face gives become single edges. The
-/// seam of a closed chain is simplified too; the remaining points keep their order.
+/// Marks the points of the run `first..=last` that a polyline within `tol` of every point of the
+/// run has to keep (Ramer–Douglas–Peucker, without recursion). The ends are the caller's.
+fn keep_run(points: &[[f64; 2]], first: usize, last: usize, tol: f64, keep: &mut [bool]) {
+    let mut runs = vec![(first, last)];
+    while let Some((i, j)) = runs.pop() {
+        let (Some(&a), Some(&b)) = (points.get(i), points.get(j)) else { continue };
+        let mut worst = (tol, None);
+        for (k, &p) in points.iter().enumerate().take(j).skip(i + 1) {
+            let d = segment_distance(p, a, b);
+            if d > worst.0 {
+                worst = (d, Some(k));
+            }
+        }
+        if let Some(k) = worst.1 {
+            if let Some(flag) = keep.get_mut(k) {
+                *flag = true;
+            }
+            runs.push((i, k));
+            runs.push((k, j));
+        }
+    }
+}
+
+/// The point of `points` farthest from `from` (the first one on a tie or without a finite
+/// distance).
+fn farthest(points: &[[f64; 2]], from: [f64; 2]) -> usize {
+    let mut best = (0.0_f64, 0_usize);
+    for (k, p) in points.iter().enumerate() {
+        let d = (p[0] - from[0]).hypot(p[1] - from[1]);
+        if d > best.0 {
+            best = (d, k);
+        }
+    }
+    best.1
+}
+
+/// Drops vertices of a plane chain so that every dropped vertex stays within `tol` (mm) of the
+/// simplified chain: the collinear runs a section of a planar face gives become single edges and
+/// a dense curve keeps its shape. A closed chain is split at two extreme points, so a start that
+/// lies inside a straight run is dropped too; the remaining points keep their order.
 #[must_use]
 pub fn simplify(points: &[[f64; 2]], closed: bool, tol: f64) -> Vec<[f64; 2]> {
-    let mut out: Vec<[f64; 2]> = Vec::with_capacity(points.len());
-    for &p in points {
-        loop {
-            let n = out.len();
-            let (Some(&a), Some(&b)) = (n.checked_sub(2).and_then(|i| out.get(i)), out.last()) else { break };
-            if !near_segment(b, a, p, tol) {
-                break;
-            }
-            out.pop();
-        }
-        out.push(p);
+    let n = points.len();
+    let Some(&start) = points.first() else { return Vec::new() };
+    if n < 3 {
+        return points.to_vec();
     }
-    if closed {
-        loop {
-            let n = out.len();
-            if n < 3 {
-                break;
+    if !closed {
+        let mut keep = vec![false; n];
+        for k in [0, n - 1] {
+            if let Some(flag) = keep.get_mut(k) {
+                *flag = true;
             }
-            let (Some(&a), Some(&b), Some(&c)) = (out.get(n - 2), out.get(n - 1), out.first()) else { break };
-            if !near_segment(b, a, c, tol) {
-                break;
-            }
-            out.pop();
         }
-        loop {
-            let n = out.len();
-            if n < 3 {
-                break;
-            }
-            let (Some(&a), Some(&b), Some(&c)) = (out.get(n - 1), out.first(), out.get(1)) else { break };
-            if !near_segment(b, a, c, tol) {
-                break;
-            }
-            out.remove(0);
+        keep_run(points, 0, n - 1, tol, &mut keep);
+        return points.iter().zip(&keep).filter(|(_, k)| **k).map(|(p, _)| *p).collect();
+    }
+    // a point farthest from any point is a corner of the outline: start the loop there
+    let anchor = farthest(points, start);
+    let turned: Vec<[f64; 2]> = points.iter().cycle().skip(anchor).take(n + 1).copied().collect();
+    let opposite = turned.first().map_or(0, |&a| farthest(&turned, a));
+    let mut keep = vec![false; n + 1];
+    for k in [0, opposite] {
+        if let Some(flag) = keep.get_mut(k) {
+            *flag = true;
         }
     }
-    out
+    keep_run(&turned, 0, opposite, tol, &mut keep);
+    keep_run(&turned, opposite, n, tol, &mut keep);
+    // back to the order of `points`: `turned[k]` is `points[(k + anchor) % n]`
+    (0..n)
+        .filter(|i| keep.get((i + n - anchor) % n).copied().unwrap_or(false))
+        .filter_map(|i| points.get(i).copied())
+        .collect()
 }
 
 #[cfg(test)]
@@ -610,5 +641,34 @@ mod tests {
             [[0.0, 0.0], [5.0, 0.0], [10.0, 0.0], [10.0, 5.0], [10.0, 10.0], [5.0, 10.0], [0.0, 10.0], [0.0, 5.0]];
         assert!(fit_circle(&square).is_none());
         assert_eq!(simplify(&square, true, 1e-9).len(), 4);
+    }
+
+    /// Distance from `p` to the nearest edge of the chain `c`.
+    fn to_chain(p: [f64; 2], c: &[[f64; 2]], closed: bool) -> f64 {
+        let n = c.len();
+        let edges = if closed { n } else { n.saturating_sub(1) };
+        (0..edges).map(|i| segment_distance(p, c[i], c[(i + 1) % n])).fold(f64::INFINITY, f64::min)
+    }
+
+    /// A dense curve (point spacing below the tolerance) must not drift: every dropped point
+    /// stays within the tolerance of the simplified chain.
+    #[test]
+    fn simplify_keeps_a_dense_curve_within_tolerance() {
+        let (r, n, tol) = (10.0, 2000, 0.05);
+        let circle: Vec<[f64; 2]> =
+            (0..n).map(|i| TAU * f64::from(i) / f64::from(n)).map(|a| [r * a.cos(), r * a.sin()]).collect();
+        for closed in [true, false] {
+            let s = simplify(&circle, closed, tol);
+            let worst = circle.iter().map(|&p| to_chain(p, &s, closed)).fold(0.0, f64::max);
+            assert!(worst <= tol + 1e-12, "closed {closed}: {} points, worst {worst} mm", s.len());
+            assert!(s.len() >= 30 && s.len() < 200, "closed {closed}: {} points", s.len());
+        }
+        // the start of a closed chain inside a straight run is not kept as a corner
+        let square = [[5.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0], [0.0, 0.0], [2.0, 0.0]];
+        assert_eq!(simplify(&square, true, 1e-9), vec![[10.0, 0.0], [10.0, 10.0], [0.0, 10.0], [0.0, 0.0]]);
+        // degenerate and hostile input: no panic
+        assert_eq!(simplify(&[], true, 0.1).len(), 0);
+        assert_eq!(simplify(&[[1.0, 2.0]], true, 0.1).len(), 1);
+        assert!(simplify(&[[f64::NAN, 0.0], [0.0, f64::INFINITY], [1.0, 1.0], [2.0, 0.0]], true, f64::NAN).len() <= 4);
     }
 }
