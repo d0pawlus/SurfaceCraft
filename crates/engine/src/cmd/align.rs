@@ -36,7 +36,7 @@ fn apply_to(s: &mut Session, id: ObjectId, also: &[ObjRef], t: &Transform, apply
     }
     for i in ids {
         let m = s.doc.mesh_mut(i).ok_or_else(|| CmdError::Params(format!("no mesh {i}")))?;
-        m.mesh = Arc::new(m.mesh.transformed(t));
+        m.transform_rigid(t);
     }
     Ok(())
 }
