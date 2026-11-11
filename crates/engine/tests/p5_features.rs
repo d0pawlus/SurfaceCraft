@@ -117,7 +117,12 @@ fn draft_block_volume_and_suggestion() {
     s.execute("feature.edit", json!({"feature": r["id"], "set": {"angle_deg": 5.0}})).unwrap();
 
     // redesign assistant: scan the drafted part, take the +x wall, suggest the angle
-    s.execute("body.to_mesh", json!({"object": "blk", "chord": 0.01, "name": "scan"})).unwrap();
+    // the kernel meshes a flat wall with as few triangles as it needs, so the "scan" is that
+    // mesh refined to a 1 mm edge length
+    s.execute("body.to_mesh", json!({"object": "blk", "chord": 0.01, "name": "cad"})).unwrap();
+    let mut cad = (*s.doc.meshes.iter().find(|m| m.name == "cad").unwrap().mesh).clone();
+    cad.weld(1e-6);
+    s.doc.add_mesh("scan", surfacecraft_geom::synth::refine(&cad, |_| 1.0));
     let m = s.doc.meshes.iter().find(|m| m.name == "scan").unwrap().mesh.clone();
     let seed = m
         .triangles

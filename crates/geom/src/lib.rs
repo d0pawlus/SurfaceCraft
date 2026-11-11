@@ -15,6 +15,7 @@
 pub mod aabb;
 pub mod bvh;
 pub mod cloud;
+mod crease;
 pub mod edit;
 pub mod kdtree;
 pub mod lod;

@@ -143,10 +143,24 @@ fn check_solid(s: &mut Session, built: &Value, cad_volume: f64, faces: usize) ->
     (vol, max)
 }
 
-/// Part A: a 40 × 30 block, vertical edges filleted r = 5, with a wavy freeform top
-/// (CAD = box + fillet + split by a spline), scanned, segmented and rebuilt.
+/// Noise seeds of part A: the first is the one the gate has always run; with the other three the
+/// gate failed before spikes next to each other were removed and holes over sharp edges were
+/// filled with the edge (a top region that leaked down the walls, a filled bottom edge 0.27 mm
+/// off, a top patch fitted with no margin).
+const PART_A_SEEDS: [u64; 4] = [21, 8, 11, 12];
+
+/// Gate P3, part A, for every seed of [`PART_A_SEEDS`].
 #[test]
 fn gate_p3_block_with_freeform_top() {
+    for seed in PART_A_SEEDS {
+        eprintln!("part A, seed {seed}");
+        part_a(seed);
+    }
+}
+
+/// Part A: a 40 × 30 block, vertical edges filleted r = 5, with a wavy freeform top
+/// (CAD = box + fillet + split by a spline), scanned with noise `seed`, segmented and rebuilt.
+fn part_a(seed: u64) {
     let mut s = Session::new();
     s.execute("body.box", json!({"size": [40.0, 30.0, 20.0], "name": "block"})).unwrap();
     let edges = vertical_edges(&body_brep(&s, "block"));
@@ -159,7 +173,7 @@ fn gate_p3_block_with_freeform_top() {
     assert!((v_cad - v_exact).abs() / v_exact < 1e-3, "CAD volume {v_cad} vs quadrature {v_exact}");
     let cad_faces = cut.faces.len();
     s.doc.add_body("part", cut);
-    scan_of(&mut s, "part", 21);
+    scan_of(&mut s, "part", seed);
     clean(&mut s);
     let seg = s.execute("region.auto_segment", json!({"mesh": "scan"})).unwrap();
     let regions = seg["regions"].as_array().unwrap().clone();
@@ -202,7 +216,8 @@ fn gate_p3_block_with_freeform_top() {
         .execute("region.grow", json!({"mesh": "scan", "triangles": [seed], "max_angle_deg": 25.0, "name": "top"}))
         .unwrap();
     eprintln!("top region: {} triangles", top["triangles"]);
-    let fit = s.execute("surface.fit", json!({"region": top["id"], "tolerance": 0.2})).unwrap();
+    // fitted tighter than the 0.2 mm the solid is held to, so the gate has a margin
+    let fit = s.execute("surface.fit", json!({"region": top["id"], "tolerance": 0.15})).unwrap();
     eprintln!("top fit: control {} max {} rms {}", fit["control"], fit["max"], fit["rms"]);
     assert!(fit["max"].as_f64().unwrap() <= 0.2, "{fit}");
     let built = s

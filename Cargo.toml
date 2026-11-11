@@ -26,13 +26,13 @@ surfacecraft-mcp = { path = "crates/mcp" }
 surfacecraft-ai = { path = "crates/ai" }
 
 # solidcore: git-only crates pinned by rev (design doc §9, spike §1.1). Only crates/kernel uses them.
-solidcore = { git = "https://github.com/tangency-labs/solidcore", rev = "b9c02da746f48d24f1c2a32deb834276b1014d03" }
-solidcore-ops = { git = "https://github.com/tangency-labs/solidcore", rev = "b9c02da746f48d24f1c2a32deb834276b1014d03" }
-solidcore-record = { git = "https://github.com/tangency-labs/solidcore", rev = "b9c02da746f48d24f1c2a32deb834276b1014d03" }
-solidcore-convert = { git = "https://github.com/tangency-labs/solidcore", rev = "b9c02da746f48d24f1c2a32deb834276b1014d03" }
-solidcore-tess = { git = "https://github.com/tangency-labs/solidcore", rev = "b9c02da746f48d24f1c2a32deb834276b1014d03" }
-step-brep = { git = "https://github.com/tangency-labs/solidcore", rev = "b9c02da746f48d24f1c2a32deb834276b1014d03" }
-step-export = { git = "https://github.com/tangency-labs/solidcore", rev = "b9c02da746f48d24f1c2a32deb834276b1014d03" }
+solidcore = { git = "https://github.com/tangency-labs/solidcore", rev = "4f2da85c26f7d608808d94cffcf06ebe867ef61d" }
+solidcore-ops = { git = "https://github.com/tangency-labs/solidcore", rev = "4f2da85c26f7d608808d94cffcf06ebe867ef61d" }
+solidcore-record = { git = "https://github.com/tangency-labs/solidcore", rev = "4f2da85c26f7d608808d94cffcf06ebe867ef61d" }
+solidcore-convert = { git = "https://github.com/tangency-labs/solidcore", rev = "4f2da85c26f7d608808d94cffcf06ebe867ef61d" }
+solidcore-tess = { git = "https://github.com/tangency-labs/solidcore", rev = "4f2da85c26f7d608808d94cffcf06ebe867ef61d" }
+step-brep = { git = "https://github.com/tangency-labs/solidcore", rev = "4f2da85c26f7d608808d94cffcf06ebe867ef61d" }
+step-export = { git = "https://github.com/tangency-labs/solidcore", rev = "4f2da85c26f7d608808d94cffcf06ebe867ef61d" }
 
 thiserror = "2"
 serde = { version = "1", features = ["derive", "rc"] }
