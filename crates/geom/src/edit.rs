@@ -111,8 +111,16 @@ pub(crate) fn vertex_rings(mesh: &Mesh) -> Vec<Vec<u32>> {
     ring
 }
 
-/// Least-squares plane of `pts` as (centroid, unit normal, mean distance to the centroid).
-fn ring_plane(pts: &[Point3]) -> Option<(Vec3, Vec3, f64)> {
+/// A ring point this many times the median distance from the ring's middle is left out of the
+/// ring's plane (it may be a spike itself).
+const RING_STRAY_FACTOR: f64 = 2.0;
+/// The points a plane is fitted to are spread enough when their second principal extent is at
+/// least this share of the first (points nearly in a line give no plane).
+const RING_MIN_SPREAD: f64 = 0.2;
+
+/// Least-squares plane of `pts` as (centroid, unit normal, mean distance to the centroid, ratio
+/// of the second to the first principal extent).
+fn ring_plane(pts: &[Point3]) -> Option<(Vec3, Vec3, f64, f64)> {
     if pts.len() < 3 {
         return None;
     }
@@ -129,23 +137,18 @@ fn ring_plane(pts: &[Point3]) -> Option<(Vec3, Vec3, f64)> {
         return None;
     }
     let e = cov.symmetric_eigen();
-    let mut k = 0;
-    for j in 1..3 {
-        if e.eigenvalues[j] < e.eigenvalues[k] {
-            k = j;
-        }
-    }
-    Some((c, e.eigenvectors.column(k).into_owned(), radius))
+    let mut order = [0usize, 1, 2];
+    order.sort_by(|&a, &b| e.eigenvalues[a].total_cmp(&e.eigenvalues[b]));
+    let [least, mid, most] = order;
+    let spread = (e.eigenvalues[mid].max(0.0) / e.eigenvalues[most].max(f64::MIN_POSITIVE)).sqrt();
+    Some((c, e.eigenvectors.column(least).into_owned(), radius, spread))
 }
 
-/// How many times the median distance from the ring's middle a ring point must be away to be
-/// left out of the ring's plane.
-const RING_STRAY_FACTOR: f64 = 2.0;
-
-/// The plane of a one ring that spikes among the ring's own points cannot tilt: ring points
+/// The plane of a one ring that a spike among the ring's own points cannot tilt: ring points
 /// more than [`RING_STRAY_FACTOR`] × the median distance from the ring's middle (the median of
-/// each coordinate) are left out, as long as three points stay.
-fn trimmed_ring_plane(pts: &[Point3]) -> Option<(Vec3, Vec3, f64)> {
+/// each coordinate) are left out, as long as the rest still spans a plane (a ring of thin
+/// triangles has far points that are no spikes, and the near ones lie almost in a line).
+fn steady_ring_plane(pts: &[Point3]) -> Option<(Vec3, Vec3, f64)> {
     let median = |mut v: Vec<f64>| {
         v.sort_by(f64::total_cmp);
         v.get(v.len() / 2).copied().unwrap_or(0.0)
@@ -157,12 +160,25 @@ fn trimmed_ring_plane(pts: &[Point3]) -> Option<(Vec3, Vec3, f64)> {
     );
     let reach = RING_STRAY_FACTOR * median(pts.iter().map(|p| (p - mid).norm()).collect());
     let kept: Vec<Point3> = pts.iter().filter(|p| (*p - mid).norm() <= reach).copied().collect();
-    if kept.len() >= 3 && kept.len() < pts.len() { ring_plane(&kept) } else { ring_plane(pts) }
+    let steady = if kept.len() >= 3 && kept.len() < pts.len() {
+        ring_plane(&kept).filter(|(_, _, _, spread)| *spread >= RING_MIN_SPREAD)
+    } else {
+        None
+    };
+    // the radius stays that of the whole ring about the plane's centre: the far points make the
+    // test stricter, they only may not tilt the plane
+    match steady {
+        Some((c, n, _, _)) => {
+            let radius = pts.iter().map(|p| (p.coords - c).norm()).sum::<f64>() / pts.len() as f64;
+            Some((c, n, radius))
+        }
+        None => ring_plane(pts).map(|(c, n, radius, _)| (c, n, radius)),
+    }
 }
 
 /// Removes spikes: vertices farther from the least-squares plane of their one ring than
-/// `ratio` × the ring's radius. The plane leaves out the ring points farthest from it, so spikes
-/// next to each other do not hide one another. Triangles touching them are removed (the holes
+/// `ratio` × the ring's radius. Far points of the ring are left out of the plane, so spikes next
+/// to each other do not hide one another. Triangles touching them are removed (the holes
 /// left behind can be filled with [`fill_holes`]). Returns the number of triangles removed.
 pub fn remove_outliers(mesh: &mut Mesh, ratio: f64) -> usize {
     if mesh.validate().is_err() {
@@ -174,7 +190,7 @@ pub fn remove_outliers(mesh: &mut Mesh, ratio: f64) -> usize {
     let bad: Vec<bool> = crate::par::map(ring.len(), |i| {
         let Some(r) = ring.get(i) else { return false };
         let pts: Vec<Point3> = r.iter().filter_map(|&j| positions.get(j as usize).copied()).collect();
-        let (Some((c, n, radius)), Some(p)) = (trimmed_ring_plane(&pts), positions.get(i)) else { return false };
+        let (Some((c, n, radius)), Some(p)) = (steady_ring_plane(&pts), positions.get(i)) else { return false };
         (p.coords - c).dot(&n).abs() > ratio * radius
     });
     let before = mesh.triangles.len();

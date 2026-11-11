@@ -34,6 +34,9 @@ const FLIP_GAIN: f64 = 0.5;
 /// Smallest area of a patch triangle after its vertices move, in squared mean loop edge lengths
 /// (an equilateral triangle of that edge has 0.43).
 const MIN_AREA: f64 = 0.02;
+/// Three sides meet in a corner when a point is on all of them within this share of the hole's
+/// size.
+const CORNER_TOLERANCE: f64 = 1e-6;
 /// Passes of edge flips over a patch.
 const FLIP_PASSES: usize = 8;
 
@@ -369,7 +372,9 @@ fn pin_corner(
             corner -= s.n * s.height(&corner);
         }
     }
-    if !crate::finite(&corner) || (corner - middle).norm() > reach {
+    // three sides need not meet in a point (a chamfer between a face and a wall): no corner then
+    let off = sides.iter().map(|s| s.height(&corner).abs()).fold(0.0, f64::max);
+    if !crate::finite(&corner) || (corner - middle).norm() > reach || !(off <= CORNER_TOLERANCE * reach) {
         return;
     }
     let nearest = mesh

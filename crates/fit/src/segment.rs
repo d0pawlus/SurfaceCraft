@@ -769,11 +769,15 @@ mod tests {
             let mut scan = cad.clone();
             synth::add_noise(&mut scan, 0.03, &mut Rng::new(seed));
             let top = (0..scan.triangle_count())
-                .find(|&t| scan.face_centroid(t).is_some_and(|c| c.z > 11.9 && (c.x - 20.0).abs() < 2.0 && (c.y - 15.0).abs() < 2.0))
+                .find(|&t| {
+                    scan.face_centroid(t)
+                        .is_some_and(|c| c.z > 11.9 && (c.x - 20.0).abs() < 2.0 && (c.y - 15.0).abs() < 2.0)
+                })
                 .unwrap();
             let region = grow_smooth(&scan, &[top as u32], 25.0);
             let below = region.iter().filter(|&&t| scan.face_centroid(t as usize).is_some_and(|c| c.z < 11.0)).count();
-            let on_top = (0..scan.triangle_count()).filter(|&t| scan.face_centroid(t).is_some_and(|c| c.z > 11.9)).count();
+            let on_top =
+                (0..scan.triangle_count()).filter(|&t| scan.face_centroid(t).is_some_and(|c| c.z > 11.9)).count();
             if below > 0 || region.len() * 10 < on_top * 9 {
                 leaks.push((seed, region.len(), below, on_top));
             }
