@@ -201,8 +201,55 @@ pub fn default_value(root: &Value, schema: &Value, ctx: Option<&FormCtx<'_>>) ->
             }
             Value::Object(m)
         }
-        Kind::Any => Value::Null,
+        // one of several shapes (a sketch entity, a constraint): the first of them
+        Kind::Any => variants(root, s)
+            .and_then(|v| v.first().map(|first| default_value(root, first.schema, ctx)))
+            .unwrap_or(Value::Null),
     }
+}
+
+/// One alternative of a parameter that is one of several shapes (`oneOf`): a sketch entity is a
+/// line, an arc, a circle or a polygon; a constraint is one of fifteen kinds.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Variant<'a> {
+    /// The name that tells the alternatives apart (`line`, `fix`).
+    pub tag: &'a str,
+    /// The schema of the alternative.
+    pub schema: &'a Value,
+    /// The property that holds the tag next to the fields (`{"type": "fix", "point": 0}`), or
+    /// `None` when the tag is the one property that wraps them (`{"line": {"from": [0, 0]}}`).
+    pub tag_field: Option<&'a str>,
+}
+
+impl Variant<'_> {
+    /// Whether `value` is of this alternative.
+    #[must_use]
+    pub fn holds(&self, value: &Value) -> bool {
+        match self.tag_field {
+            Some(field) => value.get(field).and_then(Value::as_str) == Some(self.tag),
+            None => value.get(self.tag).is_some(),
+        }
+    }
+}
+
+/// The alternatives of a `oneOf`/`anyOf` node when every one of them is a tagged object; `None`
+/// for anything else (which stays JSON text).
+#[must_use]
+pub fn variants<'a>(root: &'a Value, schema: &'a Value) -> Option<Vec<Variant<'a>>> {
+    let branches = schema.get("oneOf").or_else(|| schema.get("anyOf"))?.as_array()?;
+    let found: Vec<Variant<'a>> = branches.iter().filter_map(|b| variant_of(root, b)).collect();
+    (found.len() == branches.len() && found.len() > 1).then_some(found)
+}
+
+fn variant_of<'a>(root: &'a Value, branch: &'a Value) -> Option<Variant<'a>> {
+    let schema = resolve(root, branch);
+    let props = schema.get("properties")?.as_object()?;
+    let tagged = props.iter().find_map(|(field, p)| Some((field.as_str(), resolve(root, p).get("const")?.as_str()?)));
+    if let Some((field, tag)) = tagged {
+        return Some(Variant { tag, schema, tag_field: Some(field) });
+    }
+    let (tag, _) = props.iter().next().filter(|_| props.len() == 1)?;
+    Some(Variant { tag, schema, tag_field: None })
 }
 
 fn required_of(s: &Value) -> Vec<&str> {
@@ -299,19 +346,27 @@ fn check(root: &Value, schema: &Value, value: &Value, path: &str, objects: &[Obj
                 issue(out, path, t("form.err.not_allowed").to_string());
             }
         }
-        Kind::ObjRef => match value {
-            Value::Number(n) => {
-                if !n.as_u64().is_some_and(|id| objects.iter().any(|o| o.id == id)) {
-                    issue(out, path, tf("form.err.no_object", &[("value", &n.to_string())]));
+        Kind::ObjRef => {
+            let found = match value {
+                Value::Number(n) => n.as_u64().and_then(|id| objects.iter().find(|o| o.id == id)),
+                Value::String(name) => objects.iter().find(|o| &o.name == name),
+                _ => {
+                    issue(out, path, tf("form.err.type", &[("expected", t(type_label(&kind)))]));
+                    return;
                 }
-            }
-            Value::String(name) => {
-                if !objects.iter().any(|o| &o.name == name) {
-                    issue(out, path, tf("form.err.no_object", &[("value", name)]));
+            };
+            let kinds = accepted_kinds(leaf_name(path), description_of(root, schema).as_deref());
+            match found {
+                None => {
+                    let shown = value.as_str().map_or_else(|| value.to_string(), str::to_string);
+                    issue(out, path, tf("form.err.no_object", &[("value", &shown)]));
                 }
+                Some(o) if !kinds.is_empty() && !kinds.contains(&o.kind) => {
+                    issue(out, path, tf("form.err.wrong_kind", &[("kinds", &kind_names(&kinds))]));
+                }
+                Some(_) => {}
             }
-            _ => issue(out, path, tf("form.err.type", &[("expected", t(type_label(&kind)))])),
-        },
+        }
         Kind::Array => match value.as_array() {
             None => issue(out, path, tf("form.err.type", &[("expected", t(type_label(&kind)))])),
             Some(items) => {
@@ -399,23 +454,51 @@ pub fn unit_of(name: &str) -> &'static str {
     }
 }
 
-/// The kind of object a parameter name hints at.
-fn kind_hint(name: &str) -> Option<ObjectKind> {
-    let n = name.to_ascii_lowercase();
-    let table: [(&str, ObjectKind); 8] = [
-        ("sketch", ObjectKind::Sketch),
-        ("mesh", ObjectKind::Mesh),
-        ("region", ObjectKind::Region),
-        ("primitive", ObjectKind::Primitive),
-        ("surface", ObjectKind::Surface),
-        ("quad", ObjectKind::Quad),
-        ("feature", ObjectKind::Feature),
-        ("body", ObjectKind::Body),
+/// The kinds of object a reference parameter takes: the one its name says (`mesh`, `region`,
+/// `target`), else the ones its description names ("Scan mesh.", "Reference: a primitive, a mesh
+/// or a body."). Empty when neither says: any object.
+#[must_use]
+pub fn accepted_kinds(name: &str, description: Option<&str>) -> Vec<ObjectKind> {
+    const TABLE: [(&str, &str, ObjectKind); 8] = [
+        ("sketch", "sketches", ObjectKind::Sketch),
+        ("mesh", "meshes", ObjectKind::Mesh),
+        ("region", "regions", ObjectKind::Region),
+        ("primitive", "primitives", ObjectKind::Primitive),
+        ("surface", "surfaces", ObjectKind::Surface),
+        ("quad", "quads", ObjectKind::Quad),
+        ("feature", "features", ObjectKind::Feature),
+        ("body", "bodies", ObjectKind::Body),
     ];
+    let n = name.to_ascii_lowercase();
     if n == "target" {
-        return Some(ObjectKind::Body);
+        return vec![ObjectKind::Body];
     }
-    table.iter().find(|(p, _)| n.starts_with(p)).map(|(_, k)| *k)
+    if let Some((_, _, kind)) = TABLE.iter().find(|(one, _, _)| n.starts_with(one)) {
+        return vec![*kind];
+    }
+    let text = description.unwrap_or_default().to_ascii_lowercase();
+    let words: Vec<&str> = text.split(|c: char| !c.is_ascii_alphabetic()).filter(|w| !w.is_empty()).collect();
+    TABLE.iter().filter(|(one, many, _)| words.contains(one) || words.contains(many)).map(|(_, _, k)| *k).collect()
+}
+
+/// The object a reference parameter starts with: the selected one when it is of a kind the
+/// parameter takes, else the first object that is.
+#[must_use]
+pub fn preferred_object(objects: &[ObjInfo], selected: Option<u64>, kinds: &[ObjectKind]) -> Option<u64> {
+    let fits = |o: &&ObjInfo| kinds.is_empty() || kinds.contains(&o.kind);
+    let selected = selected.and_then(|id| objects.iter().find(|o| o.id == id)).filter(fits);
+    selected.or_else(|| objects.iter().find(fits)).map(|o| o.id)
+}
+
+/// The kinds of `kinds` as words ("mesh, body"), for a message.
+fn kind_names(kinds: &[ObjectKind]) -> String {
+    kinds.iter().map(|k| t(kind_name_key(*k))).collect::<Vec<_>>().join(", ")
+}
+
+/// The last name of a value path (`a.b[0]` is `b`).
+fn leaf_name(path: &str) -> &str {
+    let last = path.rsplit('.').next().unwrap_or(path);
+    last.split('[').next().unwrap_or(last)
 }
 
 fn kind_name_key(kind: ObjectKind) -> &'static str {
@@ -431,11 +514,25 @@ fn kind_name_key(kind: ObjectKind) -> &'static str {
     }
 }
 
-/// The label of parameter `name`: a catalogue override or the schema's own name.
+/// The label of parameter `name`: the catalogue's (`param.<command>.<name>`, then
+/// `param.<name>`), else the schema's name in plain words.
 fn label_of(ctx: &FormCtx<'_>, name: &str) -> String {
     let specific = format!("param.{}.{name}", ctx.command);
     let generic = format!("param.{name}");
-    find(&specific).or_else(|| find(&generic)).unwrap_or(name).to_string()
+    find(&specific).or_else(|| find(&generic)).map_or_else(|| humanize(name), str::to_string)
+}
+
+/// A schema name in plain words: `max_distance` is "Max distance", `draft_deg` is "Draft" (the
+/// field shows the unit).
+#[must_use]
+pub fn humanize(name: &str) -> String {
+    let base = name.strip_suffix("_deg").or_else(|| name.strip_suffix("_mm")).unwrap_or(name);
+    let words = base.replace('_', " ");
+    let mut chars = words.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => name.to_string(),
+    }
 }
 
 fn description_of(root: &Value, schema: &Value) -> Option<String> {
@@ -444,6 +541,11 @@ fn description_of(root: &Value, schema: &Value) -> Option<String> {
         .or_else(|| resolve(root, schema).get("description"))
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+/// What the tooltip of a parameter says: its description in the interface language.
+fn hover_of(root: &Value, schema: &Value) -> Option<String> {
+    description_of(root, schema).map(|d| i18n::hint(&d))
 }
 
 fn number_value(x: f64) -> Value {
@@ -480,7 +582,7 @@ pub fn form(ui: &mut egui::Ui, root: &Value, value: &mut Value, ctx: &FormCtx<'_
     }
     let (_, _, s) = classify(root, root);
     if let Some(map) = value.as_object_mut() {
-        changed |= object_rows(ui, root, s, map, "", ctx);
+        changed |= object_rows(ui, root, s, map, "", ctx, None);
     }
     changed
 }
@@ -492,18 +594,28 @@ fn object_rows(
     map: &mut Map<String, Value>,
     path: &str,
     ctx: &FormCtx<'_>,
+    skip: Option<&str>,
 ) -> bool {
     let mut changed = false;
     let Some(props) = schema.get("properties").and_then(Value::as_object) else { return false };
     let required = required_of(schema);
-    let mut names: Vec<&String> = props.keys().collect();
+    let mut names: Vec<&String> = props.keys().filter(|n| Some(n.as_str()) != skip).collect();
     names.sort_by_key(|n| !required.contains(&n.as_str()));
     if names.is_empty() {
         ui.weak(t("form.no_parameters"));
     }
+    // required parameters come first; the optional ones follow under their own heading, so
+    // what must be filled in is never lost among what may be left alone
+    let mut optional_headed = !path.is_empty() || required.is_empty();
     for name in names {
         let Some(prop) = props.get(name) else { continue };
-        changed |= property_row(ui, root, name, prop, required.contains(&name.as_str()), map, path, ctx);
+        let is_required = required.contains(&name.as_str());
+        if !is_required && !optional_headed {
+            ui.add_space(4.0);
+            ui.weak(t("form.optional"));
+            optional_headed = true;
+        }
+        changed |= property_row(ui, root, name, prop, is_required, map, path, ctx);
     }
     changed
 }
@@ -522,7 +634,7 @@ fn property_row(
     let path = join(parent, name);
     let (kind, _, schema) = classify(root, prop);
     let label = label_of(ctx, name);
-    let hover = description_of(root, prop);
+    let hover = hover_of(root, prop);
     let mut changed = false;
     let set = map.get(name).is_some_and(|v| !v.is_null());
     let compound = matches!(kind, Kind::Object) || (kind == Kind::Array && !is_tuple(schema, root));
@@ -549,7 +661,9 @@ fn property_row(
             error_line(ui, ctx, &path);
             return;
         }
-        ui.horizontal(|ui| {
+        // a narrow tool panel wraps a long row (a datum with its pick button) instead of
+        // pushing the button out of sight
+        ui.horizontal_wrapped(|ui| {
             let name_resp = if required {
                 ui.label(marked(&label, true))
             } else {
@@ -558,7 +672,7 @@ fn property_row(
                 let r = ui.checkbox(&mut on, &label);
                 if r.changed() {
                     if on {
-                        map.insert(name.to_string(), default_value(root, prop, Some(ctx)));
+                        map.insert(name.to_string(), start_value(root, prop, name, &kind, ctx));
                     } else {
                         map.remove(name);
                     }
@@ -579,7 +693,7 @@ fn property_row(
                 // world planes and axes, so they show their fields and can be edited or picked)
                 let d = datum_default(name)
                     .filter(|_| kind == Kind::Any && path == name)
-                    .unwrap_or_else(|| default_value(root, prop, Some(ctx)));
+                    .unwrap_or_else(|| start_value(root, prop, name, &kind, ctx));
                 map.insert(name.to_string(), d);
                 changed = true;
             } else {
@@ -589,6 +703,41 @@ fn property_row(
         error_line(ui, ctx, &path);
     });
     changed
+}
+
+/// The value a parameter starts with: its default, and for an object reference an object of a
+/// kind the parameter takes (the selected one when it fits).
+fn start_value(root: &Value, prop: &Value, name: &str, kind: &Kind, ctx: &FormCtx<'_>) -> Value {
+    let description = description_of(root, prop);
+    if *kind == Kind::ObjRef {
+        let kinds = accepted_kinds(name, description.as_deref());
+        return json!(preferred_object(ctx.objects, ctx.selected, &kinds).unwrap_or(0));
+    }
+    // A number or a switch the schema gives no default for starts with the default its
+    // description states, so ticking an optional parameter on does not change what the tool
+    // does until the value is edited (a neutral 0 or "off" could: a target of 0 triangles).
+    let has_default = resolve(root, prop).get("default").or_else(|| prop.get("default")).is_some_and(|d| !d.is_null());
+    let stated = description.as_deref().filter(|_| !has_default).and_then(described_default);
+    match (kind, stated) {
+        (Kind::Bool, Some(Value::Bool(on))) => Value::Bool(on),
+        (Kind::Num, Some(Value::Number(n))) => Value::Number(n),
+        (Kind::Int, Some(Value::Number(n))) => n.as_f64().map_or(Value::Null, |x| json!(x.round() as i64)),
+        _ => default_value(root, prop, Some(ctx)),
+    }
+}
+
+/// The default a parameter's description states: "default 0.5", "Default 3", "default true".
+/// `None` when it states none or states it in words ("default: the object being aligned").
+#[must_use]
+pub fn described_default(description: &str) -> Option<Value> {
+    let lower = description.to_ascii_lowercase();
+    let (_, after) = lower.split_once("default ")?;
+    let word: String = after.chars().take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-')).collect();
+    match word.trim_end_matches('.') {
+        "true" => Some(Value::Bool(true)),
+        "false" => Some(Value::Bool(false)),
+        number => number.parse::<f64>().ok().filter(|x| x.is_finite()).map(|x| json!(x)),
+    }
 }
 
 fn marked(label: &str, required: bool) -> String {
@@ -690,7 +839,13 @@ fn value_widget(
             let mut chosen: Option<Value> = None;
             let resp = egui::ComboBox::from_id_salt(path).selected_text(shown).show_ui(ui, |ui| {
                 for o in &options {
-                    if ui.selectable_label(o == value, enum_label(o)).clicked() {
+                    let r = ui.selectable_label(o == value, enum_label(o));
+                    // what the choice means, when the schema says
+                    let r = match option_hint(root, s, o) {
+                        Some(h) => r.on_hover_text(h),
+                        None => r,
+                    };
+                    if r.clicked() {
                         chosen = Some(o.clone());
                     }
                 }
@@ -703,7 +858,10 @@ fn value_widget(
                 changed = true;
             }
         }
-        Kind::ObjRef => changed |= object_picker(ui, value, name, path, ctx, label),
+        Kind::ObjRef => {
+            let kinds = accepted_kinds(name, description_of(root, schema).as_deref());
+            changed |= object_picker(ui, value, &kinds, path, ctx, label);
+        }
         Kind::Array => {
             if is_tuple(schema, root) {
                 changed |= tuple_row(ui, s, value, name, label);
@@ -713,23 +871,96 @@ fn value_widget(
         }
         Kind::Object => {
             if let Some(map) = value.as_object_mut() {
-                changed |= object_rows(ui, root, s, map, path, ctx);
+                changed |= object_rows(ui, root, s, map, path, ctx, None);
             }
         }
         Kind::Any => match datum_need(name).filter(|_| path == name) {
-            // a 3-2-1 datum: JSON text, or points clicked in the viewport
+            // a 3-2-1 datum: points clicked in the viewport (how most people set a datum), or
+            // its JSON text
             Some(need) => {
+                // under its label, so the summary and the buttons have the panel's whole width
+                ui.end_row();
                 ui.vertical(|ui| {
+                    // what the datum is, in words; its JSON stays one click away, on the row of
+                    // the pick button so three datums fit the panel without scrolling
+                    ui.label(crate::fieldpick::datum_summary(value));
+                    let open_id = ui.make_persistent_id(("datum-json", path));
+                    let mut open = ui.data(|d| d.get_temp::<bool>(open_id)).unwrap_or(false);
                     ui.horizontal(|ui| {
-                        changed |= json_text(ui, value, path, label);
                         pick_button(ui, ctx, name, path, PickKind::Datum { need });
+                        if ui.selectable_label(open, t("form.datum.edit")).clicked() {
+                            open = !open;
+                            ui.data_mut(|d| d.insert_temp(open_id, open));
+                        }
                     });
                     pick_hint_line(ui, ctx, name);
+                    if open {
+                        changed |= json_text(ui, value, path, label);
+                    }
                 });
             }
-            None => changed |= json_text(ui, value, path, label),
+            None => match variants(root, s) {
+                Some(vars) => changed |= variant_widget(ui, root, &vars, value, path, ctx, label),
+                None => changed |= json_text(ui, value, path, label),
+            },
         },
     }
+    changed
+}
+
+/// The name of an alternative (`variant.<tag>` in the catalogue, else the tag in plain words).
+fn variant_label(tag: &str) -> String {
+    find(&format!("variant.{tag}")).map_or_else(|| humanize(tag), str::to_string)
+}
+
+/// A parameter that is one of several shapes: a list to choose the shape, and under it the
+/// fields of the chosen one.
+fn variant_widget(
+    ui: &mut egui::Ui,
+    root: &Value,
+    vars: &[Variant<'_>],
+    value: &mut Value,
+    path: &str,
+    ctx: &FormCtx<'_>,
+    label: Option<egui::Id>,
+) -> bool {
+    let mut changed = false;
+    ui.vertical(|ui| {
+        let current = vars.iter().position(|v| v.holds(value));
+        let shown =
+            current.and_then(|i| vars.get(i)).map_or_else(|| t("form.none").to_string(), |v| variant_label(v.tag));
+        let mut chosen: Option<usize> = None;
+        let combo = egui::ComboBox::from_id_salt(("variant", path)).selected_text(shown).show_ui(ui, |ui| {
+            for (i, v) in vars.iter().enumerate() {
+                let r = ui.selectable_label(current == Some(i), variant_label(v.tag));
+                let r = match v.schema.get("description").and_then(Value::as_str) {
+                    Some(d) => r.on_hover_text(i18n::hint(d)),
+                    None => r,
+                };
+                if r.clicked() {
+                    chosen = Some(i);
+                }
+            }
+        });
+        if let Some(l) = label {
+            combo.response.labelled_by(l);
+        }
+        if let Some(v) = chosen.filter(|i| Some(*i) != current).and_then(|i| vars.get(i)) {
+            *value = default_value(root, v.schema, Some(ctx));
+            changed = true;
+        }
+        let Some(v) = vars.iter().find(|v| v.holds(value)) else { return };
+        let Some(map) = value.as_object_mut() else { return };
+        match v.tag_field {
+            Some(field) => changed |= object_rows(ui, root, v.schema, map, path, ctx, Some(field)),
+            None => {
+                let inner = v.schema.get("properties").and_then(|p| p.get(v.tag));
+                if let (Some(schema), Some(fields)) = (inner, map.get_mut(v.tag)) {
+                    changed |= value_widget(ui, root, schema, fields, v.tag, &join(path, v.tag), ctx, None);
+                }
+            }
+        }
+    });
     changed
 }
 
@@ -745,7 +976,8 @@ fn pick_button(ui: &mut egui::Ui, ctx: &FormCtx<'_>, name: &str, path: &str, kin
         PickKind::Edges => "form.pick_hint.edges",
     };
     let label = t(if active { "form.pick_stop" } else { "form.pick" });
-    if ui.selectable_label(active, label).on_hover_text(t(hint)).clicked() {
+    // a real button (not a text toggle): picking in the viewport is the main way to fill the field
+    if ui.add(egui::Button::new(label).selected(active)).on_hover_text(t(hint)).clicked() {
         *ctx.pick_request.borrow_mut() = Some(PickRequest { field: name.to_string(), kind, start: !active });
     }
 }
@@ -766,6 +998,17 @@ fn limits_text(min: f64, max: f64) -> String {
         (false, true) => format!("≤ {}", fmt_num(max)),
         _ => String::new(),
     }
+}
+
+/// The description of one choice of an enum whose choices are described one by one.
+fn option_hint(root: &Value, schema: &Value, option: &Value) -> Option<String> {
+    let branches = schema.get("oneOf").or_else(|| schema.get("anyOf"))?.as_array()?;
+    let is_option = |b: &&Value| {
+        let single = b.get("enum").and_then(Value::as_array).filter(|e| e.len() == 1).and_then(|e| e.first());
+        b.get("const").or(single) == Some(option)
+    };
+    let branch = branches.iter().map(|b| resolve(root, b)).find(is_option)?;
+    branch.get("description").and_then(Value::as_str).map(i18n::hint)
 }
 
 fn enum_label(v: &Value) -> String {
@@ -816,14 +1059,20 @@ fn list_widget(
     let (item_kind, _, _) = classify(root, &item_schema);
     let max = schema.get("maxItems").and_then(Value::as_u64).unwrap_or(u64::MAX) as usize;
     let min = schema.get("minItems").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let item_kinds = accepted_kinds(name, schema.get("description").and_then(Value::as_str));
     let Some(items) = value.as_array_mut() else { return false };
     let items_len_over_min = items.len() > min;
     let mut remove = None;
     for (i, v) in items.iter_mut().enumerate() {
-        ui.horizontal(|ui| {
+        // top-aligned: an item of several rows keeps its number and Remove on its first row
+        ui.horizontal_top(|ui| {
             let ipath = format!("{path}[{i}]");
             ui.label(format!("{}", i + 1));
-            changed |= value_widget(ui, root, &item_schema, v, name, &ipath, ctx, label);
+            if item_kind == Kind::ObjRef {
+                changed |= object_picker(ui, v, &item_kinds, &ipath, ctx, label);
+            } else {
+                changed |= value_widget(ui, root, &item_schema, v, name, &ipath, ctx, label);
+            }
             if items_len_over_min && ui.small_button(t("form.remove")).clicked() {
                 remove = Some(i);
             }
@@ -836,7 +1085,7 @@ fn list_widget(
     }
     ui.horizontal(|ui| {
         if items.len() < max && ui.small_button(t("form.add")).clicked() {
-            items.push(default_value(root, &item_schema, Some(ctx)));
+            items.push(start_value(root, &item_schema, name, &item_kind, ctx));
             changed = true;
         }
         let is_point = is_tuple(&item_schema, root) && item_schema.get("minItems").and_then(Value::as_u64) == Some(3);
@@ -879,13 +1128,13 @@ fn list_widget(
 fn object_picker(
     ui: &mut egui::Ui,
     value: &mut Value,
-    name: &str,
+    kinds: &[ObjectKind],
     path: &str,
     ctx: &FormCtx<'_>,
     label: Option<egui::Id>,
 ) -> bool {
     let mut changed = false;
-    let hint = kind_hint(name);
+    let fits = |id: u64| ctx.objects.iter().any(|o| o.id == id && (kinds.is_empty() || kinds.contains(&o.kind)));
     let current_id = value.as_u64();
     let describe = |o: &ObjInfo| format!("{} {} (#{})", t(kind_name_key(o.kind)), o.name, o.id);
     let shown = match value {
@@ -895,9 +1144,8 @@ fn object_picker(
         Value::String(s) => s.clone(),
         _ => t("form.none").to_string(),
     };
-    let candidates: Vec<&ObjInfo> =
-        ctx.objects.iter().filter(|o| hint.is_none_or(|h| o.kind == h) || Some(o.id) == current_id).collect();
-    let candidates: Vec<&ObjInfo> = if candidates.is_empty() { ctx.objects.iter().collect() } else { candidates };
+    // only objects of a kind the parameter takes (and the current one, so a wrong value shows)
+    let candidates: Vec<&ObjInfo> = ctx.objects.iter().filter(|o| fits(o.id) || Some(o.id) == current_id).collect();
     let mut chosen: Option<u64> = None;
     let resp = egui::ComboBox::from_id_salt(path).selected_text(shown).width(180.0).show_ui(ui, |ui| {
         if candidates.is_empty() {
@@ -912,15 +1160,17 @@ fn object_picker(
     if let Some(l) = label {
         resp.response.labelled_by(l);
     }
-    if let Some(sel) = ctx.selected
+    // the shortcuts are offered only when they would change the field to an object that fits
+    let offer = |id: u64| current_id != Some(id) && fits(id);
+    if let Some(sel) = ctx.selected.filter(|id| offer(*id))
         && ui.small_button(t("form.use_selection")).on_hover_text(t("form.use_selection_hint")).clicked()
     {
         chosen = Some(sel);
     }
-    if let Some(p) = ctx.pick_objects.last()
+    if let Some(p) = ctx.pick_objects.last().copied().filter(|id| offer(*id) && ctx.selected != Some(*id))
         && ui.small_button(t("form.use_pick")).on_hover_text(t("form.use_pick_hint")).clicked()
     {
-        chosen = Some(*p);
+        chosen = Some(p);
     }
     if let Some(id) = chosen
         && current_id != Some(id)
@@ -988,6 +1238,106 @@ mod tests {
         assert!(matches!(classify(&s, &props["mode"]).0, Kind::Enum(v) if v.len() == 3));
         let (k, nullable, _) = classify(&s, &props["target"]);
         assert_eq!((k, nullable), (Kind::ObjRef, true));
+    }
+
+    #[test]
+    fn an_object_parameter_takes_only_the_kinds_its_name_or_description_names() {
+        use ObjectKind::{Body, Mesh, Primitive, Region, Surface};
+        assert_eq!(accepted_kinds("mesh", None), vec![Mesh]);
+        assert_eq!(accepted_kinds("regions", Some("Regions of the mesh.")), vec![Region]);
+        assert_eq!(accepted_kinds("object", Some("Mesh id or name.")), vec![Mesh]);
+        assert_eq!(
+            accepted_kinds("against", Some("Reference: a primitive, a mesh or a body.")),
+            vec![Mesh, Primitive, Body]
+        );
+        assert_eq!(accepted_kinds("object", Some("Surface (or sheet body) to thicken.")), vec![Surface, Body]);
+        assert!(accepted_kinds("object", Some("Object id or name.")).is_empty(), "any object");
+        // a mesh tool: a region is refused before the command runs, the mesh is fine
+        let objects =
+            [ObjInfo { id: 1, kind: Mesh, name: "scan".into() }, ObjInfo { id: 2, kind: Region, name: "top".into() }];
+        let s = schema_of("mesh.decimate");
+        assert!(validate(&s, &json!({"object": 2}), &objects).iter().any(|i| i.path == "object"));
+        assert!(validate(&s, &json!({"object": 1}), &objects).iter().all(|i| i.path != "object"));
+        // the field starts with the selection only when it fits, else with the first object that does
+        assert_eq!(preferred_object(&objects, Some(2), &[Mesh]), Some(1));
+        assert_eq!(preferred_object(&objects, Some(2), &[]), Some(2));
+        assert_eq!(preferred_object(&objects, Some(2), &[Body]), None);
+    }
+
+    #[test]
+    fn a_sketch_entity_and_a_constraint_are_alternatives_with_fields() {
+        let s = schema_of("sketch.add");
+        let item = &s["properties"]["entities"]["items"];
+        let (kind, _, node) = classify(&s, item);
+        assert_eq!(kind, Kind::Any);
+        let vars = variants(&s, node).expect("entities are alternatives");
+        assert_eq!(vars.iter().map(|v| v.tag).collect::<Vec<_>>(), ["line", "arc", "circle", "polygon"]);
+        // a new entity is a whole line, ready to edit as fields
+        let line = default_value(&s, item, None);
+        assert_eq!(line, json!({"line": {"from": [0.0, 0.0], "to": [0.0, 0.0]}}));
+        assert!(vars[0].holds(&line) && !vars[2].holds(&line));
+        let circle = default_value(&s, vars[2].schema, None);
+        assert_eq!(circle, json!({"circle": {"center": [0.0, 0.0], "radius": 0.0}}));
+        // constraints carry their kind in a `type` field next to the others
+        let s = schema_of("sketch.constrain");
+        let item = &s["properties"]["constraints"]["items"];
+        let vars = variants(&s, classify(&s, item).2).expect("constraints are alternatives");
+        assert_eq!(vars.len(), 15);
+        assert!(vars.iter().all(|v| v.tag_field == Some("type")));
+        let fix = default_value(&s, item, None);
+        assert_eq!(fix["type"], "fix");
+        assert!(fix.get("point").is_some() && fix.get("at").is_some(), "{fix}");
+        // every alternative has a name in both languages
+        for v in &vars {
+            for lang in Lang::ALL {
+                assert!(i18n::catalog(lang).contains_key(&format!("variant.{}", v.tag)), "{lang:?} variant.{}", v.tag);
+            }
+        }
+        // the choices of an enum say what they mean
+        let s = schema_of("feature.boolean");
+        let (kind, _, node) = classify(&s, &s["properties"]["op"]);
+        assert!(matches!(kind, Kind::Enum(_)), "{kind:?}");
+        assert_eq!(option_hint(&s, node, &json!("union")).as_deref(), Some("Union."));
+        // a 3-2-1 datum is not such a list: it keeps its own editor
+        let s = schema_of("align.datum");
+        assert!(variants(&s, classify(&s, &s["properties"]["primary"]).2).is_none());
+    }
+
+    #[test]
+    fn a_ticked_optional_parameter_starts_with_the_default_its_description_states() {
+        assert_eq!(
+            described_default("Fraction of triangles to keep, (0, 1] (default 0.5 when `target` is not given)."),
+            Some(json!(0.5))
+        );
+        assert_eq!(
+            described_default("Edges sharper than this stay in place (degrees, default 40)."),
+            Some(json!(40.0))
+        );
+        assert_eq!(described_default("Keep the open boundary in place (default true)."), Some(json!(true)));
+        assert_eq!(described_default("Default 3."), Some(json!(3.0)));
+        assert_eq!(described_default("Mesh they belong to (default: the object being aligned)."), None);
+        assert_eq!(described_default("Triangles to keep."), None);
+        // ticking the field on must not change what the tool does: it shows the default
+        let s = schema_of("mesh.decimate");
+        let props = s["properties"].as_object().unwrap();
+        let tokens = Tokens::resolve(crate::theme::Preset::Dark);
+        let (issues, request) = (HashMap::new(), RefCell::new(None));
+        let ctx = FormCtx {
+            command: "mesh.decimate",
+            objects: &[],
+            selected: None,
+            pick_objects: &[],
+            pick_points: &[],
+            pick_triangles: &[],
+            picking: None,
+            pick_request: &request,
+            tokens: &tokens,
+            issues: &issues,
+        };
+        let start = |name: &str| start_value(&s, &props[name], name, &classify(&s, &props[name]).0, &ctx);
+        assert_eq!(start("ratio"), json!(0.5));
+        assert_eq!(start("feature_angle_deg"), json!(40.0));
+        assert_eq!(start("preserve_boundary"), json!(true));
     }
 
     #[test]

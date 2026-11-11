@@ -17,6 +17,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use surfacecraft_doc::{ObjectId, ObjectKind};
+use surfacecraft_engine::EngineError;
 use surfacecraft_engine::display::DisplayItem;
 use surfacecraft_geom::Mesh;
 
@@ -87,6 +88,8 @@ pub struct CommandPanel {
     changed_at: f64,
     /// `session.log.len()` when the preview was computed.
     log_len: usize,
+    /// Parameters the form marked as needing attention last frame.
+    issues: usize,
 }
 
 impl CommandPanel {
@@ -285,34 +288,134 @@ fn body(app: &mut SurfaceCraftApp, panel: &mut CommandPanel, ui: &mut egui::Ui, 
         // picking for another command's form
         app.field_pick = None;
     }
-    ui.strong(id);
-    if let Some(c) = surfacecraft_engine::cmd::find(id) {
-        ui.label(c.summary);
-    }
-    ui.horizontal(|ui| {
-        ui.selectable_value(&mut panel.json_mode, false, t("form.mode_form"));
-        ui.selectable_value(&mut panel.json_mode, true, t("form.mode_json"));
-    });
-    // the buttons come first: they stay in reach however long the form is
-    action_buttons(app, panel, ui, id);
-    let schema = panel.schema(id);
-    if panel.json_mode {
-        let l = ui.label(t("palette.parameters"));
-        ui.add(egui::TextEdit::multiline(&mut app.palette_params).code_editor().desired_rows(6)).labelled_by(l.id);
-    } else {
-        form_section(app, panel, ui, id, &schema);
-    }
-    update_preview(app, panel, ui, id);
-    preview_status(app, panel, ui);
-    if let Some(last) = app.session.log.last()
-        && last.command == id
-    {
+    // the footer is laid out first so it keeps its place under the scrolling form: OK and Cancel
+    // stay in reach however long the form is
+    egui::Panel::bottom("tool-footer")
+        .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(0, 6)))
+        .show_separator_line(true)
+        .show(ui, |ui| footer(app, panel, ui, id));
+    egui::ScrollArea::vertical().id_salt("dock-properties").auto_shrink([false, false]).show(ui, |ui| {
+        header(app, ui, id);
         ui.separator();
-        egui::ScrollArea::vertical().id_salt("result").show(ui, |ui| {
-            let text = serde_json::to_string_pretty(&last.outcome).unwrap_or_default();
-            ui.monospace(crate::app::truncate(&text, 4000));
+        let schema = panel.schema(id);
+        if panel.json_mode {
+            panel.issues = 0;
+            let l = ui.label(t("palette.parameters"));
+            ui.add(egui::TextEdit::multiline(&mut app.palette_params).code_editor().desired_rows(6)).labelled_by(l.id);
+        } else {
+            form_section(app, panel, ui, id, &schema);
+        }
+        update_preview(app, panel, ui, id);
+        result(app, ui, id);
+    });
+}
+
+/// The head of the tool: its icon and name, a button that closes it, and what it does in a
+/// sentence.
+fn header(app: &mut SurfaceCraftApp, ui: &mut egui::Ui, id: &'static str) {
+    let spec = surfacecraft_engine::cmd::find(id);
+    let name = spec.map_or_else(|| id.to_string(), crate::workflow::label_of);
+    let mut close = false;
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(22.0), egui::Sense::hover());
+        crate::icons::paint(ui, rect, crate::workflow::icon_of(id), app.tokens.color(Token::AccentHover));
+        ui.add(egui::Label::new(egui::RichText::new(name).heading()).truncate());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let style = crate::theme::icon_button_style(&app.tokens);
+            let label = t("tool.close");
+            close = craft_ui::buttons::IconButton::new(label, egui::Vec2::splat(22.0), &style)
+                .show(ui, |ui, rect, tint| crate::icons::paint(ui, rect.shrink(4.0), "close", tint))
+                .on_hover_text(t("form.cancel_hint"))
+                .clicked();
         });
+    });
+    if let Some(c) = spec {
+        ui.label(crate::workflow::hint_of(c));
     }
+    if close {
+        app.close_tool();
+    }
+}
+
+/// The foot of the tool: what needs attention (parameters to fix, the state of the preview, why
+/// the last run failed), then the preview switch, Cancel and OK, and under them the choice between
+/// the form and the JSON a script would send. The messages are here, not under the last field,
+/// so they are in view however long the form is.
+fn footer(app: &mut SurfaceCraftApp, panel: &mut CommandPanel, ui: &mut egui::Ui, id: &'static str) {
+    messages(app, panel, ui, id);
+    action_buttons(app, panel, ui, id);
+    ui.horizontal(|ui| {
+        ui.weak(id);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.selectable_value(&mut panel.json_mode, true, t("form.mode_json"));
+            ui.selectable_value(&mut panel.json_mode, false, t("form.mode_form"));
+        });
+    });
+}
+
+/// What the user has to know before pressing OK again.
+fn messages(app: &SurfaceCraftApp, panel: &CommandPanel, ui: &mut egui::Ui, id: &'static str) {
+    if panel.issues > 0 {
+        let text = tf("form.problems", &[("n", &panel.issues.to_string())]);
+        ui.colored_label(app.tokens.color(Token::StatusWarning), text);
+    }
+    preview_status(app, panel, ui);
+    if let Some(last) = app.session.log.last().filter(|e| e.command == id && !e.ok) {
+        let text = crate::i18n::engine_message(&failure_text(&last.outcome));
+        ui.colored_label(app.tokens.color(Token::StatusError), tf("form.failed", &[("error", &text)]));
+    }
+}
+
+/// The words of a failure kept in the command log. The log keeps the error as the engine
+/// serialises it (`{"kind": "invalid_params", "message": "…"}`); this is the sentence the same
+/// error prints as.
+#[must_use]
+pub fn failure_text(outcome: &Value) -> String {
+    let message = outcome.get("message").and_then(Value::as_str);
+    match (outcome.get("kind").and_then(Value::as_str), message) {
+        (Some("invalid_params"), Some(m)) => EngineError::InvalidParams(m.to_string()).to_string(),
+        (Some("unavailable"), Some(m)) => EngineError::Unavailable(m.to_string()).to_string(),
+        (Some("unknown_command"), Some(m)) => EngineError::UnknownCommand(m.to_string()).to_string(),
+        (Some("internal"), Some(m)) => EngineError::Internal(m.to_string()).to_string(),
+        (_, Some(m)) => m.to_string(),
+        _ => outcome.as_str().map_or_else(|| outcome.to_string(), str::to_string),
+    }
+}
+
+/// What the last run of this tool gave, as a table of values (a failure is in the footer).
+fn result(app: &SurfaceCraftApp, ui: &mut egui::Ui, id: &'static str) {
+    let Some(last) = app.session.log.last().filter(|e| e.command == id && e.ok) else { return };
+    ui.separator();
+    ui.strong(t("form.result"));
+    result_rows(ui, &last.outcome);
+}
+
+/// A result as rows of name and value; anything nested is shown as the JSON it is.
+fn result_rows(ui: &mut egui::Ui, value: &Value) {
+    let Some(map) = value.as_object() else {
+        let text = serde_json::to_string_pretty(value).unwrap_or_default();
+        ui.monospace(crate::app::truncate(&text, 4000));
+        return;
+    };
+    egui::Grid::new("tool-result").num_columns(2).striped(true).show(ui, |ui| {
+        for (name, v) in map {
+            ui.weak(forms::humanize(name));
+            let text = match v {
+                Value::Number(n) => n.as_f64().map_or_else(|| n.to_string(), result_number),
+                Value::String(s) => s.clone(),
+                Value::Bool(b) => t(if *b { "form.yes" } else { "form.no" }).to_string(),
+                Value::Null => t("form.none").to_string(),
+                other => other.to_string(),
+            };
+            ui.add(egui::Label::new(egui::RichText::new(crate::app::truncate(&text, 300)).monospace()).wrap());
+            ui.end_row();
+        }
+    });
+}
+
+/// A number of a result: whole numbers as they are, others with four decimals.
+fn result_number(x: f64) -> String {
+    if x.fract() == 0.0 && x.abs() < 1e15 { format!("{x:.0}") } else { format!("{x:.4}") }
 }
 
 fn form_section(
@@ -345,32 +448,20 @@ fn form_section(
     if let Some(req) = data.take_request() {
         app.handle_pick_request(req);
     }
-    if !data.issues.is_empty() {
-        ui.colored_label(
-            app.tokens.color(Token::StatusWarning),
-            tf("form.problems", &[("n", &data.issues.len().to_string())]),
-        );
-    }
+    panel.issues = data.issues.len();
 }
 
 fn action_buttons(app: &mut SurfaceCraftApp, panel: &mut CommandPanel, ui: &mut egui::Ui, id: &'static str) {
     let blocked = no_preview(id);
+    // Enter confirms and Esc closes, as in every dialog, while the keys are the tool's
+    let (enter, escape) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+    let (confirm, close) = (app.keys_free && enter, app.keys_free && escape && !enter);
     ui.horizontal(|ui| {
-        if panel.preview_on && blocked.is_none() {
-            if ui.button(t("form.apply")).on_hover_text(t("form.apply_hint")).clicked() {
-                app.run_palette();
-                panel.cancel_preview();
-            }
-            if ui.button(t("form.cancel")).on_hover_text(t("form.cancel_hint")).clicked() {
-                panel.cancel_preview();
-            }
-        } else if ui.button(t("palette.run")).clicked() {
-            app.run_palette();
-            panel.clear();
-        }
         match blocked {
             None => {
-                if ui.checkbox(&mut panel.preview_on, t("form.preview")).changed() && !panel.preview_on {
+                if ui.checkbox(&mut panel.preview_on, t("form.preview")).on_hover_text(t("form.preview_hint")).changed()
+                    && !panel.preview_on
+                {
                     panel.clear();
                 }
             }
@@ -380,6 +471,18 @@ fn action_buttons(app: &mut SurfaceCraftApp, panel: &mut CommandPanel, ui: &mut 
             }
             Some(NoPreview::ReadOnly) => {}
         }
+        // OK is the last button on the right, Cancel beside it
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let ok = crate::theme::primary_button(&app.tokens, t("form.ok"));
+            if ui.add(ok).on_hover_text(t("form.apply_hint")).clicked() || confirm {
+                app.run_palette();
+                panel.cancel_preview();
+            }
+            if ui.button(t("form.cancel")).on_hover_text(t("form.cancel_hint")).clicked() || close {
+                panel.cancel_preview();
+                app.close_tool();
+            }
+        });
     });
 }
 
@@ -394,7 +497,8 @@ fn preview_status(app: &SurfaceCraftApp, panel: &CommandPanel, ui: &mut egui::Ui
             ui.weak(tf("form.preview_ready", &[("n", &n.to_string())]));
         }
         PreviewStatus::Failed(e) => {
-            ui.colored_label(err, tf("form.preview_failed", &[("error", e)]));
+            let e = crate::i18n::engine_message(e);
+            ui.colored_label(err, tf("form.preview_failed", &[("error", &e)]));
         }
         PreviewStatus::BadJson => {
             ui.colored_label(err, t("form.err.json"));
