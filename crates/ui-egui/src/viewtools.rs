@@ -12,7 +12,7 @@ use crate::camera::{StandardView, ViewAnim};
 use crate::gizmo::{Axis, Gizmo, GizmoMode};
 use crate::i18n::{t, tf};
 use crate::sectionview::{SectionAxis, SectionPlane};
-use crate::select::{self, SelectOp, TriSelection, View, Visibility};
+use crate::select::{self, Scan, SelectOp, TriSelection, View};
 use crate::theme::Token;
 use crate::viewcube;
 use crate::viewport::Overlay;
@@ -228,14 +228,8 @@ impl SurfaceCraftApp {
         let Some(d) = self.mesh_item() else { return };
         let (cam, radius, through) = (self.camera.clone(), self.tools.brush_radius, self.tools.through);
         let centres = select::stroke_points(from.unwrap_or(to), to, radius);
-        let bvh = self.bvh_of(&d);
-        let tris = select::brush_select(
-            &d.pick_mesh,
-            &View { camera: &cam, w, h },
-            &centres,
-            radius,
-            Visibility { through, bvh: Some(bvh) },
-        );
+        let scan = Scan { mesh: &d.pick_mesh, bvh: self.bvh_of(&d) };
+        let tris = select::brush_select(scan, &View { camera: &cam, w, h }, &centres, radius, through);
         let op = if erase { SelectOp::Subtract } else { SelectOp::Add };
         self.apply_selection(&d, op, &tris);
     }
@@ -244,13 +238,8 @@ impl SurfaceCraftApp {
     pub fn select_lasso(&mut self, poly: &[[f64; 2]], w: f64, h: f64, op: SelectOp) {
         let Some(d) = self.mesh_item() else { return };
         let (cam, through) = (self.camera.clone(), self.tools.through);
-        let bvh = self.bvh_of(&d);
-        let tris = select::lasso_select(
-            &d.pick_mesh,
-            &View { camera: &cam, w, h },
-            poly,
-            Visibility { through, bvh: Some(bvh) },
-        );
+        let scan = Scan { mesh: &d.pick_mesh, bvh: self.bvh_of(&d) };
+        let tris = select::lasso_select(scan, &View { camera: &cam, w, h }, poly, through);
         self.apply_selection(&d, op, &tris);
     }
 
