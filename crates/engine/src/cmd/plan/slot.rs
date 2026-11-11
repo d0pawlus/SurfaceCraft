@@ -2,7 +2,8 @@
 //! has no scan inside such a tool, so it runs across the whole stock.
 use super::loops::{Loop, build_loops};
 use super::pocket::{Env, plan_wall_shape};
-use super::profile::{Frame, inside_polygon, polygon_distance, walls_and_corners};
+use super::profile::{Frame, polygon_of, walls_and_corners};
+use super::void::{VOID_SHARE, Void, measure};
 use super::{NEIGHBOUR_GAP, Node, PlannedTool, RoleKind, State, arr, near, snap_direction, v3};
 use surfacecraft_geom::{Vec3, normalize};
 use surfacecraft_kernel::hybrid::Shape;
@@ -12,10 +13,6 @@ use surfacecraft_kernel::local::LocalTool;
 const MAX_ROUNDS: usize = 8;
 /// A slot's direction snaps to a model axis within this angle (degrees).
 const DIRECTION_SNAP_DEG: f64 = 0.5;
-/// Points of scan allowed inside a through tool (noise, not geometry).
-const INSIDE_MAX: usize = 3;
-/// A scan point this far inside the outline is inside the tool (mm).
-const INSIDE_DEPTH: f64 = 0.5;
 /// Points sampled per wall for the frame's origin.
 const SAMPLES_PER_WALL: usize = 200;
 /// Cosine bounds: a wall square to the direction, an axis along it.
@@ -83,7 +80,7 @@ fn first_component(env: &Env, members: &[usize]) -> Vec<usize> {
         for &m in members {
             let touches = !comp.contains(&m)
                 && comp.iter().any(|&c| match (env.nodes.get(c), env.nodes.get(m)) {
-                    (Some(a), Some(b)) => near(a, b, NEIGHBOUR_GAP).is_some(),
+                    (Some(a), Some(b)) => near(a, b, env.scale.mm(NEIGHBOUR_GAP)).is_some(),
                     _ => false,
                 });
             if touches {
@@ -106,17 +103,13 @@ fn frame_of(env: &Env, comp: &[usize], d: Vec3) -> Frame {
     Frame::new(sum / cnt.max(1.0), d)
 }
 
-/// Scan points inside the loop's outline: a through tool would cut them away.
-fn scan_inside(env: &Env, frame: &Frame, l: &Loop) -> usize {
-    let (lo, hi) = l.polygon.iter().fold(([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]), |(lo, hi), q| {
-        ([lo[0].min(q[0]), lo[1].min(q[1])], [hi[0].max(q[0]), hi[1].max(q[1])])
-    });
-    env.scan
-        .iter()
-        .map(|p| frame.to2(p))
-        .filter(|q| q[0] >= lo[0] && q[0] <= hi[0] && q[1] >= lo[1] && q[1] <= hi[1])
-        .filter(|q| inside_polygon(&l.polygon, *q) && polygon_distance(&l.polygon, *q) > INSIDE_DEPTH)
-        .count()
+/// The scan surface inside the loop's outline (at any height) and the footprint of the loop on the
+/// part: a through tool would cut it away.
+fn scan_inside(env: &Env, frame: &Frame, l: &Loop) -> super::void::Measure {
+    let outline = polygon_of(&l.segs);
+    let void =
+        Void { scan: env.cloud, frame, scale: env.scale, above: None, outline: &outline, islands: &[], band: 0.0 };
+    measure(&void, |_| false)
 }
 
 /// Why a loop cannot be a through tool, if it cannot.
@@ -124,10 +117,12 @@ fn check_loop(env: &Env, frame: &Frame, l: &Loop) -> Result<(), String> {
     if l.area < 0.0 {
         return Err("walls round an island with no floor under it".into());
     }
-    let inside = scan_inside(env, frame, l);
-    if inside > INSIDE_MAX {
+    let m = scan_inside(env, frame, l);
+    if m.share() > VOID_SHARE {
         return Err(format!(
-            "slot walls with scan inside them ({inside} points): a floor that was not given, or an island"
+            "slot walls with scan inside them ({:.1} mm2, {:.1} % of the footprint): a floor that was not given, or an island",
+            m.area,
+            100.0 * m.share()
         ));
     }
     Ok(())
@@ -172,7 +167,7 @@ fn make_tool(env: &Env, st: &mut State, tools: &mut Vec<PlannedTool>, frame: &Fr
 fn plan_group(env: &Env, st: &mut State, tools: &mut Vec<PlannedTool>, comp: &[usize], d: Vec3) -> Result<(), String> {
     let frame = frame_of(env, comp, d);
     let (walls, corners) = walls_and_corners(env.nodes, comp, &frame, env.anchors)?;
-    let loops = build_loops(&walls, &corners, 2.0 * env.diag + 10.0)?;
+    let loops = build_loops(&walls, &corners, 2.0 * env.diag + 10.0, env.scale)?;
     loops.iter().try_for_each(|l| check_loop(env, &frame, l))?;
     loops.iter().for_each(|l| make_tool(env, st, tools, &frame, l));
     Ok(())
@@ -194,7 +189,9 @@ pub(super) fn plan_slots(env: &Env, st: &mut State, tools: &mut Vec<PlannedTool>
         }
         let comp = first_component(env, &members);
         if let Err(why) = plan_group(env, st, tools, &comp, d) {
-            comp.iter().for_each(|&c| st.set(c, RoleKind::Skipped, format!("slot profile: {why}")));
+            // a convex round of the group keeps its chance of being a fillet (step 6)
+            let skipped = comp.iter().filter(|&&c| env.nodes.get(c).is_some_and(|n| !is_reflex_round(n)));
+            skipped.for_each(|&c| st.set(c, RoleKind::Skipped, format!("slot profile: {why}")));
         }
     }
 }

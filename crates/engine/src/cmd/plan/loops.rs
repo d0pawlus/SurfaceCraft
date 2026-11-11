@@ -8,14 +8,19 @@
 //! tangent to both.
 use super::NEIGHBOUR_GAP;
 use super::extent::{arc_ends, wall_ends};
-use super::joint::{Part, join};
+use super::joint::{Bounds, Part, join};
 use super::profile::{Corner, Seg, Wall, crosses_itself, d2, polygon_of, signed_area, solve, tangent};
+use super::scan::Scale;
 use std::f64::consts::{PI, TAU};
 
-/// Shortest piece of a profile (mm).
+/// Shortest piece of a profile (mm at the reference spacing; so are the lengths below).
 const MIN_LENGTH: f64 = 0.05;
-/// Smallest area of a loop (mm²).
+/// Smallest area of a loop (mm² at the reference spacing).
 const MIN_AREA: f64 = 0.5;
+/// Smallest distance between a round's data and its fit's centre that is always allowed (mm).
+const ROUND_CENTRE_FLOOR: f64 = 1.0;
+/// Largest radius, and largest coordinate, of a profile (mm): anything beyond is not a part.
+const MAX_EXTENT: f64 = 1e7;
 /// How far a half round may differ from half the distance between its walls (mm).
 const HALF_ROUND_SLACK: f64 = 0.6;
 /// Largest sweep of a rounded corner between two walls, radians (a half round plus slack).
@@ -79,6 +84,7 @@ struct Path {
 struct Ctx<'a> {
     walls: &'a [Wall],
     corners: &'a [Corner],
+    scale: Scale,
 }
 
 impl Ctx<'_> {
@@ -107,11 +113,11 @@ fn angle_of(p: [f64; 2], c: [f64; 2]) -> f64 {
 
 fn elements(ctx: &Ctx) -> Vec<Elem> {
     let walls = ctx.walls.iter().enumerate().map(|(i, w)| {
-        let (begin, end) = wall_ends(w);
+        let (begin, end) = wall_ends(w, ctx.scale);
         Elem { kind: Kind::Wall(i), begin, end }
     });
     let arcs = ctx.corners.iter().enumerate().filter(|(_, k)| !k.full).map(|(i, k)| {
-        let (begin, end) = arc_ends(k);
+        let (begin, end) = arc_ends(k, ctx.scale);
         Elem { kind: Kind::Arc(i), begin, end }
     });
     walls.chain(arcs).collect()
@@ -119,20 +125,30 @@ fn elements(ctx: &Ctx) -> Vec<Elem> {
 
 /// Does the element `i` lead into `j`, and where do they meet?
 fn link_between(ctx: &Ctx, elems: &[Elem], i: usize, j: usize) -> Option<Link> {
-    let part = |k: Kind| match k {
-        Kind::Wall(w) => ctx.wall(w).map(Part::Wall),
-        Kind::Arc(c) => ctx.corner(c).map(Part::Arc),
-    };
-    let (a, b) = (part(elems.get(i)?.kind)?, part(elems.get(j)?.kind)?);
-    let joint = join(a, b)?;
+    let (a, b) = (part_of(ctx, elems.get(i)?.kind)?, part_of(ctx, elems.get(j)?.kind)?);
+    let joint = join(a, b, ctx.scale)?;
     Some(Link { from: i, to: j, gap: joint.score, vertex: joint.vertex })
 }
 
-/// Each element leads into at most one other, the nearest first.
+fn part_of<'a>(ctx: &'a Ctx<'a>, k: Kind) -> Option<Part<'a>> {
+    match k {
+        Kind::Wall(w) => ctx.wall(w).map(Part::Wall),
+        Kind::Arc(c) => ctx.corner(c).map(Part::Arc),
+    }
+}
+
+/// Each element leads into at most one other, the nearest first. The pairs worth a look are those
+/// whose boxes come near each other (each box is computed once).
 fn match_links(ctx: &Ctx, elems: &[Elem]) -> Vec<Option<Link>> {
     let n = elems.len();
+    let boxes: Vec<Option<Bounds>> = elems.iter().map(|e| part_of(ctx, e.kind).map(|p| Bounds::of(p.pts()))).collect();
+    let gap = ctx.scale.mm(NEIGHBOUR_GAP);
     let mut links: Vec<Link> = (0..n)
         .flat_map(|i| (0..n).filter(move |&j| j != i).map(move |j| (i, j)))
+        .filter(|&(i, j)| match (boxes.get(i).copied().flatten(), boxes.get(j).copied().flatten()) {
+            (Some(a), Some(b)) => a.near(&b, gap),
+            _ => false,
+        })
         .filter_map(|(i, j)| link_between(ctx, elems, i, j))
         .collect();
     links.sort_by(|a, b| a.gap.total_cmp(&b.gap));
@@ -199,12 +215,12 @@ fn paths(succ: &[Option<Link>]) -> Vec<Path> {
 
 /// A half round between two walls that face each other (a slot's end, a rib's end): the centre
 /// moves to the middle line and the radius is half the distance. `s` is +1 for a round of the void.
-fn half_round(a: &Wall, b: &Wall, k: &Corner, s: f64) -> Option<([f64; 2], f64)> {
+fn half_round(a: &Wall, b: &Wall, k: &Corner, s: f64, sc: Scale) -> Option<([f64; 2], f64)> {
     if a.n[0] * b.n[0] + a.n[1] * b.n[1] > -0.9 {
         return None;
     }
     let width = -s * (a.c + b.c);
-    if width < 0.2 || (k.r - 0.5 * width).abs() > HALF_ROUND_SLACK {
+    if width < sc.mm(0.2) || (k.r - 0.5 * width).abs() > sc.mm(HALF_ROUND_SLACK) {
         return None;
     }
     let mid = 0.5 * (a.c - b.c);
@@ -214,22 +230,23 @@ fn half_round(a: &Wall, b: &Wall, k: &Corner, s: f64) -> Option<([f64; 2], f64)>
 
 /// The round `k` between the walls `a` and `b`, solved from the walls (exactly tangent to both),
 /// if the data agrees.
-fn fillet(a: &Wall, b: &Wall, k: &Corner) -> Option<Round> {
+fn fillet(a: &Wall, b: &Wall, k: &Corner, sc: Scale) -> Option<Round> {
     let s = if k.concave { 1.0 } else { -1.0 };
     let parallel = (a.n[0] * b.n[1] - a.n[1] * b.n[0]).abs() < 0.1;
     let (center, r) = if parallel {
-        half_round(a, b, k, s)?
+        half_round(a, b, k, s, sc)?
     } else {
         let center = solve(a.n, a.c + s * k.r, b.n, b.c + s * k.r)?;
-        (d2(center, k.center) <= (0.3 * k.r).max(1.0)).then_some((center, k.r))?
+        (d2(center, k.center) <= (0.3 * k.r).max(sc.mm(ROUND_CENTRE_FLOOR))).then_some((center, k.r))?
     };
     let t1 = [center[0] - s * a.n[0] * r, center[1] - s * a.n[1] * r];
     let t2 = [center[0] - s * b.n[0] * r, center[1] - s * b.n[1] * r];
     if !parallel {
-        let touches = dist_to(&a.pts, t1) <= NEIGHBOUR_GAP
-            && dist_to(&b.pts, t2) <= NEIGHBOUR_GAP
-            && dist_to(&k.pts, t1) <= NEIGHBOUR_GAP
-            && dist_to(&k.pts, t2) <= NEIGHBOUR_GAP;
+        let gap = sc.mm(NEIGHBOUR_GAP);
+        let touches = dist_to(&a.pts, t1) <= gap
+            && dist_to(&b.pts, t2) <= gap
+            && dist_to(&k.pts, t1) <= gap
+            && dist_to(&k.pts, t2) <= gap;
         let (p, q) = (angle_of(t1, center), angle_of(t2, center));
         let sweep = if k.concave { (q - p).rem_euclid(TAU) } else { (p - q).rem_euclid(TAU) };
         if !touches || !(MIN_ROUND_SWEEP..=MAX_ROUND_SWEEP).contains(&sweep) {
@@ -257,13 +274,13 @@ fn arc_covers(seg: &Seg, p: [f64; 2]) -> bool {
 }
 
 /// The circle of radius ~`k.r` through `b` and `e` that the round's points lie on.
-fn arc_through(k: &Corner, b: [f64; 2], e: [f64; 2]) -> Result<(Seg, [f64; 2], f64), String> {
+fn arc_through(k: &Corner, b: [f64; 2], e: [f64; 2], sc: Scale) -> Result<(Seg, [f64; 2], f64), String> {
     let chord = d2(b, e);
-    if chord < MIN_LENGTH {
+    if chord < sc.mm(MIN_LENGTH) {
         return Err("a round has no length between its neighbours".into());
     }
     let half = 0.5 * chord;
-    if half - k.r > HALF_ROUND_SLACK {
+    if half - k.r > sc.mm(HALF_ROUND_SLACK) {
         return Err(format!("the round r = {:.2} is shorter than the {chord:.2} mm between its neighbours", k.r));
     }
     let r = k.r.max(half);
@@ -321,7 +338,7 @@ fn joints(ctx: &Ctx, elems: &[Elem], succ: &[Option<Link>], p: &Path) -> Joints 
         let kinds = [prev, kc, next].map(|i| p.nodes.get(i).and_then(|&n| elems.get(n)).map(|e| e.kind));
         let [Some(Kind::Wall(a)), Some(Kind::Arc(c)), Some(Kind::Wall(b))] = kinds else { continue };
         let (Some(wa), Some(wb), Some(k)) = (ctx.wall(a), ctx.wall(b), ctx.corner(c)) else { continue };
-        let Some(rd) = fillet(wa, wb, k) else { continue };
+        let Some(rd) = fillet(wa, wb, k, ctx.scale) else { continue };
         if let Some(v) = j.vout.get_mut(prev) {
             *v = Some(rd.t1);
         }
@@ -342,7 +359,7 @@ fn joints(ctx: &Ctx, elems: &[Elem], succ: &[Option<Link>], p: &Path) -> Joints 
 }
 
 /// The line of a wall between its joints; a free end runs out by `ext`.
-fn wall_seg(w: &Wall, vin: Option<[f64; 2]>, vout: Option<[f64; 2]>, ext: f64) -> Result<Seg, String> {
+fn wall_seg(w: &Wall, vin: Option<[f64; 2]>, vout: Option<[f64; 2]>, ext: f64, sc: Scale) -> Result<Seg, String> {
     let t = tangent(w.n);
     let back = |e: [f64; 2], by: f64| [e[0] - t[0] * by, e[1] - t[1] * by];
     let (b, e) = match (vin, vout) {
@@ -350,12 +367,12 @@ fn wall_seg(w: &Wall, vin: Option<[f64; 2]>, vout: Option<[f64; 2]>, ext: f64) -
         (None, Some(e)) => (back(e, ext), e),
         (Some(b), None) => (b, back(b, -ext)),
         (None, None) => {
-            let (lo, hi) = wall_ends(w);
+            let (lo, hi) = wall_ends(w, sc);
             let mid = [0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1])];
             (back(mid, ext), back(mid, -ext))
         }
     };
-    if along(e, b, t) < MIN_LENGTH {
+    if !(along(e, b, t) >= sc.mm(MIN_LENGTH)) {
         return Err("a wall has no length between its neighbours".into());
     }
     Ok(Seg::Line(b, e))
@@ -392,7 +409,7 @@ fn build_path(ctx: &Ctx, elems: &[Elem], succ: &[Option<Link>], p: &Path, ext: f
         match elems.get(n).map(|e| e.kind) {
             Some(Kind::Wall(w)) => {
                 let wall = ctx.wall(w).ok_or("index")?;
-                segs.push(wall_seg(wall, vin, vout, ext)?);
+                segs.push(wall_seg(wall, vin, vout, ext, ctx.scale)?);
                 nodes.push(wall.id);
             }
             Some(Kind::Arc(c)) => {
@@ -406,7 +423,7 @@ fn build_path(ctx: &Ctx, elems: &[Elem], succ: &[Option<Link>], p: &Path, ext: f
                 let solved = j.round.get(k).and_then(Option::as_ref);
                 let (seg, center, r) = match solved {
                     Some(rd) => (arc_seg(rd.center, rd.r, b, e, k_.concave), rd.center, rd.r),
-                    None => arc_through(k_, b, e)?,
+                    None => arc_through(k_, b, e, ctx.scale)?,
                 };
                 segs.push(seg);
                 nodes.push(k_.id);
@@ -422,25 +439,70 @@ fn build_path(ctx: &Ctx, elems: &[Elem], succ: &[Option<Link>], p: &Path, ext: f
         };
         close_chain(&mut segs, lone, ext)?;
     }
+    if !segs.iter().all(seg_is_sound) {
+        return Err("the profile has a coordinate that is not a finite number in range".into());
+    }
     let polygon = polygon_of(&segs);
     let area = signed_area(&polygon);
     if crosses_itself(&polygon) {
         return Err("the walls cross each other".into());
     }
-    if area.abs() < MIN_AREA {
+    if !(area.abs() >= ctx.scale.mm2(MIN_AREA)) {
         return Err("the walls enclose no area".into());
     }
     let probe = first_point(elems, p).unwrap_or([0.0; 2]);
     Ok(Loop { segs, polygon, closed: p.closed, area, nodes, arcs, probe })
 }
 
-/// The loops of `walls` and `corners`, and the open chains (closed far outside, `ext` beyond the
-/// part). Posts (full rounds) are loops of their own.
-pub(super) fn build_loops(walls: &[Wall], corners: &[Corner], ext: f64) -> Result<Vec<Loop>, String> {
+fn point_is_sound(p: [f64; 2]) -> bool {
+    p.iter().all(|c| c.is_finite() && c.abs() <= MAX_EXTENT)
+}
+
+/// A piece of a profile with finite coordinates in range and a positive radius.
+fn seg_is_sound(s: &Seg) -> bool {
+    match s {
+        Seg::Line(a, b) => point_is_sound(*a) && point_is_sound(*b),
+        Seg::Arc { c, r, a0, a1 } => {
+            point_is_sound(*c) && r.is_finite() && *r > 0.0 && *r <= MAX_EXTENT && a0.is_finite() && a1.is_finite()
+        }
+    }
+}
+
+/// Input is hostile: refuse numbers that are not finite, radii that are not positive and walls
+/// that have no direction before anything is computed from them.
+fn check_input(walls: &[Wall], corners: &[Corner], ext: f64) -> Result<(), String> {
+    let walls_ok = walls.iter().all(|w| {
+        let len = w.n[0].hypot(w.n[1]);
+        point_is_sound(w.n)
+            && (0.5..=2.0).contains(&len)
+            && w.c.is_finite()
+            && w.c.abs() <= MAX_EXTENT
+            && w.pts.iter().all(|p| point_is_sound(*p))
+    });
+    let corners_ok = corners.iter().all(|k| {
+        point_is_sound(k.center)
+            && k.r.is_finite()
+            && k.r > 0.0
+            && k.r <= MAX_EXTENT
+            && k.pts.iter().all(|p| point_is_sound(*p))
+    });
+    if !(walls_ok && corners_ok && ext.is_finite() && ext > 0.0 && ext <= MAX_EXTENT) {
+        return Err(
+            "a wall or round has a coordinate that is not a finite number in range, or a radius that is not positive"
+                .into(),
+        );
+    }
     if walls.iter().any(|w| w.pts.is_empty()) || corners.iter().any(|k| k.pts.is_empty()) {
         return Err("a region has no points".into());
     }
-    let ctx = Ctx { walls, corners };
+    Ok(())
+}
+
+/// The loops of `walls` and `corners`, and the open chains (closed far outside, `ext` beyond the
+/// part). Posts (full rounds) are loops of their own. `scale` carries the scan's spacing.
+pub(super) fn build_loops(walls: &[Wall], corners: &[Corner], ext: f64, scale: Scale) -> Result<Vec<Loop>, String> {
+    check_input(walls, corners, ext)?;
+    let ctx = Ctx { walls, corners, scale };
     let mut loops: Vec<Loop> = corners.iter().filter(|k| k.full).map(circle_loop).collect();
     let elems = elements(&ctx);
     let succ = match_links(&ctx, &elems);
@@ -459,6 +521,7 @@ mod tests {
     use std::f64::consts::FRAC_PI_2;
 
     const EXT: f64 = 300.0;
+    const SC: Scale = Scale { spacing: 0.9 };
 
     /// A wall along `a`..`b` (points trimmed by `trim` at both ends) with the void on the side of
     /// `void`.
@@ -510,7 +573,7 @@ mod tests {
     }
 
     fn one(walls: &[Wall], corners: &[Corner]) -> Loop {
-        let mut loops = build_loops(walls, corners, EXT).unwrap();
+        let mut loops = build_loops(walls, corners, EXT, SC).unwrap();
         assert_eq!(loops.len(), 1, "{loops:?}");
         let l = loops.remove(0);
         assert_continuous(&l);
@@ -661,15 +724,82 @@ mod tests {
     fn walls_that_do_not_meet_stay_apart() {
         let walls =
             [wall(0, [0.0, 0.0], [10.0, 0.0], [5.0, 5.0], 0.3), wall(1, [100.0, 0.0], [100.0, 10.0], [50.0, 5.0], 0.3)];
-        let loops = build_loops(&walls, &[], EXT).unwrap();
+        let loops = build_loops(&walls, &[], EXT, SC).unwrap();
         assert_eq!(loops.len(), 2);
         assert!(loops.iter().all(|l| !l.closed));
     }
 
     #[test]
+    fn hostile_regions_are_refused_not_built() {
+        let good = || wall(0, [0.0, 0.0], [10.0, 0.0], [5.0, 5.0], 0.3);
+        let mut nan_point = good();
+        nan_point.pts.push([f64::NAN, 1.0]);
+        let mut nan_c = good();
+        nan_c.c = f64::NAN;
+        let mut no_direction = good();
+        no_direction.n = [0.0, 0.0];
+        let mut far = good();
+        far.pts.push([1e300, 0.0]);
+        for w in [nan_point, nan_c, no_direction, far] {
+            assert!(build_loops(&[w], &[], EXT, SC).is_err());
+        }
+        let round_of = |centre: [f64; 2], r: f64| round(1, centre, r, 0.0, 90.0, true);
+        for k in [
+            round_of([f64::NAN, 0.0], 3.0),
+            round_of([0.0, 0.0], 0.0),
+            round_of([0.0, 0.0], -3.0),
+            round_of([0.0, 0.0], 1e300),
+        ] {
+            assert!(build_loops(&[good()], &[k], EXT, SC).is_err());
+        }
+        assert!(build_loops(&[good()], &[], f64::NAN, SC).is_err());
+        assert!(build_loops(&[good()], &[], -1.0, SC).is_err());
+    }
+
+    #[test]
+    fn a_short_segment_between_two_rounds_links_at_any_scale() {
+        // a pocket 5 x 3 with r = 1 corners: its straight pieces are 3 and 1 long, well under the
+        // fixed 6 mm the joints used to need; the same shape at twice and a fifth of the size
+        for k in [0.2, 1.0, 2.0, 5.0] {
+            let sc = Scale { spacing: 0.9 * k };
+            let (w, h, r, trim) = (5.0 * k, 3.0 * k, 1.0 * k, 0.1 * k);
+            let inside = [w / 2.0, h / 2.0];
+            let walls = [
+                wall(0, [r, 0.0], [w - r, 0.0], inside, trim),
+                wall(1, [w, r], [w, h - r], inside, trim),
+                wall(2, [w - r, h], [r, h], inside, trim),
+                wall(3, [0.0, h - r], [0.0, r], inside, trim),
+            ];
+            let corners = [
+                round(4, [w - r, r], r, -85.0, -5.0, true),
+                round(5, [w - r, h - r], r, 5.0, 85.0, true),
+                round(6, [r, h - r], r, 95.0, 175.0, true),
+                round(7, [r, r], r, 185.0, 265.0, true),
+            ];
+            let mut loops = build_loops(&walls, &corners, 100.0 * k, sc).unwrap_or_else(|e| panic!("scale {k}: {e}"));
+            assert_eq!(loops.len(), 1);
+            let l = loops.remove(0);
+            assert!(l.closed && l.segs.len() == 8, "scale {k}: {} pieces", l.segs.len());
+        }
+    }
+
+    #[test]
+    fn a_long_wall_links_to_its_round() {
+        // a wall 2000 mm long: its 400 sampled points are 5 mm apart, so only a few lie near an end
+        let r = 20.0;
+        let mut long = wall(0, [r, 0.0], [2000.0, 0.0], [1000.0, 500.0], 1.0);
+        long.pts = (0..400).map(|k| [r + 1.0 + (2000.0 - r - 2.0) * k as f64 / 399.0, 0.0]).collect();
+        let side = wall(1, [2000.0, r], [2000.0, 500.0 - r], [1000.0, 250.0], 1.0);
+        let round_ = round(2, [2000.0 - r, r], r, -85.0, -5.0, true);
+        let sc = Scale { spacing: 0.9 * 20.0 };
+        let loops = build_loops(&[long, side], &[round_], 10000.0, sc).unwrap();
+        assert!(loops.iter().any(|l| l.arcs.len() == 1), "{loops:?}");
+    }
+
+    #[test]
     fn empty_regions_and_lone_rounds_are_refused() {
-        assert!(build_loops(&[], &[], EXT).is_err());
+        assert!(build_loops(&[], &[], EXT, SC).is_err());
         let k = round(0, [0.0, 0.0], 3.0, 0.0, 90.0, true);
-        assert!(build_loops(&[], &[k], EXT).is_err());
+        assert!(build_loops(&[], &[k], EXT, SC).is_err());
     }
 }

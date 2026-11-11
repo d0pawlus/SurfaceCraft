@@ -14,8 +14,11 @@ mod joint;
 mod loops;
 mod pocket;
 mod profile;
+mod scan;
 mod slot;
+mod void;
 use pocket::{Env, plan_pockets};
+pub use scan::Scan;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use slot::plan_slots;
@@ -657,7 +660,9 @@ impl State {
 /// Plans the build: classifies every region and forms the local tools. `scan` is the whole
 /// scanned cloud the regions come from (the "is there scan in front of it?" test).
 #[must_use]
-pub fn plan(items: &[Item], scan: &[Point3], square_deg: f64) -> Plan {
+pub fn plan(items: &[Item], cloud: &Scan, square_deg: f64) -> Plan {
+    let scan: &[Point3] = &cloud.points;
+    let sc = cloud.scale();
     let nodes = make_nodes(items);
     let contacts = contacts(&nodes);
     let mut st = State {
@@ -698,7 +703,7 @@ pub fn plan(items: &[Item], scan: &[Point3], square_deg: f64) -> Plan {
             continue;
         }
         let (o, a) = (v3(*point), v3(*axis));
-        let tol = 0.1 + 0.05 * radius.min(2.0);
+        let tol = sc.mm(0.1) + 0.05 * radius.min(sc.mm(2.0));
         let out = scan.iter().filter(|p| radial_axial(p, o, a).0 > radius + tol).count() as f64 / total;
         front_of[ci] = Some(out);
         if out <= ENVELOPE_FRACTION {
@@ -725,7 +730,7 @@ pub fn plan(items: &[Item], scan: &[Point3], square_deg: f64) -> Plan {
                 let rms = (nd.pts.iter().map(|p| (p.coords - p0).dot(&n).powi(2)).sum::<f64>()
                     / nd.pts.len().max(1) as f64)
                     .sqrt();
-                let tol = (0.1 + 3.0 * rms).min(0.4);
+                let tol = (sc.mm(0.1) + 3.0 * rms).min(sc.mm(0.4));
                 let (mut in_front, mut by_boss) = (0usize, 0usize);
                 for p in scan {
                     if (p.coords - p0).dot(&n) > tol {
@@ -756,7 +761,7 @@ pub fn plan(items: &[Item], scan: &[Point3], square_deg: f64) -> Plan {
             }
             Shape::Cylinder { point, axis, radius } if nd.full && nd.convex => {
                 let (o, a) = (v3(*point), v3(*axis));
-                let tol = 0.1 + 0.05 * radius.min(2.0);
+                let tol = sc.mm(0.1) + 0.05 * radius.min(sc.mm(2.0));
                 let out = scan.iter().filter(|p| radial_axial(p, o, a).0 > radius + tol).count() as f64 / total;
                 front_of[ni] = Some(out);
                 if out <= ENVELOPE_FRACTION {
@@ -929,7 +934,15 @@ pub fn plan(items: &[Item], scan: &[Point3], square_deg: f64) -> Plan {
     }
 
     // --- 3. pockets, steps and ribs: a local floor plane with walls and rounds; 4. through slots
-    let env = Env { nodes: &nodes, scan, diag, anchors: &global_normals, explained: &explained, front_of: &front_of };
+    let env = Env {
+        nodes: &nodes,
+        cloud,
+        diag,
+        anchors: &global_normals,
+        explained: &explained,
+        front_of: &front_of,
+        scale: cloud.scale(),
+    };
     plan_pockets(&env, &mut st, &mut tools);
     plan_slots(&env, &mut st, &mut tools);
 
@@ -1200,7 +1213,7 @@ pub fn plan(items: &[Item], scan: &[Point3], square_deg: f64) -> Plan {
                 let rms = (nd.pts.iter().map(|p| (p.coords - p0).dot(&n).powi(2)).sum::<f64>()
                     / nd.pts.len().max(1) as f64)
                     .sqrt();
-                let limit = (2.0 * rms).max(0.05);
+                let limit = (2.0 * rms).max(sc.mm(0.05));
                 let shift = nd.pts.iter().map(|p| (p.coords - p0).dot(&(snapped - n)).abs()).fold(0.0, f64::max);
                 let applied = shift <= limit;
                 squared.push(SquaredPlane { item: nd.base, angle_deg: angle, max_shift: shift, limit, applied });
@@ -1403,9 +1416,10 @@ pub fn report(items: &[Item], plan: &Plan) -> PlanOut {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::f64::consts::PI;
 
     /// Box 100 x 40 x 10 as six plane items; the top plane is tilted by `tilt_deg` about y.
-    fn slab(tilt_deg: f64) -> (Vec<Item>, Vec<Point3>) {
+    fn slab(tilt_deg: f64) -> (Vec<Item>, Scan) {
         let t = tilt_deg.to_radians();
         let grid = |f: &dyn Fn(f64, f64) -> [f64; 3]| -> Vec<Point3> {
             let mut v = Vec::new();
@@ -1441,7 +1455,7 @@ mod tests {
                 }
             })
             .collect();
-        (items, scan)
+        (items, Scan::from_points(scan, 1.0))
     }
 
     #[test]
@@ -1462,5 +1476,61 @@ mod tests {
         assert!(p.squared.iter().any(|q| q.item == 1 && q.applied), "{:?}", p.squared);
         assert!(matches!(&p.roles[1].shape, Shape::Plane { normal, .. } if normal[0] == 0.0));
         assert!(plan(&items, &scan, 0.0).squared.is_empty());
+    }
+
+    /// A scan of `pts` with a floor under the walls (which the group of walls does not know).
+    fn walls_with_a_round_and_a_floor() -> (Vec<Item>, Scan) {
+        let grid = |f: &dyn Fn(f64, f64) -> [f64; 3]| -> Vec<Point3> {
+            (0..=20)
+                .flat_map(|i| (0..=20).map(move |j| (i as f64 / 20.0, j as f64 / 20.0)))
+                .map(|(u, v)| {
+                    let p = f(u, v);
+                    Point3::new(p[0], p[1], p[2])
+                })
+                .collect()
+        };
+        let wall_x = grid(&|u, v| [10.0, 10.0 + 20.0 * u, 4.0 + 4.0 * v]);
+        let wall_y = grid(&|u, v| [10.0 + 20.0 * u, 10.0, 4.0 + 4.0 * v]);
+        // the convex round of the plate's corner, a little off the walls' corner
+        let round: Vec<Point3> = (0..=20)
+            .flat_map(|i| (0..=10).map(move |j| (i as f64 / 20.0, j as f64 / 10.0)))
+            .map(|(u, v)| {
+                let a = PI * (1.0 + 0.5 * u);
+                Point3::new(8.0 + 2.0 * a.cos(), 8.0 + 2.0 * a.sin(), 4.0 + 4.0 * v)
+            })
+            .collect();
+        // the floor the walls stand on (not among the regions)
+        let floor = grid(&|u, v| [10.0 + 20.0 * u, 10.0 + 20.0 * v, 4.0]);
+        let item = |id: u64, kind: &'static str, shape: Shape, convex: bool, pts: Vec<Point3>| Item {
+            id: ObjectId(id),
+            kind,
+            cut: Cut { shape, convex, full: false },
+            pts,
+        };
+        let items = vec![
+            item(0, "plane", Shape::Plane { point: [10.0, 20.0, 6.0], normal: [1.0, 0.0, 0.0] }, true, wall_x.clone()),
+            item(1, "plane", Shape::Plane { point: [20.0, 10.0, 6.0], normal: [0.0, 1.0, 0.0] }, true, wall_y.clone()),
+            item(
+                2,
+                "cylinder",
+                Shape::Cylinder { point: [8.0, 8.0, 6.0], axis: [0.0, 0.0, 1.0], radius: 2.0 },
+                true,
+                round.clone(),
+            ),
+        ];
+        let scan: Vec<Point3> = [wall_x, wall_y, round, floor].concat();
+        (items, Scan::from_points(scan, 1.0))
+    }
+
+    #[test]
+    fn a_failed_slot_group_leaves_a_convex_round_its_fillet_role() {
+        let (items, scan) = walls_with_a_round_and_a_floor();
+        let p = plan(&items, &scan, 0.3);
+        // the walls have scan inside them (their floor): no slot, no step
+        assert!(p.tools.is_empty(), "{:?}", p.tools.iter().map(|t| t.kind).collect::<Vec<_>>());
+        assert_eq!(p.roles[0].kind, RoleKind::Skipped, "{}", p.roles[0].how);
+        assert_eq!(p.roles[1].kind, RoleKind::Skipped, "{}", p.roles[1].how);
+        // the convex round was in the group, but is not lost with it
+        assert_eq!(p.roles[2].kind, RoleKind::Blend, "{}", p.roles[2].how);
     }
 }

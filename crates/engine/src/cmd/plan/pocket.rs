@@ -2,25 +2,24 @@
 //! standing), a step (walls with a floor that run out of the part) and a rib or post (islands on a
 //! face that is cut down everywhere else). The floor is a local plane: scan lies in front of it.
 use super::loops::{Loop, build_loops};
-use super::profile::{
-    Frame, Seg, inside_polygon, polygon_distance, polygon_of, reverse_loop, wall_normal, walls_and_corners,
-};
+use super::profile::{Frame, Seg, inside_polygon, polygon_of, reverse_loop, wall_normal, walls_and_corners};
+use super::scan::{Scale, Scan};
+use super::void::{VOID_SHARE, Void, measure};
 use super::{Explained, NEIGHBOUR_GAP, Node, PlannedTool, RoleKind, State, arr, near, snap_direction, v3};
-use surfacecraft_geom::{Point3, Vec3, normalize};
+use surfacecraft_geom::{Vec3, normalize};
 use surfacecraft_kernel::hybrid::Shape;
 use surfacecraft_kernel::local::LocalTool;
 
-/// A scan point this high above the floor (mm) is in the void of a tool that starts at it.
+/// A scan vertex this high above the floor (mm at the reference spacing) is in the void of a tool
+/// that starts at it.
 const VOID_HEIGHT: f64 = 0.6;
-/// A scan point this far inside the outline of a tool (mm) is in its void.
-const VOID_DEPTH: f64 = 0.5;
-/// Points of scan allowed in the void of a step or rib (noise, not geometry).
-const VOID_MAX_POINTS: usize = 3;
-/// A wall touches its floor when its lowest point is within these heights above it (mm).
+/// A wall touches its floor when its lowest point is within these heights above it (mm at the
+/// reference spacing).
 const WALL_HEIGHTS: (f64, f64) = (-0.6, 3.0);
-/// Largest radius of a fillet between a floor and its walls (mm).
+/// Largest radius of a fillet between a floor and its walls (mm at the reference spacing); also the
+/// width of the band along the floor and the walls in which unmodelled fillets are not counted.
 const FILLET_MAX_RADIUS: f64 = 6.0;
-/// How far a fillet's axis may be from one radius above the floor (mm).
+/// How far a fillet's axis may be from one radius above the floor (mm at the reference spacing).
 const FILLET_AXIS_TOL: f64 = 0.4;
 /// A floor's normal snaps to a model axis within this angle (degrees).
 const FLOOR_SNAP_DEG: f64 = 0.3;
@@ -33,11 +32,12 @@ const ACROSS: f64 = 0.1;
 /// What the pocket step knows about the part.
 pub(super) struct Env<'a> {
     pub(super) nodes: &'a [Node],
-    pub(super) scan: &'a [Point3],
+    pub(super) cloud: &'a Scan,
     pub(super) diag: f64,
     pub(super) anchors: &'a [Vec3],
     pub(super) explained: &'a [Explained],
     pub(super) front_of: &'a [Option<f64>],
+    pub(super) scale: Scale,
 }
 
 /// A floor: a pending local plane, as the base of a tool.
@@ -59,6 +59,10 @@ impl Env<'_> {
     }
     fn ext(&self) -> f64 {
         2.0 * self.diag + 10.0
+    }
+    /// Two regions this close (mm) are neighbours.
+    fn gap(&self) -> f64 {
+        self.scale.mm(NEIGHBOUR_GAP)
     }
 }
 
@@ -122,8 +126,8 @@ fn candidates(env: &Env, st: &State, floor: &Floor) -> Candidates {
         .filter(|&ci| {
             env.node(ci).is_some_and(|c| {
                 can_touch(c, &floor.nf)
-                    && (WALL_HEIGHTS.0..=WALL_HEIGHTS.1).contains(&low(c))
-                    && near(fl, c, NEIGHBOUR_GAP).is_some()
+                    && (env.scale.mm(WALL_HEIGHTS.0)..=env.scale.mm(WALL_HEIGHTS.1)).contains(&low(c))
+                    && near(fl, c, env.gap()).is_some()
             })
         })
         .collect();
@@ -137,7 +141,7 @@ fn proximity_components(env: &Env, ids: &[usize]) -> Vec<Vec<usize>> {
     for x in 0..ids.len() {
         for y in (x + 1)..ids.len() {
             let touching = match (ids.get(x).and_then(|&i| env.node(i)), ids.get(y).and_then(|&i| env.node(i))) {
-                (Some(a), Some(b)) => near(a, b, NEIGHBOUR_GAP).is_some(),
+                (Some(a), Some(b)) => near(a, b, env.gap()).is_some(),
                 _ => false,
             };
             let (lx, ly) = (label.get(x).copied().unwrap_or(x), label.get(y).copied().unwrap_or(y));
@@ -167,7 +171,7 @@ fn floor_loops(env: &Env, st: &mut State, floor: &Floor, walls: &[usize]) -> Vec
             continue;
         }
         let built = walls_and_corners(env.nodes, &members, &floor.frame, env.anchors)
-            .and_then(|(w, c)| build_loops(&w, &c, env.ext()));
+            .and_then(|(w, c)| build_loops(&w, &c, env.ext(), env.scale));
         match built {
             Ok(loops) => out.extend(loops),
             Err(why) => members.iter().for_each(|&u| st.note(u, format!("pocket profile: {why}"))),
@@ -206,6 +210,8 @@ struct Spec<'a> {
     /// Closed by its own walls (a pocket); else it runs out of the part.
     closed: bool,
     islands: Vec<&'a Loop>,
+    /// Why the tool must not be built (a part of the pocket that was not understood).
+    blocked: Option<&'static str>,
 }
 
 impl Spec<'_> {
@@ -227,23 +233,33 @@ fn assemble(
 ) -> usize {
     let (outers, islands): (Vec<&Loop>, Vec<&Loop>) = loops.iter().partition(|l| l.area > 0.0);
     let mut owned: Vec<Vec<&Loop>> = outers.iter().map(|_| Vec::new()).collect();
+    let mut blocked: Vec<Option<&'static str>> = outers.iter().map(|_| None).collect();
     let mut loose: Vec<&Loop> = Vec::new();
     for isl in islands {
-        match holder(&outers, isl).and_then(|i| owned.get_mut(i)) {
-            Some(list) => list.push(isl),
-            None => loose.push(isl),
+        let Some(i) = holder(&outers, isl) else {
+            loose.push(isl);
+            continue;
+        };
+        if !isl.closed && outers.get(i).is_some_and(|o| o.closed) {
+            if let Some(b) = blocked.get_mut(i) {
+                *b = Some("walls that run out of the pocket's own walls are no island");
+            }
+        } else if let Some(list) = owned.get_mut(i) {
+            list.push(isl);
         }
     }
     let mut specs: Vec<Spec> = outers
         .iter()
         .zip(owned)
-        .map(|(o, islands)| Spec {
+        .zip(blocked)
+        .map(|((o, islands), blocked)| Spec {
             kind: if o.closed { "pocket" } else { "step" },
             outline: o.segs.clone(),
             nodes: o.nodes.clone(),
             arcs: o.arcs.clone(),
             closed: o.closed,
             islands,
+            blocked,
         })
         .collect();
     if !loose.is_empty() {
@@ -254,6 +270,7 @@ fn assemble(
             arcs: vec![],
             closed: false,
             islands: loose,
+            blocked: None,
         });
     }
     specs.iter().filter(|spec| build_tool(env, st, tools, floor, cand, spec)).count()
@@ -264,44 +281,37 @@ fn own_nodes(floor: &Floor, cand: &Candidates) -> Vec<usize> {
     std::iter::once(floor.node).chain(cand.walls.iter().copied()).chain(cand.fillets.iter().copied()).collect()
 }
 
-/// Scan above the floor inside the tool's outline (and outside its islands) would be cut away with
-/// the tool. Points of the tool's own walls, floor and fillets, and of a boss standing on the
-/// floor, are not that.
-fn void_check(
-    env: &Env,
-    floor: &Floor,
-    outline: &[[f64; 2]],
-    islands: &[&[[f64; 2]]],
-    own: &[usize],
-) -> Result<(), String> {
-    let (lo, hi) = outline.iter().fold(([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]), |(lo, hi), q| {
-        ([lo[0].min(q[0]), lo[1].min(q[1])], [hi[0].max(q[0]), hi[1].max(q[1])])
-    });
-    let mut count = 0usize;
-    for p in env.scan {
-        if (p.coords - floor.p0).dot(&floor.nf) <= VOID_HEIGHT {
-            continue;
-        }
-        let q = floor.frame.to2(p);
-        if q[0] < lo[0] || q[0] > hi[0] || q[1] < lo[1] || q[1] > hi[1] {
-            continue;
-        }
-        let deep = |poly: &[[f64; 2]]| inside_polygon(poly, q) && polygon_distance(poly, q) > VOID_DEPTH;
-        let near_island = |poly: &&[[f64; 2]]| inside_polygon(poly, q) || polygon_distance(poly, q) <= VOID_DEPTH;
-        if !deep(outline) || islands.iter().any(near_island) {
-            continue;
-        }
+/// Scan surface above the floor inside the tool's outline (and outside its islands) would be cut
+/// away with the tool. The tool's own walls, floor and fillets and a boss standing on the floor are
+/// not that. Measured as area against the footprint of the tool on the part.
+fn void_check(env: &Env, floor: &Floor, spec: &Spec, own: &[usize]) -> Result<(), String> {
+    let outline = polygon_of(&spec.outline);
+    let polys: Vec<&[[f64; 2]]> = spec.islands.iter().map(|l| l.polygon.as_slice()).collect();
+    let void = Void {
+        scan: env.cloud,
+        frame: &floor.frame,
+        scale: env.scale,
+        above: Some(env.scale.mm(VOID_HEIGHT)),
+        outline: &outline,
+        islands: &polys,
+        band: env.scale.mm(FILLET_MAX_RADIUS),
+    };
+    let skipped = |i: usize| {
+        let Some(p) = env.cloud.points.get(i) else { return true };
         let owned = own
             .iter()
-            .filter_map(|&i| env.node(i))
+            .filter_map(|&n| env.node(n))
             .any(|n| n.tree.nearest_within(p, SAME_POINT * SAME_POINT).is_some());
-        if owned || env.explained.iter().any(|e| e.covers(p, &floor.nf)) {
-            continue;
-        }
-        count += 1;
-        if count > VOID_MAX_POINTS {
-            return Err(format!("more than {VOID_MAX_POINTS} points of the scan lie inside it above the floor"));
-        }
+        owned || env.explained.iter().any(|e| e.covers(p, &floor.nf))
+    };
+    let m = measure(&void, skipped);
+    if m.share() > VOID_SHARE {
+        return Err(format!(
+            "{:.1} mm2 of scan surface ({:.1} % of its {:.0} mm2 footprint) lies inside it above the floor",
+            m.area,
+            100.0 * m.share(),
+            m.footprint
+        ));
     }
     Ok(())
 }
@@ -313,18 +323,18 @@ fn floor_fillet(env: &Env, floor: &Floor, used: &[usize], fillets: &[usize]) -> 
     let mut members: Vec<usize> = Vec::new();
     for &f in fillets {
         let Some(c) = env.node(f) else { continue };
-        if !used.iter().any(|&u| env.node(u).is_some_and(|w| near(w, c, NEIGHBOUR_GAP).is_some())) {
+        if !used.iter().any(|&u| env.node(u).is_some_and(|w| near(w, c, env.gap()).is_some())) {
             continue;
         }
         match &c.shape {
             Shape::Cylinder { point, radius, .. } => {
                 let h = (v3(*point) - floor.p0).dot(&floor.nf);
-                if (h - radius).abs() < FILLET_AXIS_TOL && *radius < FILLET_MAX_RADIUS {
+                if (h - radius).abs() < env.scale.mm(FILLET_AXIS_TOL) && *radius < env.scale.mm(FILLET_MAX_RADIUS) {
                     radii.push(*radius);
                     members.push(f);
                 }
             }
-            Shape::Torus { minor_radius, .. } if *minor_radius < FILLET_MAX_RADIUS => members.push(f),
+            Shape::Torus { minor_radius, .. } if *minor_radius < env.scale.mm(FILLET_MAX_RADIUS) => members.push(f),
             _ => {}
         }
     }
@@ -341,15 +351,14 @@ fn build_tool(
     spec: &Spec,
 ) -> bool {
     let nodes = spec.all_nodes();
-    if !spec.closed || !spec.islands.is_empty() {
-        let polys: Vec<&[[f64; 2]]> = spec.islands.iter().map(|l| l.polygon.as_slice()).collect();
-        let checked = void_check(env, floor, &polygon_of(&spec.outline), &polys, &own_nodes(floor, cand));
-        if let Err(why) = checked {
-            nodes
-                .iter()
-                .for_each(|&u| st.note(u, format!("a {} from its walls would cut into the part: {why}", spec.kind)));
-            return false;
-        }
+    let checked = match spec.blocked {
+        Some(why) => Err(why.to_string()),
+        None => void_check(env, floor, spec, &own_nodes(floor, cand)),
+    };
+    if let Err(why) = checked {
+        let note = format!("a {} from its walls would cut into the part: {why}", spec.kind);
+        nodes.iter().chain(std::iter::once(&floor.node)).for_each(|&u| st.note(u, note.clone()));
+        return false;
     }
     let (fillet, fmembers) =
         if spec.closed { floor_fillet(env, floor, &nodes, &cand.fillets) } else { (None, Vec::new()) };

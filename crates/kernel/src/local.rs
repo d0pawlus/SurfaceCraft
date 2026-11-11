@@ -60,6 +60,27 @@ pub enum LocalTool {
     },
 }
 
+/// Largest coordinate or radius of a tool's profile (mm): anything beyond is not a part.
+const MAX_PROFILE_EXTENT: f64 = 1e7;
+
+/// A curve with finite coordinates in range and, for an arc, a positive radius.
+fn curve_is_sound(c: &ProfileCurve) -> bool {
+    let sound = |p: &[f64; 3]| p.iter().all(|v| v.is_finite() && v.abs() <= MAX_PROFILE_EXTENT);
+    match c {
+        ProfileCurve::Line { start, end } => sound(start) && sound(end),
+        ProfileCurve::Arc { center, axis, reference, radius, start, end } => {
+            sound(center)
+                && finite_all(axis)
+                && finite_all(reference)
+                && radius.is_finite()
+                && *radius > 0.0
+                && *radius <= MAX_PROFILE_EXTENT
+                && start.is_finite()
+                && end.is_finite()
+        }
+    }
+}
+
 fn check_tool(t: &LocalTool) -> Result<()> {
     let ok = match t {
         LocalTool::BlindHole { base, axis, radius, bottom } => {
@@ -77,6 +98,8 @@ fn check_tool(t: &LocalTool) -> Result<()> {
         }
         LocalTool::Prism { profile, direction, floor_fillet, through, islands } => {
             !profile.is_empty()
+                && profile.iter().all(curve_is_sound)
+                && islands.iter().all(|l| l.iter().all(curve_is_sound))
                 && finite_all(direction)
                 && unit(*direction).is_some()
                 && floor_fillet.is_none_or(|r| r.is_finite() && r > 0.0)
@@ -599,6 +622,30 @@ mod tests {
         let (b, r) = subtract_tool(stock(), tool, lo, hi);
         assert!(matches!(r.unwrap(), Applied::Done(_)));
         60.0 * 50.0 * 20.0 - volume(&encode(&b).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_profile_with_a_non_finite_number_or_a_bad_radius_is_refused() {
+        let z = 12.0;
+        let (lo, hi) = ([0.0; 3], [60.0, 50.0, 20.0]);
+        let mut bad_line = rect(8.0, 8.0, 38.0, 28.0, z);
+        bad_line[0] = ProfileCurve::Line { start: [f64::NAN, 8.0, z], end: [38.0, 8.0, z] };
+        let huge = vec![arc([25.0, 18.0], 1e300, 0.0, PI_F, z), arc([25.0, 18.0], 1e300, PI_F, PI_F, z)];
+        let zero = vec![arc([25.0, 18.0], 0.0, 0.0, PI_F, z), arc([25.0, 18.0], 0.0, PI_F, PI_F, z)];
+        let negative = vec![arc([25.0, 18.0], -4.0, 0.0, PI_F, z), arc([25.0, 18.0], -4.0, PI_F, PI_F, z)];
+        let nan_arc = vec![arc([25.0, f64::NAN], 4.0, 0.0, PI_F, z)];
+        let bad_island = pocket_prism(rect(8.0, 8.0, 38.0, 28.0, z), vec![nan_arc.clone()]);
+        for tool in [
+            pocket_prism(bad_line, vec![]),
+            pocket_prism(huge, vec![]),
+            pocket_prism(zero, vec![]),
+            pocket_prism(negative, vec![]),
+            bad_island,
+        ] {
+            let (b, r) = subtract_tool(stock(), &tool, lo, hi);
+            assert!(r.is_err(), "{tool:?}");
+            assert!((volume(&encode(&b).unwrap()).unwrap() - 60000.0).abs() < 1e-9, "the body is left alone");
+        }
     }
 
     #[test]

@@ -14,18 +14,49 @@ use surfacecraft_geom::{Bvh, Mesh, Rng, synth};
 use surfacecraft_kernel::feature::{BoolKind, ProfileCurve, boolean, extrude};
 use surfacecraft_kernel::{record::brep::Brep, solid};
 
+use std::cell::Cell;
+
 const PI: f64 = std::f64::consts::PI;
-/// Scan to solid, the gate of design doc §11.1 (M3/M4).
+/// Scan to solid, the gate of design doc §11.1 (M3/M4), for a part of the size of the gates.
 const MAX_DEVIATION: f64 = 0.2;
+/// The planner's own error: the rebuilt solid against the CAD solid, no scan noise in it, for a
+/// part of the size of the gates (mm).
+const MAX_PLANNER_ERROR: f64 = 0.05;
+
+thread_local! {
+    /// The size of the part relative to the gates' (the scan's spacing, noise and the selection
+    /// bands scale with it; set at the start of a test).
+    static SCALE: Cell<f64> = const { Cell::new(1.0) };
+    /// The scan's spacing relative to the gates' 0.7 mm (at the part's size).
+    static DENSITY: Cell<f64> = const { Cell::new(1.0) };
+}
+
+fn set_spacing_factor(v: f64) {
+    DENSITY.with(|c| c.set(v));
+}
+
+fn k() -> f64 {
+    SCALE.with(Cell::get)
+}
+
+/// Sets the size of the part for this test; everything below takes nominal (k = 1) coordinates.
+fn set_scale(v: f64) {
+    SCALE.with(|c| c.set(v));
+}
 /// Volume against the CAD part.
 const MAX_VOLUME_ERROR: f64 = 0.005;
 
 fn scan_of(s: &mut Session, body: &str, seed: u64) {
-    s.execute("body.to_mesh", json!({"object": body, "chord": 0.01, "name": "cad"})).unwrap();
+    s.execute("body.to_mesh", json!({"object": body, "chord": 0.01 * k(), "name": "cad"})).unwrap();
     let id = s.doc.find_by_name("cad").unwrap().0;
     let mut cad: Mesh = (*s.doc.mesh(id).unwrap().mesh).clone();
     cad.weld(1e-6);
-    let d = synth::ScanDefects { spacing: 0.7, noise: 0.03, ..synth::ScanDefects::default() };
+    let d = synth::ScanDefects {
+        spacing: 0.7 * k() * DENSITY.with(Cell::get),
+        noise: 0.03 * k(),
+        hole_radius: 1.5 * k(),
+        ..synth::ScanDefects::default()
+    };
     let scan = synth::scanify(&cad, &d, &mut Rng::new(seed));
     s.doc.add_mesh("scan", scan);
 }
@@ -37,7 +68,7 @@ fn clean(s: &mut Session) {
 
 /// Deviation of every vertex of the cleaned scan from the solid `id`: (|deviation|, position).
 fn deviation(s: &mut Session, id: u64) -> Vec<(f64, [f64; 3])> {
-    let t = s.execute("body.to_mesh", json!({"object": id, "chord": 0.01, "name": "solid mesh"})).unwrap();
+    let t = s.execute("body.to_mesh", json!({"object": id, "chord": 0.01 * k(), "name": "solid mesh"})).unwrap();
     let mid = t["id"].as_u64().unwrap();
     let solid_mesh = (*s.doc.mesh(surfacecraft_doc::ObjectId(mid)).unwrap().mesh).clone();
     let scan = s.doc.find_by_name("scan").unwrap().0;
@@ -47,24 +78,19 @@ fn deviation(s: &mut Session, id: u64) -> Vec<(f64, [f64; 3])> {
     dev.iter().zip(&scan_mesh.positions).map(|(d, p)| (d.abs(), [p.x, p.y, p.z])).collect()
 }
 
-/// A session holding `cad` as body "part" and its cleaned scan "scan" (σ = 0.03 mm). The scan's
-/// holes are filled by mesh.clean with flat patches, which cut the corner when a hole straddles a
-/// sharp edge (a defect of the data, not of the reconstruction), so the first seed whose cleaned
-/// scan is within 0.19 mm of the CAD part itself is used: the gate then measures the rebuilt solid.
-fn scanned_session(cad: &Brep, first_seed: u64) -> Session {
-    for seed in first_seed..first_seed + 60 {
-        let mut s = Session::new();
-        s.doc.add_body("part", cad.clone());
-        scan_of(&mut s, "part", seed);
-        clean(&mut s);
-        let part = s.doc.find_by_name("part").unwrap().0;
-        let own = deviation(&mut s, part.0).iter().map(|d| d.0).fold(0.0, f64::max);
-        eprintln!("seed {seed}: scan to CAD max {own:.4} mm");
-        if own <= 0.19 {
-            return s;
-        }
-    }
-    panic!("no seed gives a scan within 0.19 mm of the CAD part");
+/// A session holding `cad` as body "part" and its cleaned scan "scan" (σ = 0.03 mm, holes, spikes
+/// and debris of `synth::ScanDefects`), from the fixed `seed`. The scan's own deviation from the CAD
+/// part (what `mesh.clean` leaves where it fills a hole over a sharp edge) is printed: the gate's
+/// scan-to-solid number cannot be better than it.
+fn scanned_session(cad: &Brep, seed: u64) -> Session {
+    let mut s = Session::new();
+    s.doc.add_body("part", cad.clone());
+    scan_of(&mut s, "part", seed);
+    clean(&mut s);
+    let part = s.doc.find_by_name("part").unwrap().0;
+    let own = deviation(&mut s, part.0).iter().map(|d| d.0).fold(0.0, f64::max);
+    eprintln!("seed {seed}: scan to CAD max {own:.4} mm");
+    s
 }
 
 fn triangles_where(s: &Session, pick: impl Fn([f64; 3]) -> bool) -> Vec<u32> {
@@ -95,8 +121,9 @@ fn plane(s: &mut Session, name: &str, point: [f64; 3], normal: [f64; 3]) -> Valu
     let tris: Vec<u32> = (0..scan.triangle_count() as u32)
         .filter(|&t| {
             let c = scan.face_centroid(t as usize).unwrap();
-            let d = (c.x - point[0]) * normal[0] + (c.y - point[1]) * normal[1] + (c.z - point[2]) * normal[2];
-            d.abs() < 0.12
+            let p = [point[0] * k(), point[1] * k(), point[2] * k()];
+            let d = (c.x - p[0]) * normal[0] + (c.y - p[1]) * normal[1] + (c.z - p[2]) * normal[2];
+            d.abs() < 0.12 * k()
                 && scan
                     .face_normal(t as usize)
                     .is_some_and(|n| n.x * normal[0] + n.y * normal[1] + n.z * normal[2] > 0.8)
@@ -115,10 +142,14 @@ fn planes(s: &mut Session, list: &[(&str, [f64; 3], [f64; 3])]) -> Vec<Value> {
 /// Scan on the cylinder about (c, vertical) of radius `r`, over the angles `from`..`to` (degrees,
 /// counter-clockwise), between the heights `z.0` and `z.1`.
 fn on_arc(c: [f64; 2], r: f64, from: f64, to: f64, z: (f64, f64)) -> impl Fn([f64; 3]) -> bool {
+    let m = k();
     move |p| {
-        let (dx, dy) = (p[0] - c[0], p[1] - c[1]);
+        let (dx, dy) = (p[0] - c[0] * m, p[1] - c[1] * m);
         let a = dy.atan2(dx).to_degrees();
-        (dx.hypot(dy) - r).abs() < 0.12 && (a - from).rem_euclid(360.0) <= to - from && p[2] > z.0 && p[2] < z.1
+        (dx.hypot(dy) - r * m).abs() < 0.12 * m
+            && (a - from).rem_euclid(360.0) <= to - from
+            && p[2] > z.0 * m
+            && p[2] < z.1 * m
     }
 }
 
@@ -130,14 +161,15 @@ fn arc_region(s: &mut Session, name: &str, c: [f64; 2], r: f64, from: f64, to: f
 // the CAD parts
 
 fn line(a: [f64; 2], b: [f64; 2], z: f64) -> ProfileCurve {
-    ProfileCurve::Line { start: [a[0], a[1], z], end: [b[0], b[1], z] }
+    let m = k();
+    ProfileCurve::Line { start: [a[0] * m, a[1] * m, z * m], end: [b[0] * m, b[1] * m, z * m] }
 }
 
 /// An arc about +z from `from` degrees by `sweep` degrees; clockwise when `sweep` is negative
 /// (written counter-clockwise about -z, whose angles run the other way).
 fn arc(c: [f64; 2], r: f64, from: f64, sweep: f64, z: f64) -> ProfileCurve {
     let (f, w) = (from.to_radians(), sweep.to_radians());
-    let center = [c[0], c[1], z];
+    let (center, r) = ([c[0] * k(), c[1] * k(), z * k()], r * k());
     if sweep >= 0.0 {
         ProfileCurve::Arc { center, axis: [0.0, 0.0, 1.0], reference: [1.0, 0.0, 0.0], radius: r, start: f, end: f + w }
     } else {
@@ -168,8 +200,9 @@ fn rounded_rect(x0: f64, y0: f64, x1: f64, y1: f64, r: f64, z: f64) -> Vec<Profi
 
 /// The block 60 × 50 × 20 less the prism of `loops` from z = 12 up (a pocket with its floor at 12).
 fn block_less(loops: &[Vec<ProfileCurve>]) -> Brep {
-    let block = solid::make_box([0.0; 3], [60.0, 50.0, 20.0]).unwrap();
-    let cutter = extrude(loops, [0.0, 0.0, 1.0], 9.0, 0.0).unwrap();
+    let m = k();
+    let block = solid::make_box([0.0; 3], [60.0 * m, 50.0 * m, 20.0 * m]).unwrap();
+    let cutter = extrude(loops, [0.0, 0.0, 1.0], 9.0 * m, 0.0).unwrap();
     boolean(&block, &cutter, BoolKind::Subtract).unwrap()
 }
 
@@ -186,6 +219,21 @@ fn tool_kinds(plan: &Value) -> Vec<String> {
     let mut kinds: Vec<String> = plan["tools"].as_array().unwrap().iter().map(|t| t["kind"].to_string()).collect();
     kinds.sort_unstable();
     kinds
+}
+
+/// The planner's own error, free of scan noise: the largest distance of a vertex of the rebuilt
+/// solid's tessellation from the CAD solid's, and the other way round.
+fn planner_error(s: &mut Session, built: u64) -> (f64, f64) {
+    let t = s.execute("body.to_mesh", json!({"object": built, "chord": 0.01 * k(), "name": "rebuilt"})).unwrap();
+    let rebuilt = (*s.doc.mesh(surfacecraft_doc::ObjectId(t["id"].as_u64().unwrap())).unwrap().mesh).clone();
+    let cad = (*s.doc.mesh(s.doc.find_by_name("cad").unwrap().0).unwrap().mesh).clone();
+    let against = |from: &Mesh, to: &Mesh| {
+        let bvh = Bvh::build(to);
+        let d = surfacecraft_deviation::against_mesh(&from.positions, &bvh, 5.0);
+        assert!(d.iter().all(|x| x.is_finite()), "a vertex is more than 5 mm from the other solid");
+        d.iter().map(|x| x.abs()).fold(0.0, f64::max)
+    };
+    (against(&rebuilt, &cad), against(&cad, &rebuilt))
 }
 
 /// The closed solid of `built` against the CAD truth: volume, faces, nothing skipped, scan to solid,
@@ -210,7 +258,11 @@ fn check_built(s: &mut Session, built: &Value, cad_volume: f64, faces: usize) ->
     for (d, p) in worst.iter().take(5) {
         eprintln!("  worst {d:.3} at ({:.2}, {:.2}, {:.2})", p[0], p[1], p[2]);
     }
-    assert!(max <= MAX_DEVIATION, "max deviation {max} mm");
+    assert!(max <= MAX_DEVIATION * k(), "max deviation {max} mm");
+    let (planner_error, cad_error) = planner_error(s, id);
+    eprintln!("rebuilt solid against the CAD solid: max {planner_error:.4} mm (CAD against the solid {cad_error:.4})");
+    assert!(planner_error <= MAX_PLANNER_ERROR * k(), "the planner's own error {planner_error} mm");
+    assert!(cad_error <= MAX_PLANNER_ERROR * k(), "the CAD solid is {cad_error} mm from the rebuilt one");
     let e = s.execute("export.step", json!({"objects": [id]})).unwrap();
     assert_eq!(e["content"], "solids");
     let back = s.execute("import.step", json!({"data": e["data"], "name": format!("reimported {id}")})).unwrap();
@@ -259,12 +311,30 @@ fn l_profile(z: f64) -> Vec<ProfileCurve> {
 
 #[test]
 fn gate_p8_b2_l_pocket_with_a_reflex_round() {
+    l_pocket(1.0, 101);
+}
+
+/// The same part a quarter of the size (scan spacing, noise, selection bands scaled with it).
+#[test]
+fn gate_p8_b2_l_pocket_at_a_quarter_of_the_size() {
+    l_pocket(0.25, 301);
+}
+
+/// The same part five times the size.
+#[test]
+fn gate_p8_b2_l_pocket_at_five_times_the_size() {
+    l_pocket(5.0, 331);
+}
+
+fn l_pocket(scale: f64, seed: u64) {
+    set_scale(scale);
     let cad = block_less(&[l_profile(12.0)]);
     let v_cad = solid::volume(&cad).unwrap();
     let area = 528.0 - 5.0 * 9.0 * (4.0 - PI) / 4.0 + 4.0 * (4.0 - PI) / 4.0;
-    eprintln!("CAD: {} faces, {v_cad:.3} mm3 (closed form {:.3})", cad.faces.len(), 60.0 * 50.0 * 20.0 - area * 8.0);
-    assert!((v_cad - (60.0 * 50.0 * 20.0 - area * 8.0)).abs() < 1e-3);
-    let mut s = scanned_session(&cad, 101);
+    let exact = (60.0 * 50.0 * 20.0 - area * 8.0) * scale.powi(3);
+    eprintln!("CAD (x{scale}): {} faces, {v_cad:.3} mm3 (closed form {exact:.3})", cad.faces.len());
+    assert!((v_cad - exact).abs() < 1e-3 * scale.powi(3));
+    let mut s = scanned_session(&cad, seed);
     let mut prims = planes(
         &mut s,
         &[
@@ -296,7 +366,7 @@ fn gate_p8_b2_l_pocket_with_a_reflex_round() {
         prims.push(arc_region(&mut s, name, c, r, from, to, z));
     }
     let (vol, max) = plan_and_check(&mut s, &prims, &cad, &["pocket"]);
-    eprintln!("GATE p8-b2 L pocket: volume {vol:.3} (CAD {v_cad:.3}), max deviation {max:.4}");
+    eprintln!("GATE p8-b2 L pocket x{scale}: volume {vol:.3} (CAD {v_cad:.3}), max deviation {max:.4}");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -417,40 +487,38 @@ fn full_circle(c: [f64; 2], r: f64, z: f64) -> Vec<ProfileCurve> {
     vec![arc(c, r, 0.0, 180.0, z), arc(c, r, 180.0, 180.0, z)]
 }
 
-#[test]
-fn gate_p8_b2_pocket_with_islands() {
-    // the pocket 36 × 26 (corners r = 3) with a rectangular island (corners r = 2) and a post Ø8,
-    // both reaching the top of the block
-    let cad = block_less(&[
+/// The pocket 36 × 26 (corners r = 3) with a rectangular island (corners r = 2) and a post Ø8,
+/// both reaching the top of the block.
+fn island_part() -> Brep {
+    block_less(&[
         rounded_rect(8.0, 8.0, 44.0, 34.0, 3.0, 12.0),
         rounded_rect(14.0, 16.0, 24.0, 26.0, 2.0, 12.0),
         full_circle([34.0, 21.0], 4.0, 12.0),
-    ]);
-    let v_cad = solid::volume(&cad).unwrap();
-    let area = 36.0 * 26.0 - 4.0 * 9.0 * (4.0 - PI) / 4.0 - (10.0 * 10.0 - 4.0 * 4.0 * (4.0 - PI) / 4.0) - PI * 16.0;
-    eprintln!("CAD: {} faces, {v_cad:.3} mm3 (closed form {:.3})", cad.faces.len(), 60000.0 - area * 8.0);
-    assert!((v_cad - (60000.0 - area * 8.0)).abs() < 1e-3);
-    let mut s = scanned_session(&cad, 191);
-    let mut prims = planes(
-        &mut s,
-        &[
-            ("bottom", [0.0, 0.0, 0.0], [0.0, 0.0, -1.0]),
-            ("top", [0.0, 0.0, 20.0], [0.0, 0.0, 1.0]),
-            ("left", [0.0, 0.0, 0.0], [-1.0, 0.0, 0.0]),
-            ("right", [60.0, 0.0, 0.0], [1.0, 0.0, 0.0]),
-            ("front", [0.0, 0.0, 0.0], [0.0, -1.0, 0.0]),
-            ("back", [0.0, 50.0, 0.0], [0.0, 1.0, 0.0]),
-            ("floor", [0.0, 0.0, 12.0], [0.0, 0.0, 1.0]),
-            ("wall x8", [8.0, 0.0, 0.0], [1.0, 0.0, 0.0]),
-            ("wall x44", [44.0, 0.0, 0.0], [-1.0, 0.0, 0.0]),
-            ("wall y8", [0.0, 8.0, 0.0], [0.0, 1.0, 0.0]),
-            ("wall y34", [0.0, 34.0, 0.0], [0.0, -1.0, 0.0]),
-            ("island x14", [14.0, 0.0, 0.0], [-1.0, 0.0, 0.0]),
-            ("island x24", [24.0, 0.0, 0.0], [1.0, 0.0, 0.0]),
-            ("island y16", [0.0, 16.0, 0.0], [0.0, -1.0, 0.0]),
-            ("island y26", [0.0, 26.0, 0.0], [0.0, 1.0, 0.0]),
-        ],
-    );
+    ])
+}
+
+/// The fitted regions of the island part, all but those whose name starts with `without`.
+fn island_regions(s: &mut Session, without: Option<&str>) -> Vec<Value> {
+    let list = [
+        ("bottom", [0.0, 0.0, 0.0], [0.0, 0.0, -1.0]),
+        ("top", [0.0, 0.0, 20.0], [0.0, 0.0, 1.0]),
+        ("left", [0.0, 0.0, 0.0], [-1.0, 0.0, 0.0]),
+        ("right", [60.0, 0.0, 0.0], [1.0, 0.0, 0.0]),
+        ("front", [0.0, 0.0, 0.0], [0.0, -1.0, 0.0]),
+        ("back", [0.0, 50.0, 0.0], [0.0, 1.0, 0.0]),
+        ("floor", [0.0, 0.0, 12.0], [0.0, 0.0, 1.0]),
+        ("wall x8", [8.0, 0.0, 0.0], [1.0, 0.0, 0.0]),
+        ("wall x44", [44.0, 0.0, 0.0], [-1.0, 0.0, 0.0]),
+        ("wall y8", [0.0, 8.0, 0.0], [0.0, 1.0, 0.0]),
+        ("wall y34", [0.0, 34.0, 0.0], [0.0, -1.0, 0.0]),
+        ("island x14", [14.0, 0.0, 0.0], [-1.0, 0.0, 0.0]),
+        ("island x24", [24.0, 0.0, 0.0], [1.0, 0.0, 0.0]),
+        ("island y16", [0.0, 16.0, 0.0], [0.0, -1.0, 0.0]),
+        ("island y26", [0.0, 26.0, 0.0], [0.0, 1.0, 0.0]),
+    ];
+    let skip = |name: &str| without.is_some_and(|w| name.starts_with(w));
+    let kept: Vec<_> = list.iter().filter(|p| !skip(p.0)).copied().collect();
+    let mut prims = planes(s, &kept);
     let z = (12.3, 19.7);
     let rounds = [
         ("corner 1", [41.0, 11.0], 3.0, -85.0, -5.0),
@@ -463,33 +531,71 @@ fn gate_p8_b2_pocket_with_islands() {
         ("island corner 4", [16.0, 18.0], 2.0, 185.0, 265.0),
         ("post", [34.0, 21.0], 4.0, 0.0, 360.0),
     ];
-    for (name, c, r, from, to) in rounds {
-        prims.push(arc_region(&mut s, name, c, r, from, to, z));
+    for (name, c, r, from, to) in rounds.into_iter().filter(|r| !skip(r.0)) {
+        prims.push(arc_region(s, name, c, r, from, to, z));
     }
+    prims
+}
+
+#[test]
+fn gate_p8_b2_pocket_with_islands() {
+    let cad = island_part();
+    let v_cad = solid::volume(&cad).unwrap();
+    let area = 36.0 * 26.0 - 4.0 * 9.0 * (4.0 - PI) / 4.0 - (10.0 * 10.0 - 4.0 * 4.0 * (4.0 - PI) / 4.0) - PI * 16.0;
+    eprintln!("CAD: {} faces, {v_cad:.3} mm3 (closed form {:.3})", cad.faces.len(), 60000.0 - area * 8.0);
+    assert!((v_cad - (60000.0 - area * 8.0)).abs() < 1e-3);
+    let mut s = scanned_session(&cad, 191);
+    let prims = island_regions(&mut s, None);
     let plan = s.execute("body.plan_regions", json!({"primitives": prims})).unwrap();
     assert!(plan["tools"][0]["detail"].as_str().unwrap().contains("2 islands"), "{plan}");
     let (vol, max) = plan_and_check(&mut s, &prims, &cad, &["pocket"]);
     eprintln!("GATE p8-b2 pocket with islands: volume {vol:.3} (CAD {v_cad:.3}), max deviation {max:.4}");
 }
 
+/// An island that is not among the regions (its walls and rounds were not fitted) must not be
+/// swallowed: the pocket would take it out with the rest of the tool. The pocket is refused, with
+/// the scan surface of the island's top as the reason. (The post is not fitted either.)
+#[test]
+fn p8_b2_a_pocket_does_not_swallow_an_island_it_cannot_build() {
+    let cad = island_part();
+    let mut s = scanned_session(&cad, 191);
+    let prims = island_regions(&mut s, Some("island"));
+    let plan = s.execute("body.plan_regions", json!({"primitives": prims})).unwrap();
+    let kinds: Vec<&str> = plan["tools"].as_array().unwrap().iter().map(|t| t["kind"].as_str().unwrap()).collect();
+    assert!(!kinds.contains(&"pocket"), "{plan}");
+    let reasons: Vec<&str> = plan["regions"].as_array().unwrap().iter().filter_map(|r| r["reason"].as_str()).collect();
+    assert!(reasons.iter().any(|w| w.contains("would cut into the part") && w.contains("mm2")), "{reasons:?}");
+}
+
+/// An island whose own walls cannot be joined into a loop (one wall of it is missing) is not
+/// swallowed either.
+#[test]
+fn p8_b2_a_pocket_does_not_swallow_an_island_with_a_missing_wall() {
+    let cad = island_part();
+    let mut s = scanned_session(&cad, 191);
+    let prims = island_regions(&mut s, Some("island y26"));
+    let plan = s.execute("body.plan_regions", json!({"primitives": prims})).unwrap();
+    let kinds: Vec<&str> = plan["tools"].as_array().unwrap().iter().map(|t| t["kind"].as_str().unwrap()).collect();
+    assert!(!kinds.contains(&"pocket"), "{plan}");
+    let reasons: Vec<&str> = plan["regions"].as_array().unwrap().iter().filter_map(|r| r["reason"].as_str()).collect();
+    assert!(reasons.iter().any(|w| w.contains("does not join") || w.contains("cut into the part")), "{reasons:?}");
+}
+
 // ---------------------------------------------------------------------------------------------
 // gates 5 and 6: steps and ribs
 
-#[test]
-fn gate_p8_b2_step_with_a_rib() {
-    // the block 60 × 50 × 20 cut down to z = 10 for x < 40 (a step: riser at x = 40), with a rib
-    // 8 × 20 standing on the lower level and reaching the top
+/// The block 60 × 50 × 20 cut down to z = 10 for x < 40 (a step: riser at x = 40), with a rib
+/// 8 × 20 standing on the lower level and reaching the top.
+fn step_part() -> Brep {
     let block = solid::make_box([0.0; 3], [60.0, 50.0, 20.0]).unwrap();
     let cut = solid::make_box([-1.0, -1.0, 10.0], [41.0, 52.0, 12.0]).unwrap();
     let rib = solid::make_box([12.0, 15.0, 9.0], [8.0, 20.0, 11.0]).unwrap();
-    let cad = boolean(&boolean(&block, &cut, BoolKind::Subtract).unwrap(), &rib, BoolKind::Union).unwrap();
-    let v_cad = solid::volume(&cad).unwrap();
-    let exact = 60.0 * 50.0 * 10.0 + 20.0 * 50.0 * 10.0 + 8.0 * 20.0 * 10.0;
-    eprintln!("CAD: {} faces, {v_cad:.3} mm3 (closed form {exact:.3})", cad.faces.len());
-    assert!((v_cad - exact).abs() < 1e-3);
-    let mut s = scanned_session(&cad, 221);
-    let prims = planes(
-        &mut s,
+    boolean(&boolean(&block, &cut, BoolKind::Subtract).unwrap(), &rib, BoolKind::Union).unwrap()
+}
+
+fn step_regions(s: &mut Session) -> Vec<Value> {
+    planes(
+        s,
         &[
             ("bottom", [0.0, 0.0, 0.0], [0.0, 0.0, -1.0]),
             ("top", [0.0, 0.0, 20.0], [0.0, 0.0, 1.0]),
@@ -504,7 +610,18 @@ fn gate_p8_b2_step_with_a_rib() {
             ("rib y15", [0.0, 15.0, 0.0], [0.0, -1.0, 0.0]),
             ("rib y35", [0.0, 35.0, 0.0], [0.0, 1.0, 0.0]),
         ],
-    );
+    )
+}
+
+#[test]
+fn gate_p8_b2_step_with_a_rib() {
+    let cad = step_part();
+    let v_cad = solid::volume(&cad).unwrap();
+    let exact = 60.0 * 50.0 * 10.0 + 20.0 * 50.0 * 10.0 + 8.0 * 20.0 * 10.0;
+    eprintln!("CAD: {} faces, {v_cad:.3} mm3 (closed form {exact:.3})", cad.faces.len());
+    assert!((v_cad - exact).abs() < 1e-3);
+    let mut s = scanned_session(&cad, 221);
+    let prims = step_regions(&mut s);
     let plan = s.execute("body.plan_regions", json!({"primitives": prims})).unwrap();
     assert!(plan["tools"][0]["detail"].as_str().unwrap().contains("1 islands"), "{plan}");
     let (vol, max) = plan_and_check(&mut s, &prims, &cad, &["step"]);
@@ -565,4 +682,38 @@ fn p8_b2_a_pocket_wall_is_not_taken_for_a_floor() {
     assert!(plan["tools"].as_array().unwrap().is_empty(), "{plan}");
     let skipped = plan["regions"].as_array().unwrap().iter().filter(|r| r["role"] == "skipped").count();
     assert_eq!(skipped, 2, "{plan}");
+}
+
+/// The decision about a tool does not depend on how densely the part was scanned: the same step
+/// with a rib is built, and the same pocket wall refused as a floor, at a scan spacing of 0.35 mm
+/// and of 2.0 mm (the gates use 0.7 mm).
+#[test]
+fn p8_b2_the_decision_does_not_depend_on_the_scan_spacing() {
+    for spacing in [0.35, 2.0] {
+        set_spacing_factor(spacing / 0.7);
+        eprintln!("scan spacing {spacing} mm");
+        let cad = step_part();
+        let mut s = scanned_session(&cad, 221);
+        let prims = step_regions(&mut s);
+        let plan = s.execute("body.plan_regions", json!({"primitives": prims})).unwrap();
+        assert_eq!(tool_kinds(&plan), ["\"step\""], "spacing {spacing}: {plan}");
+        // a pocket's walls with its floor missing: nothing to build
+        let cad = block_less(&[rounded_rect(8.0, 8.0, 38.0, 28.0, 4.0, 12.0)]);
+        let mut s = scanned_session(&cad, 281);
+        let prims = planes(
+            &mut s,
+            &[
+                ("bottom", [0.0, 0.0, 0.0], [0.0, 0.0, -1.0]),
+                ("top", [0.0, 0.0, 20.0], [0.0, 0.0, 1.0]),
+                ("left", [0.0, 0.0, 0.0], [-1.0, 0.0, 0.0]),
+                ("right", [60.0, 0.0, 0.0], [1.0, 0.0, 0.0]),
+                ("front", [0.0, 0.0, 0.0], [0.0, -1.0, 0.0]),
+                ("back", [0.0, 50.0, 0.0], [0.0, 1.0, 0.0]),
+                ("wall x8", [8.0, 0.0, 0.0], [1.0, 0.0, 0.0]),
+                ("wall y8", [0.0, 8.0, 0.0], [0.0, 1.0, 0.0]),
+            ],
+        );
+        let plan = s.execute("body.plan_regions", json!({"primitives": prims})).unwrap();
+        assert!(plan["tools"].as_array().unwrap().is_empty(), "spacing {spacing}: {plan}");
+    }
 }

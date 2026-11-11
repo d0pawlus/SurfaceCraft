@@ -2,9 +2,11 @@
 //! triangles whose vertices lie along a wall's line far from the wall, so the extent is that of the
 //! dense part of the data.
 use super::profile::{Corner, Wall, d2, tangent};
+use super::scan::Scale;
 use std::f64::consts::TAU;
 
-/// A wall's points count when they lie this near its line (mm); a round's when they lie within the
+/// A wall's points count when they lie this near its line (mm at the reference spacing, as are the
+/// other lengths here); a round's when they lie within the
 /// larger of `ON_CIRCLE_MIN` and `ON_CIRCLE_FRACTION` of its radius of the circle.
 const ON_LINE: f64 = 0.6;
 const ON_CIRCLE_MIN: f64 = 0.6;
@@ -61,22 +63,12 @@ pub(super) fn dense_extent(sorted: &[f64], bin: f64) -> Option<(f64, f64)> {
     Some((lo, hi))
 }
 
-pub(super) fn wall_ends(w: &Wall) -> ([f64; 2], [f64; 2]) {
+pub(super) fn wall_ends(w: &Wall, sc: Scale) -> ([f64; 2], [f64; 2]) {
     let t = tangent(w.n);
-    let on_line = |p: &&[f64; 2]| (w.n[0] * p[0] + w.n[1] * p[1] - w.c).abs() <= ON_LINE;
+    let on_line = |p: &&[f64; 2]| (w.n[0] * p[0] + w.n[1] * p[1] - w.c).abs() <= sc.mm(ON_LINE);
     let mut s: Vec<f64> = w.pts.iter().filter(on_line).map(|p| p[0] * t[0] + p[1] * t[1]).collect();
     s.sort_by(f64::total_cmp);
-    let (lo, hi) = dense_extent(&s, DENSITY_BIN).unwrap_or((0.0, 0.0));
-    if hi - lo > 11.0 {
-        let mut h = std::collections::BTreeMap::new();
-        for v in &s {
-            *h.entry(v.floor() as i64).or_insert(0usize) += 1;
-        }
-        eprintln!("DBG hist n {:?} c {:.2}: {:?}; run {lo:.2}..{hi:.2}", w.n, w.c, h);
-        let off: Vec<_> =
-            w.pts.iter().filter(|p| (w.n[0] * p[0] + w.n[1] * p[1] - w.c).abs() > ON_LINE).count().to_string().into();
-        eprintln!("DBG off-line points: {off:?}");
-    }
+    let (lo, hi) = dense_extent(&s, sc.mm(DENSITY_BIN)).unwrap_or((0.0, 0.0));
     let at = |s: f64| [w.n[0] * w.c + t[0] * s, w.n[1] * w.c + t[1] * s];
     (at(lo), at(hi))
 }
@@ -87,8 +79,8 @@ pub(super) fn on_circle(k: &Corner, a: f64) -> [f64; 2] {
 
 /// The ends of an arc in travel order (counter-clockwise for a round of the void, clockwise for a
 /// round of the material): the arc covers the circle but for the largest gap in its points.
-pub(super) fn arc_ends(k: &Corner) -> ([f64; 2], [f64; 2]) {
-    let band = ON_CIRCLE_MIN.max(ON_CIRCLE_FRACTION * k.r);
+pub(super) fn arc_ends(k: &Corner, sc: Scale) -> ([f64; 2], [f64; 2]) {
+    let band = sc.mm(ON_CIRCLE_MIN).max(ON_CIRCLE_FRACTION * k.r);
     let mut ang: Vec<f64> =
         k.pts.iter().filter(|p| (d2(**p, k.center) - k.r).abs() <= band).map(|p| angle_of(*p, k.center)).collect();
     ang.sort_by(f64::total_cmp);
@@ -108,7 +100,7 @@ pub(super) fn arc_ends(k: &Corner) -> ([f64; 2], [f64; 2]) {
             ang.get(idx).map(|a| if idx <= best.1 { a + TAU } else { *a })
         })
         .collect();
-    let (after, before) = dense_extent(&run, DENSITY_BIN / k.r.max(MIN_RADIUS)).unwrap_or((0.0, 0.0));
+    let (after, before) = dense_extent(&run, sc.mm(DENSITY_BIN) / k.r.max(MIN_RADIUS)).unwrap_or((0.0, 0.0));
     if k.concave { (on_circle(k, after), on_circle(k, before)) } else { (on_circle(k, before), on_circle(k, after)) }
 }
 

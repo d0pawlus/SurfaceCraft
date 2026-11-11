@@ -132,6 +132,38 @@ pub(super) fn polygon_distance(poly: &[[f64; 2]], p: [f64; 2]) -> f64 {
     best
 }
 
+/// The part of a polygon inside the rectangle `lo`..`hi` (Sutherland-Hodgman; the result of a
+/// concave polygon may have edges along the rectangle, which does not change its area).
+pub(super) fn clip_to_rect(poly: &[[f64; 2]], lo: [f64; 2], hi: [f64; 2]) -> Vec<[f64; 2]> {
+    let mut out: Vec<[f64; 2]> = poly.to_vec();
+    for axis in 0..2 {
+        for upper in [false, true] {
+            let bound = if upper { hi[axis] } else { lo[axis] };
+            let inside = |p: &[f64; 2]| if upper { p[axis] <= bound } else { p[axis] >= bound };
+            let input = std::mem::take(&mut out);
+            for (i, a) in input.iter().enumerate() {
+                let Some(b) = input.get((i + 1) % input.len()) else { continue };
+                let cut = |a: &[f64; 2], b: &[f64; 2]| {
+                    let t = (bound - a[axis]) / (b[axis] - a[axis]);
+                    let mut p = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+                    p[axis] = bound;
+                    p
+                };
+                match (inside(a), inside(b)) {
+                    (true, true) => out.push(*b),
+                    (true, false) => out.push(cut(a, b)),
+                    (false, true) => {
+                        out.push(cut(a, b));
+                        out.push(*b);
+                    }
+                    (false, false) => {}
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Do the segments `p1 p2` and `q1 q2` cross (a shared end point does not count)?
 fn segments_cross(p1: [f64; 2], p2: [f64; 2], q1: [f64; 2], q2: [f64; 2]) -> bool {
     let side = |a: [f64; 2], b: [f64; 2], c: [f64; 2]| (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
