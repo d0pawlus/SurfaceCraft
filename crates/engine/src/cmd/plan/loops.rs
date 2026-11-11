@@ -9,7 +9,9 @@
 use super::NEIGHBOUR_GAP;
 use super::extent::{arc_ends, wall_ends};
 use super::joint::{Bounds, Part, join};
-use super::profile::{Corner, Seg, Wall, crosses_itself, d2, polygon_of, signed_area, solve, tangent};
+use super::profile::{
+    Corner, Seg, Wall, check_input, crosses_itself, d2, polygon_of, seg_is_sound, signed_area, solve, tangent,
+};
 use super::scan::Scale;
 use std::f64::consts::{PI, TAU};
 
@@ -19,8 +21,6 @@ const MIN_LENGTH: f64 = 0.05;
 const MIN_AREA: f64 = 0.5;
 /// Smallest distance between a round's data and its fit's centre that is always allowed (mm).
 const ROUND_CENTRE_FLOOR: f64 = 1.0;
-/// Largest radius, and largest coordinate, of a profile (mm): anything beyond is not a part.
-const MAX_EXTENT: f64 = 1e7;
 /// How far a half round may differ from half the distance between its walls (mm).
 const HALF_ROUND_SLACK: f64 = 0.6;
 /// Largest sweep of a rounded corner between two walls, radians (a half round plus slack).
@@ -452,50 +452,6 @@ fn build_path(ctx: &Ctx, elems: &[Elem], succ: &[Option<Link>], p: &Path, ext: f
     }
     let probe = first_point(elems, p).unwrap_or([0.0; 2]);
     Ok(Loop { segs, polygon, closed: p.closed, area, nodes, arcs, probe })
-}
-
-fn point_is_sound(p: [f64; 2]) -> bool {
-    p.iter().all(|c| c.is_finite() && c.abs() <= MAX_EXTENT)
-}
-
-/// A piece of a profile with finite coordinates in range and a positive radius.
-fn seg_is_sound(s: &Seg) -> bool {
-    match s {
-        Seg::Line(a, b) => point_is_sound(*a) && point_is_sound(*b),
-        Seg::Arc { c, r, a0, a1 } => {
-            point_is_sound(*c) && r.is_finite() && *r > 0.0 && *r <= MAX_EXTENT && a0.is_finite() && a1.is_finite()
-        }
-    }
-}
-
-/// Input is hostile: refuse numbers that are not finite, radii that are not positive and walls
-/// that have no direction before anything is computed from them.
-fn check_input(walls: &[Wall], corners: &[Corner], ext: f64) -> Result<(), String> {
-    let walls_ok = walls.iter().all(|w| {
-        let len = w.n[0].hypot(w.n[1]);
-        point_is_sound(w.n)
-            && (0.5..=2.0).contains(&len)
-            && w.c.is_finite()
-            && w.c.abs() <= MAX_EXTENT
-            && w.pts.iter().all(|p| point_is_sound(*p))
-    });
-    let corners_ok = corners.iter().all(|k| {
-        point_is_sound(k.center)
-            && k.r.is_finite()
-            && k.r > 0.0
-            && k.r <= MAX_EXTENT
-            && k.pts.iter().all(|p| point_is_sound(*p))
-    });
-    if !(walls_ok && corners_ok && ext.is_finite() && ext > 0.0 && ext <= MAX_EXTENT) {
-        return Err(
-            "a wall or round has a coordinate that is not a finite number in range, or a radius that is not positive"
-                .into(),
-        );
-    }
-    if walls.iter().any(|w| w.pts.is_empty()) || corners.iter().any(|k| k.pts.is_empty()) {
-        return Err("a region has no points".into());
-    }
-    Ok(())
 }
 
 /// The loops of `walls` and `corners`, and the open chains (closed far outside, `ext` beyond the

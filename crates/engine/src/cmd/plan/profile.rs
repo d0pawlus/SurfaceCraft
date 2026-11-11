@@ -12,6 +12,9 @@ const ARC_STEP: f64 = 0.1;
 /// Fewest samples of an arc.
 const MIN_ARC_SAMPLES: usize = 4;
 
+/// Largest radius, and largest coordinate, of a profile (mm): anything beyond is not a part.
+const MAX_EXTENT: f64 = 1e7;
+
 /// A wall: a plane square to the floor, seen as a line.
 pub(super) struct Wall {
     /// The planner's node of the region.
@@ -270,4 +273,48 @@ pub(super) fn walls_and_corners(
         }
     }
     Ok((walls, corners))
+}
+
+fn point_is_sound(p: [f64; 2]) -> bool {
+    p.iter().all(|c| c.is_finite() && c.abs() <= MAX_EXTENT)
+}
+
+/// A piece of a profile with finite coordinates in range and a positive radius.
+pub(super) fn seg_is_sound(s: &Seg) -> bool {
+    match s {
+        Seg::Line(a, b) => point_is_sound(*a) && point_is_sound(*b),
+        Seg::Arc { c, r, a0, a1 } => {
+            point_is_sound(*c) && r.is_finite() && *r > 0.0 && *r <= MAX_EXTENT && a0.is_finite() && a1.is_finite()
+        }
+    }
+}
+
+/// Input is hostile: refuse numbers that are not finite, radii that are not positive and walls
+/// that have no direction before anything is computed from them.
+pub(super) fn check_input(walls: &[Wall], corners: &[Corner], ext: f64) -> Result<(), String> {
+    let walls_ok = walls.iter().all(|w| {
+        let len = w.n[0].hypot(w.n[1]);
+        point_is_sound(w.n)
+            && (0.5..=2.0).contains(&len)
+            && w.c.is_finite()
+            && w.c.abs() <= MAX_EXTENT
+            && w.pts.iter().all(|p| point_is_sound(*p))
+    });
+    let corners_ok = corners.iter().all(|k| {
+        point_is_sound(k.center)
+            && k.r.is_finite()
+            && k.r > 0.0
+            && k.r <= MAX_EXTENT
+            && k.pts.iter().all(|p| point_is_sound(*p))
+    });
+    if !(walls_ok && corners_ok && ext.is_finite() && ext > 0.0 && ext <= MAX_EXTENT) {
+        return Err(
+            "a wall or round has a coordinate that is not a finite number in range, or a radius that is not positive"
+                .into(),
+        );
+    }
+    if walls.iter().any(|w| w.pts.is_empty()) || corners.iter().any(|k| k.pts.is_empty()) {
+        return Err("a region has no points".into());
+    }
+    Ok(())
 }
