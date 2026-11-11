@@ -70,6 +70,8 @@ pub const KEYS: &[&str] = &[
     "deviation.triangle",
 ];
 
+/// Narrowest panel (points) that fits two statistics, each a label and a number, in one row.
+const TWO_STATS_MIN_WIDTH: f32 = 460.0;
 /// Colour-map range in tolerances: the gradient and the histogram's shading run from −3·tol to +3·tol.
 const FAR_TOLERANCES: f64 = 3.0;
 /// Slices of the legend's gradient bar; each takes the colour of its centre.
@@ -315,15 +317,22 @@ fn statistics(ui: &mut egui::Ui, cur: &Current) {
         (t("deviation.max_abs").to_string(), num(s.max_abs, 3)),
         (tf("deviation.within", &[("tol", &num(tol, 3))]), format!("{} %", num(s.within * 100.0, 1))),
     ];
-    egui::Grid::new(("deviation-stats", cur.object.0)).num_columns(4).spacing([10.0, 2.0]).show(ui, |ui| {
-        for pair in rows.chunks(2) {
-            for (label, value) in pair {
+    let per_row = stats_per_row(ui.available_width());
+    egui::Grid::new(("deviation-stats", cur.object.0)).num_columns(2 * per_row).spacing([10.0, 2.0]).show(ui, |ui| {
+        for row in rows.chunks(per_row) {
+            for (label, value) in row {
                 ui.label(label.as_str());
                 ui.monospace(value.as_str());
             }
             ui.end_row();
         }
     });
+}
+
+/// Statistics shown side by side in one row: two where the panel is wide enough for two labels
+/// with their numbers, otherwise one, so that no number is cut off at the panel's edge.
+fn stats_per_row(width: f32) -> usize {
+    if width >= TWO_STATS_MIN_WIDTH { 2 } else { 1 }
 }
 
 /// The share of the measured points within each tolerance band, as the report gives them.
@@ -427,4 +436,19 @@ fn histogram(ui: &mut egui::Ui, tokens: &Tokens, hist: &Histogram, tol: f64) {
     let tick = |v: f64| x_at(v).clamp(rect.left(), rect.right());
     painter.text(egui::pos2(tick(-tol), rect.bottom()), egui::Align2::CENTER_BOTTOM, num(-tol, 3), font.clone(), muted);
     painter.text(egui::pos2(tick(tol), rect.bottom()), egui::Align2::CENTER_BOTTOM, num(tol, 3), font, muted);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stats_per_row;
+
+    /// The right dock is about 310 points wide by default: two statistics in a row there cut the
+    /// second number off at the panel's edge.
+    #[test]
+    fn a_narrow_panel_shows_one_statistic_per_row() {
+        assert_eq!(stats_per_row(310.0), 1);
+        assert_eq!(stats_per_row(459.9), 1);
+        assert_eq!(stats_per_row(460.0), 2);
+        assert_eq!(stats_per_row(900.0), 2);
+    }
 }
