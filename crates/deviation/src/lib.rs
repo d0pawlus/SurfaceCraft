@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use surfacecraft_fit::Primitive;
 use surfacecraft_geom::{Bvh, KdTree, Mesh, Point3, Vec3};
 
+pub mod faces;
+
 /// Colours of the deviation map, linear RGBA in 0..1. [`colorize`] paints the viewport from these
 /// constants, and the UI legend resolves the same values through its theme tokens, so the legend
 /// and the map cannot drift apart.
@@ -181,20 +183,37 @@ pub fn samples_primitive(points: &[Point3], normals: &[Vec3], prim: &Primitive) 
 /// normal of `points[i]`.
 #[must_use]
 pub fn samples_mesh(points: &[Point3], normals: &[Vec3], target: &Bvh, max_distance: f64) -> Vec<Sample> {
+    samples_mesh_tagged(points, normals, target, max_distance).into_iter().map(|(s, _)| s).collect()
+}
+
+/// [`samples_mesh`] with the index of the nearest reference triangle of each point (`None` when it
+/// is not measured), so that points can be attributed to the faces of the reference.
+#[must_use]
+pub fn samples_mesh_tagged(
+    points: &[Point3],
+    normals: &[Vec3],
+    target: &Bvh,
+    max_distance: f64,
+) -> Vec<(Sample, Option<usize>)> {
     surfacecraft_geom::par::map(points.len(), |i| {
-        let Some(p) = points.get(i) else { return Sample::UNMEASURED };
-        let Some(h) = target.closest(p, max_distance) else { return Sample::UNMEASURED };
-        let Some(n) = target.triangle_normal(h.triangle) else {
-            // a degenerate reference triangle has no side: its distance is taken as outside
-            return Sample { d: h.distance, facing: true, reference: [0.0; 3] };
-        };
-        let outside = (p - h.point).dot(&n) >= 0.0;
-        Sample {
-            d: if outside { h.distance } else { -h.distance },
-            facing: faces(normals.get(i), &n),
-            reference: [n.x, n.y, n.z],
-        }
+        let Some(p) = points.get(i) else { return (Sample::UNMEASURED, None) };
+        let Some(h) = target.closest(p, max_distance) else { return (Sample::UNMEASURED, None) };
+        (mesh_sample(p, normals.get(i), target, &h), Some(h.triangle))
     })
+}
+
+/// The sample of point `p` against its nearest hit `h` on `target`.
+fn mesh_sample(p: &Point3, scan_normal: Option<&Vec3>, target: &Bvh, h: &surfacecraft_geom::SurfaceHit) -> Sample {
+    let Some(n) = target.triangle_normal(h.triangle) else {
+        // a degenerate reference triangle has no side: its distance is taken as outside
+        return Sample { d: h.distance, facing: true, reference: [0.0; 3] };
+    };
+    let outside = (p - h.point).dot(&n) >= 0.0;
+    Sample {
+        d: if outside { h.distance } else { -h.distance },
+        facing: faces(scan_normal, &n),
+        reference: [n.x, n.y, n.z],
+    }
 }
 
 /// The deviation values of the counted points, NaN for the others (for the colour map).
@@ -608,16 +627,32 @@ pub fn colorize(values: &[f64], tolerance: f64) -> Vec<[f32; 4]> {
         .collect()
 }
 
+/// Noise estimate of a scan (σ, mm); see [`noise_estimate`].
+#[must_use]
+pub fn estimate_noise(mesh: &Mesh) -> f64 {
+    noise_estimate(mesh).sigma
+}
+
+/// A noise estimate, and whether it rests on smooth samples only.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NoiseEstimate {
+    /// Estimated σ (mm); zero when there is nothing to measure.
+    pub sigma: f64,
+    /// False when too few smooth samples remained, so the estimate includes samples near sharp
+    /// edges and is inflated (a coarse mesh of a box, for example).
+    pub smooth: bool,
+}
+
 /// Noise estimate of a scan (σ, mm): median distance of vertices to a local quadric through
 /// their neighbours, scaled to a standard deviation (design doc §10: warn when a tolerance is
 /// below the scanner noise). Samples whose neighbourhood spans a sharp edge (neighbour normals
 /// more than 30° off the local plane) are left out when enough smooth samples remain, so edges
 /// and corners do not inflate the estimate.
 #[must_use]
-pub fn estimate_noise(mesh: &Mesh) -> f64 {
+pub fn noise_estimate(mesh: &Mesh) -> NoiseEstimate {
     let n = mesh.vertex_count();
     if n < 16 {
-        return 0.0;
+        return NoiseEstimate { sigma: 0.0, smooth: false };
     }
     let tree = KdTree::build(&mesh.positions);
     let stride = n.div_ceil(4000).max(1);
@@ -655,15 +690,17 @@ pub fn estimate_noise(mesh: &Mesh) -> f64 {
             d_smooth.push((h - pred).abs());
         }
     }
-    if d_smooth.len() >= 50 && d_smooth.len() * 5 >= d.len() {
+    let smooth = d_smooth.len() >= 50 && d_smooth.len() * 5 >= d.len();
+    if smooth {
         d = d_smooth;
     }
     if d.is_empty() {
-        return 0.0;
+        return NoiseEstimate { sigma: 0.0, smooth };
     }
     d.sort_by(f64::total_cmp);
     // median |x| of a normal variable is 0.6745 σ; the prediction's own error adds ≈ 10 %
-    d.get(d.len() / 2).copied().unwrap_or(0.0) / 0.6745 / 1.1
+    let sigma = d.get(d.len() / 2).copied().unwrap_or(0.0) / 0.6745 / 1.1;
+    NoiseEstimate { sigma, smooth }
 }
 
 /// Unused helper kept for symmetry with primitives: the outward normal of a primitive at `p`.

@@ -228,7 +228,8 @@ fn p8_working_copy_errors() {
     assert!(s.execute("mesh.working_discard", json!({"object": "nope"})).is_err());
 }
 
-/// A project keeps the copy and its distance numbers; a project without a copy has no `working` key.
+/// A project keeps the copy: reopened, the copy and the original have the same geometry and the same
+/// distance numbers. A project without a copy has no `working` key, and it still opens, with no copy.
 #[test]
 fn p8_save_and_open_keep_the_copy() {
     let dir = std::env::temp_dir().join(format!("sc-d2-{}", std::process::id()));
@@ -239,14 +240,48 @@ fn p8_save_and_open_keep_the_copy() {
     sheet_with_copy(&mut s, "sheet");
     s.execute("mesh.decimate", json!({"object": "sheet", "ratio": 0.5})).unwrap();
     let before = distance(&mut s, "sheet");
+    let (orig, copy) = (original(&s, "sheet"), working(&s, "sheet").unwrap());
     s.execute("doc.save", json!({"path": path})).unwrap();
-    s.execute("mesh.working_discard", json!({"object": "sheet"})).unwrap();
-    s.execute("doc.save", json!({"path": plain})).unwrap();
-    assert!(!std::fs::read_to_string(&plain).unwrap().contains("\"working\""));
     let mut t = Session::new();
     t.execute("doc.open", json!({"path": path})).unwrap();
+    assert_eq!(original(&t, "sheet"), orig);
+    assert_eq!(working(&t, "sheet"), Some(copy));
     let after = distance(&mut t, "sheet");
     assert_eq!(before["working_to_original"], after["working_to_original"]);
     assert_eq!(before["original_to_working"], after["original_to_working"]);
+    // a project written without a copy: no `working` key, it opens, and there is no copy
+    s.execute("mesh.working_discard", json!({"object": "sheet"})).unwrap();
+    s.execute("doc.save", json!({"path": plain})).unwrap();
+    assert!(!std::fs::read_to_string(&plain).unwrap().contains("\"working\""));
+    let mut u = Session::new();
+    u.execute("doc.open", json!({"path": plain})).unwrap();
+    assert_eq!(original(&u, "sheet"), orig);
+    assert!(working(&u, "sheet").is_none());
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Gate: `align.center` moves the original by the translation that puts its bounding-box centre at
+/// the origin, and moves the working copy by the same translation. A flat copy stays on the original.
+#[test]
+fn p8_align_moves_the_copy_with_the_original() {
+    let mut s = Session::new();
+    sheet_with_copy(&mut s, "sheet");
+    s.execute("mesh.decimate", json!({"object": "sheet", "ratio": 0.5})).unwrap();
+    let (orig_before, copy_before) = (original(&s, "sheet"), working(&s, "sheet").unwrap());
+    // the sheet spans [0, 50] × [0, 50] × {0}: its centre is (25, 25, 0)
+    let shift = -orig_before.bbox().center().coords;
+    assert!((shift - Vec3::new(-25.0, -25.0, 0.0)).norm() < EPS, "shift {shift}");
+    let r = s.execute("align.center", json!({"object": "sheet"})).unwrap();
+    assert_eq!(r["applied"], true, "{r}");
+    let (orig_after, copy_after) = (original(&s, "sheet"), working(&s, "sheet").unwrap());
+    for (before, after) in orig_before.positions.iter().zip(&orig_after.positions) {
+        assert!((after - before - shift).norm() < EPS, "original moved by {}", after - before);
+    }
+    for (before, after) in copy_before.positions.iter().zip(&copy_after.positions) {
+        assert!((after - before - shift).norm() < EPS, "copy moved by {}", after - before);
+    }
+    assert!(orig_after.bbox().center().coords.norm() < EPS, "centre is not at the origin");
+    let d = distance(&mut s, "sheet");
+    near(&d["working_to_original"]["max"], 0.0, EPS);
+    near(&d["original_to_working"]["max"], 0.0, EPS);
 }

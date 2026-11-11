@@ -1,6 +1,6 @@
 //! SurfaceCraft egui front end (layer L5), shared by the desktop and web apps.
 //!
-//! Every action in the UI (menus, toolbar, palette) is a command executed through
+//! Every action in the UI (menus, ribbon, tool panel) is a command executed through
 //! [`surfacecraft_engine::Session::execute`]; the log panel shows each call as the JSON a
 //! `surfacecraft-cli run` script or an MCP client would send.
 #![deny(
@@ -23,9 +23,13 @@ pub mod dock;
 pub mod fieldpick;
 pub mod forms;
 pub mod gizmo;
+pub mod guide;
+pub mod guide_panel;
 pub mod history_panel;
 pub mod i18n;
 pub mod icons;
+pub mod navbar;
+pub mod ribbon;
 pub mod sectionview;
 pub mod select;
 pub mod settings;
@@ -38,5 +42,6 @@ pub mod viewport;
 pub mod viewtools;
 #[cfg(target_arch = "wasm32")]
 pub mod web;
+pub mod workflow;
 
 pub use app::SurfaceCraftApp;
