@@ -654,12 +654,11 @@ mod tests {
         assert!((v - (30.0 * 20.0 - 48.0) * 8.0).abs() < 1e-3, "pocket with island removed {v}");
     }
 
-    /// A circle must be drawn as two arcs: one arc of 2 pi is not swept correctly by solidcore
-    /// (4f2da85: an island drawn that way takes 3.6 mm2 too little out of a pocket 600 mm2 large).
+    /// A post is drawn as two half arcs (the planner never writes one arc of 2 pi).
     #[test]
     fn a_post_drawn_as_two_half_arcs_stays_standing() {
         let z = 12.0;
-        let post = vec![arc([30.0, 25.0], 4.0, 0.0, PI_F, z), arc([30.0, 25.0], 4.0, PI_F, PI_F, z)];
+        let post = vec![arc([25.0, 18.0], 4.0, 0.0, PI_F, z), arc([25.0, 18.0], 4.0, PI_F, PI_F, z)];
         let v = removed(&pocket_prism(rect(8.0, 8.0, 38.0, 28.0, z), vec![post]));
         assert!((v - (600.0 - PI_F * 16.0) * 8.0).abs() < 1e-3, "removed {v}");
     }
