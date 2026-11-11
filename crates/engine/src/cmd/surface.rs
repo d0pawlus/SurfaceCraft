@@ -5,8 +5,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use surfacecraft_doc::{ObjectId, ObjectKind};
 
-pub use super::surface_fit::{FitIn, FitOut, GapOut, OutlineOut, PieceOut};
 use super::surface_fit::fit_cmd;
+pub use super::surface_fit::{FitIn, FitOut, GapOut, OutlineOut, PieceOut};
 
 /// One surface.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]

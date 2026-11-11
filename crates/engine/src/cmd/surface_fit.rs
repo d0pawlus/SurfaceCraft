@@ -290,7 +290,13 @@ fn select_net(grid: &HeightGrid, pts: &[Point3], st: &Settings) -> CmdResult<Net
 
 /// The sheet trimmed to the outline of `tris`, with the outline's facts; the reason as `Err`
 /// when it cannot be trimmed.
-fn trim_sheet(mesh: &Mesh, tris: &[u32], grid: &HeightGrid, srf: &Surface, tol: f64) -> Result<(Brep, OutlineOut), String> {
+fn trim_sheet(
+    mesh: &Mesh,
+    tris: &[u32],
+    grid: &HeightGrid,
+    srf: &Surface,
+    tol: f64,
+) -> Result<(Brep, OutlineOut), String> {
     let outline = region_outline(mesh, tris, grid, tol).ok_or("the region has no boundary loop to trim to")?;
     let probe = SurfaceProbe::new(srf).map_err(|e| e.to_string())?;
     let to_uv = |loop_pts: &[Point3]| -> Result<Vec<[f64; 2]>, String> {
@@ -350,7 +356,12 @@ fn make_sheet(mesh: &Mesh, p: &Piece, trim: bool, st: &Settings) -> CmdResult<Sh
             Ok((brep, outline)) => return Ok(Sheet { brep, trimmed: true, outline: Some(outline), warning: None }),
             Err(why) => {
                 let warning = format!("the sheet could not be trimmed to the region outline ({why}); it is untrimmed");
-                return Ok(Sheet { brep: sheet_from_spline(&p.srf)?, trimmed: false, outline: None, warning: Some(warning) });
+                return Ok(Sheet {
+                    brep: sheet_from_spline(&p.srf)?,
+                    trimmed: false,
+                    outline: None,
+                    warning: Some(warning),
+                });
             }
         }
     }
@@ -371,7 +382,15 @@ fn min_chart(n: usize) -> usize {
 
 /// Fits `tris`; a chart that is not a height field is split (when `st.split`) by a cone `angle`
 /// wide and each part fitted in turn, at most [`MAX_RESPLITS`] levels deep.
-fn fit_chart(mesh: &Mesh, normals: &[Vec3], tris: &[u32], st: &Settings, angle: f64, depth: u32, out: &mut Outcome) -> CmdResult<()> {
+fn fit_chart(
+    mesh: &Mesh,
+    normals: &[Vec3],
+    tris: &[u32],
+    st: &Settings,
+    angle: f64,
+    depth: u32,
+    out: &mut Outcome,
+) -> CmdResult<()> {
     match fit_piece(mesh, normals, tris, st)? {
         Fitted::Piece(p) => match refine_by_split(mesh, normals, tris, st, angle, depth, &p, out)? {
             Some(finer) => {
@@ -380,20 +399,26 @@ fn fit_chart(mesh: &Mesh, normals: &[Vec3], tris: &[u32], st: &Settings, angle: 
             }
             None => out.pieces.push(*p),
         },
-        Fitted::TooFew => out.skipped.push(format!("a part of {} triangles has too few points for a surface", tris.len())),
+        Fitted::TooFew => {
+            out.skipped.push(format!("a part of {} triangles has too few points for a surface", tris.len()))
+        }
         Fitted::NotHeightField => {
             let room = out.pieces.len() + out.skipped.len() < st.max_pieces;
             if !st.split || depth > MAX_RESPLITS || !room {
                 out.skipped.push(format!("a part of {} triangles is not a height field", tris.len()));
                 return Ok(());
             }
-            let params = SplitParams { max_angle_deg: angle, min_triangles: min_chart(tris.len()), max_pieces: st.max_pieces };
+            let params =
+                SplitParams { max_angle_deg: angle, min_triangles: min_chart(tris.len()), max_pieces: st.max_pieces };
             let split = split_charts(mesh, tris, &params);
             if split.dropped > 0 {
                 out.skipped.push(format!("{} triangles are too small a part to fit", split.dropped));
             }
             if split.charts.len() <= 1 && split.charts.first().is_some_and(|c| c.len() == tris.len()) {
-                out.skipped.push(format!("a part of {} triangles is not a height field and cannot be split further", tris.len()));
+                out.skipped.push(format!(
+                    "a part of {} triangles is not a height field and cannot be split further",
+                    tris.len()
+                ));
                 return Ok(());
             }
             let next = (angle * RESPLIT_FACTOR).max(PIECE_ANGLE_RANGE.0);
@@ -421,7 +446,13 @@ fn refine_by_split(
 ) -> CmdResult<Option<Outcome>> {
     let next = angle * RESPLIT_FACTOR;
     let room = out.pieces.len() + out.skipped.len() + 1 < st.max_pieces;
-    if !st.split || st.control.is_some() || piece.max <= st.tol || depth >= MAX_RESPLITS || !room || next < PIECE_ANGLE_RANGE.0 {
+    if !st.split
+        || st.control.is_some()
+        || piece.max <= st.tol
+        || depth >= MAX_RESPLITS
+        || !room
+        || next < PIECE_ANGLE_RANGE.0
+    {
         return Ok(None);
     }
     let params = SplitParams { max_angle_deg: next, min_triangles: min_chart(tris.len()), max_pieces: st.max_pieces };
@@ -480,7 +511,8 @@ fn resolve_input(s: &Session, i: &FitIn) -> CmdResult<Input> {
         }
         _ => return Err(CmdError::Params("give `region`, or `mesh` (and optionally `triangles`)".into())),
     };
-    let mesh = s.doc.mesh(mesh_id).map(|m| (*m.mesh).clone()).ok_or_else(|| CmdError::Params(format!("no mesh {mesh_id}")))?;
+    let mesh =
+        s.doc.mesh(mesh_id).map(|m| (*m.mesh).clone()).ok_or_else(|| CmdError::Params(format!("no mesh {mesh_id}")))?;
     if let Some(t) = tris.iter().find(|&&t| t as usize >= mesh.triangle_count()) {
         return Err(CmdError::Params(format!("triangle {t} out of range")));
     }
@@ -527,7 +559,14 @@ fn refusal(skipped: &[String], split: bool) -> CmdError {
     )
 }
 
-fn add_piece(s: &mut Session, p: &Piece, sheet: &Sheet, name: String, region: Option<ObjectId>, degree: usize) -> ObjectId {
+fn add_piece(
+    s: &mut Session,
+    p: &Piece,
+    sheet: &Sheet,
+    name: String,
+    region: Option<ObjectId>,
+    degree: usize,
+) -> ObjectId {
     let display = surfacecraft_kernel::tess::tessellate(&sheet.brep, None).unwrap_or_default();
     s.doc.add_surface(SurfaceObject {
         id: ObjectId(0),
@@ -566,7 +605,8 @@ pub(super) fn fit_cmd(s: &mut Session, i: FitIn) -> CmdResult<FitOut> {
         let sheet = make_sheet(&input.mesh, p, trim, &st)?;
         let name = if many { format!("{base} {}", k + 1) } else { base.clone() };
         let id = add_piece(s, p, &sheet, name, input.region, st.degree);
-        let warning = [p.warning.clone(), sheet.warning.clone()].into_iter().flatten().reduce(|a, b| format!("{a}; {b}"));
+        let warning =
+            [p.warning.clone(), sheet.warning.clone()].into_iter().flatten().reduce(|a, b| format!("{a}; {b}"));
         piece_out.push(PieceOut {
             id,
             triangles: p.triangles.len(),
@@ -590,9 +630,8 @@ fn summarise(st: &Settings, skipped: Vec<String>, pieces: Vec<PieceOut>, gaps: V
     let max = pieces.iter().map(|p| p.max).fold(0.0, f64::max);
     let many = pieces.len() > 1;
     let first = pieces.first().cloned();
-    let (id, control, trimmed, outline) = first
-        .as_ref()
-        .map_or((ObjectId(0), [0, 0], false, None), |f| (f.id, f.control, f.trimmed, f.outline.clone()));
+    let (id, control, trimmed, outline) =
+        first.as_ref().map_or((ObjectId(0), [0, 0], false, None), |f| (f.id, f.control, f.trimmed, f.outline.clone()));
     let mut warning: Vec<String> = pieces.iter().filter_map(|p| p.warning.clone()).collect();
     warning.dedup();
     if !skipped.is_empty() {

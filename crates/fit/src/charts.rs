@@ -126,7 +126,12 @@ fn grow(
 }
 
 /// Edges shared between charts and the triangle count of each chart.
-fn chart_graph(nb: &[[u32; 3]], ids: &[u32], chart_of: &[u32], count: usize) -> (Vec<usize>, Vec<HashMap<usize, usize>>) {
+fn chart_graph(
+    nb: &[[u32; 3]],
+    ids: &[u32],
+    chart_of: &[u32],
+    count: usize,
+) -> (Vec<usize>, Vec<HashMap<usize, usize>>) {
     let mut size = vec![0usize; count];
     let mut adj: Vec<HashMap<usize, usize>> = vec![HashMap::new(); count];
     for &t in ids {
@@ -139,10 +144,11 @@ fn chart_graph(nb: &[[u32; 3]], ids: &[u32], chart_of: &[u32], count: usize) -> 
         }
         for &o in nb.get(t as usize).into_iter().flatten() {
             let oc = chart_of.get(o as usize).copied().unwrap_or(OUTSIDE);
-            if oc < UNASSIGNED && oc != c {
-                if let Some(m) = adj.get_mut(c as usize) {
-                    *m.entry(oc as usize).or_default() += 1;
-                }
+            if oc < UNASSIGNED
+                && oc != c
+                && let Some(m) = adj.get_mut(c as usize)
+            {
+                *m.entry(oc as usize).or_default() += 1;
             }
         }
     }

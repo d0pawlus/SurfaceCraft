@@ -107,7 +107,12 @@ fn gate_h4_trimmed_step_roundtrip() {
     let orig = s.doc.surfaces.iter().find(|o| o.id.0 == t["id"].as_u64().unwrap()).unwrap();
     let orig_mesh = tess::tessellate(&orig.sheet, Some(0.005)).unwrap();
     let d = distances(&back.positions, &orig_mesh);
-    eprintln!("gate_h4 STEP: area {before:.2} -> {:.2} mm2 ({:.3} %), reimported vertices -> original max {:.5} mm", back.area(), 100.0 * rel, d[d.len() - 1]);
+    eprintln!(
+        "gate_h4 STEP: area {before:.2} -> {:.2} mm2 ({:.3} %), reimported vertices -> original max {:.5} mm",
+        back.area(),
+        100.0 * rel,
+        d[d.len() - 1]
+    );
     assert!(rel < 0.005, "area changed by {rel}");
     assert!(d[d.len() - 1] < 0.02, "max {}", d[d.len() - 1]);
 }
@@ -156,7 +161,10 @@ fn gate_h4_wrapped_region_is_split() {
     assert!(r["note"].as_str().unwrap().contains("not a G1 network"), "{r}");
     for p in pieces {
         let max = p["max"].as_f64().unwrap();
-        eprintln!("gate_h4 split: piece {} control {} max {max:.4} mm, {} triangles", p["id"], p["control"], p["triangles"]);
+        eprintln!(
+            "gate_h4 split: piece {} control {} max {max:.4} mm, {} triangles",
+            p["id"], p["control"], p["triangles"]
+        );
         assert!(max <= 0.2 && p["within_tolerance"] == true, "{p}");
         assert_eq!(p["trimmed"], true, "pieces tile only when trimmed: {p}");
     }
@@ -185,7 +193,8 @@ fn gate_h4_wrapped_region_is_split() {
 #[test]
 fn split_leaves_a_height_field_alone_and_validates_parameters() {
     let mut s = Session::new();
-    s.execute("mesh.synth", json!({"shape": "wave", "resolution": 60, "noise": 0.02, "seed": 5, "name": "scan"})).unwrap();
+    s.execute("mesh.synth", json!({"shape": "wave", "resolution": 60, "noise": 0.02, "seed": 5, "name": "scan"}))
+        .unwrap();
     let r = s.execute("surface.fit", json!({"mesh": "scan", "split": true})).unwrap();
     assert!(r.get("pieces").is_none() && r.get("note").is_none(), "one piece: {r}");
     assert_eq!(r["within_tolerance"], true);

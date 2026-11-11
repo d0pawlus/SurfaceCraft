@@ -30,7 +30,8 @@ fn trimmed_sheet_survives_step() {
     assert_eq!(back.len(), 1);
     assert_eq!(back[0].faces.len(), 1);
     assert_eq!(back[0].faces[0].loops.len(), 2, "outer loop and hole");
-    let (a0, a1) = (tess::tessellate(&b, Some(0.01)).unwrap().area(), tess::tessellate(&back[0], Some(0.01)).unwrap().area());
+    let (a0, a1) =
+        (tess::tessellate(&b, Some(0.01)).unwrap().area(), tess::tessellate(&back[0], Some(0.01)).unwrap().area());
     eprintln!("trimmed STEP round trip: area {a0:.3} -> {a1:.3} mm2");
     assert!((a0 - a1).abs() / a0 < 0.005, "area {a0} vs {a1}");
 }

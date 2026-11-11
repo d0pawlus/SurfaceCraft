@@ -191,7 +191,8 @@ mod tests {
     #[test]
     fn square_with_a_hole_and_a_notch() {
         // 30 × 30 mm, a 6 × 6 hole in the middle and a 5 × 5 notch cut from a corner
-        let (mesh, ids) = grid_mesh(30, |i, j| ((12..18).contains(&i) && (12..18).contains(&j)) || (i >= 25 && j >= 25));
+        let (mesh, ids) =
+            grid_mesh(30, |i, j| ((12..18).contains(&i) && (12..18).contains(&j)) || (i >= 25 && j >= 25));
         let g = grid_of(&mesh, &ids);
         let o = region_outline(&mesh, &ids, &g, 0.1).unwrap();
         assert_eq!(o.holes.len(), 1);
