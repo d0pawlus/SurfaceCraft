@@ -263,12 +263,14 @@ pub fn fill_holes(mesh: &mut Mesh, max_edges: usize, smooth: bool) -> FillReport
         // fill triangles run against the loop direction
         let rev: Vec<u32> = lp.iter().rev().copied().collect();
         let first_new = mesh.triangles.len();
+        let first_vertex = mesh.positions.len();
         let ok = ear_clip(mesh, &rev);
         if !ok {
             fan_fill(mesh, &rev);
         }
         if smooth {
             refine_and_fair(mesh, first_new, &lp);
+            crate::crease::sharpen_patch(mesh, first_new, first_vertex, &lp);
         }
         rep.filled += 1;
         rep.added_triangles += mesh.triangles.len() - first_new;
