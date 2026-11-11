@@ -59,14 +59,14 @@ pub struct FitIn {
     /// Target maximum deviation (mm, default 0.2 — design doc §11.1).
     #[serde(default)]
     pub tolerance: Option<f64>,
-    /// Trim each sheet to the outline of its region (outer loop and holes, smoothed and simplified
-    /// to `outline_tolerance`) instead of leaving the rectangle of the parameter domain. Omitted →
+    /// Trim each sheet to the outline of its region (outer loop and holes, simplified to
+    /// `outline_tolerance`) instead of leaving the rectangle of the parameter domain. Omitted →
     /// trimmed only when `split` produced several pieces.
     #[serde(default)]
     pub trim: Option<bool>,
-    /// Tolerance (mm, 0.001 to 10, default 0.1) of the outline simplification: every dropped
-    /// boundary vertex stays within it of the smoothed outline. Holes smaller than five
-    /// tolerances across are ignored.
+    /// Tolerance (mm, 0.001 to 10, default 0.1) of the trim outline: no boundary vertex of the
+    /// region is farther than this from the trim edge. Holes smaller than five tolerances across
+    /// are ignored.
     #[serde(default)]
     #[schemars(range(min = 0.001, max = 10.0))]
     pub outline_tolerance: Option<f64>,
