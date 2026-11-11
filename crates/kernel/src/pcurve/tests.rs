@@ -148,7 +148,7 @@ fn check_patch(p: &Patch) -> f64 {
 }
 
 #[test]
-fn gate_h1_analytic_pcurves_lie_on_their_edges() {
+fn analytic_pcurves_lie_on_their_edges() {
     let cases = [
         ("cylinder", cylinder_patch()),
         ("cone", cone_patch(0.3)),
@@ -159,7 +159,7 @@ fn gate_h1_analytic_pcurves_lie_on_their_edges() {
     ];
     for (name, p) in &cases {
         let gap = check_patch(p);
-        eprintln!("gate_h1 pcurve gap on a {name} patch: {gap:e} mm");
+        eprintln!("h1 pcurve gap on a {name} patch: {gap:e} mm");
         assert!(gap <= 1e-9, "{name}: {gap}");
     }
 }
@@ -232,7 +232,7 @@ fn an_edge_that_is_not_an_iso_curve_is_refused_and_bad_surfaces_are_rejected() {
 }
 
 #[test]
-fn gate_h1_kernel_cylinder_side_has_a_seam_one_period_apart() {
+fn kernel_cylinder_side_has_a_seam_one_period_apart() {
     let b = crate::solid::make_cylinder([0.0; 3], 5.0, 10.0).unwrap();
     let face = &b.faces[0];
     assert!(is_analytic(&face.surface));
@@ -248,14 +248,14 @@ fn gate_h1_kernel_cylinder_side_has_a_seam_one_period_apart() {
         let Loop::Edges { edges: uses } = &face.loops[0] else { panic!() };
         let e = &b.edges[uses[i].edge as usize];
         let gap = pcurve_gap(&a.surface, pc, e.nurbs.as_ref().unwrap_or(&e.curve), e.interval).unwrap();
-        eprintln!("gate_h1 kernel cylinder use {i}: gap {gap:e} mm");
+        eprintln!("h1 kernel cylinder use {i}: gap {gap:e} mm");
         assert!(gap <= 1e-9, "{gap}");
     }
 }
 
 /// A whole sphere: one face whose meridian seam is used twice, meeting itself at the poles.
 #[test]
-fn gate_h1_kernel_sphere_seam_uses_are_a_turn_apart() {
+fn kernel_sphere_seam_uses_are_a_turn_apart() {
     let b = crate::solid::make_sphere([0.0; 3], 5.0).unwrap();
     let face = &b.faces[0];
     let a = analytic_face(face, &b.edges).unwrap();
@@ -267,7 +267,7 @@ fn gate_h1_kernel_sphere_seam_uses_are_a_turn_apart() {
     for (i, pc) in row.iter().enumerate() {
         let e = &b.edges[uses[i].edge as usize];
         let gap = pcurve_gap(&a.surface, pc, e.nurbs.as_ref().unwrap_or(&e.curve), e.interval).unwrap();
-        eprintln!("gate_h1 kernel sphere use {i}: gap {gap:e} mm");
+        eprintln!("h1 kernel sphere use {i}: gap {gap:e} mm");
         assert!(gap <= 1e-9, "{gap}");
     }
 }

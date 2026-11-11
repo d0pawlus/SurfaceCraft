@@ -17,7 +17,7 @@ use crate::IoError;
 use surfacecraft_kernel::pcurve as kp;
 use surfacecraft_kernel::record::brep::{Brep, Curve2, Loop, Surface};
 
-/// An edge may carry one pcurve per face using it: at most two in a sheet.
+/// A SURFACE_CURVE holds one pcurve per face using the edge: at most two.
 const MAX_EDGE_USES: usize = 2;
 
 pub(super) struct ShellWriter<'a> {
@@ -129,7 +129,8 @@ impl<'a> ShellWriter<'a> {
     fn surface_curve(&mut self, e_idx: u32, curve_3d: u64) -> Result<u64, IoError> {
         let edge = self.b.edges.get(e_idx as usize).ok_or_else(|| bad(format!("edge {e_idx} missing")))?;
         if edge.uses.len() > MAX_EDGE_USES {
-            return Err(bad(format!("edge {e_idx} has {} uses; a sheet's edge has at most two", edge.uses.len())));
+            // a non-manifold edge: SURFACE_CURVE holds at most two pcurves, the bare curve is valid
+            return Ok(curve_3d);
         }
         let mut pcurves = Vec::with_capacity(edge.uses.len());
         for u in &edge.uses {

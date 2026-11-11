@@ -129,7 +129,7 @@ fn gate_m3_sheet_step_roundtrip() {
 }
 
 #[test]
-fn gate_h1_spline_sheet_edges_are_surface_curves_with_exact_pcurves() {
+fn spline_sheet_edges_are_surface_curves_with_exact_pcurves() {
     let b = wave();
     let text = write_sheets("wave", &[&b]).unwrap();
     assert_eq!(count(&text, "=SURFACE_CURVE("), 4);
@@ -147,9 +147,21 @@ fn gate_h1_spline_sheet_edges_are_surface_curves_with_exact_pcurves() {
     }
     let gaps = pcurve_gaps(&b).unwrap();
     let worst = gaps.iter().copied().fold(0.0, f64::max);
-    eprintln!("gate_h1 spline sheet: {} pcurves, worst gap {worst:e} mm", gaps.len());
+    eprintln!("h1 spline sheet: {} pcurves, worst gap {worst:e} mm", gaps.len());
     assert_eq!(gaps.len(), 4);
     assert!(worst <= SPLINE_GAP_MM, "{worst}");
+}
+
+/// The unit area-weighted mean normal of the display mesh of `b`.
+fn mean_normal(b: &Brep) -> [f64; 3] {
+    let mesh = surfacecraft_kernel::tess::tessellate(b, Some(0.01)).unwrap();
+    let mut sum = [0.0; 3];
+    for i in 0..mesh.triangle_count() {
+        let (n, a) = (mesh.face_normal(i).unwrap(), mesh.face_area(i));
+        sum = [sum[0] + a * n.x, sum[1] + a * n.y, sum[2] + a * n.z];
+    }
+    let len = sum.iter().map(|c| c * c).sum::<f64>().sqrt();
+    sum.map(|c| c / len)
 }
 
 fn outward_signature(b: &Brep) -> (f64, f64) {
@@ -163,11 +175,11 @@ fn outward_signature(b: &Brep) -> (f64, f64) {
     (radial, z)
 }
 
-/// Gate H1: a multi-face sheet on a closed surface (a cup: the cylinder's side with its seam, and
+/// Gate M3 (seam): a multi-face sheet on a closed surface (a cup: the cylinder's side with its seam, and
 /// the bottom disc) is written with a SEAM_CURVE and PCURVEs on both faces, every pcurve lies on
 /// its edge, and solidcore's importer reads it back, taking the file's pcurves.
 #[test]
-fn gate_h1_cup_sheet_with_a_seam_roundtrips() {
+fn gate_m3_seam_sheet_step_roundtrip() {
     let b = cup();
     assert!(is_sheet(&b));
     let text = write_sheets("cup", &[&b]).unwrap();
@@ -177,11 +189,11 @@ fn gate_h1_cup_sheet_with_a_seam_roundtrips() {
     assert!(text.contains("CYLINDRICAL_SURFACE(") && text.contains("PLANE(") && !text.contains("=CIRCLE("));
     let gaps = pcurve_gaps(&b).unwrap();
     let worst = gaps.iter().copied().fold(0.0, f64::max);
-    eprintln!("gate_h1 cup: {} edge uses, worst pcurve gap {worst:e} mm", gaps.len());
+    eprintln!("h1 cup: {} edge uses, worst pcurve gap {worst:e} mm", gaps.len());
     assert!(worst <= ANALYTIC_GAP_MM, "{worst}");
 
     let (back, report) = surfacecraft_kernel::step::import_with_pcurves(text.as_bytes()).unwrap();
-    eprintln!("gate_h1 cup importer pcurves: {report:?}");
+    eprintln!("h1 cup importer pcurves: {report:?}");
     assert_eq!(back.len(), 1);
     assert_eq!(back[0].faces.len(), 2);
     assert!(report.uses > 0 && report.curved_uses > 0, "{report:?}");
@@ -192,7 +204,7 @@ fn gate_h1_cup_sheet_with_a_seam_roundtrips() {
     });
     assert!((radius.unwrap() - 5.0).abs() < 1e-9);
     let (before, after) = (outward_signature(&b), outward_signature(&back[0]));
-    eprintln!("gate_h1 cup normals (Σ c·n·A, Σ n_z·A): {before:?} vs {after:?}");
+    eprintln!("h1 cup normals (Σ c·n·A, Σ n_z·A): {before:?} vs {after:?}");
     assert!(before.0 > 0.0 && after.0 > 0.0, "outward normals kept");
     assert!(((before.0 - after.0) / before.0).abs() < 0.01 && ((before.1 - after.1) / before.1).abs() < 0.01);
 }
@@ -297,6 +309,19 @@ mod patches {
         }
     }
 
+    /// The unit natural normal `S_u × S_v` of the record surface at the middle of the patch.
+    pub fn natural_normal(name: &str) -> [f64; 3] {
+        let k = kind(name);
+        let (u, v) = (0.5 * (k.u[0] + k.u[1]), 0.5 * (k.v[0] + k.v[1]));
+        let h = 1e-6;
+        let at = |u: f64, v: f64| surface_point(&k.surface, [u, v]).unwrap();
+        let (a, b, c, d) = (at(u + h, v), at(u - h, v), at(u, v + h), at(u, v - h));
+        let (su, sv) = ([a[0] - b[0], a[1] - b[1], a[2] - b[2]], [c[0] - d[0], c[1] - d[1], c[2] - d[2]]);
+        let n = [su[1] * sv[2] - su[2] * sv[1], su[2] * sv[0] - su[0] * sv[2], su[0] * sv[1] - su[1] * sv[0]];
+        let len = n.iter().map(|x| x * x).sum::<f64>().sqrt();
+        n.map(|x| x / len)
+    }
+
     pub fn sheet(name: &str) -> Brep {
         let k = kind(name);
         let (u, v) = (k.u, k.v);
@@ -343,10 +368,10 @@ mod patches {
     }
 }
 
-/// Gate H1: a patch on each analytic surface kind is written with pcurves on its STEP surface,
+/// A patch on each analytic surface kind is written with pcurves on its STEP surface,
 /// every pcurve within 1e-6 mm of its edge, and read back by solidcore as one face.
 #[test]
-fn gate_h1_analytic_patches_write_pcurves_that_lie_on_their_edges() {
+fn analytic_patches_write_pcurves_that_lie_on_their_edges() {
     for name in ["cylinder", "cone", "narrowing cone", "sphere", "torus"] {
         let b = patches::sheet(name);
         let text = write_sheets(name, &[&b]).unwrap();
@@ -355,15 +380,26 @@ fn gate_h1_analytic_patches_write_pcurves_that_lie_on_their_edges() {
         assert_eq!(gaps.len(), 4);
         assert_eq!(count(&text, "=PCURVE("), 4, "{name}");
         let (back, report) = surfacecraft_kernel::step::import_with_pcurves(text.as_bytes()).unwrap();
-        eprintln!("gate_h1 {name} patch: worst pcurve gap {worst:e} mm; importer {report:?}");
+        eprintln!("h1 {name} patch: worst pcurve gap {worst:e} mm; importer {report:?}");
         assert!(worst <= ANALYTIC_GAP_MM, "{name}: {worst}");
         assert_eq!(back.iter().map(|b| b.faces.len()).sum::<usize>(), 1, "{name}");
-        assert!(report.fallback_faces == 0, "{name}: {report:?}");
+        assert_eq!(report.fallback_faces, 0, "{name}: {report:?}");
+        if matches!(name, "sphere" | "torus") {
+            // the importer validated these pcurves (they passed its candidate checks) but its
+            // UV-trim matching re-projected the edges instead of taking them
+            assert_eq!((report.uses, report.uses_projected), (0, 4), "{name}: {report:?}");
+        } else {
+            assert_eq!((report.uses, report.curved_uses), (4, 4), "{name}: {report:?}");
+        }
+        let (mean, natural) = (mean_normal(&back[0]), patches::natural_normal(name));
+        let dot = mean.iter().zip(natural).map(|(a, b)| a * b).sum::<f64>();
+        eprintln!("h1 {name} patch: mean normal after round trip · natural normal = {dot:.4}");
+        assert!(dot > 0.9, "{name}: the natural normal is kept ({dot})");
     }
 }
 
 #[test]
-fn gate_h1_whole_sphere_sheet_has_a_seam_curve_and_roundtrips() {
+fn whole_sphere_sheet_has_a_seam_curve_and_roundtrips() {
     let b = surfacecraft_kernel::solid::make_sphere([0.0; 3], 5.0).unwrap();
     // a closed sphere is a solid for the exporter; as a sheet it is its one face
     let mut sheet = b.clone();
@@ -373,10 +409,14 @@ fn gate_h1_whole_sphere_sheet_has_a_seam_curve_and_roundtrips() {
     assert_eq!(count(&text, "=SEAM_CURVE("), 1);
     assert_eq!(count(&text, "=PCURVE("), 2);
     let worst = pcurve_gaps(&sheet).unwrap().iter().copied().fold(0.0, f64::max);
-    eprintln!("gate_h1 whole sphere: worst pcurve gap {worst:e} mm");
+    eprintln!("h1 whole sphere: worst pcurve gap {worst:e} mm");
     assert!(worst <= ANALYTIC_GAP_MM);
     let back = surfacecraft_kernel::step::import(text.as_bytes()).unwrap();
     assert_eq!(back[0].faces.len(), 1);
+    let (before, after) = (outward_signature(&sheet), outward_signature(&back[0]));
+    eprintln!("h1 whole sphere normals (Σ c·n·A): {before:?} vs {after:?}");
+    assert!(before.0 > 0.0 && after.0 > 0.0, "outward normals kept");
+    assert!(((before.0 - after.0) / before.0).abs() < 0.01);
 }
 
 #[test]
