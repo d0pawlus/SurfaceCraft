@@ -11,6 +11,23 @@ patch network over a whole scan.
   deviation in millimetres (default 0.2). `degree` defaults to 3. `control` `[u, v]` fixes the
   control net; without it the smallest net that meets `tolerance` is used.
 - The result gives `within_tolerance`, `rms` and `max`. Read `warning` when it is present.
+- By default the sheet is the whole rectangle of the fitted surface. `trim: true` cuts it to the
+  outline of the region instead (outer loop and holes). The outline is smoothed and simplified
+  to `outline_tolerance` (default 0.1 mm: no boundary vertex of the region farther than that from
+  the trim edge), and holes smaller than five tolerances across are ignored; `outline` in the
+  result says what was kept. If the outline cannot be used the sheet stays untrimmed and
+  `trim_error` says why.
+- A trimmed fit reports three separate numbers: `surface_deviation` (region points to the
+  spline, the old `max`), `outline_deviation` (region boundary vertices to the trim edges, in the
+  surface) and `delivered_deviation` (region points to the tessellated trimmed sheets).
+  `within_tolerance` is true only when every one that applies is within its bound, the sheet is
+  trimmed when `trim` was asked for, and no part of the region (`islands_ignored`, `skipped`) was
+  left out.
+- A region that wraps around (not a height field over one plane) is refused. `split: true`
+  splits it into height-field pieces (`max_piece_angle`, default 45 degrees; `max_pieces`,
+  default 16), fits each one and trims it to its part of the region. The result lists `pieces`
+  with their own `max`, the `gaps` between neighbouring sheets and `gap_max`. This is a split,
+  not a G1 network: the sheets meet within the gap but are not tangent-continuous.
 - `surface.info` gives the control net, degree and deviation of one surface.
 
 ## Curve networks

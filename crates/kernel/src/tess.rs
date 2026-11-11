@@ -9,6 +9,25 @@ pub fn tessellate(body: &Brep, chord: Option<f64>) -> Result<Mesh> {
     tessellate_topo(body, chord).map(|t| t.mesh)
 }
 
+/// Like [`tessellate`], but an error when the mesher refused a face (the mesh would silently lack
+/// it): for callers that measure or deliver the mesh rather than draw it.
+pub fn tessellate_all(body: &Brep, chord: Option<f64>) -> Result<Mesh> {
+    let size = bbox_size(body).max(1e-3);
+    let tol = match chord {
+        Some(c) if c.is_finite() && c > 0.0 => solidcore_tess::MeshTolerance::display(c),
+        _ => solidcore_tess::MeshTolerance::display_of(size),
+    };
+    let (plan, _stats) = solidcore_tess::plan(body, &tol, size).map_err(|e| op_err("tess::plan", e))?;
+    let (m, refused) = plan.evaluate();
+    if !refused.is_empty() {
+        return Err(op_err("tess::evaluate", format!("the mesher refused {} face(s) of the sheet", refused.len())));
+    }
+    let positions: Vec<Point3> = m.positions.iter().map(|p| Point3::new(p.x, p.y, p.z)).collect();
+    let mesh = Mesh { positions, triangles: m.triangles };
+    mesh.validate().map_err(|e| op_err("tess::evaluate", e.to_string()))?;
+    Ok(mesh)
+}
+
 /// A display mesh together with the B-rep identities the viewport picks by.
 #[derive(Clone, Debug, Default)]
 pub struct TopoMesh {

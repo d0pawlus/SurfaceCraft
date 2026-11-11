@@ -10,10 +10,12 @@
 )]
 
 pub mod auto;
+pub mod charts;
 pub mod constrain;
 pub mod features;
 pub mod lm;
 pub mod mls;
+pub mod outline;
 pub mod patch;
 pub mod plane;
 pub mod primitive;

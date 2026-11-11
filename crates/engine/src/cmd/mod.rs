@@ -22,6 +22,7 @@ pub mod exchange;
 pub mod feature;
 pub mod hybrid;
 pub mod mesh;
+pub mod mesh_edit;
 pub mod plan;
 pub mod primitive;
 pub mod qa;
@@ -32,6 +33,10 @@ pub mod section;
 pub mod sketch;
 pub mod stream;
 pub mod surface;
+mod surface_check;
+mod surface_fit;
+mod surface_pieces;
+pub mod working;
 
 /// An error from a command's `run`.
 #[derive(Clone, Debug, PartialEq)]
@@ -72,6 +77,9 @@ pub struct CommandSpec {
     pub output: fn() -> Value,
     /// Runs it.
     pub run: fn(&mut Session, Value) -> CmdResult<Value>,
+    /// Runs it without `&mut`, for the front ends' read-only queries (see `Session::query`). Only
+    /// read commands declared with [`read_command!`] have one.
+    pub read: Option<fn(&Session, Value) -> CmdResult<Value>>,
 }
 
 impl std::fmt::Debug for CommandSpec {
@@ -114,6 +122,34 @@ macro_rules! command {
                 let o: $out = $f(s, input)?;
                 $crate::cmd::out(o)
             },
+            read: None,
+        }
+    };
+}
+
+/// Declares a read-only [`CommandSpec`] from a handler `fn(&Session, In) -> CmdResult<Out>`: it
+/// changes nothing, so it is never undoable, and it has the `read` form a query runs.
+#[macro_export]
+macro_rules! read_command {
+    ($id:literal, $label:literal, $group:literal, $summary:literal, $in:ty, $out:ty, $f:path) => {
+        $crate::cmd::CommandSpec {
+            id: $id,
+            label: $label,
+            group: $group,
+            summary: $summary,
+            undoable: false,
+            input: $crate::cmd::schema::<$in>,
+            output: $crate::cmd::schema::<$out>,
+            run: |s, v| {
+                let input: $in = $crate::cmd::parse(v)?;
+                let o: $out = $f(s, input)?;
+                $crate::cmd::out(o)
+            },
+            read: Some(|s, v| {
+                let input: $in = $crate::cmd::parse(v)?;
+                let o: $out = $f(s, input)?;
+                $crate::cmd::out(o)
+            }),
         }
     };
 }
@@ -130,6 +166,7 @@ static REGISTRY: LazyLock<Vec<CommandSpec>> = LazyLock::new(|| {
     v.extend_from_slice(hybrid::COMMANDS);
     v.extend_from_slice(deviation::COMMANDS);
     v.extend_from_slice(mesh::COMMANDS);
+    v.extend_from_slice(mesh_edit::COMMANDS);
     v.extend_from_slice(primitive::COMMANDS);
     v.extend_from_slice(qa::COMMANDS);
     v.extend_from_slice(quad::COMMANDS);
@@ -139,6 +176,7 @@ static REGISTRY: LazyLock<Vec<CommandSpec>> = LazyLock::new(|| {
     v.extend_from_slice(sketch::COMMANDS);
     v.extend_from_slice(stream::COMMANDS);
     v.extend_from_slice(surface::COMMANDS);
+    v.extend_from_slice(working::COMMANDS);
     v.sort_by_key(|c| c.id);
     v
 });

@@ -34,9 +34,12 @@ fn apply_to(s: &mut Session, id: ObjectId, also: &[ObjRef], t: &Transform, apply
     for o in also {
         ids.push(o.resolve(s, ObjectKind::Mesh)?);
     }
+    // a mesh named twice (or the object itself in `also`) moves once
+    ids.sort_unstable();
+    ids.dedup();
     for i in ids {
         let m = s.doc.mesh_mut(i).ok_or_else(|| CmdError::Params(format!("no mesh {i}")))?;
-        m.mesh = Arc::new(m.mesh.transformed(t));
+        m.transform_rigid(t);
     }
     Ok(())
 }
@@ -63,8 +66,10 @@ pub struct NPointIn {
     /// Mesh to move.
     pub object: ObjRef,
     /// Points on the mesh (e.g. picked in the viewport).
+    #[schemars(extend("x-pick" = "points"))]
     pub from: Vec<[f64; 3]>,
     /// Where each point should go (same count, at least 3).
+    #[schemars(extend("x-pick" = "points"))]
     pub to: Vec<[f64; 3]>,
     /// Move the mesh (default true); false only computes.
     #[serde(default = "yes")]
@@ -299,10 +304,13 @@ pub struct DatumAlignIn {
     /// Mesh to move.
     pub object: ObjRef,
     /// Fixes +Z and the first origin constraint.
+    #[schemars(extend("x-pick" = "plane"))]
     pub primary: DatumIn,
     /// Fixes +X.
+    #[schemars(extend("x-pick" = "axis"))]
     pub secondary: DatumIn,
     /// Completes the origin.
+    #[schemars(extend("x-pick" = "point"))]
     pub tertiary: DatumIn,
     /// Move the mesh (default true).
     #[serde(default = "yes")]

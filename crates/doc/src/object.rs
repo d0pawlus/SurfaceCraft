@@ -90,27 +90,8 @@ macro_rules! object_common {
     };
 }
 
-/// A scan or other triangle mesh.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct MeshObject {
-    /// Id.
-    pub id: ObjectId,
-    /// Display name.
-    pub name: String,
-    /// Geometry (shared between undo snapshots).
-    #[serde(with = "crate::format::mesh_b64")]
-    pub mesh: Arc<Mesh>,
-    /// Shown in the viewport.
-    #[serde(default = "yes")]
-    pub visible: bool,
-}
-
-impl MeshObject {
-    fn describe(&self) -> String {
-        format!("{} triangles, {} vertices", self.mesh.triangle_count(), self.mesh.vertex_count())
-    }
-}
-object_common!(MeshObject, ObjectKind::Mesh);
+mod mesh_object;
+pub use mesh_object::MeshObject;
 
 /// A B-rep body, held as the kernel's neutral record.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -496,7 +477,7 @@ impl Document {
     pub fn add_mesh(&mut self, name: &str, mesh: Mesh) -> ObjectId {
         let id = self.fresh_id();
         let name = self.unique_name(name);
-        self.meshes.push(MeshObject { id, name, mesh: Arc::new(mesh), visible: true });
+        self.meshes.push(MeshObject { id, name, mesh: Arc::new(mesh), visible: true, working: None });
         id
     }
 

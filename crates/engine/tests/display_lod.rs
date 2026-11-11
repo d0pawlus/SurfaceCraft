@@ -46,7 +46,7 @@ fn small_meshes_are_drawn_as_they_are() {
 fn overlay_colours_are_mapped_and_a_new_overlay_changes_the_colour_key() {
     let (mut s, id, _) = session_with_sphere(2_000);
     let nv = s.doc.mesh(id).unwrap().mesh.vertex_count();
-    s.overlays.insert(id, Arc::new(vec![[1.0, 0.0, 0.0, 1.0]; nv]));
+    assert!(s.insert_map(id, vec![[1.0, 0.0, 0.0, 1.0]; nv], vec![0.0; nv]));
     let a = s.display_items();
     let a = a.iter().find(|d| d.id == id).unwrap();
     let colors = a.colors.as_ref().unwrap();
@@ -58,7 +58,7 @@ fn overlay_colours_are_mapped_and_a_new_overlay_changes_the_colour_key() {
     assert_eq!(a.colors_key, again.colors_key);
     assert_ne!(a.colors_key, 0);
     // a new overlay on the same geometry: same geometry key, different colour key
-    s.overlays.insert(id, Arc::new(vec![[0.0, 1.0, 0.0, 1.0]; nv]));
+    assert!(s.insert_map(id, vec![[0.0, 1.0, 0.0, 1.0]; nv], vec![0.0; nv]));
     let b = s.display_items();
     let b = b.iter().find(|d| d.id == id).unwrap();
     assert_eq!(a.key, b.key, "geometry is not re-uploaded");
