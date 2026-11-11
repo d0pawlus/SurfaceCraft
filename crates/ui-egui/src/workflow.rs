@@ -231,9 +231,12 @@ impl Stage {
         if matches!(id, "import.step") {
             return Some(Stage::Scan);
         }
+        if matches!(id, "body.compare") {
+            return Some(Stage::Inspect);
+        }
         let area = id.split('.').next().unwrap_or("");
         match area {
-            "mesh" => Some(Stage::Scan),
+            "mesh" | "scan" => Some(Stage::Scan),
             "align" => Some(Stage::Align),
             "region" => Some(Stage::Segment),
             "primitive" | "section" => Some(Stage::Shapes),
