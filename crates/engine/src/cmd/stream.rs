@@ -25,7 +25,7 @@ pub struct ImportStreamIn {
     #[serde(default)]
     pub scale: Option<f64>,
     /// Triangles per chunk, 64 - 262144 (default 65536). Also the memory unit of the import: the
-    /// import needs about 54 MiB + 4 x chunk_triangles x (400 + 80 x levels) bytes (254 MiB at the
+    /// import needs about 54 MiB + 4 x chunk_triangles x (400 + 80 x levels) bytes (252 MiB at the
     /// defaults, at most about 1.1 GB), whatever the size of the file; the spill files take 72
     /// bytes per triangle of disk while it runs.
     #[serde(default)]
