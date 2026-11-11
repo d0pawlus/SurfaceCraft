@@ -32,6 +32,9 @@ pub mod region;
 pub mod section;
 pub mod sketch;
 pub mod surface;
+mod surface_check;
+mod surface_fit;
+mod surface_pieces;
 pub mod working;
 
 /// An error from a command's `run`.
