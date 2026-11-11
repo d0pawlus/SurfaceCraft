@@ -24,8 +24,10 @@ const MAX_GROUPS: usize = 8;
 const MIN_SIDE_SHARE: f64 = 0.1;
 /// Rings of triangles around the hole's border a side is fitted to (the first decides the sides).
 const SUPPORT_RINGS: usize = 2;
-/// Fewest points a quadric (six terms) is fitted to; below it the side is a plane.
-const MIN_QUADRIC_POINTS: usize = 12;
+/// Fewest points a quadric (six terms) is fitted to; below it the side is a plane. With fewer,
+/// a thin band of a flat side now and then bends by noise alone and the quadric, carried over
+/// the hole, curls away from the side.
+const MIN_QUADRIC_POINTS: usize = 20;
 /// A quadric replaces the plane only when it leaves less than this share of the plane's RMS,
 /// each RMS taken over the points left after the terms fitted (so three more terms that only
 /// follow the noise gain nothing).
@@ -813,7 +815,7 @@ mod tests {
     fn a_side_bends_when_the_quadric_gains_beyond_its_extra_terms() {
         assert!(super::bends(79, 0.1007, 0.0640));
         assert!(!super::bends(92, 0.0276, 0.0270));
-        assert!(!super::bends(12, 0.0300, 0.0200));
+        assert!(!super::bends(20, 0.0300, 0.0220));
     }
 
     /// Distance from `p` to the surface of the cube [0, SIDE]³.
