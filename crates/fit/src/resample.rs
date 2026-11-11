@@ -8,6 +8,10 @@
 use nalgebra::{Matrix6, Vector6};
 use surfacecraft_geom::{KdTree, Point3, Vec3, any_perpendicular};
 
+/// A node whose nearest point is more than this fraction of its 24th-nearest distance is outside
+/// the footprint of the points (inside, the nearest point is a small part of that radius).
+const OUTSIDE_RATIO: f64 = 0.6;
+
 /// A grid over a region.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HeightGrid {
@@ -32,7 +36,7 @@ pub fn height_grid(points: &[Point3], normals: &[Vec3], nu: usize, nv: usize) ->
     let field = HeightField::new(points, normals)?;
     let (o, u, v, n) = (field.origin, field.u, field.v, field.n);
     let [[u0, u1], [v0, v1]] = field.domain;
-    let mls = |x: f64, y: f64| field.height(x, y);
+    let mls = |x: f64, y: f64| field.height_extended(x, y);
     let mut grid = Vec::with_capacity(nu);
     for i in 0..nu {
         let x = u0 + (u1 - u0) * i as f64 / (nu.max(2) - 1) as f64;
@@ -118,6 +122,30 @@ impl HeightField {
     /// Height above the plane at plane coordinates `(x, y)` (weighted quadratic of the 24 nearest).
     #[must_use]
     pub fn height(&self, x: f64, y: f64) -> Option<f64> {
+        self.local_fit(x, y).map(|c| c[0])
+    }
+
+    /// Like [`Self::height`] inside the footprint of the points, but a node far outside it (a
+    /// corner of the bounding rectangle of a round or L-shaped region) is continued linearly from
+    /// the nearest point instead of by the quadratic, which swings wildly away from the data and
+    /// would pull the least-squares surface off the region.
+    #[must_use]
+    pub fn height_extended(&self, x: f64, y: f64) -> Option<f64> {
+        let q = Point3::new(x, y, 0.0);
+        let near = self.tree.knn(&q, 1);
+        let far = self.tree.knn(&q, 24.min(self.flat.len()));
+        let (Some(&(i, d1)), Some(&(_, d24))) = (near.first(), far.last()) else { return self.height(x, y) };
+        if d1 <= OUTSIDE_RATIO * OUTSIDE_RATIO * d24 {
+            return self.height(x, y);
+        }
+        let a = self.flat.get(i)?;
+        let c = self.local_fit(a.x, a.y)?;
+        Some(c[0] + c[1] * (x - a.x) + c[2] * (y - a.y))
+    }
+
+    /// Coefficients `[h, ∂h/∂x, ∂h/∂y, …]` of the weighted quadratic of the 24 nearest points,
+    /// centred at `(x, y)`.
+    fn local_fit(&self, x: f64, y: f64) -> Option<Vector6<f64>> {
         let k = 24.min(self.flat.len());
         let nb = self.tree.knn(&Point3::new(x, y, 0.0), k);
         let h2 = nb.last().map_or(1.0, |l| l.1).max(1e-18);
@@ -135,7 +163,7 @@ impl HeightField {
         for d in 3..6 {
             a[(d, d)] += 1e-9 * (1.0 + a[(d, d)]);
         }
-        a.lu().solve(&b).map(|c| c[0]).filter(|z| z.is_finite())
+        a.lu().solve(&b).filter(|c| c.iter().all(|v| v.is_finite()))
     }
 
     /// The surface point at plane coordinates `(x, y)`.
@@ -187,5 +215,30 @@ mod tests {
         }
         assert!(max < 0.02, "max {max}");
         assert!(height_grid(&pts[..5], &[], 4, 4).is_none());
+    }
+
+    /// A round footprint: the corners of its bounding rectangle are continued from the nearest
+    /// data, not extrapolated by the quadratic.
+    #[test]
+    fn corners_outside_the_footprint_stay_near_the_data() {
+        let mut rng = Rng::new(9);
+        let f = |x: f64, y: f64| 2.0 * (x / 4.0).sin() * (y / 4.0).cos();
+        let pts: Vec<Point3> = (0..4000)
+            .filter_map(|_| {
+                let (x, y) = (rng.range(-10.0, 10.0), rng.range(-10.0, 10.0));
+                (x.hypot(y) <= 10.0).then(|| Point3::new(x, y, f(x, y)))
+            })
+            .collect();
+        let field = HeightField::new(&pts, &[]).unwrap();
+        let [[x0, x1], [y0, y1]] = field.domain;
+        let mut worst: f64 = 0.0;
+        for (x, y) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
+            // plane frame: heights are along `n`; compare the nodes' 3-D points with the analytic surface
+            let p = field.origin + field.u * x + field.v * y + field.n * field.height_extended(x, y).unwrap();
+            worst = worst.max((p.z - f(p.x, p.y)).abs());
+        }
+        assert!(worst < 1.5, "corner nodes off the surface by {worst}");
+        // inside the footprint nothing changes
+        assert_eq!(field.height_extended(0.0, 0.0), field.height(0.0, 0.0));
     }
 }
