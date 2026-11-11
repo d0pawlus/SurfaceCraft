@@ -31,6 +31,7 @@ pub mod refit;
 pub mod region;
 pub mod section;
 pub mod sketch;
+pub mod stream;
 pub mod surface;
 mod surface_check;
 mod surface_fit;
@@ -173,6 +174,7 @@ static REGISTRY: LazyLock<Vec<CommandSpec>> = LazyLock::new(|| {
     v.extend_from_slice(region::COMMANDS);
     v.extend_from_slice(section::COMMANDS);
     v.extend_from_slice(sketch::COMMANDS);
+    v.extend_from_slice(stream::COMMANDS);
     v.extend_from_slice(surface::COMMANDS);
     v.extend_from_slice(working::COMMANDS);
     v.sort_by_key(|c| c.id);
@@ -215,9 +217,11 @@ const HEAVY: &[&str] = &[
     "mesh.export",
     "mesh.fill_holes",
     "mesh.import",
+    "mesh.import_stream",
     "mesh.reconstruct",
     "mesh.remove_outliers",
     "mesh.smooth",
+    "mesh.store_info",
     "primitive.auto_constrain",
     "primitive.fit",
     "primitive.symmetry",
@@ -276,6 +280,16 @@ impl ObjRef {
             ObjRef::Name(n) => s.doc.find_by_name(n),
         }
         .ok_or_else(|| CmdError::Params(format!("no object {self:?}")))
+    }
+}
+
+/// Refuses when the session has no file access (web, MCP sandbox): for commands that work on a
+/// directory or stream a file and so cannot take their data inline.
+pub fn require_files(s: &Session) -> CmdResult<()> {
+    if s.allow_files {
+        Ok(())
+    } else {
+        Err(CmdError::Unavailable("file paths are not available here; this command works on files on disk".into()))
     }
 }
 

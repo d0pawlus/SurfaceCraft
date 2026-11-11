@@ -15,7 +15,9 @@
 pub mod dxf;
 pub mod iges;
 pub mod mesh;
+mod ply;
 pub mod step;
+pub mod stream;
 pub mod svg;
 
 pub use mesh::{Limits, MeshFormat, Scan, read_mesh, read_points, read_scan, write_mesh};
@@ -58,6 +60,18 @@ pub enum IoError {
     /// A writer could not produce output.
     #[error("export failed: {0}")]
     Export(String),
+    /// The chunk store (out-of-core import) failed or is damaged.
+    #[error("{0}")]
+    Store(String),
+}
+
+impl From<surfacecraft_geom::chunked::StoreError> for IoError {
+    fn from(e: surfacecraft_geom::chunked::StoreError) -> Self {
+        match e {
+            surfacecraft_geom::chunked::StoreError::Limit(m) => IoError::Limit(m),
+            other => IoError::Store(other.to_string()),
+        }
+    }
 }
 
 pub(crate) fn bad(format: &'static str, message: impl Into<String>) -> IoError {
