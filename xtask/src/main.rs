@@ -44,7 +44,9 @@ pub(crate) fn cargo() -> Command {
 
 pub(crate) fn run(mut c: Command, what: &str) -> Result<(), String> {
     eprintln!("==> {what}");
+    let started = std::time::Instant::now();
     let st = c.status().map_err(|e| format!("{what}: cannot start: {e}"))?;
+    eprintln!("==> {what}: {:.1} s", started.elapsed().as_secs_f64());
     if st.success() { Ok(()) } else { Err(format!("{what} failed")) }
 }
 
@@ -69,20 +71,31 @@ fn wasm() -> Result<(), String> {
     run(c, "wasm check")
 }
 
+/// Runs every test of the workspace. With cargo-nextest installed (`cargo install cargo-nextest
+/// --locked`; CI installs it) the test binaries run in parallel, one process per test, and the
+/// doc tests, which nextest does not run, follow with `cargo test --doc`; without it this is a
+/// plain `cargo test`. Both run the same tests and leave `#[ignore]` tests ignored.
 fn test() -> Result<(), String> {
-    let has_nextest = cargo().args(["nextest", "--version"]).output().map(|o| o.status.success()).unwrap_or(false);
-    if has_nextest {
-        let mut c = cargo();
-        c.args(["nextest", "run", "--workspace", "--profile", "ci", "--cargo-profile", "ci"]);
-        run(c, "tests (nextest)")?;
-        let mut d = cargo();
-        d.args(["test", "--workspace", "--doc", "--profile", "ci"]);
-        run(d, "doc tests")
-    } else {
+    if !has_nextest() {
         let mut c = cargo();
         c.args(["test", "--workspace", "--profile", "ci"]);
-        run(c, "tests")
+        return run(c, "tests (cargo test; install cargo-nextest to run them in parallel)");
     }
+    let nextest = |extra: &[&str]| {
+        let mut c = cargo();
+        c.args(["nextest", "run", "--workspace", "--cargo-profile", "ci"]).args(extra);
+        c
+    };
+    run(nextest(&["--no-run"]), "test build")?;
+    // every failure is reported, not only the first one
+    run(nextest(&["--no-fail-fast"]), "tests (nextest)")?;
+    let mut d = cargo();
+    d.args(["test", "--workspace", "--doc", "--profile", "ci"]);
+    run(d, "doc tests")
+}
+
+fn has_nextest() -> bool {
+    cargo().args(["nextest", "--version"]).output().is_ok_and(|o| o.status.success())
 }
 
 fn app_geometry() -> Result<(), String> {
