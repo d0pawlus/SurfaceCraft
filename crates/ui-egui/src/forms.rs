@@ -6,7 +6,7 @@
 //! `param.<command>.<name>` / `param.<name>`). Numbers use the locale's decimal separator and show
 //! their unit and limits; optional parameters have a "set" check box; object parameters are
 //! pickers over the document's objects; invalid values get a message from [`validate`].
-use crate::fieldpick::{PickKind, PickRequest, datum_default, datum_need};
+use crate::fieldpick::{PickKind, PickMode, PickRequest};
 use crate::i18n::{self, Lang, find, t, tf};
 use crate::theme::{Token, Tokens};
 use serde_json::{Map, Number, Value, json};
@@ -691,7 +691,8 @@ fn property_row(
             } else if required {
                 // a required parameter without a value: give it one (the 3-2-1 datums start as the
                 // world planes and axes, so they show their fields and can be edited or picked)
-                let d = datum_default(name)
+                let d = PickMode::of(prop)
+                    .and_then(PickMode::default_value)
                     .filter(|_| kind == Kind::Any && path == name)
                     .unwrap_or_else(|| start_value(root, prop, name, &kind, ctx));
                 map.insert(name.to_string(), d);
@@ -874,7 +875,7 @@ fn value_widget(
                 changed |= object_rows(ui, root, s, map, path, ctx, None);
             }
         }
-        Kind::Any => match datum_need(name).filter(|_| path == name) {
+        Kind::Any => match PickMode::of(schema).map(PickMode::kind).and_then(PickKind::need).filter(|_| path == name) {
             // a 3-2-1 datum: points clicked in the viewport (how most people set a datum), or
             // its JSON text
             Some(need) => {
@@ -1089,10 +1090,12 @@ fn list_widget(
             changed = true;
         }
         let is_point = is_tuple(&item_schema, root) && item_schema.get("minItems").and_then(Value::as_u64) == Some(3);
-        if is_point {
+        // what the viewport fills is said by the schema's marker, not by the parameter's name
+        let mode = PickMode::of(schema).map(PickMode::kind);
+        if mode == Some(PickKind::Points) && is_point {
             pick_button(ui, ctx, name, path, PickKind::Points);
         }
-        if item_kind == Kind::Int && name == "edges" {
+        if mode == Some(PickKind::Edges) && item_kind == Kind::Int {
             pick_button(ui, ctx, name, path, PickKind::Edges);
         }
         if is_point && !ctx.pick_points.is_empty() && ui.small_button(t("form.use_picked_points")).clicked() {
