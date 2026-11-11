@@ -4,7 +4,29 @@ Status: **drafts only.** Nothing has been filed at tangency-labs/solidcore. Fili
 consent (AGENTS.md / plan P3b Z5). Per the solidcore contribution rule, each item goes up as an issue
 with the reproduction first, before any PR.
 
-Pin: `solidcore` rev `b9c02da746f48d24f1c2a32deb834276b1014d03` (workspace `Cargo.toml`).
+Pin: `solidcore` rev `4f2da85c26f7d608808d94cffcf06ebe867ef61d` (workspace `Cargo.toml`), bumped from `b9c02da` in P8-U1.
+The three problems below were observed on `b9c02da` and all three still fail on `4f2da85` (checked before the
+no-local-builds rule). Self-contained drafts with public-API-only reproductions, duplicate searches and the
+template fields:
+
+| # | Draft | Reproduces at `4f2da85` | Duplicate |
+|---|---|---|---|
+| 1 | [01-step-narrowing-cone.md](01-step-narrowing-cone.md) | yes | none (related: #6310) |
+| 2 | [02-blend-cylinder-as-cone.md](02-blend-cylinder-as-cone.md) | yes | none |
+| 3 | [03-boolean-near-coaxial-cylinders.md](03-boolean-near-coaxial-cylinders.md) | yes | none (related: #13650) |
+| 4 | [04-from-record-turned-box.md](04-from-record-turned-box.md) | yes | probable: #13737 |
+| 5 | [05-from-record-union-chained-rotated-copies.md](05-from-record-union-chained-rotated-copies.md) | yes | probable: #13737 |
+| 6 | [06-from-record-shell-filleted-pocketed-plate.md](06-from-record-shell-filleted-pocketed-plate.md) | yes | probable: #13737 |
+| 7 | [07-from-record-window-along-plane-normal.md](07-from-record-window-along-plane-normal.md) | yes | probable: #13737 |
+
+Already filed by the owner: #13617 (IGES writer proposal), #13618 (multi-face sheet thicken, NotSolid), #13619 (sheet
+from a B-spline surface). At `4f2da85`: solidcore still has no IGES writer (no IGES writer in the crates; the
+`iges` hits are import test cases) and `step-export` still refuses open shells (`write` rejects "has an open shell"; only
+the faceted display writer takes them), so the STEP/IGES adaptations stay. #13618 and #13619 were NOT re-run at
+`4f2da85` (their repro is `d0pawlus/solidcore` branch `repro/surfacecraft-sheets`; the check was stopped by the
+no-local-builds rule): run it against `rev = 4f2da85...` to decide.
+
+The text below is the original P3 draft (pin `b9c02da`); the files above supersede it.
 
 Reproductions live in `crates/kernel/tests/upstream_repro.rs`. Each test asserts the expected result and
 is `#[ignore]`d, so it fails on the pin. Run them with:

@@ -24,10 +24,14 @@ const MAX_GROUPS: usize = 8;
 const MIN_SIDE_SHARE: f64 = 0.1;
 /// Rings of triangles around the hole's border a side is fitted to (the first decides the sides).
 const SUPPORT_RINGS: usize = 2;
-/// Fewest points a quadric (six terms) is fitted to; below it the side is a plane.
-const MIN_QUADRIC_POINTS: usize = 12;
-/// A quadric replaces the plane only when it leaves less than this share of the plane's RMS.
-const QUADRIC_GAIN: f64 = 0.5;
+/// Fewest points a quadric (six terms) is fitted to; below it the side is a plane. With fewer,
+/// a thin band of a flat side now and then bends by noise alone and the quadric, carried over
+/// the hole, curls away from the side.
+const MIN_QUADRIC_POINTS: usize = 20;
+/// A quadric replaces the plane only when it leaves less than this share of the plane's RMS,
+/// each RMS taken over the points left after the terms fitted (so three more terms that only
+/// follow the noise gain nothing).
+const QUADRIC_GAIN: f64 = 0.8;
 /// Triangles of one normal further apart along it than this (in mean loop edge lengths) are on
 /// two sides.
 const SAME_SIDE_STEP: f64 = 0.5;
@@ -148,6 +152,13 @@ fn fit_height(local: &[(f64, f64, f64)], terms: usize) -> Option<([f64; TERMS], 
     Some((coef, (sq / local.len().max(1) as f64).sqrt()))
 }
 
+/// Do `count` points bend away from their plane: does the quadric leave less than
+/// [`QUADRIC_GAIN`] of the plane's RMS, per point left free?
+fn bends(count: usize, plane_rms: f64, quadric_rms: f64) -> bool {
+    let free = |terms: usize| count.saturating_sub(terms).max(1) as f64;
+    quadric_rms / free(TERMS).sqrt() < QUADRIC_GAIN * plane_rms / free(PLANE_TERMS).sqrt()
+}
+
 impl Side {
     /// The side through `points` with mean normal `n`, and the RMS it leaves: a plane, or a
     /// quadric when the points are enough and bend away from the plane.
@@ -167,7 +178,7 @@ impl Side {
             .collect();
         let (plane, plane_rms) = fit_height(&local, PLANE_TERMS)?;
         let (coef, rms) = match fit_height(&local, TERMS) {
-            Some((quadric, rms)) if points.len() >= MIN_QUADRIC_POINTS && rms < QUADRIC_GAIN * plane_rms => {
+            Some((quadric, rms)) if points.len() >= MIN_QUADRIC_POINTS && bends(points.len(), plane_rms, rms) => {
                 (quadric, rms)
             }
             _ => (plane, plane_rms),
@@ -599,14 +610,43 @@ fn faces_out(mesh: &Mesh, hole: &Hole, wedge: &Wedge, t: usize) -> bool {
     wedge.sides.iter().any(|s| wedge.sign() * s.height(&c) >= top - snap && s.n.dot(&n) > MIN_FACING)
 }
 
-/// The patch triangles that are thinner than `min_area` or turned over. A triangle thinner than
-/// the hole's own least area (the fairing leaves such slivers) has no direction worth the name
-/// and is judged by its area alone.
-fn tangled(mesh: &Mesh, hole: &Hole, wedge: &Wedge, min_area: f64) -> Vec<usize> {
+/// What a sound patch is measured against: the least area of a triangle, and the triangles
+/// between border vertices alone that were turned over as the fairing left them. Those have no
+/// vertex that can move, so no move makes or mends them.
+struct Sound {
+    min_area: f64,
+    given: HashSet<[u32; 3]>,
+}
+
+impl Sound {
+    fn new(mesh: &Mesh, hole: &Hole, wedge: &Wedge, min_area: f64) -> Sound {
+        let open = Sound { min_area, given: HashSet::new() };
+        let given = tangled(mesh, hole, wedge, &open)
+            .into_iter()
+            .filter_map(|t| mesh.triangles.get(t))
+            .filter(|t| t.iter().all(|&v| (v as usize) < hole.first_vertex))
+            .map(same_corners)
+            .collect();
+        Sound { min_area, given }
+    }
+}
+
+/// The corners of a triangle in an order that does not depend on where it starts.
+fn same_corners(t: &[u32; 3]) -> [u32; 3] {
+    let mut c = *t;
+    c.sort_unstable();
+    c
+}
+
+/// The patch triangles that are thinner than the least area or turned over. A triangle thinner
+/// than the hole's own least area (the fairing leaves such slivers) has no direction worth the
+/// name and is judged by its area alone.
+fn tangled(mesh: &Mesh, hole: &Hole, wedge: &Wedge, sound: &Sound) -> Vec<usize> {
     (hole.first_tri..mesh.triangles.len())
         .filter(|&t| {
             let area = mesh.face_area(t);
-            area < min_area || (area >= hole.min_area() && !faces_out(mesh, hole, wedge, t))
+            let given = mesh.triangles.get(t).is_some_and(|c| sound.given.contains(&same_corners(c)));
+            area < sound.min_area || (area >= hole.min_area() && !given && !faces_out(mesh, hole, wedge, t))
         })
         .collect()
 }
@@ -614,10 +654,10 @@ fn tangled(mesh: &Mesh, hole: &Hole, wedge: &Wedge, min_area: f64) -> Vec<usize>
 /// Untangles the patch after its vertices moved: the patch vertices of every turned-over or
 /// squashed triangle go to the middle of their neighbours and back onto the wedge, for up to
 /// [`UNTANGLE_ROUNDS`] rounds. Returns whether the patch is sound.
-fn untangle(mesh: &mut Mesh, hole: &Hole, wedge: &Wedge, min_area: f64, snap: f64) -> bool {
+fn untangle(mesh: &mut Mesh, hole: &Hole, wedge: &Wedge, sound: &Sound, snap: f64) -> bool {
     let on_side = ON_SIDE * hole.edge;
     for _ in 0..UNTANGLE_ROUNDS {
-        let bad = tangled(mesh, hole, wedge, min_area);
+        let bad = tangled(mesh, hole, wedge, sound);
         if bad.is_empty() {
             return true;
         }
@@ -646,7 +686,7 @@ fn untangle(mesh: &mut Mesh, hole: &Hole, wedge: &Wedge, min_area: f64, snap: f6
             }
         }
     }
-    tangled(mesh, hole, wedge, min_area).is_empty()
+    tangled(mesh, hole, wedge, sound).is_empty()
 }
 
 /// Moves the patch vertices onto the wedge; false when a vertex would leave the hole's reach.
@@ -711,7 +751,8 @@ fn sharpen(
     let wedge = read_wedge(mesh, around, lp, hole.edge)?;
     let before = patch_of(mesh, &hole);
     let min_area = (MIN_AREA_KEPT * thinnest(mesh, first_tri)).min(hole.min_area());
-    let done = shape_patch(mesh, &hole, &wedge, min_area);
+    let sound = Sound::new(mesh, &hole, &wedge, min_area);
+    let done = shape_patch(mesh, &hole, &wedge, &sound);
     if done.is_err() {
         restore(mesh, &hole, before);
     }
@@ -739,24 +780,24 @@ fn restore(mesh: &mut Mesh, hole: &Hole, (positions, triangles): (Vec<Point3>, V
 /// Moves the patch onto the wedge and untangles it, with the vertices next to an edge on the
 /// edge or, when that tangles the patch, without. Then pins the corner and aligns the edges,
 /// which is undone when it tangles the patch again (the vertices stay on the sides).
-fn shape_patch(mesh: &mut Mesh, hole: &Hole, wedge: &Wedge, min_area: f64) -> Result<(), &'static str> {
+fn shape_patch(mesh: &mut Mesh, hole: &Hole, wedge: &Wedge, sound: &Sound) -> Result<(), &'static str> {
     let faired = patch_of(mesh, hole);
     let mut snap = EDGE_SNAP * hole.edge;
     if !move_onto(mesh, hole, wedge, snap) {
         return Err("a vertex would leave the hole");
     }
-    if !untangle(mesh, hole, wedge, min_area, snap) {
+    if !untangle(mesh, hole, wedge, sound, snap) {
         restore(mesh, hole, faired);
         snap = 0.0;
-        if !(move_onto(mesh, hole, wedge, snap) && untangle(mesh, hole, wedge, min_area, snap)) {
+        if !(move_onto(mesh, hole, wedge, snap) && untangle(mesh, hole, wedge, sound, snap)) {
             return Err("tangled after the move");
         }
     }
-    let sound = patch_of(mesh, hole);
+    let moved = patch_of(mesh, hole);
     pin_corner(mesh, hole, wedge);
     align_edges(mesh, hole, wedge);
-    if !untangle(mesh, hole, wedge, min_area, snap) {
-        restore(mesh, hole, sound);
+    if !untangle(mesh, hole, wedge, sound, snap) {
+        restore(mesh, hole, moved);
     }
     Ok(())
 }
@@ -767,6 +808,15 @@ mod tests {
     use crate::{Mesh, Point3, Rng, Vec3, synth};
 
     const SIDE: f64 = 20.0;
+
+    /// A cone side read with points of its neighbour (RMS 0.101 as a plane, 0.064 as a quadric)
+    /// is a quadric; a flat side whose quadric only follows the noise stays a plane.
+    #[test]
+    fn a_side_bends_when_the_quadric_gains_beyond_its_extra_terms() {
+        assert!(super::bends(79, 0.1007, 0.0640));
+        assert!(!super::bends(92, 0.0276, 0.0270));
+        assert!(!super::bends(20, 0.0300, 0.0220));
+    }
 
     /// Distance from `p` to the surface of the cube [0, SIDE]³.
     fn to_cube(p: &Point3) -> f64 {
