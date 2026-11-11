@@ -755,4 +755,33 @@ mod tests {
         assert_eq!(face.len(), 4 * 4 * 2);
         assert!(segment(&Mesh::default(), &SegmentOptions::default()).is_empty());
     }
+
+    /// A smooth selection on a noisy scan stops at a sharp edge: the thin triangles a scan has,
+    /// whose normals noise turns by tens of degrees, must not carry it from the top of a box
+    /// down its walls.
+    #[test]
+    fn grow_smooth_does_not_leak_over_a_sharp_edge_of_a_noisy_scan() {
+        // 80 divisions a side: the wall triangles are 0.5 mm long and 0.15 mm high
+        let mut cad = synth::cuboid(Point3::origin(), Vec3::new(40.0, 30.0, 12.0), 80);
+        cad.weld(1e-9);
+        let mut leaks = Vec::new();
+        for seed in 1..=24 {
+            let mut scan = cad.clone();
+            synth::add_noise(&mut scan, 0.03, &mut Rng::new(seed));
+            let top = (0..scan.triangle_count())
+                .find(|&t| {
+                    scan.face_centroid(t)
+                        .is_some_and(|c| c.z > 11.9 && (c.x - 20.0).abs() < 2.0 && (c.y - 15.0).abs() < 2.0)
+                })
+                .unwrap();
+            let region = grow_smooth(&scan, &[top as u32], 25.0);
+            let below = region.iter().filter(|&&t| scan.face_centroid(t as usize).is_some_and(|c| c.z < 11.0)).count();
+            let on_top =
+                (0..scan.triangle_count()).filter(|&t| scan.face_centroid(t).is_some_and(|c| c.z > 11.9)).count();
+            if below > 0 || region.len() * 10 < on_top * 9 {
+                leaks.push((seed, region.len(), below, on_top));
+            }
+        }
+        assert!(leaks.is_empty(), "(seed, region, below the top, top triangles): {leaks:?}");
+    }
 }

@@ -25,7 +25,7 @@ const USAGE: &str = "usage:
   surfacecraft-cli exec <command> [<params-json>] [--open <project>] [--save <project>]
   surfacecraft-cli commands [<filter>]
   surfacecraft-cli describe <command>
-  surfacecraft-cli mcp [--local] [--allow-files]
+  surfacecraft-cli mcp [--local] [--allow-files] [--tools full|compact] [--areas <a,b>]
   surfacecraft-cli assist <align|workflow> <goal> [--open <project>] [--save <project>]
   surfacecraft-cli licences
 
@@ -135,7 +135,10 @@ fn run(args: &[String]) -> Result<bool, String> {
         "mcp" => {
             let local = o.positional.iter().any(|a| a == "--local");
             let allow_files = o.positional.iter().any(|a| a == "--allow-files");
-            mcp_stdio(local, allow_files);
+            let tools = flag_value(&o.positional, "--tools")?;
+            let areas = flag_value(&o.positional, "--areas")?;
+            let config = surfacecraft_mcp::ToolConfig::resolve(tools, areas)?;
+            mcp_stdio(local, allow_files, config);
             Ok(true)
         }
         "licences" | "licenses" => {
@@ -165,14 +168,25 @@ fn serve<B: surfacecraft_mcp::Backend>(mut server: surfacecraft_mcp::Server<B>) 
     }
 }
 
+/// The value after `flag`, when the flag is given.
+fn flag_value<'a>(args: &'a [String], flag: &str) -> Result<Option<&'a str>, String> {
+    match args.iter().position(|a| a == flag) {
+        None => Ok(None),
+        Some(k) => match args.get(k + 1) {
+            Some(v) => Ok(Some(v.as_str())),
+            None => Err(format!("{flag} needs a value")),
+        },
+    }
+}
+
 /// `surfacecraft-cli mcp`: bridged to a running desktop app when one answers, else headless.
-fn mcp_stdio(local: bool, allow_files: bool) {
+fn mcp_stdio(local: bool, allow_files: bool, config: surfacecraft_mcp::ToolConfig) {
     if !local
         && let Some(b) =
             surfacecraft_mcp::bridge::BridgeBackend::connect(&surfacecraft_ui_egui::control::discovery_path())
     {
         eprintln!("surfacecraft mcp: bridged to the running SurfaceCraft app");
-        serve(surfacecraft_mcp::Server::new(b));
+        serve(surfacecraft_mcp::Server::new(b).with_tools(config));
         return;
     }
     eprintln!(
@@ -181,7 +195,7 @@ fn mcp_stdio(local: bool, allow_files: bool) {
     );
     let mut backend = surfacecraft_mcp::LocalBackend::new(allow_files);
     backend.render = Some(Box::new(|s, w, h| surfacecraft_ui_egui::shot::screenshot_png(s, None, w, h)));
-    serve(surfacecraft_mcp::Server::new(backend));
+    serve(surfacecraft_mcp::Server::new(backend).with_tools(config));
 }
 
 fn main() -> ExitCode {

@@ -12,7 +12,7 @@
 //! - decimation: quadric error metric edge collapse (Garland & Heckbert 1997) with boundary and
 //!   feature-edge constraint planes, link-condition and normal-flip checks;
 //! - smoothing: Taubin λ|μ (1995), boundary and sharp-edge vertices optionally fixed.
-use crate::{Mesh, Point3, Vec3, tri};
+use crate::{Bvh, Mesh, Point3, Vec3, tri};
 use nalgebra::{Matrix3, Matrix4, Vector4};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -95,7 +95,7 @@ pub fn remove_small_components(mesh: &mut Mesh, min_fraction: f64, min_triangles
 }
 
 /// Vertex → neighbouring vertices (one ring, unordered, no duplicates).
-fn vertex_rings(mesh: &Mesh) -> Vec<Vec<u32>> {
+pub(crate) fn vertex_rings(mesh: &Mesh) -> Vec<Vec<u32>> {
     let mut ring: Vec<Vec<u32>> = vec![Vec::new(); mesh.positions.len()];
     for t in &mesh.triangles {
         for k in 0..3 {
@@ -111,9 +111,69 @@ fn vertex_rings(mesh: &Mesh) -> Vec<Vec<u32>> {
     ring
 }
 
+/// A ring point this many times the median distance from the ring's middle may be a spike
+/// itself.
+const RING_STRAY_FACTOR: f64 = 2.0;
+/// The points a plane is fitted to are spread enough when their second principal extent is at
+/// least this share of the first (points nearly in a line give no plane).
+const RING_MIN_SPREAD: f64 = 0.2;
+
+/// Least-squares plane of `pts` as (centroid, unit normal, mean distance to the centroid, ratio
+/// of the second to the first principal extent).
+fn ring_plane(pts: &[Point3]) -> Option<(Vec3, Vec3, f64, f64)> {
+    if pts.len() < 3 {
+        return None;
+    }
+    let c = pts.iter().fold(Vec3::zeros(), |a, p| a + p.coords) / pts.len() as f64;
+    let mut cov = Matrix3::zeros();
+    let mut radius = 0.0;
+    for p in pts {
+        let d = p.coords - c;
+        cov += d * d.transpose();
+        radius += d.norm();
+    }
+    radius /= pts.len() as f64;
+    if !(radius > 0.0) {
+        return None;
+    }
+    let e = cov.symmetric_eigen();
+    let mut order = [0usize, 1, 2];
+    order.sort_by(|&a, &b| e.eigenvalues[a].total_cmp(&e.eigenvalues[b]));
+    let [least, mid, most] = order;
+    let spread = (e.eigenvalues[mid].max(0.0) / e.eigenvalues[most].max(f64::MIN_POSITIVE)).sqrt();
+    Some((c, e.eigenvectors.column(least).into_owned(), radius, spread))
+}
+
+/// Is `p` a spike that another spike in its ring `pts` hides? The other spike is a ring point
+/// far from the rest (more than [`RING_STRAY_FACTOR`] × the median distance from the ring's
+/// middle, the median of each coordinate). With it left out the rest must still span a plane,
+/// `p` must be farther from that plane than `ratio` × the whole ring's radius, and the point
+/// left out must be off the plane as well (a far point that lies in the plane is no spike: rings
+/// of thin triangles have those).
+fn hidden_spike(pts: &[Point3], p: &Point3, ratio: f64, ring_radius: f64) -> bool {
+    let median = |mut v: Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v.get(v.len() / 2).copied().unwrap_or(0.0)
+    };
+    let mid = Point3::new(
+        median(pts.iter().map(|q| q.x).collect()),
+        median(pts.iter().map(|q| q.y).collect()),
+        median(pts.iter().map(|q| q.z).collect()),
+    );
+    let reach = RING_STRAY_FACTOR * median(pts.iter().map(|q| (q - mid).norm()).collect());
+    pts.iter().enumerate().filter(|(_, q)| (*q - mid).norm() > reach).any(|(j, q)| {
+        let rest: Vec<Point3> = pts.iter().enumerate().filter(|(k, _)| *k != j).map(|(_, r)| *r).collect();
+        let Some((c, n, radius, spread)) = ring_plane(&rest) else { return false };
+        spread >= RING_MIN_SPREAD
+            && (p.coords - c).dot(&n).abs() > ratio * ring_radius
+            && (q.coords - c).dot(&n).abs() > ratio * radius
+    })
+}
+
 /// Removes spikes: vertices farther from the least-squares plane of their one ring than
-/// `ratio` × the ring's radius. Triangles touching them are removed (the holes left behind can
-/// be filled with [`fill_holes`]). Returns the number of triangles removed.
+/// `ratio` × the ring's radius, and spikes that a spike next to them hides from that test (see
+/// [`hidden_spike`]). Triangles touching them are removed (the holes
+/// left behind can be filled with [`fill_holes`]). Returns the number of triangles removed.
 pub fn remove_outliers(mesh: &mut Mesh, ratio: f64) -> usize {
     if mesh.validate().is_err() {
         return 0;
@@ -123,35 +183,9 @@ pub fn remove_outliers(mesh: &mut Mesh, ratio: f64) -> usize {
     let positions = &mesh.positions;
     let bad: Vec<bool> = crate::par::map(ring.len(), |i| {
         let Some(r) = ring.get(i) else { return false };
-        if r.len() < 3 {
-            return false;
-        }
         let pts: Vec<Point3> = r.iter().filter_map(|&j| positions.get(j as usize).copied()).collect();
-        if pts.len() < 3 {
-            return false;
-        }
-        let c = pts.iter().fold(Vec3::zeros(), |a, p| a + p.coords) / pts.len() as f64;
-        let mut cov = Matrix3::zeros();
-        let mut radius = 0.0;
-        for p in &pts {
-            let d = p.coords - c;
-            cov += d * d.transpose();
-            radius += d.norm();
-        }
-        radius /= pts.len() as f64;
-        if !(radius > 0.0) {
-            return false;
-        }
-        let e = cov.symmetric_eigen();
-        let mut k = 0;
-        for j in 1..3 {
-            if e.eigenvalues[j] < e.eigenvalues[k] {
-                k = j;
-            }
-        }
-        let n = e.eigenvectors.column(k).into_owned();
-        let Some(p) = positions.get(i) else { return false };
-        (p.coords - c).dot(&n).abs() > ratio * radius
+        let (Some((c, n, radius, _)), Some(p)) = (ring_plane(&pts), positions.get(i)) else { return false };
+        (p.coords - c).dot(&n).abs() > ratio * radius || hidden_spike(&pts, p, ratio, radius)
     });
     let before = mesh.triangles.len();
     mesh.triangles.retain(|t| !t.iter().any(|&v| bad[v as usize]));
@@ -227,11 +261,22 @@ pub struct FillReport {
 }
 
 /// Fills boundary loops with at most `max_edges` edges. `smooth` refines and fairs the patch so
-/// it follows the surrounding curvature; otherwise the patch is flat (ear clipping only).
+/// it follows the surrounding curvature, and keeps the sharp edges and corners the hole lies
+/// over; otherwise the patch is flat (ear clipping only).
 pub fn fill_holes(mesh: &mut Mesh, max_edges: usize, smooth: bool) -> FillReport {
+    fill_holes_with(mesh, max_edges, smooth, smooth)
+}
+
+/// [`fill_holes`], with the keeping of sharp edges (`sharpen`, only with `smooth`) on its own
+/// switch.
+pub(crate) fn fill_holes_with(mesh: &mut Mesh, max_edges: usize, smooth: bool, sharpen: bool) -> FillReport {
     let mut rep = FillReport::default();
     let max_edges = max_edges.clamp(3, 4000);
-    for lp in boundary_loops(mesh) {
+    let loops = boundary_loops(mesh);
+    // the surface around every hole is read from the mesh as it is before any is filled
+    let around =
+        (smooth && sharpen && loops.iter().any(|lp| lp.len() <= max_edges)).then(|| crate::crease::Around::new(mesh));
+    for lp in loops {
         if lp.len() > max_edges {
             rep.skipped += 1;
             continue;
@@ -239,12 +284,16 @@ pub fn fill_holes(mesh: &mut Mesh, max_edges: usize, smooth: bool) -> FillReport
         // fill triangles run against the loop direction
         let rev: Vec<u32> = lp.iter().rev().copied().collect();
         let first_new = mesh.triangles.len();
+        let first_vertex = mesh.positions.len();
         let ok = ear_clip(mesh, &rev);
         if !ok {
             fan_fill(mesh, &rev);
         }
         if smooth {
             refine_and_fair(mesh, first_new, &lp);
+            if let Some(around) = &around {
+                crate::crease::sharpen_patch(mesh, around, first_new, first_vertex, &lp);
+            }
         }
         rep.filled += 1;
         rep.added_triangles += mesh.triangles.len() - first_new;
@@ -634,6 +683,33 @@ impl Default for DecimateOptions {
 
 /// Quadric edge-collapse decimation; returns the number of triangles removed.
 pub fn decimate(mesh: &mut Mesh, opts: &DecimateOptions) -> usize {
+    decimate_guarded(mesh, opts, None)
+}
+
+/// Measured guard of a collapse: the reduction of [`crate::reduce`] checks every collapse against
+/// the original surface instead of trusting the quadric alone (which overestimates the error of noisy
+/// data and ignores the sagitta inside a triangle).
+pub(crate) struct Guard<'a> {
+    /// The original surface.
+    pub bvh: &'a Bvh,
+    /// Per-vertex error budget (mm), indexed by the vertices of the mesh before the call; a collapse
+    /// is allowed only when the measured deviation is within the smaller budget of its two vertices,
+    /// and the merged vertex keeps that smaller budget.
+    pub budget: &'a mut Vec<f64>,
+}
+
+/// Collapses whose quadric error is below this fraction of the budget are not measured.
+const GUARD_SKIP: f64 = 0.25;
+/// With a guard, a collapse may not grow a vertex above this many neighbours (or above the valence
+/// it already has). Flat regions collapse at zero cost, and without the cap they pile up in a few
+/// hubs whose rings make every further collapse linear in the ring (minutes on a 100k-triangle block).
+const GUARD_VALENCE: usize = 32;
+
+/// [`decimate`] with an optional measured [`Guard`]; without one it is [`decimate`].
+pub(crate) fn decimate_guarded(mesh: &mut Mesh, opts: &DecimateOptions, mut guard: Option<Guard<'_>>) -> usize {
+    if guard.as_ref().is_some_and(|g| g.budget.len() != mesh.positions.len()) {
+        return 0;
+    }
     if mesh.validate().is_err() || mesh.triangles.len() <= opts.target_triangles.max(4) {
         return 0;
     }
@@ -768,9 +844,13 @@ pub fn decimate(mesh: &mut Mesh, opts: &DecimateOptions) -> usize {
         if common != shared.len() {
             continue;
         }
+        if guard.is_some() && na.len() + nb.len() - common - 2 > GUARD_VALENCE.max(na.len()).max(nb.len()) {
+            continue;
+        }
         let p = Point3::new(c.target[0], c.target[1], c.target[2]);
         // no flipped or degenerate faces around the new vertex
         let mut ok = true;
+        let mut fan: Vec<[Point3; 3]> = Vec::new();
         for &f in fa.iter().chain(fb.iter()) {
             if shared.contains(&f) {
                 continue;
@@ -779,6 +859,7 @@ pub fn decimate(mesh: &mut Mesh, opts: &DecimateOptions) -> usize {
             let old = tri::cross(&pos[t[0] as usize], &pos[t[1] as usize], &pos[t[2] as usize]);
             let corners: Vec<Point3> = t.iter().map(|&v| if v == a || v == b { p } else { pos[v as usize] }).collect();
             let new = tri::cross(&corners[0], &corners[1], &corners[2]);
+            fan.push([corners[0], corners[1], corners[2]]);
             if new.dot(&old) <= 0.0 || new.norm() < 1e-3 * old.norm() {
                 ok = false;
                 break;
@@ -792,6 +873,14 @@ pub fn decimate(mesh: &mut Mesh, opts: &DecimateOptions) -> usize {
         }
         if !ok {
             continue;
+        }
+        if let Some(g) = guard.as_ref() {
+            let limit = g.budget[a as usize].min(g.budget[b as usize]);
+            if c.cost > (GUARD_SKIP * limit).powi(2)
+                && !collapse_within(g.bvh, limit, &p, &[pos[a as usize], pos[b as usize]], &fan)
+            {
+                continue;
+            }
         }
         // collapse b into a
         for &f in &shared {
@@ -812,6 +901,9 @@ pub fn decimate(mesh: &mut Mesh, opts: &DecimateOptions) -> usize {
         vfaces[b as usize].clear();
         vfaces[a as usize].retain(|&f| alive_t[f as usize]);
         alive_v[b as usize] = false;
+        if let Some(g) = guard.as_mut() {
+            g.budget[a as usize] = g.budget[a as usize].min(g.budget[b as usize]);
+        }
         pos[a as usize] = p;
         let qb = q[b as usize];
         q[a as usize] += qb;
@@ -843,6 +935,22 @@ pub fn decimate(mesh: &mut Mesh, opts: &DecimateOptions) -> usize {
     mesh.triangles = tris;
     compact(mesh);
     before - mesh.triangles.len()
+}
+
+/// Is the surface after a collapse within `limit` of the original? Measured: the new vertex and the
+/// centroids of the new triangles (`fan`) against the original surface, and the two vertices
+/// that vanish (`old`) against the new triangles.
+fn collapse_within(original: &Bvh, limit: f64, p: &Point3, old: &[Point3], fan: &[[Point3; 3]]) -> bool {
+    if original.closest(p, limit).is_none() {
+        return false;
+    }
+    for t in fan {
+        let centroid = Point3::from((t[0].coords + t[1].coords + t[2].coords) / 3.0);
+        if original.closest(&centroid, limit).is_none() {
+            return false;
+        }
+    }
+    old.iter().all(|q| fan.iter().any(|t| (tri::closest_point(q, &t[0], &t[1], &t[2]) - q).norm() <= limit))
 }
 
 /// Taubin smoothing; `fix_boundary` keeps boundary vertices, `feature_angle_deg` keeps vertices on
@@ -937,6 +1045,28 @@ mod tests {
         assert_eq!(r.filled, 1);
         assert!(boundary_loops(&m).is_empty());
         assert!((m.area() - 6.0 * 400.0).abs() < 1e-6, "{}", m.area());
+    }
+
+    /// Two spikes next to each other are in each other's ring; neither may hide the other.
+    #[test]
+    fn neighbouring_spikes_both_go() {
+        let mut m = synth::cuboid(Point3::origin(), Vec3::new(20.0, 20.0, 20.0), 8);
+        m.weld(1e-9);
+        for (x, lift) in [(10.0, 10.4), (12.5, 7.8)] {
+            let i = m
+                .positions
+                .iter()
+                .position(|p| (p.z - 20.0).abs() < 1e-9 && (p.x - x).abs() < 1e-9 && (p.y - 10.0).abs() < 1e-9)
+                .unwrap();
+            m.positions[i].z += lift;
+        }
+        assert!(remove_outliers(&mut m, 1.5) > 0);
+        let high = m.positions.iter().filter(|p| p.z > 20.5).count();
+        assert_eq!(high, 0, "{high} spike vertices are left");
+        // creases and corners of the clean box are still not outliers
+        let mut clean = synth::cuboid(Point3::origin(), Vec3::new(20.0, 20.0, 20.0), 8);
+        clean.weld(1e-9);
+        assert_eq!(remove_outliers(&mut clean, 1.5), 0);
     }
 
     #[test]

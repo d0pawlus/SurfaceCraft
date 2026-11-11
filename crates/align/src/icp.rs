@@ -50,6 +50,8 @@ pub struct IcpReport {
     pub deltas: Vec<f64>,
     /// Pairs kept in the last iteration.
     pub pairs: usize,
+    /// Source samples the fit used (the vertices, evenly strided down to `max_samples`).
+    pub samples: usize,
 }
 
 fn samples(source: &Mesh, max: usize) -> Vec<Point3> {
@@ -159,7 +161,22 @@ pub fn icp(source: &Mesh, target: &Bvh, init: &Transform, opts: &IcpOptions) -> 
         last_delta: deltas.last().copied().unwrap_or(0.0),
         deltas,
         pairs,
+        samples: pts.len(),
     })
+}
+
+/// RMS distance (mm) from `pts`, moved by `t`, to the surface indexed by `target`: how well a
+/// motion fits a part of a scan. `None` when the target is empty or there are no points.
+#[must_use]
+pub fn rms_to_surface(target: &Bvh, pts: &[Point3], t: &Transform) -> Option<f64> {
+    if target.is_empty() {
+        return None;
+    }
+    let sq: Vec<Option<f64>> = surfacecraft_geom::par::map_slice(pts, |p| {
+        target.closest(&t.apply(p), f64::INFINITY).map(|h| h.distance * h.distance)
+    });
+    let (sum, n) = sq.iter().flatten().fold((0.0_f64, 0_usize), |(s, n), d| (s + *d, n + 1));
+    (n > 0).then(|| (sum / n as f64).sqrt())
 }
 
 #[cfg(test)]
