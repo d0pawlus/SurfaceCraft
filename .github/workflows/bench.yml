@@ -24,11 +24,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { variant: linux-nextest, cache: linux-nextest, os: ubuntu-latest }
-          - { variant: linux-nextest-o2, cache: linux-nextest, os: ubuntu-latest, opt: 2 }
-          - { variant: windows-nextest, cache: windows-nextest, os: windows-latest }
-          - { variant: windows-nextest-lld, cache: windows-nextest, os: windows-latest, lld: true }
-          - { variant: windows-nextest-o2, cache: windows-nextest, os: windows-latest, opt: 2 }
+          - { variant: linux-nextest-o3, cache: linux-nextest, os: ubuntu-latest, opt: 3 }
+          - { variant: windows-nextest-o3, cache: windows-nextest, os: windows-latest, opt: 3 }
     steps:
       - uses: actions/checkout@v4
       - name: System libraries for eframe/rfd
