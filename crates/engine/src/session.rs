@@ -57,9 +57,17 @@ pub struct Session {
     pub tess: crate::display::TessCache,
     /// Per-vertex colour overlays on meshes (deviation maps), keyed by mesh id.
     pub overlays: std::collections::HashMap<surfacecraft_doc::ObjectId, std::sync::Arc<Vec<[f32; 4]>>>,
+    /// Per-vertex signed deviation behind each overlay (NaN where the point is not counted), keyed
+    /// by mesh id: what `deviation.at` reads. Stored and dropped together with the overlay.
+    pub deviations: std::collections::HashMap<surfacecraft_doc::ObjectId, std::sync::Arc<Vec<f32>>>,
 }
 
 const LOG_CAP: usize = 1000;
+
+/// Read-only commands a front end may run without a log entry (the viewport readout asks on every
+/// pointer move; logging those would evict the user's own commands). Nothing outside this list is
+/// run by [`Session::query`].
+pub const QUERY_COMMANDS: &[&str] = &["deviation.at"];
 
 impl Session {
     /// A new, empty session; file access allowed except on wasm.
@@ -102,6 +110,19 @@ impl Session {
             self.log.remove(0);
         }
         mapped
+    }
+
+    /// Runs read-only command `id` without a log entry or a history step. Only the commands in
+    /// [`QUERY_COMMANDS`] may run this way; any other id is refused as unavailable.
+    pub fn query(&mut self, id: &str, params: Value) -> Result<Value, EngineError> {
+        if !QUERY_COMMANDS.contains(&id) {
+            return Err(EngineError::Unavailable(format!("{id} is not a query")));
+        }
+        let spec = cmd::find(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
+        if spec.undoable {
+            return Err(EngineError::Unavailable(format!("{id} changes the document")));
+        }
+        run_guarded(spec, self, params)
     }
 
     /// Runs command `id` on a copy of the document and returns the copy: the preview of what

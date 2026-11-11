@@ -611,6 +611,7 @@ fn edit_mesh(
         obj.mesh = Arc::new(m);
     }
     s.overlays.remove(&id);
+    s.deviations.remove(&id);
     Ok(o)
 }
 
