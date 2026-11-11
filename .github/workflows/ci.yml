@@ -49,8 +49,14 @@ jobs:
     timeout-minutes: 90
     env:
       DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+      # experiment: link the native target with mold (the wasm target keeps its own flags)
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C linker-features=-lld -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
+      - uses: rui314/setup-mold@v1
+        if: env.DOCS_ONLY != 'true'
+        with:
+          make-default: false
       - name: System libraries for eframe/rfd
         if: env.DOCS_ONLY != 'true'
         # Best effort: when the Ubuntu package mirrors are unreachable (2026-11-11: every Linux job
@@ -79,6 +85,9 @@ jobs:
       - name: cargo xtask ci
         if: env.DOCS_ONLY != 'true'
         run: cargo xtask ci
+      - name: Which linker (experiment)
+        if: env.DOCS_ONLY != 'true'
+        run: readelf -p .comment "$(ls target/ci/deps/commands-* | grep -v '\.d$' | head -1)"
       - name: cargo xtask assets (documentation-only change)
         if: env.DOCS_ONLY == 'true'
         run: cargo xtask assets
