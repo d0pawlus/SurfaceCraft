@@ -3,7 +3,7 @@
 //! gives the expected numbers from known geometry, not from the command under test.
 use serde_json::{Value, json};
 use std::sync::Arc;
-use surfacecraft_doc::{ObjectId, WorkingCopy};
+use surfacecraft_doc::{Document, ObjectId, QuadObject, WorkingCopy};
 use surfacecraft_engine::Session;
 use surfacecraft_geom::{Bvh, Mesh, Point3, Vec3, synth};
 
@@ -274,14 +274,176 @@ fn p8_align_moves_the_copy_with_the_original() {
     let r = s.execute("align.center", json!({"object": "sheet"})).unwrap();
     assert_eq!(r["applied"], true, "{r}");
     let (orig_after, copy_after) = (original(&s, "sheet"), working(&s, "sheet").unwrap());
-    for (before, after) in orig_before.positions.iter().zip(&orig_after.positions) {
-        assert!((after - before - shift).norm() < EPS, "original moved by {}", after - before);
-    }
-    for (before, after) in copy_before.positions.iter().zip(&copy_after.positions) {
-        assert!((after - before - shift).norm() < EPS, "copy moved by {}", after - before);
-    }
+    assert_moved(&orig_before, &orig_after, shift);
+    assert_moved(&copy_before, &copy_after, shift);
     assert!(orig_after.bbox().center().coords.norm() < EPS, "centre is not at the origin");
     let d = distance(&mut s, "sheet");
     near(&d["working_to_original"]["max"], 0.0, EPS);
     near(&d["original_to_working"]["max"], 0.0, EPS);
+}
+
+/// Every vertex of `after` is the vertex of `before` moved by `shift`.
+fn assert_moved(before: &Mesh, after: &Mesh, shift: Vec3) {
+    assert_eq!(before.positions.len(), after.positions.len());
+    for (b, a) in before.positions.iter().zip(&after.positions) {
+        assert!((a - b - shift).norm() < EPS, "moved by {}, expected {shift}", a - b);
+    }
+}
+
+/// A quad layout over the whole sheet: a placeholder layout, not a fit.
+fn quad_over(mesh: ObjectId) -> QuadObject {
+    QuadObject {
+        id: ObjectId(0),
+        name: "layout".into(),
+        mesh,
+        region: None,
+        frame: [[0.0; 3]; 4],
+        domain: [[0.0, 1.0], [0.0, 1.0]],
+        nu: 1,
+        nv: 1,
+        vertices: vec![[0.0; 3]; 4],
+        crease_u: Vec::new(),
+        crease_v: Vec::new(),
+        faces: Vec::new(),
+        normals: Vec::new(),
+        visible: true,
+    }
+}
+
+/// Gate: `mesh.info` shows the working copy's counts and bounds next to the original's, and
+/// `mesh.export` with `working` writes the copy (STL keeps the triangle count). The sixteen-cell
+/// sheet has 2 × 16 × 16 = 512 triangles; the copy has the count `mesh.decimate` reports.
+#[test]
+fn p8_info_and_export_show_the_working_copy() {
+    let mut s = Session::new();
+    sheet_with_copy(&mut s, "sheet");
+    let info = s.execute("mesh.info", json!({"object": "sheet"})).unwrap();
+    assert!(info.get("working").is_some(), "a fresh copy is shown: {info}");
+    assert_eq!(info["triangles"], 512, "{info}");
+    let d = s.execute("mesh.decimate", json!({"object": "sheet", "ratio": 0.5})).unwrap();
+    let copy_tris = d["triangles"].as_u64().unwrap();
+    let info = s.execute("mesh.info", json!({"object": "sheet"})).unwrap();
+    assert_eq!(info["triangles"], 512, "the original is not decimated: {info}");
+    assert_eq!(info["working"]["triangles"], copy_tris, "{info}");
+    assert_eq!(info["working"]["vertices"], working(&s, "sheet").unwrap().vertex_count());
+    for k in 0..3 {
+        near(&info["working"]["bbox_min"][k], info["bbox_min"][k].as_f64().unwrap(), EPS);
+        near(&info["working"]["bbox_max"][k], info["bbox_max"][k].as_f64().unwrap(), EPS);
+    }
+    let out = s.execute("mesh.export", json!({"object": "sheet", "working": true})).unwrap();
+    let back = s.execute("mesh.import", json!({"data": out["data"].clone(), "format": "stl", "name": "copy"})).unwrap();
+    assert_eq!(back["triangles"], copy_tris, "the copy was exported");
+    let out = s.execute("mesh.export", json!({"object": "sheet"})).unwrap();
+    let back =
+        s.execute("mesh.import", json!({"data": out["data"].clone(), "format": "stl", "name": "original"})).unwrap();
+    assert_eq!(back["triangles"], 512, "the original was exported");
+    s.execute("mesh.working_discard", json!({"object": "sheet"})).unwrap();
+    assert!(s.execute("mesh.info", json!({"object": "sheet"})).unwrap().get("working").is_none());
+    assert!(s.execute("mesh.export", json!({"object": "sheet", "working": true})).is_err());
+}
+
+/// Gate: promoting a copy whose triangles changed reports the quad layouts of the original that it
+/// dropped; promoting one with the same triangles keeps them. Undo brings the layout back.
+#[test]
+fn p8_promote_reports_the_quad_layouts_dropped() {
+    let mut s = Session::new();
+    sheet_with_copy(&mut s, "sheet");
+    let id = id_of(&s, "sheet");
+    s.doc.add_quad(quad_over(id));
+    s.execute("mesh.smooth", json!({"object": "sheet", "iterations": 2})).unwrap();
+    let kept = s.execute("mesh.working_promote", json!({"object": "sheet"})).unwrap();
+    assert_eq!(kept["quad_layouts_dropped"], 0, "{kept}");
+    assert_eq!(s.doc.quads.len(), 1);
+    s.execute("mesh.working_begin", json!({"object": "sheet"})).unwrap();
+    s.execute("mesh.decimate", json!({"object": "sheet", "ratio": 0.5})).unwrap();
+    let dropped = s.execute("mesh.working_promote", json!({"object": "sheet"})).unwrap();
+    assert_eq!(dropped["quad_layouts_dropped"], 1, "{dropped}");
+    assert!(s.doc.quads.is_empty());
+    s.execute("edit.undo", Value::Null).unwrap();
+    assert_eq!(s.doc.quads.len(), 1, "undo brings the layout back");
+}
+
+/// Gate: a copy or an original without triangles has nothing to measure, and `mesh.working_distance`
+/// says so instead of giving numbers.
+#[test]
+fn p8_distance_refuses_meshes_without_triangles() {
+    let mut s = Session::new();
+    sheet_with_copy(&mut s, "sheet");
+    let id = id_of(&s, "sheet");
+    let empty = || Mesh { positions: Vec::new(), triangles: Vec::new() };
+    s.doc.mesh_mut(id).unwrap().working = Some(WorkingCopy { mesh: Arc::new(empty()) });
+    assert!(s.execute("mesh.working_distance", json!({"object": "sheet"})).is_err(), "an empty copy");
+    s.execute("mesh.working_discard", json!({"object": "sheet"})).unwrap();
+    s.execute("mesh.working_begin", json!({"object": "sheet"})).unwrap();
+    s.doc.mesh_mut(id).unwrap().mesh = Arc::new(empty());
+    assert!(s.execute("mesh.working_distance", json!({"object": "sheet"})).is_err(), "an empty original");
+}
+
+/// Gate: a repeated id in `also` (the object again, or one id twice) moves each mesh once: the original
+/// and its copy move by the centring shift, not by a multiple of it.
+#[test]
+fn p8_align_applies_the_transform_once_with_repeated_ids() {
+    let mut s = Session::new();
+    sheet_with_copy(&mut s, "sheet");
+    s.execute("mesh.decimate", json!({"object": "sheet", "ratio": 0.5})).unwrap();
+    let (orig_before, copy_before) = (original(&s, "sheet"), working(&s, "sheet").unwrap());
+    let shift = -orig_before.bbox().center().coords;
+    s.execute("align.center", json!({"object": "sheet", "also": ["sheet", "sheet"]})).unwrap();
+    assert_moved(&orig_before, &original(&s, "sheet"), shift);
+    assert_moved(&copy_before, &working(&s, "sheet").unwrap(), shift);
+}
+
+/// A project whose working copy has an out-of-range index, or a NaN coordinate, does not open.
+#[test]
+fn p8_hostile_working_copy_does_not_open() {
+    let dir = std::env::temp_dir().join(format!("sc-d2-hostile-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let base = synth::plane(Point3::origin(), Vec3::x(), Vec3::y(), 1.0, 1.0, 1, 1);
+    let bad = [
+        Mesh { positions: base.positions.clone(), triangles: vec![[0, 1, 99]] },
+        Mesh {
+            positions: vec![Point3::new(f64::NAN, 0.0, 0.0), Point3::new(1.0, 0.0, 0.0), Point3::new(0.0, 1.0, 0.0)],
+            triangles: vec![[0, 1, 2]],
+        },
+    ];
+    for (k, copy) in bad.into_iter().enumerate() {
+        let mut d = Document::new();
+        let id = d.add_mesh("sheet", base.clone());
+        d.mesh_mut(id).unwrap().working = Some(WorkingCopy { mesh: Arc::new(copy) });
+        let path = dir.join(format!("bad-{k}.scproj")).to_string_lossy().to_string();
+        std::fs::write(&path, surfacecraft_doc::format::to_json(&d).unwrap()).unwrap();
+        let mut s = Session::new();
+        assert!(s.execute("doc.open", json!({"path": path})).is_err(), "copy {k} opened");
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Gate: a session without file access refuses `path` for the distance map and writes nothing; the
+/// summary alone still works.
+#[test]
+fn p8_distance_path_needs_file_access() {
+    let mut s = Session::new();
+    sheet_with_copy(&mut s, "sheet");
+    s.allow_files = false;
+    let path = std::env::temp_dir().join(format!("sc-d2-nofiles-{}.csv", std::process::id()));
+    let path = path.to_string_lossy().to_string();
+    assert!(s.execute("mesh.working_distance", json!({"object": "sheet", "path": path})).is_err());
+    assert!(!std::path::Path::new(&path).exists(), "nothing was written");
+    assert!(s.execute("mesh.working_distance", json!({"object": "sheet"})).is_ok());
+}
+
+/// Gate: promoting a copy with the same triangles (smoothing only moves vertices) keeps the regions of
+/// the original, and nothing is reported dropped.
+#[test]
+fn p8_promote_with_unchanged_triangles_keeps_regions() {
+    let mut s = Session::new();
+    sheet_with_copy(&mut s, "sheet");
+    let id = id_of(&s, "sheet");
+    s.doc.add_region("patch", id, vec![0, 1, 2]);
+    s.execute("mesh.smooth", json!({"object": "sheet", "iterations": 3})).unwrap();
+    let p = s.execute("mesh.working_promote", json!({"object": "sheet"})).unwrap();
+    assert_eq!(p["regions_dropped"], 0, "{p}");
+    assert_eq!(p["quad_layouts_dropped"], 0, "{p}");
+    assert_eq!(p["triangles"], p["triangles_before"], "{p}");
+    assert_eq!(s.doc.regions.len(), 1);
 }

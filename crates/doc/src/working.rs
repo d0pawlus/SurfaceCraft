@@ -8,6 +8,15 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use surfacecraft_geom::{Mesh, Transform};
 
+/// What promoting a working copy dropped from the original's topology.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Promotion {
+    /// Regions whose triangle indices no longer refer to the mesh.
+    pub regions_dropped: usize,
+    /// Quad layouts over the mesh (their faces index the old triangles' vertices).
+    pub quads_dropped: usize,
+}
+
 /// The editable copy of a mesh.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkingCopy {
@@ -65,16 +74,18 @@ impl Document {
     }
 
     /// Replaces the original of mesh `id` with its working copy. Regions and quad layouts of the
-    /// original are dropped when the triangles changed (their indices refer to the old mesh); the
-    /// number of regions dropped is returned. `None` when there is no working copy.
-    pub fn promote_working(&mut self, id: ObjectId) -> Option<usize> {
+    /// original are dropped when the triangles changed (their indices refer to the old mesh), and the
+    /// counts are returned. `None` when there is no working copy.
+    pub fn promote_working(&mut self, id: ObjectId) -> Option<Promotion> {
         let obj = self.mesh_mut(id)?;
         let copy = obj.working.take()?.mesh;
         if obj.mesh.triangles == copy.triangles {
             obj.mesh = copy;
-            return Some(0);
+            return Some(Promotion::default());
         }
-        self.replace_mesh_topology(id, Arc::unwrap_or_clone(copy))
+        let quads_dropped = self.quads.iter().filter(|q| q.mesh == id).count();
+        let regions_dropped = self.replace_mesh_topology(id, Arc::unwrap_or_clone(copy))?;
+        Some(Promotion { regions_dropped, quads_dropped })
     }
 }
 
@@ -108,7 +119,7 @@ mod tests {
         assert!(d.start_working(id));
         let lifted = flat(4).transformed(&Transform::translation(Vec3::new(0.0, 0.0, 1.0)));
         *d.mesh_mut(id).unwrap().editable_mut() = Arc::new(lifted);
-        assert_eq!(d.promote_working(id), Some(0));
+        assert_eq!(d.promote_working(id), Some(Promotion::default()));
         assert_eq!(d.regions.len(), 1);
         assert!(!d.mesh(id).unwrap().is_working());
         assert!(d.promote_working(id).is_none());
@@ -121,7 +132,7 @@ mod tests {
         d.add_region("patch", id, vec![0, 1]);
         assert!(d.start_working(id));
         *d.mesh_mut(id).unwrap().editable_mut() = Arc::new(flat(2));
-        assert_eq!(d.promote_working(id), Some(1));
+        assert_eq!(d.promote_working(id), Some(Promotion { regions_dropped: 1, quads_dropped: 0 }));
         assert!(d.regions.is_empty());
         assert_eq!(d.mesh(id).unwrap().mesh.triangle_count(), flat(2).triangle_count());
     }

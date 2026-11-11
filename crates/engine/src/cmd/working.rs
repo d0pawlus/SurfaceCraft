@@ -39,6 +39,8 @@ pub struct PromoteOut {
     pub triangles: usize,
     /// Regions dropped because the triangles changed.
     pub regions_dropped: usize,
+    /// Quad layouts of the original dropped with them.
+    pub quad_layouts_dropped: usize,
 }
 
 /// Distance measurement parameters.
@@ -98,9 +100,15 @@ fn promote(s: &mut Session, i: MeshIn) -> CmdResult<PromoteOut> {
     let id = i.object.resolve(s, ObjectKind::Mesh)?;
     let triangles_before = s.doc.mesh(id).map_or(0, |o| o.mesh.triangle_count());
     let triangles = copy_of(s, id)?.triangle_count();
-    let regions_dropped = s.doc.promote_working(id).ok_or_else(|| no_working(id))?;
+    let dropped = s.doc.promote_working(id).ok_or_else(|| no_working(id))?;
     s.overlays.remove(&id);
-    Ok(PromoteOut { id, triangles_before, triangles, regions_dropped })
+    Ok(PromoteOut {
+        id,
+        triangles_before,
+        triangles,
+        regions_dropped: dropped.regions_dropped,
+        quad_layouts_dropped: dropped.quads_dropped,
+    })
 }
 
 fn discard(s: &mut Session, i: MeshIn) -> CmdResult<WorkingOut> {
@@ -154,6 +162,9 @@ fn map_csv(copy: &Mesh, m: &Measured) -> CmdResult<String> {
     out.push('\n');
     for (v, s) in m.vertices.iter().zip(&m.signed) {
         let Some(p) = copy.positions.get(*v as usize) else { continue };
+        if !s.d.is_finite() {
+            continue; // not measured: there is no number to write
+        }
         writeln!(out, "{v},{},{},{},{},{}", p.x, p.y, p.z, s.d, s.d.abs())
             .map_err(|e| CmdError::Failed(e.to_string()))?;
     }
@@ -173,6 +184,11 @@ fn distance(s: &mut Session, i: DistanceIn) -> CmdResult<DistanceOut> {
     let tolerance = positive_tolerance(i.tolerance)?;
     let copy = copy_of(s, id)?;
     let original = s.doc.mesh(id).map(|o| Arc::clone(&o.mesh)).ok_or_else(|| no_working(id))?;
+    if copy.triangle_count() == 0 || original.triangle_count() == 0 {
+        return Err(CmdError::Params(format!(
+            "mesh {id}: the working copy and the original both need triangles to measure a distance"
+        )));
+    }
     let forward = measure(&copy, &original);
     let backward = measure(&original, &copy);
     let out = DistanceOut {

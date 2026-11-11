@@ -3,6 +3,7 @@ use super::{CmdError, CmdResult, CommandSpec, ObjRef, read_file, write_file};
 use crate::{Session, command};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use surfacecraft_doc::{ObjectId, ObjectKind, base64};
 use surfacecraft_geom::{Mesh, Point3, PointCloud, ReconParams, Rng, Transform, Vec3, reconstruct, synth};
 use surfacecraft_io::{Limits, MeshFormat, Scan, read_points, read_scan, write_mesh};
@@ -24,20 +25,46 @@ pub struct MeshInfo {
     pub bbox_max: [f64; 3],
     /// Surface area, mm².
     pub area: f64,
+    /// The working copy, when there is one: the geometry edits act on (`mesh.working_begin`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working: Option<WorkingInfo>,
+}
+
+/// Size of a working copy.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct WorkingInfo {
+    /// Vertex count.
+    pub vertices: usize,
+    /// Triangle count.
+    pub triangles: usize,
+    /// Bounding box minimum.
+    pub bbox_min: [f64; 3],
+    /// Bounding box maximum.
+    pub bbox_max: [f64; 3],
+}
+
+/// Bounding box corners of `m`; zeros for an empty mesh.
+fn bounds(m: &Mesh) -> ([f64; 3], [f64; 3]) {
+    let b = m.bbox();
+    if b.is_empty() { ([0.0; 3], [0.0; 3]) } else { (b.min.coords.into(), b.max.coords.into()) }
 }
 
 pub(crate) fn mesh_info(s: &Session, id: ObjectId) -> CmdResult<MeshInfo> {
     let m = s.doc.mesh(id).ok_or_else(|| CmdError::Params(format!("no mesh {id}")))?;
-    let b = m.mesh.bbox();
-    let (lo, hi) = if b.is_empty() { ([0.0; 3], [0.0; 3]) } else { (b.min.coords.into(), b.max.coords.into()) };
+    let (bbox_min, bbox_max) = bounds(&m.mesh);
+    let working = m.working.as_ref().map(|w| {
+        let (bbox_min, bbox_max) = bounds(&w.mesh);
+        WorkingInfo { vertices: w.mesh.vertex_count(), triangles: w.mesh.triangle_count(), bbox_min, bbox_max }
+    });
     Ok(MeshInfo {
         id,
         name: m.name.clone(),
         triangles: m.mesh.triangle_count(),
         vertices: m.mesh.vertex_count(),
-        bbox_min: lo,
-        bbox_max: hi,
+        bbox_min,
+        bbox_max,
         area: m.mesh.area(),
+        working,
     })
 }
 
@@ -273,6 +300,22 @@ pub struct ExportIn {
     /// Format (default: from the path's extension, else STL).
     #[serde(default)]
     pub format: Option<MeshFormat>,
+    /// Export the working copy instead of the original (an error when there is none).
+    #[serde(default)]
+    pub working: bool,
+}
+
+/// The geometry `mesh.export` writes: the working copy when `working`, else the original.
+fn exported_mesh(s: &Session, id: ObjectId, working: bool) -> CmdResult<Arc<Mesh>> {
+    let obj = s.doc.mesh(id).ok_or_else(|| CmdError::Params(format!("no mesh {id}")))?;
+    if !working {
+        return Ok(obj.mesh.clone());
+    }
+    obj.working.as_ref().map(|w| w.mesh.clone()).ok_or_else(|| {
+        CmdError::Params(format!(
+            "mesh {id} has no working copy; export the original or start one with mesh.working_begin"
+        ))
+    })
 }
 
 /// Export result.
@@ -290,7 +333,7 @@ pub struct ExportOut {
 
 fn export(s: &mut Session, i: ExportIn) -> CmdResult<ExportOut> {
     let id = i.object.resolve(s, ObjectKind::Mesh)?;
-    let m = s.doc.mesh(id).ok_or_else(|| CmdError::Params(format!("no mesh {id}")))?;
+    let geometry = exported_mesh(s, id, i.working)?;
     let fmt = i
         .format
         .or_else(|| {
@@ -299,7 +342,7 @@ fn export(s: &mut Session, i: ExportIn) -> CmdResult<ExportOut> {
             })
         })
         .unwrap_or(MeshFormat::Stl);
-    let bytes = write_mesh(&m.mesh, fmt);
+    let bytes = write_mesh(&geometry, fmt);
     match i.path {
         Some(p) => {
             write_file(s, &p, &bytes)?;
