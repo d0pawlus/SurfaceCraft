@@ -100,15 +100,84 @@ fn harness_sized(mut app: SurfaceCraftApp, size: (f32, f32)) -> H {
     h
 }
 
-fn shell(dir: &std::path::Path, name: &str, theme: Theme, lang: Lang, log_hidden: bool) {
+fn shell(dir: &std::path::Path, name: &str, theme: Theme, lang: Lang) {
     let mut app = SurfaceCraftApp::with_settings(UiSettings { theme, lang, ..UiSettings::default() });
     scene(&mut app);
-    if log_hidden {
-        let _ =
-            surfacecraft_ui_egui::dock::set_visible(&mut app.workspace, surfacecraft_ui_egui::dock::Panel::Log, false);
-    }
     let mut h = harness(app);
     render(&mut h, dir, &format!("p6-g1-{name}.png"));
+}
+
+/// The empty application: the welcome card over the viewport and the guide's first step.
+fn welcome(dir: &std::path::Path, name: &str, lang: Lang) {
+    let app = SurfaceCraftApp::with_settings(UiSettings { lang, ..UiSettings::default() });
+    let mut h = harness(app);
+    render(&mut h, dir, &format!("p6-welcome{name}.png"));
+}
+
+/// A long form with fields picked in the viewport: the 3-2-1 alignment of a scan.
+fn datum_form(dir: &std::path::Path) {
+    let mut app = SurfaceCraftApp::headless();
+    run(&mut app, "mesh.synth", json!({"shape": "bracket", "name": "scan"}));
+    app.camera.fit(&app.session.doc.bbox());
+    app.camera.orbit(50.0, -35.0);
+    app.choose_command("align.datum");
+    let mut h = harness(app);
+    render(&mut h, dir, "p6-form-align.png");
+}
+
+/// The same form in Polish: tool, parameter and choice names come from the catalogue.
+fn form_pl(dir: &std::path::Path) {
+    let settings = UiSettings { lang: Lang::Pl, ..UiSettings::default() };
+    let mut app = SurfaceCraftApp::with_settings(settings);
+    run(&mut app, "sketch.create", json!({"name": "base"}));
+    let pts = [[0.0, 0.0], [40.0, 0.0], [40.0, 20.0], [0.0, 20.0]];
+    run(&mut app, "sketch.add", json!({"sketch": "base", "entities": [{"polygon": {"points": pts}}]}));
+    app.camera.fit(&app.session.doc.bbox());
+    app.camera.orbit(50.0, -35.0);
+    app.choose_command("feature.extrude");
+    app.palette_params = json!({"sketch": "base", "distance": 12.0, "mode": "new", "draft_deg": 2.0}).to_string();
+    let mut h = harness(app);
+    render(&mut h, dir, "p6-form-extrude-pl.png");
+}
+
+/// A list of alternatives in Polish: each sketch constraint is chosen from a list and edited as
+/// fields, not as JSON.
+fn constraints_form_pl(dir: &std::path::Path) {
+    let settings = UiSettings { lang: Lang::Pl, ..UiSettings::default() };
+    let mut app = SurfaceCraftApp::with_settings(settings);
+    run(&mut app, "sketch.create", json!({"name": "base"}));
+    let pts = [[0.0, 0.0], [40.0, 0.0], [40.0, 20.0], [0.0, 20.0]];
+    run(&mut app, "sketch.add", json!({"sketch": "base", "entities": [{"polygon": {"points": pts}}]}));
+    app.camera.fit(&app.session.doc.bbox());
+    app.choose_command("sketch.constrain");
+    let constraints = json!([{"type": "horizontal", "line": 0}, {"type": "length", "line": 0, "value": 40.0}]);
+    app.palette_params = json!({"sketch": "base", "constraints": constraints}).to_string();
+    let mut h = harness(app);
+    render(&mut h, dir, "p6-form-constraints-pl.png");
+}
+
+/// A failed tool in Polish: the engine's message is shown in the interface language.
+fn error_pl(dir: &std::path::Path) {
+    let settings = UiSettings { lang: Lang::Pl, ..UiSettings::default() };
+    let mut app = SurfaceCraftApp::with_settings(settings);
+    run(&mut app, "mesh.synth", json!({"shape": "bracket", "name": "scan"}));
+    app.camera.fit(&app.session.doc.bbox());
+    app.camera.orbit(50.0, -35.0);
+    app.choose_command("mesh.transform");
+    let matrix = [[1.0, 0.0, 0.0, 5.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
+    app.palette_params = json!({"object": "scan", "matrix": matrix, "scale": -1.0}).to_string();
+    let _ = app.run_palette();
+    let mut h = harness(app);
+    render(&mut h, dir, "p6-form-error-pl.png");
+}
+
+/// The command log shown on request (View > Command log) beside the deviation map.
+fn log(dir: &std::path::Path) {
+    let mut app = SurfaceCraftApp::headless();
+    scene(&mut app);
+    app.perform(surfacecraft_ui_egui::shell::AppAction::ToggleLog);
+    let mut h = harness(app);
+    render(&mut h, dir, "p6-log.png");
 }
 
 /// A noisy plane measured against the clean plane: the Deviation panel with its map.
@@ -179,7 +248,7 @@ fn gizmo(dir: &std::path::Path) {
     render(&mut h, dir, "p6-gizmo-viewcube.png");
 }
 
-/// A narrow window: the viewport's tool strip wraps before the view cube's corner.
+/// A narrow window: the ribbon scrolls and the navigation bar stays under the view cube.
 fn narrow(dir: &std::path::Path) {
     let mut app = SurfaceCraftApp::headless();
     scene(&mut app);
@@ -218,16 +287,54 @@ fn section(dir: &std::path::Path) {
     render(&mut h, dir, "p6-section.png");
 }
 
+/// Every icon of the catalogue on one sheet, at the size the ribbon draws it, with its name.
+fn icon_sheet(dir: &std::path::Path) {
+    let tokens = surfacecraft_ui_egui::theme::Tokens::resolve(Preset::Dark);
+    let ink = tokens.color(surfacecraft_ui_egui::theme::Token::TextPrimary);
+    let mut h = Harness::builder().with_size((1500.0, 900.0)).with_pixels_per_point(1.0).wgpu().build_ui(move |ui| {
+        surfacecraft_ui_egui::icons::install(ui.ctx());
+        egui::Grid::new("icons").num_columns(14).spacing([18.0, 14.0]).show(ui, |ui| {
+            for (i, name) in surfacecraft_ui_egui::icons::NAMES.iter().enumerate() {
+                ui.vertical(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(48.0), egui::Sense::hover());
+                    surfacecraft_ui_egui::icons::paint(ui, rect.shrink(12.0), name, ink);
+                    ui.small(*name);
+                });
+                if i % 14 == 13 {
+                    ui.end_row();
+                }
+            }
+        });
+    });
+    for _ in 0..4 {
+        h.run();
+    }
+    let image = match h.render() {
+        Ok(i) => i,
+        Err(e) => panic!("render: {e}"),
+    };
+    let png = surfacecraft_ui_egui::shot::encode_png(&image, image.width(), image.height()).expect("png");
+    std::fs::write(dir.join("p6-icons.png"), png).expect("write the icon sheet");
+}
+
 #[test]
 fn write_shell_screenshots() {
     let Some(dir) = std::env::var_os("SURFACECRAFT_SHOTS") else { return };
     let dir = std::path::PathBuf::from(dir);
     std::fs::create_dir_all(&dir).expect("screenshot directory");
     let t = |preset, density| Theme { preset, density };
-    shell(&dir, "dark", t(Preset::Dark, Density::Comfortable), Lang::En, false);
-    shell(&dir, "light", t(Preset::Light, Density::Comfortable), Lang::En, false);
-    shell(&dir, "high-contrast", t(Preset::HighContrast, Density::Comfortable), Lang::En, false);
-    shell(&dir, "dark-compact-pl", t(Preset::Dark, Density::Compact), Lang::Pl, true);
+    shell(&dir, "dark", t(Preset::Dark, Density::Comfortable), Lang::En);
+    shell(&dir, "light", t(Preset::Light, Density::Comfortable), Lang::En);
+    shell(&dir, "high-contrast", t(Preset::HighContrast, Density::Comfortable), Lang::En);
+    shell(&dir, "dark-compact-pl", t(Preset::Dark, Density::Compact), Lang::Pl);
+    welcome(&dir, "", Lang::En);
+    welcome(&dir, "-pl", Lang::Pl);
+    form_pl(&dir);
+    datum_form(&dir);
+    constraints_form_pl(&dir);
+    error_pl(&dir);
+    log(&dir);
+    icon_sheet(&dir);
     deviation(&dir);
     sketch(&dir);
     form(&dir);

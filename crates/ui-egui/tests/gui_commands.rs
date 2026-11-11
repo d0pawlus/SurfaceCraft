@@ -1,4 +1,4 @@
-//! The GUI drives the same commands as the CLI: clicking palette entries, menus and Run
+//! The GUI drives the same commands as the CLI: clicking ribbon tools, the search and OK
 //! executes engine commands, and the log turns into a script that replays identically.
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
@@ -16,27 +16,31 @@ fn harness() -> Harness<'static, SurfaceCraftApp> {
 fn palette_runs_commands_and_log_replays_in_the_engine() {
     let mut h = harness();
     h.run();
-    // filter the palette, choose mesh.synth, edit its parameters, press Run
-    h.get_by_label("Filter").focus();
+    // search the tools, choose mesh.synth, edit its parameters, press OK
+    h.get_by_label("Search tools").focus();
     h.run();
-    h.get_by_label("Filter").type_text("synth");
+    h.get_by_label("Search tools").type_text("synth");
     h.run();
-    h.get_by_label("mesh.synth  —  Synthetic scan").click();
+    h.get_by_label("Synthetic scan").click();
     h.run();
     assert_eq!(h.state().palette_command, Some("mesh.synth"));
+    assert!(h.state().tool_search.is_empty(), "choosing a tool clears the search");
     h.state_mut().palette_params = json!({"shape": "sphere", "size": [12.0], "resolution": 16}).to_string();
-    h.get_by_label("Run").click();
+    h.get_by_label("OK").click();
     h.run();
     assert_eq!(h.state().session.doc.meshes.len(), 1, "status: {}", h.state().status);
+    assert_eq!(h.state().palette_command, None, "a tool that changed the document closes");
 
-    // the Solid menu reaches body.box
+    // the Solid stage's More list reaches body.box
     h.get_by_label("Solid").click();
+    h.run();
+    h.get_by_label("More").click();
     h.run();
     h.get_by_label("Box").click();
     h.run();
     assert_eq!(h.state().palette_command, Some("body.box"));
     h.state_mut().palette_params = json!({"size": [20.0, 10.0, 5.0]}).to_string();
-    h.get_by_label("Run").click();
+    h.get_by_label("OK").click();
     h.run();
     assert_eq!(h.state().session.doc.bodies.len(), 1, "status: {}", h.state().status);
 
@@ -89,13 +93,18 @@ fn template_never_prefills_object_zero() {
         objects: vec![(ObjectId(1), ObjectKind::Mesh), (ObjectId(9), ObjectKind::Body)],
         ..Default::default()
     };
-    assert_eq!(ctx.reference_for("mesh"), Some(ObjectId(1)));
-    assert_eq!(ctx.reference_for("body"), Some(ObjectId(9)));
-    assert_eq!(ctx.reference_for("object"), Some(ObjectId(9)));
+    assert_eq!(ctx.reference_for("mesh", None), Some(ObjectId(1)));
+    assert_eq!(ctx.reference_for("body", None), Some(ObjectId(9)));
+    assert_eq!(ctx.reference_for("object", None), Some(ObjectId(9)));
+    // a parameter called `object` takes the kind its description names
+    assert_eq!(ctx.reference_for("object", Some("Mesh id or name.")), Some(ObjectId(1)));
     let none = PickContext::default();
-    assert_eq!(none.reference_for("mesh"), None);
+    assert_eq!(none.reference_for("mesh", None), None);
     let schema = (surfacecraft_engine::cmd::find("mesh.info").unwrap().input)();
     assert_ne!(template(&schema, &none)["object"], json!(0));
+    // a mesh tool opened with a body selected starts with the mesh, not the selection
+    let schema = (surfacecraft_engine::cmd::find("mesh.decimate").unwrap().input)();
+    assert_eq!(template(&schema, &ctx)["object"], json!(1));
 }
 
 /// N-point alignment from the GUI: picks on the model prefill `from` of `align.n_point`.
@@ -119,7 +128,7 @@ fn viewport_picks_feed_n_point_alignment() {
     p["to"] = json!(to);
     app.palette_params = p.to_string();
     h.run();
-    h.get_by_label("Run").click();
+    h.get_by_label("OK").click();
     h.run();
     let b = h.state().session.doc.bbox();
     assert!((b.min.x - 10.0).abs() < 1e-6, "{b:?} status {}", h.state().status);
@@ -138,7 +147,7 @@ fn picked_triangle_grows_a_region() {
     let p: serde_json::Value = serde_json::from_str(&app.palette_params).unwrap();
     assert_eq!(p["triangles"].as_array().unwrap().len(), 1);
     h.run();
-    h.get_by_label("Run").click();
+    h.get_by_label("OK").click();
     h.run();
     let app = h.state_mut();
     assert_eq!(app.session.doc.regions.len(), 1, "status {}", app.status);
@@ -167,14 +176,14 @@ fn surface_menu_fits_a_patch() {
     assert_eq!(h.state().palette_command, Some("surface.fit"));
     h.state_mut().palette_params = json!({"region": "free"}).to_string();
     h.run();
-    h.get_by_label("Run").click();
+    h.get_by_label("OK").click();
     h.run();
     let app = h.state_mut();
     assert_eq!(app.session.doc.surfaces.len(), 1, "status {}", app.status);
     assert!(app.session.display_items().iter().any(|d| d.kind == surfacecraft_doc::ObjectKind::Surface));
 }
 
-/// AutoSurface from the GUI: the Freeform menu reaches the quad layout and AutoSurface.
+/// AutoSurface from the GUI: the Surface stage reaches the quad layout and AutoSurface.
 #[test]
 fn freeform_menu_runs_autosurface() {
     let mut h = harness();
@@ -183,13 +192,13 @@ fn freeform_menu_runs_autosurface() {
     for (item, params) in
         [("Quad layout", json!({"mesh": "scan", "target_quads": 6})), ("AutoSurface", json!({"object": "quads"}))]
     {
-        h.get_by_label("Freeform").click();
+        h.get_by_label("Surface").click();
         h.run();
         h.get_by_label(item).click();
         h.run();
         h.state_mut().palette_params = params.to_string();
         h.run();
-        h.get_by_label("Run").click();
+        h.get_by_label("OK").click();
         h.run();
     }
     let app = h.state_mut();
@@ -198,28 +207,34 @@ fn freeform_menu_runs_autosurface() {
     assert!(app.session.display_items().iter().any(|d| d.kind == surfacecraft_doc::ObjectKind::Quad));
 }
 
-/// Parametric modelling from the GUI: Sketch and Feature menus reach the same commands; the
+/// Parametric modelling from the GUI: the Sketch and Solid stages reach the same commands; the
 /// extruded body appears and the history replays after a sketch edit.
 #[test]
 fn sketch_and_feature_menus_build_a_part() {
     let mut h = harness();
+    // (stage tab, in the stage's More list?, tool, parameters)
     let steps = [
-        ("Sketch", "New sketch", json!({"name": "base"})),
+        ("Sketch", true, "New sketch (empty)", json!({"name": "base"})),
         (
             "Sketch",
+            true,
             "Add sketch entities",
             json!({"sketch": "base", "entities": [{"polygon": {"points": [[0, 0], [30, 0], [30, 10], [0, 10]]}}]}),
         ),
-        ("Feature", "Extrude", json!({"sketch": "base", "distance": 5.0, "name": "part"})),
+        ("Solid", false, "Extrude", json!({"sketch": "base", "distance": 5.0, "name": "part"})),
     ];
-    for (menu, item, params) in steps {
-        h.get_by_label(menu).click();
+    for (stage, in_more, item, params) in steps {
+        h.get_by_label(stage).click();
         h.run();
+        if in_more {
+            h.get_by_label("More").click();
+            h.run();
+        }
         h.get_by_label(item).click();
         h.run();
         h.state_mut().palette_params = params.to_string();
         h.run();
-        h.get_by_label("Run").click();
+        h.get_by_label("OK").click();
         h.run();
     }
     let app = h.state_mut();
