@@ -9,7 +9,7 @@ pub const STORAGE_KEY: &str = "surfacecraft.ui.v1";
 
 /// Version of the dock arrangement. A layout saved under another version is dropped on load, so
 /// an update shows its new default arrangement instead of the old one.
-pub const LAYOUT_VERSION: u32 = 2;
+pub const LAYOUT_VERSION: u32 = 3;
 
 /// Everything the shell remembers.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

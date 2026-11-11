@@ -122,6 +122,54 @@ pub fn datum_value(points: &[[f64; 3]]) -> Option<Value> {
     }
 }
 
+/// One coordinate of a datum's summary: two decimals at most, no trailing zeros.
+fn summary_number(x: f64) -> String {
+    let s = format!("{x:.2}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    if s.is_empty() || s == "-0" || s == "-" { "0".to_string() } else { s.to_string() }
+}
+
+fn summary_vector(v: [f64; 3]) -> String {
+    format!("({}, {}, {})", summary_number(v[0]), summary_number(v[1]), summary_number(v[2]))
+}
+
+/// The three numbers of a JSON array (`None` for anything else).
+fn vector_of(v: Option<&Value>) -> Option<[f64; 3]> {
+    let a = v?.as_array()?;
+    match a.as_slice() {
+        [x, y, z] => Some([x.as_f64()?, y.as_f64()?, z.as_f64()?]),
+        _ => None,
+    }
+}
+
+/// A direction as a unit vector, so a normal of any length reads the same.
+fn unit(v: [f64; 3]) -> [f64; 3] {
+    let n = Vec3::new(v[0], v[1], v[2]).norm();
+    if n > DEGENERATE { [v[0] / n, v[1] / n, v[2] / n] } else { v }
+}
+
+/// A datum in plain words ("Plane through (0, 0, 0), facing (0, 0, 1)"), what the form shows in
+/// place of the datum's JSON. A value that is not a datum the form knows says so.
+#[must_use]
+pub fn datum_summary(value: &Value) -> String {
+    let part = |kind: &str, key: &str| vector_of(value.get(kind).and_then(|d| d.get(key)));
+    if let (Some(point), Some(normal)) = (part("plane", "point"), part("plane", "normal")) {
+        let (point, normal) = (summary_vector(point), summary_vector(unit(normal)));
+        return tf("form.datum.plane", &[("point", &point), ("normal", &normal)]);
+    }
+    if let (Some(point), Some(direction)) = (part("axis", "point"), part("axis", "direction")) {
+        let (point, direction) = (summary_vector(point), summary_vector(unit(direction)));
+        return tf("form.datum.axis", &[("point", &point), ("direction", &direction)]);
+    }
+    if let Some(point) = part("point", "point") {
+        return tf("form.datum.point", &[("point", &summary_vector(point))]);
+    }
+    if let Some(triangles) = value.get("plane_from_triangles").and_then(Value::as_array) {
+        return tf("form.datum.triangles", &[("n", &triangles.len().to_string())]);
+    }
+    t("form.datum.custom").to_string()
+}
+
 impl SurfaceCraftApp {
     fn params_object(&self) -> Option<Map<String, Value>> {
         match serde_json::from_str::<Value>(&self.palette_params) {
@@ -399,6 +447,21 @@ mod tests {
         assert_eq!(datum_value(&[o, x, [20.0, 0.0, 0.0]]), None, "collinear points give no plane");
         assert_eq!(datum_value(&[o, o]), None, "coinciding points give no axis");
         assert_eq!(datum_value(&[]), None);
+    }
+
+    #[test]
+    fn a_datum_is_summarised_in_plain_words() {
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        let plane = json!({"plane": {"point": [0.0, 0.0, 0.0], "normal": [0.0, 0.0, 100.0]}}); // not a colour
+        assert_eq!(datum_summary(&plane), "Plane through (0, 0, 0), facing (0, 0, 1)");
+        let axis = json!({"axis": {"point": [1.5, 2.0, -0.004], "direction": [10.0, 0.0, 0.0]}});
+        assert_eq!(datum_summary(&axis), "Axis through (1.5, 2, 0), along (1, 0, 0)");
+        assert_eq!(datum_summary(&json!({"point": {"point": [1.0, 2.25, 3.0]}})), "Point (1, 2.25, 3)");
+        assert_eq!(datum_summary(&json!({"plane_from_triangles": [1, 2, 3]})), "Plane fitted to 3 triangles");
+        // hostile or unknown values never panic and say what they are
+        for odd in [json!(null), json!(7), json!({"plane": {"point": [1, 2]}}), json!({"axis": "x"})] {
+            assert_eq!(datum_summary(&odd), "Custom value", "{odd}");
+        }
     }
 
     #[test]

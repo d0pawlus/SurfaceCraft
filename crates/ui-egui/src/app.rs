@@ -1,5 +1,5 @@
-//! The application state and the panel bodies. The shell around them (menus, toolbar, docking,
-//! settings, dialogs) is in [`crate::shell`]; every colour is a theme token and every text a
+//! The application state and the panel bodies. The shell around them (menus, ribbon, docking,
+//! settings, dialogs) is in [`crate::shell`] and [`crate::ribbon`]; every colour is a theme token and every text a
 //! catalogue key.
 use crate::camera::Camera;
 use crate::i18n::{t, tf};
@@ -25,10 +25,16 @@ pub struct SurfaceCraftApp {
     pub palette_command: Option<&'static str>,
     /// The palette's parameter editor (JSON).
     pub palette_params: String,
-    /// Palette filter text.
-    pub palette_filter: String,
-    /// The command list is shown in full (it folds to one line once a command is chosen).
-    pub palette_list_open: bool,
+    /// The stage whose tools the ribbon shows.
+    pub stage: crate::workflow::Stage,
+    /// The text of the ribbon's tool search.
+    pub tool_search: String,
+    /// Put the keyboard in the search field on the next frame.
+    pub(crate) focus_search: bool,
+    /// Enter and Esc belong to the open tool this frame: when the frame began, no field had the
+    /// keyboard, no menu was open and nothing in the viewport was using the keys (a pick, a
+    /// sketch, a drag).
+    pub(crate) keys_free: bool,
     /// The sketch editing mode (G5).
     pub sketch_editor: crate::sketch_editor::SketchEditor,
     /// The Properties panel's form and live preview.
@@ -109,8 +115,10 @@ impl SurfaceCraftApp {
             selected_object: None,
             palette_command: None,
             palette_params: "{}".into(),
-            palette_filter: String::new(),
-            palette_list_open: true,
+            stage: crate::workflow::Stage::default(),
+            tool_search: String::new(),
+            focus_search: false,
+            keys_free: false,
             sketch_editor: crate::sketch_editor::SketchEditor::default(),
             cmd_panel: Default::default(),
             hist_panel: Default::default(),
@@ -169,7 +177,8 @@ impl SurfaceCraftApp {
         }
         let hit = match best {
             Some(p) => {
-                self.status = format!("picked {} at ({:.3}, {:.3}, {:.3})", p.object, p.point.x, p.point.y, p.point.z);
+                let at = format!("{:.3}, {:.3}, {:.3}", p.point.x, p.point.y, p.point.z);
+                self.status = tf("status.picked", &[("object", &p.object.to_string()), ("at", &at)]);
                 self.selected_object = Some(p.object);
                 self.picks.push(p);
                 true
@@ -260,9 +269,11 @@ impl SurfaceCraftApp {
     pub fn run_command(&mut self, id: &str, params: Value) -> Result<Value, EngineError> {
         let had = self.session.doc.summaries().len();
         let r = self.session.execute(id, params);
+        // the status line names the tool the way the ribbon does
+        let name = surfacecraft_engine::cmd::find(id).map_or_else(|| id.to_string(), crate::workflow::label_of);
         match &r {
             Ok(_) => {
-                self.status = format!("{id}: done");
+                self.status = tf("status.done", &[("name", &name)]);
                 if had == 0 && !self.session.doc.summaries().is_empty() {
                     self.fit_pending = true;
                 }
@@ -271,34 +282,68 @@ impl SurfaceCraftApp {
                     crate::dock::show_tab(&mut self.workspace, crate::dock::Panel::Deviation);
                 }
             }
-            Err(e) => self.status = format!("{id}: {e}"),
+            Err(e) => {
+                let error = crate::i18n::engine_message(&e.to_string());
+                self.status = tf("status.failed", &[("name", &name), ("error", &error)]);
+            }
         }
         r
     }
 
-    /// Chooses a command in the palette and prefills its parameters.
+    /// Opens a command in the tool panel and prefills its parameters; the ribbon follows to the
+    /// command's stage.
     pub fn choose_command(&mut self, id: &'static str) {
         self.palette_command = Some(id);
         self.field_pick = None;
-        // the form is what the Properties panel shows now: the list folds to one line
-        self.palette_list_open = false;
+        if let Some(stage) = crate::workflow::Stage::of(id) {
+            self.stage = stage;
+        }
+        // the tool panel is where the form is: show it (again, if it was closed) with its tab
+        // in front; a layout that refuses keeps the panel where it is
+        let _ = crate::dock::set_visible(&mut self.workspace, crate::dock::Panel::Properties, true);
         let schema = surfacecraft_engine::cmd::find(id).map(|c| (c.input)()).unwrap_or(Value::Null);
         self.palette_params =
             serde_json::to_string_pretty(&template(&schema, &self.pick_context())).unwrap_or_else(|_| "{}".into());
     }
 
-    /// Runs the palette's command with its edited parameters.
-    pub fn run_palette(&mut self) {
+    /// Closes the open tool without running it: the tool panel shows the guide again.
+    pub fn close_tool(&mut self) {
+        self.palette_command = None;
+        self.field_pick = None;
+        self.cmd_panel.cancel_preview();
+    }
+
+    /// Runs the open tool with its edited parameters. A command that changed the document closes
+    /// its tool (the guide shows what comes next); a failed one, or one that only reports
+    /// (statistics, information), stays open with its message or result. Returns whether it ran
+    /// without an error.
+    pub fn run_palette(&mut self) -> bool {
         self.field_pick = None;
         let Some(id) = self.palette_command else {
             self.status = t("status.choose_command").to_string();
-            return;
+            return false;
         };
         match serde_json::from_str::<Value>(&self.palette_params) {
             Ok(v) => {
-                let _ = self.run_command(id, v);
+                let ok = self.run_command(id, v).is_ok();
+                if ok && surfacecraft_engine::cmd::find(id).is_some_and(|c| c.undoable) {
+                    self.close_tool();
+                }
+                ok
             }
-            Err(e) => self.status = tf("status.params_not_json", &[("error", &e.to_string())]),
+            Err(e) => {
+                self.status = tf("status.params_not_json", &[("error", &e.to_string())]);
+                false
+            }
+        }
+    }
+
+    /// What the guide reads from the session: the kinds in the document and what ran.
+    #[must_use]
+    pub fn progress(&self) -> crate::guide::Progress {
+        crate::guide::Progress {
+            kinds: self.session.doc.summaries().iter().map(|s| s.kind).collect(),
+            ran: self.session.log.iter().filter(|e| e.ok).map(|e| e.command.clone()).collect(),
         }
     }
 
@@ -392,10 +437,17 @@ impl SurfaceCraftApp {
     }
 
     pub(crate) fn shortcuts(&mut self, ui: &mut egui::Ui) {
-        let (undo, redo) = ui.input(|i| {
+        let (undo, redo, search) = ui.input(|i| {
             let z = i.modifiers.command && i.key_pressed(egui::Key::Z);
-            (z && !i.modifiers.shift, (z && i.modifiers.shift) || (i.modifiers.command && i.key_pressed(egui::Key::Y)))
+            (
+                z && !i.modifiers.shift,
+                (z && i.modifiers.shift) || (i.modifiers.command && i.key_pressed(egui::Key::Y)),
+                i.modifiers.command && i.key_pressed(egui::Key::K),
+            )
         });
+        if search {
+            self.focus_search = true;
+        }
         if undo {
             let _ = self.run_command("edit.undo", Value::Null);
         }
@@ -421,6 +473,10 @@ impl SurfaceCraftApp {
         let summaries = self.session.doc.summaries();
         if summaries.is_empty() {
             ui.weak(t("objects.empty"));
+            ui.add_space(4.0);
+            if ui.button(t(crate::shell::AppAction::ImportMesh.short_key())).clicked() {
+                self.perform(crate::shell::AppAction::ImportMesh);
+            }
         }
         let mut action: Option<(&str, Value)> = None;
         for kind in KIND_ORDER {
@@ -439,9 +495,12 @@ impl SurfaceCraftApp {
                             action = Some(("doc.show", json!({"object": s.id.0, "visible": !s.visible})));
                         }
                         let sel = self.selected_object == Some(s.id);
+                        // the name is what people read; the kind is the group's header and the id
+                        // (what scripts use) stays beside it, muted
+                        let label = format!("{} ({})", s.name, s.id);
                         if ui
-                            .selectable_label(sel, format!("{} {} ({})", t(kind_key(kind)), s.name, s.id))
-                            .on_hover_text(&s.detail)
+                            .selectable_label(sel, label)
+                            .on_hover_text(format!("{}: {}", t(kind_key(kind)), s.detail))
                             .clicked()
                         {
                             self.selected_object = if sel { None } else { Some(s.id) };
@@ -456,7 +515,9 @@ impl SurfaceCraftApp {
         if let Some((id, p)) = action {
             let _ = self.run_command(id, p);
         }
-        self.picks_panel(ui);
+        if !self.picks.is_empty() {
+            self.picks_panel(ui);
+        }
     }
 
     /// The operation history: what undo would step back through, newest first.
@@ -467,8 +528,11 @@ impl SurfaceCraftApp {
             ui.weak(t("history.empty"));
         }
         for (i, label) in labels.iter().rev().enumerate() {
-            let text = if i == 0 { egui::RichText::new(*label).strong() } else { egui::RichText::new(*label) };
-            ui.label(text);
+            // an undo step is named after its command: show the tool's name, the id on hover
+            let name =
+                surfacecraft_engine::cmd::find(label).map_or_else(|| (*label).to_string(), crate::workflow::label_of);
+            let text = if i == 0 { egui::RichText::new(name).strong() } else { egui::RichText::new(name) };
+            ui.label(text).on_hover_text(*label);
         }
         let redo = self.session.history.redo_len();
         if redo > 0 {
@@ -504,72 +568,21 @@ impl SurfaceCraftApp {
         crate::deviation_panel::show(self, ui);
     }
 
-    /// The command palette with its JSON parameter editor and the assistant.
+    /// The tool panel: the open tool's form, or the guide (and the assistant, when a language
+    /// model is configured) while no tool is open.
     pub(crate) fn palette_panel(&mut self, ui: &mut egui::Ui) {
-        if self.palette_command.is_some() && !self.palette_list_open {
-            self.palette_folded(ui);
-        } else {
-            self.palette_list(ui);
-        }
-        ui.separator();
         if let Some(id) = self.palette_command {
             crate::command_panel::command_body(self, ui, id);
-        } else {
-            ui.weak(t("palette.choose"));
+            return;
         }
-        self.assistant_panel(ui);
-    }
-
-    /// The full command list with the filter (searchable), the Properties panel's list.
-    fn palette_list(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            let l = ui.label(t("palette.filter"));
-            ui.add(egui::TextEdit::singleline(&mut self.palette_filter).hint_text(t("palette.filter_hint")))
-                .labelled_by(l.id);
-            if self.palette_command.is_some() && ui.small_button(t("palette.hide_list")).clicked() {
-                self.palette_list_open = false;
+        egui::ScrollArea::vertical().id_salt("dock-guide").auto_shrink([false, false]).show(ui, |ui| {
+            // with a language model configured the assistant comes first: it is how that user
+            // works, and it stays above the fold
+            if self.provider.is_some() {
+                self.assistant_panel(ui);
+                ui.separator();
             }
-        });
-        let filter = self.palette_filter.to_lowercase();
-        egui::ScrollArea::vertical().id_salt("cmdlist").max_height(160.0).show(ui, |ui| {
-            for c in self.session.commands() {
-                if !filter.is_empty() && !c.id.contains(&filter) && !c.label.to_lowercase().contains(&filter) {
-                    continue;
-                }
-                let sel = self.palette_command == Some(c.id);
-                if ui.selectable_label(sel, format!("{}  —  {}", c.id, c.label)).on_hover_text(c.summary).clicked() {
-                    self.choose_command(c.id);
-                }
-            }
-        });
-    }
-
-    /// The chosen command on one line with the filter: the list folds to this once a command is
-    /// chosen, and the button shows the whole list again. Typing in the filter shows the list.
-    fn palette_folded(&mut self, ui: &mut egui::Ui) {
-        let chosen = self
-            .session
-            .commands()
-            .iter()
-            .find(|c| Some(c.id) == self.palette_command)
-            .map(|c| format!("{}  —  {}", c.id, c.label))
-            .unwrap_or_default();
-        ui.horizontal(|ui| {
-            let l = ui.label(t("palette.filter"));
-            let filter = ui
-                .add(
-                    egui::TextEdit::singleline(&mut self.palette_filter)
-                        .hint_text(t("palette.filter_hint"))
-                        .desired_width(96.0),
-                )
-                .labelled_by(l.id);
-            if filter.changed() {
-                self.palette_list_open = true;
-            }
-            ui.add(egui::Label::new(egui::RichText::new(chosen).strong()).truncate());
-            if ui.small_button(t("palette.show_all")).clicked() {
-                self.palette_list_open = true;
-            }
+            self.guide_panel(ui);
         });
     }
 
@@ -589,15 +602,14 @@ impl SurfaceCraftApp {
         let png = crate::shot::screenshot_png(&mut self.session, Some(&cam), 512, 384);
         let goal = self.assistant_goal.clone();
         self.status = match surfacecraft_ai::run(&mut self.session, p.as_mut(), mode, &goal, png.as_deref(), 20) {
-            Ok(o) => format!("assistant: {} ({} commands)", o.summary, o.steps.len()),
-            Err(e) => format!("assistant failed: {e}"),
+            Ok(o) => tf("assistant.done", &[("summary", &o.summary), ("n", &o.steps.len().to_string())]),
+            Err(e) => tf("assistant.failed", &[("error", &crate::i18n::engine_message(&e.to_string()))]),
         };
         self.provider = Some(p);
         self.fit_pending = true;
     }
 
     fn assistant_panel(&mut self, ui: &mut egui::Ui) {
-        ui.separator();
         ui.strong(t("assistant.title"));
         ui.horizontal(|ui| {
             ui.radio_value(&mut self.assistant_align, true, t("assistant.align"));
@@ -608,9 +620,6 @@ impl SurfaceCraftApp {
             .labelled_by(l.id);
         if ui.button(t("assistant.ask")).clicked() {
             self.ask_assistant();
-        }
-        if self.provider.is_none() {
-            ui.weak(t("assistant.no_provider"));
         }
     }
 
@@ -663,14 +672,18 @@ impl SurfaceCraftApp {
                 self.sketch_overlay(ui, rect);
                 return;
             }
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                tf("viewport.no_gpu", &[("n", &self.session.doc.summaries().len().to_string())]),
-                egui::FontId::proportional(14.0),
-                self.tokens.color(Token::TextMuted),
-            );
+            let objects = self.session.doc.summaries().len();
+            if objects > 0 {
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    tf("viewport.no_gpu", &[("n", &objects.to_string())]),
+                    egui::FontId::proportional(14.0),
+                    self.tokens.color(Token::TextMuted),
+                );
+            }
             self.paint_view_overlays(ui, rect);
+            self.welcome_card(ui.ctx(), rect);
             return;
         }
         let ppp = ui.ctx().pixels_per_point();
@@ -681,6 +694,7 @@ impl SurfaceCraftApp {
             self.sketch_overlay(ui, rect);
         } else {
             self.paint_view_overlays(ui, rect);
+            self.welcome_card(ui.ctx(), rect);
         }
     }
 
@@ -797,32 +811,19 @@ pub struct PickContext {
 }
 
 impl PickContext {
-    /// The object a reference parameter called `name` should point at: the selection when it
-    /// fits, else the first object of the needed kind (any object when the kind is open).
+    /// The object a reference parameter called `name` should point at: the selection when it is
+    /// of a kind the parameter takes (see [`crate::forms::accepted_kinds`]), else the first
+    /// object that is.
     #[must_use]
-    pub fn reference_for(&self, name: &str) -> Option<ObjectId> {
-        let want = ref_kind(name);
-        let fits = |k: ObjectKind| want.is_none_or(|w| w == k);
+    pub fn reference_for(&self, name: &str, description: Option<&str>) -> Option<ObjectId> {
+        let kinds = crate::forms::accepted_kinds(name, description);
+        let fits = |k: ObjectKind| kinds.is_empty() || kinds.contains(&k);
         if let Some(sel) = self.selected
             && self.objects.iter().any(|(id, k)| *id == sel && fits(*k))
         {
             return Some(sel);
         }
         self.objects.iter().find(|(_, k)| fits(*k)).map(|(id, _)| *id)
-    }
-}
-
-/// The kind of object a reference parameter names (`None` when any kind goes).
-fn ref_kind(name: &str) -> Option<ObjectKind> {
-    match name {
-        "mesh" | "against" => Some(ObjectKind::Mesh),
-        "region" | "regions" => Some(ObjectKind::Region),
-        "sketch" | "sketches" | "profile" | "path" => Some(ObjectKind::Sketch),
-        "body" | "tool" => Some(ObjectKind::Body),
-        "feature" => Some(ObjectKind::Feature),
-        "surface" | "surfaces" => Some(ObjectKind::Surface),
-        "primitive" | "primitives" => Some(ObjectKind::Primitive),
-        _ => None,
     }
 }
 
@@ -845,13 +846,14 @@ pub fn template(schema: &Value, ctx: &PickContext) -> Value {
     if let Some(props) = props {
         for name in required {
             let p = props.get(name).cloned().unwrap_or(Value::Null);
+            let described = p.get("description").and_then(Value::as_str);
             let v = match name {
                 _ if is_obj_ref(&p) || name == "object" || name == "mesh" => {
-                    ctx.reference_for(name).map_or(json!(""), |id| json!(id.0))
+                    ctx.reference_for(name, described).map_or(json!(""), |id| json!(id.0))
                 }
                 _ if p.get("items").is_some_and(is_obj_ref) => {
                     let n = p.get("minItems").and_then(Value::as_u64).unwrap_or(0) as usize;
-                    let id = ctx.reference_for(name).map_or(json!(""), |id| json!(id.0));
+                    let id = ctx.reference_for(name, described).map_or(json!(""), |id| json!(id.0));
                     Value::Array(vec![id; n])
                 }
                 "from" | "points" if !ctx.points.is_empty() => json!(ctx.points),
