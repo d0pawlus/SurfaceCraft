@@ -4,7 +4,7 @@ use crate::{Session, command};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use surfacecraft_align::{Datum, IcpOptions, datum_321, icp, kabsch, principal_frame};
+use surfacecraft_align::{Datum, IcpOptions, datum_321, icp, kabsch, principal_frame, rms_to_surface};
 use surfacecraft_doc::{ObjectId, ObjectKind};
 use surfacecraft_geom::{Bvh, Mesh, Point3, Transform, Vec3};
 
@@ -104,6 +104,13 @@ pub struct IcpIn {
     /// Other meshes moved by the same motion.
     #[serde(default)]
     pub also: Vec<ObjRef>,
+    /// Region of `object` that alone drives the fit (a local fine fit); the motion still moves
+    /// all of `object`. Give `region` or `triangles`, not both.
+    #[serde(default)]
+    pub region: Option<ObjRef>,
+    /// Triangles of `object` that alone drive the fit, as an alternative to `region`.
+    #[serde(default)]
+    pub triangles: Option<Vec<u32>>,
 }
 
 /// ICP result.
@@ -119,6 +126,17 @@ pub struct IcpOut {
     pub last_delta: f64,
     /// Pairs used in the last iteration.
     pub pairs: usize,
+    /// Points the fit used: the vertices of the marked part (of the whole object without a
+    /// selection), evenly strided down to `options.max_samples`.
+    pub points_used: usize,
+    /// RMS distance (mm) of the marked part to the target before the motion.
+    pub rms_before_marked: f64,
+    /// RMS distance (mm) of the marked part to the target after the motion.
+    pub rms_after_marked: f64,
+    /// RMS distance (mm) of the whole object to the target before the motion.
+    pub rms_before_whole: f64,
+    /// RMS distance (mm) of the whole object to the target after the motion.
+    pub rms_after_whole: f64,
 }
 
 fn target_mesh(s: &mut Session, r: &ObjRef) -> CmdResult<Arc<Mesh>> {
@@ -145,6 +163,39 @@ fn target_mesh(s: &mut Session, r: &ObjRef) -> CmdResult<Arc<Mesh>> {
     }
 }
 
+/// The triangles of `mesh` (`count` triangles) that drive a local fit, from `region` or
+/// `triangles`; `None` for a whole-object fit. Invalid selections are parameter errors.
+fn selection(
+    s: &Session,
+    mesh: ObjectId,
+    region: Option<&ObjRef>,
+    triangles: Option<&[u32]>,
+    count: usize,
+) -> CmdResult<Option<Vec<u32>>> {
+    let tris: Vec<u32> = match (region, triangles) {
+        (None, None) => return Ok(None),
+        (Some(_), Some(_)) => return Err(CmdError::Params("give either `region` or `triangles`, not both".into())),
+        (Some(r), None) => {
+            let rid = r.resolve(s, ObjectKind::Region)?;
+            let reg = s.doc.region(rid).ok_or_else(|| CmdError::Params(format!("no region {rid}")))?;
+            if reg.mesh != mesh {
+                return Err(CmdError::Params(format!("region {rid} is not a region of the object being moved")));
+            }
+            (*reg.triangles).clone()
+        }
+        (None, Some(t)) => t.to_vec(),
+    };
+    if tris.is_empty() {
+        return Err(CmdError::Params(
+            "the marked part has no triangles; use align.n_point with point pairs instead".into(),
+        ));
+    }
+    if let Some(t) = tris.iter().find(|&&t| t as usize >= count) {
+        return Err(CmdError::Params(format!("triangle {t} is out of range (the object has {count})")));
+    }
+    Ok(Some(tris))
+}
+
 fn icp_cmd(s: &mut Session, i: IcpIn) -> CmdResult<IcpOut> {
     let id = i.object.resolve(s, ObjectKind::Mesh)?;
     let target = target_mesh(s, &i.target)?;
@@ -152,8 +203,45 @@ fn icp_cmd(s: &mut Session, i: IcpIn) -> CmdResult<IcpOut> {
     if i.options.max_iterations > 10_000 {
         return Err(CmdError::Params("max_iterations must be at most 10000".into()));
     }
+    let marked = selection(s, id, i.region.as_ref(), i.triangles.as_deref(), source.triangle_count())?;
+    let local = marked.is_some();
+    // the part whose vertices drive the fit: the marked triangles, or the whole object
+    let part: Option<Mesh> = marked.as_ref().map(|tris| source.submesh(tris));
+    let whole: &Mesh = &source;
+    let fit_on: &Mesh = part.as_ref().unwrap_or(whole);
+    if local && fit_on.vertex_count() < 6 {
+        return Err(CmdError::Params(format!(
+            "the marked part has {} points, at least 6 are needed for a local fit; use align.n_point with point pairs instead",
+            fit_on.vertex_count()
+        )));
+    }
     let bvh = Bvh::build(&target);
-    let rep = icp(&source, &bvh, &Transform::identity(), &i.options)?;
+    let rep = match icp(fit_on, &bvh, &Transform::identity(), &i.options) {
+        Ok(rep) => rep,
+        Err(e) if local => {
+            return Err(CmdError::Failed(format!(
+                "the local fit failed ({e}); use align.n_point with point pairs instead"
+            )));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if local && !rep.converged {
+        return Err(CmdError::Failed(format!(
+            "the local fit did not converge in {} iterations (last change {:.3e} mm); use align.n_point with point pairs instead",
+            rep.iterations, rep.last_delta
+        )));
+    }
+    let identity = Transform::identity();
+    let measure = |pts: &[Point3], t: &Transform| {
+        rms_to_surface(&bvh, pts, t).ok_or_else(|| CmdError::Failed("there is nothing to measure the fit on".into()))
+    };
+    let rms_before_whole = measure(&whole.positions[..], &identity)?;
+    let rms_after_whole = measure(&whole.positions[..], &rep.transform)?;
+    let (rms_before_marked, rms_after_marked) = if local {
+        (measure(&fit_on.positions[..], &identity)?, measure(&fit_on.positions[..], &rep.transform)?)
+    } else {
+        (rms_before_whole, rms_after_whole)
+    };
     apply_to(s, id, &i.also, &rep.transform, i.apply)?;
     Ok(IcpOut {
         align: out(id, &rep.transform, Some(rep.rms), i.apply),
@@ -161,6 +249,11 @@ fn icp_cmd(s: &mut Session, i: IcpIn) -> CmdResult<IcpOut> {
         converged: rep.converged,
         last_delta: rep.last_delta,
         pairs: rep.pairs,
+        points_used: rep.samples,
+        rms_before_marked,
+        rms_after_marked,
+        rms_before_whole,
+        rms_after_whole,
     })
 }
 
@@ -276,7 +369,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         "Fine align (ICP)",
         "Align",
         true,
-        "Point-to-plane ICP of `object` onto `target` (mesh or body); stops below `options.tolerance` mm/iteration.",
+        "Point-to-plane ICP of `object` onto `target` (mesh or body); stops below `options.tolerance` mm/iteration. With `region` or `triangles`, only that part of `object` drives the fit and the motion moves all of `object`; a part that does not converge or has under 6 points is an error suggesting align.n_point.",
         IcpIn,
         IcpOut,
         icp_cmd
