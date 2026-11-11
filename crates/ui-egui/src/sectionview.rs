@@ -130,6 +130,24 @@ impl SectionPlane {
     }
 }
 
+/// The part of the polygon `poly` (corners in order) whose depth is at least `near`: the corners in
+/// front are kept, and each side that crosses the near plane is cut where it crosses. A triangle
+/// that reaches behind the eye so keeps its part in front, instead of vanishing whole.
+#[must_use]
+pub fn clip_front(poly: &[Point3], depth: &dyn Fn(&Point3) -> f64, near: f64) -> Vec<Point3> {
+    let mut out = Vec::with_capacity(poly.len() + 1);
+    for (cur, next) in poly.iter().zip(poly.iter().cycle().skip(1)) {
+        let (dc, dn) = (depth(cur) - near, depth(next) - near);
+        if dc >= 0.0 {
+            out.push(*cur);
+        }
+        if (dc >= 0.0) != (dn >= 0.0) {
+            out.push(*cur + (*next - *cur) * (dc / (dc - dn)));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,5 +214,20 @@ mod tests {
         let flipped = SectionPlane { flip: true, ..s };
         assert!(flipped.cap_seen_from(&Point3::new(0.0, 0.0, -9.0)));
         assert!(!SectionPlane { enabled: false, ..s }.cap_seen_from(&Point3::new(0.0, 0.0, 9.0)));
+    }
+
+    /// A triangle that reaches behind the eye keeps the part in front of the near plane: nothing
+    /// behind it, the whole of a triangle in front, and a quadrilateral for one that straddles.
+    #[test]
+    fn a_polygon_is_clipped_to_the_part_in_front_of_the_near_plane() {
+        let depth = |p: &Point3| p.z;
+        let behind = [Point3::new(0.0, 0.0, -2.0), Point3::new(1.0, 0.0, -2.0), Point3::new(0.0, 1.0, -2.0)];
+        assert!(clip_front(&behind, &depth, 1.0).is_empty());
+        let front = [Point3::new(0.0, 0.0, 2.0), Point3::new(1.0, 0.0, 2.0), Point3::new(0.0, 1.0, 2.0)];
+        assert_eq!(clip_front(&front, &depth, 1.0), front.to_vec());
+        let straddle = [Point3::new(0.0, 0.0, 0.0), Point3::new(4.0, 0.0, 2.0), Point3::new(0.0, 4.0, 2.0)];
+        let clipped = clip_front(&straddle, &depth, 1.0);
+        assert_eq!(clipped.len(), 4);
+        assert!(clipped.iter().all(|p| depth(p) >= 1.0 - 1e-12), "{clipped:?}");
     }
 }

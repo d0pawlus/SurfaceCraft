@@ -30,36 +30,57 @@ const CUBE_HALF: f64 = 44.0;
 const CUBE_MARGIN: f64 = 14.0;
 /// Opacity of the section cap (the cut face) against the accent colour.
 const CAP_FILL: f32 = 0.22;
-/// Inset (px) and text size of the note that counts the open section outlines.
+/// Inset (px) and text size of the note about the section cap.
 const CAP_NOTE_INSET: f32 = 8.0;
 const CAP_NOTE_PX: f32 = 12.0;
+/// The near plane of the cap, as a fraction of the camera distance: the cap is cut there, so a
+/// triangle reaching behind the eye keeps the part in front (the projection stops much nearer).
+const CAP_NEAR_FRACTION: f64 = 1e-3;
 
-/// Paints the triangles of a section cap as one flat fill. Triangles with a corner behind the eye
-/// are left out. `origin` is the viewport's top-left corner on the screen.
-fn paint_cap(
-    painter: &egui::Painter,
+/// The cap of `cuts` as one flat fill on the screen, for the viewport `rect`. A triangle with a
+/// corner behind the eye is cut at the near plane, not dropped, so the cap stays when the camera is
+/// close to it.
+fn build_cap_mesh(
+    cuts: &[surfacecraft_geom::cap::Cut],
     cam: &crate::camera::Camera,
-    triangles: &[[surfacecraft_geom::Point3; 3]],
+    rect: egui::Rect,
     fill: egui::Color32,
-    (w, h): (f64, f64),
-    origin: egui::Pos2,
-) {
+) -> egui::Mesh {
+    let (w, h) = (f64::from(rect.width()), f64::from(rect.height()));
+    let near = cam.distance * CAP_NEAR_FRACTION;
+    let depth = |p: &surfacecraft_geom::Point3| cam.depth(p);
     let mut mesh = egui::Mesh::default();
-    for tri in triangles {
-        let corners: Option<Vec<egui::Pos2>> = tri
-            .iter()
-            .map(|p| cam.project(p, w, h).map(|s| egui::pos2(origin.x + s[0] as f32, origin.y + s[1] as f32)))
-            .collect();
-        let Some(corners) = corners else { continue };
-        let base = mesh.vertices.len() as u32;
-        for c in corners {
-            mesh.colored_vertex(c, fill);
+    for cut in cuts {
+        for tri in &cut.cap.triangles {
+            let corners = crate::sectionview::clip_front(tri, &depth, near);
+            let screen: Vec<egui::Pos2> = corners
+                .iter()
+                .filter_map(|p| cam.project(p, w, h))
+                .map(|s| egui::pos2(rect.min.x + s[0] as f32, rect.min.y + s[1] as f32))
+                .collect();
+            let Some((first, rest)) = screen.split_first() else { continue };
+            // a fan from the first corner of the clipped polygon
+            for pair in rest.windows(2) {
+                let base = mesh.vertices.len() as u32;
+                for c in [*first, pair[0], pair[1]] {
+                    mesh.colored_vertex(c, fill);
+                }
+                mesh.add_triangle(base, base + 1, base + 2);
+            }
         }
-        mesh.add_triangle(base, base + 1, base + 2);
     }
-    if !mesh.indices.is_empty() {
-        painter.add(egui::Shape::mesh(mesh));
-    }
+    mesh
+}
+
+/// The cap as it was last painted. It is reused while the cut, the camera, the viewport and the
+/// colour stay the same.
+#[derive(Clone, Debug)]
+struct CapPaint {
+    cuts: Arc<Vec<surfacecraft_geom::cap::Cut>>,
+    camera: crate::camera::Camera,
+    rect: egui::Rect,
+    fill: egui::Color32,
+    mesh: Arc<egui::Mesh>,
 }
 
 /// The tool the primary mouse button drives in the viewport.
@@ -169,6 +190,8 @@ pub struct ViewTools {
     drawn: HashMap<ObjectId, (usize, u64, Arc<Vec<u32>>)>,
     /// Section cut cache (outline and cap per mesh): `(item keys, plane, cuts)`.
     cut: Option<(Vec<usize>, SectionPlane, Arc<Vec<surfacecraft_geom::cap::Cut>>)>,
+    /// The section cap as last painted (see [`CapPaint`]).
+    cap_paint: Option<CapPaint>,
     /// Pivot cache of the gizmo: `(mesh key, centre)`.
     pivot: Option<(usize, Point3)>,
 }
@@ -195,6 +218,7 @@ impl Default for ViewTools {
             version: 0,
             drawn: HashMap::new(),
             cut: None,
+            cap_paint: None,
             pivot: None,
         }
     }
@@ -478,6 +502,29 @@ impl SurfaceCraftApp {
         let cuts = Arc::new(plane.cut(&meshes));
         self.tools.cut = Some((keys, plane, cuts.clone()));
         cuts
+    }
+
+    /// The cap of `cuts` on the screen, rebuilt only when the cut, the camera, the viewport or the
+    /// colour changed since it was last built.
+    fn cap_mesh(
+        &mut self,
+        cuts: &Arc<Vec<surfacecraft_geom::cap::Cut>>,
+        cam: &crate::camera::Camera,
+        rect: egui::Rect,
+        fill: egui::Color32,
+    ) -> Arc<egui::Mesh> {
+        if let Some(c) = &self.tools.cap_paint
+            && Arc::ptr_eq(&c.cuts, cuts)
+            && c.camera == *cam
+            && c.rect == rect
+            && c.fill == fill
+        {
+            return c.mesh.clone();
+        }
+        let mesh = Arc::new(build_cap_mesh(cuts, cam, rect, fill));
+        self.tools.cap_paint =
+            Some(CapPaint { cuts: cuts.clone(), camera: cam.clone(), rect, fill, mesh: mesh.clone() });
+        mesh
     }
 
     // ----------------------------------------------------- what the frame draws
@@ -767,9 +814,9 @@ impl SurfaceCraftApp {
             let stroke = egui::Stroke::new(2.0, accent);
             let cuts = self.section_cut();
             if self.tools.section.cap_seen_from(&cam.eye()) {
-                let fill = accent.gamma_multiply(CAP_FILL);
-                for cut in cuts.iter() {
-                    paint_cap(&painter, &cam, &cut.cap.triangles, fill, (w, h), rect.min);
+                let mesh = self.cap_mesh(&cuts, &cam, rect, accent.gamma_multiply(CAP_FILL));
+                if !mesh.indices.is_empty() {
+                    painter.add(egui::Shape::Mesh(mesh));
                 }
             }
             for pl in cuts.iter().flat_map(|c| c.lines.iter()) {
@@ -782,8 +829,14 @@ impl SurfaceCraftApp {
                 line(&painter, &pts, stroke);
             }
             let open: usize = cuts.iter().map(|c| c.cap.open_loops).sum();
-            if open > 0 {
-                let text = tf("section.cap_open", &[("n", &open.to_string())]);
+            let failed: usize = cuts.iter().map(|c| c.cap.failed_loops).sum();
+            let too_large = cuts.iter().any(|c| c.cap.over_limit);
+            if too_large || open + failed > 0 {
+                let text = if too_large {
+                    t("section.cap_too_large").to_string()
+                } else {
+                    tf("section.cap_note", &[("open", &open.to_string()), ("failed", &failed.to_string())])
+                };
                 let at = rect.min + egui::vec2(CAP_NOTE_INSET, CAP_NOTE_INSET);
                 painter.text(at, egui::Align2::LEFT_TOP, text, egui::FontId::proportional(CAP_NOTE_PX), accent);
             }

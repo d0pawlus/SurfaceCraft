@@ -141,6 +141,14 @@ impl Camera {
         Some([(ndc_x + 1.0) * 0.5 * w, (1.0 - ndc_y) * 0.5 * h, depth])
     }
 
+    /// The distance of `p` along the view direction from the eye: positive in front, negative
+    /// behind it.
+    #[must_use]
+    pub fn depth(&self, p: &Point3) -> f64 {
+        let (_, _, f) = self.basis();
+        (p - self.eye()).dot(&f)
+    }
+
     /// World length of one screen pixel at distance `depth` for a viewport `h` px tall.
     #[must_use]
     pub fn world_per_pixel(&self, depth: f64, h: f64) -> f64 {
@@ -272,6 +280,18 @@ impl ViewAnim {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Depth is the distance along the view direction: the target lies one distance in front of the
+    /// eye, and a point behind the eye has a negative depth.
+    #[test]
+    fn depth_runs_along_the_view_direction_from_the_eye() {
+        let cam = Camera::default();
+        let eye = cam.eye();
+        let (_, _, f) = cam.basis();
+        assert!((cam.depth(&cam.target) - cam.distance).abs() < 1e-9);
+        assert!((cam.depth(&(eye + f * 10.0)) - 10.0).abs() < 1e-9);
+        assert!((cam.depth(&(eye - f * 3.0)) + 3.0).abs() < 1e-9);
+    }
 
     fn near(a: Vec3, b: Vec3) -> bool {
         (a - b).norm() < 2e-3
