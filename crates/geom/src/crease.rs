@@ -26,8 +26,10 @@ const MIN_SIDE_SHARE: f64 = 0.1;
 const SUPPORT_RINGS: usize = 2;
 /// Fewest points a quadric (six terms) is fitted to; below it the side is a plane.
 const MIN_QUADRIC_POINTS: usize = 12;
-/// A quadric replaces the plane only when it leaves less than this share of the plane's RMS.
-const QUADRIC_GAIN: f64 = 0.5;
+/// A quadric replaces the plane only when it leaves less than this share of the plane's RMS,
+/// each RMS taken over the points left after the terms fitted (so three more terms that only
+/// follow the noise gain nothing).
+const QUADRIC_GAIN: f64 = 0.8;
 /// Triangles of one normal further apart along it than this (in mean loop edge lengths) are on
 /// two sides.
 const SAME_SIDE_STEP: f64 = 0.5;
@@ -148,6 +150,13 @@ fn fit_height(local: &[(f64, f64, f64)], terms: usize) -> Option<([f64; TERMS], 
     Some((coef, (sq / local.len().max(1) as f64).sqrt()))
 }
 
+/// Do `count` points bend away from their plane: does the quadric leave less than
+/// [`QUADRIC_GAIN`] of the plane's RMS, per point left free?
+fn bends(count: usize, plane_rms: f64, quadric_rms: f64) -> bool {
+    let free = |terms: usize| count.saturating_sub(terms).max(1) as f64;
+    quadric_rms / free(TERMS).sqrt() < QUADRIC_GAIN * plane_rms / free(PLANE_TERMS).sqrt()
+}
+
 impl Side {
     /// The side through `points` with mean normal `n`, and the RMS it leaves: a plane, or a
     /// quadric when the points are enough and bend away from the plane.
@@ -167,7 +176,7 @@ impl Side {
             .collect();
         let (plane, plane_rms) = fit_height(&local, PLANE_TERMS)?;
         let (coef, rms) = match fit_height(&local, TERMS) {
-            Some((quadric, rms)) if points.len() >= MIN_QUADRIC_POINTS && rms < QUADRIC_GAIN * plane_rms => {
+            Some((quadric, rms)) if points.len() >= MIN_QUADRIC_POINTS && bends(points.len(), plane_rms, rms) => {
                 (quadric, rms)
             }
             _ => (plane, plane_rms),
@@ -797,6 +806,15 @@ mod tests {
     use crate::{Mesh, Point3, Rng, Vec3, synth};
 
     const SIDE: f64 = 20.0;
+
+    /// A cone side read with points of its neighbour (RMS 0.101 as a plane, 0.064 as a quadric)
+    /// is a quadric; a flat side whose quadric only follows the noise stays a plane.
+    #[test]
+    fn a_side_bends_when_the_quadric_gains_beyond_its_extra_terms() {
+        assert!(super::bends(79, 0.1007, 0.0640));
+        assert!(!super::bends(92, 0.0276, 0.0270));
+        assert!(!super::bends(12, 0.0300, 0.0200));
+    }
 
     /// Distance from `p` to the surface of the cube [0, SIDE]³.
     fn to_cube(p: &Point3) -> f64 {
