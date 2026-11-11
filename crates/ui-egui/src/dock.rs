@@ -20,7 +20,7 @@ pub enum Panel {
     Objects,
     /// The operation history.
     History,
-    /// Command parameters and the assistant.
+    /// The tool panel: the open tool's form, or the guide and the assistant.
     Properties,
     /// Regions of the selected scan.
     Regions,
@@ -104,12 +104,13 @@ fn dock(side: Side, width: f32, groups: &[&[Panel]]) -> Node<Panel> {
 }
 
 /// The default arrangement for a dock column width (in points): objects over history on the left,
-/// the viewport over the log in the middle, and on the right one column with the properties over
-/// a group of two tabs, regions and the deviation map. The viewport keeps most of the window.
+/// the viewport in the middle, and on the right one column with the tool panel over a group of
+/// two tabs, regions and the deviation map. The viewport keeps most of the window; the command
+/// log is hidden until asked for.
 #[must_use]
 pub fn default_workspace(side_width: f32) -> Workspace {
-    let centre =
-        split(SplitAxis::Vertical, SplitSize::FixedSecond(150.0), tabs(&[Panel::Viewport]), tabs(&[Panel::Log]));
+    // the command log (the JSON a script would send) is for scripting: View > Command log shows it
+    let centre = tabs(&[Panel::Viewport]);
     let column_width = side_width + 40.0;
     let right = dock(Side::End, column_width, &[&[Panel::Properties], &[Panel::Regions, Panel::Deviation]]);
     let left = dock(Side::Start, side_width, &[&[Panel::Objects], &[Panel::History]]);
@@ -127,6 +128,11 @@ pub fn default_workspace(side_width: f32) -> Workspace {
 /// Body height of the deviation tab in the default right dock: with its tab strip about 45 % of
 /// the dock at 1500 x 900 points, which shows the statistics and the histogram without scrolling.
 pub const DEVIATION_BODY_HEIGHT: f32 = 336.0;
+/// Body height the tool panel asks for while a tool is open: the 3-2-1 alignment form with its
+/// three datums and optional settings, without scrolling.
+const TOOL_FORM_HEIGHT: f32 = 560.0;
+/// Body height the tabs under an open tool give way down to.
+const TABS_UNDER_TOOL_HEIGHT: f32 = 140.0;
 
 /// Fits a loaded workspace to the panels registered now and to the viewport rules: an invalid
 /// file gives the default arrangement; the viewport is always shown.
@@ -144,7 +150,9 @@ pub fn set_visible(workspace: &mut Workspace, panel: Panel, visible: bool) -> Re
     if !visible && !panel.closable() {
         return Ok(());
     }
-    workspace.set_visible(panel, visible, None, permissions).map_err(|e| e.to_string())
+    // a panel that was never laid out (the command log) opens beside the deviation map
+    let beside = Some(Panel::Deviation).filter(|p| *p != panel && workspace.layout.contains(p));
+    workspace.set_visible(panel, visible, beside, permissions).map_err(|e| e.to_string())
 }
 
 /// Brings a panel's tab to the front of its group (a panel that is not shown is left alone).
@@ -181,7 +189,8 @@ impl DockContent<Panel> for Panels<'_> {
         egui::Frame::NONE.inner_margin(egui::Margin::same(pad.round() as i8)).show(ui, |ui| match panel {
             Panel::Objects => scroll(ui, "dock-objects", |ui| self.app.objects_panel(ui)),
             Panel::History => scroll(ui, "dock-history", |ui| self.app.history_panel(ui)),
-            Panel::Properties => scroll(ui, "dock-properties", |ui| self.app.palette_panel(ui)),
+            // the tool panel scrolls its own body so its OK and Cancel stay in reach
+            Panel::Properties => self.app.palette_panel(ui),
             Panel::Regions => scroll(ui, "dock-regions", |ui| self.app.regions_panel(ui)),
             Panel::Deviation => scroll(ui, "dock-deviation", |ui| self.app.deviation_panel(ui)),
             Panel::Log => self.app.log_panel(ui),
@@ -207,14 +216,19 @@ impl DockContent<Panel> for Panels<'_> {
     }
 
     fn dock_heights(&self, panel: &Panel) -> Option<DockHeights> {
-        // The object tree keeps more room than the history under it. The right dock's properties
-        // (command, parameters, assistant) take the height the bottom group leaves; the group of
-        // regions and deviation tabs asks for about 45 % of the dock, enough for the statistics.
+        // The object tree keeps more room than the history under it. The right dock's tool panel
+        // takes the height the bottom group leaves; the group of regions and deviation tabs asks
+        // for about 45 % of the dock, enough for the statistics. While a tool is open its form is
+        // what the user works on: the tool panel asks for the height of the longest everyday
+        // form (3-2-1 alignment) and the tabs under it give way further.
+        let tool_open = self.app.palette_command.is_some();
+        let (tool_fill, tabs_compact) =
+            if tool_open { (TOOL_FORM_HEIGHT, TABS_UNDER_TOOL_HEIGHT) } else { (460.0, 240.0) };
         match panel {
             Panel::Objects => Some(DockHeights::new(360.0)),
-            Panel::Properties => Some(DockHeights::new(640.0).compact(360.0).fill(460.0)),
+            Panel::Properties => Some(DockHeights::new(640.0).compact(360.0).fill(tool_fill)),
             Panel::Regions => Some(DockHeights::new(150.0).compact(110.0)),
-            Panel::Deviation => Some(DockHeights::new(DEVIATION_BODY_HEIGHT).compact(240.0)),
+            Panel::Deviation => Some(DockHeights::new(DEVIATION_BODY_HEIGHT).compact(tabs_compact)),
             _ => None,
         }
     }

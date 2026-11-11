@@ -82,6 +82,10 @@ impl Density {
                 tab_height: 24.0,
                 side_dock_width: 240.0,
                 panel_padding: 4.0,
+                tool_button: Vec2::new(52.0, 48.0),
+                tool_icon: 20.0,
+                ribbon_tab_height: 24.0,
+                nav_button: 28.0,
             },
             Density::Comfortable => Metrics {
                 item_spacing: Vec2::new(8.0, 5.0),
@@ -92,6 +96,10 @@ impl Density {
                 tab_height: 28.0,
                 side_dock_width: 280.0,
                 panel_padding: 8.0,
+                tool_button: Vec2::new(60.0, 58.0),
+                tool_icon: 24.0,
+                ribbon_tab_height: 30.0,
+                nav_button: 32.0,
             },
         }
     }
@@ -116,6 +124,14 @@ pub struct Metrics {
     pub panel_padding: f32,
     /// Default width of a side dock column.
     pub side_dock_width: f32,
+    /// Smallest size of a ribbon tool button (an icon over its label).
+    pub tool_button: Vec2,
+    /// Side of the icon of a ribbon tool button.
+    pub tool_icon: f32,
+    /// Height of the ribbon's stage tabs.
+    pub ribbon_tab_height: f32,
+    /// Side of a button of the viewport's navigation bar.
+    pub nav_button: f32,
 }
 
 /// The theme choice that is saved in the settings.
@@ -160,11 +176,13 @@ tokens! {
     SurfaceSunken => "surface.sunken",
     SurfaceHover => "surface.hover",
     SurfaceActive => "surface.active",
+    SurfaceChrome => "surface.chrome",
     TextPrimary => "text.primary",
     TextMuted => "text.muted",
     TextOnAccent => "text.on_accent",
     AccentPrimary => "accent.primary",
     AccentHover => "accent.hover",
+    AccentSoft => "accent.soft",
     BorderSubtle => "border.subtle",
     BorderStrong => "border.strong",
     FocusRing => "focus.ring",
@@ -239,11 +257,13 @@ fn raw(preset: Preset, token: Token) -> [u8; 4] {
             SurfaceSunken => [22, 24, 28, 255],
             SurfaceHover => [54, 59, 68, 255],
             SurfaceActive => [66, 73, 85, 255],
+            SurfaceChrome => [24, 26, 31, 255],
             TextPrimary => [226, 230, 236, 255],
             TextMuted => [145, 153, 165, 255],
             TextOnAccent => [255, 255, 255, 255],
             AccentPrimary => [64, 132, 232, 255],
             AccentHover => [96, 154, 240, 255],
+            AccentSoft => [38, 62, 104, 255],
             BorderSubtle => [58, 63, 72, 255],
             BorderStrong => [92, 100, 113, 255],
             FocusRing => [120, 170, 250, 255],
@@ -259,11 +279,13 @@ fn raw(preset: Preset, token: Token) -> [u8; 4] {
             SurfaceSunken => [230, 233, 238, 255],
             SurfaceHover => [226, 232, 241, 255],
             SurfaceActive => [208, 218, 233, 255],
+            SurfaceChrome => [233, 236, 241, 255],
             TextPrimary => [28, 33, 41, 255],
             TextMuted => [92, 101, 114, 255],
             TextOnAccent => [255, 255, 255, 255],
             AccentPrimary => [30, 100, 206, 255],
             AccentHover => [22, 80, 170, 255],
+            AccentSoft => [214, 228, 248, 255],
             BorderSubtle => [212, 217, 226, 255],
             BorderStrong => [150, 159, 173, 255],
             FocusRing => [30, 100, 206, 255],
@@ -280,11 +302,13 @@ fn raw(preset: Preset, token: Token) -> [u8; 4] {
             SurfaceSunken => [0, 0, 0, 255],
             SurfaceHover => [38, 38, 38, 255],
             SurfaceActive => [64, 64, 64, 255],
+            SurfaceChrome => [0, 0, 0, 255],
             TextPrimary => [255, 255, 255, 255],
             TextMuted => [214, 214, 214, 255],
             TextOnAccent => [0, 0, 0, 255],
             AccentPrimary => [255, 221, 0, 255],
             AccentHover => [255, 240, 120, 255],
+            AccentSoft => [70, 60, 0, 255],
             BorderSubtle => [160, 160, 160, 255],
             BorderStrong => [255, 255, 255, 255],
             FocusRing => [0, 220, 255, 255],
@@ -380,6 +404,31 @@ impl Tokens {
     }
 }
 
+/// Corner radius of controls (buttons, fields, tool buttons).
+pub const RADIUS: u8 = 6;
+/// Corner radius of cards floating over the viewport (the welcome card, the navigation bar).
+pub const CARD_RADIUS: u8 = 10;
+
+/// The frame of a card that floats over the viewport.
+pub fn card_frame(t: &Tokens) -> egui::Frame {
+    egui::Frame::new()
+        .fill(t.color(Token::SurfaceRaised))
+        .stroke(Stroke::new(1.0, t.color(Token::BorderSubtle)))
+        .corner_radius(CornerRadius::same(CARD_RADIUS))
+        .inner_margin(egui::Margin::same(8))
+}
+
+/// The frame of the bars above the dock area (menu bar and ribbon) and of the status bar.
+pub fn chrome_frame(t: &Tokens, margin: egui::Margin) -> egui::Frame {
+    egui::Frame::new().fill(t.color(Token::SurfaceChrome)).inner_margin(margin)
+}
+
+/// The button that confirms (OK, the suggested next step): accent fill, text on accent.
+pub fn primary_button<'a>(t: &Tokens, text: &str) -> egui::Button<'a> {
+    egui::Button::new(egui::RichText::new(text).strong().color(t.color(Token::TextOnAccent)))
+        .fill(t.color(Token::AccentPrimary))
+}
+
 /// Installs the theme into an egui context: visuals from the tokens, widget states through
 /// `WidgetPalette`, spacing from the density.
 pub fn apply(ctx: &egui::Context, theme: &Theme) {
@@ -395,7 +444,7 @@ pub fn apply(ctx: &egui::Context, theme: &Theme) {
         active: c(Token::SurfaceActive),
         open: c(Token::SurfaceActive),
     }
-    .apply_to(&mut v.widgets, CornerRadius::same(4), Stroke::new(1.0, c(Token::TextPrimary)));
+    .apply_to(&mut v.widgets, CornerRadius::same(RADIUS), Stroke::new(1.0, c(Token::TextPrimary)));
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, c(Token::BorderSubtle));
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, c(Token::TextMuted));
     v.widgets.inactive.bg_stroke = Stroke::new(1.0, c(Token::BorderSubtle));
@@ -435,7 +484,7 @@ pub fn icon_button_style(t: &Tokens) -> craft_ui::buttons::IconButtonStyle {
         hovered: visuals(Token::SurfaceHover, Some(Token::BorderSubtle), Token::TextPrimary),
         pressed: Some(visuals(Token::SurfaceActive, Some(Token::BorderStrong), Token::TextPrimary)),
         selected: visuals(Token::SurfaceActive, Some(Token::AccentPrimary), Token::AccentHover),
-        corner_radius: CornerRadius::same(4),
+        corner_radius: CornerRadius::same(RADIUS),
         focus_stroke: Stroke::new(1.5, t.color(Token::FocusRing)),
     }
 }
