@@ -2,11 +2,12 @@
 //!
 //! A hole that straddles a sharp edge (a spike removed on the edge of a part, missing data on a
 //! corner) is first filled and faired like any other, which rounds the edge off into a chamfer.
-//! [`sharpen_patch`] then looks at the surface around the hole: when it falls into two or three
-//! smooth sides that meet at sharp edges, each side is extended over the hole (a plane, or a
-//! quadric when the side is curved) and the patch vertices are moved onto the extended sides, the
-//! ones next to an edge onto the edge itself. A hole in a smooth surface has one side and is left
-//! as the fairing made it.
+//! [`sharpen_patch`] then looks at the surface the hole's border runs through: when it falls
+//! into two or three smooth, connected sides that meet at sharp edges, each side is extended over
+//! the hole (a plane, or a quadric when the side is curved) and the patch vertices are moved
+//! onto the extended sides, the ones next to an edge onto the edge itself. A hole in a smooth
+//! surface has one side and is left as the fairing made it, and so is any patch the move would
+//! turn over or squash.
 
 use crate::{Mesh, Point3, Vec3, tri};
 use nalgebra::{SMatrix, SVector};
@@ -19,29 +20,93 @@ const FEATURE_DEG: f64 = 35.0;
 const MAX_SIDES: usize = 3;
 /// Most groups of normals looked at before the surface is taken to be too rough to read.
 const MAX_GROUPS: usize = 8;
-/// Smallest share of the area around the hole that makes a group of triangles a side.
+/// Smallest share of the area next to the hole's border that makes a group of triangles a side.
 const MIN_SIDE_SHARE: f64 = 0.1;
+/// Rings of triangles around the hole's border a side is fitted to (the first decides the sides).
+const SUPPORT_RINGS: usize = 2;
 /// Fewest points a quadric (six terms) is fitted to; below it the side is a plane.
 const MIN_QUADRIC_POINTS: usize = 12;
 /// A quadric replaces the plane only when it leaves less than this share of the plane's RMS.
 const QUADRIC_GAIN: f64 = 0.5;
+/// Triangles of one normal further apart along it than this (in mean loop edge lengths) are on
+/// two sides.
+const SAME_SIDE_STEP: f64 = 0.5;
+/// A side whose fit leaves more than this RMS (in mean loop edge lengths) is not one surface.
+const MAX_SIDE_RMS: f64 = 0.25;
+/// Sides closer to each other's middle than this (in mean loop edge lengths) make no wedge.
+const MIN_WEDGE: f64 = 1e-6;
 /// A patch vertex this close to a second side (in mean loop edge lengths) goes onto the edge.
 const EDGE_SNAP: f64 = 0.5;
 /// Projection rounds for one vertex.
 const PROJECTIONS: usize = 12;
-/// A patch edge is flipped when the other diagonal is at most this share as far from the wedge.
-const FLIP_GAIN: f64 = 0.5;
-/// Smallest area of a patch triangle after its vertices move, in squared mean loop edge lengths
-/// (an equilateral triangle of that edge has 0.43).
-const MIN_AREA: f64 = 0.02;
+/// A point is on a side within this many mean loop edge lengths.
+const ON_SIDE: f64 = 1e-12;
 /// Three sides meet in a corner when a point is on all of them within this share of the hole's
 /// size.
 const CORNER_TOLERANCE: f64 = 1e-6;
+/// Smallest area of a patch triangle after its vertices move, in squared mean loop edge lengths
+/// (an equilateral triangle of that edge has 0.43).
+const MIN_AREA: f64 = 0.02;
+/// The moved patch is kept only when its thinnest triangle has at least this share of the area
+/// of the thinnest one before (or [`MIN_AREA`]).
+const MIN_AREA_KEPT: f64 = 0.5;
+/// A patch triangle faces the way a side does when the cosine between their normals is above
+/// this.
+const MIN_FACING: f64 = 0.1;
+/// Rounds of untangling a patch whose triangles the move turned over.
+const UNTANGLE_ROUNDS: usize = 20;
+/// A patch edge is flipped when the other diagonal is at most this share as far from the wedge.
+const FLIP_GAIN: f64 = 0.5;
 /// Passes of edge flips over a patch.
 const FLIP_PASSES: usize = 8;
 
 /// Terms of the height polynomial of a side: 1, x, y, x², xy, y².
 const TERMS: usize = 6;
+/// Terms of a plane.
+const PLANE_TERMS: usize = 3;
+
+/// The triangles around each vertex of a mesh (as it is when this is built).
+pub(crate) struct Around {
+    start: Vec<u32>,
+    tris: Vec<u32>,
+}
+
+impl Around {
+    /// Indexes `mesh`; triangles with a vertex out of range are left out.
+    pub(crate) fn new(mesh: &Mesh) -> Self {
+        let n = mesh.positions.len();
+        let valid = |t: &[u32; 3]| t.iter().all(|&v| (v as usize) < n);
+        let mut start = vec![0u32; n + 1];
+        for t in mesh.triangles.iter().filter(|t| valid(t)) {
+            for &v in t {
+                if let Some(c) = start.get_mut(v as usize + 1) {
+                    *c += 1;
+                }
+            }
+        }
+        for i in 1..start.len() {
+            start[i] += start[i - 1];
+        }
+        let mut next = start.clone();
+        let mut tris = vec![0u32; start.last().copied().unwrap_or(0) as usize];
+        for (i, t) in mesh.triangles.iter().enumerate().filter(|(_, t)| valid(t)) {
+            for &v in t {
+                if let Some(slot) = next.get_mut(v as usize) {
+                    if let Some(place) = tris.get_mut(*slot as usize) {
+                        *place = i as u32;
+                    }
+                    *slot += 1;
+                }
+            }
+        }
+        Self { start, tris }
+    }
+
+    fn of(&self, v: u32) -> &[u32] {
+        let (Some(&a), Some(&b)) = (self.start.get(v as usize), self.start.get(v as usize + 1)) else { return &[] };
+        self.tris.get(a as usize..b as usize).unwrap_or(&[])
+    }
+}
 
 /// One smooth side of the surface around a hole, as a height field over its mean plane.
 struct Side {
@@ -58,18 +123,19 @@ fn basis(x: f64, y: f64) -> [f64; TERMS] {
 
 /// Least squares of z over the first `terms` basis functions; the coefficients and the RMS left.
 fn fit_height(local: &[(f64, f64, f64)], terms: usize) -> Option<([f64; TERMS], f64)> {
+    let terms = terms.min(TERMS);
     let mut a = SMatrix::<f64, TERMS, TERMS>::zeros();
     let mut b = SVector::<f64, TERMS>::zeros();
     for &(x, y, z) in local {
         let f = basis(x, y);
-        for i in 0..terms.min(TERMS) {
-            for j in 0..terms.min(TERMS) {
+        for i in 0..terms {
+            for j in 0..terms {
                 a[(i, j)] += f[i] * f[j];
             }
             b[i] += f[i] * z;
         }
     }
-    for i in terms.min(TERMS)..TERMS {
+    for i in terms..TERMS {
         a[(i, i)] = 1.0;
     }
     let c = a.lu().solve(&b)?;
@@ -77,22 +143,16 @@ fn fit_height(local: &[(f64, f64, f64)], terms: usize) -> Option<([f64; TERMS], 
     if coef.iter().any(|x| !x.is_finite()) {
         return None;
     }
-    let sq: f64 = local
-        .iter()
-        .map(|&(x, y, z)| {
-            let f = basis(x, y);
-            let h: f64 = f.iter().zip(&coef).map(|(f, c)| f * c).sum();
-            (z - h).powi(2)
-        })
-        .sum();
+    let height = |x: f64, y: f64| basis(x, y).iter().zip(&coef).map(|(f, c)| f * c).sum::<f64>();
+    let sq: f64 = local.iter().map(|&(x, y, z)| (z - height(x, y)).powi(2)).sum();
     Some((coef, (sq / local.len().max(1) as f64).sqrt()))
 }
 
 impl Side {
-    /// The side through `points` with mean normal `n`: a plane, or a quadric when the points
-    /// are enough and bend away from the plane.
-    fn fit(points: &[Point3], n: Vec3) -> Option<Side> {
-        if points.len() < 3 {
+    /// The side through `points` with mean normal `n`, and the RMS it leaves: a plane, or a
+    /// quadric when the points are enough and bend away from the plane.
+    fn fit(points: &[Point3], n: Vec3) -> Option<(Side, f64)> {
+        if points.len() < PLANE_TERMS {
             return None;
         }
         let origin = Point3::from(points.iter().fold(Vec3::zeros(), |a, p| a + p.coords) / points.len() as f64);
@@ -105,12 +165,14 @@ impl Side {
                 (d.dot(&u), d.dot(&v), d.dot(&n))
             })
             .collect();
-        let (plane, plane_rms) = fit_height(&local, 3)?;
-        let coef = match fit_height(&local, TERMS) {
-            Some((quadric, rms)) if points.len() >= MIN_QUADRIC_POINTS && rms < QUADRIC_GAIN * plane_rms => quadric,
-            _ => plane,
+        let (plane, plane_rms) = fit_height(&local, PLANE_TERMS)?;
+        let (coef, rms) = match fit_height(&local, TERMS) {
+            Some((quadric, rms)) if points.len() >= MIN_QUADRIC_POINTS && rms < QUADRIC_GAIN * plane_rms => {
+                (quadric, rms)
+            }
+            _ => (plane, plane_rms),
         };
-        Some(Side { origin, n, u, v, coef })
+        Some((Side { origin, n, u, v, coef }, rms))
     }
 
     /// Height of `p` over the side, along the side's normal.
@@ -121,45 +183,111 @@ impl Side {
     }
 }
 
-/// A triangle next to the hole: its vertices, unit normal, area and side (once known).
+/// The sides of the surface around a hole and whether they make a convex or a concave wedge.
+struct Wedge {
+    sides: Vec<Side>,
+    convex: bool,
+}
+
+impl Wedge {
+    fn sign(&self) -> f64 {
+        if self.convex { 1.0 } else { -1.0 }
+    }
+
+    /// The side `p` is highest over (lowest under, in a concave wedge) and that signed height.
+    fn top(&self, p: &Point3) -> Option<(usize, f64)> {
+        self.sides
+            .iter()
+            .map(|s| self.sign() * s.height(p))
+            .enumerate()
+            .fold(None, |b: Option<(usize, f64)>, c| if b.is_none_or(|b| c.1 > b.1) { Some(c) } else { b })
+    }
+
+    /// Distance of `p` from the surface of the wedge.
+    fn off(&self, p: &Point3) -> f64 {
+        self.top(p).map_or(f64::INFINITY, |(_, h)| h.abs())
+    }
+
+    /// `p` moved onto the surface of the wedge, and that point moved on to the edge or corner
+    /// when further sides are within `snap` of it (`None` when none is).
+    fn onto(&self, snap: f64, on_side: f64, p: Point3) -> (Point3, Option<Point3>) {
+        let mut q = p;
+        for _ in 0..PROJECTIONS {
+            let Some((k, h)) = self.top(&q) else { return (p, None) };
+            if h.abs() < on_side {
+                break;
+            }
+            if let Some(s) = self.sides.get(k) {
+                q -= s.n * (self.sign() * h);
+            }
+        }
+        let close: Vec<&Side> = self.sides.iter().filter(|s| self.sign() * s.height(&q) > -snap).collect();
+        if close.len() < 2 {
+            return (q, None);
+        }
+        (q, Some(onto_all(&close, q)))
+    }
+}
+
+/// `p` moved onto every one of `sides` at once, by projecting onto them in turn.
+fn onto_all(sides: &[&Side], p: Point3) -> Point3 {
+    let mut q = p;
+    for _ in 0..PROJECTIONS {
+        for s in sides {
+            q -= s.n * s.height(&q);
+        }
+    }
+    q
+}
+
+/// A triangle next to the hole: its vertices, unit normal, area, middle, whether it touches the hole's
+/// border, and its group of normals and its side (once known).
 struct Near {
     corners: [u32; 3],
     normal: Vec3,
     area: f64,
+    centre: Point3,
+    at_border: bool,
+    group: Option<usize>,
     side: Option<usize>,
 }
 
-/// The triangles before `first_tri` within two rings of the loop, in index order.
-fn triangles_near(mesh: &Mesh, first_tri: usize, lp: &[u32]) -> Vec<Near> {
-    let mut reach: HashSet<u32> = lp.iter().copied().collect();
-    let mut picked: Vec<usize> = Vec::new();
-    let mut seen: HashSet<usize> = HashSet::new();
-    for _ring in 0..2 {
-        let mut next = reach.clone();
-        for (i, t) in mesh.triangles.iter().enumerate().take(first_tri) {
-            if t.iter().any(|v| reach.contains(v)) && seen.insert(i) {
-                picked.push(i);
-                next.extend(t.iter().copied());
+/// The triangles within [`SUPPORT_RINGS`] rings of the loop, in index order.
+fn triangles_near(mesh: &Mesh, around: &Around, lp: &[u32]) -> Vec<Near> {
+    let mut ring_of: HashMap<u32, usize> = HashMap::new();
+    let mut front: Vec<u32> = lp.to_vec();
+    for ring in 0..SUPPORT_RINGS {
+        let mut next: Vec<u32> = Vec::new();
+        for &v in &front {
+            for &t in around.of(v) {
+                if let std::collections::hash_map::Entry::Vacant(e) = ring_of.entry(t) {
+                    e.insert(ring);
+                    next.extend(mesh.triangles.get(t as usize).into_iter().flatten());
+                }
             }
         }
-        reach = next;
+        front = next;
     }
+    let mut picked: Vec<(u32, usize)> = ring_of.into_iter().collect();
     picked.sort_unstable();
     picked
         .into_iter()
-        .filter_map(|i| {
-            let corners = *mesh.triangles.get(i)?;
-            let [a, b, c] = mesh.triangle(i)?;
-            Some(Near { corners, normal: tri::normal(&a, &b, &c)?, area: tri::area(&a, &b, &c), side: None })
+        .filter_map(|(i, ring)| {
+            let corners = *mesh.triangles.get(i as usize)?;
+            let [a, b, c] = mesh.triangle(i as usize)?;
+            let (normal, area) = (tri::normal(&a, &b, &c)?, tri::area(&a, &b, &c));
+            let centre = Point3::from((a.coords + b.coords + c.coords) / 3.0);
+            Some(Near { corners, normal, area, centre, at_border: ring == 0, group: None, side: None })
         })
         .collect()
 }
 
-/// Groups the triangles by normal and gives the mean normal of each side; `None` unless there
-/// are two or three sides further apart than the feature angle.
-fn sides_of(near: &mut [Near]) -> Option<Vec<Vec3>> {
+/// Groups the triangles by normal (the groups are those of the triangles at the hole's border)
+/// and returns the mean normal of each group. `None` unless there are at least two groups
+/// further apart than the feature angle.
+fn group_by_normal(near: &mut [Near]) -> Option<Vec<Vec3>> {
     let cos = FEATURE_DEG.to_radians().cos();
-    let mut order: Vec<usize> = (0..near.len()).collect();
+    let mut order: Vec<usize> = (0..near.len()).filter(|&i| near.get(i).is_some_and(|t| t.at_border)).collect();
     order.sort_by(|&a, &b| near[b].area.total_cmp(&near[a].area).then(a.cmp(&b)));
     // (first normal, area-weighted sum, area)
     let mut groups: Vec<(Vec3, Vec3, f64)> = Vec::new();
@@ -177,7 +305,7 @@ fn sides_of(near: &mut [Near]) -> Option<Vec<Vec3>> {
     let total: f64 = groups.iter().map(|g| g.2).sum();
     let means: Vec<Vec3> =
         groups.iter().filter(|g| g.2 >= MIN_SIDE_SHARE * total).filter_map(|g| crate::normalize(g.1)).collect();
-    if means.len() < 2 || means.len() > MAX_SIDES {
+    if means.len() < 2 {
         return None;
     }
     for (i, a) in means.iter().enumerate() {
@@ -191,15 +319,13 @@ fn sides_of(near: &mut [Near]) -> Option<Vec<Vec3>> {
             .enumerate()
             .map(|(k, m)| (m.dot(&t.normal), k))
             .fold(None, |b: Option<(f64, usize)>, c| if b.is_none_or(|b| c.0 > b.0) { Some(c) } else { b });
-        t.side = best.filter(|b| b.0 >= cos).map(|b| b.1);
+        t.group = best.filter(|b| b.0 >= cos).map(|b| b.1);
     }
     Some(means)
 }
 
-/// Do the sides meet at sharp edges? The median turn across the mesh edges that join triangles
-/// of different sides must exceed the feature angle (a smooth surface that merely curves a lot
-/// around the hole turns a little at each edge).
-fn meets_sharply(near: &[Near]) -> bool {
+/// The triangles on each mesh edge among `near`.
+fn edges_of(near: &[Near]) -> HashMap<(u32, u32), Vec<usize>> {
     let mut by_edge: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
     for (i, t) in near.iter().enumerate() {
         for k in 0..3 {
@@ -207,6 +333,57 @@ fn meets_sharply(near: &[Near]) -> bool {
             by_edge.entry((a.min(b), a.max(b))).or_default().push(i);
         }
     }
+    by_edge
+}
+
+/// Splits each group of normals where its triangles step along the group's normal by more
+/// than [`SAME_SIDE_STEP`] mean loop edge lengths (the two faces of a step have one normal and
+/// are two sides; a curved side has no such step) and makes the pieces that hold enough of the
+/// hole's border the sides. Returns the mean normal of each side; `None` unless there are two or
+/// three.
+fn split_sides(near: &mut [Near], means: &[Vec3], edge: f64) -> Option<Vec<Vec3>> {
+    // (area at the border, area-weighted normal, triangles)
+    let mut pieces: Vec<(f64, Vec3, Vec<usize>)> = Vec::new();
+    for (g, mean) in means.iter().enumerate() {
+        let mut members: Vec<(f64, usize)> = near
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.group == Some(g))
+            .map(|(i, t)| (t.centre.coords.dot(mean), i))
+            .collect();
+        members.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        let mut last: Option<f64> = None;
+        for (d, i) in members {
+            if last.is_none_or(|l| d - l > SAME_SIDE_STEP * edge) {
+                pieces.push((0.0, Vec3::zeros(), Vec::new()));
+            }
+            last = Some(d);
+            if let (Some(p), Some(t)) = (pieces.last_mut(), near.get(i)) {
+                p.0 += if t.at_border { t.area } else { 0.0 };
+                p.1 += t.normal * t.area;
+                p.2.push(i);
+            }
+        }
+    }
+    let total: f64 = pieces.iter().map(|p| p.0).sum();
+    pieces.retain(|p| p.0 >= MIN_SIDE_SHARE * total && p.0 > 0.0);
+    if pieces.len() < 2 || pieces.len() > MAX_SIDES {
+        return None;
+    }
+    for (k, p) in pieces.iter().enumerate() {
+        for &i in &p.2 {
+            if let Some(t) = near.get_mut(i) {
+                t.side = Some(k);
+            }
+        }
+    }
+    pieces.iter().map(|p| crate::normalize(p.1)).collect()
+}
+
+/// Do the sides meet at sharp edges? The median turn across the mesh edges that join triangles
+/// of different sides must exceed the feature angle (a smooth surface that merely curves a lot
+/// around the hole turns a little at each edge).
+fn meets_sharply(near: &[Near], by_edge: &HashMap<(u32, u32), Vec<usize>>) -> bool {
     let mut turns: Vec<f64> = by_edge
         .values()
         .filter_map(|ts| match ts.as_slice() {
@@ -222,14 +399,15 @@ fn meets_sharply(near: &[Near]) -> bool {
     turns.get(turns.len() / 2).is_some_and(|m| *m > FEATURE_DEG.to_radians())
 }
 
-/// Is the wedge of the sides convex (`Some(true)`), concave (`Some(false)`) or neither?
-fn convexity(sides: &[Side]) -> Option<bool> {
+/// Is the wedge of the sides convex (`Some(true)`), concave (`Some(false)`) or neither? Every
+/// side's middle must be under (over) every other side by more than `tiny`.
+fn convexity(sides: &[Side], tiny: f64) -> Option<bool> {
     let mut signs: Vec<bool> = Vec::new();
     for (i, a) in sides.iter().enumerate() {
         for (j, b) in sides.iter().enumerate() {
             if i != j {
                 let h = b.height(&a.origin);
-                if !(h.abs() > 1e-9) {
+                if !(h.abs() > tiny) {
                     return None;
                 }
                 signs.push(h < 0.0);
@@ -240,39 +418,30 @@ fn convexity(sides: &[Side]) -> Option<bool> {
     signs.iter().all(|s| *s == convex).then_some(convex)
 }
 
-/// `p` moved onto the surface of the wedge: onto the side it is highest over (lowest under, in
-/// a concave wedge), and that point moved on to the edge or corner when further sides are within
-/// `snap` of it (`None` when none is).
-fn onto_wedge(sides: &[Side], convex: bool, snap: f64, p: Point3) -> (Point3, Option<Point3>) {
-    let sign = if convex { 1.0 } else { -1.0 };
-    let top = |q: &Point3| {
-        sides
-            .iter()
-            .map(|s| sign * s.height(q))
-            .enumerate()
-            .fold(None, |b: Option<(usize, f64)>, c| if b.is_none_or(|b| c.1 > b.1) { Some(c) } else { b })
-    };
-    let mut q = p;
-    for _ in 0..PROJECTIONS {
-        let Some((k, h)) = top(&q) else { return (p, None) };
-        if h.abs() < 1e-12 {
-            break;
-        }
-        if let Some(s) = sides.get(k) {
-            q -= s.n * (sign * h);
-        }
+/// Reads the surface around the hole as a wedge of two or three sides; `None` when it is one
+/// smooth surface or cannot be read (`edge` is the mean loop edge length).
+fn read_wedge(mesh: &Mesh, around: &Around, lp: &[u32], edge: f64) -> Option<Wedge> {
+    let mut near = triangles_near(mesh, around, lp);
+    let means = group_by_normal(&mut near)?;
+    let normals = split_sides(&mut near, &means, edge)?;
+    let by_edge = edges_of(&near);
+    if !meets_sharply(&near, &by_edge) {
+        return None;
     }
-    let close: Vec<&Side> = sides.iter().filter(|s| sign * s.height(&q) > -snap).collect();
-    if close.len() < 2 {
-        return (q, None);
-    }
-    let mut e = q;
-    for _ in 0..PROJECTIONS {
-        for s in &close {
-            e -= s.n * s.height(&e);
+    let mut sides: Vec<Side> = Vec::with_capacity(normals.len());
+    for (k, n) in normals.iter().enumerate() {
+        let mut ids: Vec<u32> = near.iter().filter(|t| t.side == Some(k)).flat_map(|t| t.corners).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let points: Vec<Point3> = ids.iter().filter_map(|&v| mesh.positions.get(v as usize).copied()).collect();
+        let (side, rms) = Side::fit(&points, *n)?;
+        if !(rms <= MAX_SIDE_RMS * edge) {
+            return None;
         }
+        sides.push(side);
     }
-    (q, Some(e))
+    let convex = convexity(&sides, MIN_WEDGE * edge)?;
+    Some(Wedge { sides, convex })
 }
 
 /// Area of the smallest patch triangle (from `first_tri` on) at vertex `v`.
@@ -296,112 +465,97 @@ fn move_keeping_shape(mesh: &mut Mesh, first_tri: usize, v: usize, to: Point3, m
     }
 }
 
-/// Moves the vertices from `first_vertex` on (the patch of the hole bounded by `lp`, whose
-/// triangles start at `first_tri`) onto the sides of the surface around the hole when those meet
-/// at sharp edges. Returns whether it did; otherwise the patch is untouched.
-pub(crate) fn sharpen_patch(mesh: &mut Mesh, first_tri: usize, first_vertex: usize, lp: &[u32]) -> bool {
-    if first_vertex >= mesh.positions.len() || lp.len() < 3 {
-        return false;
-    }
-    let mut near = triangles_near(mesh, first_tri, lp);
-    let Some(means) = sides_of(&mut near) else { return false };
-    if !meets_sharply(&near) {
-        return false;
-    }
-    let mut sides: Vec<Side> = Vec::with_capacity(means.len());
-    for (k, n) in means.iter().enumerate() {
-        let mut ids: Vec<u32> = near.iter().filter(|t| t.side == Some(k)).flat_map(|t| t.corners).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        let points: Vec<Point3> = ids.iter().filter_map(|&v| mesh.positions.get(v as usize).copied()).collect();
-        let Some(side) = Side::fit(&points, *n) else { return false };
-        sides.push(side);
-    }
-    let Some(convex) = convexity(&sides) else { return false };
-    let on_loop: Vec<Point3> = lp.iter().filter_map(|&v| mesh.positions.get(v as usize).copied()).collect();
-    let n = on_loop.len();
-    if n < 3 {
-        return false;
-    }
-    let edge: f64 = (0..n).map(|k| (on_loop[k] - on_loop[(k + 1) % n]).norm()).sum::<f64>() / n as f64;
-    let reach = on_loop.iter().flat_map(|a| on_loop.iter().map(move |b| (a - b).norm())).fold(0.0, f64::max);
-    let moved: Vec<(Point3, Option<Point3>)> =
-        mesh.positions.iter().skip(first_vertex).map(|p| onto_wedge(&sides, convex, EDGE_SNAP * edge, *p)).collect();
-    let sane = mesh
-        .positions
-        .iter()
-        .skip(first_vertex)
-        .zip(&moved)
-        .all(|(p, (q, e))| [Some(*q), *e].iter().flatten().all(|to| crate::finite(to) && (to - p).norm() <= reach));
-    if !sane {
-        return false;
-    }
-    for (p, (q, _)) in mesh.positions.iter_mut().skip(first_vertex).zip(&moved) {
-        *p = *q;
-    }
-    // onto the edges one vertex at a time, so two vertices never land on each other
-    let min_area = MIN_AREA * edge * edge;
-    for (k, (_, e)) in moved.iter().enumerate() {
-        if let Some(e) = e {
-            move_keeping_shape(mesh, first_tri, first_vertex + k, *e, min_area);
-        }
-    }
-    pin_corner(mesh, first_tri, first_vertex, &sides, &on_loop, reach, min_area);
-    align_edges(mesh, first_tri, &sides, convex, min_area);
-    true
-}
-
-/// Where three sides meet there is a corner, and a patch has to have a vertex on it or a
-/// triangle cuts it off: the patch vertex nearest the corner is moved there.
-fn pin_corner(
-    mesh: &mut Mesh,
+/// The hole: its patch and the measures of its border.
+struct Hole {
     first_tri: usize,
     first_vertex: usize,
-    sides: &[Side],
-    on_loop: &[Point3],
-    reach: f64,
-    min_area: f64,
-) {
-    if sides.len() != MAX_SIDES || on_loop.is_empty() {
+    /// Middle of the border.
+    middle: Point3,
+    /// Largest distance of a border point from the middle.
+    radius: f64,
+    /// Mean length of a border edge.
+    edge: f64,
+}
+
+impl Hole {
+    fn new(mesh: &Mesh, first_tri: usize, first_vertex: usize, lp: &[u32]) -> Option<Hole> {
+        let on: Vec<Point3> = lp.iter().filter_map(|&v| mesh.positions.get(v as usize).copied()).collect();
+        if on.len() < 3 || on.len() != lp.len() || first_vertex >= mesh.positions.len() {
+            return None;
+        }
+        let n = on.len();
+        let middle = Point3::from(on.iter().fold(Vec3::zeros(), |a, p| a + p.coords) / n as f64);
+        let radius = on.iter().map(|p| (p - middle).norm()).fold(0.0, f64::max);
+        let edge = (0..n).filter_map(|k| Some((on.get(k)? - on.get((k + 1) % n)?).norm())).sum::<f64>() / n as f64;
+        (edge > 0.0 && radius.is_finite()).then_some(Hole { first_tri, first_vertex, middle, radius, edge })
+    }
+
+    fn min_area(&self) -> f64 {
+        MIN_AREA * self.edge * self.edge
+    }
+}
+
+/// Where three sides meet in a point inside the hole there is a corner, and a patch has to have
+/// a vertex on it or a triangle cuts it off: the patch vertex nearest the corner is moved there.
+fn pin_corner(mesh: &mut Mesh, hole: &Hole, wedge: &Wedge) {
+    if wedge.sides.len() != MAX_SIDES {
         return;
     }
-    let middle = Point3::from(on_loop.iter().fold(Vec3::zeros(), |a, p| a + p.coords) / on_loop.len() as f64);
-    let mut corner = middle;
-    for _ in 0..PROJECTIONS {
-        for s in sides {
-            corner -= s.n * s.height(&corner);
-        }
-    }
-    // three sides need not meet in a point (a chamfer between a face and a wall): no corner then
-    let off = sides.iter().map(|s| s.height(&corner).abs()).fold(0.0, f64::max);
-    if !crate::finite(&corner) || (corner - middle).norm() > reach || !(off <= CORNER_TOLERANCE * reach) {
+    let all: Vec<&Side> = wedge.sides.iter().collect();
+    let corner = onto_all(&all, hole.middle);
+    // three sides need not meet in a point (a chamfer between a face and a wall), and a corner
+    // outside the hole is not the patch's to make
+    let off = wedge.sides.iter().map(|s| s.height(&corner).abs()).fold(0.0, f64::max);
+    if !crate::finite(&corner)
+        || (corner - hole.middle).norm() > hole.radius
+        || !(off <= CORNER_TOLERANCE * hole.radius)
+    {
         return;
     }
     let nearest = mesh
         .positions
         .iter()
         .enumerate()
-        .skip(first_vertex)
+        .skip(hole.first_vertex)
         .map(|(i, p)| ((p - corner).norm(), i))
         .fold(None, |b: Option<(f64, usize)>, c| if b.is_none_or(|b| c.0 < b.0) { Some(c) } else { b });
     if let Some((_, i)) = nearest {
-        move_keeping_shape(mesh, first_tri, i, corner, min_area);
+        move_keeping_shape(mesh, hole.first_tri, i, corner, hole.min_area());
     }
 }
 
-/// Distance of `p` from the surface of the wedge (zero on a side that is the outermost there).
-fn off_wedge(sides: &[Side], convex: bool, p: &Point3) -> f64 {
-    let sign = if convex { 1.0 } else { -1.0 };
-    sides.iter().map(|s| sign * s.height(p)).fold(f64::NEG_INFINITY, f64::max).abs()
+/// The two patch triangles on edge (a, b) and the vertices opposite it, when it is an inner
+/// patch edge that may be flipped.
+type Flip = (usize, usize, u32, u32);
+
+fn flip_of(mesh: &Mesh, edge: &HashMap<(u32, u32), (usize, usize)>, a: u32, b: u32) -> Option<Flip> {
+    let (&(t0, k0), &(t1, k1)) = (edge.get(&(a, b))?, edge.get(&(b, a))?);
+    let c = mesh.triangles.get(t0)?[(k0 + 2) % 3];
+    let d = mesh.triangles.get(t1)?[(k1 + 2) % 3];
+    (c != d && !edge.contains_key(&(c, d)) && !edge.contains_key(&(d, c))).then_some((t0, t1, c, d))
 }
 
-/// Flips patch edges that cut across a sharp edge of the wedge: an edge between two patch
-/// triangles is swapped for the other diagonal when that one's midpoint is at most
-/// [`FLIP_GAIN`] × as far from the wedge and the two new triangles keep the orientation.
-fn align_edges(mesh: &mut Mesh, first_tri: usize, sides: &[Side], convex: bool, min_area: f64) {
+/// Should edge (a, b) between triangles (a, b, c) and (b, a, d) become (c, d)? Yes when the
+/// middle of (c, d) is at most [`FLIP_GAIN`] × as far from the wedge and the two new triangles
+/// keep the orientation and are not slivers.
+fn flip_gains(mesh: &Mesh, wedge: &Wedge, min_area: f64, [a, b, c, d]: [u32; 4]) -> bool {
+    let at = |v: u32| mesh.positions.get(v as usize).copied();
+    let (Some(pa), Some(pb), Some(pc), Some(pd)) = (at(a), at(b), at(c), at(d)) else { return false };
+    let mid = |p: &Point3, q: &Point3| Point3::from((p.coords + q.coords) / 2.0);
+    if !(wedge.off(&mid(&pc, &pd)) < FLIP_GAIN * wedge.off(&mid(&pa, &pb))) {
+        return false;
+    }
+    // the new triangles (c, d, b) and (d, c, a) must face the way the old pair did
+    let old = tri::cross(&pa, &pb, &pc) + tri::cross(&pb, &pa, &pd);
+    let (n1, n2) = (tri::cross(&pc, &pd, &pb), tri::cross(&pd, &pc, &pa));
+    n1.dot(&old) > 0.0 && n2.dot(&old) > 0.0 && n1.norm().min(n2.norm()) >= 2.0 * min_area
+}
+
+/// Flips patch edges that cut across a sharp edge of the wedge (see [`flip_gains`]).
+fn align_edges(mesh: &mut Mesh, hole: &Hole, wedge: &Wedge) {
     for _pass in 0..FLIP_PASSES {
         let mut edge: HashMap<(u32, u32), (usize, usize)> = HashMap::new();
-        for (ti, t) in mesh.triangles.iter().enumerate().skip(first_tri) {
+        for (ti, t) in mesh.triangles.iter().enumerate().skip(hole.first_tri) {
             for k in 0..3 {
                 edge.insert((t[k], t[(k + 1) % 3]), (ti, k));
             }
@@ -409,31 +563,11 @@ fn align_edges(mesh: &mut Mesh, first_tri: usize, sides: &[Side], convex: bool, 
         let mut keys: Vec<(u32, u32)> = edge.keys().copied().filter(|(a, b)| a < b).collect();
         keys.sort_unstable();
         let mut done: HashSet<usize> = HashSet::new();
-        let mut flipped = false;
+        let mut made: HashSet<(u32, u32)> = HashSet::new();
         for (a, b) in keys {
-            let (Some(&(t0, k0)), Some(&(t1, k1))) = (edge.get(&(a, b)), edge.get(&(b, a))) else { continue };
-            if done.contains(&t0) || done.contains(&t1) {
-                continue;
-            }
-            let (Some(c), Some(d)) =
-                (mesh.triangles.get(t0).map(|t| t[(k0 + 2) % 3]), mesh.triangles.get(t1).map(|t| t[(k1 + 2) % 3]))
-            else {
-                continue;
-            };
-            if c == d || edge.contains_key(&(c, d)) || edge.contains_key(&(d, c)) {
-                continue;
-            }
-            let at = |v: u32| mesh.positions.get(v as usize).copied();
-            let (Some(pa), Some(pb), Some(pc), Some(pd)) = (at(a), at(b), at(c), at(d)) else { continue };
-            let mid = |p: &Point3, q: &Point3| Point3::from((p.coords + q.coords) / 2.0);
-            let (now, then) = (off_wedge(sides, convex, &mid(&pa, &pb)), off_wedge(sides, convex, &mid(&pc, &pd)));
-            if !(then < FLIP_GAIN * now) {
-                continue;
-            }
-            // the new triangles (c, d, b) and (d, c, a) must face the way the old pair did
-            let old = tri::cross(&pa, &pb, &pc) + tri::cross(&pb, &pa, &pd);
-            let (n1, n2) = (tri::cross(&pc, &pd, &pb), tri::cross(&pd, &pc, &pa));
-            if n1.dot(&old) <= 0.0 || n2.dot(&old) <= 0.0 || n1.norm().min(n2.norm()) < 2.0 * min_area {
+            let Some((t0, t1, c, d)) = flip_of(mesh, &edge, a, b) else { continue };
+            let fresh = !done.contains(&t0) && !done.contains(&t1) && !made.contains(&(c.min(d), c.max(d)));
+            if !fresh || !flip_gains(mesh, wedge, hole.min_area(), [a, b, c, d]) {
                 continue;
             }
             if let Some(t) = mesh.triangles.get_mut(t0) {
@@ -442,19 +576,141 @@ fn align_edges(mesh: &mut Mesh, first_tri: usize, sides: &[Side], convex: bool, 
             if let Some(t) = mesh.triangles.get_mut(t1) {
                 *t = [d, c, a];
             }
-            done.insert(t0);
-            done.insert(t1);
-            flipped = true;
+            done.extend([t0, t1]);
+            made.insert((c.min(d), c.max(d)));
         }
-        if !flipped {
+        if done.is_empty() {
             break;
         }
     }
 }
 
+/// Area of the thinnest patch triangle.
+fn thinnest(mesh: &Mesh, first_tri: usize) -> f64 {
+    (first_tri..mesh.triangles.len()).map(|t| mesh.face_area(t)).fold(f64::INFINITY, f64::min)
+}
+
+/// Does patch triangle `t` face the way a side at its middle does? At an edge the middle is on
+/// two sides at once (within the snap distance), and either will do.
+fn faces_out(mesh: &Mesh, hole: &Hole, wedge: &Wedge, t: usize) -> bool {
+    let snap = EDGE_SNAP * hole.edge;
+    let (Some(c), Some(n)) = (mesh.face_centroid(t), mesh.face_normal(t)) else { return false };
+    let Some((_, top)) = wedge.top(&c) else { return false };
+    wedge.sides.iter().any(|s| wedge.sign() * s.height(&c) >= top - snap && s.n.dot(&n) > MIN_FACING)
+}
+
+/// The patch triangles that are thinner than `min_area` or turned over. A triangle thinner than
+/// the hole's own least area (the fairing leaves such slivers) has no direction worth the name
+/// and is judged by its area alone.
+fn tangled(mesh: &Mesh, hole: &Hole, wedge: &Wedge, min_area: f64) -> Vec<usize> {
+    (hole.first_tri..mesh.triangles.len())
+        .filter(|&t| {
+            let area = mesh.face_area(t);
+            area < min_area || (area >= hole.min_area() && !faces_out(mesh, hole, wedge, t))
+        })
+        .collect()
+}
+
+/// Untangles the patch after its vertices moved: the patch vertices of every turned-over or
+/// squashed triangle go to the middle of their neighbours and back onto the wedge, for up to
+/// [`UNTANGLE_ROUNDS`] rounds. Returns whether the patch is sound.
+fn untangle(mesh: &mut Mesh, hole: &Hole, wedge: &Wedge, min_area: f64) -> bool {
+    let (snap, on_side) = (EDGE_SNAP * hole.edge, ON_SIDE * hole.edge);
+    for _ in 0..UNTANGLE_ROUNDS {
+        let bad = tangled(mesh, hole, wedge, min_area);
+        if bad.is_empty() {
+            return true;
+        }
+        let mut ring: HashMap<u32, Vec<u32>> = HashMap::new();
+        for t in mesh.triangles.iter().skip(hole.first_tri) {
+            for k in 0..3 {
+                ring.entry(t[k]).or_default().extend([t[(k + 1) % 3], t[(k + 2) % 3]]);
+            }
+        }
+        let mut loose: Vec<u32> = bad.iter().filter_map(|&t| mesh.triangles.get(t)).flatten().copied().collect();
+        loose.retain(|&v| v as usize >= hole.first_vertex);
+        loose.sort_unstable();
+        loose.dedup();
+        for v in loose {
+            let Some(around) = ring.get_mut(&v) else { continue };
+            around.sort_unstable();
+            around.dedup();
+            let near: Vec<Point3> = around.iter().filter_map(|&w| mesh.positions.get(w as usize).copied()).collect();
+            if near.is_empty() {
+                continue;
+            }
+            let middle = Point3::from(near.iter().fold(Vec3::zeros(), |a, p| a + p.coords) / near.len() as f64);
+            let (on, at_edge) = wedge.onto(snap, on_side, middle);
+            if let Some(p) = mesh.positions.get_mut(v as usize) {
+                *p = at_edge.unwrap_or(on);
+            }
+        }
+    }
+    tangled(mesh, hole, wedge, min_area).is_empty()
+}
+
+/// Moves the patch vertices onto the wedge; false when a vertex would leave the hole's reach.
+fn move_onto(mesh: &mut Mesh, hole: &Hole, wedge: &Wedge) -> bool {
+    let (snap, on_side) = (EDGE_SNAP * hole.edge, ON_SIDE * hole.edge);
+    let moved: Vec<(Point3, Option<Point3>)> =
+        mesh.positions.iter().skip(hole.first_vertex).map(|p| wedge.onto(snap, on_side, *p)).collect();
+    let reach = 2.0 * hole.radius;
+    let sane = mesh
+        .positions
+        .iter()
+        .skip(hole.first_vertex)
+        .zip(&moved)
+        .all(|(p, (q, e))| [Some(*q), *e].iter().flatten().all(|to| crate::finite(to) && (to - p).norm() <= reach));
+    if !sane {
+        return false;
+    }
+    for (p, (q, _)) in mesh.positions.iter_mut().skip(hole.first_vertex).zip(&moved) {
+        *p = *q;
+    }
+    // onto the edges one vertex at a time, so two vertices never land on each other
+    for (k, (_, e)) in moved.iter().enumerate() {
+        if let Some(e) = e {
+            move_keeping_shape(mesh, hole.first_tri, hole.first_vertex + k, *e, hole.min_area());
+        }
+    }
+    true
+}
+
+/// Moves the vertices from `first_vertex` on (the patch of the hole bounded by `lp`, whose
+/// triangles start at `first_tri`) onto the sides of the surface around the hole when those meet
+/// at sharp edges. `around` indexes the mesh as it was before holes were filled. Returns whether
+/// it did; otherwise the patch is as it was.
+pub(crate) fn sharpen_patch(
+    mesh: &mut Mesh,
+    around: &Around,
+    first_tri: usize,
+    first_vertex: usize,
+    lp: &[u32],
+) -> bool {
+    let Some(hole) = Hole::new(mesh, first_tri, first_vertex, lp) else { return false };
+    let Some(wedge) = read_wedge(mesh, around, lp, hole.edge) else { return false };
+    let positions: Vec<Point3> = mesh.positions.iter().skip(first_vertex).copied().collect();
+    let triangles: Vec<[u32; 3]> = mesh.triangles.iter().skip(first_tri).copied().collect();
+    let min_area = (MIN_AREA_KEPT * thinnest(mesh, first_tri)).min(hole.min_area());
+    let kept = move_onto(mesh, &hole, &wedge) && untangle(mesh, &hole, &wedge, min_area) && {
+        pin_corner(mesh, &hole, &wedge);
+        align_edges(mesh, &hole, &wedge);
+        untangle(mesh, &hole, &wedge, min_area)
+    };
+    if !kept {
+        for (p, q) in mesh.positions.iter_mut().skip(first_vertex).zip(positions) {
+            *p = q;
+        }
+        for (t, u) in mesh.triangles.iter_mut().skip(first_tri).zip(triangles) {
+            *t = u;
+        }
+    }
+    kept
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::edit::{boundary_loops, fill_holes};
+    use crate::edit::{boundary_loops, fill_holes, fill_holes_with};
     use crate::{Mesh, Point3, Rng, Vec3, synth};
 
     const SIDE: f64 = 20.0;
@@ -521,5 +777,91 @@ mod tests {
         let (a, _, _) = cut_and_fill(Point3::new(10.0, 0.0, SIDE), 3.0, 0.03);
         let (b, _, _) = cut_and_fill(Point3::new(10.0, 0.0, SIDE), 3.0, 0.03);
         assert_eq!(a, b);
+    }
+
+    /// A hole in a face, near a corner but not over an edge, is none of the corner's business:
+    /// the patch stays in the face and no vertex is dragged to the corner.
+    #[test]
+    fn a_hole_near_a_corner_stays_in_its_face() {
+        let (m, vertices, centroids) = cut_and_fill(Point3::new(3.0, 3.0, SIDE), 2.0, 0.0);
+        assert!(vertices < 1e-9 && centroids < 1e-9, "{vertices} {centroids}");
+        let top: f64 = (0..m.triangle_count())
+            .filter(|&t| m.face_centroid(t).is_some_and(|c| c.z > SIDE - 1e-6))
+            .map(|t| m.face_area(t))
+            .sum();
+        assert!((top - SIDE * SIDE).abs() < 1e-6, "the top has area {top}: the patch overlaps it");
+    }
+
+    /// A Z-shaped step (top, wall, floor), 1 mm triangles, as an open sheet over 20 mm in y.
+    fn step(height: f64, sigma: f64, seed: u64) -> Mesh {
+        let profile = |s: f64| -> (f64, f64) {
+            if s <= 10.0 {
+                (s, height)
+            } else if s <= 10.0 + height {
+                (10.0, height - (s - 10.0))
+            } else {
+                (s - height, 0.0)
+            }
+        };
+        let (ns, ny) = ((20.0 + height).round() as usize, 20usize);
+        let mut m = Mesh::default();
+        for i in 0..=ns {
+            let (x, z) = profile(i as f64);
+            for j in 0..=ny {
+                m.positions.push(Point3::new(x, j as f64, z));
+            }
+        }
+        let id = |i: usize, j: usize| (i * (ny + 1) + j) as u32;
+        for i in 0..ns {
+            for j in 0..ny {
+                m.triangles.push([id(i, j), id(i + 1, j), id(i + 1, j + 1)]);
+                m.triangles.push([id(i, j), id(i + 1, j + 1), id(i, j + 1)]);
+            }
+        }
+        if sigma > 0.0 {
+            synth::add_noise(&mut m, sigma, &mut Rng::new(seed));
+        }
+        m
+    }
+
+    /// Distance from `p` to the step's profile (top, wall and floor as segments in x, z).
+    fn to_step(p: &Point3, height: f64) -> f64 {
+        let seg = |a: (f64, f64), b: (f64, f64)| {
+            let (dx, dz) = (b.0 - a.0, b.1 - a.1);
+            let t = (((p.x - a.0) * dx + (p.z - a.1) * dz) / (dx * dx + dz * dz)).clamp(0.0, 1.0);
+            (a.0 + t * dx - p.x).hypot(a.1 + t * dz - p.z)
+        };
+        seg((0.0, height), (10.0, height)).min(seg((10.0, height), (10.0, 0.0))).min(seg((10.0, 0.0), (20.0, 0.0)))
+    }
+
+    /// The top and the floor of a step have one normal but are two faces: a hole over the wall
+    /// must not be filled worse, or with slivers, because they were read as one tilted side.
+    #[test]
+    fn a_hole_over_a_step_is_not_made_worse() {
+        for (height, r) in [(2.0, 3.0), (3.0, 5.0), (4.0, 4.0)] {
+            for seed in 1..=10 {
+                let m = step(height, 0.03, seed);
+                let at = Point3::new(10.0, 10.0, height / 2.0);
+                let keep: Vec<u32> = (0..m.triangle_count() as u32)
+                    .filter(|&t| m.face_centroid(t as usize).is_some_and(|c| (c - at).norm() > r))
+                    .collect();
+                let cut = m.submesh(&keep);
+                let worst = |mm: &Mesh| mm.positions.iter().map(|p| to_step(p, height)).fold(0.0, f64::max);
+                let (mut faired, mut sharp) = (cut.clone(), cut.clone());
+                // the sheet's own border is a longer loop than the hole and stays open
+                fill_holes_with(&mut faired, 60, true, false);
+                let rep = fill_holes_with(&mut sharp, 60, true, true);
+                assert_eq!(rep.filled, 1);
+                assert!(
+                    worst(&sharp) <= worst(&faired) + 1e-9,
+                    "step {height} hole {r} seed {seed}: {} mm, faired {} mm",
+                    worst(&sharp),
+                    worst(&faired)
+                );
+                let thinnest =
+                    |mm: &Mesh| (0..mm.triangle_count()).map(|t| mm.face_area(t)).fold(f64::INFINITY, f64::min);
+                assert!(thinnest(&sharp) >= 0.5 * thinnest(&faired).min(0.02), "a sliver of {} mm²", thinnest(&sharp));
+            }
+        }
     }
 }

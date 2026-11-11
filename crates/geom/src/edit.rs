@@ -111,8 +111,8 @@ pub(crate) fn vertex_rings(mesh: &Mesh) -> Vec<Vec<u32>> {
     ring
 }
 
-/// A ring point this many times the median distance from the ring's middle is left out of the
-/// ring's plane (it may be a spike itself).
+/// A ring point this many times the median distance from the ring's middle may be a spike
+/// itself.
 const RING_STRAY_FACTOR: f64 = 2.0;
 /// The points a plane is fitted to are spread enough when their second principal extent is at
 /// least this share of the first (points nearly in a line give no plane).
@@ -144,41 +144,35 @@ fn ring_plane(pts: &[Point3]) -> Option<(Vec3, Vec3, f64, f64)> {
     Some((c, e.eigenvectors.column(least).into_owned(), radius, spread))
 }
 
-/// The plane of a one ring that a spike among the ring's own points cannot tilt: ring points
-/// more than [`RING_STRAY_FACTOR`] × the median distance from the ring's middle (the median of
-/// each coordinate) are left out, as long as the rest still spans a plane (a ring of thin
-/// triangles has far points that are no spikes, and the near ones lie almost in a line).
-fn steady_ring_plane(pts: &[Point3]) -> Option<(Vec3, Vec3, f64)> {
+/// Is `p` a spike that another spike in its ring `pts` hides? The other spike is a ring point
+/// far from the rest (more than [`RING_STRAY_FACTOR`] × the median distance from the ring's
+/// middle, the median of each coordinate). With it left out the rest must still span a plane,
+/// `p` must be farther from that plane than `ratio` × the whole ring's radius, and the point
+/// left out must be off the plane as well (a far point that lies in the plane is no spike: rings
+/// of thin triangles have those).
+fn hidden_spike(pts: &[Point3], p: &Point3, ratio: f64, ring_radius: f64) -> bool {
     let median = |mut v: Vec<f64>| {
         v.sort_by(f64::total_cmp);
         v.get(v.len() / 2).copied().unwrap_or(0.0)
     };
     let mid = Point3::new(
-        median(pts.iter().map(|p| p.x).collect()),
-        median(pts.iter().map(|p| p.y).collect()),
-        median(pts.iter().map(|p| p.z).collect()),
+        median(pts.iter().map(|q| q.x).collect()),
+        median(pts.iter().map(|q| q.y).collect()),
+        median(pts.iter().map(|q| q.z).collect()),
     );
-    let reach = RING_STRAY_FACTOR * median(pts.iter().map(|p| (p - mid).norm()).collect());
-    let kept: Vec<Point3> = pts.iter().filter(|p| (*p - mid).norm() <= reach).copied().collect();
-    let steady = if kept.len() >= 3 && kept.len() < pts.len() {
-        ring_plane(&kept).filter(|(_, _, _, spread)| *spread >= RING_MIN_SPREAD)
-    } else {
-        None
-    };
-    // the radius stays that of the whole ring about the plane's centre: the far points make the
-    // test stricter, they only may not tilt the plane
-    match steady {
-        Some((c, n, _, _)) => {
-            let radius = pts.iter().map(|p| (p.coords - c).norm()).sum::<f64>() / pts.len() as f64;
-            Some((c, n, radius))
-        }
-        None => ring_plane(pts).map(|(c, n, radius, _)| (c, n, radius)),
-    }
+    let reach = RING_STRAY_FACTOR * median(pts.iter().map(|q| (q - mid).norm()).collect());
+    pts.iter().enumerate().filter(|(_, q)| (*q - mid).norm() > reach).any(|(j, q)| {
+        let rest: Vec<Point3> = pts.iter().enumerate().filter(|(k, _)| *k != j).map(|(_, r)| *r).collect();
+        let Some((c, n, radius, spread)) = ring_plane(&rest) else { return false };
+        spread >= RING_MIN_SPREAD
+            && (p.coords - c).dot(&n).abs() > ratio * ring_radius
+            && (q.coords - c).dot(&n).abs() > ratio * radius
+    })
 }
 
 /// Removes spikes: vertices farther from the least-squares plane of their one ring than
-/// `ratio` × the ring's radius. Far points of the ring are left out of the plane, so spikes next
-/// to each other do not hide one another. Triangles touching them are removed (the holes
+/// `ratio` × the ring's radius, and spikes that a spike next to them hides from that test (see
+/// [`hidden_spike`]). Triangles touching them are removed (the holes
 /// left behind can be filled with [`fill_holes`]). Returns the number of triangles removed.
 pub fn remove_outliers(mesh: &mut Mesh, ratio: f64) -> usize {
     if mesh.validate().is_err() {
@@ -190,8 +184,8 @@ pub fn remove_outliers(mesh: &mut Mesh, ratio: f64) -> usize {
     let bad: Vec<bool> = crate::par::map(ring.len(), |i| {
         let Some(r) = ring.get(i) else { return false };
         let pts: Vec<Point3> = r.iter().filter_map(|&j| positions.get(j as usize).copied()).collect();
-        let (Some((c, n, radius)), Some(p)) = (steady_ring_plane(&pts), positions.get(i)) else { return false };
-        (p.coords - c).dot(&n).abs() > ratio * radius
+        let (Some((c, n, radius, _)), Some(p)) = (ring_plane(&pts), positions.get(i)) else { return false };
+        (p.coords - c).dot(&n).abs() > ratio * radius || hidden_spike(&pts, p, ratio, radius)
     });
     let before = mesh.triangles.len();
     mesh.triangles.retain(|t| !t.iter().any(|&v| bad[v as usize]));
@@ -267,11 +261,22 @@ pub struct FillReport {
 }
 
 /// Fills boundary loops with at most `max_edges` edges. `smooth` refines and fairs the patch so
-/// it follows the surrounding curvature; otherwise the patch is flat (ear clipping only).
+/// it follows the surrounding curvature, and keeps the sharp edges and corners the hole lies
+/// over; otherwise the patch is flat (ear clipping only).
 pub fn fill_holes(mesh: &mut Mesh, max_edges: usize, smooth: bool) -> FillReport {
+    fill_holes_with(mesh, max_edges, smooth, smooth)
+}
+
+/// [`fill_holes`], with the keeping of sharp edges (`sharpen`, only with `smooth`) on its own
+/// switch.
+pub(crate) fn fill_holes_with(mesh: &mut Mesh, max_edges: usize, smooth: bool, sharpen: bool) -> FillReport {
     let mut rep = FillReport::default();
     let max_edges = max_edges.clamp(3, 4000);
-    for lp in boundary_loops(mesh) {
+    let loops = boundary_loops(mesh);
+    // the surface around every hole is read from the mesh as it is before any is filled
+    let around =
+        (smooth && sharpen && loops.iter().any(|lp| lp.len() <= max_edges)).then(|| crate::crease::Around::new(mesh));
+    for lp in loops {
         if lp.len() > max_edges {
             rep.skipped += 1;
             continue;
@@ -286,7 +291,9 @@ pub fn fill_holes(mesh: &mut Mesh, max_edges: usize, smooth: bool) -> FillReport
         }
         if smooth {
             refine_and_fair(mesh, first_new, &lp);
-            crate::crease::sharpen_patch(mesh, first_new, first_vertex, &lp);
+            if let Some(around) = &around {
+                crate::crease::sharpen_patch(mesh, around, first_new, first_vertex, &lp);
+            }
         }
         rep.filled += 1;
         rep.added_triangles += mesh.triangles.len() - first_new;
