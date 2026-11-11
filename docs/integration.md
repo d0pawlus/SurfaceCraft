@@ -22,3 +22,26 @@ An integration pass then checks several pull requests on one build:
    owner.
 
 The integration branch is not merged itself; `main` receives the pull requests, merged by the owner.
+
+## Local builds by agents
+
+Compiling is the slow part of an agent's work on this workstation, and several agents compiling at
+once slow each other down far more than they gain (2026-11-11: eight at once, load average 40 to
+70 on 8 cores, a four-minute build took hours). Rules for whoever dispatches agents:
+
+1. **Compiler cache.** Each agent runs cargo with `RUSTC_WRAPPER=sccache` and
+   `CARGO_INCREMENTAL=0` (sccache is installed on the workstation; it is set per command, not in
+   the global Cargo configuration). Dependencies compiled once are then taken from the cache in
+   every other worktree.
+2. **Own target directory.** Each worktree has its own `CARGO_TARGET_DIR`
+   (`../SurfaceCraft-wt/target-<name>`). One directory shared by several worktrees gave stale
+   artifacts and ran another worktree's `xtask`.
+3. **At most three agents compiling at a time.** The rest wait; look at the machine's load and at
+   builds of other sessions before starting a batch.
+4. **No local build for non-code changes.** A change that only touches documentation, locale
+   files or other non-code files is pushed and checked by GitHub Actions (documentation-only pull
+   requests skip the heavy steps there).
+
+A copy-on-write clone of a warm target directory (`cp -c -R -p`, seconds on APFS) helps only when
+the agent runs exactly the commands the directory was built with: Cargo compiles a dependency
+again for a different set of packages or features. The compiler cache does not have that limit.
