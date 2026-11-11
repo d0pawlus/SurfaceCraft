@@ -116,7 +116,7 @@ pub fn feature_tree(app: &mut SurfaceCraftApp, ui: &mut egui::Ui) {
             if let Some(e) = &r.error {
                 ui.colored_label(
                     app.tokens.color(Token::StatusError),
-                    tf("history.failed", &[("name", &r.name), ("error", e)]),
+                    tf("history.failed", &[("name", &r.name), ("error", &crate::i18n::engine_message(e))]),
                 );
             }
         });

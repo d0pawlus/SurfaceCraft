@@ -49,6 +49,8 @@ impl SurfaceCraftApp {
         let name = o.name.clone();
         align_camera(&mut self.camera, &plane, centre, extent.max(40.0));
         self.sketch_editor.begin(id);
+        // the ribbon follows: the Sketch stage holds "Finish sketch" and the sketch tools
+        self.stage = crate::workflow::Stage::Sketch;
         self.selected_object = Some(id);
         self.status = tf("sketch.status.editing", &[("name", &name)]);
     }
@@ -185,6 +187,9 @@ impl SurfaceCraftApp {
         let Some((_, name, sk, report)) = self.current_sketch() else { return };
         let view = PlaneView::new(&self.camera, &sk.plane, rect.width(), rect.height());
         let tk = self.tokens.clone();
+        let metrics = self.settings.theme.density.metrics();
+        let icon_style = crate::theme::icon_button_style(&tk);
+        let icon_inset = ((metrics.nav_button - metrics.icon) / 2.0).max(0.0);
         let painter = ui.painter().with_clip_rect(rect);
         let at = |q: [f32; 2]| Pos2::new(rect.min.x + q[0], rect.min.y + q[1]);
         let sp = |p: [f64; 2]| view.to_screen(p).map(at);
@@ -384,12 +389,50 @@ impl SurfaceCraftApp {
             .corner_radius(6.0)
             .inner_margin(egui::Margin::same(4))
             .show(&mut child, |ui| {
+                // the tools as icon buttons (the name and what to click are in the tooltip): the
+                // drawing tools, then the constraints, then the view and the way out
+                let tool_button = |ui: &mut egui::Ui, tool: Tool, selected: bool| -> bool {
+                    let label = t(tool.label_key());
+                    craft_ui::buttons::IconButton::new(label, Vec2::splat(metrics.nav_button), &icon_style)
+                        .selected(selected)
+                        .show(ui, |ui, rect, tint| crate::icons::paint(ui, rect.shrink(icon_inset), tool.icon(), tint))
+                        .on_hover_ui(|ui| {
+                            ui.set_max_width(280.0);
+                            ui.strong(label);
+                            ui.label(t(tool.hint_key()));
+                        })
+                        .clicked()
+                };
                 ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
                     for tool in std::iter::once(Tool::Select).chain(Tool::DRAW) {
-                        if ui.selectable_label(ed.tool == tool, t(tool.label_key())).clicked() {
+                        if tool_button(ui, tool, ed.tool == tool) {
                             ed.set_tool(tool);
                         }
                     }
+                    ui.separator();
+                    for tool in Tool::CONSTRAIN {
+                        if tool_button(ui, tool, ed.tool == tool) {
+                            ed.set_tool(tool);
+                        }
+                    }
+                    ui.separator();
+                    let fit = craft_ui::buttons::IconButton::new(
+                        t("sketch.fit"),
+                        Vec2::splat(metrics.nav_button),
+                        &icon_style,
+                    )
+                    .show(ui, |ui, rect, tint| crate::icons::paint(ui, rect.shrink(icon_inset), "fit", tint))
+                    .on_hover_text(t("sketch.fit"));
+                    if fit.clicked() {
+                        refit = true;
+                    }
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    if ui.add(crate::theme::primary_button(&tk, t("sketch.finish"))).clicked() {
+                        finish = true;
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
                     let label = egui::RichText::new(tf(
                         status.key,
                         &[("dof", &status.dof.to_string()), ("n", &status.conflicting.len().to_string())],
@@ -399,19 +442,8 @@ impl SurfaceCraftApp {
                     if ui.selectable_label(ed.details_open, label).on_hover_text(t("sketch.details_hint")).clicked() {
                         ed.details_open = !ed.details_open;
                     }
-                });
-                ui.horizontal_wrapped(|ui| {
-                    for tool in Tool::CONSTRAIN {
-                        if ui.selectable_label(ed.tool == tool, t(tool.label_key())).clicked() {
-                            ed.set_tool(tool);
-                        }
-                    }
-                    if ui.button(t("sketch.fit")).clicked() {
-                        refit = true;
-                    }
-                    if ui.button(t("sketch.finish")).clicked() {
-                        finish = true;
-                    }
+                    // what to click with the active tool
+                    ui.weak(t(ed.tool.hint_key()));
                 });
                 // a dimension being typed in, and the details the user opened
                 if ed.details_open || ed.pending.is_some() {
