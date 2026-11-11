@@ -17,15 +17,15 @@ env:
 
 jobs:
   bench:
-    name: ${{ matrix.variant }}
+    name: ${{ matrix.os }}-o${{ matrix.opt }}-${{ matrix.replica }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { variant: linux-nextest-o3, cache: linux-nextest, os: ubuntu-latest, opt: 3 }
-          - { variant: windows-nextest-o3, cache: windows-nextest, os: windows-latest, opt: 3 }
+        os: [ubuntu-latest, windows-latest]
+        opt: [1, 2, 3]
+        replica: [a, b]
     steps:
       - uses: actions/checkout@v4
       - name: System libraries for eframe/rfd
@@ -41,19 +41,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-all-crates: true
-          key: ${{ matrix.cache }}
+          key: ${{ runner.os == 'Linux' && 'linux-nextest' || 'windows-nextest' }}
           save-if: false
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
           tool: cargo-nextest
       # set after the cache step so that the cache key (which hashes CARGO_* variables) stays the same
-      - name: Link with rust-lld
-        if: matrix.lld
+      - name: Workspace opt-level and CPU model
         shell: bash
-        run: echo "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=rust-lld" >> "$GITHUB_ENV"
-      - name: Workspace opt-level
-        if: matrix.opt
-        shell: bash
-        run: echo "CARGO_PROFILE_CI_OPT_LEVEL=${{ matrix.opt }}" >> "$GITHUB_ENV"
+        run: |
+          (grep -m1 "model name" /proc/cpuinfo || wmic cpu get name || powershell -c "(Get-CimInstance Win32_Processor).Name") 2>/dev/null | sed 's/^/CPU: /'
+          echo "CARGO_PROFILE_CI_OPT_LEVEL=${{ matrix.opt }}" >> "$GITHUB_ENV"
       - name: cargo xtask test
         run: cargo xtask test
