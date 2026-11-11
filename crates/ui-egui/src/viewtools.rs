@@ -28,6 +28,39 @@ pub const EDGE_PICK_PX: f64 = 7.0;
 /// Half-size of the view cube (px).
 const CUBE_HALF: f64 = 44.0;
 const CUBE_MARGIN: f64 = 14.0;
+/// Opacity of the section cap (the cut face) against the accent colour.
+const CAP_FILL: f32 = 0.22;
+/// Inset (px) and text size of the note that counts the open section outlines.
+const CAP_NOTE_INSET: f32 = 8.0;
+const CAP_NOTE_PX: f32 = 12.0;
+
+/// Paints the triangles of a section cap as one flat fill. Triangles with a corner behind the eye
+/// are left out. `origin` is the viewport's top-left corner on the screen.
+fn paint_cap(
+    painter: &egui::Painter,
+    cam: &crate::camera::Camera,
+    triangles: &[[surfacecraft_geom::Point3; 3]],
+    fill: egui::Color32,
+    (w, h): (f64, f64),
+    origin: egui::Pos2,
+) {
+    let mut mesh = egui::Mesh::default();
+    for tri in triangles {
+        let corners: Option<Vec<egui::Pos2>> = tri
+            .iter()
+            .map(|p| cam.project(p, w, h).map(|s| egui::pos2(origin.x + s[0] as f32, origin.y + s[1] as f32)))
+            .collect();
+        let Some(corners) = corners else { continue };
+        let base = mesh.vertices.len() as u32;
+        for c in corners {
+            mesh.colored_vertex(c, fill);
+        }
+        mesh.add_triangle(base, base + 1, base + 2);
+    }
+    if !mesh.indices.is_empty() {
+        painter.add(egui::Shape::mesh(mesh));
+    }
+}
 
 /// The tool the primary mouse button drives in the viewport.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -134,8 +167,8 @@ pub struct ViewTools {
     version: u64,
     /// Highlight in drawn triangles per object: `(draw key, version, triangles)`.
     drawn: HashMap<ObjectId, (usize, u64, Arc<Vec<u32>>)>,
-    /// Section outline cache: `(item keys, plane, polylines)`.
-    outline: Option<(Vec<usize>, SectionPlane, Arc<Vec<surfacecraft_geom::section::Polyline>>)>,
+    /// Section cut cache (outline and cap per mesh): `(item keys, plane, cuts)`.
+    cut: Option<(Vec<usize>, SectionPlane, Arc<Vec<surfacecraft_geom::cap::Cut>>)>,
     /// Pivot cache of the gizmo: `(mesh key, centre)`.
     pivot: Option<(usize, Point3)>,
 }
@@ -161,7 +194,7 @@ impl Default for ViewTools {
             pointer: None,
             version: 0,
             drawn: HashMap::new(),
-            outline: None,
+            cut: None,
             pivot: None,
         }
     }
@@ -426,24 +459,25 @@ impl SurfaceCraftApp {
         self.tools.section = SectionPlane { enabled: true, axis, offset: mid, flip: self.tools.section.flip };
     }
 
-    /// The section outline of the visible geometry (cached until the plane or a mesh changes).
-    pub fn section_outline(&mut self) -> Arc<Vec<surfacecraft_geom::section::Polyline>> {
+    /// The section cut of the visible geometry: outline and cap per mesh (cached until the plane or
+    /// a mesh changes).
+    pub fn section_cut(&mut self) -> Arc<Vec<surfacecraft_geom::cap::Cut>> {
         let plane = self.tools.section;
         if !plane.enabled {
             return Arc::new(Vec::new());
         }
         let items = self.session.display_items();
         let keys: Vec<usize> = items.iter().map(|d| d.key).collect();
-        if let Some((k, p, lines)) = &self.tools.outline
+        if let Some((k, p, cuts)) = &self.tools.cut
             && *k == keys
             && *p == plane
         {
-            return lines.clone();
+            return cuts.clone();
         }
         let meshes: Vec<&surfacecraft_geom::Mesh> = items.iter().map(|d| d.mesh.as_ref()).collect();
-        let lines = Arc::new(plane.outline(&meshes));
-        self.tools.outline = Some((keys, plane, lines.clone()));
-        lines
+        let cuts = Arc::new(plane.cut(&meshes));
+        self.tools.cut = Some((keys, plane, cuts.clone()));
+        cuts
     }
 
     // ----------------------------------------------------- what the frame draws
@@ -726,10 +760,19 @@ impl SurfaceCraftApp {
             }
         };
 
-        // section outline
+        // section: the cap (where the plane is seen from the removed side), the outline, and the
+        // open outlines that have no cap
         if self.tools.section.enabled {
-            let stroke = egui::Stroke::new(2.0, self.token_color(Token::AccentPrimary));
-            for pl in self.section_outline().iter() {
+            let accent = self.token_color(Token::AccentPrimary);
+            let stroke = egui::Stroke::new(2.0, accent);
+            let cuts = self.section_cut();
+            if self.tools.section.cap_seen_from(&cam.eye()) {
+                let fill = accent.gamma_multiply(CAP_FILL);
+                for cut in cuts.iter() {
+                    paint_cap(&painter, &cam, &cut.cap.triangles, fill, (w, h), rect.min);
+                }
+            }
+            for pl in cuts.iter().flat_map(|c| c.lines.iter()) {
                 let mut pts = pl.points.clone();
                 if pl.closed
                     && let Some(first) = pts.first().copied()
@@ -737,6 +780,12 @@ impl SurfaceCraftApp {
                     pts.push(first);
                 }
                 line(&painter, &pts, stroke);
+            }
+            let open: usize = cuts.iter().map(|c| c.cap.open_loops).sum();
+            if open > 0 {
+                let text = tf("section.cap_open", &[("n", &open.to_string())]);
+                let at = rect.min + egui::vec2(CAP_NOTE_INSET, CAP_NOTE_INSET);
+                painter.text(at, egui::Align2::LEFT_TOP, text, egui::FontId::proportional(CAP_NOTE_PX), accent);
             }
         }
 

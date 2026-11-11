@@ -291,6 +291,7 @@
   "section.axis_x": "X",
   "section.axis_y": "Y",
   "section.axis_z": "Z",
+  "section.cap_open": "Open section outline: {n} not capped (the mesh has a hole there)",
   "section.flip": "Flip",
   "section.offset": "Position",
   "section.title": "Section plane",

@@ -1,7 +1,8 @@
 //! The viewport's section plane: a movable axis-aligned plane that clips the drawing (the GPU
-//! discards fragments on its far side) and whose outline on the visible meshes comes from
-//! `geom::section`. The maths here is plain and tested without a GPU.
-use surfacecraft_geom::{Mesh, Point3, Vec3, section::Polyline};
+//! discards fragments on its far side). On the visible meshes it gives the outline of the cut and
+//! its cap (the filled cut face), both from `geom::cap`. The maths here is plain and tested without
+//! a GPU.
+use surfacecraft_geom::{Mesh, Point3, Vec3, cap::Cut};
 
 /// The axis a section plane is perpendicular to.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -114,10 +115,18 @@ impl SectionPlane {
         shifted_plane(&self.world_plane(), shift)
     }
 
-    /// The outline of the plane on `meshes`.
+    /// The cut of the plane through each of `meshes`: its outline and its cap. A cap is per mesh,
+    /// so two solids are filled separately even where they overlap.
     #[must_use]
-    pub fn outline(&self, meshes: &[&Mesh]) -> Vec<Polyline> {
-        meshes.iter().flat_map(|m| surfacecraft_geom::section::section(m, &self.origin(), &self.normal())).collect()
+    pub fn cut(&self, meshes: &[&Mesh]) -> Vec<Cut> {
+        meshes.iter().map(|m| surfacecraft_geom::cap::cut(m, &self.origin(), &self.normal())).collect()
+    }
+
+    /// Whether the cap can be seen from `eye`. The cap lies on the plane inside the solid, so from
+    /// the kept side the solid's own surface hides it; from the removed side nothing does.
+    #[must_use]
+    pub fn cap_seen_from(&self, eye: &Point3) -> bool {
+        self.enabled && self.signed_distance(eye) > 0.0
     }
 }
 
@@ -155,20 +164,37 @@ mod tests {
         assert_eq!(SectionPlane::default().shader_plane(&shift), [0.0; 4]);
     }
 
-    /// The outline of a plane through a sphere's middle is a closed circle of the sphere's radius.
+    /// The outline of a plane through a sphere's middle is a closed circle of the sphere's radius,
+    /// and its cap is the disc inside it.
     #[test]
-    fn outline_of_a_sphere_is_its_great_circle() {
+    fn outline_of_a_sphere_is_its_great_circle_and_its_cap_the_disc() {
         let mesh = synth::sphere(Point3::origin(), 10.0, 48, 24);
         let s = SectionPlane { enabled: true, axis: SectionAxis::Z, offset: 0.0, flip: false };
-        let lines = s.outline(&[&mesh]);
+        let cuts = s.cut(&[&mesh]);
+        assert_eq!(cuts.len(), 1);
+        let lines = &cuts[0].lines;
         assert_eq!(lines.len(), 1);
         assert!(lines[0].closed);
         for p in &lines[0].points {
             assert!(p.z.abs() < 1e-9);
             assert!((p.coords.norm() - 10.0).abs() < 0.15, "{p:?}");
         }
-        // a plane off the body has no outline
+        let disc = std::f64::consts::PI * 100.0;
+        assert!((cuts[0].cap.area - disc).abs() / disc < 0.01, "cap {}", cuts[0].cap.area);
+        // a plane off the body has no outline and no cap
         let off = SectionPlane { offset: 50.0, ..s };
-        assert!(off.outline(&[&mesh]).is_empty());
+        let none = &off.cut(&[&mesh])[0];
+        assert!(none.lines.is_empty() && none.cap.triangles.is_empty());
+    }
+
+    /// The cap is seen from the removed side of the plane only: the kept side has the solid in front.
+    #[test]
+    fn the_cap_is_seen_from_the_removed_side_only() {
+        let s = SectionPlane { enabled: true, axis: SectionAxis::Z, offset: 2.0, flip: false };
+        assert!(s.cap_seen_from(&Point3::new(0.0, 0.0, 9.0)), "above the plane, the normal side is removed");
+        assert!(!s.cap_seen_from(&Point3::new(0.0, 0.0, -9.0)));
+        let flipped = SectionPlane { flip: true, ..s };
+        assert!(flipped.cap_seen_from(&Point3::new(0.0, 0.0, -9.0)));
+        assert!(!SectionPlane { enabled: false, ..s }.cap_seen_from(&Point3::new(0.0, 0.0, 9.0)));
     }
 }

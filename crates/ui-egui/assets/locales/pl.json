@@ -291,6 +291,7 @@
   "section.axis_x": "X",
   "section.axis_y": "Y",
   "section.axis_z": "Z",
+  "section.cap_open": "Otwarty kontur przekroju: {n} bez wypełnienia (w siatce jest tam dziura)",
   "section.flip": "Odwróć",
   "section.offset": "Położenie",
   "section.title": "Płaszczyzna przekroju",
