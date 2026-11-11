@@ -153,3 +153,14 @@ fn p8_parameters() {
     }
     assert_eq!(mesh_of(&s, "ball").triangle_count() as u64, before);
 }
+
+/// A target of no triangles is refused like a ratio of zero: it would erase the scan.
+#[test]
+fn a_target_of_zero_triangles_is_refused() {
+    let mut s = Session::new();
+    s.execute("mesh.synth", json!({"shape": "sphere", "size": [10.0], "resolution": 12, "name": "ball"})).unwrap();
+    let before = s.doc.meshes[0].mesh.triangle_count();
+    let err = s.execute("mesh.decimate", json!({"object": "ball", "target": 0})).unwrap_err();
+    assert!(matches!(err, surfacecraft_engine::EngineError::InvalidParams(_)), "{err:?}");
+    assert_eq!(s.doc.meshes[0].mesh.triangle_count(), before, "the scan is untouched");
+}

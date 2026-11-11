@@ -22,6 +22,7 @@ pub mod kdtree;
 pub mod lod;
 pub mod mesh;
 pub mod par;
+pub mod quality;
 pub mod recon;
 pub mod reduce;
 pub mod rng;

@@ -24,6 +24,7 @@ pub mod hybrid;
 pub mod mesh;
 pub mod plan;
 pub mod primitive;
+pub mod qa;
 pub mod quad;
 pub mod refit;
 pub mod region;
@@ -130,6 +131,7 @@ static REGISTRY: LazyLock<Vec<CommandSpec>> = LazyLock::new(|| {
     v.extend_from_slice(deviation::COMMANDS);
     v.extend_from_slice(mesh::COMMANDS);
     v.extend_from_slice(primitive::COMMANDS);
+    v.extend_from_slice(qa::COMMANDS);
     v.extend_from_slice(quad::COMMANDS);
     v.extend_from_slice(refit::COMMANDS);
     v.extend_from_slice(region::COMMANDS);
@@ -156,6 +158,7 @@ pub fn find(id: &str) -> Option<&'static CommandSpec> {
 /// Commands too slow to run on every parameter change (a front end skips their live preview).
 const HEAVY: &[&str] = &[
     "align.icp",
+    "body.compare",
     "body.from_regions",
     "body.plan_regions",
     "body.refit_faces",
@@ -184,6 +187,7 @@ const HEAVY: &[&str] = &[
     "primitive.auto_constrain",
     "primitive.fit",
     "primitive.symmetry",
+    "scan.qa",
     "quad.retopo",
     "region.auto_segment",
     "region.grow",

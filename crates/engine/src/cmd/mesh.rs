@@ -782,6 +782,10 @@ fn decimate(s: &mut Session, i: DecimateIn) -> CmdResult<EditOut> {
     if !(ratio.is_finite() && ratio > 0.0 && ratio <= 1.0) {
         return Err(CmdError::Params("ratio must be in (0, 1]".into()));
     }
+    if i.target == Some(0) {
+        // like a ratio of zero: it would erase the scan
+        return Err(CmdError::Params("target must be at least one triangle".into()));
+    }
     if let Some(e) = i.max_error
         && !(e.is_finite() && e > 0.0)
     {

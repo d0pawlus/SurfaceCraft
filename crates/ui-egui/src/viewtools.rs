@@ -28,8 +28,6 @@ pub const EDGE_PICK_PX: f64 = 7.0;
 /// Half-size of the view cube (px).
 const CUBE_HALF: f64 = 44.0;
 const CUBE_MARGIN: f64 = 14.0;
-/// Width the view cube takes at the top right of the viewport, margins included (px).
-const CUBE_SPACE: f32 = 2.0 * (CUBE_HALF as f32 + CUBE_MARGIN as f32) + 12.0;
 
 /// The tool the primary mouse button drives in the viewport.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -70,6 +68,34 @@ impl Tool {
             Tool::Edges => "tool.edges",
             Tool::Move => "tool.move",
             Tool::Rotate => "tool.rotate",
+        }
+    }
+
+    /// The catalogue key of the sentence that says what the tool does.
+    #[must_use]
+    pub fn hint_key(self) -> &'static str {
+        match self {
+            Tool::Navigate => "tool.navigate_hint",
+            Tool::Brush => "tool.brush_hint",
+            Tool::Lasso => "tool.lasso_hint",
+            Tool::Smart => "tool.smart_hint",
+            Tool::Faces | Tool::Edges => "tool.brep_hint",
+            Tool::Move | Tool::Rotate => "tool.gizmo_hint",
+        }
+    }
+
+    /// The icon of the tool in the navigation bar.
+    #[must_use]
+    pub fn icon(self) -> &'static str {
+        match self {
+            Tool::Navigate => "tool-navigate",
+            Tool::Brush => "tool-brush",
+            Tool::Lasso => "tool-lasso",
+            Tool::Smart => "tool-smart",
+            Tool::Faces => "tool-faces",
+            Tool::Edges => "tool-edges",
+            Tool::Move => "tool-move",
+            Tool::Rotate => "tool-rotate",
         }
     }
 }
@@ -327,7 +353,7 @@ impl SurfaceCraftApp {
     // ------------------------------------------------------------------- gizmo
 
     /// The mesh the gizmo would move: the selected object when it is a scan.
-    fn gizmo_mesh(&mut self) -> Option<DisplayItem> {
+    pub(crate) fn gizmo_mesh(&mut self) -> Option<DisplayItem> {
         let id = self.selected_object?;
         self.session.display_items().into_iter().find(|d| d.id == id && d.kind == ObjectKind::Mesh)
     }
@@ -683,7 +709,7 @@ impl SurfaceCraftApp {
 
     // ----------------------------------------------------------------- painting
 
-    fn token_color(&self, token: Token) -> egui::Color32 {
+    pub(crate) fn token_color(&self, token: Token) -> egui::Color32 {
         self.tokens.color(token)
     }
 
@@ -885,142 +911,5 @@ impl SurfaceCraftApp {
                 self.token_color(Token::TextPrimary),
             );
         }
-    }
-
-    /// The tool strip in the top-left corner of the viewport. It wraps before the view cube's
-    /// corner, so the two never overlap, however narrow the viewport.
-    fn tool_strip(&mut self, ctx: &egui::Context, rect: egui::Rect) {
-        let pos = rect.min + egui::vec2(8.0, 8.0);
-        let width = (rect.width() - CUBE_SPACE - 8.0).max(160.0);
-        egui::Area::new(egui::Id::unique("viewport-tools")).fixed_pos(pos).order(egui::Order::Foreground).show(
-            ctx,
-            |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_max_width(width);
-                    ui.horizontal_wrapped(|ui| {
-                        for tool in Tool::ALL {
-                            if ui.selectable_label(self.tools.tool == tool, t(tool.key())).clicked() {
-                                self.cancel_interaction();
-                                self.tools.tool = tool;
-                            }
-                        }
-                    });
-                    match self.tools.tool {
-                        Tool::Brush => {
-                            ui.horizontal(|ui| {
-                                let l = ui.label(t("tool.brush_radius"));
-                                ui.add(egui::Slider::new(&mut self.tools.brush_radius, 4.0..=120.0).suffix(" px"))
-                                    .labelled_by(l.id);
-                                ui.checkbox(&mut self.tools.through, t("tool.through"));
-                            });
-                            ui.weak(t("tool.brush_hint"));
-                        }
-                        Tool::Lasso => {
-                            ui.checkbox(&mut self.tools.through, t("tool.through"));
-                            ui.weak(t("tool.lasso_hint"));
-                        }
-                        Tool::Smart => {
-                            ui.horizontal(|ui| {
-                                let l = ui.label(t("tool.smart_angle"));
-                                ui.add(egui::Slider::new(&mut self.tools.smart_angle, 1.0..=90.0).suffix("°"))
-                                    .labelled_by(l.id);
-                            });
-                        }
-                        Tool::Faces | Tool::Edges => {
-                            ui.weak(t("tool.brep_hint"));
-                        }
-                        Tool::Move | Tool::Rotate => {
-                            if self.gizmo_mesh().is_none() {
-                                ui.weak(t("tool.gizmo_no_mesh"));
-                            } else {
-                                ui.weak(t("tool.gizmo_hint"));
-                            }
-                        }
-                        Tool::Navigate => {}
-                    }
-                    self.field_pick_strip(ui);
-                    self.selection_chip(ui);
-                    self.section_controls(ui);
-                    ui.horizontal(|ui| {
-                        if ui.small_button(t("view.iso")).clicked() {
-                            self.set_standard_view(StandardView::Iso);
-                        }
-                        if ui.small_button(t("view.fit")).clicked() {
-                            self.fit_pending = true;
-                        }
-                    });
-                });
-            },
-        );
-    }
-
-    /// While a form field is being picked: what to click, and a button to stop.
-    fn field_pick_strip(&mut self, ui: &mut egui::Ui) {
-        let Some((_, hint)) = self.field_pick_hint() else { return };
-        ui.separator();
-        ui.horizontal_wrapped(|ui| {
-            ui.colored_label(self.token_color(Token::AccentPrimary), hint);
-            if ui.small_button(t("fieldpick.stop")).clicked() {
-                self.stop_field_pick();
-            }
-        });
-    }
-
-    fn selection_chip(&mut self, ui: &mut egui::Ui) {
-        let n = self.tools.selection.tris.len();
-        let (nf, ne) = (self.tools.brep.faces.len(), self.tools.brep.edges.len());
-        if n == 0 && nf + ne == 0 {
-            return;
-        }
-        ui.separator();
-        ui.horizontal(|ui| {
-            if n > 0 {
-                ui.label(tf("select.count", &[("n", &n.to_string())]));
-                if ui.button(t("select.create_region")).clicked() {
-                    self.create_region_from_selection();
-                }
-            }
-            if nf + ne > 0 {
-                ui.label(tf("select.brep_count", &[("faces", &nf.to_string()), ("edges", &ne.to_string())]));
-            }
-            if ui.button(t("select.clear")).clicked() {
-                self.clear_selection();
-            }
-        });
-    }
-
-    fn section_controls(&mut self, ui: &mut egui::Ui) {
-        ui.separator();
-        let mut enabled = self.tools.section.enabled;
-        if ui.checkbox(&mut enabled, t("section.title")).changed() {
-            if enabled {
-                let axis = self.tools.section.axis;
-                self.enable_section(axis);
-            } else {
-                self.tools.section.enabled = false;
-            }
-        }
-        if !self.tools.section.enabled {
-            return;
-        }
-        ui.horizontal(|ui| {
-            for axis in SectionAxis::ALL {
-                if ui.selectable_label(self.tools.section.axis == axis, t(axis.key())).clicked()
-                    && self.tools.section.axis != axis
-                {
-                    self.enable_section(axis);
-                    self.tools.section.axis = axis;
-                }
-            }
-            ui.checkbox(&mut self.tools.section.flip, t("section.flip"));
-        });
-        let b = self.session.doc.bbox();
-        let axis = self.tools.section.axis;
-        let (lo, hi) = if b.is_empty() { (-100.0, 100.0) } else { (axis.coord(&b.min), axis.coord(&b.max)) };
-        let (lo, hi) = if hi > lo { (lo, hi) } else { (lo - 1.0, lo + 1.0) };
-        ui.horizontal(|ui| {
-            let l = ui.label(t("section.offset"));
-            ui.add(egui::Slider::new(&mut self.tools.section.offset, lo..=hi)).labelled_by(l.id);
-        });
     }
 }
