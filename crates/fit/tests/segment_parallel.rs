@@ -21,8 +21,8 @@ struct Shape {
 /// The shape of the scale measurement (R = 100 mm): at 0.5 M triangles it ends in thousands of
 /// regions.
 const LARGE: Shape = Shape { radius: 100.0, bump: 2.5, wave_scale: 1.0 };
-/// A small shape for the equality test: 25 k triangles end in a couple of hundred regions.
-const SMALL: Shape = Shape { radius: 20.0, bump: 0.5, wave_scale: 0.7 };
+/// A medium shape (the equality test and the reference digests): 25 k triangles end in a couple of hundred regions.
+const MEDIUM: Shape = Shape { radius: 20.0, bump: 0.5, wave_scale: 0.7 };
 /// Wave numbers of the three bump factors.
 const WAVES: [f64; 3] = [37.0, 29.0, 23.0];
 /// Scanner noise along the normal (mm).
@@ -66,7 +66,7 @@ fn digest(segs: &[Segment]) -> u64 {
 
 #[test]
 fn organic_segmentation_is_identical_on_one_thread_and_many() {
-    let mesh = organic_scan(25_000, SMALL);
+    let mesh = organic_scan(25_000, MEDIUM);
     let opts = SegmentOptions::default();
     let many = std::thread::available_parallelism().map_or(4, usize::from).max(4);
     let one = segment_on(1, &mesh, &opts);
@@ -103,7 +103,8 @@ fn print_reference_digests() {
     synth::add_noise(&mut annulus, 0.01, &mut Rng::new(5));
     let mut block = synth::cuboid(Point3::origin(), Vec3::new(40.0, 30.0, 12.0), 60);
     synth::add_noise(&mut block, 0.03, &mut Rng::new(6));
-    let scans = [("bracket", bracket), ("annulus", annulus), ("block", block), ("organic 25k", organic_scan(25_000, SMALL))];
+    let scans =
+        [("bracket", bracket), ("annulus", annulus), ("block", block), ("organic 25k", organic_scan(25_000, MEDIUM))];
     for (name, mesh) in scans {
         let segs = segment_on(2, &mesh, &opts);
         eprintln!("digest {name}: {:016x} ({} regions)", digest(&segs), segs.len());
@@ -134,6 +135,11 @@ fn perf_segment_organic() {
             mesh.triangle_count(),
             segs.len(),
             phases.join(", ")
+        );
+        let w = surfacecraft_fit::stats::snapshot();
+        eprintln!(
+            "perf segment work: {} seed fits, {} grow refits, {} final fits, {} speculative jobs ({} used)",
+            w.seed_fits, w.grow_refits, w.final_fits, w.speculative_jobs, w.speculative_used
         );
         digests.push(d);
     }
