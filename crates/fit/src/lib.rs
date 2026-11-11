@@ -10,6 +10,7 @@
 )]
 
 pub mod auto;
+pub mod constrain;
 pub mod features;
 pub mod lm;
 pub mod mls;
