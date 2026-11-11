@@ -599,14 +599,43 @@ fn faces_out(mesh: &Mesh, hole: &Hole, wedge: &Wedge, t: usize) -> bool {
     wedge.sides.iter().any(|s| wedge.sign() * s.height(&c) >= top - snap && s.n.dot(&n) > MIN_FACING)
 }
 
-/// The patch triangles that are thinner than `min_area` or turned over. A triangle thinner than
-/// the hole's own least area (the fairing leaves such slivers) has no direction worth the name
-/// and is judged by its area alone.
-fn tangled(mesh: &Mesh, hole: &Hole, wedge: &Wedge, min_area: f64) -> Vec<usize> {
+/// What a sound patch is measured against: the least area of a triangle, and the triangles
+/// between border vertices alone that were turned over as the fairing left them. Those have no
+/// vertex that can move, so no move makes or mends them.
+struct Sound {
+    min_area: f64,
+    given: HashSet<[u32; 3]>,
+}
+
+impl Sound {
+    fn new(mesh: &Mesh, hole: &Hole, wedge: &Wedge, min_area: f64) -> Sound {
+        let open = Sound { min_area, given: HashSet::new() };
+        let given = tangled(mesh, hole, wedge, &open)
+            .into_iter()
+            .filter_map(|t| mesh.triangles.get(t))
+            .filter(|t| t.iter().all(|&v| (v as usize) < hole.first_vertex))
+            .map(same_corners)
+            .collect();
+        Sound { min_area, given }
+    }
+}
+
+/// The corners of a triangle in an order that does not depend on where it starts.
+fn same_corners(t: &[u32; 3]) -> [u32; 3] {
+    let mut c = *t;
+    c.sort_unstable();
+    c
+}
+
+/// The patch triangles that are thinner than the least area or turned over. A triangle thinner
+/// than the hole's own least area (the fairing leaves such slivers) has no direction worth the
+/// name and is judged by its area alone.
+fn tangled(mesh: &Mesh, hole: &Hole, wedge: &Wedge, sound: &Sound) -> Vec<usize> {
     (hole.first_tri..mesh.triangles.len())
         .filter(|&t| {
             let area = mesh.face_area(t);
-            area < min_area || (area >= hole.min_area() && !faces_out(mesh, hole, wedge, t))
+            let given = mesh.triangles.get(t).is_some_and(|c| sound.given.contains(&same_corners(c)));
+            area < sound.min_area || (area >= hole.min_area() && !given && !faces_out(mesh, hole, wedge, t))
         })
         .collect()
 }
@@ -614,10 +643,10 @@ fn tangled(mesh: &Mesh, hole: &Hole, wedge: &Wedge, min_area: f64) -> Vec<usize>
 /// Untangles the patch after its vertices moved: the patch vertices of every turned-over or
 /// squashed triangle go to the middle of their neighbours and back onto the wedge, for up to
 /// [`UNTANGLE_ROUNDS`] rounds. Returns whether the patch is sound.
-fn untangle(mesh: &mut Mesh, hole: &Hole, wedge: &Wedge, min_area: f64, snap: f64) -> bool {
+fn untangle(mesh: &mut Mesh, hole: &Hole, wedge: &Wedge, sound: &Sound, snap: f64) -> bool {
     let on_side = ON_SIDE * hole.edge;
     for _ in 0..UNTANGLE_ROUNDS {
-        let bad = tangled(mesh, hole, wedge, min_area);
+        let bad = tangled(mesh, hole, wedge, sound);
         if bad.is_empty() {
             return true;
         }
@@ -646,7 +675,7 @@ fn untangle(mesh: &mut Mesh, hole: &Hole, wedge: &Wedge, min_area: f64, snap: f6
             }
         }
     }
-    tangled(mesh, hole, wedge, min_area).is_empty()
+    tangled(mesh, hole, wedge, sound).is_empty()
 }
 
 /// Moves the patch vertices onto the wedge; false when a vertex would leave the hole's reach.
@@ -711,7 +740,8 @@ fn sharpen(
     let wedge = read_wedge(mesh, around, lp, hole.edge)?;
     let before = patch_of(mesh, &hole);
     let min_area = (MIN_AREA_KEPT * thinnest(mesh, first_tri)).min(hole.min_area());
-    let done = shape_patch(mesh, &hole, &wedge, min_area);
+    let sound = Sound::new(mesh, &hole, &wedge, min_area);
+    let done = shape_patch(mesh, &hole, &wedge, &sound);
     if done.is_err() {
         restore(mesh, &hole, before);
     }
@@ -739,24 +769,24 @@ fn restore(mesh: &mut Mesh, hole: &Hole, (positions, triangles): (Vec<Point3>, V
 /// Moves the patch onto the wedge and untangles it, with the vertices next to an edge on the
 /// edge or, when that tangles the patch, without. Then pins the corner and aligns the edges,
 /// which is undone when it tangles the patch again (the vertices stay on the sides).
-fn shape_patch(mesh: &mut Mesh, hole: &Hole, wedge: &Wedge, min_area: f64) -> Result<(), &'static str> {
+fn shape_patch(mesh: &mut Mesh, hole: &Hole, wedge: &Wedge, sound: &Sound) -> Result<(), &'static str> {
     let faired = patch_of(mesh, hole);
     let mut snap = EDGE_SNAP * hole.edge;
     if !move_onto(mesh, hole, wedge, snap) {
         return Err("a vertex would leave the hole");
     }
-    if !untangle(mesh, hole, wedge, min_area, snap) {
+    if !untangle(mesh, hole, wedge, sound, snap) {
         restore(mesh, hole, faired);
         snap = 0.0;
-        if !(move_onto(mesh, hole, wedge, snap) && untangle(mesh, hole, wedge, min_area, snap)) {
+        if !(move_onto(mesh, hole, wedge, snap) && untangle(mesh, hole, wedge, sound, snap)) {
             return Err("tangled after the move");
         }
     }
-    let sound = patch_of(mesh, hole);
+    let moved = patch_of(mesh, hole);
     pin_corner(mesh, hole, wedge);
     align_edges(mesh, hole, wedge);
-    if !untangle(mesh, hole, wedge, min_area, snap) {
-        restore(mesh, hole, sound);
+    if !untangle(mesh, hole, wedge, sound, snap) {
+        restore(mesh, hole, moved);
     }
     Ok(())
 }

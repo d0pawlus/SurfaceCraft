@@ -57,10 +57,15 @@ fn clean_and_check(s: &mut Session, cad: &Mesh, sigma: f64) {
     assert_eq!(surfacecraft_geom::edit::components(&m).len(), 1, "debris remains");
     // every vertex within 6 σ of the CAD surface: no spike survived (filled holes included)
     let bvh = Bvh::build(cad);
-    let worst =
-        surfacecraft_deviation::against_mesh(&m.positions, &bvh, 10.0).iter().map(|d| d.abs()).fold(0.0, f64::max);
+    let off = surfacecraft_deviation::against_mesh(&m.positions, &bvh, 10.0);
+    let (at, worst) = off.iter().map(|d| d.abs()).enumerate().fold((0, 0.0), |a, b| if b.1 > a.1 { b } else { a });
     eprintln!("clean: {c}, worst vertex {worst:.4} mm");
-    assert!(worst < 6.0 * sigma, "a vertex is {worst} mm off the CAD surface");
+    assert!(
+        worst < 6.0 * sigma,
+        "vertex {at} of {} at {:?} is {worst} mm off the CAD surface",
+        off.len(),
+        m.positions.get(at)
+    );
     let n = s.execute("deviation.noise", json!({"object": "scan"})).unwrap();
     let est = n["sigma"].as_f64().unwrap();
     eprintln!("noise estimate {est:.4} (true {sigma})");
