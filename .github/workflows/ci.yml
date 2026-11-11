@@ -21,9 +21,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: System libraries for eframe/rfd
+        timeout-minutes: 10
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev
+          # the man-db trigger can take many minutes on hosted runners; nothing here reads man pages
+          sudo rm -f /var/lib/man-db/auto-update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y \
+            libgtk-3-dev libxkbcommon-dev libwayland-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
