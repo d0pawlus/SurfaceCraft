@@ -14,13 +14,45 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
+  # A pull request that only changes documentation skips the heavy steps below; the jobs still
+  # run and report, so they can stay required checks. docs/guides/*.md are compiled into the
+  # engine (include_str!), so they count as code. A push to main always runs everything.
+  changes:
+    name: detect docs-only change
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.diff.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - id: diff
+        if: github.event_name == 'pull_request'
+        run: |
+          # HEAD is the merge commit of the pull request; its first parent is the base branch
+          files=$(git diff --name-only HEAD^1 HEAD)
+          echo "$files"
+          code=$(echo "$files" | grep -Ev '(\.md$|^docs/)' || true)
+          guides=$(echo "$files" | grep -E '^docs/guides/' || true)
+          if [ -n "$files" ] && [ -z "$code" ] && [ -z "$guides" ]; then
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+          fi
+
   ci:
     name: cargo xtask ci
+    needs: changes
+    # runs even when detection failed: only an explicit docs_only == 'true' skips steps
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    env:
+      DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
     steps:
       - uses: actions/checkout@v4
       - name: System libraries for eframe/rfd
+        if: env.DOCS_ONLY != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev
@@ -29,27 +61,58 @@ jobs:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+        if: env.DOCS_ONLY != 'true'
         with:
           cache-all-crates: true
+      - uses: taiki-e/install-action@v2
+        if: env.DOCS_ONLY != 'true'
+        with:
+          tool: cargo-nextest
       - name: cargo xtask ci
+        if: env.DOCS_ONLY != 'true'
         run: cargo xtask ci
+      - name: cargo xtask assets (documentation-only change)
+        if: env.DOCS_ONLY == 'true'
+        run: cargo xtask assets
 
   windows-tests:
     name: tests (windows)
+    needs: changes
+    if: ${{ !cancelled() }}
     runs-on: windows-latest
     timeout-minutes: 90
+    env:
+      DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
     steps:
       - uses: actions/checkout@v4
+        if: env.DOCS_ONLY != 'true'
       - uses: dtolnay/rust-toolchain@stable
+        if: env.DOCS_ONLY != 'true'
       - uses: Swatinem/rust-cache@v2
+        if: env.DOCS_ONLY != 'true'
+        with:
+          cache-all-crates: true
+      - uses: taiki-e/install-action@v2
+        if: env.DOCS_ONLY != 'true'
+        with:
+          tool: cargo-nextest
       - name: cargo xtask test
+        if: env.DOCS_ONLY != 'true'
         run: cargo xtask test
+      - name: Nothing to test (documentation-only change)
+        if: env.DOCS_ONLY == 'true'
+        run: echo "documentation-only change"
 
   deny:
     name: cargo deny (sources, bans, licences)
+    needs: changes
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
+    env:
+      DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
+        if: env.DOCS_ONLY != 'true'
         with:
           command: check sources bans licenses
