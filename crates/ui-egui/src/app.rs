@@ -860,10 +860,10 @@ pub fn template(schema: &Value, ctx: &PickContext) -> Value {
                 "triangles" if !ctx.triangles.is_empty() => json!(ctx.triangles),
                 "faces" if !ctx.faces.is_empty() => json!(ctx.faces),
                 "edges" if !ctx.edges.is_empty() => json!(ctx.edges),
-                "primary" | "secondary" | "tertiary" => {
-                    crate::fieldpick::datum_default(name).unwrap_or_else(|| example(&p, schema))
-                }
-                _ => example(&p, schema),
+                _ => match crate::fieldpick::PickMode::of(&p).and_then(crate::fieldpick::PickMode::default_value) {
+                    Some(datum) => datum,
+                    None => example(&p, schema),
+                },
             };
             out.insert(name.to_string(), v);
         }

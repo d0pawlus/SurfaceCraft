@@ -159,8 +159,10 @@ fn revolve(s: &mut Session, i: RevolveIn) -> CmdResult<FeatureOut> {
 #[serde(deny_unknown_fields)]
 pub struct BlendIn {
     /// Body.
+    #[schemars(extend("x-pick-body" = true))]
     pub body: ObjRef,
     /// Edge indices.
+    #[schemars(extend("x-pick" = "edges"))]
     pub edges: Vec<usize>,
     /// Radius (fillet) or distance (chamfer).
     pub size: f64,
