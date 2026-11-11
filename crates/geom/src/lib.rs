@@ -14,6 +14,7 @@
 
 pub mod aabb;
 pub mod bvh;
+pub mod chunked;
 pub mod cloud;
 mod crease;
 pub mod edit;
