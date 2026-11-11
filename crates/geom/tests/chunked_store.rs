@@ -186,8 +186,8 @@ fn gate_g1_build_is_bounded_and_deterministic() {
     assert!(st.peak_buffered_triangles <= SPILL_BUFFER_TRIANGLES, "{st:?}");
     assert!(st.spill_flushes >= 1 && st.max_chunk_triangles <= 2048 && st.leaves >= soup.len() / 2048, "{st:?}");
     assert!(
-        surfacecraft_geom::chunked::build::memory_bound_bytes(&params) < 200 << 20,
-        "the documented memory bound is a constant of a few tens of MB"
+        surfacecraft_geom::chunked::build::memory_bound_bytes(&params) < 128 << 20,
+        "the documented memory bound is a constant: it depends on the chunk size, not on the input"
     );
     let mut names: Vec<String> =
         std::fs::read_dir(d1.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();

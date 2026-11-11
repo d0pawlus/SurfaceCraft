@@ -260,6 +260,8 @@ fn perf_store_scale() {
             surfacecraft_geom::chunked::build::memory_bound_bytes(&opts.store) >> 20,
             report.stats
         );
+        let bound_mb = (surfacecraft_geom::chunked::build::memory_bound_bytes(&opts.store) >> 20) as u64;
+        assert!(rss == 0 || rss / 1024 <= bound_mb, "resident {} MB over the bound of {bound_mb} MB", rss / 1024);
         let st = disk::open(dir.path()).unwrap();
         let v = st.verify().unwrap();
         eprintln!("perf {n} tris: verify read {} blocks, {} MB", v.blocks, v.bytes >> 20);

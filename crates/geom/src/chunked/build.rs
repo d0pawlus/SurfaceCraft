@@ -11,8 +11,8 @@
 //! 4. leaf by leaf: read the spill, weld, build the levels, append to the data files.
 //!
 //! **Memory bound.** Peak memory is `memory_bound_bytes(params)`: the histogram and the cell→leaf
-//! table (`8 bytes × cells`, cells ≤ 2²¹), the spill buffers (`72 bytes × 2¹⁸` triangles), one chunk
-//! at a time (`chunk_triangles ×` [`CHUNK_WORK_BYTES_PER_TRIANGLE`]) and the index entries
+//! table (`8 bytes × cells`, cells ≤ 2²¹), the spill buffers (`72 bytes × 2¹⁸` triangles, twice for
+//! `Vec` slack), one chunk at a time (`chunk_triangles ×` [`CHUNK_WORK_BYTES_PER_TRIANGLE`]) and the index entries
 //! (`O(triangles / chunk_triangles)`). None of it grows with the number of triangles, only the index
 //! does, by a few hundred bytes per chunk. The spill files and the data files live in the directory
 //! the caller gave; spill files are deleted as soon as they are read, and on failure everything the
@@ -33,15 +33,19 @@ use std::path::Path;
 /// A destination for triangles: the replay calls it with batches.
 pub type Sink<'a> = &'a mut dyn FnMut(&[[Point3; 3]]) -> Result<(), StoreError>;
 
-/// Working memory of finishing one chunk, per triangle of the chunk (soup, weld keys, hash maps and
-/// the coarse levels of [`build_levels`] with generous slack).
-pub const CHUNK_WORK_BYTES_PER_TRIANGLE: usize = 1024;
+/// Working memory of finishing one chunk, per triangle of the chunk. The structures themselves (soup,
+/// welded mesh, weld keys, the coarse levels with their hash maps and maps) add up to well under
+/// 1 KB per triangle; the constant is empirical and also covers allocator retention and the levels
+/// being built on several threads: a full 65 536-triangle chunk peaked at 243 MB resident for the
+/// whole process (`perf_store_scale`, 4 M triangles), which is below the bound this gives.
+pub const CHUNK_WORK_BYTES_PER_TRIANGLE: usize = 4096;
 
 /// Upper bound of the memory a build needs, bytes (see the module docs).
 #[must_use]
 pub fn memory_bound_bytes(params: &StoreParams) -> usize {
     let grid = super::plan::MAX_GRID_CELLS * 8;
-    let spill = SPILL_BUFFER_TRIANGLES * SPILL_TRIANGLE_BYTES;
+    // the buffers are `Vec`s that grow by doubling: allow twice their contents
+    let spill = 2 * SPILL_BUFFER_TRIANGLES * SPILL_TRIANGLE_BYTES;
     grid + spill + params.chunk_triangles * CHUNK_WORK_BYTES_PER_TRIANGLE
 }
 
