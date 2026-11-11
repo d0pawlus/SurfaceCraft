@@ -22,6 +22,7 @@ pub mod exchange;
 pub mod feature;
 pub mod hybrid;
 pub mod mesh;
+pub mod mesh_edit;
 pub mod plan;
 pub mod primitive;
 pub mod qa;
@@ -34,6 +35,7 @@ pub mod surface;
 mod surface_check;
 mod surface_fit;
 mod surface_pieces;
+pub mod working;
 
 /// An error from a command's `run`.
 #[derive(Clone, Debug, PartialEq)]
@@ -163,6 +165,7 @@ static REGISTRY: LazyLock<Vec<CommandSpec>> = LazyLock::new(|| {
     v.extend_from_slice(hybrid::COMMANDS);
     v.extend_from_slice(deviation::COMMANDS);
     v.extend_from_slice(mesh::COMMANDS);
+    v.extend_from_slice(mesh_edit::COMMANDS);
     v.extend_from_slice(primitive::COMMANDS);
     v.extend_from_slice(qa::COMMANDS);
     v.extend_from_slice(quad::COMMANDS);
@@ -171,6 +174,7 @@ static REGISTRY: LazyLock<Vec<CommandSpec>> = LazyLock::new(|| {
     v.extend_from_slice(section::COMMANDS);
     v.extend_from_slice(sketch::COMMANDS);
     v.extend_from_slice(surface::COMMANDS);
+    v.extend_from_slice(working::COMMANDS);
     v.sort_by_key(|c| c.id);
     v
 });

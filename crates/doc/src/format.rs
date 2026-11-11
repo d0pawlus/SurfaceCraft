@@ -33,6 +33,9 @@ pub fn from_json(text: &str) -> Result<Document, String> {
     }
     for m in &env.document.meshes {
         m.mesh.validate().map_err(|e| format!("mesh {}: {e}", m.name))?;
+        if let Some(w) = &m.working {
+            w.mesh.validate().map_err(|e| format!("working copy of {}: {e}", m.name))?;
+        }
     }
     let mut doc = env.document;
     let max_id = doc.meshes.iter().map(|m| m.id.0).chain(doc.bodies.iter().map(|b| b.id.0)).max().unwrap_or(0);
@@ -121,5 +124,25 @@ mod tests {
         assert!(from_json("not json").is_err());
         let tampered = text.replace("\"vertices\":", "\"vertices\":1");
         assert!(from_json(&tampered).is_err());
+    }
+
+    #[test]
+    fn working_copy_roundtrip() {
+        use crate::WorkingCopy;
+        use crate::object::Object;
+        use std::sync::Arc;
+        use surfacecraft_geom::{Point3, Vec3};
+        let mut d = Document::new();
+        let original = synth::plane(Point3::origin(), Vec3::x(), Vec3::y(), 2.0, 2.0, 2, 2);
+        let id = d.add_mesh("sheet", original.clone());
+        let plain = to_json(&d).unwrap();
+        assert!(!plain.contains("\"working\""), "no copy, no key");
+        let copy = synth::plane(Point3::new(0.0, 0.0, 1.0), Vec3::x(), Vec3::y(), 2.0, 2.0, 3, 3);
+        d.mesh_mut(id).unwrap().working = Some(WorkingCopy { mesh: Arc::new(copy.clone()) });
+        let back = from_json(&to_json(&d).unwrap()).unwrap();
+        let obj = back.mesh(id).unwrap();
+        assert_eq!(*obj.mesh, original);
+        assert_eq!(obj.working.as_ref().map(|w| (*w.mesh).clone()), Some(copy));
+        assert!(obj.detail().contains("working copy"), "{}", obj.detail());
     }
 }
