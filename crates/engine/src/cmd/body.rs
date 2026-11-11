@@ -95,8 +95,10 @@ fn make_sphere(s: &mut Session, i: SphereIn) -> CmdResult<BodyOut> {
 #[serde(deny_unknown_fields)]
 pub struct BlendIn {
     /// Body id or name.
+    #[schemars(extend("x-pick-body" = true))]
     pub object: ObjRef,
     /// Edge indices (as in the body record).
+    #[schemars(extend("x-pick" = "edges"))]
     pub edges: Vec<usize>,
     /// Radius (fillet) or distance (chamfer), mm.
     pub size: f64,

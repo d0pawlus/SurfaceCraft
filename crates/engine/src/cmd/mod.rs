@@ -73,6 +73,9 @@ pub struct CommandSpec {
     pub output: fn() -> Value,
     /// Runs it.
     pub run: fn(&mut Session, Value) -> CmdResult<Value>,
+    /// Runs it without `&mut`, for the front ends' read-only queries (see `Session::query`). Only
+    /// read commands declared with [`read_command!`] have one.
+    pub read: Option<fn(&Session, Value) -> CmdResult<Value>>,
 }
 
 impl std::fmt::Debug for CommandSpec {
@@ -115,6 +118,34 @@ macro_rules! command {
                 let o: $out = $f(s, input)?;
                 $crate::cmd::out(o)
             },
+            read: None,
+        }
+    };
+}
+
+/// Declares a read-only [`CommandSpec`] from a handler `fn(&Session, In) -> CmdResult<Out>`: it
+/// changes nothing, so it is never undoable, and it has the `read` form a query runs.
+#[macro_export]
+macro_rules! read_command {
+    ($id:literal, $label:literal, $group:literal, $summary:literal, $in:ty, $out:ty, $f:path) => {
+        $crate::cmd::CommandSpec {
+            id: $id,
+            label: $label,
+            group: $group,
+            summary: $summary,
+            undoable: false,
+            input: $crate::cmd::schema::<$in>,
+            output: $crate::cmd::schema::<$out>,
+            run: |s, v| {
+                let input: $in = $crate::cmd::parse(v)?;
+                let o: $out = $f(s, input)?;
+                $crate::cmd::out(o)
+            },
+            read: Some(|s, v| {
+                let input: $in = $crate::cmd::parse(v)?;
+                let o: $out = $f(s, input)?;
+                $crate::cmd::out(o)
+            }),
         }
     };
 }

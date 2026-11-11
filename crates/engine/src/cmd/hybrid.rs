@@ -327,7 +327,7 @@ fn collect_items(
     refs: &[ObjRef],
     cache: &mut HashMap<ObjectId, Arc<Vec<Vec3>>>,
     mut grow: impl FnMut(&[Point3]),
-) -> CmdResult<(Vec<Item>, Vec<FaceOf>, Vec<Point3>)> {
+) -> CmdResult<(Vec<Item>, Vec<FaceOf>, plan::Scan)> {
     let mut items: Vec<Item> = Vec::new();
     let mut early: Vec<FaceOf> = Vec::new();
     let mut mesh: Option<ObjectId> = None;
@@ -358,9 +358,9 @@ fn collect_items(
             }),
         }
     }
-    let scan: Vec<Point3> = match mesh.and_then(|m| s.doc.mesh(m)) {
-        Some(m) => m.mesh.positions.clone(),
-        None => Vec::new(),
+    let scan = match mesh.and_then(|m| s.doc.mesh(m)) {
+        Some(m) => plan::Scan::from_mesh(&m.mesh),
+        None => plan::Scan::from_points(Vec::new(), 1.0),
     };
     Ok((items, early, scan))
 }

@@ -2,18 +2,24 @@
 //! threads). Callers write one closure; the result order is the index order either way, so
 //! parallel and sequential runs give identical results.
 
+/// Threads data-parallel work spreads over (1 on wasm).
+#[must_use]
+pub fn threads() -> usize {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        rayon::current_num_threads()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        1
+    }
+}
+
 /// Does this build run work on several threads? (Results never depend on it; it only tells
 /// callers whether speculative work can pay off.)
 #[must_use]
 pub fn parallel() -> bool {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        rayon::current_num_threads() > 1
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        false
-    }
+    threads() > 1
 }
 
 /// `f(0), f(1), …, f(n − 1)`, evaluated in parallel where threads exist.

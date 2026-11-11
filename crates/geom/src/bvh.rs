@@ -237,6 +237,29 @@ impl Bvh {
         }
         best
     }
+
+    /// The triangles under every box on their way down that `keep` accepts, ascending. A box that
+    /// `keep` rejects prunes all its triangles, so `keep` must accept every box that can hold a
+    /// triangle the caller wants (a box is never smaller than what it holds).
+    #[must_use]
+    pub fn candidates(&self, keep: &dyn Fn(&Aabb) -> bool) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut stack: Vec<u32> = if self.nodes.is_empty() { Vec::new() } else { vec![0] };
+        while let Some(ni) = stack.pop() {
+            let Some(node) = self.nodes.get(ni as usize) else { continue };
+            if !keep(&node.bbox) {
+                continue;
+            }
+            if node.leaf {
+                out.extend_from_slice(self.order.get(node.start as usize..node.end as usize).unwrap_or(&[]));
+            } else {
+                stack.push(node.left);
+                stack.push(node.right);
+            }
+        }
+        out.sort_unstable();
+        out
+    }
 }
 
 fn slab(b: &Aabb, o: &Point3, inv: &Vec3, tmax: f64) -> bool {
@@ -294,5 +317,38 @@ mod tests {
         let (_, t) = bvh.ray_cast(&Point3::new(0.1, 0.2, 20.0), &Vec3::new(0.0, 0.0, -1.0)).unwrap();
         assert!((t - 15.0).abs() < 0.1);
         assert!(bvh.ray_cast(&Point3::new(9.0, 9.0, 20.0), &Vec3::new(0.0, 0.0, -1.0)).is_none());
+    }
+
+    #[test]
+    fn candidates_keep_every_triangle_whose_centroid_is_in_the_box() {
+        let m = synth::sphere(Point3::origin(), 5.0, 48, 24);
+        let bvh = Bvh::build(&m);
+        let all = bvh.candidates(&|_| true);
+        assert_eq!(all, (0..m.triangle_count() as u32).collect::<Vec<u32>>(), "ascending, each once");
+        let region = Aabb { min: Point3::new(-1.0, -1.0, 2.0), max: Point3::new(1.0, 1.0, 6.0) };
+        let kept = bvh.candidates(&|b| {
+            b.min.x <= region.max.x
+                && b.max.x >= region.min.x
+                && b.min.y <= region.max.y
+                && b.max.y >= region.min.y
+                && b.min.z <= region.max.z
+                && b.max.z >= region.min.z
+        });
+        for t in 0..m.triangle_count() {
+            let c = m.triangle(t).map(|[a, b, c]| Point3::from((a.coords + b.coords + c.coords) / 3.0));
+            if c.is_some_and(|c| {
+                region.min.x <= c.x
+                    && c.x <= region.max.x
+                    && region.min.y <= c.y
+                    && c.y <= region.max.y
+                    && region.min.z <= c.z
+                    && c.z <= region.max.z
+            }) {
+                assert!(kept.contains(&(t as u32)), "triangle {t} lies in the box and was pruned");
+            }
+        }
+        assert!(kept.len() < m.triangle_count() / 4, "the box prunes most of the sphere: {}", kept.len());
+        assert!(bvh.candidates(&|_| false).is_empty());
+        assert!(Bvh::default().candidates(&|_| true).is_empty());
     }
 }

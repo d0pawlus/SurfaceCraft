@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use surfacecraft_doc::{Document, ObjectId, QuadObject, WorkingCopy};
 use surfacecraft_engine::Session;
+use surfacecraft_fit::Primitive;
 use surfacecraft_geom::{Bvh, Mesh, Point3, Vec3, synth};
 
 /// Tolerance of the exact comparisons (mm).
@@ -446,4 +447,37 @@ fn p8_promote_with_unchanged_triangles_keeps_regions() {
     assert_eq!(p["quad_layouts_dropped"], 0, "{p}");
     assert_eq!(p["triangles"], p["triangles_before"], "{p}");
     assert_eq!(s.doc.regions.len(), 1);
+}
+
+/// Gate: a deviation map is tied to the original's geometry. Edits of the working copy leave the
+/// original's allocation alone, so its map stays live; discarding the copy keeps it; promoting a copy
+/// whose triangles changed replaces the original's geometry and drops the map.
+#[test]
+fn p8_a_map_of_the_original_survives_copy_edits_and_promote_drops_it() {
+    let mut s = Session::new();
+    sheet_with_copy(&mut s, "sheet");
+    s.doc.add_primitive(
+        "ref",
+        Primitive::Plane { point: [0.0, 0.0, 0.0], normal: [0.0, 0.0, 1.0] },
+        None,
+        0.0,
+        0.0,
+        Mesh::default(),
+    );
+    let id = id_of(&s, "sheet");
+    let reading = |s: &Session| s.query("deviation.at", json!({"object": "sheet", "triangle": 0})).is_ok();
+    s.execute("deviation.compute", json!({"object": "sheet", "against": "ref", "tolerance": 0.02})).unwrap();
+    assert!(s.live_map(id).is_some() && reading(&s), "the map of the original");
+    // edits of the copy: the original is untouched, so its map is still live
+    s.execute("mesh.decimate", json!({"object": "sheet", "ratio": 0.5})).unwrap();
+    assert!(s.live_map(id).is_some() && reading(&s), "the copy's edit keeps the original's map");
+    // discard: the original is untouched, so the map is still live
+    s.execute("mesh.working_discard", json!({"object": "sheet"})).unwrap();
+    assert!(s.live_map(id).is_some() && reading(&s), "discard keeps the original's map");
+    // promote a copy whose triangles changed: the original's geometry is replaced and the map goes
+    s.execute("mesh.working_begin", json!({"object": "sheet"})).unwrap();
+    s.execute("mesh.decimate", json!({"object": "sheet", "ratio": 0.5})).unwrap();
+    s.execute("mesh.working_promote", json!({"object": "sheet"})).unwrap();
+    assert!(s.maps.is_empty(), "promote drops the map of the replaced geometry");
+    assert!(!reading(&s), "no stale reading after promote");
 }

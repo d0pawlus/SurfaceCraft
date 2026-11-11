@@ -20,6 +20,7 @@ pub mod hybrid;
 pub mod local;
 pub mod naming;
 pub mod nurbs;
+pub mod pcurve;
 pub mod refit;
 pub mod solid;
 pub mod step;

@@ -133,9 +133,6 @@ fn edit_mesh(
     } else {
         store_editable(s, id, m)?;
     }
-    if !working {
-        s.overlays.remove(&id);
-    }
     Ok(o)
 }
 

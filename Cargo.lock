@@ -2957,8 +2957,10 @@ name = "surfacecraft-fit"
 version = "0.1.0"
 dependencies = [
  "nalgebra",
+ "rayon",
  "schemars",
  "serde",
+ "serde_json",
  "surfacecraft-geom",
 ]
 

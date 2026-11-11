@@ -1,7 +1,8 @@
 //! Picking the value of a form field with the mouse in the viewport.
 //!
-//! A form field that takes geometry (the 3-2-1 datums of `align.datum`, lists of points, the
-//! `edges` of a fillet or chamfer) gets a "Pick in viewport" button. While a field is being
+//! A form field that takes geometry gets a "Pick in viewport" button. Which fields do is said by
+//! the `x-pick` marker in the command's JSON Schema (the 3-2-1 datums of `align.datum`, lists of
+//! points, the `edges` of a fillet or chamfer), never by the field's name. While a field is being
 //! picked a click in the viewport ray-casts onto the scan (points) or looks for the nearest body
 //! edge within a pixel tolerance (edges), writes the result into the command's JSON parameters
 //! (the typed field stays editable and shows the same value) and highlights what was picked.
@@ -18,13 +19,12 @@ use std::collections::BTreeSet;
 use surfacecraft_doc::ObjectId;
 use surfacecraft_geom::Vec3;
 
-/// The datum parameters of `align.datum`, in order, with the number of points each one takes: a
-/// plane from three points, an axis from two, a point from one.
-pub const DATUM_FIELDS: [(&str, usize); 3] = [("primary", 3), ("secondary", 2), ("tertiary", 1)];
+/// The schema extension that marks a parameter the viewport can fill, with what is picked for it
+/// (`"plane"`, `"axis"`, `"point"`, `"points"` or `"edges"`).
+pub const PICK_MARKER: &str = "x-pick";
 
-/// The parameters that name the body whose edges are picked (`body.fillet` calls it `object`,
-/// `feature.fillet` calls it `body`).
-const BODY_KEYS: [&str; 2] = ["object", "body"];
+/// The schema extension that marks the parameter naming the body whose edges are picked.
+pub const PICK_BODY_MARKER: &str = "x-pick-body";
 
 /// A point closer than this to collinear gives no plane.
 const DEGENERATE: f64 = 1e-9;
@@ -43,22 +43,126 @@ pub enum PickKind {
     Edges,
 }
 
-/// The number of points the datum parameter called `name` takes (`None` for other parameters).
-#[must_use]
-pub fn datum_need(name: &str) -> Option<usize> {
-    DATUM_FIELDS.iter().find(|(n, _)| *n == name).map(|(_, k)| *k)
+impl PickKind {
+    /// The points a datum takes (`None` for lists).
+    #[must_use]
+    pub fn need(self) -> Option<usize> {
+        match self {
+            Self::Datum { need } => Some(need),
+            Self::Points | Self::Edges => None,
+        }
+    }
 }
 
-/// What the datum parameter `name` starts as: the world plane, axis or point of its role (a 3-2-1
-/// alignment with these moves nothing).
-#[must_use]
-pub fn datum_default(name: &str) -> Option<Value> {
-    match name {
-        "primary" => Some(json!({"plane": {"point": [0.0, 0.0, 0.0], "normal": [0.0, 0.0, 1.0]}})), // not a colour
-        "secondary" => Some(json!({"axis": {"point": [0.0, 0.0, 0.0], "direction": [1.0, 0.0, 0.0]}})), // not a colour
-        "tertiary" => Some(json!({"point": {"point": [0.0, 0.0, 0.0]}})),                           // not a colour
-        _ => None,
+/// What a marked parameter takes, as its schema marker names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PickMode {
+    /// A plane datum from three points (the primary datum of a 3-2-1 alignment).
+    Plane,
+    /// An axis datum from two points (the secondary datum).
+    Axis,
+    /// A point datum from one point (the tertiary datum).
+    Point,
+    /// A list of points.
+    Points,
+    /// A list of edge indices of a body.
+    Edges,
+}
+
+impl PickMode {
+    /// The mode a marker names (`None` for an unknown marker).
+    #[must_use]
+    pub fn from_marker(marker: &str) -> Option<Self> {
+        match marker {
+            "plane" => Some(Self::Plane),
+            "axis" => Some(Self::Axis),
+            "point" => Some(Self::Point),
+            "points" => Some(Self::Points),
+            "edges" => Some(Self::Edges),
+            _ => None,
+        }
     }
+
+    /// The mode of a property schema (`None` when the property carries no marker).
+    #[must_use]
+    pub fn of(prop: &Value) -> Option<Self> {
+        Self::from_marker(prop.get(PICK_MARKER)?.as_str()?)
+    }
+
+    /// What a field of this mode takes from the viewport.
+    #[must_use]
+    pub fn kind(self) -> PickKind {
+        match self {
+            Self::Plane => PickKind::Datum { need: 3 },
+            Self::Axis => PickKind::Datum { need: 2 },
+            Self::Point => PickKind::Datum { need: 1 },
+            Self::Points => PickKind::Points,
+            Self::Edges => PickKind::Edges,
+        }
+    }
+
+    /// The position of a datum in the 3-2-1 order (plane, axis, point); `None` for lists.
+    #[must_use]
+    pub fn datum_rank(self) -> Option<u8> {
+        match self {
+            Self::Plane => Some(0),
+            Self::Axis => Some(1),
+            Self::Point => Some(2),
+            Self::Points | Self::Edges => None,
+        }
+    }
+
+    /// What a datum parameter of this mode starts as: the world plane, axis or point (a 3-2-1
+    /// alignment with these moves nothing). `None` for lists.
+    #[must_use]
+    pub fn default_value(self) -> Option<Value> {
+        match self {
+            Self::Plane => Some(json!({"plane": {"point": [0.0, 0.0, 0.0], "normal": [0.0, 0.0, 1.0]}})), // not a colour
+            Self::Axis => Some(json!({"axis": {"point": [0.0, 0.0, 0.0], "direction": [1.0, 0.0, 0.0]}})), // not a colour
+            Self::Point => Some(json!({"point": {"point": [0.0, 0.0, 0.0]}})), // not a colour
+            Self::Points | Self::Edges => None,
+        }
+    }
+}
+
+/// The parameters of a command's input schema that carry a pick marker, in property order.
+#[must_use]
+pub fn marked_fields(input: &Value) -> Vec<(String, PickMode)> {
+    let Some(props) = input.get("properties").and_then(Value::as_object) else { return Vec::new() };
+    props.iter().filter_map(|(name, prop)| Some((name.clone(), PickMode::of(prop)?))).collect()
+}
+
+/// The parameter of a command's input schema that names the body whose edges are picked.
+#[must_use]
+pub fn body_field(input: &Value) -> Option<String> {
+    let props = input.get("properties").and_then(Value::as_object)?;
+    props.iter().find(|(_, p)| p.get(PICK_BODY_MARKER).and_then(Value::as_bool) == Some(true)).map(|(n, _)| n.clone())
+}
+
+/// The JSON Schema of the parameters of the command `id` (`None` for an unknown command).
+#[must_use]
+pub fn input_schema(id: &str) -> Option<Value> {
+    surfacecraft_engine::cmd::find(id).map(|spec| (spec.input)())
+}
+
+/// The parameters a pick fills, in order: the field itself, and for a 3-2-1 datum the datums after
+/// it in the schema.
+#[must_use]
+pub fn pick_queue(input: &Value, field: &str, kind: PickKind) -> Vec<(String, PickKind)> {
+    let marked = marked_fields(input);
+    if !matches!(kind, PickKind::Datum { .. }) {
+        return vec![(field.to_string(), kind)];
+    }
+    let Some(from) = marked.iter().find(|(n, _)| n == field).and_then(|(_, m)| m.datum_rank()) else {
+        return Vec::new();
+    };
+    let mut datums: Vec<(u8, String, PickMode)> = marked
+        .into_iter()
+        .filter_map(|(n, m)| Some((m.datum_rank()?, n, m)))
+        .filter(|(rank, _, _)| *rank >= from)
+        .collect();
+    datums.sort_by_key(|(rank, _, _)| *rank);
+    datums.into_iter().map(|(_, n, m)| (n, m.kind())).collect()
 }
 
 /// A form's wish to start or stop picking a field (the form never acts on it itself).
@@ -79,6 +183,8 @@ pub struct FieldPick {
     pub command: &'static str,
     /// The fields still to pick, the current one first.
     queue: Vec<(String, PickKind)>,
+    /// The parameter naming the body whose edges are picked (`x-pick-body`), if the command has one.
+    body: Option<String>,
     /// Points clicked for the current datum.
     pub buffer: Vec<[f64; 3]>,
     /// Every point clicked in this pick (drawn as numbered markers).
@@ -203,18 +309,13 @@ impl SurfaceCraftApp {
     /// palette is the one the pick belongs to.
     pub fn start_field_pick(&mut self, field: &str, kind: PickKind) {
         let Some(command) = self.palette_command else { return };
-        let queue: Vec<(String, PickKind)> = match kind {
-            PickKind::Datum { .. } => DATUM_FIELDS
-                .iter()
-                .skip_while(|(n, _)| *n != field)
-                .map(|(n, k)| ((*n).to_string(), PickKind::Datum { need: *k }))
-                .collect(),
-            other => vec![(field.to_string(), other)],
-        };
+        let Some(input) = input_schema(command) else { return };
+        let queue = pick_queue(&input, field, kind);
         if queue.is_empty() {
             return;
         }
-        self.field_pick = Some(FieldPick { command, queue, buffer: Vec::new(), marks: Vec::new(), hover: None });
+        let body = body_field(&input);
+        self.field_pick = Some(FieldPick { command, queue, body, buffer: Vec::new(), marks: Vec::new(), hover: None });
         self.tools.hover = None;
         self.tools.touch();
         if let Some((_, hint)) = self.field_pick_hint() {
@@ -379,9 +480,9 @@ impl SurfaceCraftApp {
             return Err("fieldpick.miss");
         };
         let Some(mut map) = self.params_object() else { return Err("form.err.json") };
-        let key = BODY_KEYS.iter().copied().find(|k| map.contains_key(*k));
+        let key = self.field_pick.as_ref().and_then(|f| f.body.clone());
         // edges of another body start a new list: edge indices only mean something per body
-        let same_body = match key.and_then(|k| map.get(k)) {
+        let same_body = match key.as_ref().and_then(|k| map.get(k)) {
             Some(v) => self.object_of(v) == Some(body),
             None => true,
         };
@@ -415,7 +516,7 @@ impl SurfaceCraftApp {
             && let Some(field) = fp.field()
             && let Some(map) = self.params_object()
         {
-            let body = BODY_KEYS.iter().find_map(|k| map.get(*k)).and_then(|v| self.object_of(v));
+            let body = fp.body.as_ref().and_then(|k| map.get(k)).and_then(|v| self.object_of(v));
             return (body, Self::edges_of(&map, field).into_iter().map(|e| e as usize).collect());
         }
         (self.tools.brep.body, self.tools.brep.edges.clone())
@@ -464,11 +565,125 @@ mod tests {
         }
     }
 
+    /// The schema extensions the engine puts on the fields the viewport fills, as (command,
+    /// parameter, extension). These are the fields that had a "Pick in viewport" button before the
+    /// markers: the 3-2-1 datums, the lists of points, the edge lists, and the bodies owning them.
+    const MARKED: &[(&str, &str, &str)] = &[
+        ("align.n_point", "from", "x-pick"),
+        ("align.n_point", "to", "x-pick"),
+        ("align.datum", "primary", "x-pick"),
+        ("align.datum", "secondary", "x-pick"),
+        ("align.datum", "tertiary", "x-pick"),
+        ("body.fillet", "edges", "x-pick"),
+        ("body.fillet", "object", "x-pick-body"),
+        ("body.chamfer", "edges", "x-pick"),
+        ("body.chamfer", "object", "x-pick-body"),
+        ("feature.fillet", "edges", "x-pick"),
+        ("feature.fillet", "body", "x-pick-body"),
+        ("feature.chamfer", "edges", "x-pick"),
+        ("feature.chamfer", "body", "x-pick-body"),
+    ];
+
+    fn input_of(id: &str) -> Value {
+        surfacecraft_engine::cmd::find(id).map(|spec| (spec.input)()).expect("a registered command")
+    }
+
     #[test]
-    fn the_datum_parameters_are_in_3_2_1_order() {
-        assert_eq!(datum_need("primary"), Some(3));
-        assert_eq!(datum_need("secondary"), Some(2));
-        assert_eq!(datum_need("tertiary"), Some(1));
-        assert_eq!(datum_need("object"), None);
+    fn every_marker_resolves_and_the_engine_marks_exactly_the_fields_that_had_a_button() {
+        let mut found: Vec<(String, String, String)> = Vec::new();
+        for spec in surfacecraft_engine::cmd::registry() {
+            let input = (spec.input)();
+            let Some(props) = input.get("properties").and_then(Value::as_object) else { continue };
+            for (name, prop) in props {
+                for ext in [PICK_MARKER, PICK_BODY_MARKER] {
+                    if prop.get(ext).is_some() {
+                        found.push((spec.id.to_string(), name.clone(), ext.to_string()));
+                    }
+                }
+                if prop.get(PICK_MARKER).is_some() {
+                    assert!(PickMode::of(prop).is_some(), "{}.{name}: unknown pick mode {prop}", spec.id);
+                }
+            }
+        }
+        let mut want: Vec<(String, String, String)> =
+            MARKED.iter().map(|(c, f, e)| ((*c).to_string(), (*f).to_string(), (*e).to_string())).collect();
+        found.sort();
+        want.sort();
+        assert_eq!(found, want);
+    }
+
+    #[test]
+    fn each_marked_field_takes_the_pick_its_mode_names() {
+        let modes = [
+            ("align.n_point", "from", PickMode::Points),
+            ("align.n_point", "to", PickMode::Points),
+            ("align.datum", "primary", PickMode::Plane),
+            ("align.datum", "secondary", PickMode::Axis),
+            ("align.datum", "tertiary", PickMode::Point),
+            ("body.fillet", "edges", PickMode::Edges),
+            ("feature.chamfer", "edges", PickMode::Edges),
+        ];
+        for (command, field, mode) in modes {
+            let input = input_of(command);
+            let prop = input.get("properties").and_then(|p| p.get(field)).expect("the field exists");
+            assert_eq!(PickMode::of(prop), Some(mode), "{command}.{field}");
+        }
+        assert_eq!(body_field(&input_of("body.fillet")).as_deref(), Some("object"));
+        assert_eq!(body_field(&input_of("feature.fillet")).as_deref(), Some("body"));
+        assert_eq!(body_field(&input_of("align.datum")), None);
+    }
+
+    /// A pick is chosen by its marker, never by the parameter's name: a parameter named like a
+    /// datum, an edge list or a body does nothing without a marker.
+    #[test]
+    fn a_field_is_picked_by_its_marker_not_by_its_name() {
+        let input = json!({"properties": {
+            "primary": {"type": "array"},
+            "edges": {"type": "array"},
+            "body": {"type": "string"},
+            "from": {"type": "array", "x-pick": "edges"},
+            "anything": {"type": "array", "x-pick": "points"},
+        }});
+        let mut marked = marked_fields(&input);
+        marked.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(marked, vec![("anything".to_string(), PickMode::Points), ("from".to_string(), PickMode::Edges)]);
+        assert_eq!(body_field(&input), None);
+        assert!(pick_queue(&input, "primary", PickKind::Datum { need: 3 }).is_empty());
+        assert_eq!(
+            pick_queue(&input, "from", PickKind::Edges),
+            vec![("from".to_string(), PickKind::Edges)],
+            "a marked field picks what its marker names, whatever its name"
+        );
+    }
+
+    #[test]
+    fn a_datum_pick_goes_on_through_the_datums_after_it_in_3_2_1_order() {
+        let input = input_of("align.datum");
+        let datum = |n: &str, need: usize| (n.to_string(), PickKind::Datum { need });
+        let from = |f: &str| pick_queue(&input, f, PickKind::Datum { need: 3 });
+        assert_eq!(from("primary"), vec![datum("primary", 3), datum("secondary", 2), datum("tertiary", 1)]);
+        assert_eq!(from("secondary"), vec![datum("secondary", 2), datum("tertiary", 1)]);
+        assert_eq!(from("tertiary"), vec![datum("tertiary", 1)]);
+        assert!(from("object").is_empty(), "an unmarked field starts no pick");
+    }
+
+    #[test]
+    fn datum_modes_start_as_the_world_plane_axis_and_point() {
+        assert_eq!(PickMode::Plane.kind(), PickKind::Datum { need: 3 });
+        assert_eq!(PickMode::Axis.kind(), PickKind::Datum { need: 2 });
+        assert_eq!(PickMode::Point.kind(), PickKind::Datum { need: 1 });
+        assert_eq!(PickMode::Points.kind(), PickKind::Points);
+        assert_eq!(PickMode::Edges.kind(), PickKind::Edges);
+        assert_eq!(
+            PickMode::Plane.default_value(),
+            Some(json!({"plane": {"point": [0.0, 0.0, 0.0], "normal": [0.0, 0.0, 1.0]}}))
+        );
+        assert_eq!(
+            PickMode::Axis.default_value(),
+            Some(json!({"axis": {"point": [0.0, 0.0, 0.0], "direction": [1.0, 0.0, 0.0]}}))
+        );
+        assert_eq!(PickMode::Point.default_value(), Some(json!({"point": {"point": [0.0, 0.0, 0.0]}})));
+        assert_eq!(PickMode::Edges.default_value(), None);
+        assert_eq!(PickMode::from_marker("face"), None, "faces are not picked as a field yet");
     }
 }

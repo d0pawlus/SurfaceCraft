@@ -8,8 +8,11 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use serde_json::json;
 use surfacecraft_deviation::{colorize, palette};
+use surfacecraft_doc::ObjectId;
+use surfacecraft_geom::Point3;
 use surfacecraft_ui_egui::SurfaceCraftApp;
-use surfacecraft_ui_egui::deviation_panel::{self, LEGEND};
+use surfacecraft_ui_egui::deviation_panel::readout::{self, MAX_PINS, Reading, Spot, with_pin, without_pin};
+use surfacecraft_ui_egui::deviation_panel::{self, LEGEND, hotspots};
 use surfacecraft_ui_egui::i18n::{self, Lang};
 use surfacecraft_ui_egui::theme::{Preset, Token, Tokens, to_color32};
 
@@ -26,6 +29,11 @@ fn scanned() -> SurfaceCraftApp {
     app
 }
 
+/// A window tall enough for the whole Deviation tab, so that its lower buttons are on screen.
+fn tall_harness(app: SurfaceCraftApp) -> Harness<'static, SurfaceCraftApp> {
+    Harness::builder().with_size((1600.0, 1600.0)).build_ui_state(|ui, app: &mut SurfaceCraftApp| app.draw(ui), app)
+}
+
 fn harness(app: SurfaceCraftApp) -> Harness<'static, SurfaceCraftApp> {
     Harness::builder().with_size((1600.0, 1000.0)).build_ui_state(|ui, app: &mut SurfaceCraftApp| app.draw(ui), app)
 }
@@ -37,8 +45,8 @@ fn the_panel_shows_the_statistics_and_the_histogram_adds_up_to_the_count() {
     assert_eq!(cur.name, "scan");
     assert!(cur.stats.count > 1000, "points measured: {}", cur.stats.count);
     // the bins of the histogram hold every measured point
-    let bins = deviation_panel::bins(&cur.stats);
-    assert_eq!(bins.len(), 10);
+    let bins = deviation_panel::bins(&cur.report.histogram, cur.stats.tolerance);
+    assert_eq!(bins.len(), 10, "the report's bins are the stats' ten bins");
     assert_eq!(bins.iter().map(|b| b.count).sum::<usize>(), cur.stats.count);
     // statistics are ordered and the noise sits inside the tolerance
     assert!(cur.stats.min <= cur.stats.mean && cur.stats.mean <= cur.stats.max);
@@ -109,6 +117,205 @@ fn the_tolerance_control_reruns_the_command_with_the_same_reference() {
     // without a map there is nothing to recompute
     let mut empty = SurfaceCraftApp::headless();
     assert!(deviation_panel::recompute(&mut empty, 0.1).is_none());
+}
+
+/// A flat 40 mm scan 0.05 mm above a flat reference, mapped with tolerance 0.02 mm: every point is
+/// off the tolerance, so the hotspots are one group. The plane's `center` is its corner, so it is
+/// set at (−20, −20) to be centred on the origin, where the default camera looks.
+fn offset_map() -> SurfaceCraftApp {
+    let mut app = SurfaceCraftApp::headless();
+    let plane = |z: f64, name: &str| json!({"shape": "plane", "size": [40.0, 40.0], "resolution": 40, "center": [-20.0, -20.0, z], "name": name});
+    app.run_command("mesh.synth", plane(0.05, "scan")).expect("the offset scan");
+    app.run_command("mesh.synth", plane(0.0, "ref")).expect("the reference");
+    app.run_command("deviation.compute", json!({"object": "scan", "against": "ref", "tolerance": 0.02}))
+        .expect("the deviation map");
+    app
+}
+
+fn scan_id(app: &SurfaceCraftApp) -> ObjectId {
+    app.session.doc.summaries().into_iter().find(|s| s.name == "scan").expect("the scan").id
+}
+
+/// A view of 800 × 600 pixels: its centre ray meets the scan at the origin.
+const VIEW: (f64, f64) = (800.0, 600.0);
+
+fn spot(object: u64, triangle: u32) -> Spot {
+    Spot { object: ObjectId(object), triangle, point: [0.0; 3] }
+}
+
+#[test]
+fn the_histogram_bins_and_bands_are_the_command_output() {
+    let mut app = scanned();
+    let out = app
+        .run_command("deviation.compute", json!({"object": "scan", "against": "ref", "tolerance": 0.1}))
+        .expect("the map");
+    let cur = deviation_panel::current(&app).expect("a map");
+    let counts: Vec<u64> =
+        out["report"]["histogram"]["counts"].as_array().expect("the bins").iter().filter_map(|c| c.as_u64()).collect();
+    let shown: Vec<u64> =
+        deviation_panel::bins(&cur.report.histogram, cur.stats.tolerance).iter().map(|b| b.count as u64).collect();
+    assert_eq!(shown, counts, "the bins shown are the command's");
+    let shares: Vec<f64> =
+        out["report"]["bands"].as_array().expect("the bands").iter().filter_map(|b| b["share"].as_f64()).collect();
+    let shown_shares: Vec<f64> = cur.report.bands.iter().map(|b| b.share).collect();
+    assert_eq!(shown_shares, shares, "the bands shown are the command's");
+    assert!(shares.windows(2).all(|w| w[0] <= w[1]), "the bands are cumulative: {shares:?}");
+    let at_tolerance = cur.report.bands.iter().find(|b| (b.tolerance - cur.stats.tolerance).abs() < 1e-12);
+    let at_tolerance = at_tolerance.expect("a band at the tolerance");
+    assert!((at_tolerance.share - cur.stats.within).abs() < 1e-9, "the band at the tolerance is the within share");
+}
+
+#[test]
+fn a_reading_is_pinned_once_and_the_oldest_goes_past_the_limit() {
+    let pinned = with_pin(&[], spot(1, 3));
+    assert_eq!(pinned, vec![spot(1, 3)]);
+    assert_eq!(with_pin(&pinned, spot(1, 3)), pinned, "a triangle is pinned once");
+    let many = (0..MAX_PINS + 2).fold(Vec::new(), |pins, t| with_pin(&pins, spot(1, t as u32)));
+    assert_eq!(many.len(), MAX_PINS);
+    assert_eq!(many.first().map(|s| s.triangle), Some(2), "the two oldest are gone");
+    assert_eq!(without_pin(&pinned, 0), Vec::<Spot>::new(), "a removed pin is gone");
+    assert_eq!(without_pin(&pinned, 4), pinned, "an index past the end removes nothing");
+}
+
+#[test]
+fn the_reading_at_the_centre_of_the_view_is_the_engines_reading() {
+    let mut app = offset_map();
+    let scan = scan_id(&app);
+    let (vw, vh) = VIEW;
+    let at_centre = readout::spot_at(&mut app, scan, vw / 2.0, vh / 2.0, vw, vh).expect("the scan is at the centre");
+    assert_eq!(at_centre.object, scan);
+    let Reading::Measured(value) = readout::read(&mut app, at_centre) else { panic!("the centre is measured") };
+    // 0.05 mm off the reference; the sign follows the mesh normals, so only the size is known
+    assert!((value.abs() - 0.05).abs() < 1e-3, "{value}");
+    let logged = app
+        .run_command("deviation.at", json!({"object": scan.0, "triangle": at_centre.triangle}))
+        .expect("the command reads the same triangle");
+    let by_command = logged["deviation"].as_f64().expect("a deviation");
+    assert!((by_command - value).abs() < 1e-9, "the readout is the command's: {by_command} and {value}");
+}
+
+#[test]
+fn a_click_on_the_scan_pins_its_reading_until_it_is_removed() {
+    let mut app = offset_map();
+    let scan = scan_id(&app);
+    let (vw, vh) = VIEW;
+    let at_centre = readout::spot_at(&mut app, scan, vw / 2.0, vh / 2.0, vw, vh).expect("the scan at the centre");
+    readout::pin_click(&mut app, vw / 2.0, vh / 2.0, vw, vh, true);
+    readout::pin_click(&mut app, vw / 2.0, vh / 2.0, vw, vh, true);
+    assert_eq!(app.deviation.pins, vec![at_centre], "the same triangle is pinned once");
+    let mut ui = tall_harness(app);
+    ui.run();
+    ui.get_by_label("Deviation").click();
+    ui.run();
+    ui.run();
+    assert!(ui.query_by_label(i18n::lookup(Lang::En, "deviation.pinned")).is_some(), "the pinned section");
+    assert!(ui.query_by_label(i18n::lookup(Lang::En, "deviation.unpin")).is_some(), "the pin's Remove button");
+    // the Remove button sits below the fold of the 336 px tab, so the removal is driven on the state
+    let remaining = readout::without_pin(&ui.state().deviation.pins, 0);
+    ui.state_mut().deviation.pins = remaining;
+    ui.run();
+    assert!(ui.state().deviation.pins.is_empty(), "a removed pin is gone");
+}
+
+#[test]
+fn a_plain_click_on_the_scan_only_selects_and_an_alt_click_pins() {
+    let mut app = offset_map();
+    let (vw, vh) = VIEW;
+    readout::pin_click(&mut app, vw / 2.0, vh / 2.0, vw, vh, false);
+    assert!(app.deviation.pins.is_empty(), "a plain click pins nothing");
+    readout::pin_click(&mut app, vw / 2.0, vh / 2.0, vw, vh, true);
+    assert_eq!(app.deviation.pins.len(), 1, "Alt-click pins the reading");
+}
+
+#[test]
+fn clearing_a_scans_map_drops_its_pins() {
+    let mut app = offset_map();
+    let (vw, vh) = VIEW;
+    readout::pin_click(&mut app, vw / 2.0, vh / 2.0, vw, vh, true);
+    app.run_command("deviation.clear", json!({"object": "scan"})).expect("the map is cleared");
+    let mut ui = harness(app);
+    ui.run();
+    assert!(ui.state().deviation.pins.is_empty(), "a pin without a map is dropped");
+}
+
+#[test]
+fn a_new_document_drops_the_maps_and_the_pins() {
+    let mut app = offset_map();
+    let (vw, vh) = VIEW;
+    readout::pin_click(&mut app, vw / 2.0, vh / 2.0, vw, vh, true);
+    app.run_command("doc.new", json!({})).expect("a new document");
+    let mut ui = harness(app);
+    ui.run();
+    assert!(ui.state().session.maps.is_empty(), "the maps are gone");
+    assert!(ui.state().deviation.pins.is_empty(), "the pins are gone");
+}
+
+#[test]
+fn a_moved_scan_has_no_current_map_for_the_panel() {
+    let mut app = offset_map();
+    app.run_command("mesh.transform", json!({"object": "scan", "translate": [0.0, 0.0, 1.0]})).expect("moved");
+    assert!(deviation_panel::current(&app).is_none(), "the panel does not show the old map of a moved scan");
+}
+
+/// Gate: the per-frame work is cached. With a pin and a map, the first frame reads the pinned
+/// reading; idle frames (no pointer, no command, no camera move) make no engine query at all.
+#[test]
+fn idle_frames_make_no_engine_queries() {
+    let mut app = offset_map();
+    let (vw, vh) = VIEW;
+    readout::pin_click(&mut app, vw / 2.0, vh / 2.0, vw, vh, true);
+    let mut ui = harness(app);
+    ui.run();
+    let after_first = ui.state().deviation.queries;
+    assert!(after_first >= 1, "the first frame reads the pinned reading");
+    for _ in 0..5 {
+        ui.run();
+    }
+    assert_eq!(ui.state().deviation.queries, after_first, "idle frames read nothing");
+}
+
+#[test]
+fn the_histogram_axis_is_the_legend_range() {
+    let app = scanned();
+    let cur = deviation_panel::current(&app).expect("a map");
+    let tol = cur.stats.tolerance;
+    let hist = &cur.report.histogram;
+    assert!((hist.lo + 3.0 * tol).abs() < 1e-12 && (hist.hi - 3.0 * tol).abs() < 1e-12, "{hist:?}");
+    assert_eq!(hist.counts.len(), 10, "the stats' ten bins");
+}
+
+#[test]
+fn a_hotspot_centres_the_view_on_its_centroid() {
+    let mut app = offset_map();
+    let cur = deviation_panel::current(&app).expect("a map");
+    app.run_command("deviation.hotspots", hotspots::params(&cur)).expect("the hotspots");
+    let found = hotspots::latest(&app, &cur).expect("the run is listed for this map");
+    let first = found.hotspots.first().expect("the offset scan is a hotspot");
+    app.camera.target = Point3::origin();
+    hotspots::focus(&mut app, first);
+    assert_eq!(app.camera.target, hotspots::centroid(first));
+    assert!((app.camera.target.z - 0.05).abs() < 1e-6, "the scan is 0.05 mm up: {:?}", app.camera.target);
+}
+
+/// The Deviation tab shows the bands and the hotspot search. The search button is below the fold
+/// of the 336 px tab, so its run and the focus it gives are driven on the state here (the same
+/// calls the button and a group's row make) and the button itself is listed for a local check.
+#[test]
+fn the_tab_shows_the_bands_and_the_hotspot_search_and_a_group_focuses_the_view() {
+    let mut ui = tall_harness(offset_map());
+    ui.run();
+    ui.get_by_label("Deviation").click();
+    ui.run();
+    assert!(ui.query_by_label(i18n::lookup(Lang::En, "deviation.bands")).is_some(), "the bands");
+    assert!(ui.query_by_label(i18n::lookup(Lang::En, "deviation.find_hotspots")).is_some(), "the search button");
+    let cur = deviation_panel::current(ui.state()).expect("a map");
+    ui.state_mut().run_command("deviation.hotspots", hotspots::params(&cur)).expect("the search");
+    let found = hotspots::latest(ui.state(), &cur).expect("the panel lists the run");
+    let first = found.hotspots.first().expect("one hotspot").clone();
+    ui.state_mut().camera.target = Point3::origin();
+    hotspots::focus(ui.state_mut(), &first);
+    ui.run();
+    assert_eq!(ui.state().camera.target, hotspots::centroid(&first));
 }
 
 #[test]

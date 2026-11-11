@@ -118,6 +118,17 @@ fn params(v: &[Param], o: &mut String) {
 pub struct Writer {
     lines: Vec<String>,
     shared: HashMap<String, u64>,
+    /// The first entity given a real that is not finite (which would be written as 0.).
+    invalid: Option<String>,
+}
+
+fn has_non_finite(p: &Param) -> bool {
+    match p {
+        Param::Real(x) => !x.is_finite(),
+        Param::List(v) => v.iter().any(has_non_finite),
+        Param::Typed(_, v) => has_non_finite(v),
+        _ => false,
+    }
 }
 
 impl Writer {
@@ -149,18 +160,29 @@ impl Writer {
         body
     }
 
+    fn check(&mut self, name: &str, p: &[Param]) {
+        if self.invalid.is_none() && p.iter().any(has_non_finite) {
+            self.invalid = Some(format!("{name} has a number that is not finite"));
+        }
+    }
+
     /// A simple entity instance, shared with an identical earlier one.
     pub fn add(&mut self, name: &str, p: &[Param]) -> u64 {
+        self.check(name, p);
         self.push(Self::simple(name, p))
     }
 
     /// A simple entity instance of its own, even when an identical one exists.
     pub fn add_distinct(&mut self, name: &str, p: &[Param]) -> u64 {
+        self.check(name, p);
         self.push_distinct(&Self::simple(name, p))
     }
 
     /// A complex entity instance; its records are written in alphabetical order, as Part 21 asks.
     pub fn add_complex(&mut self, records: &[(&str, Vec<Param>)]) -> u64 {
+        for (name, p) in records {
+            self.check(name, p);
+        }
         let mut sorted: Vec<&(&str, Vec<Param>)> = records.iter().collect();
         sorted.sort_by(|a, b| a.0.cmp(b.0));
         let mut body = String::from("(");
@@ -174,20 +196,23 @@ impl Writer {
         self.push(body)
     }
 
-    /// The whole exchange file around the entities written so far.
-    #[must_use]
-    pub fn file(&self, name: &str, schema: &str) -> String {
+    /// The whole exchange file around the entities written so far; an error naming the entity if
+    /// one was given a number that is not finite (nothing is written then).
+    pub fn file(&self, name: &str, schema: &str) -> Result<String, String> {
+        if let Some(why) = &self.invalid {
+            return Err(why.clone());
+        }
         let mut data = String::new();
         for l in &self.lines {
             data.push_str(l);
             data.push('\n');
         }
-        format!(
+        Ok(format!(
             "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\nFILE_NAME({},'',(''),(''),'SurfaceCraft','SurfaceCraft','');\nFILE_SCHEMA(({}));\nENDSEC;\nDATA;\n{}ENDSEC;\nEND-ISO-10303-21;\n",
             string(name),
             string(schema),
             data
-        )
+        ))
     }
 }
 
@@ -208,6 +233,8 @@ mod tests {
         assert_eq!(a, b);
         let c = w.add_distinct("VERTEX_POINT", &[Param::Str(String::new()), Param::Ref(a)]);
         assert_ne!(c, a);
-        assert!(w.file("x", "AUTOMOTIVE_DESIGN").contains("#2=VERTEX_POINT('',#1);"));
+        assert!(w.file("x", "AUTOMOTIVE_DESIGN").unwrap().contains("#2=VERTEX_POINT('',#1);"));
+        w.add("CIRCLE", &[Param::Real(f64::NAN)]);
+        assert!(w.file("x", "AUTOMOTIVE_DESIGN").unwrap_err().contains("CIRCLE"));
     }
 }

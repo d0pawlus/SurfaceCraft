@@ -101,7 +101,6 @@ fn promote(s: &mut Session, i: MeshIn) -> CmdResult<PromoteOut> {
     let triangles_before = s.doc.mesh(id).map_or(0, |o| o.mesh.triangle_count());
     let triangles = copy_of(s, id)?.triangle_count();
     let dropped = s.doc.promote_working(id).ok_or_else(|| no_working(id))?;
-    s.overlays.remove(&id);
     Ok(PromoteOut {
         id,
         triangles_before,

@@ -20,3 +20,10 @@ description: Adding or changing a SurfaceCraft command, crate boundaries, the CL
 - Layers (checked by `cargo xtask layers`): L0 geom; L1 kernel, fit, align, sketch; L2 deviation,
   doc; L3 io; L4 engine; L5 ui-egui, mcp; apps. A crate depends only on lower layers (or earlier
   crates of its own layer, listed in `INTRA_LAYER_ORDER`). Only `kernel` uses solidcore.
+- The one exception to "every command is logged" is `Session::query` (`crates/engine/src/session.rs`).
+  It runs a read-only command on a shared `&Session` without a log entry or a history step, so that
+  the desktop UI can poll a value on every frame (today only `deviation.at`, for the viewport
+  readout). The ids it accepts are a private list in `session.rs`; a command joins it only if it is
+  declared with `read_command!` (it has a `read` form), is not undoable and is not heavy. It is
+  UI-only: the MCP server, the CLI and scripts reach commands through `execute`, which logs them,
+  and replay of the log is unaffected because queries are never in it.

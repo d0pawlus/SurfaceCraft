@@ -1010,6 +1010,7 @@ mod tests {
             direction: [0.0, 0.0, 1.0],
             through: false,
             floor_fillet: None,
+            islands: Vec::new(),
         };
         let mut cuts = box_planes(size);
         // a concave round r = 3 in the pocket's corner at (8, 8), tangent to both walls
