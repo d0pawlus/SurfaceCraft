@@ -75,11 +75,9 @@ opt-level = 1
 [profile.dev.package."*"]
 opt-level = 2
 
-# opt-level 2 for the workspace too: the gate tests are CPU-bound, and on the CI runners this
-# halves the test run without lengthening the build (measured in pull request #70).
 [profile.ci]
 inherits = "dev"
-opt-level = 2
+opt-level = 1
 debug = "line-tables-only"
 debug-assertions = false
 overflow-checks = true
