@@ -58,6 +58,7 @@ fn import_stream_builds_a_store_and_store_info_reads_it_back() {
     assert!(r["build"]["peak_buffered_triangles"].as_u64().unwrap() <= n as u64);
     assert!(r["build"]["max_chunk_triangles"].as_u64().unwrap() <= 1024);
     assert!(r["build"]["memory_bound_mib"].as_f64().unwrap() > 0.0);
+    assert_eq!(r["build"]["peak_spill_bytes"].as_u64().unwrap(), 72 * n as u64);
     // the document is untouched: a store is not a mesh object
     assert!(s.doc.find_by_name("t").is_none());
     // the size in x of a torus with R = 30, r = 7 is 74 mm
@@ -67,6 +68,7 @@ fn import_stream_builds_a_store_and_store_info_reads_it_back() {
     let info = s.execute("mesh.store_info", json!({"store_dir": store})).unwrap();
     assert_eq!(info["triangles"], r["triangles"]);
     assert_eq!(info["verified"], false);
+    assert_eq!(info["bytes_on_disk"], r["bytes_on_disk"]);
     let verified = s.execute("mesh.store_info", json!({"store_dir": store, "verify": true})).unwrap();
     assert_eq!(verified["verified"], true);
     // PLY works too, an existing store needs `overwrite`
@@ -122,6 +124,11 @@ fn import_stream_rejects_bad_parameters_without_touching_the_disk() {
         json!({"path": path, "store_dir": dir.s("a"), "scale": 0.0}),
         json!({"path": dir.s("missing.stl"), "store_dir": dir.s("a")}),
         json!({"path": path}),
+        json!({"path": path, "store_dir": ""}),
+        json!({"path": "", "store_dir": dir.s("a")}),
+        json!({"path": path, "store_dir": path}),
+        json!({"path": path, "store_dir": dir.s("a"), "chunk_triangles": 262145}),
+        json!({"path": path, "store_dir": dir.s("a"), "levels": 9}),
         json!({"store_dir": dir.s("a")}),
         json!({"path": path, "store_dir": dir.s("a"), "bogus": 1}),
         Value::Null,
@@ -140,4 +147,9 @@ fn the_commands_have_schemas_and_are_listed() {
         assert!(!c.undoable);
         assert!(surfacecraft_engine::cmd::is_heavy(id));
     }
+    // the parameters that fix the memory bound are bounded in the schema too
+    let props = (surfacecraft_engine::cmd::find("mesh.import_stream").unwrap().input)()["properties"].clone();
+    let max = |k: &str| props[k]["maximum"].as_u64().or_else(|| props[k]["anyOf"][0]["maximum"].as_u64());
+    assert_eq!(max("chunk_triangles"), Some(262_144), "{props}");
+    assert_eq!(max("levels"), Some(8), "{props}");
 }

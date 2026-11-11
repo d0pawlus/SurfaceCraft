@@ -20,6 +20,11 @@ pub(crate) const PAGE_VERTICES: usize = 1024;
 /// Pages in the cache.
 pub(crate) const PAGE_SLOTS: usize = 1024;
 const READ_BUFFER: usize = 1 << 20;
+/// Vertex bytes a read may fetch, as a multiple of the file length (an ordered file fetches about
+/// its vertex element once).
+const LOAD_FACTOR: u64 = 8;
+/// Added to that allowance so small files are never refused.
+const LOAD_FLOOR: u64 = 64 << 20;
 
 fn read_scalar<R: Read>(r: &mut R, s: Scalar, enc: Encoding) -> Result<f64, IoError> {
     let mut buf = [0u8; 8];
@@ -101,10 +106,14 @@ struct VertexTable<R> {
     props: Vec<(Scalar, Option<usize>)>,
     slots: Vec<Option<Page>>,
     scratch: Vec<u8>,
+    page_vertices: usize,
+    /// Vertex bytes fetched so far and the most a read may fetch.
+    loaded: u64,
+    load_cap: u64,
 }
 
 impl<R: Read + Seek> VertexTable<R> {
-    fn new(rd: R, v: &Element, base: u64, enc: Encoding) -> Result<Self, IoError> {
+    fn new(rd: R, v: &Element, base: u64, enc: Encoding, cfg: &PageConfig, load_cap: u64) -> Result<Self, IoError> {
         let axis = |n: &str| match n {
             "x" => Some(0),
             "y" => Some(1),
@@ -130,14 +139,23 @@ impl<R: Read + Seek> VertexTable<R> {
             count: v.count,
             enc,
             props,
-            slots: (0..PAGE_SLOTS).map(|_| None).collect(),
+            slots: (0..cfg.slots.max(1)).map(|_| None).collect(),
             scratch: Vec::new(),
+            page_vertices: cfg.vertices.max(1),
+            loaded: 0,
+            load_cap,
         })
     }
 
     fn load(&mut self, number: usize) -> Result<Page, IoError> {
-        let first = number * PAGE_VERTICES;
-        let n = PAGE_VERTICES.min(self.count.saturating_sub(first));
+        let first = number * self.page_vertices;
+        let n = self.page_vertices.min(self.count.saturating_sub(first));
+        self.loaded = self.loaded.saturating_add((n * self.record) as u64);
+        if self.loaded > self.load_cap {
+            return Err(IoError::Limit(
+                "the faces refer to vertices in too scattered an order to stream (the vertex reads would far exceed the file size); use mesh.import for this file".into(),
+            ));
+        }
         let at = self.base + (first * self.record) as u64;
         self.rd.seek(SeekFrom::Start(at)).map_err(|e| io_err(&e))?;
         self.scratch.resize(n * self.record, 0);
@@ -161,8 +179,8 @@ impl<R: Read + Seek> VertexTable<R> {
         if i >= self.count {
             return Err(bad("PLY", format!("face index {i} out of range")));
         }
-        let (number, local) = (i / PAGE_VERTICES, i % PAGE_VERTICES);
-        let slot = number % PAGE_SLOTS;
+        let (number, local) = (i / self.page_vertices, i % self.page_vertices);
+        let slot = number % self.slots.len();
         if self.slots.get(slot).and_then(Option::as_ref).is_none_or(|p| p.number != number) {
             let page = self.load(number)?;
             if let Some(s) = self.slots.get_mut(slot) {
@@ -178,12 +196,33 @@ impl<R: Read + Seek> VertexTable<R> {
     }
 }
 
-/// Reads the faces of a binary PLY, fan-triangulating polygons.
-pub(crate) fn read_binary<R: Read + Seek>(
-    open: Open<'_, R>,
-    limits: &Limits,
-    out: &mut Batcher<'_>,
-) -> Result<(), IoError> {
+/// How the vertex cache is sized and how much vertex data a read may fetch.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PageConfig {
+    pub(crate) vertices: usize,
+    pub(crate) slots: usize,
+    /// Vertex bytes that may be fetched in all: `factor × file length + floor`.
+    pub(crate) load_factor: u64,
+    pub(crate) load_floor: u64,
+}
+
+impl Default for PageConfig {
+    fn default() -> Self {
+        Self { vertices: PAGE_VERTICES, slots: PAGE_SLOTS, load_factor: LOAD_FACTOR, load_floor: LOAD_FLOOR }
+    }
+}
+
+/// An opened PLY: the face stream, the vertex table and where the faces are.
+struct OpenPly<R> {
+    faces: BufReader<R>,
+    vertices: VertexTable<R>,
+    face_props: Vec<Prop>,
+    face_count: usize,
+    vertex_count: usize,
+    enc: Encoding,
+}
+
+fn open_ply<R: Read + Seek>(open: Open<'_, R>, limits: &Limits, cfg: &PageConfig) -> Result<OpenPly<R>, IoError> {
     let mut first = open().map_err(|e| io_err(&e))?;
     let len = first.seek(SeekFrom::End(0)).map_err(|e| io_err(&e))?;
     first.seek(SeekFrom::Start(0)).map_err(|e| io_err(&e))?;
@@ -194,36 +233,70 @@ pub(crate) fn read_binary<R: Read + Seek>(
         return Err(IoError::Unsupported("streaming import reads binary PLY; use mesh.import for ASCII PLY".into()));
     }
     let lay = layout(&header.elements, header.body_start, len, limits)?;
-    let mut vertices = VertexTable::new(open().map_err(|e| io_err(&e))?, &lay.vertex, lay.vertex_base, header.enc)?;
+    let cap = len.saturating_mul(cfg.load_factor).saturating_add(cfg.load_floor);
+    let vertices =
+        VertexTable::new(open().map_err(|e| io_err(&e))?, &lay.vertex, lay.vertex_base, header.enc, cfg, cap)?;
     first.seek(SeekFrom::Start(lay.face_start)).map_err(|e| io_err(&e))?;
-    let mut faces = BufReader::with_capacity(READ_BUFFER, first);
-    let mut poly: Vec<usize> = Vec::new();
-    for item in 0..lay.face.count {
-        poly.clear();
-        for p in &lay.face.props {
-            match p {
-                Prop::Scalar(_, s) => {
-                    read_scalar(&mut faces, *s, header.enc)?;
-                }
-                Prop::List(name, c, i) => {
-                    let n = read_scalar(&mut faces, *c, header.enc)?;
-                    if !(0.0..=limits.max_polygon as f64).contains(&n) {
-                        return Err(IoError::Limit(format!("face {item}: list of {n} items")));
-                    }
-                    let wanted = name == "vertex_indices" || name == "vertex_index";
-                    for _ in 0..n as usize {
-                        let v = read_scalar(&mut faces, *i, header.enc)?;
-                        if wanted {
-                            if !(v >= 0.0 && v < lay.vertex.count as f64 && v.fract() == 0.0) {
-                                return Err(bad("PLY", format!("face {item}: index {v} out of range")));
-                            }
-                            poly.push(v as usize);
-                        }
-                    }
-                }
+    Ok(OpenPly {
+        faces: BufReader::with_capacity(READ_BUFFER, first),
+        vertices,
+        face_props: lay.face.props,
+        face_count: lay.face.count,
+        vertex_count: lay.vertex.count,
+        enc: header.enc,
+    })
+}
+
+/// Reads the vertex indices of face `item` into `poly`, skipping its other properties.
+fn read_face<R: Read>(p: &mut OpenPly<R>, limits: &Limits, item: usize, poly: &mut Vec<usize>) -> Result<(), IoError> {
+    poly.clear();
+    for prop in &p.face_props {
+        let Prop::List(name, c, i) = prop else {
+            if let Prop::Scalar(_, s) = prop {
+                read_scalar(&mut p.faces, *s, p.enc)?;
             }
+            continue;
+        };
+        let n = read_scalar(&mut p.faces, *c, p.enc)?;
+        if !(0.0..=limits.max_polygon as f64).contains(&n) {
+            return Err(IoError::Limit(format!("face {item}: list of {n} items")));
         }
-        emit_fan(&poly, &mut vertices, out)?;
+        let wanted = name == "vertex_indices" || name == "vertex_index";
+        for _ in 0..n as usize {
+            let v = read_scalar(&mut p.faces, *i, p.enc)?;
+            if !wanted {
+                continue;
+            }
+            if !(v >= 0.0 && v < p.vertex_count as f64 && v.fract() == 0.0) {
+                return Err(bad("PLY", format!("face {item}: index {v} out of range")));
+            }
+            poly.push(v as usize);
+        }
+    }
+    Ok(())
+}
+
+/// Reads the faces of a binary PLY, fan-triangulating polygons.
+pub(crate) fn read_binary<R: Read + Seek>(
+    open: Open<'_, R>,
+    limits: &Limits,
+    out: &mut Batcher<'_>,
+) -> Result<(), IoError> {
+    read_binary_with(open, limits, out, &PageConfig::default())
+}
+
+pub(crate) fn read_binary_with<R: Read + Seek>(
+    open: Open<'_, R>,
+    limits: &Limits,
+    out: &mut Batcher<'_>,
+    cfg: &PageConfig,
+) -> Result<(), IoError> {
+    let mut ply = open_ply(open, limits, cfg)?;
+    out.check_declared(ply.face_count)?;
+    let mut poly: Vec<usize> = Vec::new();
+    for item in 0..ply.face_count {
+        read_face(&mut ply, limits, item, &mut poly)?;
+        emit_fan(&poly, &mut ply.vertices, out)?;
     }
     Ok(())
 }
@@ -240,4 +313,67 @@ fn emit_fan<R: Read + Seek>(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stream::StreamOptions;
+    use std::io::Cursor;
+
+    /// A binary LE PLY of a strip of `n` quads' triangles, with faces in `order` (indices of triangles).
+    fn strip_ply(n: usize, shuffled: bool) -> Vec<u8> {
+        let mut b = format!(
+            "ply\nformat binary_little_endian 1.0\nelement vertex {}\nproperty float x\nproperty float y\nproperty float z\nelement face {}\nproperty list uchar int vertex_indices\nend_header\n",
+            2 * (n + 1),
+            2 * n
+        )
+        .into_bytes();
+        for i in 0..=n {
+            for y in [0.0f32, 1.0] {
+                for c in [i as f32, y, 0.0] {
+                    b.extend_from_slice(&c.to_le_bytes());
+                }
+            }
+        }
+        let mut faces: Vec<[i32; 3]> =
+            (0..n as i32).flat_map(|i| [[2 * i, 2 * i + 2, 2 * i + 1], [2 * i + 1, 2 * i + 2, 2 * i + 3]]).collect();
+        if shuffled {
+            // a fixed pseudo-random permutation
+            let m = faces.len();
+            for k in 0..m {
+                faces.swap(k, (k * 7919 + 13) % m);
+            }
+        }
+        for f in faces {
+            b.push(3);
+            for v in f {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        b
+    }
+
+    fn run(bytes: &[u8], cfg: &PageConfig) -> Result<u64, IoError> {
+        let opts = StreamOptions { limits: Limits::default(), scale: 1.0 };
+        let mut sink = |_: &[[Point3; 3]]| Ok(());
+        let mut batcher = Batcher::new(&mut sink, opts);
+        read_binary_with(&|| Ok(Cursor::new(bytes)), &opts.limits, &mut batcher, cfg)?;
+        batcher.flush()?;
+        Ok(batcher.count)
+    }
+
+    #[test]
+    fn a_shuffled_face_order_stops_with_a_clear_error_while_an_ordered_one_streams() {
+        let tight = PageConfig { vertices: 64, slots: 2, load_factor: 8, load_floor: 0 };
+        let ordered = strip_ply(20_000, false);
+        assert_eq!(run(&ordered, &tight).unwrap(), 40_000);
+        let shuffled = strip_ply(20_000, true);
+        let err = run(&shuffled, &tight).unwrap_err();
+        assert!(matches!(&err, IoError::Limit(m) if m.contains("scattered")), "{err}");
+        // the default configuration holds this small file entirely, so it streams either way
+        assert_eq!(run(&shuffled, &PageConfig::default()).unwrap(), 40_000);
+        // loads are counted per read: a second read starts from zero
+        assert_eq!(run(&ordered, &tight).unwrap(), 40_000);
+    }
 }

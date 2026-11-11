@@ -4,7 +4,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use surfacecraft_geom::chunked::build::{Sink, build_store};
-use surfacecraft_geom::chunked::format::{FileKind, StoreIndex, checksum};
+use surfacecraft_geom::chunked::format::{
+    BLOCK_OPTIONAL, ExtraBlock, FORMAT_VERSION, FileKind, Span, StoreIndex, checksum, decode_mesh_block,
+    encode_mesh_block, projected_index_bytes,
+};
 use surfacecraft_geom::chunked::levels::finalize_soup;
 use surfacecraft_geom::chunked::spill::SPILL_BUFFER_TRIANGLES;
 use surfacecraft_geom::chunked::{
@@ -255,7 +258,7 @@ fn directories_are_never_clobbered_and_failures_leave_nothing_behind() {
     let fail = TempDir::new("fail");
     let r = build_store(fail.path(), &params, false, &mut replay_of(&bad));
     assert!(matches!(r, Err(StoreError::Input(_))), "{r:?}");
-    assert_eq!(std::fs::read_dir(fail.path()).unwrap().count(), 0);
+    assert!(!fail.path().exists() && !work_dir(fail.path()).exists());
     // an input that differs between passes is detected
     let mut calls = 0;
     let mut shifting = |sink: Sink<'_>| -> Result<(), StoreError> {
@@ -265,7 +268,7 @@ fn directories_are_never_clobbered_and_failures_leave_nothing_behind() {
     };
     let r = build_store(fail.path(), &params, false, &mut shifting);
     assert!(matches!(r, Err(StoreError::Input(_))), "{r:?}");
-    assert_eq!(std::fs::read_dir(fail.path()).unwrap().count(), 0);
+    assert!(!fail.path().exists() && !work_dir(fail.path()).exists());
     // parameters and empty input
     let tiny = StoreParams { chunk_triangles: 3, ..params };
     assert!(matches!(build_store(fail.path(), &tiny, false, &mut replay_of(&soup)), Err(StoreError::Params(_))));
@@ -456,4 +459,116 @@ fn levels_built_directly_are_deterministic_and_shrink() {
     let counts: HashMap<usize, usize> =
         a.levels.iter().enumerate().map(|(i, l)| (i, l.mesh.triangle_count())).collect();
     assert!(counts[&0] > counts[&1] && counts[&1] > counts[&2] && counts[&2] > counts[&3], "{counts:?}");
+}
+
+fn work_dir(dir: &Path) -> PathBuf {
+    dir.with_file_name(format!("{}.building", dir.file_name().unwrap().to_string_lossy()))
+}
+
+#[test]
+fn empty_paths_files_and_limits_are_refused_before_anything_is_written() {
+    let soup = soup_of(&torus(40, 30));
+    let params = StoreParams { chunk_triangles: 256, levels: 1, ..StoreParams::default() };
+    let r = build_store(Path::new(""), &params, true, &mut replay_of(&soup));
+    assert!(matches!(r, Err(StoreError::Params(_))), "{r:?}");
+    let file = TempDir::new("is-a-file");
+    std::fs::write(file.path(), "data").unwrap();
+    let r = build_store(file.path(), &params, true, &mut replay_of(&soup));
+    assert!(matches!(r, Err(StoreError::Params(_))), "{r:?}");
+    assert_eq!(std::fs::read_to_string(file.path()).unwrap(), "data");
+    // limits: bounded parameters, and an input over max_triangles is refused while it is counted
+    let dir = TempDir::new("limits");
+    for p in [
+        StoreParams { chunk_triangles: (1 << 18) + 1, ..params },
+        StoreParams { levels: 9, ..params },
+        StoreParams { max_triangles: u64::from(u32::MAX), ..params },
+    ] {
+        assert!(
+            matches!(build_store(dir.path(), &p, false, &mut replay_of(&soup)), Err(StoreError::Params(_))),
+            "{p:?}"
+        );
+    }
+    let few = StoreParams { max_triangles: 100, ..params };
+    assert!(matches!(build_store(dir.path(), &few, false, &mut replay_of(&soup)), Err(StoreError::Limit(_))));
+    assert!(!dir.path().exists() && !work_dir(dir.path()).exists());
+    // the documented index projection is an upper bound of a real index
+    let rep = build(dir.path(), &soup, &params);
+    let store = disk::open(dir.path()).unwrap();
+    assert!(projected_index_bytes(rep.summary.chunks, 1) >= store.index().encode().len() as u64);
+    assert_eq!(rep.stats.peak_spill_bytes, 72 * soup.len() as u64);
+    assert!(!work_dir(dir.path()).exists());
+}
+
+#[test]
+fn a_failed_overwrite_leaves_the_old_store_readable() {
+    let soup = soup_of(&torus(40, 30));
+    let params = StoreParams { chunk_triangles: 256, levels: 2, ..StoreParams::default() };
+    let dir = TempDir::new("keep-old");
+    let first = build(dir.path(), &soup, &params);
+    let mut bad = soup.clone();
+    bad[3][0].x = f64::INFINITY;
+    for input in [bad, Vec::new()] {
+        let r = build_store(dir.path(), &params, true, &mut replay_of(&input));
+        assert!(r.is_err());
+        let store = disk::open(dir.path()).unwrap();
+        store.verify().unwrap();
+        assert_eq!(store.summary(), first.summary);
+        assert!(!work_dir(dir.path()).exists());
+    }
+    // a good overwrite replaces it
+    let second = StoreParams { levels: 1, ..params };
+    build_store(dir.path(), &second, true, &mut replay_of(&soup)).unwrap();
+    assert_eq!(disk::open(dir.path()).unwrap().level_count(), 2);
+    assert!(!dir.path().join("mesh-2.dat").exists());
+}
+
+fn rewrite_index(index: &StoreIndex, edit: impl FnOnce(&mut Vec<u8>)) -> Result<StoreIndex, StoreError> {
+    let mut b = index.encode();
+    edit(&mut b);
+    let n = b.len() - 8;
+    let sum = checksum(&b[..n]);
+    b[n..].copy_from_slice(&sum.to_le_bytes());
+    StoreIndex::decode(&b)
+}
+
+#[test]
+fn the_format_accepts_unknown_optional_blocks_and_newer_minors_but_not_other_majors() {
+    let (index, _) = memory_store().into_parts();
+    // an unknown optional block (say, vertex normals of a later minor) survives a round trip
+    let mut with = index.clone();
+    let extra = ExtraBlock {
+        kind: 77,
+        flags: BLOCK_OPTIONAL,
+        attributes: 0b101,
+        span: Span { offset: 9, len: 5, checksum: 1 },
+    };
+    with.chunks[0].levels[1].extras.push(extra);
+    assert_eq!(StoreIndex::decode(&with.encode()).unwrap(), with);
+    // the same block without the optional flag needs a newer reader
+    let mut required = with.clone();
+    required.chunks[0].levels[1].extras[0].flags = 0;
+    assert!(matches!(StoreIndex::decode(&required.encode()), Err(StoreError::Corrupt(_))));
+    // a store with the extra block opens and reads as before (the block is never touched)
+    let (_, blocks) = memory_store().into_parts();
+    let store = Chunked::new(with, blocks).unwrap();
+    store.verify().unwrap();
+    // minor version: bytes 8..12 of the index
+    assert!(rewrite_index(&index, |b| b[8..12].copy_from_slice(&7u32.to_le_bytes())).is_ok());
+    // major version: bytes 4..8
+    let other = FORMAT_VERSION + 1;
+    assert!(rewrite_index(&index, |b| b[4..8].copy_from_slice(&other.to_le_bytes())).is_err());
+}
+
+#[test]
+fn reads_refuse_repeated_indices_and_vertices_outside_the_chunk_box() {
+    let m = Mesh {
+        positions: vec![Point3::origin(), Point3::new(1.0, 0.0, 0.0), Point3::new(0.0, 1.0, 0.0)],
+        triangles: vec![[0, 1, 1]],
+    };
+    assert!(matches!(decode_mesh_block(&encode_mesh_block(&m), 3, 1), Err(StoreError::Corrupt(_))));
+    let (mut index, blocks) = memory_store().into_parts();
+    index.chunks[0].bbox.max.x -= 1.0;
+    let store = Chunked::new(index, blocks).unwrap();
+    assert!(matches!(store.read_mesh(0, 0), Err(StoreError::Corrupt(_))));
+    assert!(store.verify().is_err());
 }

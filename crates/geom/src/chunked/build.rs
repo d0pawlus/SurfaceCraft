@@ -10,20 +10,24 @@
 //!    [`SPILL_BUFFER_TRIANGLES`] triangles buffered;
 //! 4. leaf by leaf: read the spill, weld, build the levels, append to the data files.
 //!
-//! **Memory bound.** Peak memory is `memory_bound_bytes(params)`: the histogram and the cell→leaf
-//! table (`8 bytes × cells`, cells ≤ 2²¹), the spill buffers (`72 bytes × 2¹⁸` triangles, twice for
-//! `Vec` slack), one chunk at a time (`chunk_triangles ×` [`CHUNK_WORK_BYTES_PER_TRIANGLE`]) and the index entries
+//! **Memory bound.** Peak memory is `memory_bound_bytes(params)` (formula there, from the structures in
+//! this module and `levels`; one factor is measured and labelled so): the histogram and the cell→leaf
+//! table (`8 bytes × cells`, cells ≤ 2²¹), the spill buffers (`72 bytes × 2¹⁸` triangles), one chunk
+//! at a time (`chunk_triangles × (struct + levels × level bytes)`) and the index entries
 //! (`O(triangles / chunk_triangles)`). None of it grows with the number of triangles, only the index
-//! does, by a few hundred bytes per chunk. The spill files and the data files live in the directory
-//! the caller gave; spill files are deleted as soon as they are read, and on failure everything the
-//! build wrote is removed.
+//! does, by a few hundred bytes per chunk.
+//!
+//! **Disk.** The build writes into `<dir>.building` next to the target and moves the files into the
+//! target only when it succeeded, so an earlier store survives a failed import. Peak disk use is the
+//! store plus the spill files, `72 bytes ×` triangles (`spill_disk_bytes`), which are deleted as they
+//! are read; on failure the work directory is removed.
 use super::assemble::{Scan, centroid, changed, level_params, make_index};
-use super::format::{INDEX_FILE, StoreSummary};
+use super::format::{INDEX_FILE, MAX_INDEX_BYTES, StoreSummary, projected_index_bytes};
 use super::levels::{build_levels, finalize_soup};
 use super::plan::{CellGrid, Partition};
 use super::spill::{SPILL_BUFFER_TRIANGLES, SPILL_TRIANGLE_BYTES, Spill, take_spill};
 use super::writer::StoreWriter;
-use super::{StoreError, StoreParams, disk::DiskBlocks, view::Chunked};
+use super::{MAX_CHUNKS, StoreError, StoreParams, disk::DiskBlocks, target, view::Chunked};
 use crate::{Aabb, Mesh, Point3};
 use std::collections::HashMap;
 use std::fs::File;
@@ -33,20 +37,40 @@ use std::path::Path;
 /// A destination for triangles: the replay calls it with batches.
 pub type Sink<'a> = &'a mut dyn FnMut(&[[Point3; 3]]) -> Result<(), StoreError>;
 
-/// Working memory of finishing one chunk, per triangle of the chunk. The structures themselves (soup,
-/// welded mesh, weld keys, the coarse levels with their hash maps and maps) add up to well under
-/// 1 KB per triangle; the constant is empirical and also covers allocator retention and the levels
-/// being built on several threads: a full 65 536-triangle chunk peaked at 243 MB resident for the
-/// whole process (`perf_store_scale`, 4 M triangles), which is below the bound this gives.
-pub const CHUNK_WORK_BYTES_PER_TRIANGLE: usize = 4096;
+/// Bytes of one spilled triangle on disk (nine `f64`).
+pub const SPILL_DISK_BYTES_PER_TRIANGLE: u64 = SPILL_TRIANGLE_BYTES as u64;
+/// Bytes per chunk triangle of the structures alive while a chunk is finished at full resolution:
+/// the soup (72 B), its indexed mesh (84 B), the weld keys and remaps (about 130 B), the welded mesh
+/// (about 25 B), rounded up.
+pub const CHUNK_STRUCT_BYTES_PER_TRIANGLE: usize = 400;
+/// Bytes per chunk triangle of one coarse level while it is built: the clustering hash maps (about
+/// 40 B per vertex, one vertex per two triangles), the maps (6 B) and the level itself, rounded up.
+pub const LEVEL_BYTES_PER_TRIANGLE: usize = 80;
+/// Factor between the structures above and the resident memory seen: allocator retention and the
+/// levels of a chunk being built on several threads. MEASURED, not derived: a full 65 536-triangle
+/// chunk with 5 levels peaked at 243 MB resident for the whole process (`perf_store_scale`, 4 M
+/// triangles) against 52 MB of structures, so 4 is the smallest round factor above that.
+pub const ALLOCATOR_FACTOR: usize = 4;
 
-/// Upper bound of the memory a build needs, bytes (see the module docs).
+/// Upper bound of the memory a build needs, bytes, as a function of the parameters only:
+/// the grid (histogram plus cell table, 8 B per cell, at most 2^21 cells), the spill buffers
+/// (`Vec`s that grow by doubling, so twice 2^18 triangles of 72 B), and one chunk at a time:
+/// `ALLOCATOR_FACTOR × chunk_triangles × (CHUNK_STRUCT + levels × LEVEL)` bytes. With the
+/// command's limits (`chunk_triangles` ≤ 2^18, `levels` ≤ 8) the bound is under 1.1 GB; at the
+/// defaults (65 536, 5) it is 254 MiB.
 #[must_use]
 pub fn memory_bound_bytes(params: &StoreParams) -> usize {
     let grid = super::plan::MAX_GRID_CELLS * 8;
-    // the buffers are `Vec`s that grow by doubling: allow twice their contents
     let spill = 2 * SPILL_BUFFER_TRIANGLES * SPILL_TRIANGLE_BYTES;
-    grid + spill + params.chunk_triangles * CHUNK_WORK_BYTES_PER_TRIANGLE
+    let per_triangle = CHUNK_STRUCT_BYTES_PER_TRIANGLE + params.levels * LEVEL_BYTES_PER_TRIANGLE;
+    grid + spill + ALLOCATOR_FACTOR * params.chunk_triangles * per_triangle
+}
+
+/// Disk the spill files take at their peak, bytes: every triangle is parked once, 72 B each, before
+/// the chunks are written (on top of the store itself).
+#[must_use]
+pub fn spill_disk_bytes(triangles: u64) -> u64 {
+    triangles.saturating_mul(SPILL_DISK_BYTES_PER_TRIANGLE)
 }
 
 /// What the build measured about itself.
@@ -64,6 +88,8 @@ pub struct BuildStats {
     pub heavy_cells: usize,
     /// Times the spill buffers were flushed.
     pub spill_flushes: usize,
+    /// Disk the spill files took at their peak (72 B per triangle), deleted again.
+    pub peak_spill_bytes: u64,
     /// Bytes of all store files.
     pub bytes_on_disk: u64,
 }
@@ -88,12 +114,19 @@ pub fn build_store<E: From<StoreError>>(
     replay: &mut dyn FnMut(Sink<'_>) -> Result<(), E>,
 ) -> Result<BuildReport, E> {
     params.validate()?;
-    prepare_dir(dir, overwrite)?;
-    let result = run(dir, params, replay);
-    if result.is_err() {
-        remove_store_files(dir);
+    let work = target::prepare(dir, overwrite)?;
+    let result = run(&work, params, replay);
+    match result {
+        Ok(mut report) => {
+            target::install(&work, dir)?;
+            report.stats.bytes_on_disk = target::dir_bytes(dir);
+            Ok(report)
+        }
+        Err(e) => {
+            target::discard(&work);
+            Err(e)
+        }
     }
-    result
 }
 
 fn run<E: From<StoreError>>(
@@ -122,6 +155,7 @@ fn run<E: From<StoreError>>(
     }
     let part = Partition::plan(grid, &counts, params.chunk_triangles as u32);
     drop(counts);
+    check_projection(&part, params)?;
     let spill = route(dir, &part, replay)?;
     let stats = BuildStats {
         peak_buffered_triangles: spill.peak_buffered,
@@ -129,9 +163,29 @@ fn run<E: From<StoreError>>(
         leaves: part.leaf_counts.len(),
         heavy_cells: part.heavy.len(),
         spill_flushes: spill.flushes,
+        peak_spill_bytes: spill_disk_bytes(scan.triangles),
         ..BuildStats::default()
     };
     Ok(finish(dir, params, &scan, &part, stats)?)
+}
+
+/// Refuses, before any triangle is spilled, what the reader would refuse later: too many chunks, an
+/// index over the size limit. (The vertex-id limit is enforced by `MAX_STORE_TRIANGLES`, three
+/// vertices per triangle at most, while the input is counted.)
+fn check_projection(part: &Partition, params: &StoreParams) -> Result<(), StoreError> {
+    let leaves = part.leaf_counts.len();
+    if leaves > MAX_CHUNKS {
+        return Err(StoreError::Limit(format!(
+            "the input would make {leaves} chunks, over the limit of {MAX_CHUNKS}; use a larger chunk_triangles"
+        )));
+    }
+    let bytes = projected_index_bytes(leaves, params.levels);
+    if bytes > MAX_INDEX_BYTES {
+        return Err(StoreError::Limit(format!(
+            "the index would take {bytes} bytes, over the limit of {MAX_INDEX_BYTES}; use a larger chunk_triangles"
+        )));
+    }
+    Ok(())
 }
 
 fn route<E: From<StoreError>>(
@@ -196,7 +250,7 @@ fn finish(
     let store = Chunked::new(index, DiskBlocks::new(dir))?;
     let index_path = dir.join(INDEX_FILE);
     std::fs::write(&index_path, store.index().encode()).map_err(|e| io(&index_path, e))?;
-    stats.bytes_on_disk = dir_bytes(dir);
+    stats.bytes_on_disk = target::dir_bytes(dir);
     Ok(BuildReport { summary: store.summary(), stats })
 }
 
@@ -209,76 +263,4 @@ fn soup_mesh(soup: &[[Point3; 3]]) -> Mesh {
         triangles.push([i, i + 1, i + 2]);
     }
     Mesh { positions, triangles }
-}
-
-/// Is `name` a file this module writes?
-fn is_store_file(name: &str) -> bool {
-    let numbered = |prefix: &str, suffix: &str| {
-        name.strip_prefix(prefix)
-            .and_then(|r| r.strip_suffix(suffix))
-            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-    };
-    name == INDEX_FILE || numbered("mesh-", ".dat") || numbered("map-", ".dat") || numbered("spill-", ".tmp")
-}
-
-fn prepare_dir(dir: &Path, overwrite: bool) -> Result<(), StoreError> {
-    let io = |e: std::io::Error| StoreError::Io(format!("{}: {e}", dir.display()));
-    if !dir.exists() {
-        return std::fs::create_dir_all(dir).map_err(io);
-    }
-    let names: Vec<String> = std::fs::read_dir(dir)
-        .map_err(io)?
-        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
-        .collect();
-    if names.is_empty() {
-        return Ok(());
-    }
-    if !overwrite {
-        return Err(StoreError::Params(format!(
-            "{} is not empty; pass overwrite to replace a store there",
-            dir.display()
-        )));
-    }
-    if let Some(other) = names.iter().find(|n| !is_store_file(n)) {
-        return Err(StoreError::Params(format!(
-            "{} holds {other}, which is not a store file; nothing was deleted",
-            dir.display()
-        )));
-    }
-    remove_store_files(dir);
-    Ok(())
-}
-
-/// Removes the files of a store (best effort), nothing else.
-fn remove_store_files(dir: &Path) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
-    for e in rd.flatten() {
-        if is_store_file(&e.file_name().to_string_lossy()) {
-            let _ = std::fs::remove_file(e.path());
-        }
-    }
-}
-
-fn dir_bytes(dir: &Path) -> u64 {
-    let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
-    rd.flatten()
-        .filter(|e| is_store_file(&e.file_name().to_string_lossy()))
-        .filter_map(|e| e.metadata().ok())
-        .map(|m| m.len())
-        .sum()
-}
-
-#[cfg(test)]
-mod name_tests {
-    use super::*;
-    use crate::chunked::spill::spill_name;
-
-    #[test]
-    fn only_our_own_file_names_count_as_store_files() {
-        assert!(is_store_file("index.scx") && is_store_file("mesh-0.dat") && is_store_file("map-12.dat"));
-        assert!(is_store_file(&spill_name(3)));
-        for other in ["notes.txt", "mesh-.dat", "mesh-x.dat", "mesh-1.dat.bak", "index.scx.old", "spill-1.tmp.x"] {
-            assert!(!is_store_file(other), "{other}");
-        }
-    }
 }

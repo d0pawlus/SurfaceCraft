@@ -1,13 +1,10 @@
 //! The chunk store on disk: a [`BlockStore`] over the data files of a directory, and `open`.
 use super::StoreError;
-use super::format::{FileKind, INDEX_FILE, StoreIndex};
+use super::format::{FileKind, INDEX_FILE, MAX_INDEX_BYTES, StoreIndex};
 use super::view::{BlockStore, Chunked};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-
-/// The largest index file that is read (a hostile file cannot make `open` allocate more).
-const MAX_INDEX_BYTES: u64 = 256 << 20;
 
 /// The data files of a store directory.
 #[derive(Clone, Debug)]
@@ -60,4 +57,17 @@ pub fn open(dir: &Path) -> Result<ChunkStore, StoreError> {
     let bytes = std::fs::read(&path).map_err(|e| io_err(&path, &e))?;
     let index = StoreIndex::decode(&bytes)?;
     Chunked::new(index, DiskBlocks::new(dir))
+}
+
+/// Bytes of all files of the store in `dir` (index and data files).
+pub fn store_bytes(store: &ChunkStore, dir: &Path) -> u64 {
+    let idx = std::fs::metadata(dir.join(INDEX_FILE)).map_or(0, |m| m.len());
+    let mut kinds = vec![FileKind::Mesh(0)];
+    for l in 1..store.level_count() {
+        kinds.push(FileKind::Mesh(l));
+        if store.index().has_maps {
+            kinds.push(FileKind::Map(l));
+        }
+    }
+    kinds.into_iter().filter_map(|k| store.blocks().len(k).ok()).sum::<u64>() + idx
 }

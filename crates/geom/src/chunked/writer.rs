@@ -55,6 +55,7 @@ impl<W: Write> StoreWriter<W> {
                 error: lv.error,
                 mesh,
                 map,
+                extras: Vec::new(),
             });
         }
         Ok(ChunkEntry { bbox: chunk.bbox(), levels })

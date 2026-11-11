@@ -24,11 +24,16 @@ pub struct ImportStreamIn {
     /// Scale applied on import (e.g. 25.4 for inches to mm). Default 1.
     #[serde(default)]
     pub scale: Option<f64>,
-    /// Triangles per chunk, 64 - 4194304 (default 65536). Also the memory unit of the import.
+    /// Triangles per chunk, 64 - 262144 (default 65536). Also the memory unit of the import: the
+    /// import needs about 54 MiB + 4 x chunk_triangles x (400 + 80 x levels) bytes (254 MiB at the
+    /// defaults, at most about 1.1 GB), whatever the size of the file; the spill files take 72
+    /// bytes per triangle of disk while it runs.
     #[serde(default)]
+    #[schemars(range(min = 64, max = 262144))]
     pub chunk_triangles: Option<usize>,
-    /// Coarse levels of detail above full resolution, 0 - 16 (default 5).
+    /// Coarse levels of detail above full resolution, 0 - 8 (default 5).
     #[serde(default)]
+    #[schemars(range(min = 0, max = 8))]
     pub levels: Option<usize>,
     /// Keep per-level vertex and triangle maps, so per-vertex data carries to a level (default true).
     #[serde(default)]
@@ -74,6 +79,8 @@ pub struct BuildOut {
     pub peak_buffered_triangles: usize,
     /// Most triangles of one chunk before welding.
     pub max_chunk_triangles: usize,
+    /// Disk the spill files took at their peak, bytes (72 per triangle; deleted again).
+    pub peak_spill_bytes: u64,
     /// Upper bound of the memory the import needs, MiB (independent of the size of the file).
     pub memory_bound_mib: f64,
 }
@@ -103,7 +110,7 @@ pub struct StoreOut {
     pub has_maps: bool,
     /// Levels, full resolution first.
     pub levels: Vec<LevelOut>,
-    /// Bytes of the store files (after an import).
+    /// Bytes of the store files.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes_on_disk: Option<u64>,
     /// True when every block was read back and checked.
@@ -169,6 +176,9 @@ fn import_stream(s: &mut Session, i: ImportStreamIn) -> CmdResult<StoreOut> {
     use surfacecraft_geom::chunked::build::memory_bound_bytes;
     use surfacecraft_io::stream::import::{StreamImportOptions, import_to_store};
     super::require_files(s)?;
+    if i.path.is_empty() || i.store_dir.is_empty() {
+        return Err(CmdError::Params("`path` and `store_dir` must not be empty".into()));
+    }
     let store = params_of(&i)?;
     let opts = StreamImportOptions {
         format: i.format,
@@ -183,6 +193,7 @@ fn import_stream(s: &mut Session, i: ImportStreamIn) -> CmdResult<StoreOut> {
     out.build = Some(BuildOut {
         peak_buffered_triangles: report.stats.peak_buffered_triangles,
         max_chunk_triangles: report.stats.max_chunk_triangles,
+        peak_spill_bytes: report.stats.peak_spill_bytes,
         memory_bound_mib: memory_bound_bytes(&store) as f64 / (1024.0 * 1024.0),
     });
     Ok(out)
@@ -196,6 +207,9 @@ fn import_stream(_s: &mut Session, _i: ImportStreamIn) -> CmdResult<StoreOut> {
 #[cfg(not(target_arch = "wasm32"))]
 fn store_info(s: &mut Session, i: StoreInfoIn) -> CmdResult<StoreOut> {
     super::require_files(s)?;
+    if i.store_dir.is_empty() {
+        return Err(CmdError::Params("`store_dir` must not be empty".into()));
+    }
     let store = surfacecraft_geom::chunked::disk::open(std::path::Path::new(&i.store_dir))
         .map_err(|e| CmdError::Failed(e.to_string()))?;
     let verified = i.verify.unwrap_or(false);
@@ -203,6 +217,7 @@ fn store_info(s: &mut Session, i: StoreInfoIn) -> CmdResult<StoreOut> {
         store.verify().map_err(|e| CmdError::Failed(e.to_string()))?;
     }
     let mut out = store_out(&i.store_dir, &store.summary());
+    out.bytes_on_disk = Some(surfacecraft_geom::chunked::disk::store_bytes(&store, std::path::Path::new(&i.store_dir)));
     out.verified = verified;
     Ok(out)
 }

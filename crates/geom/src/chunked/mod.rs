@@ -36,9 +36,35 @@
 //! `index.scx` (written last: its presence means the store is complete), `mesh-<l>.dat` for every
 //! level and `map-<l>.dat` for every level ≥ 1. A mesh block is `f64 × 3` per vertex then `u32 × 3`
 //! per triangle (little endian); a map block is `u32 × vertices` then `u32 × triangles` of level 0.
-//! The index lists per chunk and level the counts, the measured error and the byte span and
-//! checksum of each block, and ends with a checksum of its own, so a damaged store is an error and
-//! never a silently wrong surface.
+//! The index lists per chunk and level the counts, the measured error and a table of blocks
+//! (`kind`, `flags`, `attributes`, byte span with checksum), and ends with a checksum of its own, so a
+//! damaged store is an error and never a silently wrong surface.
+//!
+//! # Evolving the format (major 1)
+//!
+//! A reader refuses another *major* version and accepts any *minor* of its major. Later minors add
+//! data as new block kinds (vertex normals, colours, per-vertex attributes, seam-vertex ids), each a
+//! block of its own flagged `BLOCK_OPTIONAL`: a reader that does not know the kind keeps the entry
+//! (`BlockRef::extras`) and never reads it; an unknown kind without the flag is an error ("needs a
+//! newer reader"). The `attributes` word of a block entry is reserved for the channel mask of such a
+//! block; it must be 0 for the mesh and map blocks. No existing record changes.
+//!
+//! # Using a store (for the out-of-core work in the engine, G2)
+//!
+//! * Bulk access goes through [`Chunked::read_mesh`](view::Chunked::read_mesh) and `read_maps` per
+//!   chunk and level (they parallelise by chunk). The source traits (`point_at`,
+//!   `triangle_indices_at`) are a seam for code written against `&dyn PointSource`: they go through a
+//!   small cache of decoded chunks (2 per hardware thread, 8 to 64), so random access or more
+//!   threads than that thrashes it, and every call takes a lock.
+//! * A failed read inside a trait call returns `None`; the first error is kept for `take_error()`.
+//!   Check it after a pass, or `verify()` the store once.
+//! * Coarse levels are *not* watertight: a triangle whose corners fall in one or two cells is dropped
+//!   (holes where the surface is thinner than a cell), neighbouring chunks cluster independently
+//!   (cracks at chunk seams up to twice the error bound), and a level may hold vertices but no
+//!   triangles at all (a level can be points-only, or one chunk's level empty of triangles).
+//!   Vertices of every level are cluster means, so a level is a faithful *point* source within its
+//!   error bound but not a surface to cut or fill.
+//! * Seam vertices are duplicated per chunk; match them by their bit-identical position.
 use thiserror::Error;
 
 mod assemble;
@@ -54,9 +80,11 @@ pub mod build;
 pub mod disk;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod spill;
+#[cfg(not(target_arch = "wasm32"))]
+mod target;
 
 pub use assemble::chunk_in_memory;
-pub use format::{BlockRef, ChunkEntry, FileKind, LevelInfo, Span, StoreIndex, StoreSummary};
+pub use format::{BlockRef, ChunkEntry, ExtraBlock, FileKind, LevelInfo, Span, StoreIndex, StoreSummary};
 pub use levels::{ChunkLevels, LevelBlocks, LevelParams};
 pub use view::{BlockStore, Chunked, LevelMaps, LevelView, MemBlocks, VerifyReport};
 pub use writer::StoreWriter;
@@ -66,15 +94,16 @@ pub const DEFAULT_CHUNK_TRIANGLES: usize = 65_536;
 /// Smallest allowed chunk size.
 pub const MIN_CHUNK_TRIANGLES: usize = 64;
 /// Largest allowed chunk size.
-pub const MAX_CHUNK_TRIANGLES: usize = 1 << 22;
+pub const MAX_CHUNK_TRIANGLES: usize = 1 << 18;
 /// Default number of coarse levels above full resolution.
 pub const DEFAULT_LEVELS: usize = 5;
 /// Most coarse levels.
-pub const MAX_LEVELS: usize = 16;
+pub const MAX_LEVELS: usize = 8;
 /// Most chunks a store may hold (a hostile index cannot ask for more).
 pub const MAX_CHUNKS: usize = 1 << 24;
-/// Most triangles a store may hold.
-pub const MAX_STORE_TRIANGLES: u64 = 4_000_000_000;
+/// Most triangles a store may hold: a level-0 vertex count is at most three per triangle and vertex
+/// ids are `u32`, so more would be refused when the store is opened. The build checks this first.
+pub const MAX_STORE_TRIANGLES: u64 = (u32::MAX / 3) as u64;
 
 /// Why a store could not be built or read.
 #[derive(Clone, Debug, PartialEq, Error)]

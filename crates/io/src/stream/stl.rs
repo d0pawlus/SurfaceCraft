@@ -48,6 +48,7 @@ pub(crate) fn read_binary<R: Read + Seek>(mut r: R, out: &mut Batcher<'_>) -> Re
     if n > available {
         return Err(bad("STL", format!("header declares {n} triangles but the file holds {available}")));
     }
+    out.check_declared(usize::try_from(n).unwrap_or(usize::MAX))?;
     let mut rec = [0u8; RECORD_BYTES as usize];
     for t in 0..n {
         rd.read_exact(&mut rec).map_err(|_| bad("STL", "truncated triangle"))?;

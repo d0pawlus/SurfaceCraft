@@ -77,6 +77,17 @@ impl<'a> Batcher<'a> {
         if self.buf.len() >= BATCH_TRIANGLES { self.flush() } else { Ok(()) }
     }
 
+    /// Refuses a declared item count over the triangle limit before anything is read.
+    pub(crate) fn check_declared(&self, items: usize) -> Result<(), IoError> {
+        if items > self.opts.limits.max_triangles {
+            return Err(IoError::Limit(format!(
+                "{items} items declared, over the limit of {}",
+                self.opts.limits.max_triangles
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) fn flush(&mut self) -> Result<(), IoError> {
         if self.buf.is_empty() {
             return Ok(());

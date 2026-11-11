@@ -6,8 +6,10 @@ use crate::{Aabb, Mesh, Point3, PointSource, TriangleSource};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-/// Decoded chunk meshes kept for random access through the source traits.
-const CACHE_ENTRIES: usize = 8;
+/// Fewest decoded chunk meshes kept for random access through the source traits.
+const MIN_CACHE_ENTRIES: usize = 8;
+/// Most decoded chunk meshes kept.
+const MAX_CACHE_ENTRIES: usize = 64;
 
 /// Where the bytes of the data files come from.
 pub trait BlockStore: Send + Sync {
@@ -84,6 +86,7 @@ pub struct Chunked<P: BlockStore> {
     vertex_offsets: Vec<Vec<u64>>,
     triangle_offsets: Vec<Vec<u64>>,
     cache: Mutex<Cache>,
+    cache_entries: usize,
     first_error: Mutex<Option<StoreError>>,
 }
 
@@ -118,6 +121,9 @@ impl<P: BlockStore> Chunked<P> {
             vertex_offsets,
             triangle_offsets,
             cache: Mutex::new(Cache::default()),
+            cache_entries: std::thread::available_parallelism()
+                .map_or(MIN_CACHE_ENTRIES, |n| 2 * n.get())
+                .clamp(MIN_CACHE_ENTRIES, MAX_CACHE_ENTRIES),
             first_error: Mutex::new(None),
         })
     }
@@ -191,7 +197,15 @@ impl<P: BlockStore> Chunked<P> {
             .and_then(|c| c.levels.get(level))
             .ok_or_else(|| StoreError::Params(format!("no chunk {chunk} at level {level}")))?;
         let bytes = self.block_bytes(FileKind::Mesh(level), &b.mesh)?;
-        decode_mesh_block(&bytes, b.vertices as usize, b.triangles as usize)
+        let mesh = decode_mesh_block(&bytes, b.vertices as usize, b.triangles as usize)?;
+        // the box of a chunk is computed from its level-0 vertices: a store that disagrees is damaged
+        // (coarse vertices are means and may leave the box by a rounding error, so only level 0 is checked)
+        let bbox = self.index.chunks.get(chunk).map(|c| c.bbox);
+        let outside = |p: &Point3| bbox.is_none_or(|b| (0..3).any(|i| p[i] < b.min[i] || p[i] > b.max[i]));
+        if level == 0 && mesh.positions.iter().any(outside) {
+            return Err(corrupt(format!("chunk {chunk}: a vertex lies outside the bounding box of the index")));
+        }
+        Ok(mesh)
     }
 
     /// The mesh of `chunk` at `level` (checksum and structure verified, kept in a small cache).
@@ -207,7 +221,7 @@ impl<P: BlockStore> Chunked<P> {
         }
         let mesh = Arc::new(self.load_mesh(chunk, level)?);
         let mut cache = lock(&self.cache);
-        if cache.entries.len() >= CACHE_ENTRIES {
+        if cache.entries.len() >= self.cache_entries {
             cache.entries.remove(0);
         }
         cache.entries.push(((chunk, level), Arc::clone(&mesh)));

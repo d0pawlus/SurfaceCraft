@@ -5,15 +5,32 @@
 use super::{MAX_CHUNK_TRIANGLES, MAX_CHUNKS, MAX_LEVELS, StoreError, corrupt};
 use crate::{Aabb, Mesh, Point3};
 
-/// Version of the layout described in [`super`].
+/// Major version of the layout described in [`super`]: a reader refuses another major version.
 pub const FORMAT_VERSION: u32 = 1;
+/// Minor version written. A reader accepts any minor of its major version: later minors may add
+/// optional blocks (see [`BLOCK_OPTIONAL`]) and ignorable header flags, never change a record.
+pub const FORMAT_MINOR: u32 = 0;
+/// Block kind of the mesh block (vertices and triangles).
+pub const BLOCK_MESH: u32 = 1;
+/// Block kind of the map block (level-0 vertex and triangle maps).
+pub const BLOCK_MAP: u32 = 2;
+/// Block flag: a reader that does not know the kind may ignore the block. Kinds reserved for later:
+/// vertex normals, colours, per-vertex attributes, seam-vertex ids, each as a block of its own.
+pub const BLOCK_OPTIONAL: u32 = 1;
+/// Most blocks listed for one chunk at one level.
+const MAX_BLOCKS_PER_LEVEL: usize = 32;
+/// The largest index file a reader accepts (and a build projects against).
+pub const MAX_INDEX_BYTES: u64 = 256 << 20;
 /// File name of the index.
 pub const INDEX_FILE: &str = "index.scx";
 const INDEX_MAGIC: [u8; 4] = *b"SCIX";
-const HEADER_BYTES: usize = 4 + 4 * 4 + 3 * 8 + 6 * 8 + 3 * 8;
+const HEADER_BYTES: usize = 4 + 5 * 4 + 3 * 8 + 6 * 8 + 3 * 8;
 const BBOX_BYTES: usize = 6 * 8;
-const BLOCK_REF_BYTES: usize = 4 + 4 + 8 + 2 * SPAN_BYTES;
+/// kind, flags, attributes, span.
+const ENTRY_BYTES: usize = 3 * 4 + SPAN_BYTES;
 const SPAN_BYTES: usize = 3 * 8;
+/// vertices, triangles, error, block count, and at least the mesh entry.
+const MIN_BLOCK_REF_BYTES: usize = 4 + 4 + 8 + 4 + ENTRY_BYTES;
 const SUM_BYTES: usize = 8;
 /// Bytes of one vertex (three `f64`) and one triangle (three `u32`) in a mesh block.
 pub const VERTEX_BYTES: usize = 24;
@@ -71,8 +88,21 @@ pub struct Span {
     pub checksum: u64,
 }
 
+/// A block this reader does not know, kept so the index can be rewritten without losing it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExtraBlock {
+    /// Block kind.
+    pub kind: u32,
+    /// Flags ([`BLOCK_OPTIONAL`] is set, or the block would have been refused).
+    pub flags: u32,
+    /// Attribute mask of the block (meaning defined by its kind).
+    pub attributes: u32,
+    /// Where it is.
+    pub span: Span,
+}
+
 /// One chunk at one level: counts, measured error and where its blocks are.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct BlockRef {
     /// Vertices at this level.
     pub vertices: u32,
@@ -84,6 +114,8 @@ pub struct BlockRef {
     pub mesh: Span,
     /// The map block (empty at level 0 and when the store keeps no maps).
     pub map: Span,
+    /// Optional blocks of kinds this reader does not know (never read, never validated).
+    pub extras: Vec<ExtraBlock>,
 }
 
 /// One chunk: its bounding box and its blocks per level (`levels[0]` is full resolution).
@@ -201,6 +233,7 @@ impl StoreIndex {
         let mut o = Vec::with_capacity(HEADER_BYTES + self.chunks.len() * 400);
         o.extend_from_slice(&INDEX_MAGIC);
         put_u32(&mut o, FORMAT_VERSION);
+        put_u32(&mut o, FORMAT_MINOR);
         put_u32(&mut o, self.chunk_triangles);
         put_u32(&mut o, self.levels.len() as u32);
         put_u32(&mut o, u32::from(self.has_maps));
@@ -221,8 +254,15 @@ impl StoreIndex {
                 put_u32(&mut o, b.vertices);
                 put_u32(&mut o, b.triangles);
                 put_f64(&mut o, b.error);
-                put_span(&mut o, &b.mesh);
-                put_span(&mut o, &b.map);
+                let has_map = b.map != Span::default();
+                put_u32(&mut o, (1 + usize::from(has_map) + b.extras.len()) as u32);
+                put_entry(&mut o, BLOCK_MESH, 0, 0, &b.mesh);
+                if has_map {
+                    put_entry(&mut o, BLOCK_MAP, 0, 0, &b.map);
+                }
+                for e in &b.extras {
+                    put_entry(&mut o, e.kind, e.flags, e.attributes, &e.span);
+                }
             }
         }
         let sum = checksum(&o);
@@ -247,16 +287,20 @@ impl StoreIndex {
         if version != FORMAT_VERSION {
             return Err(corrupt(format!("store format version {version}, this build reads {FORMAT_VERSION}")));
         }
+        let _minor = r.u32()?; // any minor of this major is readable
         let (mut idx, declared) = read_header(&mut r)?;
         let level_count = idx.levels.len();
-        let record = BBOX_BYTES + (level_count + 1) * BLOCK_REF_BYTES;
-        let expected = declared.checked_mul(record).and_then(|n| n.checked_add(r.at()));
-        if expected != Some(body.len()) {
-            return Err(corrupt("index length does not match its chunk count"));
+        // a chunk record is at least this long: refuse a count the bytes cannot hold before reserving
+        let min_record = BBOX_BYTES + (level_count + 1) * MIN_BLOCK_REF_BYTES;
+        if declared.checked_mul(min_record).is_none_or(|n| n > body.len() - r.at()) {
+            return Err(corrupt("index is too short for its chunk count"));
         }
         idx.chunks.reserve(declared);
         for _ in 0..declared {
             idx.chunks.push(read_chunk(&mut r, level_count, &idx)?);
+        }
+        if r.at() != body.len() {
+            return Err(corrupt("index has trailing bytes"));
         }
         Ok(idx)
     }
@@ -276,6 +320,13 @@ fn put_box(o: &mut Vec<u8>, b: &Aabb) {
         put_f64(o, *c);
     }
 }
+fn put_entry(o: &mut Vec<u8>, kind: u32, flags: u32, attributes: u32, s: &Span) {
+    put_u32(o, kind);
+    put_u32(o, flags);
+    put_u32(o, attributes);
+    put_span(o, s);
+}
+
 fn put_span(o: &mut Vec<u8>, s: &Span) {
     put_u64(o, s.offset);
     put_u64(o, s.len);
@@ -332,13 +383,14 @@ impl<'a> Reader<'a> {
 fn read_header(r: &mut Reader<'_>) -> Result<(StoreIndex, usize), StoreError> {
     let chunk_triangles = r.u32()?;
     let level_count = r.u32()? as usize;
-    let has_maps = r.u32()?;
+    let header_flags = r.u32()?;
+    let has_maps = header_flags & 1;
     let chunk_count = r.u64()?;
     if chunk_triangles == 0 || chunk_triangles as usize > MAX_CHUNK_TRIANGLES {
         return Err(corrupt(format!("chunk capacity {chunk_triangles} out of range")));
     }
-    if level_count > MAX_LEVELS || has_maps > 1 {
-        return Err(corrupt("level count or map flag out of range"));
+    if level_count > MAX_LEVELS || header_flags > 1 {
+        return Err(corrupt("level count or header flags out of range"));
     }
     if chunk_count > MAX_CHUNKS as u64 {
         return Err(corrupt(format!("{chunk_count} chunks exceed the limit of {MAX_CHUNKS}")));
@@ -376,17 +428,43 @@ fn read_chunk(r: &mut Reader<'_>, level_count: usize, idx: &StoreIndex) -> Resul
     let bbox = r.bbox()?;
     let mut levels: Vec<BlockRef> = Vec::with_capacity(level_count + 1);
     for l in 0..=level_count {
-        let b = BlockRef {
-            vertices: r.u32()?,
-            triangles: r.u32()?,
-            error: r.finite("block error")?,
-            mesh: r.span()?,
-            map: r.span()?,
-        };
+        let b = read_block_ref(r)?;
         check_block(&b, l, levels.first(), idx)?;
         levels.push(b);
     }
     Ok(ChunkEntry { bbox, levels })
+}
+
+fn read_block_ref(r: &mut Reader<'_>) -> Result<BlockRef, StoreError> {
+    let mut b =
+        BlockRef { vertices: r.u32()?, triangles: r.u32()?, error: r.finite("block error")?, ..BlockRef::default() };
+    let count = r.u32()? as usize;
+    if count == 0 || count > MAX_BLOCKS_PER_LEVEL {
+        return Err(corrupt(format!("{count} blocks listed for one chunk level")));
+    }
+    let mut seen = (false, false);
+    for _ in 0..count {
+        let (kind, flags, attributes, span) = (r.u32()?, r.u32()?, r.u32()?, r.span()?);
+        match kind {
+            BLOCK_MESH | BLOCK_MAP => {
+                let slot = if kind == BLOCK_MESH { &mut seen.0 } else { &mut seen.1 };
+                if std::mem::replace(slot, true) || flags != 0 || attributes != 0 {
+                    return Err(corrupt(format!("block kind {kind} is repeated or has unknown flags")));
+                }
+                if kind == BLOCK_MESH { b.mesh = span } else { b.map = span }
+            }
+            _ if flags & BLOCK_OPTIONAL != 0 => b.extras.push(ExtraBlock { kind, flags, attributes, span }),
+            _ => {
+                return Err(corrupt(format!(
+                    "block kind {kind} is required but unknown: the store needs a newer reader"
+                )));
+            }
+        }
+    }
+    if !seen.0 {
+        return Err(corrupt("a chunk level has no mesh block"));
+    }
+    Ok(b)
 }
 
 fn check_block(b: &BlockRef, level: usize, base: Option<&BlockRef>, idx: &StoreIndex) -> Result<(), StoreError> {
@@ -450,6 +528,15 @@ impl StoreIndex {
     }
 }
 
+/// Bytes of an index for `chunks` chunks and `levels` coarse levels at its largest (every block
+/// table with a mesh and a map entry), for checking against [`MAX_INDEX_BYTES`] before a build.
+#[must_use]
+pub fn projected_index_bytes(chunks: usize, levels: usize) -> u64 {
+    let per_level = (4 + 4 + 8 + 4 + 2 * ENTRY_BYTES) as u64;
+    let per_chunk = BBOX_BYTES as u64 + (levels as u64 + 1) * per_level;
+    (HEADER_BYTES + SUM_BYTES) as u64 + levels as u64 * 16 + chunks as u64 * per_chunk
+}
+
 /// Serialises a mesh block.
 #[must_use]
 pub fn encode_mesh_block(m: &Mesh) -> Vec<u8> {
@@ -487,6 +574,9 @@ pub fn decode_mesh_block(bytes: &[u8], vertices: usize, triangles: usize) -> Res
     }
     let m = Mesh { positions, triangles: tris };
     m.validate().map_err(|e| corrupt(format!("mesh block: {e}")))?;
+    if m.triangles.iter().any(|t| t[0] == t[1] || t[1] == t[2] || t[0] == t[2]) {
+        return Err(corrupt("mesh block has a triangle with a repeated vertex"));
+    }
     Ok(m)
 }
 
