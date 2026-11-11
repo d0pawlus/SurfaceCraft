@@ -11,10 +11,15 @@
 //! Where there is no other thread (a browser without threads, or a page that is not cross-origin
 //! isolated) a heavy command runs in place after the dialog has been painted with a warning, so
 //! the user knows why the page stops answering.
+//!
+//! Whatever changes the session goes through [`SurfaceCraftApp::idle_session`], which refuses
+//! while a command runs; what feeds commands in from outside the window (the control channel,
+//! files picked in the browser) waits for the running command instead of being dropped.
 use crate::SurfaceCraftApp;
 use crate::i18n::{t, tf};
 use crate::theme::Token;
-use serde_json::Value;
+use serde_json::{Value, json};
+use std::sync::Arc;
 use surfacecraft_engine::{EngineError, Job, JobPoll, Session, cmd};
 
 /// How often the UI looks whether the job is done, in seconds (it never waits for it).
@@ -54,7 +59,8 @@ pub(crate) struct Busy {
     id: String,
     /// The tool's name, as the ribbon shows it.
     name: String,
-    params: Value,
+    /// Shared with the job: the parameters may hold a whole file and are not copied here.
+    params: Arc<Value>,
     /// Objects in the document when the command started.
     had: usize,
     /// When the UI first saw the command running (egui time, seconds).
@@ -64,15 +70,23 @@ pub(crate) struct Busy {
 }
 
 impl SurfaceCraftApp {
-    /// Executes a command in place, the way every quick UI control does, updating the status
-    /// line. Refused while a background command runs.
-    pub fn run_command(&mut self, id: &str, params: Value) -> Result<Value, EngineError> {
+    /// The session, for whatever changes it: refused (with the reason on the status line) while
+    /// a command runs, because the session the app holds then is only what it draws, and the
+    /// running command's session will replace it. Every `&mut` use of the session outside
+    /// drawing goes through here.
+    pub(crate) fn idle_session(&mut self) -> Result<&mut Session, EngineError> {
         if let Some(busy) = &self.busy {
             self.status = tf("status.busy", &[("name", &busy.name)]);
             return Err(EngineError::Unavailable(format!("{} is running", busy.id)));
         }
+        Ok(&mut self.session)
+    }
+
+    /// Executes a command in place, the way every quick UI control does, updating the status
+    /// line. Refused while a background command runs.
+    pub fn run_command(&mut self, id: &str, params: Value) -> Result<Value, EngineError> {
         let had = self.session.doc.summaries().len();
-        let r = self.session.execute(id, params);
+        let r = self.idle_session()?.execute(id, params);
         self.settle(id, had, &r);
         r
     }
@@ -139,6 +153,13 @@ impl SurfaceCraftApp {
             self.finish(after, id, r);
             return ok;
         }
+        if self.still_finishing() {
+            self.status = t("status.finishing").to_string();
+            let refused = EngineError::Unavailable("the cancelled command is still finishing".into());
+            self.finish(after, id, Err(refused));
+            return false;
+        }
+        let params = Arc::new(params);
         let how = match Job::start(&self.session, id, params.clone()) {
             Some(job) => How::Background(job),
             None => How::InPlace,
@@ -150,6 +171,18 @@ impl SurfaceCraftApp {
         let had = self.session.doc.summaries().len();
         self.busy = Some(Busy { id: id.to_string(), name, params, had, started: None, after, how });
         true
+    }
+
+    /// Is the thread of a cancelled command still at work? A command that does not look at the
+    /// cancellation flag runs to its end (its result is dropped); until then no other heavy
+    /// command starts, so abandoned work cannot pile up or, in the browser, hold the pool's
+    /// workers while a new command waits behind it.
+    fn still_finishing(&mut self) -> bool {
+        if self.finishing.as_ref().is_some_and(Job::is_running) {
+            return true;
+        }
+        self.finishing = None;
+        false
     }
 
     /// Moves the running command on: takes the result of a finished job, or starts a run in
@@ -170,9 +203,10 @@ impl SurfaceCraftApp {
             },
             How::InPlace if waited < WARNING_SECONDS => None,
             How::InPlace => {
-                let had = self.session.doc.summaries().len();
-                busy.had = had;
-                Some(self.session.execute(&busy.id, busy.params.clone()))
+                busy.had = self.session.doc.summaries().len();
+                // `busy` was taken above, so the session is idle; nobody else holds the parameters
+                let params = Arc::unwrap_or_clone(std::mem::take(&mut busy.params));
+                Some(self.idle_session().and_then(|session| session.execute(&busy.id, params)))
             }
         };
         let Some(result) = result else {
@@ -194,10 +228,11 @@ impl SurfaceCraftApp {
     /// says it was cancelled, and the command is asked to stop (see `Job::cancel` for which do).
     pub fn cancel_job(&mut self) {
         let Some(busy) = self.busy.take() else { return };
-        if let How::Background(job) = &busy.how {
+        if let How::Background(job) = busy.how {
             job.cancel();
+            self.finishing = Some(job);
         }
-        self.session.note_cancelled(&busy.id, busy.params);
+        self.session.note_cancelled(&busy.id, Arc::unwrap_or_clone(busy.params));
         self.status = tf("status.cancelled", &[("name", &busy.name)]);
         self.finish(busy.after, &busy.id, Err(EngineError::Failed(cmd::CANCELLED.into())));
     }
@@ -223,11 +258,93 @@ impl SurfaceCraftApp {
             #[cfg(not(target_arch = "wasm32"))]
             After::Reply(reply) => {
                 let _ = reply.send(match result {
-                    Ok(v) => serde_json::json!({"ok": v}),
-                    Err(e) => serde_json::json!({"err": e}),
+                    Ok(v) => json!({"ok": v}),
+                    Err(e) => json!({"err": e}),
                 });
             }
         }
+    }
+
+    /// Feeds this app from a control channel (the desktop app opens one; tests bring their own).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn attach_control(&mut self, requests: std::sync::mpsc::Receiver<crate::control::Request>) {
+        self.control = Some(requests);
+    }
+
+    /// Answers control-channel requests (bridged MCP) between frames.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn poll_control(&mut self) {
+        // one request at a time: a heavy command runs in the background and the requests behind
+        // it wait in the channel until it has answered
+        while !self.is_busy() {
+            let Some(r) = self.control.as_ref().and_then(|rx| rx.try_recv().ok()) else { return };
+            let reply = match r.method.as_str() {
+                "engine.execute" => {
+                    let cmd = r.params.get("command").and_then(Value::as_str).unwrap_or("").to_string();
+                    let params = r.params.get("params").cloned().unwrap_or(Value::Null);
+                    self.launch(&cmd, params, After::Reply(r.reply));
+                    continue;
+                }
+                "ui.screenshot" => {
+                    let dim = |k: &str, d: u64| r.params.get(k).and_then(Value::as_u64).unwrap_or(d) as u32;
+                    let cam = self.camera.clone();
+                    let (w, h) = (dim("width", 800), dim("height", 600));
+                    match self.idle_session().map(|session| crate::shot::screenshot_png(session, Some(&cam), w, h)) {
+                        Ok(Some(png)) => json!({"png": surfacecraft_doc::base64::encode(&png)}),
+                        Ok(None) => json!({"err": "no renderer"}),
+                        Err(e) => json!({"err": e}),
+                    }
+                }
+                other => json!({"err": format!("unknown method {other}")}),
+            };
+            let _ = r.reply.send(reply);
+        }
+    }
+
+    /// Imports files the browser picked (web build).
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn poll_inbox(&mut self) {
+        // one file at a time: an import may run in the background, and the next waits for it
+        while !self.is_busy() {
+            let mut inbox = self.inbox.borrow_mut();
+            if inbox.is_empty() {
+                return;
+            }
+            let (name, bytes) = inbox.remove(0);
+            drop(inbox);
+            let lower = name.to_lowercase();
+            let ext = lower.rsplit('.').next().unwrap_or("").to_string();
+            let stem = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s).to_string();
+            let data = surfacecraft_doc::base64::encode(&bytes);
+            let (id, params) = if ext == "step" || ext == "stp" {
+                ("import.step", json!({"data": data, "name": stem}))
+            } else {
+                ("mesh.import", json!({"data": data, "format": ext, "name": stem}))
+            };
+            self.launch(id, params, After::Fit);
+        }
+    }
+
+    /// Downloads the selected object: a mesh as STL, a body or surface as STEP (web build).
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn download_selected(&mut self) {
+        let Some(id) = self.selected_object else {
+            self.status = t("status.select_first").to_string();
+            return;
+        };
+        let (cmd, params, file) = match self.session.doc.kind_of(id) {
+            Some(surfacecraft_doc::ObjectKind::Mesh) => {
+                ("mesh.export", json!({"object": id.0, "format": "stl"}), "mesh.stl")
+            }
+            Some(surfacecraft_doc::ObjectKind::Body | surfacecraft_doc::ObjectKind::Surface) => {
+                ("export.step", json!({"objects": [id.0]}), "model.step")
+            }
+            _ => {
+                self.status = t("status.download_kinds").to_string();
+                return;
+            }
+        };
+        self.launch(cmd, params, After::Download(file));
     }
 
     /// The dialog over the window while a command runs: what runs, for how long, and Cancel.

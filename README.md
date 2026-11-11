@@ -79,12 +79,13 @@ cargo xtask web      # → apps/surfacecraft-web/dist (serve it with any static 
 ```
 
 You need `wasm-bindgen` on your `PATH` (the version of `Cargo.lock`) and the nightly toolchain the
-bundle is built with: `rustup toolchain install "$(cargo xtask web-toolchain)" --profile minimal
---component rust-src`. The bundle has threads (heavy tools run in web workers), which the browser
-allows only on a cross-origin isolated page: serve it with the headers
-`Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` (the
-`vercel.json` in `dist` sets them on Vercel). Without them the app still runs, on one thread.
-`cargo xtask web --no-threads` builds a bundle without threads on stable. The browser build renders
+threaded bundle is built with: `rustup toolchain install "$(cargo xtask web-toolchain)" --profile
+minimal --component rust-src`. `dist` holds two bundles and a page that picks one: `mt/` with
+threads (heavy tools run in web workers), which the browser allows only on a cross-origin isolated
+page, so serve `dist` with the headers `Cross-Origin-Opener-Policy: same-origin` and
+`Cross-Origin-Embedder-Policy: require-corp` (the `vercel.json` in `dist` sets them on Vercel); and
+`st/` without threads, used wherever the page cannot share memory (no headers, an older browser,
+`?threads=0`). `cargo xtask web --no-threads` builds only `st/`, on stable. The browser build renders
 with WebGPU, falling back to WebGL.
 
 ## For agents: MCP, CLI and scripts

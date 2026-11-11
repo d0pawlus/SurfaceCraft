@@ -13,6 +13,7 @@
 )]
 
 pub mod app;
+pub mod assistant;
 pub mod brep;
 pub mod camera;
 pub mod command_panel;

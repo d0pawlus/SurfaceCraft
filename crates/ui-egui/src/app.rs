@@ -49,6 +49,8 @@ pub struct SurfaceCraftApp {
     pub background_jobs: bool,
     /// The command running now, if one is.
     pub(crate) busy: Option<crate::jobs::Busy>,
+    /// A cancelled command whose thread has not finished yet.
+    pub(crate) finishing: Option<surfacecraft_engine::Job>,
     /// Last status line.
     pub status: String,
     /// Points picked in the viewport (click: replace, Shift+click: add).
@@ -74,12 +76,12 @@ pub struct SurfaceCraftApp {
     pub assistant_goal: String,
     /// Align (true) or workflow mode.
     pub assistant_align: bool,
-    provider: Option<Box<dyn surfacecraft_ai::Provider>>,
+    pub(crate) provider: Option<Box<dyn surfacecraft_ai::Provider>>,
     pub(crate) prepared: bool,
     pub(crate) ctx: Option<egui::Context>,
     pub(crate) applied: Option<(crate::theme::Theme, crate::i18n::Lang)>,
     #[cfg(not(target_arch = "wasm32"))]
-    control: Option<std::sync::mpsc::Receiver<crate::control::Request>>,
+    pub(crate) control: Option<std::sync::mpsc::Receiver<crate::control::Request>>,
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) dialogs: craft_dialogs::Dialogs<crate::shell::DialogThen>,
     #[cfg(target_arch = "wasm32")]
@@ -133,6 +135,7 @@ impl SurfaceCraftApp {
             deviation: Default::default(),
             background_jobs: false,
             busy: None,
+            finishing: None,
             status: t("status.ready").to_string(),
             picks: Vec::new(),
             field_pick: None,
@@ -147,7 +150,7 @@ impl SurfaceCraftApp {
             tools: crate::viewtools::ViewTools::default(),
             assistant_goal: String::new(),
             assistant_align: true,
-            provider: default_provider(),
+            provider: crate::assistant::default_provider(),
             prepared: false,
             ctx: None,
             applied: None,
@@ -322,81 +325,6 @@ impl SurfaceCraftApp {
         json!({ "commands": cmds })
     }
 
-    /// Answers control-channel requests (bridged MCP) between frames.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn poll_control(&mut self) {
-        // one request at a time: a heavy command runs in the background and the requests behind
-        // it wait in the channel until it has answered
-        while !self.is_busy() {
-            let Some(r) = self.control.as_ref().and_then(|rx| rx.try_recv().ok()) else { return };
-            let reply = match r.method.as_str() {
-                "engine.execute" => {
-                    let cmd = r.params.get("command").and_then(Value::as_str).unwrap_or("").to_string();
-                    let params = r.params.get("params").cloned().unwrap_or(Value::Null);
-                    self.launch(&cmd, params, crate::jobs::After::Reply(r.reply));
-                    continue;
-                }
-                "ui.screenshot" => {
-                    let dim = |k: &str, d: u64| r.params.get(k).and_then(Value::as_u64).unwrap_or(d) as u32;
-                    let cam = self.camera.clone();
-                    match crate::shot::screenshot_png(
-                        &mut self.session,
-                        Some(&cam),
-                        dim("width", 800),
-                        dim("height", 600),
-                    ) {
-                        Some(png) => json!({"png": surfacecraft_doc::base64::encode(&png)}),
-                        None => json!({"err": "no renderer"}),
-                    }
-                }
-                other => json!({"err": format!("unknown method {other}")}),
-            };
-            let _ = r.reply.send(reply);
-        }
-    }
-
-    /// Imports files the browser picked (web build).
-    #[cfg(target_arch = "wasm32")]
-    pub(crate) fn poll_inbox(&mut self) {
-        // one file at a time: an import may run in the background, and the next waits for it
-        while !self.is_busy() {
-            let mut inbox = self.inbox.borrow_mut();
-            if inbox.is_empty() {
-                return;
-            }
-            let (name, bytes) = inbox.remove(0);
-            drop(inbox);
-            let lower = name.to_lowercase();
-            let ext = lower.rsplit('.').next().unwrap_or("").to_string();
-            let stem = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s).to_string();
-            let data = surfacecraft_doc::base64::encode(&bytes);
-            let (id, params) = if ext == "step" || ext == "stp" {
-                ("import.step", json!({"data": data, "name": stem}))
-            } else {
-                ("mesh.import", json!({"data": data, "format": ext, "name": stem}))
-            };
-            self.launch(id, params, crate::jobs::After::Fit);
-        }
-    }
-
-    /// Downloads the selected object: a mesh as STL, a body or surface as STEP (web build).
-    #[cfg(target_arch = "wasm32")]
-    pub(crate) fn download_selected(&mut self) {
-        let Some(id) = self.selected_object else {
-            self.status = t("status.select_first").to_string();
-            return;
-        };
-        let (cmd, params, file) = match self.session.doc.kind_of(id) {
-            Some(ObjectKind::Mesh) => ("mesh.export", json!({"object": id.0, "format": "stl"}), "mesh.stl"),
-            Some(ObjectKind::Body | ObjectKind::Surface) => ("export.step", json!({"objects": [id.0]}), "model.step"),
-            _ => {
-                self.status = t("status.download_kinds").to_string();
-                return;
-            }
-        };
-        self.launch(cmd, params, crate::jobs::After::Download(file));
-    }
-
     pub(crate) fn shortcuts(&mut self, ui: &mut egui::Ui) {
         if self.is_busy() {
             return;
@@ -548,43 +476,6 @@ impl SurfaceCraftApp {
             }
             self.guide_panel(ui);
         });
-    }
-
-    /// Uses `p` as the assistant's language model.
-    pub fn set_provider(&mut self, p: Box<dyn surfacecraft_ai::Provider>) {
-        self.provider = Some(p);
-    }
-
-    /// Runs the assistant on the current goal with a picture of the viewport.
-    pub fn ask_assistant(&mut self) {
-        let Some(mut p) = self.provider.take() else {
-            self.status = t("assistant.no_provider_status").to_string();
-            return;
-        };
-        let mode = if self.assistant_align { surfacecraft_ai::Mode::Align } else { surfacecraft_ai::Mode::Workflow };
-        let cam = self.camera.clone();
-        let png = crate::shot::screenshot_png(&mut self.session, Some(&cam), 512, 384);
-        let goal = self.assistant_goal.clone();
-        self.status = match surfacecraft_ai::run(&mut self.session, p.as_mut(), mode, &goal, png.as_deref(), 20) {
-            Ok(o) => tf("assistant.done", &[("summary", &o.summary), ("n", &o.steps.len().to_string())]),
-            Err(e) => tf("assistant.failed", &[("error", &crate::i18n::engine_message(&e.to_string()))]),
-        };
-        self.provider = Some(p);
-        self.fit_pending = true;
-    }
-
-    fn assistant_panel(&mut self, ui: &mut egui::Ui) {
-        ui.strong(t("assistant.title"));
-        ui.horizontal(|ui| {
-            ui.radio_value(&mut self.assistant_align, true, t("assistant.align"));
-            ui.radio_value(&mut self.assistant_align, false, t("assistant.workflow"));
-        });
-        let l = ui.label(t("assistant.goal"));
-        ui.add(egui::TextEdit::singleline(&mut self.assistant_goal).hint_text(t("assistant.goal_hint")))
-            .labelled_by(l.id);
-        if ui.button(t("assistant.ask")).clicked() {
-            self.ask_assistant();
-        }
     }
 
     /// The command log: every call as the JSON a script or MCP client would send.
@@ -871,15 +762,4 @@ fn example(p: &Value, root: &Value) -> Value {
 #[must_use]
 pub fn kind_color(kind: ObjectKind) -> [f32; 4] {
     Tokens::resolve(crate::theme::Preset::Light).object(kind)
-}
-
-fn default_provider() -> Option<Box<dyn surfacecraft_ai::Provider>> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        surfacecraft_ai::CommandProvider::from_env().map(|p| Box::new(p) as Box<dyn surfacecraft_ai::Provider>)
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        None
-    }
 }

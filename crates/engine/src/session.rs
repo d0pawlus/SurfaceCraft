@@ -66,8 +66,9 @@ pub struct Session {
     pub doc: Document,
     /// Undo/redo.
     pub history: History,
-    /// Every command executed, oldest first (capped).
-    pub log: Vec<LogEntry>,
+    /// Every command executed, oldest first (capped). Entries are shared: a fork of the session
+    /// copies pointers, not the parameters (which may hold a whole imported file).
+    pub log: Vec<Arc<LogEntry>>,
     /// Whether commands may touch the file system (false on the web and in sandboxed MCP).
     pub allow_files: bool,
     /// Body display meshes.
@@ -132,14 +133,16 @@ impl Session {
     }
 
     fn push_log(&mut self, entry: LogEntry) {
-        self.log.push(entry);
+        self.log.push(Arc::new(entry));
         if self.log.len() > LOG_CAP {
             self.log.remove(0);
         }
     }
 
-    /// A second session in the state of this one: the same document, history, log and caches
-    /// (shared, not copied: they are reference-counted), and its own cancellation flag. A
+    /// A second session in the state of this one, and its own cancellation flag. Cheap: the
+    /// geometry, the undo snapshots and the log entries are reference-counted, so the fork copies
+    /// the object lists of the current document and one pointer per undo step, log entry and
+    /// cache entry; no parameter of a logged command and no mesh is copied. A
     /// background job runs a command on the fork while the front end keeps showing this session;
     /// when the job is done the fork is the session, and when it is abandoned this one still is.
     #[must_use]

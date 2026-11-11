@@ -25,6 +25,9 @@ getrandom = { workspace = true, features = ["wasm_js"] }
 # `web_spin_lock` lets the page's thread, which may not block, hand work to the pool.
 [target.'cfg(all(target_arch = "wasm32", target_feature = "atomics"))'.dependencies]
 rayon = { workspace = true, features = ["web_spin_lock"] }
+# std's allocator for wasm takes one global lock per call when built with atomics, so the workers
+# of the pool queue on it; this one gives every thread its own heap.
+orx-parallel-wasm-allocator = "0.2.1"
 
 [lints]
 workspace = true

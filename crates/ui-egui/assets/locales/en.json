@@ -922,5 +922,6 @@
   "busy.in_place": "This browser page has no background threads, so the page will not respond until the command has finished.",
   "status.running": "{name}: running…",
   "status.busy": "{name} is still running",
-  "status.cancelled": "{name}: cancelled"
+  "status.cancelled": "{name}: cancelled",
+  "status.finishing": "The cancelled command is still finishing; try again in a moment"
 }

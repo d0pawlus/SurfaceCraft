@@ -12,6 +12,18 @@
 #[cfg(target_arch = "wasm32")]
 mod threads;
 
+/// Heaps of the threaded bundle's allocator: one per allocating thread (the page and at most 16
+/// pool workers), with room so that two threads do not share one.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+const ALLOCATOR_HEAPS: usize = 32;
+
+/// The threaded bundle's allocator: a heap per thread. std's allocator for wasm serialises every
+/// allocation of every thread on one lock, which made the pool slower than one thread.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[global_allocator]
+static ALLOCATOR: orx_parallel_wasm_allocator::WasmParallelAllocator<ALLOCATOR_HEAPS> =
+    orx_parallel_wasm_allocator::WasmParallelAllocator::new();
+
 #[cfg(not(target_arch = "wasm32"))]
 fn main() {
     println!("surfacecraft-web is the browser build: cargo xtask web");

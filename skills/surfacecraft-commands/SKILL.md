@@ -23,7 +23,11 @@ description: Adding or changing a SurfaceCraft command, crate boundaries, the CL
   same log entry and undo step as `Session::execute`. The UI thread never waits (in the browser it
   must not). `Session::execute`, the CLI, MCP and scripts are unchanged; a headless
   `SurfaceCraftApp` (tests) runs everything in place. A long loop may look at `Session::cancel`
-  and return `cmd::cancelled()` (today: `region.auto_segment`, `region.resegment`).
+  and return `cmd::cancelled()` (today: `region.auto_segment`, `region.resegment`, `align.icp`,
+  `mesh.smooth`); `cmd::write_file` writes nothing for a cancelled command. A cancelled command
+  that does not look at the flag runs to its end, and no other heavy command starts before that.
+  UI code that changes the session takes it from `SurfaceCraftApp::idle_session`, which refuses
+  while a command runs.
 - Layers (checked by `cargo xtask layers`): L0 geom; L1 kernel, fit, align, sketch; L2 deviation,
   doc; L3 io; L4 engine; L5 ui-egui, mcp; apps. A crate depends only on lower layers (or earlier
   crates of its own layer, listed in `INTRA_LAYER_ORDER`). Only `kernel` uses solidcore.

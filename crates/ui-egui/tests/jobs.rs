@@ -150,3 +150,88 @@ fn the_window_says_what_runs_and_cancel_stops_it() {
     assert_eq!(h.state().status, "Auto segment: cancelled");
     assert!(h.query_by_label("Running: Auto segment").is_none());
 }
+
+/// Tries a heavy command until the app takes it (a cancelled one may still be finishing).
+fn launch_when_free(app: &mut SurfaceCraftApp) {
+    let started = Instant::now();
+    while !app.run_palette() {
+        assert!(started.elapsed() < PATIENCE, "the cancelled command never finished: {}", app.status);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn a_new_heavy_command_waits_for_a_cancelled_one_that_cannot_stop() {
+    let mut app = slow_scan();
+    // decimation does not look at the cancellation flag: it runs to its end after Cancel
+    app.choose_command("mesh.decimate");
+    app.palette_params = json!({"object": "scan", "target": 500}).to_string();
+    assert!(app.run_palette());
+    app.cancel_job();
+    assert!(!app.is_busy());
+
+    open_auto_segment(&mut app, "scan");
+    assert!(!app.run_palette(), "a heavy command is refused while the cancelled one still runs");
+    assert_eq!(app.status, "The cancelled command is still finishing; try again in a moment");
+    assert!(!app.is_busy());
+    // quick commands are not held up
+    assert!(app.run_command("mesh.synth", json!({"shape": "box"})).is_ok());
+    // and once the cancelled command has ended, heavy ones start again
+    launch_when_free(&mut app);
+    assert!(app.is_busy());
+    app.cancel_job();
+    assert_eq!(app.session.doc.meshes.len(), 2, "the cancelled decimation changed nothing");
+}
+
+#[test]
+fn the_assistant_is_refused_while_a_command_runs() {
+    let mut app = slow_scan();
+    app.set_provider(Box::new(surfacecraft_ai::ScriptedProvider::default()));
+    open_auto_segment(&mut app, "scan");
+    assert!(app.run_palette());
+    let log = app.session.log.len();
+
+    app.ask_assistant();
+
+    assert_eq!(app.status, "Auto segment is still running");
+    assert_eq!(app.session.log.len(), log);
+    assert!(app.is_busy());
+    app.cancel_job();
+}
+
+#[test]
+fn a_heavy_command_from_the_control_channel_runs_in_the_background_and_answers() {
+    use surfacecraft_ui_egui::control::Request;
+    let mut in_place = bracket(false);
+    let expected = in_place.run_command("region.auto_segment", json!({"mesh": "scan"})).unwrap();
+
+    let mut app = bracket(true);
+    let (requests, inbox) = std::sync::mpsc::channel();
+    app.attach_control(inbox);
+    let ask = |command: &str, params: serde_json::Value| {
+        let (reply, answer) = std::sync::mpsc::channel();
+        let params = json!({"command": command, "params": params});
+        requests.send(Request { method: "engine.execute".into(), params, reply }).unwrap();
+        answer
+    };
+    let segmented = ask("region.auto_segment", json!({"mesh": "scan"}));
+    let listed = ask("region.list", json!({}));
+
+    app.poll_control();
+    assert!(app.is_busy(), "the heavy command runs in the background");
+    assert!(segmented.try_recv().is_err(), "no answer before it has finished");
+    assert!(listed.try_recv().is_err(), "the request behind it waits in the channel");
+    wait(&mut app);
+    app.poll_control();
+
+    assert_eq!(segmented.try_recv().unwrap(), json!({"ok": expected}));
+    let regions = listed.try_recv().unwrap();
+    assert_eq!(regions["ok"]["regions"].as_array().map(Vec::len), Some(app.session.doc.regions.len()));
+    assert_eq!(app.session.log, in_place_log_with_list(&mut in_place));
+}
+
+/// The log of `app` after it has also listed the regions.
+fn in_place_log_with_list(app: &mut SurfaceCraftApp) -> Vec<std::sync::Arc<surfacecraft_engine::LogEntry>> {
+    app.run_command("region.list", json!({})).unwrap();
+    app.session.log.clone()
+}

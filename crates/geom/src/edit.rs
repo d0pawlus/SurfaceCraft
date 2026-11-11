@@ -956,8 +956,20 @@ fn collapse_within(original: &Bvh, limit: f64, p: &Point3, old: &[Point3], fan: 
 /// Taubin smoothing; `fix_boundary` keeps boundary vertices, `feature_angle_deg` keeps vertices on
 /// edges sharper than that (None = smooth everything). Returns the largest displacement (mm).
 pub fn smooth(mesh: &mut Mesh, iterations: usize, fix_boundary: bool, feature_angle_deg: Option<f64>) -> f64 {
+    smooth_cancellable(mesh, iterations, fix_boundary, feature_angle_deg, &crate::Cancel::new()).unwrap_or(0.0)
+}
+
+/// [`smooth`] that gives up when `cancel` is set (checked every iteration): `None` then, with the
+/// mesh left part-way smoothed, for the caller to discard.
+pub fn smooth_cancellable(
+    mesh: &mut Mesh,
+    iterations: usize,
+    fix_boundary: bool,
+    feature_angle_deg: Option<f64>,
+    cancel: &crate::Cancel,
+) -> Option<f64> {
     if mesh.validate().is_err() {
-        return 0.0;
+        return Some(0.0);
     }
     let ring = vertex_rings(mesh);
     let mut fixed = vec![false; mesh.positions.len()];
@@ -996,10 +1008,13 @@ pub fn smooth(mesh: &mut Mesh, iterations: usize, fix_boundary: bool, feature_an
         }
     };
     for _ in 0..iterations.min(1000) {
+        if cancel.is_cancelled() {
+            return None;
+        }
         step(&mut mesh.positions, 0.5);
         step(&mut mesh.positions, -0.53);
     }
-    mesh.positions.iter().zip(&start).map(|(a, b)| (a - b).norm()).fold(0.0, f64::max)
+    Some(mesh.positions.iter().zip(&start).map(|(a, b)| (a - b).norm()).fold(0.0, f64::max))
 }
 
 #[cfg(test)]

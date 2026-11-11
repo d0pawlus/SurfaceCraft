@@ -22,7 +22,7 @@ pub mod principal;
 pub mod symmetry;
 
 pub use datum::{Datum, datum_321};
-pub use icp::{IcpOptions, IcpReport, icp, rms_to_surface};
+pub use icp::{IcpOptions, IcpReport, icp, icp_cancellable, rms_to_surface};
 pub use kabsch::kabsch;
 pub use principal::principal_frame;
 pub use symmetry::{SymmetryPlane, symmetry_plane};
@@ -36,6 +36,9 @@ pub enum AlignError {
     /// The input is degenerate (collinear points, parallel planes…).
     #[error("degenerate input: {0}")]
     Degenerate(String),
+    /// The caller cancelled the computation.
+    #[error("cancelled")]
+    Cancelled,
 }
 
 /// Plane through points with the normal oriented along `orient` (PCA).

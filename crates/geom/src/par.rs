@@ -6,7 +6,7 @@
 //! the thread pool (the main thread must not wait: `Atomics.wait` throws there), so work spreads
 //! only when the caller already runs on the pool, which is where [`spawn_background`] puts heavy
 //! work. A browser build without threads never has a pool and runs everything in place.
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Stack of a background thread on native targets (the browser's workers get theirs from
 /// the web app): solidcore recurses deeply and asks for 8 MiB.
@@ -15,6 +15,9 @@ const BACKGROUND_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 /// Set once the browser's thread pool runs (see [`enable_background`]).
 static POOL_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Times a background thread was reported dead (see [`background_failed`]).
+static FAILURES: AtomicUsize = AtomicUsize::new(0);
 
 /// May the calling thread hand work to other threads and wait for it?
 fn fans_out() -> bool {
@@ -46,6 +49,22 @@ pub fn parallel() -> bool {
 /// it. The web app calls it once the pool has started; native targets need no call.
 pub fn enable_background() {
     POOL_STARTED.store(true, Ordering::Release);
+}
+
+/// Reports that a thread of the browser's pool died (its worker threw: a panic aborts in wasm).
+/// The pool is not used from then on, [`background_available`] is false and work runs in place;
+/// whoever waits for background work learns from [`background_failures`] that it may never end.
+/// On native targets, where a panic unwinds and is caught, only the count moves.
+pub fn background_failed() {
+    POOL_STARTED.store(false, Ordering::Release);
+    FAILURES.fetch_add(1, Ordering::AcqRel);
+}
+
+/// How many times [`background_failed`] was called. Work started while it had one value and
+/// still unfinished when it has another must be given up.
+#[must_use]
+pub fn background_failures() -> usize {
+    FAILURES.load(Ordering::Acquire)
 }
 
 /// Can [`spawn_background`] run work off the calling thread? Always on native targets; in the

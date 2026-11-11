@@ -309,13 +309,31 @@ pub fn read_file(s: &Session, path: &str) -> CmdResult<Vec<u8>> {
     std::fs::read(path).map_err(|e| CmdError::Failed(format!("cannot read {path}: {e}")))
 }
 
-/// Writes a file, refusing when the session has no file access.
+/// Writes a file, refusing when the session has no file access. Nothing is written for a
+/// command that was cancelled meanwhile, and the file appears whole or not at all: the data
+/// goes to a temporary file beside it, which is renamed over `path` once written.
 pub fn write_file(s: &Session, path: &str, data: &[u8]) -> CmdResult<()> {
     if !s.allow_files {
         return Err(CmdError::Unavailable("file paths are not available here; ask for the data inline".into()));
     }
-    std::fs::write(path, data).map_err(|e| CmdError::Failed(format!("cannot write {path}: {e}")))
+    if s.cancel.is_cancelled() {
+        return Err(cancelled());
+    }
+    let failed = |e: std::io::Error| CmdError::Failed(format!("cannot write {path}: {e}"));
+    let partial = format!("{path}{PARTIAL_SUFFIX}");
+    std::fs::write(&partial, data).map_err(failed)?;
+    if s.cancel.is_cancelled() {
+        let _ = std::fs::remove_file(&partial);
+        return Err(cancelled());
+    }
+    std::fs::rename(&partial, path).map_err(|e| {
+        let _ = std::fs::remove_file(&partial);
+        failed(e)
+    })
 }
+
+/// What [`write_file`] appends to the name of the file it writes before renaming it into place.
+const PARTIAL_SUFFIX: &str = ".part";
 
 #[cfg(test)]
 mod tests {

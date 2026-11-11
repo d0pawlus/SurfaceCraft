@@ -1,7 +1,8 @@
 //! `cargo xtask <task>`: the repository's checks.
 //!
 //! `ci` runs, in order: fmt → assets → licences → layers → ui-containers → app-geometry → clippy → wasm → test.
-//! `web [--no-threads]` (not in ci) builds the browser bundle; `web-toolchain` prints the nightly it needs.
+//! `web [--no-threads]` (not in ci) builds the browser bundles, `web --check` type-checks the threaded one
+//! (its own CI job); `web-toolchain` prints the nightly they need.
 //! `dist [--tag vX.Y.Z]` (not in ci) builds the host-target release packages in `dist/<target>/release/`.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -215,13 +216,14 @@ fn main() -> ExitCode {
             "clippy" => clippy(),
             "wasm" => wasm(),
             "test" => test(),
+            "web" if check => web::check(),
             "web" => web::build(!args.iter().any(|a| a == "--no-threads")),
             "web-toolchain" => {
                 println!("{}", web::NIGHTLY);
                 Ok(())
             }
             "dist" => dist::run(&args),
-            _ => Err("tasks: ci, quick [--tests] [packages], fmt, assets, licences [--check], layers, ui-containers, app-geometry, clippy, wasm, test, web [--no-threads], web-toolchain, dist [--tag vX.Y.Z]"
+            _ => Err("tasks: ci, quick [--tests] [packages], fmt, assets, licences [--check], layers, ui-containers, app-geometry, clippy, wasm, test, web [--no-threads | --check], web-toolchain, dist [--tag vX.Y.Z]"
                 .into()),
         };
     match r {

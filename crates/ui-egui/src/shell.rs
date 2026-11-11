@@ -352,6 +352,10 @@ impl SurfaceCraftApp {
     #[cfg(not(target_arch = "wasm32"))]
     fn poll_dialogs(&mut self) {
         use craft_dialogs::Answer;
+        // an answer that arrives while a command runs waits for it (it is not dropped)
+        if self.is_busy() {
+            return;
+        }
         for (then, answer) in self.dialogs.take_answers() {
             let path = match answer {
                 Answer::Paths(p) => p.into_iter().next(),

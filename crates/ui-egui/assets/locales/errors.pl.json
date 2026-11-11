@@ -517,6 +517,7 @@
   "{} is too heavy to preview": "{} jest zbyt czasochłonne na podgląd",
   "{} is running": "trwa polecenie {}",
   "cancelled": "anulowano",
+  "the cancelled command is still finishing": "anulowane polecenie jeszcze się kończy",
   "{} knots for {} control points": "{} węzłów przy {} punktach kontrolnych",
   "{} must be 1..=500": "{} musi być w zakresie 1..=500",
   "{} must be a positive number": "{} musi być liczbą dodatnią",

@@ -7,6 +7,11 @@
 //! memory and then takes one of rayon's threads from a queue and runs it. The page's thread may
 //! never block, so it only starts work on the pool (`surfacecraft_geom::par::spawn_background`)
 //! and polls for the result.
+//!
+//! A panic in wasm aborts the worker it happens on. `pool.js` reports that, the pool is then
+//! given up (`surfacecraft_geom::par::background_failed`): the command that was running is
+//! reported as failed, and heavy commands run on the page's thread from then on, with the warning
+//! a page without threads shows. Reloading the page brings the pool back.
 
 /// A bundle without threads has no pool to start.
 #[cfg(not(target_feature = "atomics"))]
@@ -45,6 +50,7 @@ mod pool {
             main_js: js_sys::JsString,
             count: u32,
             stack: u32,
+            on_dead: &Closure<dyn Fn(String)>,
         ) -> js_sys::Promise;
     }
 
@@ -100,8 +106,11 @@ mod pool {
             return Err("the thread pool was already started".into());
         }
         let main_js = MAIN_JS.with(Clone::clone);
-        let workers =
-            start_workers(wasm_bindgen::module(), wasm_bindgen::memory(), main_js, threads as u32, WORKER_STACK_BYTES);
+        let on_dead = Closure::<dyn Fn(String)>::new(worker_died);
+        let (module, memory) = (wasm_bindgen::module(), wasm_bindgen::memory());
+        let workers = start_workers(module, memory, main_js, threads as u32, WORKER_STACK_BYTES, &on_dead);
+        // the workers may report a death for as long as the page lives
+        on_dead.forget();
         wasm_bindgen_futures::JsFuture::from(workers).await?;
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
@@ -111,6 +120,19 @@ mod pool {
             })
             .build_global()
             .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// A worker of the pool died (a panic aborts in wasm): the command that ran on it will never
+    /// finish and the pool may be stuck waiting for it, so it is not used again. The running
+    /// command is reported as failed and later heavy commands run on the page's thread.
+    fn worker_died(message: String) {
+        surfacecraft_geom::par::background_failed();
+        web_sys::console::error_1(
+            &format!(
+                "SurfaceCraft: a worker of the thread pool died ({message}); heavy tools now run on the page's thread"
+            )
+            .into(),
+        );
     }
 
     fn warn(message: &str) {

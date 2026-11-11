@@ -5,6 +5,7 @@
 const INIT = 'surfacecraft_pool_init';
 const READY = 'surfacecraft_pool_ready';
 const FAILED = 'surfacecraft_pool_failed';
+const DIED = 'surfacecraft_pool_died';
 
 if (typeof WorkerGlobalScope !== 'undefined' && self instanceof WorkerGlobalScope) {
   self.addEventListener('message', async ({ data }) => {
@@ -22,8 +23,14 @@ if (typeof WorkerGlobalScope !== 'undefined' && self instanceof WorkerGlobalScop
       return;
     }
     postMessage({ type: READY });
-    // does not return: it waits for work from the pool
-    pkg.pool_worker_run();
+    try {
+      // does not return while the pool lives: it waits for work
+      pkg.pool_worker_run();
+      postMessage({ type: DIED, message: 'the pool thread ended' });
+    } catch (e) {
+      // a panic in wasm is a trap: this thread of the pool is gone, and so is the work it had
+      postMessage({ type: DIED, message: String(e) });
+    }
   });
 }
 
@@ -32,16 +39,21 @@ if (typeof WorkerGlobalScope !== 'undefined' && self instanceof WorkerGlobalScop
 let workers = [];
 
 // Starts `count` workers on `module` and `memory`; resolves once every one is instantiated and
-// rejects when one cannot start.
-export async function startWorkers(module, memory, mainJs, count, stackBytes) {
+// rejects when one cannot start. `onDead(message)` is called whenever a worker dies later.
+export async function startWorkers(module, memory, mainJs, count, stackBytes, onDead) {
   const start = () =>
     new Promise((resolve, reject) => {
       const worker = new Worker(import.meta.url, { type: 'module' });
+      let ready = false;
+      const dead = message => (ready ? onDead(message) : reject(new Error(message)));
       worker.addEventListener('message', ({ data }) => {
-        if (data?.type === READY) resolve(worker);
-        if (data?.type === FAILED) reject(new Error(data.message));
+        if (data?.type === READY) {
+          ready = true;
+          resolve(worker);
+        }
+        if (data?.type === FAILED || data?.type === DIED) dead(data.message);
       });
-      worker.addEventListener('error', e => reject(new Error(e.message || 'a pool worker failed to load')));
+      worker.addEventListener('error', e => dead(e.message || 'a pool worker failed'));
       worker.postMessage({ type: INIT, module, memory, mainJs, stackBytes });
     });
   workers = await Promise.all(Array.from({ length: count }, start));

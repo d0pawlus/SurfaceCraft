@@ -30,7 +30,8 @@ pub enum JobPoll {
     Running,
     /// The command finished (with a result or an error); returned once.
     Finished(Box<Finished>),
-    /// The job's thread ended without a result (a bug: it panicked outside the command), or the
+    /// The job's thread ended without a result (a bug: it panicked outside the command), a
+    /// thread of the browser's pool died while the job ran (a panic aborts in wasm), or the
     /// result was already taken. The caller's own session is still good.
     Lost,
 }
@@ -55,27 +56,34 @@ impl Drop for Done {
 #[derive(Debug)]
 pub struct Job {
     command: String,
-    params: Value,
+    params: Arc<Value>,
     slot: Arc<Slot>,
     cancel: Cancel,
+    /// [`par::background_failures`] when the job started: if it moves, a thread of the pool
+    /// died, and the job may be the one that ran on it.
+    failures: usize,
 }
 
 impl Job {
     /// Starts command `id` with `params` on a fork of `session`. `None` when there is no thread
     /// to run it on (a browser without threads): the caller then executes it in place.
+    ///
+    /// The parameters are shared with the job, not copied here: the one copy `execute` needs is
+    /// made on the job's thread.
     #[must_use]
-    pub fn start(session: &Session, id: &str, params: Value) -> Option<Job> {
+    pub fn start(session: &Session, id: &str, params: Arc<Value>) -> Option<Job> {
         let (command, given) = (id.to_string(), params.clone());
-        Self::start_with(session.fork(), id, params, move |s| s.execute(&command, given))
+        Self::start_with(session.fork(), id, params, move |s| s.execute(&command, Value::clone(&given)))
     }
 
-    fn start_with<W>(mut fork: Session, id: &str, params: Value, work: W) -> Option<Job>
+    fn start_with<W>(mut fork: Session, id: &str, params: Arc<Value>, work: W) -> Option<Job>
     where
         W: FnOnce(&mut Session) -> Result<Value, EngineError> + Send + 'static,
     {
         let slot = Arc::new(Slot::default());
         let cancel = fork.cancel.clone();
         let done = Done(slot.clone());
+        let failures = par::background_failures();
         let spawned = par::spawn_background(move || {
             let result = work(&mut fork);
             if let Ok(mut finished) = done.0.finished.lock() {
@@ -83,7 +91,7 @@ impl Job {
             }
             // `done` drops here, after the result is in place
         });
-        spawned.then(|| Job { command: id.to_string(), params, slot, cancel })
+        spawned.then(|| Job { command: id.to_string(), params, slot, cancel, failures })
     }
 
     /// The command's id.
@@ -94,7 +102,7 @@ impl Job {
 
     /// The parameters the command was started with.
     #[must_use]
-    pub fn params(&self) -> &Value {
+    pub fn params(&self) -> &Arc<Value> {
         &self.params
     }
 
@@ -102,7 +110,9 @@ impl Job {
     #[must_use]
     pub fn poll(&self) -> JobPoll {
         if !self.slot.done.load(Ordering::Acquire) {
-            return JobPoll::Running;
+            // a dead pool thread never sets the flag: do not wait for it for ever
+            let orphaned = par::background_failures() != self.failures;
+            return if orphaned { JobPoll::Lost } else { JobPoll::Running };
         }
         let taken = match self.slot.finished.try_lock() {
             Ok(mut finished) => finished.take(),
@@ -112,10 +122,18 @@ impl Job {
         taken.map_or(JobPoll::Lost, |f| JobPoll::Finished(Box::new(f)))
     }
 
+    /// Is the job's thread still at work? (Also after [`Job::cancel`], until the command ends.)
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        !self.slot.done.load(Ordering::Acquire) && par::background_failures() == self.failures
+    }
+
     /// Asks the command to stop. The commands whose long loops look at the flag
-    /// (`region.auto_segment`, `region.resegment`) end within a moment with the error
-    /// [`crate::cmd::CANCELLED`]; any other runs to its end. Either way the caller may drop the
-    /// job at once: its own session is the state from before the command.
+    /// (`region.auto_segment`, `region.resegment`, `align.icp`, `mesh.smooth`) end within a
+    /// moment with the error [`crate::cmd::CANCELLED`]; any other runs to its end, but writes no
+    /// file once cancelled (`cmd::write_file`). The caller's own session is the state from
+    /// before the command either way; it keeps the job to know when its thread is free again
+    /// ([`Job::is_running`]).
     pub fn cancel(&self) {
         self.cancel.cancel();
     }
@@ -143,8 +161,10 @@ mod tests {
         let mut session = Session::new();
         session.execute("mesh.synth", serde_json::json!({"shape": "sphere"})).unwrap();
         let before = session.doc.summaries();
-        let job = Job::start_with(session.fork(), "test.panic", Value::Null, |_| panic!("a bug outside the command"))
-            .unwrap();
+        let job = Job::start_with(session.fork(), "test.panic", Arc::new(Value::Null), |_| {
+            panic!("a bug outside the command")
+        })
+        .unwrap();
         assert!(matches!(wait(&job), JobPoll::Lost));
         assert_eq!(session.doc.summaries(), before);
         assert_eq!(session.log.len(), 1);
@@ -153,7 +173,7 @@ mod tests {
     #[test]
     fn the_work_runs_on_another_thread() {
         let here = std::thread::current().id();
-        let job = Job::start_with(Session::new(), "test.thread", Value::Null, move |_| {
+        let job = Job::start_with(Session::new(), "test.thread", Arc::new(Value::Null), move |_| {
             Ok(serde_json::json!(std::thread::current().id() != here))
         })
         .unwrap();

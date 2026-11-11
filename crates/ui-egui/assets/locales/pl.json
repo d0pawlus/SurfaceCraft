@@ -922,5 +922,6 @@
   "busy.in_place": "Ta strona przeglądarki nie ma wątków w tle, więc nie będzie odpowiadać, dopóki polecenie się nie skończy.",
   "status.running": "{name}: trwa…",
   "status.busy": "{name} jeszcze trwa",
-  "status.cancelled": "{name}: anulowano"
+  "status.cancelled": "{name}: anulowano",
+  "status.finishing": "Anulowane polecenie jeszcze się kończy; spróbuj za chwilę"
 }
