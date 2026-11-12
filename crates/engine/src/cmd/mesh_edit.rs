@@ -39,6 +39,9 @@ pub struct EditOut {
     /// The edit changed the working copy, and the original is untouched.
     #[serde(skip_serializing_if = "is_false", default)]
     pub working: bool,
+    /// Why a `mesh.decimate` with a `target` stopped above it (`triangles` is what was reached).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub target_not_reached: Option<String>,
 }
 
 fn is_false(v: &bool) -> bool {
@@ -124,6 +127,7 @@ fn edit_mesh(
         regions_dropped: 0,
         tolerance_report: None,
         working,
+        target_not_reached: None,
     };
     let old_tris = m.triangles.clone();
     f(&mut m, &mut o)?;
@@ -306,6 +310,25 @@ pub struct DecimateIn {
     pub share: Option<f64>,
 }
 
+/// Why a decimation stopped above its target, `None` when it did not.
+fn not_reached(reached: usize, target: usize, report: &edit::DecimateReport, max_error: Option<f64>) -> Option<String> {
+    if reached <= target.max(4) {
+        return None;
+    }
+    Some(if report.turns_refused > 0 {
+        format!(
+            "stopped at {reached} triangles: {} collapses were refused because they would have folded a triangle over the surface (a thin wall or a sharp ridge)",
+            report.turns_refused
+        )
+    } else if max_error.is_some() {
+        format!("stopped at {reached} triangles: no collapse left within `max_error`")
+    } else {
+        format!(
+            "stopped at {reached} triangles: no collapse left that keeps the surface a manifold without sharp edges or boundary moving"
+        )
+    })
+}
+
 fn decimate(s: &mut Session, i: DecimateIn) -> CmdResult<EditOut> {
     let ratio = i.ratio.unwrap_or(0.5);
     if !(ratio.is_finite() && ratio > 0.0 && ratio <= 1.0) {
@@ -353,7 +376,9 @@ fn decimate(s: &mut Session, i: DecimateIn) -> CmdResult<EditOut> {
             o.removed_triangles = before.saturating_sub(m.triangle_count());
             o.tolerance_report = Some(ToleranceOut::new(report, tol, share));
         } else {
-            o.removed_triangles = edit::decimate(m, &opts);
+            let report = edit::decimate_with_report(m, &opts);
+            o.removed_triangles = report.removed;
+            o.target_not_reached = not_reached(m.triangle_count(), target, &report, i.max_error);
         }
         Ok(())
     })
@@ -435,7 +460,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         "Decimate",
         "Mesh",
         true,
-        "Reduces to `target` triangles or `ratio`, within `max_error` mm, keeping edges sharper than `feature_angle_deg`. With `tolerance` (mm) the reduction is measured both ways and refined locally until `share` (default 0.999) of the samples is within it; `tolerance_report` has max, p99 and share per direction, triangle counts and rounds.",
+        "Reduces to `target` triangles or `ratio`, within `max_error` mm, keeping edges sharper than `feature_angle_deg`. A collapse that would fold a triangle over the surface is never made, so on a thin wall or a sharp ridge the result can stay above the target: `triangles` is what was reached and `target_not_reached` says why. With `tolerance` (mm) the reduction is measured both ways and refined locally until `share` (default 0.999) of the samples is within it; `tolerance_report` has max, p99 and share per direction, triangle counts and rounds.",
         DecimateIn,
         EditOut,
         decimate

@@ -152,6 +152,15 @@ fn an_inside_out_network_below_2000_patches_is_turned_outward_behind_the_healing
 }
 
 #[test]
+fn the_volume_shown_for_a_body_is_the_kernel_volume_when_the_healer_takes_it() {
+    let net = cube_sphere(n_for(300), RADIUS);
+    let sheet = sheet_from_bezier_network(&net.patches, &net.corners).expect("builds");
+    let shown = solid::info(&sheet).volume.expect("a volume");
+    assert_eq!(Some(shown), solid::volume(&sheet).ok());
+    assert_eq!(solid::volume_as_built(&sheet).ok(), Some(shown));
+}
+
+#[test]
 fn an_inside_out_network_is_turned_outward() {
     let baseline = baseline_volume(2_100);
     let mut net = cube_sphere(n_for(2_100), RADIUS);

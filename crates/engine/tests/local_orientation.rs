@@ -1,7 +1,7 @@
 //! P9-O8: orientation of the bodies `surface.wrap` makes from real scans that stay outside the
 //! repository (measurement only, no thresholds). `SURFACECRAFT_LOCAL_CORPUS` names the directory;
-//! files are reported by number only (sorted order, from 1); `SURFACECRAFT_LOCAL_CORPUS_ONLY`
-//! narrows by file-name text. Without the variable the test returns silently.
+//! files are reported by number only (sorted order, from 1); `SURFACECRAFT_ORIENTATION_ONLY` is a
+//! comma-separated list of file numbers (default all). Without the variable the test returns silently.
 //!
 //! `SURFACECRAFT_LOCAL_CORPUS=… SURFACECRAFT_ORIENTATION_ONLY=8 cargo test --release -p surfacecraft-engine --test local_orientation -- --ignored --nocapture`
 use serde_json::{Value, json};
@@ -230,7 +230,27 @@ fn body_report(s: &Session, w: &Value, scan: &Mesh) -> String {
     )
 }
 
+/// `scan.to_solid` (freeform) on the scan as imported: the verdict and the issue codes.
+fn to_solid_report(number: usize, path: &std::path::Path) {
+    let mut s = Session::new();
+    if s.execute("mesh.import", json!({"path": path.to_string_lossy(), "name": "scan"})).is_err() {
+        return;
+    }
+    match s.execute("scan.to_solid", json!({"scan": "scan", "method": "freeform"})) {
+        Ok(r) => {
+            let codes: Vec<&str> =
+                r["issues"].as_array().into_iter().flatten().filter_map(|i| i["code"].as_str()).collect();
+            eprintln!("C{number:02} to_solid verdict {} issues {codes:?} deviation {}", r["verdict"], r["deviation"]);
+        }
+        Err(e) => eprintln!("C{number:02} to_solid error {}", e.to_string().chars().take(100).collect::<String>()),
+    }
+}
+
 fn run_one(number: usize, path: &std::path::Path) {
+    if std::env::var("SURFACECRAFT_ORIENTATION_TO_SOLID").is_ok() {
+        to_solid_report(number, path);
+        return;
+    }
     let mut s = Session::new();
     if let Err(e) = s.execute("mesh.import", json!({"path": path.to_string_lossy(), "name": "scan"})) {
         eprintln!("C{number:02} import error {}", e.to_string().chars().take(80).collect::<String>());

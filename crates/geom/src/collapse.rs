@@ -126,11 +126,12 @@ pub(crate) struct Collapser<'a> {
     seen_pair: HashSet<(u32, u32)>,
     guard: Option<Guard<'a>>,
     live: usize,
-    /// Tests switch the orientation check off to show what it prevents, and count its refusals.
+    /// Tests switch the orientation check off to show what it prevents.
     #[cfg(test)]
     pub(crate) orient_guard: bool,
-    #[cfg(test)]
-    pub(crate) turns_refused: std::sync::atomic::AtomicUsize,
+    /// Collapses refused because they would have turned a triangle against its surface (attempts:
+    /// an edge that is queued again and refused again counts again).
+    turns_refused: std::sync::atomic::AtomicUsize,
 }
 
 impl<'a> Collapser<'a> {
@@ -170,7 +171,6 @@ impl<'a> Collapser<'a> {
             live,
             #[cfg(test)]
             orient_guard: true,
-            #[cfg(test)]
             turns_refused: std::sync::atomic::AtomicUsize::new(0),
         };
         s.seed(parallel_seed);
@@ -297,7 +297,6 @@ impl<'a> Collapser<'a> {
                 return None;
             }
             if self.turns_against_origin(&t, (a, b), &old, &new) {
-                #[cfg(test)]
                 self.turns_refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return None;
             }
@@ -371,6 +370,11 @@ impl<'a> Collapser<'a> {
                 }
             }
         }
+    }
+
+    /// Collapses refused so far for turning a triangle against the surface it came from.
+    pub(crate) fn turns_refused(&self) -> usize {
+        self.turns_refused.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The surviving triangles, positions, quadrics and original orientations (vertex numbers

@@ -274,15 +274,29 @@ struct Candidate {
     rms: Option<f64>,
 }
 
-/// The issue of a coverage below [`MIN_COVERAGE`], told by what is wrong. `low_coverage`: part of
-/// the scan is not near `what`. `inconsistent_orientation`: the scan is there, but its points face
-/// away from the surface (the solid is inside out or has faces turned the wrong way), which is a
-/// defect of the solid and not a part of the scan it misses.
+/// `inconsistent_orientation` needs at least this share of the missing coverage to lie on the solid
+/// but face away from it; noise at sharp edges alone gives a few percent that do.
+const ORIENTATION_SHARE_OF_MISSING: f64 = 0.5;
+/// Above this share of the scan facing away, it is the scan that is inside out, not the solid.
+const INSIDE_OUT_SHARE: f64 = 0.9;
+
+/// The issue of a coverage below [`MIN_COVERAGE`], told by what is wrong. `scan_inside_out`: nearly
+/// every point faces away (the kernel turns a solid outward, so the scan's normals point inward).
+/// `inconsistent_orientation`: much of what is missing lies on `what` but faces away from it (its
+/// faces are turned the wrong way). Otherwise `low_coverage`: the scan is not near `what`.
 pub(super) fn coverage_issue(d: &DeviationSummary, what: &str) -> Option<Issue> {
     if d.coverage >= MIN_COVERAGE {
         return None;
     }
-    if d.coverage + d.not_facing >= MIN_COVERAGE {
+    let missing = 1.0 - d.coverage;
+    if d.not_facing >= INSIDE_OUT_SHARE {
+        let msg = format!(
+            "{:.1} % of the scan points face away from {what}: the scan is inside out (its normals point inward); flip the normals of the scan and run again",
+            100.0 * d.not_facing
+        );
+        return Some(issue("scan_inside_out", msg));
+    }
+    if d.not_facing >= ORIENTATION_SHARE_OF_MISSING * missing {
         let msg = format!(
             "{:.1} % of the scan points lie on {what} but face away from it (only {:.1} % face it): its faces are turned the wrong way",
             100.0 * d.not_facing,
@@ -290,10 +304,13 @@ pub(super) fn coverage_issue(d: &DeviationSummary, what: &str) -> Option<Issue> 
         );
         return Some(issue("inconsistent_orientation", msg));
     }
+    let far = (missing - d.not_facing).max(0.0);
     let msg = format!(
-        "only {:.1} % of the scan points lie on {what} (at least {:.0} % expected)",
-        100.0 * (d.coverage + d.not_facing),
-        100.0 * MIN_COVERAGE
+        "only {:.1} % of the scan points lie on {what} and face it (at least {:.0} % expected): {:.1} % lie on it but face away, {:.1} % are farther away",
+        100.0 * d.coverage,
+        100.0 * MIN_COVERAGE,
+        100.0 * d.not_facing,
+        100.0 * far
     );
     Some(issue("low_coverage", msg))
 }
@@ -793,15 +810,39 @@ mod coverage_tests {
         assert!(coverage_issue(&summary_of(0.95, 0.0), "the solid").is_none());
     }
 
+    fn code(coverage: f64, not_facing: f64) -> String {
+        coverage_issue(&summary_of(coverage, not_facing), "the solid").expect("an issue").code
+    }
+
     #[test]
     fn points_that_lie_on_the_solid_but_face_away_are_an_orientation_issue_not_missing_scan() {
-        let issue = coverage_issue(&summary_of(0.71, 0.29), "the patches").expect("an issue");
-        assert_eq!(issue.code, "inconsistent_orientation");
+        assert_eq!(code(0.71, 0.29), "inconsistent_orientation");
+    }
+
+    #[test]
+    fn a_few_percent_facing_away_beside_a_real_gap_is_low_coverage_with_both_figures() {
+        // 85 % cover, 6 % face away, 9 % are far: the gap is the problem
+        let issue = coverage_issue(&summary_of(0.85, 0.06), "the solid").expect("an issue");
+        assert_eq!(issue.code, "low_coverage");
+        assert!(issue.message.contains("85.0 %") && issue.message.contains("6.0 %") && issue.message.contains("9.0 %"));
+    }
+
+    #[test]
+    fn the_orientation_issue_starts_at_half_of_the_missing_share() {
+        // missing 0.20: 0.10 facing away is the boundary
+        assert_eq!(code(0.80, 0.10), "inconsistent_orientation");
+        assert_eq!(code(0.80, 0.0999), "low_coverage");
+    }
+
+    #[test]
+    fn a_scan_whose_points_nearly_all_face_away_is_inside_out() {
+        assert_eq!(code(0.05, 0.95), "scan_inside_out");
+        assert_eq!(code(0.10, 0.90), "scan_inside_out");
+        assert_eq!(code(0.20, 0.80), "inconsistent_orientation");
     }
 
     #[test]
     fn points_far_from_the_solid_are_low_coverage() {
-        let issue = coverage_issue(&summary_of(0.5, 0.05), "the solid").expect("an issue");
-        assert_eq!(issue.code, "low_coverage");
+        assert_eq!(code(0.5, 0.05), "low_coverage");
     }
 }

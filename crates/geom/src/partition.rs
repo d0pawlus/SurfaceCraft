@@ -25,6 +25,8 @@ pub(crate) struct Whole {
     pub q: Vec<Quadric>,
     pub origin: Vec<Vec3>,
     pub locked: Vec<bool>,
+    /// Collapses the parts refused for turning a triangle against its surface.
+    pub refused: usize,
 }
 
 /// A vertex a part ends with: its number in the mesh, position, quadric, original orientation and budget.
@@ -40,6 +42,7 @@ struct VertexOut {
 struct PartOut {
     tris: Vec<[u32; 3]>,
     vertices: Vec<VertexOut>,
+    refused: usize,
 }
 
 /// Splits triangle ids into parts of at most [`PART_TRIANGLES`], each in ascending order.
@@ -103,6 +106,7 @@ fn reduce_part(
     let mut c =
         Collapser::new(ltris, lpos, lq, lorigin, llocked.clone(), Some(Guard { bvh: g.0, budget: &mut budget }), false);
     c.run(floor, max_cost);
+    let refused = c.turns_refused();
     let (tris, pos, q, origin) = c.finish();
     let mut used = vec![false; gids.len()];
     for t in &tris {
@@ -114,7 +118,7 @@ fn reduce_part(
         .filter(|&v| used[v] && !llocked[v])
         .map(|v| VertexOut { id: gids[v], pos: pos[v], q: q[v], origin: origin[v], budget: budget[v] })
         .collect();
-    PartOut { tris: tris.iter().map(|t| t.map(|v| gids[v as usize])).collect(), vertices }
+    PartOut { tris: tris.iter().map(|t| t.map(|v| gids[v as usize])).collect(), vertices, refused }
 }
 
 /// Reduces `whole` part by part and returns what is left, compact (vertex numbers by ascending
@@ -148,17 +152,19 @@ pub(crate) fn reduce_in_parts(
             reduce_part(&whole, ids, &owner, (bvh, budget), floor, max_cost)
         })
     };
-    let Whole { tris: _, mut pos, mut q, mut origin, locked } = whole;
+    let Whole { tris: _, mut pos, mut q, mut origin, locked, refused: _ } = whole;
+    let mut refused = 0;
     let mut budget = std::mem::take(guard.budget);
     let mut tris: Vec<[u32; 3]> = Vec::new();
     for out in outs {
+        refused += out.refused;
         tris.extend(out.tris);
         for v in out.vertices {
             let id = v.id as usize;
             (pos[id], q[id], origin[id], budget[id]) = (v.pos, v.q, v.origin, v.budget);
         }
     }
-    compact_whole(Whole { tris, pos, q, origin, locked }, budget, guard)
+    compact_whole(Whole { tris, pos, q, origin, locked, refused }, budget, guard)
 }
 
 /// Renumbers the vertices in use by ascending number; the matching budgets go to `guard`.
@@ -181,6 +187,7 @@ fn compact_whole(whole: Whole, budget: Vec<f64>, guard: &mut Guard<'_>) -> Whole
         q: kept.iter().map(|&v| whole.q[v]).collect(),
         origin: kept.iter().map(|&v| whole.origin[v]).collect(),
         locked: kept.iter().map(|&v| whole.locked[v]).collect(),
+        refused: whole.refused,
     }
 }
 

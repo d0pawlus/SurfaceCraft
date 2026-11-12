@@ -89,18 +89,21 @@ fn tiny_parts() -> Vec<(&'static str, Mesh)> {
 
 #[test]
 fn a_part_much_smaller_than_the_tolerance_still_gives_a_solid_with_a_positive_volume_and_a_warning() {
+    let mut closed = 0;
     for (name, scan) in tiny_parts() {
         // Act
         let (_s, w) = wrap(scan, json!({}));
 
         // Assert
         if w["closed"] == true {
+            closed += 1;
             let v = w["body"]["volume"].as_f64();
             assert!(v.is_some_and(|v| v.is_finite() && v > 0.0), "{name}: volume {:?}: {w}", w["body"]["volume"]);
         }
         let warning = w["warning"].as_str().unwrap_or_default();
         assert!(warning.contains("units"), "{name}: no warning about the units: {w}");
     }
+    assert!(closed > 0, "no part closed, so no volume was checked");
 }
 
 #[test]
@@ -116,4 +119,24 @@ fn scan_to_solid_names_the_tolerance_when_the_part_is_smaller_than_it() {
     let codes: Vec<&str> = r["issues"].as_array().unwrap().iter().filter_map(|i| i["code"].as_str()).collect();
     assert!(codes.contains(&"tolerance_exceeds_part"), "{codes:?}: {r}");
     assert_ne!(r["verdict"], "pass");
+}
+
+#[test]
+fn a_decimation_that_stops_above_its_target_says_so_and_why() {
+    // Arrange: a thin plate cannot be brought to 4 triangles without folding it over
+    let mut s = Session::new();
+    let mut plate = synth::rounded_cuboid(Point3::origin(), Vec3::new(40.0, 40.0, 1.0), 0.4, 30);
+    synth::add_noise(&mut plate, 0.05, &mut Rng::new(3));
+    s.doc.add_mesh("plate", plate);
+    s.doc.add_mesh("ball", synth::sphere(Point3::origin(), 10.0, 40, 20));
+
+    // Act
+    let thin = s.execute("mesh.decimate", json!({"object": "plate", "target": 4})).unwrap();
+    let ball = s.execute("mesh.decimate", json!({"object": "ball", "target": 100})).unwrap();
+
+    // Assert
+    assert!(thin["triangles"].as_u64().unwrap() > 4, "{thin}");
+    let why = thin["target_not_reached"].as_str().unwrap_or_default();
+    assert!(why.starts_with("stopped at"), "{thin}");
+    assert!(ball["target_not_reached"].is_null(), "{ball}");
 }
