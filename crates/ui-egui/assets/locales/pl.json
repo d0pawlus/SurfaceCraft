@@ -965,5 +965,6 @@
   "cmd.surface.wrap.hint": "Pokrywa cały skan szczelną siatką płatów dopasowanych do skanu; do odlewów, karoserii i kształtów organicznych.",
   "param.exclude_triangles": "Wyklucz trójkąty",
   "param.exclude_spheres": "Wyklucz kule",
-  "param.exclude_boxes": "Wyklucz prostopadłościany"
+  "param.exclude_boxes": "Wyklucz prostopadłościany",
+  "param.conform_boundary": "Dopasuj do konturu (eksperymentalne)"
 }

@@ -965,5 +965,6 @@
   "cmd.surface.wrap.hint": "Covers the whole scan with a watertight network of patches fitted to it; for castings, body panels and organic shapes.",
   "param.exclude_triangles": "Exclude triangles",
   "param.exclude_spheres": "Exclude spheres",
-  "param.exclude_boxes": "Exclude boxes"
+  "param.exclude_boxes": "Exclude boxes",
+  "param.conform_boundary": "Conform to outline (experimental)"
 }
