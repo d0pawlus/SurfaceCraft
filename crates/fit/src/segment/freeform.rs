@@ -52,10 +52,14 @@ const SAMPLE_TRIANGLES: usize = 1500;
 /// A curved primitive needs its region to span this many radii (or it is a patch of something
 /// else).
 const MIN_SUPPORT: f64 = 1.0;
-/// The noise level of a scan is taken as at most this share of the tolerance.
-const NOISE_CAP_SHARE: f64 = 0.25;
-/// A fit is sound when its RMS is within this factor of the noise level.
+/// A small region's fit is sound when its RMS is within this factor of the noise level.
 const SOUND_FACTOR: f64 = 1.2;
+/// A large region's fit is sound when the robust spread of its residuals is within this factor of
+/// the noise level, and its RMS within [`LARGE_RMS_FACTOR`].
+const LARGE_SOUND_FACTOR: f64 = 1.05;
+const LARGE_RMS_FACTOR: f64 = 2.0;
+/// Scales a median absolute deviation to a standard deviation.
+const MAD_TO_SIGMA: f64 = 1.4826;
 /// A plain region is an island of an organic area when at least this share of its boundary
 /// edges runs into it without a crease, and at most [`ISLAND_CREASE`] of them are creases (a
 /// wall or a fillet next to a freeform top has the crease along the top and none into it).
@@ -78,6 +82,11 @@ pub(super) struct Settings {
     pub min_cluster: usize,
     /// Fewest triangles of a freeform area.
     pub min_triangles: usize,
+    /// Scanner noise sigma (mm): given or measured when `noise_known`, else the fallback.
+    /// Never derived from the fits it judges.
+    pub noise: f64,
+    /// Is `noise` known? When not, no large region is demoted.
+    pub noise_known: bool,
     /// Distance tolerance of a primitive (mm): an area one primitive fits within it is no
     /// freeform area.
     pub tolerance: f64,
@@ -104,28 +113,39 @@ impl Standing {
     }
 }
 
-/// The noise level of the scan: the lower quartile of the regions' RMS, at most
-/// [`NOISE_CAP_SHARE`] of the tolerance (when every region is a fragment the quartile is the
-/// fragments' own misfit, which is no noise).
-fn noise_level(segs: &[Segment], tolerance: f64) -> f64 {
-    let mut rms: Vec<f64> = segs.iter().map(|s| s.rms).filter(|r| r.is_finite()).collect();
-    rms.sort_by(f64::total_cmp);
-    let quartile = rms.get(rms.len().saturating_sub(1) / 4).copied().unwrap_or(f64::INFINITY);
-    quartile.min(NOISE_CAP_SHARE * tolerance)
+/// The robust spread of the residuals of `seg` to its primitive (1.4826 x the median absolute
+/// distance of a sample of its corners): a shoulder where a region grew into a tangent
+/// neighbour (its tail) does not inflate it as it does the RMS.
+fn robust_sigma(mesh: &Mesh, seg: &Segment) -> f64 {
+    let mut d: Vec<f64> =
+        sample_corners(mesh, &seg.triangles).iter().map(|p| seg.primitive.distance(p).abs()).collect();
+    d.sort_by(f64::total_cmp);
+    MAD_TO_SIGMA * d.get(d.len() / 2).copied().unwrap_or(f64::INFINITY)
 }
 
-/// The standing of `seg` for the scan noise `noise`.
-fn standing_of(mesh: &Mesh, seg: &Segment, set: &Settings, noise: f64) -> Standing {
+/// The standing of `seg` (see the module documentation). Without a known noise level
+/// ([`Settings::noise_known`]) no fit is judged by it: a large region is never demoted, a small
+/// one is judged against the fallback.
+fn standing_of(mesh: &Mesh, seg: &Segment, set: &Settings) -> Standing {
     let large = seg.triangles.len() >= set.strong_tris;
-    let sound = seg.rms <= SOUND_FACTOR * noise;
-    match (large, sound) {
-        (true, true) if seg.triangles.len() >= set.dominant_tris || curvature_support(mesh, seg) >= MIN_SUPPORT => {
-            Standing::Protected
-        }
-        (true, true) | (true, false) if curvature_support(mesh, seg) < MIN_SUPPORT => Standing::Fragment,
-        (true, _) => Standing::Plain,
-        (false, true) if curvature_support(mesh, seg) >= MIN_SUPPORT => Standing::Neutral,
-        (false, _) => Standing::Fragment,
+    if large && !set.noise_known {
+        return Standing::Protected;
+    }
+    let sound = if large {
+        // a large region is judged by the spread of most of its residuals (a shoulder where it
+        // grew into a tangent neighbour is not misfit), and by an RMS cap
+        robust_sigma(mesh, seg) <= LARGE_SOUND_FACTOR * set.noise && seg.rms <= LARGE_RMS_FACTOR * set.noise
+    } else {
+        seg.rms <= SOUND_FACTOR * set.noise
+    };
+    let supported = curvature_support(mesh, seg) >= MIN_SUPPORT;
+    match (large, sound, supported) {
+        (true, true, true) => Standing::Protected,
+        (true, true, false) if seg.triangles.len() >= set.dominant_tris => Standing::Protected,
+        (true, false, true) => Standing::Plain,
+        (true, _, _) => Standing::Fragment,
+        (false, true, true) => Standing::Neutral,
+        (false, _, _) => Standing::Fragment,
     }
 }
 
@@ -241,14 +261,19 @@ impl Layout {
     }
 }
 
-/// Which pieces are freeform areas: enough fragments (a region counts at its first triangle) and
-/// enough triangles.
+/// Which pieces are freeform areas: enough fragments and enough triangles. A fragment counts
+/// once in every piece it occupies (one that crosses a crease is a fragment on both sides).
 fn qualifying(segs: &[Segment], standing: &[Standing], label: &[u32], pieces: usize, set: &Settings) -> Vec<bool> {
     let mut fragments = vec![0usize; pieces];
     for (s, _) in segs.iter().zip(standing).filter(|(_, st)| **st == Standing::Fragment) {
-        let piece = s.triangles.first().and_then(|&t| label.get(t as usize)).copied().unwrap_or(NONE);
-        if let Some(c) = fragments.get_mut(piece as usize) {
-            *c += 1;
+        let mut occupied: Vec<u32> =
+            s.triangles.iter().filter_map(|&t| label.get(t as usize).copied()).filter(|&l| l != NONE).collect();
+        occupied.sort_unstable();
+        occupied.dedup();
+        for piece in occupied {
+            if let Some(c) = fragments.get_mut(piece as usize) {
+                *c += 1;
+            }
         }
     }
     let mut size = vec![0usize; pieces];
@@ -335,8 +360,7 @@ pub(super) fn consolidate(
     segs: Vec<Segment>,
     set: &Settings,
 ) -> Vec<Segment> {
-    let noise = noise_level(&segs, set.tolerance);
-    let mut standing: Vec<Standing> = segs.iter().map(|s| standing_of(mesh, s, set, noise)).collect();
+    let mut standing: Vec<Standing> = segs.iter().map(|s| standing_of(mesh, s, set)).collect();
     if !standing.contains(&Standing::Fragment) {
         return segs;
     }
@@ -358,14 +382,56 @@ pub(super) fn consolidate(
         }
         lay = layout(mesh, nb, &face, &segs, &standing, set);
     }
-    assemble(mesh, normals, segs, &standing, &lay, set)
+    assemble(mesh, normals, nb, segs, &standing, &lay, set)
+}
+
+/// Connected pieces of `tris` (sorted) across shared edges, ordered by their lowest triangle.
+fn connected_pieces(nb: &[[u32; 3]], tris: &[u32]) -> Vec<Vec<u32>> {
+    let mut seen = vec![false; tris.len()];
+    let mut pieces = Vec::new();
+    for start in 0..tris.len() {
+        if seen[start] {
+            continue;
+        }
+        seen[start] = true;
+        let mut piece = Vec::new();
+        let mut stack = vec![start];
+        while let Some(i) = stack.pop() {
+            piece.push(tris[i]);
+            for &o in nb.get(tris[i] as usize).into_iter().flatten() {
+                if let Ok(j) = tris.binary_search(&o)
+                    && !seen[j]
+                {
+                    seen[j] = true;
+                    stack.push(j);
+                }
+            }
+        }
+        piece.sort_unstable();
+        pieces.push(piece);
+    }
+    pieces
+}
+
+/// A piece cut from a region: its own fit, or `None` (released) when it is under `min_triangles`
+/// or no primitive fits it within the tolerance any more.
+fn refit_piece(mesh: &Mesh, normals: &[Vec3], tris: &[u32], set: &Settings) -> Option<Segment> {
+    if tris.len() < set.min_triangles {
+        return None;
+    }
+    let f = fit_tris(mesh, normals, tris).filter(|f| f.rms <= set.tolerance)?;
+    Some(Segment { triangles: tris.to_vec(), primitive: f.primitive, rms: f.rms, freeform: false })
 }
 
 /// The regions that remain and the region of every organic area, each triangle going by its own
-/// piece (a region on both sides of a crease is split there; nothing is left empty).
+/// piece. A region that lost triangles to an area is cut into its connected pieces (by lowest
+/// triangle); each is fitted again, and a piece under `min_triangles`, or that no primitive fits
+/// within the tolerance, is released (left unassigned). Order: untouched regions, the pieces of
+/// the cut ones, then the areas.
 fn assemble(
     mesh: &Mesh,
     normals: &[Vec3],
+    nb: &[[u32; 3]],
     segs: Vec<Segment>,
     standing: &[Standing],
     lay: &Layout,
@@ -377,81 +443,27 @@ fn assemble(
             areas[piece as usize].push(t as u32);
         }
     }
-    let mut out: Vec<Segment> = segs
-        .into_iter()
-        .zip(standing)
-        .filter_map(|(mut s, st)| {
-            if st.in_mask() {
-                s.triangles.retain(|&t| !lay.label.get(t as usize).is_some_and(|&l| lay.is_organic(l)));
-            }
-            (!s.triangles.is_empty()).then_some(s)
-        })
-        .collect();
+    let mut out: Vec<Segment> = Vec::new();
+    let mut cut: Vec<Vec<u32>> = Vec::new();
+    for (s, st) in segs.into_iter().zip(standing) {
+        let kept: Vec<u32> = if st.in_mask() {
+            s.triangles
+                .iter()
+                .copied()
+                .filter(|&t| !lay.label.get(t as usize).is_some_and(|&l| lay.is_organic(l)))
+                .collect()
+        } else {
+            out.push(s);
+            continue;
+        };
+        if kept.len() == s.triangles.len() {
+            out.push(s);
+        } else {
+            cut.extend(connected_pieces(nb, &kept));
+        }
+    }
+    let refitted = surfacecraft_geom::par::map_slice(&cut, |tris| refit_piece(mesh, normals, tris, set));
+    out.extend(refitted.into_iter().flatten());
     out.extend(areas.into_iter().filter(|a| !a.is_empty()).map(|tris| area_segment(mesh, normals, tris, set)));
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use surfacecraft_geom::synth;
-
-    fn fragment(tris: Vec<u32>) -> Segment {
-        Segment {
-            triangles: tris,
-            primitive: Primitive::Plane { point: [0.0; 3], normal: [0.0, 0.0, 1.0] },
-            rms: 0.1,
-            freeform: false,
-        }
-    }
-
-    /// A floor (x 0 to 10, z = 0) and a wall (x = 10, z 0 to 10) that meet at a 90 degree crease.
-    fn folded_sheet() -> Mesh {
-        let mut m = synth::plane(Point3::origin(), Vec3::x(), Vec3::y(), 10.0, 10.0, 10, 10);
-        m.append(&synth::plane(Point3::new(10.0, 0.0, 0.0), Vec3::z(), Vec3::y(), 10.0, 10.0, 10, 10));
-        m.weld(1e-9);
-        m
-    }
-
-    /// A weak region that straddles a sharp crease is split there: the part on the floor, where
-    /// five more fragments make an organic area, joins it, the part on the wall (a piece with no
-    /// fragment of its own) stays a region; no triangle is in two regions and none is empty.
-    #[test]
-    fn a_weak_region_across_a_crease_is_split_at_it() {
-        let m = folded_sheet();
-        let centroid = |t: usize| m.face_centroid(t).unwrap_or_else(Point3::origin);
-        let floor: Vec<u32> = (0..m.triangle_count() as u32).filter(|&t| centroid(t as usize).z < 1e-6).collect();
-        let strip: Vec<u32> = (0..m.triangle_count() as u32)
-            .filter(|&t| {
-                let c = centroid(t as usize);
-                (c.z < 1e-6 && c.x > 7.0) || (c.x > 10.0 - 1e-6 && c.z < 3.0)
-            })
-            .collect();
-        let rest: Vec<u32> = floor.iter().copied().filter(|t| !strip.contains(t)).collect();
-        let mut segs = vec![fragment(strip.clone())];
-        segs.extend(rest.chunks(rest.len().div_ceil(5)).map(|c| fragment(c.to_vec())));
-        let set = Settings {
-            strong_tris: 1000,
-            dominant_tris: 1000,
-            min_cluster: 5,
-            min_triangles: 10,
-            tolerance: 0.2,
-            cos_crease: 40f64.to_radians().cos(),
-        };
-        let normals = m.vertex_normals();
-        let nb = m.triangle_neighbours();
-        let out = consolidate(&m, &normals, &nb, segs, &set);
-        let mut seen = std::collections::HashSet::new();
-        assert!(out.iter().all(|s| !s.triangles.is_empty()));
-        assert!(out.iter().flat_map(|s| s.triangles.iter()).all(|t| seen.insert(*t)), "a triangle is in two regions");
-        let on_wall = |t: &u32| centroid(*t as usize).x > 10.0 - 1e-6;
-        for s in &out {
-            let (wall, flat) =
-                (s.triangles.iter().filter(|t| on_wall(t)).count(), s.triangles.iter().filter(|t| !on_wall(t)).count());
-            assert!(wall == 0 || flat == 0, "a region across the crease: {wall} wall, {flat} floor triangles");
-        }
-        let wall_part: Vec<u32> = strip.iter().copied().filter(on_wall).collect();
-        assert!(out.iter().any(|s| s.triangles == wall_part), "the wall part of the strip stays one region");
-        assert!(out.iter().any(|s| floor.iter().all(|t| s.triangles.contains(t))), "the floor is one area");
-    }
 }

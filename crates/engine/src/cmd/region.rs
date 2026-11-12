@@ -5,6 +5,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
+#[path = "region_noise.rs"]
+mod noise;
+use noise::{NoiseSource, with_noise};
 use surfacecraft_doc::{ObjectId, ObjectKind};
 use surfacecraft_fit::segment::{Segment, SegmentOptions, grow_smooth, region_points, segment_cancellable};
 use surfacecraft_fit::{PrimitiveKind, fit_auto};
@@ -145,6 +148,13 @@ pub struct RegionsOut {
     pub regions: Vec<RegionInfo>,
     /// Triangles not in any region.
     pub unassigned: usize,
+    /// The scanner noise sigma (mm) the freeform consolidation used; absent when it is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noise_used: Option<f64>,
+    /// Where it came from: `estimated` (measured on the scan), `given` (`options.noise`) or
+    /// `fallback` (no reliable estimate; only small regions are consolidated).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noise_source: Option<NoiseSource>,
 }
 
 /// Adds the region of one segment found (`number` names it): a freeform area has no kind and no
@@ -168,10 +178,11 @@ pub(crate) fn auto_segment(s: &mut Session, i: AutoIn) -> CmdResult<RegionsOut> 
         return Err(CmdError::Params("tolerance must be positive and the angle finite".into()));
     }
     let m = s.doc.mesh(mesh).map(|m| m.mesh.clone()).ok_or_else(|| CmdError::Params(format!("no mesh {mesh}")))?;
+    let (options, noise) = with_noise(&m, o)?;
     if i.replace {
         s.doc.regions.retain(|r| r.mesh != mesh);
     }
-    let segs = segment_cancellable(&m, o, &s.cancel).ok_or_else(super::cancelled)?;
+    let segs = segment_cancellable(&m, &options, &s.cancel).ok_or_else(super::cancelled)?;
     let mut out = Vec::new();
     let mut assigned = 0;
     for (k, seg) in segs.into_iter().enumerate() {
@@ -179,7 +190,12 @@ pub(crate) fn auto_segment(s: &mut Session, i: AutoIn) -> CmdResult<RegionsOut> 
         let id = add_segment(s, mesh, seg, k + 1);
         out.push(info(s, id)?);
     }
-    Ok(RegionsOut { regions: out, unassigned: m.triangle_count().saturating_sub(assigned) })
+    Ok(RegionsOut {
+        regions: out,
+        unassigned: m.triangle_count().saturating_sub(assigned),
+        noise_used: noise.map(|n| n.sigma),
+        noise_source: noise.map(|n| n.source),
+    })
 }
 
 /// Merge parameters.
@@ -284,7 +300,7 @@ fn split(s: &mut Session, i: SplitIn) -> CmdResult<RegionsOut> {
         classify(s, rid)?;
         out.push(info(s, rid)?);
     }
-    Ok(RegionsOut { regions: out, unassigned: 0 })
+    Ok(RegionsOut { regions: out, unassigned: 0, noise_used: None, noise_source: None })
 }
 
 /// List parameters.
@@ -300,7 +316,7 @@ fn list(s: &mut Session, i: ListIn) -> CmdResult<RegionsOut> {
     let mesh = i.mesh.map(|m| m.resolve(s, ObjectKind::Mesh)).transpose()?;
     let ids: Vec<ObjectId> = s.doc.regions.iter().filter(|r| mesh.is_none_or(|m| r.mesh == m)).map(|r| r.id).collect();
     let regions = ids.into_iter().map(|id| info(s, id)).collect::<CmdResult<_>>()?;
-    Ok(RegionsOut { regions, unassigned: 0 })
+    Ok(RegionsOut { regions, unassigned: 0, noise_used: None, noise_source: None })
 }
 
 /// A region a region operation created, changed or removed.
@@ -323,6 +339,12 @@ pub struct RegionChangeOut {
     pub regions: Vec<TouchedRegion>,
     /// Triangles the operation released that no region holds afterwards.
     pub unassigned: usize,
+    /// The scanner noise sigma (mm) a segmentation used; absent for other operations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noise_used: Option<f64>,
+    /// Where it came from (see `region.auto_segment`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noise_source: Option<NoiseSource>,
 }
 
 /// Sets the flags of `tris` in `f` (indices out of range are ignored).
@@ -483,7 +505,7 @@ fn enlarge(s: &mut Session, i: EnlargeIn) -> CmdResult<RegionChangeOut> {
     }
     drop_regions(s, &emptied);
     classify(s, id)?;
-    Ok(RegionChangeOut { regions: report(s, &touched), unassigned: 0 })
+    Ok(RegionChangeOut { regions: report(s, &touched), unassigned: 0, noise_used: None, noise_source: None })
 }
 
 /// Shrink parameters.
@@ -541,7 +563,7 @@ fn shrink(s: &mut Session, i: ShrinkIn) -> CmdResult<RegionChangeOut> {
         classify(s, id)?;
     }
     let unassigned = unassigned_of(s, mesh, &removed);
-    Ok(RegionChangeOut { regions: report(s, &[(id, false)]), unassigned })
+    Ok(RegionChangeOut { regions: report(s, &[(id, false)]), unassigned, noise_used: None, noise_source: None })
 }
 
 /// Separate parameters.
@@ -586,7 +608,7 @@ fn separate(s: &mut Session, i: SeparateIn) -> CmdResult<RegionChangeOut> {
         touched.push((rid, k > 0));
     }
     let unassigned = unassigned_of(s, r.mesh, &r.triangles);
-    Ok(RegionChangeOut { regions: report(s, &touched), unassigned })
+    Ok(RegionChangeOut { regions: report(s, &touched), unassigned, noise_used: None, noise_source: None })
 }
 
 /// A sphere selection: the triangles whose centroid lies inside it.
@@ -702,7 +724,7 @@ fn insert(s: &mut Session, i: InsertIn) -> CmdResult<RegionChangeOut> {
     classify(s, rid)?;
     let mut out = vec![(rid, true)];
     out.extend(touched);
-    Ok(RegionChangeOut { regions: report(s, &out), unassigned: 0 })
+    Ok(RegionChangeOut { regions: report(s, &out), unassigned: 0, noise_used: None, noise_source: None })
 }
 
 /// Resegment parameters.
@@ -746,7 +768,9 @@ fn resegment(s: &mut Session, i: ResegmentIn) -> CmdResult<RegionChangeOut> {
         return Err(CmdError::Params("the regions hold no triangles".into()));
     }
     // the triangles alone form the sub-mesh, so its outer edges bound the growth
-    let segs = segment_cancellable(&m.submesh(&all), o, &s.cancel).ok_or_else(super::cancelled)?;
+    // the noise is a property of the scan: measured on the whole mesh, not on the selection
+    let (options, noise) = with_noise(&m, o)?;
+    let segs = segment_cancellable(&m.submesh(&all), &options, &s.cancel).ok_or_else(super::cancelled)?;
     if segs.is_empty() {
         return Err(CmdError::Failed(format!(
             "no surface of at least {} triangles was found in the {} triangles of the regions; they are kept as they were",
@@ -764,7 +788,12 @@ fn resegment(s: &mut Session, i: ResegmentIn) -> CmdResult<RegionChangeOut> {
     drop_regions(s, &ids);
     touched.extend(ids.iter().map(|&id| (id, false)));
     let unassigned = unassigned_of(s, mesh, &all);
-    Ok(RegionChangeOut { regions: report(s, &touched), unassigned })
+    Ok(RegionChangeOut {
+        regions: report(s, &touched),
+        unassigned,
+        noise_used: noise.map(|n| n.sigma),
+        noise_source: noise.map(|n| n.source),
+    })
 }
 
 /// `region.*` commands.

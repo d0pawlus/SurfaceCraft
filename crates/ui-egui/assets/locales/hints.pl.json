@@ -414,6 +414,7 @@
   "Scan points farther than this from the body are not measured (mm, default 5).": "Punkty skanu dalsze od bryły niż ta odległość nie są mierzone (mm, domyślnie 5).",
   "Scan points measured at most (default 20000).": "Największa liczba mierzonych punktów skanu (domyślnie 20000).",
   "Scan points measured at most (default 50000).": "Największa liczba mierzonych punktów skanu (domyślnie 50000).",
+  "Scanner noise sigma (mm) the freeform consolidation judges fits by; omitted: unknown, and\na conservative fallback is used that never demotes a large region (`region.auto_segment`\nmeasures it from the scan).": "Szum skanera sigma (mm), według którego łączenie obszarów swobodnych ocenia dopasowania; pominięty: nieznany, wtedy działa ostrożna wartość zastępcza, która nigdy nie obniża rangi dużego regionu (`region.auto_segment` mierzy go na skanie).",
   "Search radius around the edge (mm, default 10).": "Promień szukania wokół krawędzi (mm, domyślnie 10).",
   "Second entity (a line when `a` is a line, else an arc or circle).": "Drugi element (odcinek, gdy pierwszy jest odcinkiem; w innym razie łuk lub okrąg).",
   "Second line.": "Drugi odcinek.",

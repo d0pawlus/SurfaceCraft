@@ -8,6 +8,8 @@
 //! released. Everything is mesh-side (design doc §5).
 mod fits;
 mod freeform;
+#[cfg(test)]
+mod freeform_tests;
 mod grow;
 mod merge;
 mod relax;
@@ -46,6 +48,10 @@ pub struct SegmentOptions {
     /// Sharpest crease a freeform region crosses (degrees, default 40): neighbouring triangles
     /// whose face normals differ more are in different areas.
     pub freeform_crease_deg: f64,
+    /// Scanner noise sigma (mm) the freeform consolidation judges fits by; omitted: unknown, and
+    /// a conservative fallback is used that never demotes a large region (`region.auto_segment`
+    /// measures it from the scan).
+    pub noise: Option<f64>,
 }
 
 impl Default for SegmentOptions {
@@ -58,6 +64,7 @@ impl Default for SegmentOptions {
             freeform: true,
             freeform_min_share: DEFAULT_FREEFORM_SHARE,
             freeform_crease_deg: DEFAULT_FREEFORM_CREASE_DEG,
+            noise: None,
         }
     }
 }
@@ -293,6 +300,18 @@ fn run(mesh: &Mesh, opts: &SegmentOptions, cancel: &Cancel) -> Option<(Vec<Segme
     Some((merged, stats))
 }
 
+/// Share of the tolerance taken as scanner noise when none is known.
+const FALLBACK_NOISE_SHARE: f64 = 0.25;
+
+/// The scanner noise (sigma, mm) the freeform consolidation uses when [`SegmentOptions::noise`]
+/// is absent or unusable: a quarter of the tolerance. It is a conservative guess, never derived
+/// from the fits of the regions it judges, and with it no large region is demoted: only small
+/// regions are consolidated.
+#[must_use]
+pub fn fallback_noise(tolerance: f64) -> f64 {
+    FALLBACK_NOISE_SHARE * tolerance
+}
+
 /// Settings of the freeform consolidation for a scan of `nt` triangles; options that make no
 /// sense (not finite, out of range) fall back to the defaults.
 fn freeform_settings(opts: &SegmentOptions, nt: usize, seed_tris: usize, tol: f64) -> freeform::Settings {
@@ -306,8 +325,11 @@ fn freeform_settings(opts: &SegmentOptions, nt: usize, seed_tris: usize, tol: f6
     } else {
         DEFAULT_FREEFORM_CREASE_DEG
     };
+    let known_noise = opts.noise.filter(|n| n.is_finite() && *n > 0.0);
     freeform::Settings {
         strong_tris: ((share * nt as f64).ceil() as usize).max(WEAK_SEED_PATCHES * seed_tris),
+        noise: known_noise.unwrap_or_else(|| fallback_noise(tol)),
+        noise_known: known_noise.is_some(),
         dominant_tris: (DOMINANT_SHARE * nt as f64).ceil() as usize,
         min_cluster: MIN_FREEFORM_CLUSTER,
         min_triangles: opts.min_triangles,
