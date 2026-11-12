@@ -140,12 +140,17 @@ fn latest(app: &SurfaceCraftApp, only: Option<ObjectId>) -> Option<Current> {
 /// Reruns `deviation.compute` of the current map with another tolerance and the same reference.
 /// `None` when there is no current map.
 pub fn recompute(app: &mut SurfaceCraftApp, tolerance: f64) -> Option<Result<Value, EngineError>> {
-    let cur = current(app)?;
-    let mut params = cur.params;
+    let params = recompute_params(app, tolerance)?;
+    Some(app.run_command("deviation.compute", params))
+}
+
+/// The parameters of the current map's `deviation.compute` with another tolerance.
+fn recompute_params(app: &SurfaceCraftApp, tolerance: f64) -> Option<Value> {
+    let mut params = current(app)?.params;
     if let Some(m) = params.as_object_mut() {
         m.insert("tolerance".into(), json!(tolerance));
     }
-    Some(app.run_command("deviation.compute", params))
+    Some(params)
 }
 
 /// One row of the legend: the bands it names, the theme tokens that paint them and the range.
@@ -360,8 +365,8 @@ fn tolerance_control(app: &mut SurfaceCraftApp, ui: &mut egui::Ui, tokens: &Toke
     if let Some(w) = &cur.warning {
         ui.colored_label(tokens.color(Token::StatusWarning), w);
     }
-    if recompute_now {
-        let _ = recompute(app, edit);
+    if recompute_now && let Some(params) = recompute_params(app, edit) {
+        app.launch("deviation.compute", params, crate::jobs::After::Nothing);
     }
 }
 

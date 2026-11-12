@@ -201,6 +201,9 @@ impl SurfaceCraftApp {
     /// Draws the whole UI (the body of `eframe::App::ui`).
     pub fn draw(&mut self, ui: &mut egui::Ui) {
         self.prepare(ui.ctx());
+        // a finished background command is taken over before anything reads the session
+        let now = ui.input(|i| i.time);
+        self.advance_job(now);
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.poll_control();
@@ -211,7 +214,8 @@ impl SurfaceCraftApp {
         self.shortcuts(ui);
         // decided before anything is drawn, so a key that ends a pick or leaves a text field
         // this frame does not also confirm or close the tool
-        self.keys_free = !(ui.memory(|m| m.focused().is_some())
+        self.keys_free = !(self.is_busy()
+            || ui.memory(|m| m.focused().is_some())
             || egui::Popup::is_any_open(ui.ctx())
             || ui.input(|i| i.pointer.any_down())
             || self.field_pick.is_some()
@@ -223,6 +227,7 @@ impl SurfaceCraftApp {
         egui::Panel::top("ribbon").frame(chrome(6, 3)).show(ui, |ui| self.ribbon(ui));
         egui::Panel::bottom("status").frame(chrome(8, 3)).show(ui, |ui| self.status_bar(ui));
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.dock_area(ui));
+        self.busy_overlay(ui.ctx());
     }
 
     /// The docks and the viewport: draws the layout and applies the actions the user's gestures
@@ -347,6 +352,10 @@ impl SurfaceCraftApp {
     #[cfg(not(target_arch = "wasm32"))]
     fn poll_dialogs(&mut self) {
         use craft_dialogs::Answer;
+        // an answer that arrives while a command runs waits for it (it is not dropped)
+        if self.is_busy() {
+            return;
+        }
         for (then, answer) in self.dialogs.take_answers() {
             let path = match answer {
                 Answer::Paths(p) => p.into_iter().next(),
@@ -358,6 +367,7 @@ impl SurfaceCraftApp {
             };
             let Some(p) = path else { continue };
             let p = p.to_string_lossy().to_string();
+            use crate::jobs::After;
             match then {
                 DialogThen::OpenProject => {
                     let _ = self.run_command("doc.open", json!({"path": p}));
@@ -367,18 +377,16 @@ impl SurfaceCraftApp {
                     let _ = self.run_command("doc.save", json!({"path": p}));
                 }
                 DialogThen::ImportMesh => {
-                    let _ = self.run_command("mesh.import", json!({"path": p}));
-                    self.fit_pending = true;
+                    self.launch("mesh.import", json!({"path": p}), After::Fit);
                 }
                 DialogThen::ImportStep => {
-                    let _ = self.run_command("import.step", json!({"path": p}));
-                    self.fit_pending = true;
+                    self.launch("import.step", json!({"path": p}), After::Fit);
                 }
                 DialogThen::ExportStep(id) => {
-                    let _ = self.run_command("export.step", json!({"objects": [id.0], "path": p}));
+                    self.launch("export.step", json!({"objects": [id.0], "path": p}), After::Nothing);
                 }
                 DialogThen::ExportMesh(id) => {
-                    let _ = self.run_command("mesh.export", json!({"object": id.0, "path": p}));
+                    self.launch("mesh.export", json!({"object": id.0, "path": p}), After::Nothing);
                 }
             }
         }

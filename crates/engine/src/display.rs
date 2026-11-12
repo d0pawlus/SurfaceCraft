@@ -114,7 +114,7 @@ impl DisplayItem {
 }
 
 /// Caches of derived display data.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct TessCache {
     entries: HashMap<ObjectId, (usize, Arc<Mesh>, Arc<BodyTopo>)>,
     region_colors: HashMap<ObjectId, (u64, Arc<Vec<[f32; 4]>>)>,

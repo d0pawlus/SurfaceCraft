@@ -10,7 +10,7 @@ use crate::AlignError;
 use nalgebra::{Matrix6, Vector6};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use surfacecraft_geom::{Bvh, Mesh, Point3, Transform, Vec3};
+use surfacecraft_geom::{Bvh, Cancel, Mesh, Point3, Transform, Vec3};
 
 /// ICP settings.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -71,6 +71,18 @@ fn rot(w: &Vec3) -> Transform {
 
 /// Aligns `source` onto the surface indexed by `target`, starting from `init`.
 pub fn icp(source: &Mesh, target: &Bvh, init: &Transform, opts: &IcpOptions) -> Result<IcpReport, AlignError> {
+    icp_cancellable(source, target, init, opts, &Cancel::new())
+}
+
+/// [`icp`] that gives up with [`AlignError::Cancelled`] when `cancel` is set (checked every
+/// iteration).
+pub fn icp_cancellable(
+    source: &Mesh,
+    target: &Bvh,
+    init: &Transform,
+    opts: &IcpOptions,
+    cancel: &Cancel,
+) -> Result<IcpReport, AlignError> {
     let pts = samples(source, opts.max_samples);
     if pts.len() < 6 {
         return Err(AlignError::NotEnough(format!("{} source points; at least 6 are needed", pts.len())));
@@ -86,6 +98,9 @@ pub fn icp(source: &Mesh, target: &Bvh, init: &Transform, opts: &IcpOptions) -> 
     let mut pairs = 0;
     let mut lambda = 0.0f64;
     for _ in 0..opts.max_iterations.max(1) {
+        if cancel.is_cancelled() {
+            return Err(AlignError::Cancelled);
+        }
         // correspondences
         let moved: Vec<Point3> = pts.iter().map(|p| t.apply(p)).collect();
         let hits: Vec<Option<(Point3, Vec3, f64)>> = surfacecraft_geom::par::map_slice(&moved, |p| {

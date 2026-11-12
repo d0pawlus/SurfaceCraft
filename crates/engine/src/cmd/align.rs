@@ -4,7 +4,7 @@ use crate::{Session, command};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use surfacecraft_align::{Datum, IcpOptions, datum_321, icp, kabsch, principal_frame, rms_to_surface};
+use surfacecraft_align::{Datum, IcpOptions, datum_321, icp_cancellable, kabsch, principal_frame, rms_to_surface};
 use surfacecraft_doc::{ObjectId, ObjectKind};
 use surfacecraft_geom::{Bvh, Mesh, Point3, Transform, Vec3};
 
@@ -221,8 +221,9 @@ fn icp_cmd(s: &mut Session, i: IcpIn) -> CmdResult<IcpOut> {
         )));
     }
     let bvh = Bvh::build(&target);
-    let rep = match icp(fit_on, &bvh, &Transform::identity(), &i.options) {
+    let rep = match icp_cancellable(fit_on, &bvh, &Transform::identity(), &i.options, &s.cancel) {
         Ok(rep) => rep,
+        Err(surfacecraft_align::AlignError::Cancelled) => return Err(super::cancelled()),
         Err(e) if local => {
             return Err(CmdError::Failed(format!(
                 "the local fit failed ({e}); use align.n_point with point pairs instead"

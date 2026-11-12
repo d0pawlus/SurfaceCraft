@@ -77,6 +77,7 @@ pub(super) fn relax_boundaries(
     nb: &[[u32; 3]],
     mut segs: Vec<Segment>,
     tol: f64,
+    cancel: &surfacecraft_geom::Cancel,
 ) -> Vec<Segment> {
     const PASSES: usize = 8;
     if segs.len() < 2 {
@@ -89,6 +90,9 @@ pub(super) fn relax_boundaries(
         }
     }
     for _pass in 0..PASSES {
+        if cancel.is_cancelled() {
+            break;
+        }
         // decided on the previous state, so every triangle is independent of the others
         let moves: Vec<(u32, u32)> = surfacecraft_geom::par::map(nb.len(), |t| {
             better_owner(mesh, nb, &segs, &owner, t, tol).map(|b| (t as u32, b))

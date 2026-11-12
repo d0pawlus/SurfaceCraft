@@ -13,6 +13,7 @@
 )]
 
 pub mod app;
+pub mod assistant;
 pub mod brep;
 pub mod camera;
 pub mod command_panel;
@@ -28,6 +29,7 @@ pub mod guide_panel;
 pub mod history_panel;
 pub mod i18n;
 pub mod icons;
+pub mod jobs;
 pub mod navbar;
 pub mod ribbon;
 pub mod sectionview;

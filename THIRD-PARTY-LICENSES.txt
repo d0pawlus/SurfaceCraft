@@ -24,6 +24,10 @@ allocator-api2 0.2.21
     licence: MIT OR Apache-2.0
     source: https://github.com/zakarumych/allocator-api2
 
+allocator-api2 0.4.0
+    licence: MIT OR Apache-2.0
+    source: https://github.com/zakarumych/allocator-api2
+
 android-activity 0.6.1
     licence: MIT OR Apache-2.0
     source: https://github.com/rust-mobile/android-activity
@@ -788,6 +792,10 @@ ordered-float 5.5.1
     licence: MIT
     source: https://github.com/reem/rust-ordered-float
 
+orx-parallel-wasm-allocator 0.2.1
+    licence: MIT OR Apache-2.0
+    source: https://github.com/orxfun/orx-parallel-wasm-allocator/
+
 os_pipe 1.2.3
     licence: MIT
     source: https://github.com/oconnor663/os_pipe.rs
@@ -1144,6 +1152,10 @@ spade 2.15.1
     licence: MIT OR Apache-2.0
     source: https://github.com/Stoeoef/spade
 
+spinning_top 0.3.1
+    licence: MIT OR Apache-2.0
+    source: https://github.com/rust-osdev/spinning_top
+
 spirv 0.4.0+sdk-1.4.341.0
     licence: Apache-2.0
     source: https://github.com/gfx-rs/rspirv
@@ -1179,6 +1191,10 @@ syn 2.0.119
 syn 3.0.9
     licence: MIT OR Apache-2.0
     source: https://github.com/dtolnay/syn
+
+talc 5.1.1
+    licence: MIT
+    source: https://github.com/SFBdragon/talc
 
 termcolor 1.4.1
     licence: Unlicense OR MIT
@@ -1323,6 +1339,10 @@ wasm-bindgen-macro-support 0.2.130
 wasm-bindgen-shared 0.2.130
     licence: MIT OR Apache-2.0
     source: https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/shared
+
+wasm_sync 0.1.2
+    licence: MIT OR Apache-2.0
+    source: https://github.com/DouglasDwyer/wasm_sync
 
 wayland-backend 0.3.17
     licence: MIT

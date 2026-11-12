@@ -4,6 +4,12 @@ name: deploy-web
 # (Vercel project `surfacecraft`) after `ci` passes on main. Vercel itself never builds this
 # repository (its Ignored Build Step is `exit 0`): the bundle is built here and uploaded prebuilt.
 # Needs the repository secret VERCEL_TOKEN; without it the bundle is built and the deploy skipped.
+#
+# The bundle has threads (shared wasm memory), so it is built on the one nightly `cargo xtask
+# web-toolchain` names, with a rebuilt std (`rust-src`); stable builds the xtask itself. The page
+# must be cross-origin isolated for threads: `cargo xtask web` writes the COOP and COEP headers
+# into `dist/vercel.json`, and the step after the Vercel build fails the job if they are not in
+# the output that is uploaded.
 
 on:
   workflow_run:
@@ -45,6 +51,11 @@ jobs:
         with:
           key: web
           cache-all-crates: true
+      - name: Nightly of the threaded web build (pinned in xtask/src/web.rs)
+        run: |
+          nightly=$(cargo xtask web-toolchain)
+          echo "web build toolchain: $nightly"
+          rustup toolchain install "$nightly" --profile minimal --component rust-src
       - name: wasm-bindgen CLI (the version in Cargo.lock)
         run: |
           v=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/version = |"/, ""); print; exit }' Cargo.lock)
@@ -75,4 +86,7 @@ jobs:
         run: |
           npx --yes vercel@65 pull --yes --environment=production --token "$VERCEL_TOKEN"
           npx --yes vercel@65 build --prod --token "$VERCEL_TOKEN"
+          # without these headers the site still works, but on one thread: do not publish that silently
+          grep -q "Cross-Origin-Opener-Policy" .vercel/output/config.json
+          grep -q "Cross-Origin-Embedder-Policy" .vercel/output/config.json
           npx --yes vercel@65 deploy --prebuilt --prod --token "$VERCEL_TOKEN"
