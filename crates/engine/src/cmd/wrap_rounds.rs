@@ -6,16 +6,23 @@
 //! the patches miss (per-vertex detail levels, [`reduce_to_tolerance_scaled`]).
 //!
 //! Both refine the coarse *triangle mesh*, never single patches: every round lays the patches on a
-//! fresh, manifold, conforming mesh (`fit::patch::wrap_patches`), so neighbouring patches always
-//! share a whole boundary curve and no T-junction can open a gap, whatever the refinement.
+//! fresh, manifold, conforming mesh (`fit::patch_g1::wrap_patches_g1`), so neighbouring patches
+//! always share a whole boundary curve and no T-junction can open a gap, whatever the refinement.
+//!
+//! The layout is searched with unconstrained patches, which follow the scan best; the best layout is
+//! then wrapped once more with patches that are tangent across the smooth edges, and the search is
+//! repeated with tangent patches only when those lose the tolerance.
 use super::wrap::WrapDeviation;
 use super::{CmdError, CmdResult};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use surfacecraft_fit::patch::{PatchSet, tessellate, wrap_patches};
+use std::collections::BTreeSet;
+use surfacecraft_fit::mls::ScanSurface;
+use surfacecraft_fit::patch::{PatchSet, tessellate};
+use surfacecraft_fit::patch_g1::{G1Options, wrap_patches_g1};
 use surfacecraft_geom::edit::{DecimateOptions, decimate, remove_non_manifold};
 use surfacecraft_geom::reduce::{ToleranceOptions, raise_levels, reduce_to_tolerance, reduce_to_tolerance_scaled};
-use surfacecraft_geom::{Bvh, Mesh, Point3};
+use surfacecraft_geom::{Bvh, Mesh, Point3, Vec3};
 
 /// Patches per coarse triangle.
 const PATCHES_PER_TRIANGLE: usize = 3;
@@ -89,6 +96,15 @@ pub struct WrapLevel {
 /// One round: the coarse mesh, its patches and their deviation.
 pub(super) struct Round {
     pub(super) set: PatchSet,
+    /// The coarse mesh the patches were laid on.
+    coarse: Mesh,
+    /// Layout edges of the patches that are creases.
+    pub(super) creases: BTreeSet<(u32, u32)>,
+    /// Coarse edges that are creases / smooth.
+    pub(super) crease_edges: usize,
+    pub(super) smooth_edges: usize,
+    /// Patches built without the tangent construction (it folded them).
+    pub(super) g0_patches: usize,
     pub(super) coarse_triangles: usize,
     pub(super) budget: f64,
     pub(super) capped: bool,
@@ -99,6 +115,8 @@ pub(super) struct Round {
 pub(super) struct Target<'a> {
     pub(super) scan: &'a Mesh,
     bvh: Bvh,
+    surface: ScanSurface,
+    options: G1Options,
     stride: usize,
     samples: Vec<Point3>,
     pub(super) tolerance: f64,
@@ -107,11 +125,14 @@ pub(super) struct Target<'a> {
 }
 
 impl<'a> Target<'a> {
-    pub(super) fn new(scan: &'a Mesh, tolerance: f64, min_within: f64, max_patches: usize) -> Self {
+    pub(super) fn new(scan: &'a Mesh, tolerance: f64, min_within: f64, max_patches: usize, options: G1Options) -> Self {
+        let normals: Vec<Vec3> = scan.vertex_normals().into_iter().map(|n| n.try_normalize(0.0).unwrap_or(n)).collect();
         let stride = scan.positions.len().div_ceil(MAX_SAMPLES).max(1);
         Self {
             scan,
             bvh: Bvh::build(scan),
+            surface: ScanSurface::oriented(&scan.positions, &normals),
+            options,
             stride,
             samples: scan.positions.iter().step_by(stride).copied().collect(),
             tolerance,
@@ -181,11 +202,28 @@ fn deviation_of(d: &[f64], tolerance: f64) -> WrapDeviation {
 }
 
 /// Lays the patches on `coarse` and measures them; also returns the distance of every sample.
-fn build_round(t: &Target, coarse: &Mesh, budget: f64, capped: bool) -> (Round, Vec<f64>) {
-    let set = wrap_patches(coarse, &t.bvh, REACH_BUDGETS * budget);
-    let d = distances(&set, &t.samples);
+fn build_round(t: &Target, coarse: &Mesh, budget: f64, capped: bool, g1: bool) -> (Round, Vec<f64>) {
+    let options = G1Options { g1, ..t.options };
+    let wrap = wrap_patches_g1(coarse, &t.bvh, &t.surface, REACH_BUDGETS * budget, &options);
+    let d = distances(&wrap.set, &t.samples);
     let deviation = deviation_of(&d, t.tolerance);
-    (Round { set, coarse_triangles: coarse.triangle_count(), budget, capped, deviation }, d)
+    let (crease_edges, smooth_edges, g0_patches) = (wrap.crease_edges, wrap.smooth_edges, wrap.fallbacks);
+    let (set, creases) = (wrap.set, wrap.creases);
+    (
+        Round {
+            set,
+            coarse: coarse.clone(),
+            creases,
+            crease_edges,
+            smooth_edges,
+            g0_patches,
+            coarse_triangles: coarse.triangle_count(),
+            budget,
+            capped,
+            deviation,
+        },
+        d,
+    )
 }
 
 fn level_of(round: usize, r: &Round, refined_vertices: usize) -> WrapLevel {
@@ -212,7 +250,7 @@ fn failed() -> CmdError {
 }
 
 /// The uniform layout: the budget of the whole scan is halved each round.
-fn uniform_rounds(t: &Target) -> CmdResult<Wrapped> {
+fn uniform_rounds(t: &Target, g1: bool) -> CmdResult<Wrapped> {
     let mut best: Option<Round> = None;
     let mut levels = Vec::new();
     let mut budget = FIRST_BUDGET * t.tolerance;
@@ -220,7 +258,7 @@ fn uniform_rounds(t: &Target) -> CmdResult<Wrapped> {
         let raw = reduce_scan(t.scan, budget, &[]);
         let capped = raw.triangle_count() > t.max_triangles;
         let coarse = fit_to_limit(raw, budget, t.max_triangles);
-        let (r, _) = build_round(t, &coarse, budget, capped);
+        let (r, _) = build_round(t, &coarse, budget, capped, g1);
         levels.push(level_of(round, &r, 0));
         let done = capped || r.deviation.within >= t.min_within;
         best = keep_better(best, r);
@@ -249,7 +287,7 @@ fn scale_of(levels: &[u8]) -> Vec<f64> {
 /// The adaptive layout: detail levels are raised around the scan points the patches miss, the
 /// coarse mesh is reduced again from the scan with the new levels. A round whose mesh would not
 /// fit `max_patches` is not built: the best earlier round is returned, flagged as capped.
-fn adaptive_rounds(t: &Target) -> CmdResult<Wrapped> {
+fn adaptive_rounds(t: &Target, g1: bool) -> CmdResult<Wrapped> {
     let mut best: Option<Round> = None;
     let mut log = Vec::new();
     let mut levels: Vec<u8> = vec![0; t.scan.positions.len()];
@@ -262,7 +300,7 @@ fn adaptive_rounds(t: &Target) -> CmdResult<Wrapped> {
             break;
         }
         let coarse = if over { fit_to_limit(raw, budget, t.max_triangles) } else { raw };
-        let (r, d) = build_round(t, &coarse, budget, over);
+        let (r, d) = build_round(t, &coarse, budget, over, g1);
         let refined = levels.iter().filter(|&&l| l > 0).count();
         log.push(level_of(round, &r, refined));
         let done = over || r.deviation.within >= t.min_within;
@@ -281,11 +319,32 @@ fn adaptive_rounds(t: &Target) -> CmdResult<Wrapped> {
     best.map(|best| Wrapped { best, rounds, levels: log }).ok_or_else(failed)
 }
 
+fn search(t: &Target, refine: Refine, g1: bool) -> CmdResult<Wrapped> {
+    match refine {
+        Refine::Adaptive => adaptive_rounds(t, g1),
+        Refine::Uniform => uniform_rounds(t, g1),
+    }
+}
+
 /// Wraps the scan until `min_within` of the samples are within the tolerance, or the rounds or the
 /// patch limit run out.
+///
+/// The layout is searched with the unconstrained patches (they follow the scan best, and are cheapest);
+/// the best layout is then wrapped once more with tangent patches. When those meet the tolerance too
+/// (or lose nothing the unconstrained ones had) they are the result; otherwise the search is repeated
+/// with tangent patches, so the refinement absorbs what the tangent condition costs.
 pub(super) fn wrap_rounds(t: &Target, refine: Refine) -> CmdResult<Wrapped> {
-    match refine {
-        Refine::Adaptive => adaptive_rounds(t),
-        Refine::Uniform => uniform_rounds(t),
+    let mut found = search(t, refine, false)?;
+    if !t.options.g1 {
+        return Ok(found);
     }
+    let best = &found.best;
+    let (tangent, _) = build_round(t, &best.coarse, best.budget, best.capped, true);
+    let kept = tangent.deviation.within >= t.min_within.min(best.deviation.within);
+    if !kept {
+        return search(t, refine, true);
+    }
+    let refined = found.levels.last().map_or(0, |l| l.refined_vertices);
+    found.levels.push(level_of(found.rounds + 1, &tangent, refined));
+    Ok(Wrapped { best: tangent, rounds: found.rounds + 1, levels: found.levels })
 }

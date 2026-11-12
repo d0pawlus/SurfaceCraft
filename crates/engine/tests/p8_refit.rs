@@ -262,3 +262,34 @@ fn refit_faces_stiffness_and_refusals() {
     );
     assert!(s.execute("body.refit_faces", json!({"body": "part", "mesh": "scan", "max_change": -1.0})).is_err());
 }
+
+/// A dimension or feature field that follows an expression is fitted like any other, and the
+/// fitted value is then a plain number: the expression no longer drives it.
+#[test]
+fn refit_features_turns_expression_driven_values_into_plain_numbers() {
+    let mut scan_session = Session::new();
+    build_part(&mut scan_session, 40.6, 20.0, 10.3, 8.0, 3.0);
+    let truth = body_of(&scan_session, "plate");
+    let mut s = Session::new();
+    let ids = build_part(&mut s, 40.0, 20.0, 10.0, 8.0, 3.0);
+    add_scan(&mut s, &truth, "scan", 5);
+    s.execute("param.set", json!({"name": "ln", "expression": "40"})).unwrap();
+    s.execute("param.set", json!({"name": "ht", "expression": "10"})).unwrap();
+    s.execute(
+        "sketch.edit_constraint",
+        json!({"sketch": "base", "index": 5, "constraint": {"type": "length", "line": 0, "value": {"expr": "ln"}}}),
+    )
+    .unwrap();
+    s.execute("feature.edit", json!({"feature": ids[0], "set": {"distance": {"expr": "ht"}}})).unwrap();
+    let base = s.doc.sketches.iter().find(|k| k.name == "base").unwrap().id.0;
+    let only = [format!("sketch/{base}/5"), format!("feature/{}/distance", ids[0])];
+    let out = s.execute("body.refit_features", json!({"body": "plate", "mesh": "scan", "params": only})).unwrap();
+    assert!((param(&out, &only[0])["new"].as_f64().unwrap() - 40.6).abs() <= 0.05, "{out}");
+    assert!(!s.doc.sketches.iter().any(|k| k.sketch.dim_exprs.contains_key(&5)), "the dimension is a plain number");
+    assert!(s.doc.features.iter().all(|f| f.exprs.is_empty()), "so is the extrusion depth");
+    let fitted = volume(&body_of(&s, "plate")).unwrap();
+    s.execute("param.set", json!({"name": "ln", "expression": "99"})).unwrap();
+    s.execute("param.set", json!({"name": "ht", "expression": "99"})).unwrap();
+    let after = volume(&body_of(&s, "plate")).unwrap();
+    assert!((after - fitted).abs() < 1e-9, "the parameters no longer move the part: {after} vs {fitted}");
+}
