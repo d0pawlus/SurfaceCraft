@@ -181,7 +181,7 @@ pub(crate) fn auto_segment(s: &mut Session, i: AutoIn) -> CmdResult<RegionsOut> 
         return Err(CmdError::Params("tolerance must be positive and the angle finite".into()));
     }
     let m = s.doc.mesh(mesh).map(|m| m.mesh.clone()).ok_or_else(|| CmdError::Params(format!("no mesh {mesh}")))?;
-    let (options, noise) = with_noise(&m, o)?;
+    let (options, noise) = with_noise(&m, &m, o)?;
     if i.replace {
         s.doc.regions.retain(|r| r.mesh != mesh);
     }
@@ -363,9 +363,11 @@ fn resegment(s: &mut Session, i: ResegmentIn) -> CmdResult<RegionChangeOut> {
         return Err(CmdError::Params("the regions hold no triangles".into()));
     }
     // the triangles alone form the sub-mesh, so its outer edges bound the growth
-    // the noise is a property of the scan: measured on the whole mesh, not on the selection
-    let (options, noise) = with_noise(&m, o)?;
-    let segs = segment_cancellable(&m.submesh(&all), &options, &s.cancel).ok_or_else(super::cancelled)?;
+    // the noise is measured on the selected geometry (the part may be noisier or cleaner than the
+    // rest of the mesh); only a selection too small to measure uses the whole mesh, if uniform
+    let sub = m.submesh(&all);
+    let (options, noise) = with_noise(&m, &sub, o)?;
+    let segs = segment_cancellable(&sub, &options, &s.cancel).ok_or_else(super::cancelled)?;
     if segs.is_empty() {
         return Err(CmdError::Failed(format!(
             "no surface of at least {} triangles was found in the {} triangles of the regions; they are kept as they were",

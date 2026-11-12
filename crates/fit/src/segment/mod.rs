@@ -17,6 +17,7 @@ mod seeds;
 
 use crate::primitive::{Primitive, PrimitiveKind};
 use fits::fit_tris;
+pub use freeform::{LARGE_SOUND_FACTOR, residual_spread};
 use grow::Ctx;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

@@ -42,7 +42,8 @@
 //! Everything is a pure function of the regions, in triangle-index order, so the result does not
 //! depend on the number of threads.
 use super::Segment;
-use super::fits::{fit_kind_tris, fit_tris};
+use super::fits::{best_rms_kind, fit_kind_tris, fit_tris, refit_kind_points};
+use super::region_points;
 use crate::primitive::{Primitive, PrimitiveKind};
 use std::collections::VecDeque;
 use surfacecraft_geom::{Mesh, Point3, Vec3};
@@ -55,8 +56,15 @@ const MIN_SUPPORT: f64 = 1.0;
 /// A small region's fit is sound when its RMS is within this factor of the noise level.
 const SOUND_FACTOR: f64 = 1.2;
 /// A large region's fit is sound when the robust spread of its residuals is within this factor of
-/// the noise level, and its RMS within [`LARGE_RMS_FACTOR`].
-const LARGE_SOUND_FACTOR: f64 = 1.05;
+/// the noise level, and its RMS within [`LARGE_RMS_FACTOR`]. Calibrated (see
+/// `crates/engine/tests/p9_noise_calibration.rs`): on genuine planes, cylinders and spheres
+/// (sigma 0.01 to 0.1, three densities, 20 seeds) the ratio of that spread to the noise measured
+/// on the scan has median 0.91, 95th percentile 0.99, 99th 1.02 and maximum 1.055; a noise
+/// estimate 7 % low (0.028 for a true 0.03) lifts the ratio of a genuine plane to 1.085. On
+/// fragments of a wavy surface the ratio overlaps that range from below (at sigma 0.1 the noise
+/// swamps the misfit and nothing separates them), so the threshold sits above both: losing a real
+/// primitive costs more than keeping a fragment.
+pub const LARGE_SOUND_FACTOR: f64 = 1.10;
 const LARGE_RMS_FACTOR: f64 = 2.0;
 /// Scales a median absolute deviation to a standard deviation.
 const MAD_TO_SIGMA: f64 = 1.4826;
@@ -113,12 +121,13 @@ impl Standing {
     }
 }
 
-/// The robust spread of the residuals of `seg` to its primitive (1.4826 x the median absolute
-/// distance of a sample of its corners): a shoulder where a region grew into a tangent
-/// neighbour (its tail) does not inflate it as it does the RMS.
-fn robust_sigma(mesh: &Mesh, seg: &Segment) -> f64 {
-    let mut d: Vec<f64> =
-        sample_corners(mesh, &seg.triangles).iter().map(|p| seg.primitive.distance(p).abs()).collect();
+/// The robust spread of the residuals of the region `triangles` to `primitive` (1.4826 x the
+/// median absolute distance of a sample of its corners, sigma mm): a shoulder where the region
+/// grew into a tangent neighbour does not inflate it as it does the RMS. `INFINITY` for no
+/// triangles.
+#[must_use]
+pub fn residual_spread(mesh: &Mesh, triangles: &[u32], primitive: &Primitive) -> f64 {
+    let mut d: Vec<f64> = sample_corners(mesh, triangles).iter().map(|p| primitive.distance(p).abs()).collect();
     d.sort_by(f64::total_cmp);
     MAD_TO_SIGMA * d.get(d.len() / 2).copied().unwrap_or(f64::INFINITY)
 }
@@ -134,7 +143,8 @@ fn standing_of(mesh: &Mesh, seg: &Segment, set: &Settings) -> Standing {
     let sound = if large {
         // a large region is judged by the spread of most of its residuals (a shoulder where it
         // grew into a tangent neighbour is not misfit), and by an RMS cap
-        robust_sigma(mesh, seg) <= LARGE_SOUND_FACTOR * set.noise && seg.rms <= LARGE_RMS_FACTOR * set.noise
+        residual_spread(mesh, &seg.triangles, &seg.primitive) <= LARGE_SOUND_FACTOR * set.noise
+            && seg.rms <= LARGE_RMS_FACTOR * set.noise
     } else {
         seg.rms <= SOUND_FACTOR * set.noise
     };
@@ -413,14 +423,32 @@ fn connected_pieces(nb: &[[u32; 3]], tris: &[u32]) -> Vec<Vec<u32>> {
     pieces
 }
 
-/// A piece cut from a region: its own fit, or `None` (released) when it is under `min_triangles`
-/// or no primitive fits it within the tolerance any more.
-fn refit_piece(mesh: &Mesh, normals: &[Vec3], tris: &[u32], set: &Settings) -> Option<Segment> {
+/// A piece cut from a region (of primitive kind `origin`): its own fit, or `None` (released) when
+/// it is under `min_triangles` or no primitive fits it within the tolerance. `fit_auto` prefers a
+/// simpler kind that is up to 20 % worse than the best, which can miss the tolerance when
+/// another kind meets it; so the choice of `fit_auto`, the kind with the lowest RMS and the
+/// original kind are each fitted over the whole piece, and the best of those within the
+/// tolerance is taken.
+pub(super) fn refit_piece(
+    mesh: &Mesh,
+    normals: &[Vec3],
+    tris: &[u32],
+    origin: PrimitiveKind,
+    set: &Settings,
+) -> Option<Segment> {
     if tris.len() < set.min_triangles {
         return None;
     }
-    let f = fit_tris(mesh, normals, tris).filter(|f| f.rms <= set.tolerance)?;
-    Some(Segment { triangles: tris.to_vec(), primitive: f.primitive, rms: f.rms, freeform: false })
+    let mut kinds = vec![fit_tris(mesh, normals, tris)?.primitive.kind(), origin];
+    kinds.extend(best_rms_kind(mesh, normals, tris));
+    kinds.dedup();
+    let (p, n) = region_points(mesh, normals, tris);
+    let best = kinds
+        .into_iter()
+        .filter_map(|kind| refit_kind_points(&p, &n, kind))
+        .filter(|f| f.rms <= set.tolerance)
+        .min_by(|a, b| a.rms.total_cmp(&b.rms))?;
+    Some(Segment { triangles: tris.to_vec(), primitive: best.primitive, rms: best.rms, freeform: false })
 }
 
 /// The regions that remain and the region of every organic area, each triangle going by its own
@@ -444,7 +472,7 @@ fn assemble(
         }
     }
     let mut out: Vec<Segment> = Vec::new();
-    let mut cut: Vec<Vec<u32>> = Vec::new();
+    let mut cut: Vec<(Vec<u32>, PrimitiveKind)> = Vec::new();
     for (s, st) in segs.into_iter().zip(standing) {
         let kept: Vec<u32> = if st.in_mask() {
             s.triangles
@@ -459,10 +487,11 @@ fn assemble(
         if kept.len() == s.triangles.len() {
             out.push(s);
         } else {
-            cut.extend(connected_pieces(nb, &kept));
+            let kind = s.primitive.kind();
+            cut.extend(connected_pieces(nb, &kept).into_iter().map(|piece| (piece, kind)));
         }
     }
-    let refitted = surfacecraft_geom::par::map_slice(&cut, |tris| refit_piece(mesh, normals, tris, set));
+    let refitted = surfacecraft_geom::par::map_slice(&cut, |(tris, kind)| refit_piece(mesh, normals, tris, *kind, set));
     out.extend(refitted.into_iter().flatten());
     out.extend(areas.into_iter().filter(|a| !a.is_empty()).map(|tris| area_segment(mesh, normals, tris, set)));
     out

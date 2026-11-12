@@ -1,6 +1,6 @@
 //! Unit tests of the freeform consolidation on hand-made regions.
 use super::Segment;
-use super::freeform::{Settings, consolidate};
+use super::freeform::{Settings, consolidate, refit_piece};
 use crate::primitive::{Primitive, PrimitiveKind};
 use surfacecraft_geom::{Mesh, Point3, Vec3, synth};
 
@@ -296,4 +296,37 @@ fn without_a_known_noise_a_large_region_is_never_demoted() {
     let set = Settings { noise: 0.05, noise_known: false, ..settings(NOISE) };
     let out = run(&m, segs, &set);
     assert!(out.iter().any(|s| s.triangles == flat && !s.freeform), "the large region was demoted");
+}
+
+/// A cylindrical strip (R = 42 mm, 10 mm wide, 60 mm long) with noise 0.185 mm: against the
+/// tolerance 0.2 the plane fits at about 0.205 and the cylinder at about 0.185.
+fn strip_between_plane_and_cylinder() -> Mesh {
+    const R: f64 = 42.0;
+    let mut m = sheet(10.0, 60.0, 20, 120, |x, y| {
+        let x = x - 5.0;
+        Point3::new(x, y, R - (R * R - x * x).sqrt())
+    });
+    synth::add_noise(&mut m, 0.185, &mut surfacecraft_geom::Rng::new(9));
+    m
+}
+
+/// `fit_auto` prefers the simpler plane when it is within 20 % of the best RMS; the plane at
+/// 0.205 misses the tolerance 0.2 while the cylinder at 0.185 meets it. A cut piece must not be
+/// released then: a primitive fits it.
+#[test]
+fn a_piece_is_kept_when_only_the_model_auto_does_not_prefer_fits_the_tolerance() {
+    let m = strip_between_plane_and_cylinder();
+    let tris: Vec<u32> = (0..m.triangle_count() as u32).collect();
+    let normals = m.vertex_normals();
+    let set = Settings { tolerance: 0.2, ..settings(NOISE) };
+    let auto = super::fits::fit_tris(&m, &normals, &tris).expect("a fit");
+    eprintln!("auto: {:?} rms {:.4}", auto.primitive.kind(), auto.rms);
+    assert!(
+        auto.rms > 0.2 && auto.primitive.kind() == PrimitiveKind::Plane,
+        "the scenario: auto picks a plane above the tolerance"
+    );
+    let piece = refit_piece(&m, &normals, &tris, PrimitiveKind::Plane, &set)
+        .expect("the piece is released although the cylinder fits");
+    assert_eq!(piece.primitive.kind(), PrimitiveKind::Cylinder);
+    assert!(piece.rms <= 0.2);
 }

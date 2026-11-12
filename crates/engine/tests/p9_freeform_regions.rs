@@ -162,3 +162,69 @@ fn resegment_reports_the_noise() {
     let out = s.execute("region.resegment", json!({"regions": ids})).unwrap();
     assert_eq!(out["noise_source"], "estimated", "{out}");
 }
+
+// --- the noise is measured where the segmentation looks -------------------------------------------
+
+/// A flat plate of `side` mm (150 cells a side) at x = 200, with noise `sigma`: geometry unrelated to
+/// the scan it is appended to.
+fn unrelated_plate(sigma: f64, seed: u64) -> Mesh {
+    let mut m = sheet(100.0, 100.0, 150, |x, y| Point3::new(200.0 + x, y, 0.0));
+    synth::add_noise(&mut m, sigma, &mut Rng::new(seed));
+    m
+}
+
+/// The mounting-face scan (sigma 0.03), with `extra` appended; the first triangles are the scan's.
+fn scan_with(extra: Option<Mesh>) -> (Mesh, usize) {
+    let mut m = mounting_face_scan();
+    let n = m.triangle_count();
+    if let Some(e) = extra {
+        m.append(&e);
+    }
+    (m, n)
+}
+
+/// Resegments the scan's own triangles (a region of them) and returns the source of the noise and
+/// the sorted `(kind, freeform, triangles)` of the regions that come out.
+fn resegment_the_scan(extra: Option<Mesh>) -> (Value, Vec<(String, bool, u64)>) {
+    let (mesh, n) = scan_with(extra);
+    let mut s = Session::new();
+    s.doc.add_mesh("scan", mesh);
+    let made =
+        s.execute("region.create", json!({"mesh": "scan", "triangles": (0..n as u32).collect::<Vec<_>>()})).unwrap();
+    let out = s.execute("region.resegment", json!({"regions": [made["id"]]})).unwrap();
+    let list = s.execute("region.list", json!({})).unwrap();
+    let mut regions: Vec<(String, bool, u64)> = list["regions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["kind"].to_string(), r["freeform"] == true, r["triangles"].as_u64().unwrap()))
+        .collect();
+    regions.sort();
+    (out["noise_source"].clone(), regions)
+}
+
+/// The same selected surface is classified the same with and without unrelated geometry in the
+/// mesh, clean (a mesh dominated by clean geometry would give a low sigma and make the genuine
+/// plane look unsound) or noisy (it would protect fragments): the noise is measured on the
+/// selection.
+#[test]
+fn a_selection_is_classified_the_same_with_and_without_unrelated_geometry() {
+    let (source, alone) = resegment_the_scan(None);
+    let (clean_source, with_clean) = resegment_the_scan(Some(unrelated_plate(0.005, 1)));
+    let (noisy_source, with_noisy) = resegment_the_scan(Some(unrelated_plate(0.12, 2)));
+    eprintln!("alone {alone:?}\nclean {with_clean:?}\nnoisy {with_noisy:?}");
+    assert_eq!((source, clean_source, noisy_source), (json!("estimated"), json!("estimated"), json!("estimated")));
+    assert!(alone.iter().any(|r| r.0 == "\"plane\"" && r.2 > 4000), "the mounting face is a plane: {alone:?}");
+    assert_eq!(with_clean, alone, "clean geometry appended changed the classification");
+    assert_eq!(with_noisy, alone, "noisy geometry appended changed the classification");
+}
+
+/// A mesh whose parts differ in noise by far more than the estimator's own spread has no one
+/// noise: `region.auto_segment` says so (fallback) instead of using a mixture.
+#[test]
+fn a_mesh_with_very_different_noise_in_its_parts_uses_the_fallback() {
+    let mut s = Session::new();
+    s.doc.add_mesh("scan", scan_with(Some(unrelated_plate(0.005, 1))).0);
+    let out = s.execute("region.auto_segment", json!({"mesh": "scan"})).unwrap();
+    assert_eq!((out["noise_source"].clone(), out["noise_used"].clone()), (json!("fallback"), json!(0.05)), "{out}");
+}
