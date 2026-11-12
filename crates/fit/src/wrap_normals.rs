@@ -121,14 +121,14 @@ impl Layout<'_> {
         (mid, SUPPORT_SHARE * (pb - pa).norm(), self.inward(f, mid, &edge))
     }
 
-    /// The normal at the middle of the edge `a`-`b` seen from its face `f` alone, and the normal of the
-    /// plane through that side of the scan (the one angles are judged by).
-    fn one_sided(&self, f: usize, a: u32, b: u32) -> (Vec3, Vec3) {
+    /// The normal at the middle of the edge `a`-`b` seen from its face `f` alone. Taken from the quadric
+    /// (not the plane) of that side: a plane through a half disc of a curved surface is tilted by the
+    /// curvature times the distance of the half disc's centre from the edge, which on a sparse scan is
+    /// as large as a crease; the quadric is evaluated at the edge itself.
+    fn one_sided(&self, f: usize, a: u32, b: u32) -> Vec3 {
         let (mid, radius, side) = self.side_support(f, a, b);
         let keep = move |p: &Point3| (p.coords - mid).dot(&side) > -SIDE_SLACK * radius;
-        let hint = self.normal_of(f);
-        let n = self.estimate(mid, radius, hint, &keep);
-        (n, self.plane(mid, radius, hint, &keep).unwrap_or(n))
+        self.estimate(mid, radius, self.normal_of(f), &keep)
     }
 
     /// The normal at the middle of the edge `a`-`b` from both sides.
@@ -148,8 +148,8 @@ fn classify_edges(l: &Layout, crease_rad: f64, out: &mut LayoutNormals) {
     for (&(a, b), faces) in l.edges {
         let slots: Vec<(usize, usize)> =
             faces.iter().filter_map(|&f| Some((f, edge_slot(l.coarse.triangles.get(f)?, a, b)?))).collect();
-        let (sides, planes): (Vec<Vec3>, Vec<Vec3>) = faces.iter().map(|&f| l.one_sided(f, a, b)).unzip();
-        let crease = matches!(planes.as_slice(), [n1, n2] if angle(n1, n2) > crease_rad);
+        let sides: Vec<Vec3> = faces.iter().map(|&f| l.one_sided(f, a, b)).collect();
+        let crease = matches!(sides.as_slice(), [n1, n2] if angle(n1, n2) > crease_rad);
         let shared = if crease { None } else { Some(l.two_sided(faces, a, b)) };
         if faces.len() == 2 {
             if crease {

@@ -76,6 +76,7 @@ const G1_SIGMAS: [f64; 2] = [0.004, 0.04];
 /// Parameters at which a patch is checked against the coarse face, and the least cosine with its normal.
 const CHECK_GRID: [f64; 5] = [0.05, 0.25, 0.5, 0.75, 0.95];
 const MIN_FACING: f64 = 0.3;
+const EDGE_CHECK: [f64; 7] = [0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875];
 /// A tangent patch is kept when its rms distance from the scan is at most this multiple of that of the
 /// unconstrained patch plus this floor (mm): the tangent condition may not cost accuracy.
 const ACCURACY_SLACK: f64 = 1.25;
@@ -488,9 +489,13 @@ fn add_spokes(l: &Layer, tri: &Triangle, nf: Vec3, build: &mut Build) -> u32 {
     g
 }
 
-/// Does the patch face the way the coarse face does everywhere (no fold, no inverted corner)?
+/// Does the patch face the way the coarse face does, inside and along its boundary (no fold, no inverted
+/// corner)? The boundary is checked at the points the jumps across it are measured at.
 fn follows(net: &crate::patch::Net, nf: &Vec3) -> bool {
-    CHECK_GRID.iter().all(|&u| CHECK_GRID.iter().all(|&v| normal(net, u, v).is_none_or(|n| n.dot(nf) > MIN_FACING)))
+    let faces = |u: f64, v: f64| normal(net, u, v).is_none_or(|n| n.dot(nf) > MIN_FACING);
+    let inside = CHECK_GRID.iter().all(|&u| CHECK_GRID.iter().all(|&v| faces(u, v)));
+    let along = EDGE_CHECK.iter().all(|&t| faces(t, 0.0) && faces(t, 1.0) && faces(0.0, t) && faces(1.0, t));
+    inside && along
 }
 
 /// Root mean square distance of the patch from the scan over a grid of points on it.
