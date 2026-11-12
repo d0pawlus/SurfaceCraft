@@ -17,6 +17,7 @@
 
 pub mod chains;
 pub mod constraint;
+pub mod expr;
 pub mod fit2d;
 pub mod moving;
 pub mod profile;
@@ -29,6 +30,7 @@ pub use solve::{SATISFIED_TOL, SolveReport, SolveStatus, polish, solve};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use surfacecraft_geom::{Point3, Vec3};
 
 /// The plane a sketch lies on: `origin + x·u + y·v`.
@@ -128,6 +130,10 @@ pub struct Sketch {
     pub entities: Vec<Entity>,
     /// Constraints.
     pub constraints: Vec<Constraint>,
+    /// Dimensions given as an expression over named parameters, by constraint index: the text
+    /// (the constraint keeps the value it had when the expression was last evaluated).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dim_exprs: BTreeMap<usize, String>,
 }
 
 /// Why a sketch is malformed.
@@ -202,7 +208,31 @@ impl Sketch {
         for (k, c) in self.constraints.iter().enumerate() {
             c.validate(self).map_err(|m| SketchError::Index(format!("constraint {k}: {m}")))?;
         }
+        self.validate_dim_exprs()
+    }
+
+    /// Checks that every dimension expression belongs to a dimension and is not absurdly long.
+    pub fn validate_dim_exprs(&self) -> Result<(), SketchError> {
+        for (k, text) in &self.dim_exprs {
+            if !self.constraints.get(*k).is_some_and(|c| c.dimension().is_some()) {
+                return Err(SketchError::Index(format!("expression for constraint {k}, which is not a dimension")));
+            }
+            if text.len() > expr::MAX_LEN {
+                return Err(SketchError::Value(format!("the expression of constraint {k} is too long")));
+            }
+        }
         Ok(())
+    }
+
+    /// The expressions after constraint `index` was removed: its own is dropped and the later
+    /// ones move down with their constraints.
+    #[must_use]
+    pub fn dim_exprs_without(&self, index: usize) -> BTreeMap<usize, String> {
+        self.dim_exprs
+            .iter()
+            .filter(|(k, _)| **k != index)
+            .map(|(k, v)| (if *k > index { k - 1 } else { *k }, v.clone()))
+            .collect()
     }
 
     /// Endpoints of an entity (`None` for a circle).

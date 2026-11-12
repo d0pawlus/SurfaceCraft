@@ -392,13 +392,14 @@ fn write_values(
     for (p, v) in params.iter().zip(values) {
         match &p.owner {
             Owner::Constraint { sketch, index } => {
-                let c = doc
-                    .sketch_mut(*sketch)
-                    .and_then(|o| o.sketch.constraints.get_mut(*index))
-                    .ok_or_else(|| format!("{}: the constraint is gone", p.id))?;
+                let o = doc.sketch_mut(*sketch).ok_or_else(|| format!("{}: the constraint is gone", p.id))?;
+                let c =
+                    o.sketch.constraints.get_mut(*index).ok_or_else(|| format!("{}: the constraint is gone", p.id))?;
                 if !set_constraint(c, *v) {
                     return Err(format!("{}: not a dimension", p.id));
                 }
+                // the fitted value is a plain number: it no longer follows an expression
+                o.sketch.dim_exprs.remove(index);
                 if !touched.contains(sketch) {
                     touched.push(*sketch);
                 }
@@ -408,6 +409,7 @@ fn write_values(
                 if !set_field(&mut f.op, name, *v) {
                     return Err(format!("{}: not a parameter", p.id));
                 }
+                f.exprs.remove(*name);
             }
         }
     }

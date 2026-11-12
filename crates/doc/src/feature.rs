@@ -5,6 +5,7 @@
 use crate::ObjectId;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use surfacecraft_kernel::naming::{EdgeSig, FaceSig};
 use surfacecraft_kernel::record::brep::Brep;
@@ -301,6 +302,10 @@ pub struct SketchObject {
     /// Result of the last solve.
     #[serde(default)]
     pub report: Option<SolveReport>,
+    /// Why the sketch is unusable after a parameter change: a dimension expression that does not
+    /// evaluate, or constraints that cannot be satisfied. Features reading it fail while it is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     /// Shown?
     #[serde(default = "crate::object::yes_fn")]
     pub visible: bool,
@@ -326,4 +331,9 @@ pub struct FeatureObject {
     /// Shown in lists.
     #[serde(default = "crate::object::yes_fn")]
     pub visible: bool,
+    /// Numeric fields of `op` that are given as an expression over parameters, by field name
+    /// (`distance`, `translate.1` for a component of a vector): the text. The fields of `op`
+    /// hold the values of the last evaluation.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub exprs: BTreeMap<String, String>,
 }

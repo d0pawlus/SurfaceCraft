@@ -6,7 +6,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use surfacecraft_doc::{BoolOp, FeatureObject, FeatureOp, Mode, ObjectId, ObjectKind, Side};
 
+mod exprs;
+use exprs::ClearedExpr;
 mod rollback;
+use super::param::num::{Count, ExprSet, Num, zero3};
+use std::collections::BTreeMap;
 use surfacecraft_geom::{Point3, Vec3};
 
 /// Result of a feature command.
@@ -27,6 +31,9 @@ pub struct FeatureOut {
     pub error: Option<String>,
     /// Features that failed in the replay.
     pub failed_features: usize,
+    /// For `feature.edit`: the expressions the edit replaced with plain numbers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expressions_cleared: Vec<ClearedExpr>,
 }
 
 fn report(s: &Session, id: ObjectId, failed: usize) -> CmdResult<FeatureOut> {
@@ -35,7 +42,16 @@ fn report(s: &Session, id: ObjectId, failed: usize) -> CmdResult<FeatureOut> {
     let (volume, faces, edges) = s.doc.body(body).map_or((None, 0, 0), |b| {
         (surfacecraft_kernel::solid::volume(&b.brep).ok(), b.brep.faces.len(), b.brep.edges.len())
     });
-    Ok(FeatureOut { id, body, volume, faces, edges, error: f.error.clone(), failed_features: failed })
+    Ok(FeatureOut {
+        id,
+        body,
+        volume,
+        faces,
+        edges,
+        error: f.error.clone(),
+        failed_features: failed,
+        expressions_cleared: Vec::new(),
+    })
 }
 
 /// Makes sure a body that did not come from a feature enters the history as a base feature.
@@ -53,7 +69,7 @@ fn ensure_history(s: &mut Session, body: ObjectId) -> CmdResult<()> {
 fn push(
     s: &mut Session,
     name: &str,
-    op: FeatureOp,
+    (op, exprs): (FeatureOp, BTreeMap<String, String>),
     body: Option<ObjectId>,
     body_name: Option<&str>,
 ) -> CmdResult<FeatureOut> {
@@ -67,6 +83,9 @@ fn push(
         None => s.doc.fresh_id(),
     };
     let fid = s.doc.add_feature(name, op, body);
+    if let Some(f) = s.doc.feature_mut(fid) {
+        f.exprs = exprs;
+    }
     let failed = crate::replay::replay(s);
     if let Some(e) = s.doc.feature(fid).and_then(|f| f.error.clone()) {
         return Err(CmdError::Failed(format!("{name} failed: {e}")));
@@ -90,10 +109,10 @@ pub struct ExtrudeIn {
     /// Sketch with closed profiles.
     pub sketch: ObjRef,
     /// Distance along the sketch normal (negative = other side).
-    pub distance: f64,
+    pub distance: Num,
     /// Draft angle, degrees.
     #[serde(default)]
-    pub draft_deg: f64,
+    pub draft_deg: Num,
     /// `new` body, `add` to or `cut` from `target`.
     #[serde(default)]
     pub mode: Mode,
@@ -111,8 +130,10 @@ fn extrude(s: &mut Session, i: ExtrudeIn) -> CmdResult<FeatureOut> {
     if i.mode != Mode::New && target.is_none() {
         return Err(CmdError::Params("add/cut needs `target`".into()));
     }
-    let op = FeatureOp::Extrude { sketch, distance: i.distance, draft_deg: i.draft_deg, mode: i.mode, target };
-    push(s, "extrude", op, target, i.name.as_deref().or(Some("part")).filter(|_| target.is_none()))
+    let mut x = ExprSet::new(&s.doc.params);
+    let (distance, draft_deg) = (x.num("distance", &i.distance)?, x.num("draft_deg", &i.draft_deg)?);
+    let op = FeatureOp::Extrude { sketch, distance, draft_deg, mode: i.mode, target };
+    push(s, "extrude", (op, x.finish()), target, i.name.as_deref().or(Some("part")).filter(|_| target.is_none()))
 }
 
 /// Revolve parameters.
@@ -122,12 +143,12 @@ pub struct RevolveIn {
     /// Sketch with a closed profile.
     pub sketch: ObjRef,
     /// A point of the axis (model space).
-    pub axis_origin: [f64; 3],
+    pub axis_origin: [Num; 3],
     /// Axis direction.
-    pub axis_direction: [f64; 3],
+    pub axis_direction: [Num; 3],
     /// Angle, degrees (default 360).
     #[serde(default)]
-    pub angle_deg: Option<f64>,
+    pub angle_deg: Option<Num>,
     /// `new`, `add` or `cut`.
     #[serde(default)]
     pub mode: Mode,
@@ -145,15 +166,16 @@ fn revolve(s: &mut Session, i: RevolveIn) -> CmdResult<FeatureOut> {
     if i.mode != Mode::New && target.is_none() {
         return Err(CmdError::Params("add/cut needs `target`".into()));
     }
+    let mut x = ExprSet::new(&s.doc.params);
     let op = FeatureOp::Revolve {
         sketch,
-        axis_origin: i.axis_origin,
-        axis_direction: i.axis_direction,
-        angle_deg: i.angle_deg.unwrap_or(360.0),
+        axis_origin: x.vec3("axis_origin", &i.axis_origin)?,
+        axis_direction: x.vec3("axis_direction", &i.axis_direction)?,
+        angle_deg: x.opt("angle_deg", &i.angle_deg)?.unwrap_or(360.0),
         mode: i.mode,
         target,
     };
-    push(s, "revolve", op, target, i.name.as_deref().or(Some("part")).filter(|_| target.is_none()))
+    push(s, "revolve", (op, x.finish()), target, i.name.as_deref().or(Some("part")).filter(|_| target.is_none()))
 }
 
 /// Edge-blend parameters.
@@ -167,29 +189,23 @@ pub struct BlendIn {
     #[schemars(extend("x-pick" = "edges"))]
     pub edges: Vec<usize>,
     /// Radius (fillet) or distance (chamfer).
-    pub size: f64,
+    pub size: Num,
 }
 
 fn fillet(s: &mut Session, i: BlendIn) -> CmdResult<FeatureOut> {
     let target = resolve_body(s, &i.body)?;
-    push(
-        s,
-        "fillet",
-        FeatureOp::Fillet { target, edges: i.edges, radius: i.size, edge_refs: Vec::new() },
-        Some(target),
-        None,
-    )
+    let mut x = ExprSet::new(&s.doc.params);
+    let radius = x.num("radius", &i.size)?;
+    let op = FeatureOp::Fillet { target, edges: i.edges, radius, edge_refs: Vec::new() };
+    push(s, "fillet", (op, x.finish()), Some(target), None)
 }
 
 fn chamfer(s: &mut Session, i: BlendIn) -> CmdResult<FeatureOut> {
     let target = resolve_body(s, &i.body)?;
-    push(
-        s,
-        "chamfer",
-        FeatureOp::Chamfer { target, edges: i.edges, distance: i.size, edge_refs: Vec::new() },
-        Some(target),
-        None,
-    )
+    let mut x = ExprSet::new(&s.doc.params);
+    let distance = x.num("distance", &i.size)?;
+    let op = FeatureOp::Chamfer { target, edges: i.edges, distance, edge_refs: Vec::new() };
+    push(s, "chamfer", (op, x.finish()), Some(target), None)
 }
 
 /// Shell parameters.
@@ -201,18 +217,15 @@ pub struct ShellIn {
     /// Faces removed.
     pub faces: Vec<usize>,
     /// Wall thickness (positive outward, negative inward).
-    pub thickness: f64,
+    pub thickness: Num,
 }
 
 fn shell(s: &mut Session, i: ShellIn) -> CmdResult<FeatureOut> {
     let target = resolve_body(s, &i.body)?;
-    push(
-        s,
-        "shell",
-        FeatureOp::Shell { target, faces: i.faces, thickness: i.thickness, face_refs: Vec::new() },
-        Some(target),
-        None,
-    )
+    let mut x = ExprSet::new(&s.doc.params);
+    let thickness = x.num("thickness", &i.thickness)?;
+    let op = FeatureOp::Shell { target, faces: i.faces, thickness, face_refs: Vec::new() };
+    push(s, "shell", (op, x.finish()), Some(target), None)
 }
 
 /// Pattern parameters.
@@ -222,32 +235,33 @@ pub struct PatternIn {
     /// Body.
     pub body: ObjRef,
     /// Instances including the original.
-    pub count: usize,
+    pub count: Count,
     /// Translation between instances.
-    #[serde(default)]
-    pub translate: [f64; 3],
+    #[serde(default = "zero3")]
+    pub translate: [Num; 3],
     /// Rotation axis between instances (circular pattern).
     #[serde(default)]
-    pub rotate_axis: Option<[f64; 3]>,
+    pub rotate_axis: Option<[Num; 3]>,
     /// Point of the rotation axis.
-    #[serde(default)]
-    pub rotate_origin: [f64; 3],
+    #[serde(default = "zero3")]
+    pub rotate_origin: [Num; 3],
     /// Rotation angle between instances, degrees.
     #[serde(default)]
-    pub rotate_deg: f64,
+    pub rotate_deg: Num,
 }
 
 fn pattern(s: &mut Session, i: PatternIn) -> CmdResult<FeatureOut> {
     let target = resolve_body(s, &i.body)?;
+    let mut x = ExprSet::new(&s.doc.params);
     let op = FeatureOp::Pattern {
         target,
-        count: i.count,
-        translate: i.translate,
-        rotate_axis: i.rotate_axis,
-        rotate_origin: i.rotate_origin,
-        rotate_deg: i.rotate_deg,
+        count: x.count("count", &i.count)?,
+        translate: x.vec3("translate", &i.translate)?,
+        rotate_axis: x.opt_vec3("rotate_axis", &i.rotate_axis)?,
+        rotate_origin: x.vec3("rotate_origin", &i.rotate_origin)?,
+        rotate_deg: x.num("rotate_deg", &i.rotate_deg)?,
     };
-    push(s, "pattern", op, Some(target), None)
+    push(s, "pattern", (op, x.finish()), Some(target), None)
 }
 
 /// Boolean parameters.
@@ -268,7 +282,7 @@ fn boolean(s: &mut Session, i: BooleanIn) -> CmdResult<FeatureOut> {
     if target == tool {
         return Err(CmdError::Params("a body cannot be combined with itself".into()));
     }
-    push(s, "boolean", FeatureOp::Boolean { target, tool, op: i.op }, Some(target), None)
+    push(s, "boolean", (FeatureOp::Boolean { target, tool, op: i.op }, BTreeMap::new()), Some(target), None)
 }
 
 /// Edit parameters.
@@ -287,36 +301,21 @@ fn edit(s: &mut Session, i: EditIn) -> CmdResult<FeatureOut> {
     if matches!(f.op, FeatureOp::Base { .. }) {
         return Err(CmdError::Params("a base feature has no parameters".into()));
     }
-    let mut v = serde_json::to_value(&f.op).map_err(|e| CmdError::Failed(e.to_string()))?;
     let Some(set) = i.set.as_object() else {
         return Err(CmdError::Params("`set` is an object of fields".into()));
     };
-    if let Some(obj) = v.as_object_mut() {
-        for (k, val) in set {
-            if k == "kind" || !obj.contains_key(k) {
-                return Err(CmdError::Params(format!("`{k}` is not a parameter of this feature")));
-            }
-            obj.insert(k.clone(), val.clone());
-        }
-    }
-    // new indices name new references: the stored signatures are recaptured from them
-    if let Some(obj) = v.as_object_mut() {
-        if set.contains_key("edges") {
-            obj.remove("edge_refs");
-        }
-        if set.contains_key("faces") {
-            obj.remove("face_refs");
-        }
-    }
-    let op: FeatureOp = serde_json::from_value(v).map_err(|e| CmdError::Params(e.to_string()))?;
+    let (op, exprs, cleared) = exprs::edited(f, set, &s.doc.params)?;
     if let Some(f) = s.doc.feature_mut(id) {
         f.op = op;
+        f.exprs = exprs;
     }
     let failed = crate::replay::replay(s);
     if let Some(e) = s.doc.feature(id).and_then(|f| f.error.clone()) {
         return Err(CmdError::Failed(format!("the edited feature fails: {e}")));
     }
-    report(s, id, failed)
+    let expressions_cleared =
+        cleared.into_iter().map(|(field, expression)| ClearedExpr { field, expression }).collect();
+    Ok(FeatureOut { expressions_cleared, ..report(s, id, failed)? })
 }
 
 /// Suppress parameters.
@@ -360,6 +359,9 @@ pub struct TreeNode {
     /// Behind the roll-back marker: not replayed.
     #[serde(default)]
     pub rolled_back: bool,
+    /// Fields given as an expression over parameters (their values are in the operation).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub expressions: BTreeMap<String, String>,
 }
 
 /// A feature whose last replay failed.
@@ -429,6 +431,7 @@ fn tree_of(s: &Session, failed: usize) -> TreeOut {
                 suppressed: f.suppressed,
                 error: f.error.clone(),
                 rolled_back: k >= marker,
+                expressions: f.exprs.clone(),
             }
         })
         .collect();
@@ -528,7 +531,7 @@ pub struct LoftIn {
     pub sketches: Vec<ObjRef>,
     /// Degree across the sections (1 = ruled, up to 3; default: the highest the count allows).
     #[serde(default)]
-    pub degree: Option<u32>,
+    pub degree: Option<Count>,
     /// `new`, `add` or `cut`.
     #[serde(default)]
     pub mode: Mode,
@@ -549,8 +552,9 @@ fn loft(s: &mut Session, i: LoftIn) -> CmdResult<FeatureOut> {
     if i.mode != Mode::New && target.is_none() {
         return Err(CmdError::Params("add/cut needs `target`".into()));
     }
-    let op = FeatureOp::Loft { sketches, degree: i.degree, mode: i.mode, target };
-    push(s, "loft", op, target, new_body_name(&i.name, target).as_deref())
+    let mut x = ExprSet::new(&s.doc.params);
+    let op = FeatureOp::Loft { sketches, degree: x.opt_count("degree", &i.degree)?, mode: i.mode, target };
+    push(s, "loft", (op, x.finish()), target, new_body_name(&i.name, target).as_deref())
 }
 
 /// Sweep parameters.
@@ -583,7 +587,7 @@ fn sweep(s: &mut Session, i: SweepIn) -> CmdResult<FeatureOut> {
         return Err(CmdError::Params("add/cut needs `target`".into()));
     }
     let op = FeatureOp::Sweep { profile, path, follow: i.follow.unwrap_or(true), mode: i.mode, target };
-    push(s, "sweep", op, target, new_body_name(&i.name, target).as_deref())
+    push(s, "sweep", (op, BTreeMap::new()), target, new_body_name(&i.name, target).as_deref())
 }
 
 /// Draft parameters.
@@ -595,28 +599,29 @@ pub struct DraftIn {
     /// Faces drafted (record indices).
     pub faces: Vec<usize>,
     /// Angle, degrees (positive leans the faces in going along `pull`).
-    pub angle_deg: f64,
+    pub angle_deg: Num,
     /// A point of the neutral plane (it does not move).
-    pub neutral_origin: [f64; 3],
+    pub neutral_origin: [Num; 3],
     /// Normal of the neutral plane.
-    pub neutral_normal: [f64; 3],
+    pub neutral_normal: [Num; 3],
     /// Pull direction (default: `neutral_normal`).
     #[serde(default)]
-    pub pull: Option<[f64; 3]>,
+    pub pull: Option<[Num; 3]>,
 }
 
 fn draft(s: &mut Session, i: DraftIn) -> CmdResult<FeatureOut> {
     let target = resolve_body(s, &i.body)?;
+    let mut x = ExprSet::new(&s.doc.params);
     let op = FeatureOp::Draft {
         target,
         faces: i.faces,
-        angle_deg: i.angle_deg,
-        neutral_origin: i.neutral_origin,
-        neutral_normal: i.neutral_normal,
-        pull: i.pull,
+        angle_deg: x.num("angle_deg", &i.angle_deg)?,
+        neutral_origin: x.vec3("neutral_origin", &i.neutral_origin)?,
+        neutral_normal: x.vec3("neutral_normal", &i.neutral_normal)?,
+        pull: x.opt_vec3("pull", &i.pull)?,
         face_refs: Vec::new(),
     };
-    push(s, "draft", op, Some(target), None)
+    push(s, "draft", (op, x.finish()), Some(target), None)
 }
 
 /// Mirror parameters.
@@ -626,9 +631,9 @@ pub struct MirrorIn {
     /// Body.
     pub body: ObjRef,
     /// A point of the mirror plane.
-    pub plane_origin: [f64; 3],
+    pub plane_origin: [Num; 3],
     /// Normal of the mirror plane.
-    pub plane_normal: [f64; 3],
+    pub plane_normal: [Num; 3],
     /// Unite the reflection with the original (default true) or keep only the reflection.
     #[serde(default)]
     pub merge: Option<bool>,
@@ -636,13 +641,14 @@ pub struct MirrorIn {
 
 fn mirror(s: &mut Session, i: MirrorIn) -> CmdResult<FeatureOut> {
     let target = resolve_body(s, &i.body)?;
+    let mut x = ExprSet::new(&s.doc.params);
     let op = FeatureOp::Mirror {
         target,
-        plane_origin: i.plane_origin,
-        plane_normal: i.plane_normal,
+        plane_origin: x.vec3("plane_origin", &i.plane_origin)?,
+        plane_normal: x.vec3("plane_normal", &i.plane_normal)?,
         merge: i.merge.unwrap_or(true),
     };
-    push(s, "mirror", op, Some(target), None)
+    push(s, "mirror", (op, x.finish()), Some(target), None)
 }
 
 /// Split parameters.
@@ -652,9 +658,9 @@ pub struct SplitIn {
     /// Body.
     pub body: ObjRef,
     /// A point of the cutting plane.
-    pub plane_origin: [f64; 3],
+    pub plane_origin: [Num; 3],
     /// Normal of the cutting plane.
-    pub plane_normal: [f64; 3],
+    pub plane_normal: [Num; 3],
     /// The side kept: `front` (the normal side, default) or `back`.
     #[serde(default)]
     pub keep: Side,
@@ -662,8 +668,14 @@ pub struct SplitIn {
 
 fn split(s: &mut Session, i: SplitIn) -> CmdResult<FeatureOut> {
     let target = resolve_body(s, &i.body)?;
-    let op = FeatureOp::Split { target, plane_origin: i.plane_origin, plane_normal: i.plane_normal, keep: i.keep };
-    push(s, "split", op, Some(target), None)
+    let mut x = ExprSet::new(&s.doc.params);
+    let op = FeatureOp::Split {
+        target,
+        plane_origin: x.vec3("plane_origin", &i.plane_origin)?,
+        plane_normal: x.vec3("plane_normal", &i.plane_normal)?,
+        keep: i.keep,
+    };
+    push(s, "split", (op, x.finish()), Some(target), None)
 }
 
 /// Pattern-along-a-path parameters.
@@ -675,7 +687,7 @@ pub struct PathPatternIn {
     /// Sketch with the open path (a chain of lines and arcs).
     pub path: ObjRef,
     /// Instances including the original (at the start of the path), evenly spaced by arc length.
-    pub count: usize,
+    pub count: Count,
     /// Each copy turns with the path tangent (default false: translated only).
     #[serde(default)]
     pub follow: bool,
@@ -684,13 +696,9 @@ pub struct PathPatternIn {
 fn path_pattern(s: &mut Session, i: PathPatternIn) -> CmdResult<FeatureOut> {
     let target = resolve_body(s, &i.body)?;
     let path = i.path.resolve(s, ObjectKind::Sketch)?;
-    push(
-        s,
-        "path_pattern",
-        FeatureOp::PathPattern { target, path, count: i.count, follow: i.follow },
-        Some(target),
-        None,
-    )
+    let mut x = ExprSet::new(&s.doc.params);
+    let op = FeatureOp::PathPattern { target, path, count: x.count("count", &i.count)?, follow: i.follow };
+    push(s, "path_pattern", (op, x.finish()), Some(target), None)
 }
 
 /// The scan points (and normals) a suggestion measures on: a region, or a mesh and triangles.
