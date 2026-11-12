@@ -8,7 +8,11 @@
 //! the outline deviation (region boundary vertices to the trim edges) and the delivered
 //! deviation (region points to the tessellated sheets). `within_tolerance` needs all that apply.
 use super::surface_check::{delivered_deviation, outline_deviation};
+use super::surface_mask::{BoxIn, ExclusionOut, Mask, SphereIn};
 use super::surface_pieces::{Ctx, MIN_POINTS, Outcome, Piece, Settings, fit_chart, piece_gaps};
+use super::surface_report::{
+    CoverageOut, CoverageShares, PieceCoverage, SampleCounts, piece_coverage, sample_counts, summarise_coverage,
+};
 use super::{CmdError, CmdResult, ObjRef};
 use crate::Session;
 use schemars::JsonSchema;
@@ -16,8 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use surfacecraft_doc::{ObjectId, ObjectKind, SurfaceObject};
 use surfacecraft_fit::outline::region_outline;
-use surfacecraft_fit::segment::region_points;
-use surfacecraft_geom::{Mesh, Point3, Vec3};
+use surfacecraft_geom::{Mesh, Point3};
 use surfacecraft_kernel::nurbs::{MAX_OUTLINE_CORNERS, SurfaceProbe, sheet_from_spline, trimmed_sheet};
 use surfacecraft_kernel::record::brep::Brep;
 use surfacecraft_kernel::tess::tessellate_all;
@@ -82,6 +85,15 @@ pub struct FitIn {
     #[serde(default)]
     #[schemars(range(min = 1, max = 64))]
     pub max_pieces: Option<usize>,
+    /// Triangles (mesh indices) to leave out of the fit and its deviation numbers; the region and mesh stay unchanged, indices outside the region are ignored and counted.
+    #[serde(default)]
+    pub exclude_triangles: Option<Vec<u32>>,
+    /// Spheres to leave out: a triangle whose centroid is inside one is excluded like one in `exclude_triangles`.
+    #[serde(default)]
+    pub exclude_spheres: Option<Vec<SphereIn>>,
+    /// Boxes to leave out: a triangle whose centroid is inside one is excluded like one in `exclude_triangles`.
+    #[serde(default)]
+    pub exclude_boxes: Option<Vec<BoxIn>>,
     /// Name.
     #[serde(default)]
     pub name: Option<String>,
@@ -132,6 +144,9 @@ pub struct PieceOut {
     pub delivered_deviation: Option<f64>,
     /// Points measured.
     pub measured: usize,
+    /// Shares of the sheet's parameter domain with data under them, bridged holes and extrapolation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<CoverageShares>,
     /// Surface deviation within the tolerance, and, when trimming was asked for, the sheet is
     /// trimmed, its outline deviation within `outline_tolerance`, its delivered deviation within
     /// the tolerance and no part of the region left out.
@@ -184,8 +199,19 @@ pub struct FitOut {
     /// Delivered deviation: the worst piece's (mm), when any sheet is trimmed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivered_deviation: Option<f64>,
-    /// Points measured.
+    /// Points measured (distinct points over all pieces); same as `samples.measured`.
     pub measured: usize,
+    /// What became of the points of the region: eligible, measured, excluded, failed.
+    #[serde(default)]
+    pub samples: SampleCounts,
+    /// The exclusion masks applied and what they took out; absent when none was given. Excluded
+    /// points are in none of the deviation numbers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclusion: Option<ExclusionOut>,
+    /// Which parts of the patch's parameter domain have scan data under them, which bridge a hole
+    /// of the data and which extrapolate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<CoverageOut>,
     /// True only when every piece is within tolerance (see `PieceOut::within_tolerance`) and no
     /// part of the region was left out.
     pub within_tolerance: bool,
@@ -371,8 +397,7 @@ fn refusal(skipped: &[String], split: bool) -> CmdError {
 /// The tessellations of the sheets and the deviation of the points of each piece from all of
 /// them together; `None` when no sheet is trimmed (the sheets are then the splines themselves).
 fn delivered(
-    mesh: &Mesh,
-    normals: &[Vec3],
+    cx: &Ctx,
     pieces: &[Piece],
     sheets: &[Sheet],
     tol: f64,
@@ -394,7 +419,7 @@ fn delivered(
     }
     let dev = pieces
         .iter()
-        .map(|p| Some(delivered_deviation(&region_points(mesh, normals, &p.triangles).0, &union)))
+        .map(|p| Some(delivered_deviation(&cx.mask.points(cx.mesh, cx.normals, &p.triangles).0, &union)))
         .collect();
     Ok((dev, Some(tess)))
 }
@@ -424,7 +449,14 @@ fn add_piece(
 }
 
 /// One piece's result: what is known, and whether it is within tolerance.
-fn piece_out(id: ObjectId, p: &Piece, sheet: Sheet, delivered: Option<f64>, trim: bool, st: &Settings) -> PieceOut {
+fn piece_out(
+    id: ObjectId,
+    p: &Piece,
+    sheet: Sheet,
+    delivered: Option<f64>,
+    cov: Option<&PieceCoverage>,
+    (trim, st): (bool, &Settings),
+) -> PieceOut {
     let outline_dev = sheet.outline.as_ref().map(|o| o.deviation);
     let islands = sheet.outline.as_ref().map_or(0, |o| o.islands_ignored);
     let trim_ok = !trim
@@ -434,6 +466,8 @@ fn piece_out(id: ObjectId, p: &Piece, sheet: Sheet, delivered: Option<f64>, trim
             && delivered.is_some_and(|d| d <= st.tol));
     let notes = [
         p.warning.clone(),
+        (p.failed > 0)
+            .then(|| format!("{} point(s) could not be projected onto the spline and are not measured", p.failed)),
         sheet
             .trim_error
             .as_ref()
@@ -457,6 +491,7 @@ fn piece_out(id: ObjectId, p: &Piece, sheet: Sheet, delivered: Option<f64>, trim
         outline_deviation: outline_dev,
         delivered_deviation: delivered,
         measured: p.measured,
+        coverage: cov.map(|c| CoverageShares::from(&c.coverage)),
         within_tolerance: p.max <= st.tol && trim_ok,
         trimmed: sheet.trimmed,
         trim_error: sheet.trim_error,
@@ -469,11 +504,20 @@ pub(super) fn fit_cmd(s: &mut Session, i: FitIn) -> CmdResult<FitOut> {
     let st = settings(&i)?;
     let input = resolve_input(s, &i)?;
     let normals = input.mesh.vertex_normals();
-    if region_points(&input.mesh, &normals, &input.tris).0.len() < MIN_POINTS {
-        return Err(CmdError::Params(format!("too few points for a surface (need {MIN_POINTS})")));
+    let (mask, exclusion) = Mask::build(
+        &input.mesh,
+        &input.tris,
+        i.exclude_triangles.as_deref(),
+        i.exclude_spheres.as_deref(),
+        i.exclude_boxes.as_deref(),
+    )?;
+    let cx = Ctx { mesh: &input.mesh, normals: &normals, st: &st, mask: &mask };
+    if mask.points(&input.mesh, &normals, &input.tris).0.len() < MIN_POINTS {
+        return Err(CmdError::Params(format!(
+            "too few points for a surface (need {MIN_POINTS}), after the exclusions"
+        )));
     }
     let mut out = Outcome::default();
-    let cx = Ctx { mesh: &input.mesh, normals: &normals, st: &st };
     fit_chart(&cx, &input.tris, st.angle, 0, st.max_pieces, &mut out)?;
     if out.pieces.is_empty() {
         return Err(refusal(&out.skipped, st.split));
@@ -482,20 +526,30 @@ pub(super) fn fit_cmd(s: &mut Session, i: FitIn) -> CmdResult<FitOut> {
     // the pieces of a split tile the region only when each is cut to its outline
     let trim = i.trim.unwrap_or(many);
     let sheets = out.pieces.iter().map(|p| make_sheet(&input.mesh, p, trim, &st)).collect::<CmdResult<Vec<_>>>()?;
-    let (dev, tess) = delivered(&input.mesh, &normals, &out.pieces, &sheets, st.tol)?;
+    let (dev, tess) = delivered(&cx, &out.pieces, &sheets, st.tol)?;
     let gaps = if many { piece_gaps(&input.mesh, &out.pieces, tess.as_deref())? } else { Vec::new() };
+    let covers: Vec<Option<PieceCoverage>> = out.pieces.iter().map(|p| piece_coverage(&input.mesh, &mask, p)).collect();
     let base = i.name.clone().unwrap_or_else(|| "surface".into());
+    let samples = sample_counts(&input.mesh, &mask, &input.tris, &out.pieces);
     let mut results = Vec::with_capacity(out.pieces.len());
-    for (k, ((p, sheet), d)) in out.pieces.iter().zip(sheets).zip(dev).enumerate() {
+    for (k, (((p, sheet), d), cov)) in out.pieces.iter().zip(sheets).zip(dev).zip(&covers).enumerate() {
         let name = if many { format!("{base} {}", k + 1) } else { base.clone() };
         let id = add_piece(s, p, &sheet, name, input.region, st.degree)?;
-        results.push(piece_out(id, p, sheet, d, trim, &st));
+        results.push(piece_out(id, p, sheet, d, cov.as_ref(), (trim, &st)));
     }
-    Ok(summarise(&st, out.skipped, results, gaps))
+    let report = Report { samples, exclusion, coverage: summarise_coverage(&covers) };
+    Ok(summarise(&st, out.skipped, results, gaps, report))
+}
+
+/// What the fit says about its own measurement.
+struct Report {
+    samples: SampleCounts,
+    exclusion: Option<ExclusionOut>,
+    coverage: Option<CoverageOut>,
 }
 
 /// The result of the whole fit from its pieces.
-fn summarise(st: &Settings, skipped: Vec<String>, pieces: Vec<PieceOut>, gaps: Vec<GapOut>) -> FitOut {
+fn summarise(st: &Settings, skipped: Vec<String>, pieces: Vec<PieceOut>, gaps: Vec<GapOut>, report: Report) -> FitOut {
     let total: usize = pieces.iter().map(|p| p.measured).sum();
     let sq: f64 = pieces.iter().map(|p| p.rms * p.rms * p.measured as f64).sum();
     let max = pieces.iter().map(|p| p.max).fold(0.0, f64::max);
@@ -509,6 +563,12 @@ fn summarise(st: &Settings, skipped: Vec<String>, pieces: Vec<PieceOut>, gaps: V
     if !skipped.is_empty() {
         warning.push("part of the region was left out (see `skipped`)".into());
     }
+    let mask_note = report.exclusion.as_ref().map(|e| {
+        format!(
+            "{} point(s) of {} were excluded by mask and are in none of the deviation numbers",
+            e.points, report.samples.eligible
+        )
+    });
     let gap_max = gaps.iter().map(|g| g.max_gap).reduce(f64::max);
     FitOut {
         id,
@@ -519,7 +579,10 @@ fn summarise(st: &Settings, skipped: Vec<String>, pieces: Vec<PieceOut>, gaps: V
         surface_deviation: max,
         outline_deviation: worst(|p| p.outline_deviation),
         delivered_deviation: worst(|p| p.delivered_deviation),
-        measured: total,
+        measured: report.samples.measured,
+        samples: report.samples,
+        exclusion: report.exclusion,
+        coverage: report.coverage,
         within_tolerance: pieces.iter().all(|p| p.within_tolerance) && skipped.is_empty(),
         warning: (!warning.is_empty()).then(|| warning.join("; ")),
         trimmed,
@@ -530,6 +593,9 @@ fn summarise(st: &Settings, skipped: Vec<String>, pieces: Vec<PieceOut>, gaps: V
         gaps,
         gap_max,
         skipped,
-        note: many.then(|| SPLIT_NOTE.to_string()),
+        note: [many.then(|| SPLIT_NOTE.to_string()), mask_note]
+            .into_iter()
+            .flatten()
+            .reduce(|a, b| format!("{a}; {b}")),
     }
 }

@@ -5,10 +5,10 @@
 //! net is offered finer charts. `max_pieces` is a hard bound: every call is given the number of
 //! pieces it may add and hands its charts shares that sum to at most that.
 use super::surface_fit::GapOut;
+use super::surface_mask::Mask;
 use super::{CmdError, CmdResult};
 use surfacecraft_fit::charts::{SplitParams, shared_vertices, split_charts};
 use surfacecraft_fit::resample::{HeightGrid, height_grid};
-use surfacecraft_fit::segment::region_points;
 use surfacecraft_geom::{Bvh, Mesh, Point3, Vec3};
 use surfacecraft_kernel::nurbs::{SurfaceProbe, fit_grid};
 use surfacecraft_kernel::record::brep::Surface;
@@ -58,6 +58,8 @@ pub(super) struct Piece {
     pub rms: f64,
     pub max: f64,
     pub measured: usize,
+    /// Points whose projection onto the spline failed (not in `measured`).
+    pub failed: usize,
     pub warning: Option<String>,
 }
 
@@ -80,17 +82,28 @@ pub(super) struct Ctx<'a> {
     pub mesh: &'a Mesh,
     pub normals: &'a [Vec3],
     pub st: &'a Settings,
+    pub mask: &'a Mask,
 }
 
+/// `(rms, max, count)` of the distances of `pts` to the spline. A point whose projection fails is
+/// not counted (the caller reports the difference); when none can be projected that is an error.
 fn measure(probe: &SurfaceProbe, pts: &[Point3]) -> CmdResult<(f64, f64, usize)> {
     let mut sq = 0.0;
     let mut max: f64 = 0.0;
     let mut n = 0;
+    let mut first_error = None;
     for p in pts {
-        let (d, _) = probe.closest([p.x, p.y, p.z])?;
-        sq += d * d;
-        max = max.max(d);
-        n += 1;
+        match probe.closest([p.x, p.y, p.z]) {
+            Ok((d, _)) => {
+                sq += d * d;
+                max = max.max(d);
+                n += 1;
+            }
+            Err(e) => first_error = first_error.or(Some(e)),
+        }
+    }
+    if let (0, Some(e)) = (n, first_error) {
+        return Err(e.into());
     }
     Ok(((sq / n.max(1) as f64).sqrt(), max, n))
 }
@@ -151,7 +164,7 @@ fn select_net(grid: &HeightGrid, pts: &[Point3], st: &Settings) -> CmdResult<Net
 /// Fits one chart. `Ok(NotHeightField)` / `Ok(TooFew)` are not errors: the caller may split.
 fn fit_piece(cx: &Ctx, tris: &[u32]) -> CmdResult<Fitted> {
     let st = cx.st;
-    let (pts, nrm) = region_points(cx.mesh, cx.normals, tris);
+    let (pts, nrm) = cx.mask.points(cx.mesh, cx.normals, tris);
     if pts.len() < MIN_POINTS {
         return Ok(Fitted::TooFew);
     }
@@ -174,6 +187,7 @@ fn fit_piece(cx: &Ctx, tris: &[u32]) -> CmdResult<Fitted> {
         rms,
         max,
         measured,
+        failed: pts.len().saturating_sub(measured),
         warning,
     })))
 }
