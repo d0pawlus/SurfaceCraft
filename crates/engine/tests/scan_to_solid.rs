@@ -89,8 +89,9 @@ fn a_scan_that_does_not_close_gets_a_verdict_and_next_steps_not_an_error() {
     let mut s = Session::new();
     s.execute("mesh.synth", json!({"shape": "bracket", "noise": 0.03, "name": "scan"})).unwrap();
 
-    // Act
-    let out = s.execute("scan.to_solid", json!({"scan": "scan"})).unwrap();
+    // Act: the primitives method, since `auto` now (P9-O7) takes the cleaned boss, whose filled
+    // holes the segmentation consolidates into a freeform area, for a freeform scan and wraps it
+    let out = s.execute("scan.to_solid", json!({"scan": "scan", "method": "primitives"})).unwrap();
 
     // Assert
     eprintln!("verdict {} issues {}", out["verdict"], out["issues"]);
@@ -102,7 +103,9 @@ fn a_scan_that_does_not_close_gets_a_verdict_and_next_steps_not_an_error() {
     assert!(!steps.is_empty(), "{out}");
     assert!(steps.iter().all(|st| st["command"].is_string() && st["why"].is_string()), "{out}");
     assert_eq!(out["verdict"], "fail", "{out}");
-    assert!(codes(&out["issues"]).contains(&"no_solid".to_string()), "{out}");
+    // no solid, or one that holds a part of the scan (the boss is left out as a freeform area)
+    let found = codes(&out["issues"]);
+    assert!(found.contains(&"no_solid".to_string()) || found.contains(&"low_coverage".to_string()), "{out}");
     // every suggested step has parameters its command accepts
     for st in steps {
         let command = st["command"].as_str().unwrap();

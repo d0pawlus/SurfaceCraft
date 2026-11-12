@@ -8,6 +8,16 @@ or torus) and fit a primitive to each region. A region is a set of triangles of 
 - `region.auto_segment` with `mesh`: splits the mesh into regions, one per primitive. `options`
   takes `tolerance` (mm, default 0.2), `max_angle_deg` (default 20) and `min_triangles`
   (default 30). `replace` (default true) deletes the mesh's existing regions first.
+- Organic surfaces: a bumpy surface is never one primitive for long, so fit-and-grow would end
+  in thousands of slivers. With `options.freeform` (default true) regions that hold less than
+  `freeform_min_share` of the scan's triangles (default 0.005, never fewer than 10 seed patches),
+  or that are a curved primitive spanning less than a radius, are merged, together with the
+  triangles between them, into one region per smooth area when at least five of them touch
+  without a crease. Areas are split at creases sharper than `freeform_crease_deg` (default 40,
+  between neighbouring face normals). Such a region has `freeform: true` and `kind: null`; fit
+  a surface to it with `surface.fit`. Primitives with more triangles than the share and the
+  ones that meet the area at creases (walls, fillets) stay as they were. `freeform: false`
+  gives every fragment as a primitive region, as before.
 - By hand: `region.grow` from seed `triangles` across edges sharper than `max_angle_deg`
   (default 15), or `region.create` from exact `triangles`.
 - Correct the result with `region.split` (triangles into a new region, or into connected

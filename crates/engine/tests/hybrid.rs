@@ -160,13 +160,18 @@ fn gate_p3_block_with_freeform_top() {
 
 /// Part A: a 40 × 30 block, vertical edges filleted r = 5, with a wavy freeform top
 /// (CAD = box + fillet + split by a spline), scanned with noise `seed`, segmented and rebuilt.
-fn part_a(seed: u64) {
-    let mut s = Session::new();
+/// Part A as a CAD body `block` in `s`: the filleted block cut by the wavy spline.
+fn part_a_cad(s: &mut Session) -> Brep {
     s.execute("body.box", json!({"size": [40.0, 30.0, 20.0], "name": "block"})).unwrap();
-    let edges = vertical_edges(&body_brep(&s, "block"));
+    let edges = vertical_edges(&body_brep(s, "block"));
     assert_eq!(edges.len(), 4);
     s.execute("body.fillet", json!({"object": "block", "edges": edges, "size": 5.0})).unwrap();
-    let cut = hybrid::cut_by_spline(&body_brep(&s, "block"), &wave_spline(), [0.0, 0.0, 1.0]).unwrap();
+    hybrid::cut_by_spline(&body_brep(s, "block"), &wave_spline(), [0.0, 0.0, 1.0]).unwrap()
+}
+
+fn part_a(seed: u64) {
+    let mut s = Session::new();
+    let cut = part_a_cad(&mut s);
     let v_cad = solid::volume(&cut).unwrap();
     let v_exact = analytic_volume_a();
     eprintln!("part A: CAD volume {v_cad:.3}, quadrature {v_exact:.3}, faces {}", cut.faces.len());
@@ -380,4 +385,95 @@ fn gate_p3b_replace_face_up_and_down() {
     let err = hybrid::replace_face(&tee, t_top[0], &patch).unwrap_err();
     eprintln!("collision refused: {err}");
     assert!(err.to_string().contains("cannot be raised"), "{err}");
+}
+
+/// The CAD primitives of part A among segmentation `regions`, chosen as the gate of part A does
+/// (the axis-aligned planes and the vertical r = 5 cylinders of at least 200 triangles): sorted
+/// `(kind, triangles)`.
+fn cad_primitives_of_part_a(s: &mut Session, regions: &[Value]) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    for r in regions.iter().filter(|r| r["triangles"].as_u64().unwrap() >= 200) {
+        let Some(kind) = r["kind"].as_str().filter(|k| *k == "plane" || *k == "cylinder") else { continue };
+        let f = s.execute("primitive.fit", json!({"region": r["id"], "kind": kind})).unwrap();
+        let p = &f["primitive"];
+        let keep = if kind == "plane" {
+            let n: Vec<f64> = p["normal"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
+            let z0 = p["point"][2].as_f64().unwrap();
+            n.iter().any(|c| c.abs() > 0.999) && (n[2].abs() < 0.5 || z0.abs() < 0.5)
+        } else {
+            p["axis"][2].as_f64().unwrap().abs() > 0.99 && (p["radius"].as_f64().unwrap() - 5.0).abs() < 0.3
+        };
+        if keep {
+            out.push((kind.to_string(), r["triangles"].as_u64().unwrap()));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// P9-O7, part A: the walls and the bottom come out as the same primitives as without the
+/// consolidation, and the wavy top (it fell into small unrelated pieces) is ONE freeform region
+/// that holds nearly all of it and nothing of the walls.
+#[test]
+fn p9_block_with_wavy_top_has_one_freeform_top() {
+    for seed in PART_A_SEEDS {
+        let mut s = Session::new();
+        let cut = part_a_cad(&mut s);
+        s.doc.add_body("part", cut);
+        scan_of(&mut s, "part", seed);
+        clean(&mut s);
+        let old = s.execute("region.auto_segment", json!({"mesh": "scan", "options": {"freeform": false}})).unwrap();
+        let old_regions = old["regions"].as_array().unwrap().clone();
+        let cad_old = cad_primitives_of_part_a(&mut s, &old_regions);
+        let new = s.execute("region.auto_segment", json!({"mesh": "scan"})).unwrap();
+        let regions = new["regions"].as_array().unwrap().clone();
+        let freeform: Vec<&Value> = regions.iter().filter(|r| r["freeform"] == true).collect();
+        eprintln!(
+            "seed {seed}: before {} regions (unassigned {}), after {} regions (unassigned {}), freeform {:?}",
+            old_regions.len(),
+            old["unassigned"],
+            regions.len(),
+            new["unassigned"],
+            freeform.iter().map(|r| r["triangles"].as_u64().unwrap()).collect::<Vec<_>>()
+        );
+        let cad_new = cad_primitives_of_part_a(&mut s, &regions);
+        eprintln!("seed {seed}: CAD primitives before {cad_old:?}, after {cad_new:?}");
+        assert_eq!(cad_new, cad_old, "seed {seed}");
+        assert_eq!(cad_new.iter().filter(|(k, _)| k == "plane").count(), 5, "bottom and four walls");
+        assert_eq!(cad_new.iter().filter(|(k, _)| k == "cylinder").count(), 4, "four fillets");
+        assert_eq!(freeform.len(), 1, "seed {seed}: {freeform:?}");
+        assert!(freeform[0]["kind"].is_null() && freeform[0]["rms"].is_null(), "{}", freeform[0]);
+        // the top: triangles facing up, in the upper half of the part
+        let scan_id = s.doc.find_by_name("scan").unwrap().0;
+        let scan = s.doc.mesh(scan_id).unwrap().mesh.clone();
+        let is_top = |t: usize| {
+            let (n, c) = (scan.face_normal(t), scan.face_centroid(t));
+            matches!((n, c), (Some(n), Some(c)) if n.z > 0.5 && c.z > 8.0)
+        };
+        let top: Vec<usize> = (0..scan.triangle_count()).filter(|&t| is_top(t)).collect();
+        let fid = surfacecraft_doc::ObjectId(freeform[0]["id"].as_u64().unwrap());
+        let tris = s.doc.region(fid).unwrap().triangles.clone();
+        let in_top = tris.iter().filter(|&&t| is_top(t as usize)).count();
+        let walls = tris.iter().filter(|&&t| scan.face_centroid(t as usize).is_some_and(|c| c.z < 6.0)).count();
+        eprintln!(
+            "seed {seed}: top {} triangles, freeform {} of them {in_top}, below z 6: {walls}",
+            top.len(),
+            tris.len()
+        );
+        assert!(in_top as f64 >= 0.85 * top.len() as f64, "seed {seed}: {in_top} of {} top triangles", top.len());
+        assert!(walls * 50 <= tris.len(), "seed {seed}: the freeform region runs down the walls ({walls})");
+    }
+}
+
+/// P9-O7: a prismatic bracket has no freeform region and the primitives of before.
+#[test]
+fn p9_bracket_has_no_freeform_region() {
+    let mut s = Session::new();
+    s.execute("mesh.synth", json!({"shape": "bracket", "noise": 0.05, "seed": 4, "name": "scan"})).unwrap();
+    let out = s.execute("region.auto_segment", json!({"mesh": "scan"})).unwrap();
+    let regions = out["regions"].as_array().unwrap();
+    assert!(regions.iter().all(|r| r["freeform"] == false), "{out}");
+    let mut kinds: Vec<&str> = regions.iter().map(|r| r["kind"].as_str().unwrap()).collect();
+    kinds.sort_unstable();
+    assert_eq!(kinds, ["cylinder", "plane", "plane", "plane", "plane", "plane", "plane", "sphere"]);
 }

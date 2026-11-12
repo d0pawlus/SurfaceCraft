@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use surfacecraft_doc::{ObjectId, ObjectKind};
-use surfacecraft_fit::segment::{SegmentOptions, grow_smooth, region_points, segment_cancellable};
+use surfacecraft_fit::segment::{Segment, SegmentOptions, grow_smooth, region_points, segment_cancellable};
 use surfacecraft_fit::{PrimitiveKind, fit_auto};
 use surfacecraft_geom::{Mesh, Point3};
 
@@ -25,11 +25,22 @@ pub struct RegionInfo {
     pub kind: Option<PrimitiveKind>,
     /// RMS of the classification (mm).
     pub rms: Option<f64>,
+    /// An organic area that no primitive describes (found by `region.auto_segment`; `kind` is
+    /// then null). Fit a freeform surface to it.
+    pub freeform: bool,
 }
 
 pub(crate) fn info(s: &Session, id: ObjectId) -> CmdResult<RegionInfo> {
     let r = s.doc.region(id).ok_or_else(|| CmdError::Params(format!("no region {id}")))?;
-    Ok(RegionInfo { id, name: r.name.clone(), mesh: r.mesh, triangles: r.triangles.len(), kind: r.kind, rms: r.rms })
+    Ok(RegionInfo {
+        id,
+        name: r.name.clone(),
+        mesh: r.mesh,
+        triangles: r.triangles.len(),
+        kind: r.kind,
+        rms: r.rms,
+        freeform: r.freeform,
+    })
 }
 
 fn check_tris(s: &Session, mesh: ObjectId, tris: &[u32]) -> CmdResult<()> {
@@ -53,6 +64,7 @@ pub(crate) fn classify(s: &mut Session, id: ObjectId) -> CmdResult<()> {
     if let Some(r) = s.doc.region_mut(id) {
         r.kind = fit.as_ref().map(|f| f.best.primitive.kind());
         r.rms = fit.as_ref().map(|f| f.best.rms);
+        r.freeform = false;
     }
     Ok(())
 }
@@ -114,7 +126,7 @@ fn grow(s: &mut Session, i: GrowIn) -> CmdResult<RegionInfo> {
 pub struct AutoIn {
     /// Mesh id or name.
     pub mesh: ObjRef,
-    /// Segmentation settings (tolerance 0.2 mm, 20°, ≥ 30 triangles by default).
+    /// Segmentation settings (tolerance 0.2 mm, 20°, ≥ 30 triangles by default; `freeform` true: the fragments of an organic surface become a few large regions flagged `freeform`).
     #[serde(default)]
     pub options: SegmentOptions,
     /// Delete the mesh's existing regions first (default true).
@@ -135,6 +147,20 @@ pub struct RegionsOut {
     pub unassigned: usize,
 }
 
+/// Adds the region of one segment found (`number` names it): a freeform area has no kind and no
+/// RMS, a primitive region has both.
+fn add_segment(s: &mut Session, mesh: ObjectId, seg: Segment, number: usize) -> ObjectId {
+    let label =
+        if seg.freeform { "freeform".to_string() } else { format!("{:?}", seg.primitive.kind()).to_lowercase() };
+    let id = s.doc.add_region(&format!("{label} {number}"), mesh, seg.triangles);
+    if let Some(r) = s.doc.region_mut(id) {
+        r.freeform = seg.freeform;
+        r.kind = (!seg.freeform).then(|| seg.primitive.kind());
+        r.rms = (!seg.freeform).then_some(seg.rms);
+    }
+    id
+}
+
 pub(crate) fn auto_segment(s: &mut Session, i: AutoIn) -> CmdResult<RegionsOut> {
     let mesh = i.mesh.resolve(s, ObjectKind::Mesh)?;
     let o = &i.options;
@@ -150,12 +176,7 @@ pub(crate) fn auto_segment(s: &mut Session, i: AutoIn) -> CmdResult<RegionsOut> 
     let mut assigned = 0;
     for (k, seg) in segs.into_iter().enumerate() {
         assigned += seg.triangles.len();
-        let name = format!("{} {}", format!("{:?}", seg.primitive.kind()).to_lowercase(), k + 1);
-        let id = s.doc.add_region(&name, mesh, seg.triangles);
-        if let Some(r) = s.doc.region_mut(id) {
-            r.kind = Some(seg.primitive.kind());
-            r.rms = Some(seg.rms);
-        }
+        let id = add_segment(s, mesh, seg, k + 1);
         out.push(info(s, id)?);
     }
     Ok(RegionsOut { regions: out, unassigned: m.triangle_count().saturating_sub(assigned) })
@@ -735,15 +756,9 @@ fn resegment(s: &mut Session, i: ResegmentIn) -> CmdResult<RegionChangeOut> {
     }
     let mut touched: Vec<(ObjectId, bool)> = Vec::new();
     for (k, seg) in segs.into_iter().enumerate() {
-        let kind = seg.primitive.kind();
         // a sub-mesh triangle is the original triangle at the same position in `all`
         let tris: Vec<u32> = seg.triangles.iter().filter_map(|&t| all.get(t as usize).copied()).collect();
-        let name = format!("{} {}", format!("{kind:?}").to_lowercase(), k + 1);
-        let rid = s.doc.add_region(&name, mesh, tris);
-        if let Some(r) = s.doc.region_mut(rid) {
-            r.kind = Some(kind);
-            r.rms = Some(seg.rms);
-        }
+        let rid = add_segment(s, mesh, Segment { triangles: tris, ..seg }, k + 1);
         touched.push((rid, true));
     }
     drop_regions(s, &ids);
