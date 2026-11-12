@@ -419,6 +419,7 @@
   "Share of the measured scan points that must lie within `tolerance` for a pass (0..1,\ndefault 0.99).": "Jaka część zmierzonych punktów skanu musi mieścić się w tolerancji, aby wynik był zaliczony (od 0 do 1, domyślnie 0.99).",
   "Share of the samples that must be within `tolerance`, (0, 1] (default 0.999).": "Jaka część próbek musi mieścić się w polu „Tolerancja”, w zakresie (0, 1] (domyślnie 0.999).",
   "Share of the scan points that must lie within `tolerance` (0..1, default 0.99).": "Udział punktów skanu, które muszą leżeć w tolerancji (0..1, domyślnie 0,99).",
+  "How the layout is refined where the tolerance is missed: `adaptive` (default, only around the missed scan points) or `uniform` (the whole scan).": "Jak zagęszcza się układ płatów tam, gdzie tolerancja jest przekroczona: „adaptive” (domyślnie, tylko wokół chybionych punktów skanu) albo „uniform” (cały skan).",
   "Shell parameters.": "Ustawienia skorupy.",
   "Show (true) or hide (false).": "Pokaż (włączone) lub ukryj (wyłączone).",
   "Show the colour map on the mesh (default true).": "Pokazuje mapę kolorów na skanie (domyślnie tak).",
