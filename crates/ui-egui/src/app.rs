@@ -67,6 +67,9 @@ pub struct SurfaceCraftApp {
     pub tokens: Tokens,
     /// Where the viewport was drawn last frame (screen points).
     pub viewport_rect: Option<egui::Rect>,
+    /// Where the Properties panel and its footer were drawn last frame (tests check the layout).
+    pub tool_panel_rect: Option<egui::Rect>,
+    pub tool_footer_rect: Option<egui::Rect>,
     /// Whether a wgpu render state exists (false in headless tests).
     gpu: bool,
     pub(crate) fit_pending: bool,
@@ -146,6 +149,8 @@ impl SurfaceCraftApp {
             workspace,
             settings,
             viewport_rect: None,
+            tool_panel_rect: None,
+            tool_footer_rect: None,
             gpu: false,
             fit_pending: false,
             bvh_cache: HashMap::new(),
@@ -352,15 +357,16 @@ impl SurfaceCraftApp {
     }
 
     /// A small icon toggle for lists: returns the click.
-    fn icon_toggle(&self, ui: &mut egui::Ui, label_key: &str, icon: &str, selected: bool) -> egui::Response {
+    /// An icon button named `label` (its accessible name and tooltip).
+    fn icon_toggle(&self, ui: &mut egui::Ui, label: &str, icon: &str, selected: bool) -> egui::Response {
         let m = self.settings.theme.density.metrics();
         let style = crate::theme::icon_button_style(&self.tokens);
         let size = egui::Vec2::splat(m.icon_button - 6.0);
         let inset = ((size.x - m.icon) / 2.0).max(0.0);
-        craft_ui::buttons::IconButton::new(t(label_key), size, &style)
+        craft_ui::buttons::IconButton::new(label, size, &style)
             .selected(selected)
             .show(ui, |ui, rect, tint| crate::icons::paint(ui, rect.shrink(inset), icon, tint))
-            .on_hover_text(t(label_key))
+            .on_hover_text(label)
     }
 
     /// The object tree: objects grouped by kind, with visibility and delete controls.
@@ -383,8 +389,10 @@ impl SurfaceCraftApp {
             egui::CollapsingHeader::new(title).id_salt(("objects", kind_key(kind))).default_open(true).show(ui, |ui| {
                 for s in of_kind {
                     ui.horizontal(|ui| {
+                        // the buttons name their object: a screen reader reads them out of context
+                        let show_hide = tf("objects.show_hide_named", &[("name", &s.name)]);
                         if self
-                            .icon_toggle(ui, "objects.show_hide", if s.visible { "eye" } else { "eye-off" }, !s.visible)
+                            .icon_toggle(ui, &show_hide, if s.visible { "eye" } else { "eye-off" }, !s.visible)
                             .clicked()
                         {
                             action = Some(("doc.show", json!({"object": s.id.0, "visible": !s.visible})));
@@ -400,7 +408,8 @@ impl SurfaceCraftApp {
                         {
                             self.selected_object = if sel { None } else { Some(s.id) };
                         }
-                        if self.icon_toggle(ui, "objects.delete", "trash", false).clicked() {
+                        let delete = tf("objects.delete_named", &[("name", &s.name)]);
+                        if self.icon_toggle(ui, &delete, "trash", false).clicked() {
                             action = Some(("doc.delete", json!({"object": s.id.0})));
                         }
                     });
@@ -509,6 +518,7 @@ impl SurfaceCraftApp {
         let rect = ui.available_rect_before_wrap();
         self.viewport_rect = Some(rect);
         let resp = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Canvas, true, t("viewport.name")));
         // Sketch mode takes precedence over the viewport tools: the sketch editor owns the
         // primary button and Esc (the innermost gesture); navigation stays (Alt+drag orbits).
         let sketching = self.sketch_editing();
@@ -746,6 +756,10 @@ fn example(p: &Value, root: &Value) -> Value {
             }
             return example(def, root);
         }
+    }
+    // a number that may also be an expression object: the number
+    if let Some(first) = p.get("anyOf").and_then(|a| a.get(0)).filter(|f| f.get("x-expr").is_some()) {
+        return example(first, root);
     }
     match p.get("type").and_then(Value::as_str) {
         Some("string") => json!(""),

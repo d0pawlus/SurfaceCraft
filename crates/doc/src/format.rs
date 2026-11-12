@@ -39,6 +39,9 @@ pub fn from_json(text: &str) -> Result<Document, String> {
     }
     let mut doc = env.document;
     repair_counter(&mut doc)?;
+    let (params, stale) = crate::param_use::validate_document(&doc).map_err(|e| format!("parameters: {e}"))?;
+    doc.params = params;
+    doc.needs_recompute = stale;
     Ok(doc)
 }
 
@@ -201,6 +204,32 @@ mod tests {
         assert!(from_json("not json").is_err());
         let tampered = text.replace("\"vertices\":", "\"vertices\":1");
         assert!(from_json(&tampered).is_err());
+    }
+
+    #[test]
+    fn parameters_roundtrip_with_their_expression_text() {
+        let mut d = Document::new();
+        d.params = d.params.with_param("w", "40", Some("width")).unwrap().with_param("h", "w / 2", None).unwrap();
+        let text = to_json(&d).unwrap();
+        assert!(text.contains("\"w / 2\"") && text.contains("\"width\""), "{text}");
+        let back = from_json(&text).unwrap();
+        assert_eq!(back.params, d.params);
+        let none = to_json(&Document::new()).unwrap();
+        assert!(!none.contains("params"), "an empty table writes nothing, so old readers and files agree");
+        assert!(from_json(&none).unwrap().params.is_empty(), "a file without the table loads");
+    }
+
+    #[test]
+    fn a_project_with_a_broken_parameter_table_is_refused() {
+        let mut d = Document::new();
+        d.params = d.params.with_param("w", "40", None).unwrap();
+        let text = to_json(&d).unwrap();
+        let cycle = text.replace("\"expr\":\"40\"", "\"expr\":\"w\"");
+        assert!(from_json(&cycle).is_err(), "self reference");
+        let unknown = text.replace("\"expr\":\"40\"", "\"expr\":\"q\"");
+        assert!(from_json(&unknown).is_err());
+        let wrong_value = text.replace("\"value\":40.0", "\"value\":1.0");
+        assert_eq!(from_json(&wrong_value).unwrap().params.get("w").map(|p| p.value), Some(40.0), "re-evaluated");
     }
 
     #[test]

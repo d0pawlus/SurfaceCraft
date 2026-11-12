@@ -241,7 +241,7 @@ impl Stage {
             "region" => Some(Stage::Segment),
             "primitive" | "section" => Some(Stage::Shapes),
             "sketch" => Some(Stage::Sketch),
-            "feature" | "body" => Some(Stage::Solid),
+            "feature" | "body" | "param" => Some(Stage::Solid),
             "surface" | "quad" => Some(Stage::Surface),
             "deviation" => Some(Stage::Inspect),
             "export" => Some(Stage::Export),

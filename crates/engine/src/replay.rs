@@ -5,6 +5,7 @@ use crate::Session;
 use std::collections::HashMap;
 use std::sync::Arc;
 use surfacecraft_doc::Document;
+use surfacecraft_doc::param_use::apply_feature_exprs;
 use surfacecraft_doc::{BoolOp, FeatureOp, Mode, ObjectId, Side};
 use surfacecraft_geom::{Transform, Vec3};
 use surfacecraft_kernel::feature::{
@@ -152,13 +153,22 @@ fn path_placements(chain: &[Segment3], count: usize, follow: bool) -> Result<Vec
     Ok(out)
 }
 
+/// The sketch a feature reads, unless a parameter change left it unusable.
+fn sketch_of<'a>(doc: &'a Document, id: &ObjectId) -> Result<&'a surfacecraft_doc::SketchObject, String> {
+    let sk = doc.sketch(*id).ok_or_else(|| format!("sketch {id} is gone"))?;
+    match &sk.error {
+        Some(e) => Err(format!("sketch {} cannot be used: {e}", sk.name)),
+        None => Ok(sk),
+    }
+}
+
 fn run(doc: &Document, op: &FeatureOp, bodies: &HashMap<ObjectId, Brep>, own: Option<&Brep>) -> Result<Brep, String> {
     let body =
         |id: &ObjectId| bodies.get(id).ok_or_else(|| format!("body {id} does not exist at this point of the history"));
     match op {
         FeatureOp::Base { brep } => Ok((**brep).clone()),
         FeatureOp::Extrude { sketch, distance, draft_deg, mode, target } => {
-            let sk = doc.sketch(*sketch).ok_or_else(|| format!("sketch {sketch} is gone"))?;
+            let sk = sketch_of(doc, sketch)?;
             let mut loops = profiles(&sk.sketch, 1e-6);
             if loops.is_empty() {
                 return Err("the sketch has no closed profile".into());
@@ -172,7 +182,7 @@ fn run(doc: &Document, op: &FeatureOp, bodies: &HashMap<ObjectId, Brep>, own: Op
             combine(base, made, *mode)
         }
         FeatureOp::Revolve { sketch, axis_origin, axis_direction, angle_deg, mode, target } => {
-            let sk = doc.sketch(*sketch).ok_or_else(|| format!("sketch {sketch} is gone"))?;
+            let sk = sketch_of(doc, sketch)?;
             let loops = profiles(&sk.sketch, 1e-6);
             let first = loops.first().ok_or("the sketch has no closed profile")?;
             let made = revolve(&curves(first), *axis_origin, *axis_direction, angle_deg.to_radians())
@@ -203,7 +213,7 @@ fn run(doc: &Document, op: &FeatureOp, bodies: &HashMap<ObjectId, Brep>, own: Op
         FeatureOp::Loft { sketches, degree, mode, target } => {
             let mut secs = Vec::with_capacity(sketches.len());
             for id in sketches {
-                let sk = doc.sketch(*id).ok_or_else(|| format!("sketch {id} is gone"))?;
+                let sk = sketch_of(doc, id)?;
                 secs.push(outer_profile(&sk.sketch)?);
             }
             let deg = degree.unwrap_or_else(|| u32::try_from(secs.len().saturating_sub(1)).unwrap_or(3).clamp(1, 3));
@@ -212,8 +222,8 @@ fn run(doc: &Document, op: &FeatureOp, bodies: &HashMap<ObjectId, Brep>, own: Op
             combine(base, made, *mode)
         }
         FeatureOp::Sweep { profile, path, follow, mode, target } => {
-            let psk = doc.sketch(*profile).ok_or_else(|| format!("sketch {profile} is gone"))?;
-            let ksk = doc.sketch(*path).ok_or_else(|| format!("sketch {path} is gone"))?;
+            let psk = sketch_of(doc, profile)?;
+            let ksk = sketch_of(doc, path)?;
             let made = sweep(&outer_profile(&psk.sketch)?, &curves(&path_of(&ksk.sketch)?), *follow)
                 .map_err(|e| e.to_string())?;
             let base = target.as_ref().map(body).transpose()?.or(own);
@@ -231,7 +241,7 @@ fn run(doc: &Document, op: &FeatureOp, bodies: &HashMap<ObjectId, Brep>, own: Op
             split(body(target)?, *plane_origin, *plane_normal, *keep == Side::Front).map_err(|e| e.to_string())
         }
         FeatureOp::PathPattern { target, path, count, follow } => {
-            let ksk = doc.sketch(*path).ok_or_else(|| format!("sketch {path} is gone"))?;
+            let ksk = sketch_of(doc, path)?;
             let placements = path_placements(&path_of(&ksk.sketch)?, *count, *follow)?;
             pattern_placed(body(target)?, &placements).map_err(|e| e.to_string())
         }
@@ -246,25 +256,63 @@ fn run(doc: &Document, op: &FeatureOp, bodies: &HashMap<ObjectId, Brep>, own: Op
     }
 }
 
-/// Replays the whole history; returns the number of features that failed.
-pub fn replay(s: &mut Session) -> usize {
-    replay_doc(&mut s.doc)
+/// Evaluates the expression-valued fields of every feature into its operation, so that the
+/// operations hold the current values of the parameters (parked features too, which will be
+/// replayed when rolled forward). The features whose expressions do not evaluate are returned
+/// with the reason; their operations are left as they were.
+fn apply_exprs(doc: &mut Document) -> HashMap<ObjectId, String> {
+    let params = doc.params.clone();
+    let mut errors = HashMap::new();
+    for f in doc.features.iter_mut().filter(|f| !f.exprs.is_empty()) {
+        match apply_feature_exprs(&f.op, &f.exprs, &params) {
+            Ok(op) if op != f.op => f.op = op,
+            Ok(_) => {}
+            Err(e) => {
+                errors.insert(f.id, e);
+            }
+        }
+    }
+    for f in doc.rolled_back.iter_mut().filter(|f| !f.exprs.is_empty()) {
+        if let Ok(op) = apply_feature_exprs(&f.op, &f.exprs, &params) {
+            f.op = op;
+        }
+    }
+    errors
 }
 
-/// [`replay`] on a document alone (a scratch copy, as a refit evaluates trial parameters).
+/// Replays the whole history; returns the number of features that failed. The expressions of the
+/// features are evaluated first, against the current parameters.
+pub fn replay(s: &mut Session) -> usize {
+    let errors = apply_exprs(&mut s.doc);
+    replay_with(&mut s.doc, &errors)
+}
+
+/// [`replay`] on a document alone (a scratch copy, as a refit evaluates trial parameters): the
+/// operations are replayed as they are stored.
 pub fn replay_doc(doc: &mut Document) -> usize {
+    replay_with(doc, &HashMap::new())
+}
+
+/// Replays the history; a feature named in `broken` fails with the reason given.
+fn replay_with(doc: &mut Document, broken: &HashMap<ObjectId, String>) -> usize {
     let feature_bodies: Vec<ObjectId> = doc.features.iter().map(|f| f.body).collect();
     // bodies outside the history keep their geometry; feature bodies start empty
     let mut bodies: HashMap<ObjectId, Brep> =
         doc.bodies.iter().filter(|b| !feature_bodies.contains(&b.id)).map(|b| (b.id, (*b.brep).clone())).collect();
     let mut consumed: Vec<ObjectId> = Vec::new();
     let mut failed = 0;
-    let ops: Vec<(usize, FeatureOp, ObjectId, bool)> =
-        doc.features.iter().enumerate().map(|(i, f)| (i, f.op.clone(), f.body, f.suppressed)).collect();
-    for (i, mut op, out, suppressed) in ops {
+    let ops: Vec<(usize, FeatureOp, ObjectId, bool, Option<String>)> = doc
+        .features
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (i, f.op.clone(), f.body, f.suppressed, broken.get(&f.id).cloned()))
+        .collect();
+    for (i, mut op, out, suppressed, broken_by) in ops {
         let mut rebound = false;
         let result = if suppressed {
             Ok(None)
+        } else if let Some(e) = broken_by {
+            Err(e)
         } else {
             bind_refs(&mut op, &bodies).and_then(|changed| {
                 rebound = changed;

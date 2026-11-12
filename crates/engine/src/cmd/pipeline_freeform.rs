@@ -162,6 +162,8 @@ fn wrap_with(s: &mut Session, set: &Settings, max_patches: Option<usize>) -> Cmd
             min_within: Some(set.min_within),
             max_patches,
             refine: None,
+            crease_deg: None,
+            continuity: None,
             name: Some(set.name.clone()),
         },
     )

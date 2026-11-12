@@ -21,12 +21,15 @@ pub mod mls;
 pub mod orient;
 pub mod outline;
 pub mod patch;
+pub mod patch_g1;
+mod patch_jumps;
 pub mod plane;
 pub mod primitive;
 pub mod resample;
 pub mod retopo;
 pub mod segment;
 pub mod stats;
+mod wrap_normals;
 
 pub use auto::{AutoFit, fit_auto};
 pub use plane::{PlaneFit, fit_plane};
