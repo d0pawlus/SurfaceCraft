@@ -130,7 +130,7 @@ pub(crate) fn reduce_in_parts(
     let outs: Vec<PartOut> = {
         let budget: &[f64] = guard.budget;
         par::map_slice(&parts, |ids| {
-            let floor = (opts.target_triangles * ids.len()).div_ceil(total);
+            let floor = part_floor(opts.target_triangles, ids.len(), total);
             reduce_part(&whole, ids, &owner, (bvh, budget), floor, max_cost)
         })
     };
@@ -167,5 +167,25 @@ fn compact_whole(whole: Whole, budget: Vec<f64>, guard: &mut Guard<'_>) -> Whole
         pos: kept.iter().map(|&v| whole.pos[v]).collect(),
         q: kept.iter().map(|&v| whole.q[v]).collect(),
         locked: kept.iter().map(|&v| whole.locked[v]).collect(),
+    }
+}
+
+/// The share of the triangle floor `target` that falls to a part of `part` of `total` triangles,
+/// rounded up. The product is taken in 128 bits: on a 32-bit target (wasm) it does not fit `usize`.
+fn part_floor(target: usize, part: usize, total: usize) -> usize {
+    let share = (target as u128 * part as u128).div_ceil(total.max(1) as u128);
+    usize::try_from(share).unwrap_or(usize::MAX)
+}
+
+#[cfg(test)]
+mod floor_tests {
+    use super::part_floor;
+
+    #[test]
+    fn the_floor_of_a_part_does_not_overflow() {
+        assert_eq!(part_floor(120_000, 40_000, 160_000), 30_000);
+        assert_eq!(part_floor(10, 3, 9), 4);
+        assert_eq!(part_floor(usize::MAX, usize::MAX, 1), usize::MAX);
+        assert_eq!(part_floor(5, 5, 0), 25);
     }
 }
