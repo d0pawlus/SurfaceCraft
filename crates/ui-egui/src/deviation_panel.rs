@@ -396,7 +396,8 @@ fn range_text(key: &str, tol: f64) -> String {
 /// The gradient bar of the legend, with the ±tolerance band marked by two ticks.
 fn gradient_bar(ui: &mut egui::Ui, tokens: &Tokens, tol: f64) {
     let width = ui.available_width().max(MIN_GRADIENT_WIDTH);
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, GRADIENT_HEIGHT), Sense::hover());
+    let (rect, scale) = ui.allocate_exact_size(Vec2::new(width, GRADIENT_HEIGHT), Sense::hover());
+    scale.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Image, true, t("deviation.scale")));
     let painter = ui.painter_at(rect);
     let colours = gradient(tol);
     let slice = rect.width() / colours.len().max(1) as f32;
@@ -417,7 +418,8 @@ fn histogram(ui: &mut egui::Ui, tokens: &Tokens, hist: &Histogram, tol: f64) {
     let bins = bins(hist, tol);
     let max = bins.iter().map(|b| b.count).max().unwrap_or(0).max(1) as f32;
     let width = ui.available_width().max(MIN_HISTOGRAM_WIDTH);
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, HISTOGRAM_HEIGHT), Sense::hover());
+    let (rect, chart) = ui.allocate_exact_size(Vec2::new(width, HISTOGRAM_HEIGHT), Sense::hover());
+    chart.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Image, true, t("deviation.histogram")));
     let painter = ui.painter_at(rect);
     let base = rect.bottom() - AXIS_ROOM;
     let span = (hist.hi - hist.lo).max(f64::MIN_POSITIVE);
