@@ -185,6 +185,7 @@
   "Hotspot parameters.": "Ustawienia miejsc największych odchyłek.",
   "How a sweep combines with an existing body.": "Jak przeciągnięcie łączy się z istniejącą bryłą.",
   "How firmly a face is held to its original place.": "Jak mocno ściana trzyma się pierwotnego położenia.",
+  "How the layout is refined where the tolerance is missed: `adaptive` (default, only around the missed scan points) or `uniform` (the whole scan).": "Jak zagęszcza się układ płatów tam, gdzie tolerancja jest przekroczona: „adaptive” (domyślnie, tylko wokół chybionych punktów skanu) albo „uniform” (cały skan).",
   "How the solid is made.": "Sposób budowy bryły.",
   "ICP parameters.": "Ustawienia dokładnego wyrównania.",
   "ICP settings.": "Ustawienia dokładnego wyrównania.",
