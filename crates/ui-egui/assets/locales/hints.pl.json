@@ -136,6 +136,7 @@
   "Enlarge parameters.": "Ustawienia powiększania.",
   "Entities; end points equal to existing points are shared.": "Elementy do dodania; końce pokrywające się z istniejącymi punktami są z nimi łączone.",
   "Every feature is active again (`\"end\"`).": "Wszystkie cechy są znów aktywne (`\"end\"`).",
+  "Experimental: conform the layout of an open region to a smoothed outline of the region and put split boundary vertices back onto it (default false). Falls back to the plain layout when any quad would be improper.": "Eksperymentalne: dopasowuje układ otwartego regionu do wygładzonego konturu regionu i po podziale przywraca na niego wierzchołki brzegowe (domyślnie wyłączone). Gdy jakikolwiek czworokąt byłby niepoprawny, wraca do zwykłego układu.",
   "Export parameters.": "Ustawienia eksportu.",
   "Export the working copy instead of the original (an error when there is none).": "Eksportuj kopię roboczą zamiast oryginału (gdy kopii nie ma, zgłaszany jest błąd).",
   "Extension of the patch past its region on every side, mm (default 3).": "O ile płat wychodzi poza swój region z każdej strony, mm (domyślnie 3).",
