@@ -261,7 +261,8 @@ impl Mesh {
         let mut remap = crate::weld::representatives(&self.positions, 1.0 / tol);
         // new ids in order of first occurrence; a representative never has a higher index than
         // its members, so `remap` is rewritten in place
-        let mut out: Vec<Point3> = Vec::new();
+        let mut out: Vec<Point3> =
+            Vec::with_capacity(remap.iter().enumerate().filter(|&(i, &r)| r as usize == i).count());
         for i in 0..n {
             let r = remap.get(i).copied().unwrap_or(0) as usize;
             if r == i {

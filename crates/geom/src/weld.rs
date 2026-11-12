@@ -43,33 +43,41 @@ pub(crate) fn representatives(pos: &[Point3], inv: f64) -> Vec<u32> {
         }
         by
     });
-    let resolved: Vec<Vec<(u32, u32)>> = par::map(BUCKETS, |b| resolve_bucket(pos, inv, &dealt, b));
-    drop(dealt);
+    let resolved: Vec<Vec<u32>> = par::map(BUCKETS, |b| resolve_bucket(pos, inv, &dealt, b));
+    // every bucket's answers are in the order its vertices were dealt: by ascending index
     let mut rep = vec![0u32; n];
-    for (i, r) in resolved.into_iter().flatten() {
-        if let Some(slot) = rep.get_mut(i as usize) {
-            *slot = r;
+    for (b, answers) in resolved.iter().enumerate() {
+        let dealt_to_b = dealt.iter().filter_map(|d| d.get(b)).flatten().copied();
+        for (i, &r) in dealt_to_b.zip(answers) {
+            if let Some(slot) = rep.get_mut(i as usize) {
+                *slot = r;
+            }
         }
     }
     rep
 }
 
-/// (vertex, representative) of every vertex of bucket `b`.
-fn resolve_bucket(pos: &[Point3], inv: f64, dealt: &[Vec<Vec<u32>>], b: usize) -> Vec<(u32, u32)> {
-    let mut keyed: Vec<(Cell, u32)> = Vec::new();
-    for list in dealt.iter().filter_map(|d| d.get(b)) {
-        keyed.extend(list.iter().filter_map(|&i| Some((cell_of(pos.get(i as usize)?, inv), i))));
-    }
+/// The representative of every vertex dealt to bucket `b`, in the order they were dealt.
+fn resolve_bucket(pos: &[Point3], inv: f64, dealt: &[Vec<Vec<u32>>], b: usize) -> Vec<u32> {
+    let ids: Vec<u32> = dealt.iter().filter_map(|d| d.get(b)).flatten().copied().collect();
+    let mut keyed: Vec<(Cell, u32)> = ids
+        .iter()
+        .enumerate()
+        .map(|(k, &i)| (cell_of(&pos.get(i as usize).copied().unwrap_or_else(Point3::origin), inv), k as u32))
+        .collect();
+    // the dealt order is ascending by index, so (cell, position) sorts like (cell, index)
     keyed.sort_unstable();
-    let mut out = Vec::with_capacity(keyed.len());
-    let mut first = (Cell::default(), u32::MAX);
-    for (k, &(cell, i)) in keyed.iter().enumerate() {
-        if k == 0 || cell != first.0 {
-            first = (cell, i);
+    let mut reps = vec![0u32; ids.len()];
+    let mut first = (Cell::default(), 0u32);
+    for (n, &(cell, k)) in keyed.iter().enumerate() {
+        if n == 0 || cell != first.0 {
+            first = (cell, ids.get(k as usize).copied().unwrap_or(0));
         }
-        out.push((i, first.1));
+        if let Some(slot) = reps.get_mut(k as usize) {
+            *slot = first.1;
+        }
     }
-    out
+    reps
 }
 
 #[cfg(test)]

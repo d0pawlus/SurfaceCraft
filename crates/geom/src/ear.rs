@@ -188,18 +188,26 @@ mod tests {
             assert!(ear_clip(&mut m, &lp));
             let got: Vec<[usize; 3]> = m.triangles.iter().map(|t| t.map(|v| v as usize)).collect();
             assert_eq!(got, want, "n = {n}");
-            let area: f64 = (0..m.triangles.len()).map(|t| tri::area(&m.positions[m.triangles[t][0] as usize], &m.positions[m.triangles[t][1] as usize], &m.positions[m.triangles[t][2] as usize])).sum();
+            let area: f64 = (0..m.triangles.len())
+                .map(|t| {
+                    tri::area(
+                        &m.positions[m.triangles[t][0] as usize],
+                        &m.positions[m.triangles[t][1] as usize],
+                        &m.positions[m.triangles[t][2] as usize],
+                    )
+                })
+                .sum();
             assert!(area > 0.0 && m.triangles.len() == n - 2);
         }
     }
 
     #[test]
     fn a_long_loop_is_clipped_in_reasonable_time() {
-        let mut m = star(6000, 4);
-        let lp: Vec<u32> = (0..6000).collect();
+        let mut m = star(20_000, 4);
+        let lp: Vec<u32> = (0..20_000).collect();
         let t = std::time::Instant::now();
         assert!(ear_clip(&mut m, &lp));
-        assert_eq!(m.triangles.len(), 5998);
+        assert_eq!(m.triangles.len(), 19_998);
         assert!(t.elapsed().as_secs() < 60, "{:?}", t.elapsed());
     }
 }

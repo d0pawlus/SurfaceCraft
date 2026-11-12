@@ -105,7 +105,8 @@ pub(crate) fn fill_holes_with(mesh: &mut Mesh, max_edges: usize, smooth: bool, s
     let source: &Mesh = mesh;
     let fill = |lp: &Vec<u32>| fill_in_workspace(source, &faces, lp, smooth, sharpen);
     // a single hole stays on this thread (the crease tests read a thread-local reason)
-    let patches: Vec<Patch> = if todo.len() < 2 { todo.iter().map(fill).collect() } else { par::map_slice(&todo, fill) };
+    let patches: Vec<Patch> =
+        if todo.len() < 2 { todo.iter().map(fill).collect() } else { par::map_slice(&todo, fill) };
     for patch in patches {
         rep.filled += 1;
         rep.added_triangles += patch.triangles.len();
@@ -187,7 +188,8 @@ fn fill_in_workspace(mesh: &Mesh, faces: &VertexFaces, lp: &[u32], smooth: bool,
         front = next;
     }
     tris.sort_unstable();
-    let mut origin: Vec<u32> = tris.iter().flat_map(|&t| mesh.triangles[t as usize]).chain(lp.iter().copied()).collect();
+    let mut origin: Vec<u32> =
+        tris.iter().flat_map(|&t| mesh.triangles[t as usize]).chain(lp.iter().copied()).collect();
     origin.sort_unstable();
     origin.dedup();
     let local = |v: u32| origin.binary_search(&v).map_or(0, |k| k as u32);
@@ -209,11 +211,7 @@ fn fill_in_workspace(mesh: &Mesh, faces: &VertexFaces, lp: &[u32], smooth: bool,
             crate::crease::sharpen_patch(&mut work, around, first_tri, first_vertex, &lp);
         }
     }
-    Patch {
-        origin,
-        positions: work.positions.split_off(first_vertex),
-        triangles: work.triangles.split_off(first_tri),
-    }
+    Patch { origin, positions: work.positions.split_off(first_vertex), triangles: work.triangles.split_off(first_tri) }
 }
 
 /// Refines the triangles from `first` on (centroid splits until edges are about the loop's mean
@@ -318,6 +316,13 @@ fn flip_patch(mesh: &mut Mesh, first: usize) {
     }
 }
 
+/// One row of the fairing operator (see [`fair_patch`]).
+struct RowOp {
+    len: usize,
+    cols: Vec<usize>,
+    own: Option<usize>,
+}
+
 /// Fairs the vertices from `first_vertex` on: membrane (umbrella) iterations, then thin-plate
 /// (umbrella of the umbrella) iterations, the rest of the mesh fixed.
 fn fair_patch(mesh: &mut Mesh, first_tri: usize, first_vertex: usize) {
@@ -371,37 +376,42 @@ fn fair_patch(mesh: &mut Mesh, first_tri: usize, first_vertex: usize) {
         r.sort_unstable();
         r
     };
-    let col: HashMap<u32, usize> = free.iter().enumerate().map(|(k, &v)| (v, k)).collect();
+    // the free vertices are the last ones, so a vertex's column is its offset from the first
+    let col_of = |v: u32| (v as usize >= first_vertex).then(|| v as usize - first_vertex);
     let nf = free.len();
     let empty: Vec<u32> = Vec::new();
     let ring_of = |v: u32| ring.get(&v).unwrap_or(&empty);
+    // every row of M once: ring size, columns of its free ring members, its own column
+    let ops: Vec<RowOp> = rows
+        .iter()
+        .map(|&v| {
+            let r = ring_of(v);
+            RowOp { len: r.len(), cols: r.iter().filter_map(|&j| col_of(j)).collect(), own: col_of(v) }
+        })
+        .collect();
     // M x (rows) for free values x, fixed ones taken as zero
     let m_apply = |x: &[f64]| -> Vec<f64> {
-        rows.iter()
-            .map(|&v| {
-                let r = ring_of(v);
-                if r.is_empty() {
+        ops.iter()
+            .map(|o| {
+                if o.len == 0 {
                     return 0.0;
                 }
-                let avg = r.iter().filter_map(|j| col.get(j).map(|&k| x[k])).sum::<f64>() / r.len() as f64;
-                avg - col.get(&v).map_or(0.0, |&k| x[k])
+                let avg = o.cols.iter().map(|&k| x[k]).sum::<f64>() / o.len as f64;
+                avg - o.own.map_or(0.0, |k| x[k])
             })
             .collect()
     };
     let mt_apply = |y: &[f64]| -> Vec<f64> {
         let mut out = vec![0.0; nf];
-        for (ri, &v) in rows.iter().enumerate() {
-            let r = ring_of(v);
-            if r.is_empty() {
+        for (ri, o) in ops.iter().enumerate() {
+            if o.len == 0 {
                 continue;
             }
-            let w = y[ri] / r.len() as f64;
-            for j in r {
-                if let Some(&k) = col.get(j) {
-                    out[k] += w;
-                }
+            let w = y[ri] / o.len as f64;
+            for &k in &o.cols {
+                out[k] += w;
             }
-            if let Some(&k) = col.get(&v) {
+            if let Some(k) = o.own {
                 out[k] -= y[ri];
             }
         }
@@ -417,9 +427,9 @@ fn fair_patch(mesh: &mut Mesh, first_tri: usize, first_vertex: usize) {
                     return 0.0;
                 }
                 let avg =
-                    r.iter().filter(|j| !col.contains_key(j)).map(|&j| mesh.positions[j as usize][axis]).sum::<f64>()
+                    r.iter().filter(|&&j| col_of(j).is_none()).map(|&j| mesh.positions[j as usize][axis]).sum::<f64>()
                         / r.len() as f64;
-                avg - if col.contains_key(&v) { 0.0 } else { mesh.positions[v as usize][axis] }
+                avg - if col_of(v).is_some() { 0.0 } else { mesh.positions[v as usize][axis] }
             })
             .collect();
         let b: Vec<f64> = mt_apply(&fixed_lap).iter().map(|x| -x).collect();
@@ -477,7 +487,10 @@ mod tests {
             .iter()
             .copied()
             .filter(|t| {
-                let c = (m.positions[t[0] as usize].coords + m.positions[t[1] as usize].coords + m.positions[t[2] as usize].coords) / 3.0;
+                let c = (m.positions[t[0] as usize].coords
+                    + m.positions[t[1] as usize].coords
+                    + m.positions[t[2] as usize].coords)
+                    / 3.0;
                 seeds.iter().all(|s| (c - s.coords).norm() > 1.2)
             })
             .collect();
