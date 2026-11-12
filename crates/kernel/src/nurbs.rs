@@ -15,7 +15,9 @@ use solidcore::nurbs::srf_basic::Surface as Nurb;
 use solidcore::query::api_queries::surface_closest_point;
 use solidcore::surface::surface::{Surface as KSurface, SurfaceKind};
 
+mod network_check;
 mod trim;
+pub use network_check::MAX_NETWORK_PATCHES;
 pub use trim::{MAX_OUTLINE_CORNERS, trimmed_sheet};
 
 /// Largest control net accepted (per direction).
@@ -513,7 +515,8 @@ pub(crate) fn canonicalize(mut b: Brep) -> Brep {
 /// `[n][n]`, `[0][n]`. Patches that share a layout edge must carry identical control points
 /// along it (checked), so the kernel sees one shared edge; faces are oriented by `u × v`, which
 /// must be consistent over the layout. With every edge used twice the shell is closed and the
-/// result is a solid.
+/// result is a solid. At most [`MAX_NETWORK_PATCHES`] patches; above 2000 the kernel's healer is
+/// skipped as in [`sheet_from_bezier_network_as_is`] (it grows faster than linearly).
 pub fn sheet_from_bezier_network(patches: &[Vec<Vec<[f64; 3]>>], corners: &[[u32; 4]]) -> Result<Brep> {
     bezier_network(patches, corners, true)
 }
@@ -530,8 +533,10 @@ pub fn sheet_from_bezier_network_as_is(patches: &[Vec<Vec<[f64; 3]>>], corners: 
 
 fn bezier_network(patches: &[Vec<Vec<[f64; 3]>>], corners: &[[u32; 4]], heal: bool) -> Result<Brep> {
     let nf = patches.len();
-    if nf == 0 || corners.len() != nf {
-        return Err(KernelError::Argument("the network needs at least one patch and one corner list per patch".into()));
+    network_check::check_patch_count(nf)?;
+    let heal = heal && network_check::heal_allowed(nf);
+    if corners.len() != nf {
+        return Err(KernelError::Argument("the network needs one corner list per patch".into()));
     }
     let n = patches.first().map_or(0, |p| p.len().saturating_sub(1));
     if n == 0 || n > 8 || patches.iter().any(|p| p.len() != n + 1 || p.iter().any(|r| r.len() != n + 1)) {
@@ -663,7 +668,7 @@ fn bezier_network(patches: &[Vec<Vec<[f64; 3]>>], corners: &[[u32; 4]], heal: bo
         vertices,
     };
     let brep = canonicalize(brep);
-    brep.validate().map_err(|e| op_err("record validate", e))?;
+    network_check::validate_network_record(&brep)?;
     // The healer may rework a network of scan-fitted patches (it then cannot say which entity is
     // which, and the conversion refuses). The network is consistent by construction (shared curves
     // and vertices are checked above), so it is then taken as it is.

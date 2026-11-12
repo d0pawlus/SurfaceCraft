@@ -7,6 +7,8 @@
 //! The draft issue texts are in `docs/upstream/` (`solidcore-p3.md` and the files it names).
 //! Problems 1 to 3 were first seen on `b9c02da`; all of them were re-checked on `4f2da85`.
 //! The tests below use the public API of `solidcore-ops` and `solidcore-record` only.
+mod common;
+
 use solidcore_ops as ops;
 use solidcore_record::brep::{Brep, Surface};
 use surfacecraft_kernel::{solid, step};
@@ -310,4 +312,48 @@ fn window_along_a_plane_normal_reads_back() {
         Ok(b) => assert!(b.volume(1e-6).is_ok(), "no volume"),
         Err(e) => panic!("{e}"),
     }
+}
+
+// Problems 8 and 9 (P9-O3): large B-spline shells. The record is assembled in `common` with
+// `solidcore-record` types only: a cube sphere of `6 n²` bicubic patches, closed, edges shared.
+
+/// Problem 8: a closed B-spline shell of 45 000 bicubic patches (about 4.5 million items) is
+/// refused by `Brep::validate` with `item budget`, although the body reads back and the same
+/// record passes `validate_built`.
+///
+/// Input: the cube sphere record of 45 414 patches (n = 87), `Body::from_record`, `to_record`.
+/// Expected: the record `to_record` writes passes `Brep::validate`, or the item budget scales
+/// with the number of faces.
+/// Actual: `validate()` returns `item budget` between 39 366 (ok) and 40 344 (refused) bicubic patches (MAX_ITEMS = 4 000 000,
+/// about 100 items per patch); `validate_built()` and `Body::from_record` accept the record.
+#[test]
+#[ignore = "solidcore 4f2da85: Brep::validate refuses a 45 000 patch B-spline shell with `item budget`"]
+fn record_of_a_large_closed_bspline_shell_validates() {
+    let net = common::cube_sphere(87, 50.0);
+    let record = common::record_of(&net);
+    assert!(record.validate_built().is_ok(), "validate_built must accept the record");
+    let (body, _) = ops::Body::from_record(&record, true).expect("from_record");
+    let (written, _) = body.to_record().expect("to_record");
+    let verdict = written.validate().map_err(|e| e.to_string());
+    assert!(verdict.is_ok(), "{} faces: {verdict:?}", written.faces.len());
+}
+
+/// Problem 9: the healer of `Body::from_record(.., false)` takes more than linear time in the
+/// number of faces.
+///
+/// Input: cube sphere records of 1 014 and 4 056 bicubic patches (n = 13 and 26).
+/// Expected: four times the faces take at most six times as long (linear is four).
+/// Actual: 2.7 s and 30.0 s, a factor of 11 (measured: 600 faces 1.4 s, 2 166 faces 8.9 s,
+/// 8 214 faces 91.4 s, `ci` profile).
+#[test]
+#[ignore = "solidcore 4f2da85: the healer of from_record(.., false) is super-linear in the face count (about n^1.6 to n^2)"]
+fn healer_time_is_close_to_linear_in_the_face_count() {
+    let time = |n: usize| {
+        let record = common::record_of(&common::cube_sphere(n, 50.0));
+        let start = std::time::Instant::now();
+        ops::Body::from_record(&record, false).expect("from_record with the healer");
+        start.elapsed().as_secs_f64()
+    };
+    let (small, large) = (time(13), time(26));
+    assert!(large <= 6.0 * small, "1 014 faces took {small:.2} s, 4 056 faces {large:.2} s (x{:.1})", large / small);
 }
