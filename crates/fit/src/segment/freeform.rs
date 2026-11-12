@@ -38,9 +38,9 @@ const MIN_SUPPORT: f64 = 1.0;
 /// edges runs into it without a crease, and at most [`ISLAND_CREASE`] of them are creases (a
 /// wall or a fillet next to a freeform top has the crease along the top and none into it).
 const ISLAND_ORGANIC: f64 = 0.3;
-const ISLAND_CREASE: f64 = 0.3;
+const ISLAND_CREASE: f64 = 0.5;
 /// Rounds of absorbing islands (an absorbed island can make the next one an island).
-const ISLAND_PASSES: usize = 3;
+const ISLAND_PASSES: usize = 4;
 /// Owner of a triangle in no region, and component of one outside the mask.
 const NONE: u32 = u32::MAX;
 
@@ -269,6 +269,23 @@ fn area_segment(mesh: &Mesh, normals: &[Vec3], tris: Vec<u32>, set: &Settings) -
     }
 }
 
+/// The layout of the mask for the regions flagged `weak`: its pieces and which are organic.
+fn layout(
+    mesh: &Mesh,
+    nb: &[[u32; 3]],
+    face: &[Option<Vec3>],
+    segs: &[Segment],
+    weak: &[bool],
+    set: &Settings,
+) -> Layout {
+    let owner = owners(mesh.triangle_count(), segs);
+    let mask: Vec<bool> = owner.iter().map(|&o| o == NONE || weak.get(o as usize).copied().unwrap_or(false)).collect();
+    let (label, pieces) = components(nb, face, &mask, set.cos_crease);
+    let region_piece = region_pieces(segs, weak, &label);
+    let organic = qualifying(&region_piece, &label, pieces, set);
+    Layout { owner, label, region_piece, organic }
+}
+
 /// Replaces the weak regions and unassigned triangles of every organic area by one freeform
 /// region; everything else is returned as it was (retained regions first, in order, then the
 /// freeform ones by their lowest triangle).
@@ -279,31 +296,29 @@ pub(super) fn consolidate(
     segs: Vec<Segment>,
     set: &Settings,
 ) -> Vec<Segment> {
-    let weak: Vec<bool> = segs.iter().map(|s| is_weak(mesh, s, set)).collect();
+    let mut weak: Vec<bool> = segs.iter().map(|s| is_weak(mesh, s, set)).collect();
     if !weak.iter().any(|&w| w) {
         return segs;
     }
-    let owner = owners(mesh.triangle_count(), &segs);
-    let mask: Vec<bool> = owner.iter().map(|&o| o == NONE || weak.get(o as usize).copied().unwrap_or(false)).collect();
     // raw face normals: the smoothed ones blur a sharp edge into steps too small to cut at
     let face = surfacecraft_geom::par::map(mesh.triangle_count(), |t| mesh.face_normal(t));
-    let (label, pieces) = components(nb, &face, &mask, set.cos_crease);
-    let region_piece = region_pieces(&segs, &weak, &label);
-    let organic = qualifying(&region_piece, &label, pieces, set);
-    if !organic.iter().any(|&o| o) {
+    let mut lay = layout(mesh, nb, &face, &segs, &weak, set);
+    if !lay.organic.iter().any(|&o| o) {
         return segs;
     }
-    let mut lay = Layout { owner, label, region_piece, organic };
+    // an absorbed island joins the mask, which can join pieces it separated (a fragment that
+    // was alone on its side of it is then part of the area) and make the next island
     for _ in 0..ISLAND_PASSES {
         let found = islands(nb, &face, &lay, set.cos_crease);
         if found.is_empty() {
             break;
         }
-        for (region, piece) in found {
-            lay.region_piece[region] = piece;
+        for (region, _) in found {
+            weak[region] = true;
         }
+        lay = layout(mesh, nb, &face, &segs, &weak, set);
     }
-    let mut areas: Vec<Vec<u32>> = vec![Vec::new(); pieces];
+    let mut areas: Vec<Vec<u32>> = vec![Vec::new(); lay.organic.len()];
     for t in 0..lay.owner.len() {
         let piece = lay.piece_of(t);
         if lay.is_organic(piece) {

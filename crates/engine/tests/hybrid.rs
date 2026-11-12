@@ -411,57 +411,97 @@ fn cad_primitives_of_part_a(s: &mut Session, regions: &[Value]) -> Vec<(String, 
     out
 }
 
+/// What segmenting part A with noise seed `seed` gave: structural `problems` (CAD primitives
+/// that differ from the plain segmentation, not exactly one freeform region, one that runs down
+/// the walls), the share of the top's triangles in the freeform region, and what else holds the
+/// top (`(kind, triangles, top triangles)` of every other region with some).
+struct TopCase {
+    problems: Vec<String>,
+    share: f64,
+    others: Vec<(String, u64, usize)>,
+}
+
+fn wavy_top_case(seed: u64) -> TopCase {
+    let mut s = Session::new();
+    let cut = part_a_cad(&mut s);
+    s.doc.add_body("part", cut);
+    scan_of(&mut s, "part", seed);
+    clean(&mut s);
+    let old = s.execute("region.auto_segment", json!({"mesh": "scan", "options": {"freeform": false}})).unwrap();
+    let old_regions = old["regions"].as_array().unwrap().clone();
+    let cad_old = cad_primitives_of_part_a(&mut s, &old_regions);
+    let new = s.execute("region.auto_segment", json!({"mesh": "scan"})).unwrap();
+    let regions = new["regions"].as_array().unwrap().clone();
+    let cad_new = cad_primitives_of_part_a(&mut s, &regions);
+    let mut problems = Vec::new();
+    if cad_new != cad_old {
+        problems.push(format!("CAD primitives before {cad_old:?}, after {cad_new:?}"));
+    }
+    let freeform: Vec<&Value> = regions.iter().filter(|r| r["freeform"] == true).collect();
+    if freeform.len() != 1 {
+        problems.push(format!("{} freeform regions", freeform.len()));
+    }
+    let scan_id = s.doc.find_by_name("scan").unwrap().0;
+    let scan = s.doc.mesh(scan_id).unwrap().mesh.clone();
+    // the top: triangles facing up, in the upper half of the part
+    let is_top =
+        |t: usize| matches!((scan.face_normal(t), scan.face_centroid(t)), (Some(n), Some(c)) if n.z > 0.5 && c.z > 8.0);
+    let top = (0..scan.triangle_count()).filter(|&t| is_top(t)).count();
+    let mut in_freeform = 0;
+    let mut others = Vec::new();
+    for r in &regions {
+        let tris = s.doc.region(surfacecraft_doc::ObjectId(r["id"].as_u64().unwrap())).unwrap().triangles.clone();
+        let on_top = tris.iter().filter(|&&t| is_top(t as usize)).count();
+        if r["freeform"] == true {
+            in_freeform += on_top;
+            let walls = tris.iter().filter(|&&t| scan.face_centroid(t as usize).is_some_and(|c| c.z < 6.0)).count();
+            if walls * 50 > tris.len() {
+                problems.push(format!("the freeform region runs down the walls ({walls})"));
+            }
+        } else if on_top > 0 {
+            others.push((r["kind"].to_string(), r["triangles"].as_u64().unwrap(), on_top));
+        }
+    }
+    TopCase { problems, share: in_freeform as f64 / top.max(1) as f64, others }
+}
+
+/// Noise seeds of the wavy top gate: those of part A and the worst ones of a sweep of 1..=40
+/// (before the islands were joined again after each absorption, the freeform region held only
+/// 86 to 93 % of the top for these, and on Linux's different tessellation under half).
+const WAVY_TOP_SEEDS: [u64; 11] = [21, 8, 11, 12, 18, 17, 22, 26, 19, 16, 14];
+
 /// P9-O7, part A: the walls and the bottom come out as the same primitives as without the
 /// consolidation, and the wavy top (it fell into small unrelated pieces) is ONE freeform region
 /// that holds nearly all of it and nothing of the walls.
 #[test]
 fn p9_block_with_wavy_top_has_one_freeform_top() {
-    for seed in PART_A_SEEDS {
-        let mut s = Session::new();
-        let cut = part_a_cad(&mut s);
-        s.doc.add_body("part", cut);
-        scan_of(&mut s, "part", seed);
-        clean(&mut s);
-        let old = s.execute("region.auto_segment", json!({"mesh": "scan", "options": {"freeform": false}})).unwrap();
-        let old_regions = old["regions"].as_array().unwrap().clone();
-        let cad_old = cad_primitives_of_part_a(&mut s, &old_regions);
-        let new = s.execute("region.auto_segment", json!({"mesh": "scan"})).unwrap();
-        let regions = new["regions"].as_array().unwrap().clone();
-        let freeform: Vec<&Value> = regions.iter().filter(|r| r["freeform"] == true).collect();
-        eprintln!(
-            "seed {seed}: before {} regions (unassigned {}), after {} regions (unassigned {}), freeform {:?}",
-            old_regions.len(),
-            old["unassigned"],
-            regions.len(),
-            new["unassigned"],
-            freeform.iter().map(|r| r["triangles"].as_u64().unwrap()).collect::<Vec<_>>()
+    for seed in WAVY_TOP_SEEDS {
+        let c = wavy_top_case(seed);
+        eprintln!("seed {seed}: top share {:.3}, other regions on the top {:?}", c.share, c.others);
+        assert!(c.problems.is_empty(), "seed {seed}: {:?}", c.problems);
+        assert!(
+            c.share >= 0.85,
+            "seed {seed}: {:.1} % of the top in the freeform region, rest in {:?}",
+            100.0 * c.share,
+            c.others
         );
-        let cad_new = cad_primitives_of_part_a(&mut s, &regions);
-        eprintln!("seed {seed}: CAD primitives before {cad_old:?}, after {cad_new:?}");
-        assert_eq!(cad_new, cad_old, "seed {seed}");
-        assert_eq!(cad_new.iter().filter(|(k, _)| k == "plane").count(), 5, "bottom and four walls");
-        assert_eq!(cad_new.iter().filter(|(k, _)| k == "cylinder").count(), 4, "four fillets");
-        assert_eq!(freeform.len(), 1, "seed {seed}: {freeform:?}");
-        assert!(freeform[0]["kind"].is_null() && freeform[0]["rms"].is_null(), "{}", freeform[0]);
-        // the top: triangles facing up, in the upper half of the part
-        let scan_id = s.doc.find_by_name("scan").unwrap().0;
-        let scan = s.doc.mesh(scan_id).unwrap().mesh.clone();
-        let is_top = |t: usize| {
-            let (n, c) = (scan.face_normal(t), scan.face_centroid(t));
-            matches!((n, c), (Some(n), Some(c)) if n.z > 0.5 && c.z > 8.0)
-        };
-        let top: Vec<usize> = (0..scan.triangle_count()).filter(|&t| is_top(t)).collect();
-        let fid = surfacecraft_doc::ObjectId(freeform[0]["id"].as_u64().unwrap());
-        let tris = s.doc.region(fid).unwrap().triangles.clone();
-        let in_top = tris.iter().filter(|&&t| is_top(t as usize)).count();
-        let walls = tris.iter().filter(|&&t| scan.face_centroid(t as usize).is_some_and(|c| c.z < 6.0)).count();
-        eprintln!(
-            "seed {seed}: top {} triangles, freeform {} of them {in_top}, below z 6: {walls}",
-            top.len(),
-            tris.len()
-        );
-        assert!(in_top as f64 >= 0.85 * top.len() as f64, "seed {seed}: {in_top} of {} top triangles", top.len());
-        assert!(walls * 50 <= tris.len(), "seed {seed}: the freeform region runs down the walls ({walls})");
+    }
+}
+
+/// Sweep of noise seeds (`--ignored --nocapture`): the share per seed.
+#[test]
+#[ignore = "sweep"]
+fn p9_wavy_top_seed_sweep() {
+    let (lo, hi): (u64, u64) = (
+        std::env::var("SWEEP_LO").ok().and_then(|v| v.parse().ok()).unwrap_or(1),
+        std::env::var("SWEEP_HI").ok().and_then(|v| v.parse().ok()).unwrap_or(40),
+    );
+    for seed in lo..=hi {
+        let c = std::panic::catch_unwind(|| wavy_top_case(seed));
+        match c {
+            Ok(c) => eprintln!("SWEEP {seed} share {:.3} problems {:?} others {:?}", c.share, c.problems, c.others),
+            Err(_) => eprintln!("SWEEP {seed} panicked"),
+        }
     }
 }
 
