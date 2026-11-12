@@ -11,7 +11,7 @@
 
 use super::p21::Param;
 use super::topology::ShellWriter;
-use super::{bad, e, ints, r, reals, s};
+use super::{bad, e, ints, r, reals, s, unsupported};
 use crate::IoError;
 use surfacecraft_kernel::record::brep::{Curve, Frame, Surface};
 
@@ -194,7 +194,7 @@ impl ShellWriter<'_> {
                 let ids = self.point_refs(&pts)?;
                 self.bspline_curve(knots, ids, Some(&ws))
             }
-            other => Err(bad(format!("not supported yet: STEP export of a {} edge in a sheet", curve_name(other)))),
+            other => Err(unsupported(format!("not supported yet: STEP export of a {} edge", curve_name(other)))),
         }
     }
 
@@ -313,9 +313,7 @@ impl ShellWriter<'_> {
                 let ax = self.placement(frame)?;
                 Ok(self.w.add("TOROIDAL_SURFACE", &[s(), r(ax), Param::Real(big), Param::Real(small)]))
             }
-            other => {
-                Err(bad(format!("not supported yet: STEP export of a {} surface in a sheet", surface_name(other))))
-            }
+            other => Err(unsupported(format!("not supported yet: STEP export of a {} surface", surface_name(other)))),
         }
     }
 }

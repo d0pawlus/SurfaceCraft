@@ -9,15 +9,23 @@
 // each face that uses it (computed by the kernel crate where the record's parameters are not
 // STEP's); own AP214 product structure and units. Split over `geom`, `topology`, `pcurve`.
 // Technical debt (design doc §10): the pinned `step-export` writes closed MANIFOLD_SOLID_BREPs
-// only (it refuses an open shell and every body kind but a solid), so sheets are written here.
+// only (it refuses an open shell and every body kind but a solid), so sheets are written here;
+// it also costs ~24 KB per spline patch, so closed solids of spline patches are written here too
+// (`solid.rs`, our own code on the same topology writer).
 
-//! STEP export of sheet (open shell) bodies, design doc §10 milestone M3.
+//! STEP export of sheet (open shell) bodies, design doc §10 milestone M3, and of closed solids
+//! made of many spline patches (compact, shared topology).
 
 mod geom;
 pub mod p21;
 mod pcurve;
+mod solid;
 mod topology;
 
+#[cfg(test)]
+mod network_fixture;
+#[cfg(test)]
+mod solid_tests;
 #[cfg(test)]
 mod tests;
 
@@ -25,6 +33,8 @@ use crate::IoError;
 use p21::{Param, Writer};
 use surfacecraft_kernel::record::brep::{Brep, Shell};
 use topology::ShellWriter;
+
+pub use solid::write_solids;
 
 fn s() -> Param {
     Param::Str(String::new())
@@ -48,6 +58,11 @@ fn ints(v: &[usize]) -> Param {
 
 fn bad(m: impl Into<String>) -> IoError {
     IoError::Export(m.into())
+}
+
+/// A record the writer has no entity for (the caller may use another exporter).
+fn unsupported(m: impl Into<String>) -> IoError {
+    IoError::Unsupported(m.into())
 }
 
 /// Is the record a sheet (no bounded material region)?
@@ -159,13 +174,18 @@ pub fn write_sheets(name: &str, bodies: &[&Brep]) -> Result<String, IoError> {
         w = next;
         models.extend(model);
     }
+    finish(w, name, models, "MANIFOLD_SURFACE_SHAPE_REPRESENTATION")
+}
+
+/// The units, the origin placement, the shape representation `rep_kind` of `models` and the product
+/// structure, then the file.
+fn finish(mut w: Writer, name: &str, mut models: Vec<Param>, rep_kind: &str) -> Result<String, IoError> {
     let ctx = units_and_context(&mut w);
     let o = w.add("CARTESIAN_POINT", &[s(), reals(&[0.0, 0.0, 0.0])]);
     let z = w.add("DIRECTION", &[s(), reals(&[0.0, 0.0, 1.0])]);
     let x = w.add("DIRECTION", &[s(), reals(&[1.0, 0.0, 0.0])]);
     models.push(r(w.add("AXIS2_PLACEMENT_3D", &[s(), r(o), r(z), r(x)])));
-    let rep = w
-        .add_distinct("MANIFOLD_SURFACE_SHAPE_REPRESENTATION", &[Param::Str(name.into()), Param::List(models), r(ctx)]);
+    let rep = w.add_distinct(rep_kind, &[Param::Str(name.into()), Param::List(models), r(ctx)]);
     product_structure(&mut w, name, rep);
     w.file(name, "AUTOMOTIVE_DESIGN { 1 0 10303 214 1 1 1 1 }").map_err(bad)
 }
