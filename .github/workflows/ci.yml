@@ -120,6 +120,39 @@ jobs:
         if: env.DOCS_ONLY == 'true'
         run: echo "documentation-only change"
 
+  # The browser bundle with threads is built on a pinned nightly with shared memory, and some
+  # code exists only there (the worker pool, the allocator, the `atomics` paths). This job
+  # type-checks exactly that configuration, so a break shows on the pull request instead of at
+  # the deploy. A check, not a build: no code generation, no wasm-bindgen.
+  web-threads:
+    name: web bundle with threads (type check)
+    needs: changes
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v4
+        if: env.DOCS_ONLY != 'true'
+      - uses: dtolnay/rust-toolchain@stable
+        if: env.DOCS_ONLY != 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: env.DOCS_ONLY != 'true'
+        with:
+          key: web-threads
+          cache-all-crates: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Nightly of the threaded web build (pinned in xtask/src/web.rs)
+        if: env.DOCS_ONLY != 'true'
+        run: rustup toolchain install "$(cargo xtask web-toolchain)" --profile minimal --component rust-src
+      - name: cargo xtask web --check
+        if: env.DOCS_ONLY != 'true'
+        run: cargo xtask web --check
+      - name: Nothing to check (documentation-only change)
+        if: env.DOCS_ONLY == 'true'
+        run: echo "documentation-only change"
+
   deny:
     name: cargo deny (sources, bans, licences)
     needs: changes

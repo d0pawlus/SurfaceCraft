@@ -53,6 +53,7 @@ pub(super) fn grow_regions(
     ctx: &Ctx<'_>,
     order: &[(u64, u32)],
     min_triangles: usize,
+    cancel: &surfacecraft_geom::Cancel,
 ) -> (Vec<Segment>, super::SegmentStats) {
     let threads = surfacecraft_geom::par::threads();
     let (lo, hi) = BATCH_LIMITS;
@@ -71,7 +72,8 @@ pub(super) fn grow_regions(
         totals: super::SegmentStats::default(),
     };
     for (idx, &(_, seed)) in order.iter().enumerate() {
-        if s.out.len() >= MAX_REGIONS {
+        // a cancelled run stops here; its caller drops what was found so far
+        if s.out.len() >= MAX_REGIONS || cancel.is_cancelled() {
             break;
         }
         s.step(idx, seed);

@@ -22,3 +22,43 @@ An integration pass then checks several pull requests on one build:
    owner.
 
 The integration branch is not merged itself; `main` receives the pull requests, merged by the owner.
+
+## Local builds by agents
+
+Compiling is the slow part of an agent's work on this workstation. One dependency, `solidcore`,
+takes about three of the three and a half minutes of a first build, and several agents compiling
+at once slow each other down far more than they gain (2026-11-11: eight at once, load average 40
+to 70 on 8 cores, a four-minute build took hours). Rules for whoever dispatches agents:
+
+1. **Start from a clone of the seed target directory.** `../SurfaceCraft-wt/target-seed` is
+   built on `main` with the commands agents run (`cargo test --profile ci -p <package> --no-run`
+   for each library package, `cargo xtask quick` for the same packages, `cargo xtask wasm`). A
+   new worktree gets a copy-on-write clone of it, which takes about a second on APFS and no disk
+   space until files change:
+   `cp -c -R -p ../SurfaceCraft-wt/target-seed ../SurfaceCraft-wt/target-<name>`, then
+   `CARGO_TARGET_DIR=../SurfaceCraft-wt/target-<name>` and `CARGO_INCREMENTAL=0` for every cargo
+   call. Only the workspace crates are compiled again. Rebuild the seed when `Cargo.lock` or the
+   toolchain changes (its `SEED_COMMIT` file names the commit it was built on).
+2. **Own target directory.** Never one directory shared by several worktrees: that gave stale
+   artifacts and ran another worktree's `xtask`.
+3. **At most three agents compiling at a time.** The rest wait; look at the machine's load and at
+   builds of other sessions before starting a batch.
+4. **No local build for non-code changes.** A change that only touches documentation, locale
+   files or other non-code files is pushed and checked by GitHub Actions (documentation-only pull
+   requests skip the heavy steps there).
+5. **Build one test binary, not all of them**, while working:
+   `cargo test --profile ci -p <package> --test <file> <name>`.
+
+Measured on 2026-11-12 (M1 Pro, another session's test running alongside):
+
+| First build in a fresh worktree | Engine tests (`--no-run`) |
+|---|---|
+| Empty target directory | 212 s (`solidcore` alone 178 s) |
+| Clone of the seed | 36 s, no dependency compiled |
+| After editing `geom`, one engine test binary | 23 s |
+
+`cargo xtask quick surfacecraft-engine` from the clone: 48 s; `surfacecraft-ui-egui` tests: 35 s.
+
+Tried and dropped: a compiler cache (sccache). Its key includes the target directory's path, so
+with one target directory per worktree it never hits (second build into another directory: 0
+hits, 220 s).

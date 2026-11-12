@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use surfacecraft_doc::{ObjectId, ObjectKind};
-use surfacecraft_engine::{EngineError, Session};
+use surfacecraft_engine::Session;
 use surfacecraft_geom::{Bvh, Point3};
 
 /// The SurfaceCraft UI.
@@ -43,6 +43,14 @@ pub struct SurfaceCraftApp {
     pub hist_panel: crate::history_panel::HistoryPanel,
     /// The deviation readings in the viewport: pinned ones and the one under the pointer.
     pub deviation: crate::deviation_panel::readout::State,
+    /// Whether heavy commands launched from the UI run in the background (see [`crate::jobs`]).
+    /// On in a window; off in a headless app, whose callers expect every command to have run
+    /// when the call returns.
+    pub background_jobs: bool,
+    /// The command running now, if one is.
+    pub(crate) busy: Option<crate::jobs::Busy>,
+    /// A cancelled command whose thread has not finished yet.
+    pub(crate) finishing: Option<surfacecraft_engine::Job>,
     /// Last status line.
     pub status: String,
     /// Points picked in the viewport (click: replace, Shift+click: add).
@@ -68,12 +76,12 @@ pub struct SurfaceCraftApp {
     pub assistant_goal: String,
     /// Align (true) or workflow mode.
     pub assistant_align: bool,
-    provider: Option<Box<dyn surfacecraft_ai::Provider>>,
+    pub(crate) provider: Option<Box<dyn surfacecraft_ai::Provider>>,
     pub(crate) prepared: bool,
     pub(crate) ctx: Option<egui::Context>,
     pub(crate) applied: Option<(crate::theme::Theme, crate::i18n::Lang)>,
     #[cfg(not(target_arch = "wasm32"))]
-    control: Option<std::sync::mpsc::Receiver<crate::control::Request>>,
+    pub(crate) control: Option<std::sync::mpsc::Receiver<crate::control::Request>>,
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) dialogs: craft_dialogs::Dialogs<crate::shell::DialogThen>,
     #[cfg(target_arch = "wasm32")]
@@ -125,6 +133,9 @@ impl SurfaceCraftApp {
             cmd_panel: Default::default(),
             hist_panel: Default::default(),
             deviation: Default::default(),
+            background_jobs: false,
+            busy: None,
+            finishing: None,
             status: t("status.ready").to_string(),
             picks: Vec::new(),
             field_pick: None,
@@ -139,7 +150,7 @@ impl SurfaceCraftApp {
             tools: crate::viewtools::ViewTools::default(),
             assistant_goal: String::new(),
             assistant_align: true,
-            provider: default_provider(),
+            provider: crate::assistant::default_provider(),
             prepared: false,
             ctx: None,
             applied: None,
@@ -251,6 +262,7 @@ impl SurfaceCraftApp {
         let settings =
             saved.unwrap_or_else(|| UiSettings { lang: crate::i18n::Lang::from_system(), ..UiSettings::default() });
         let mut app = Self::with_settings(settings);
+        app.background_jobs = true;
         if let Some(rs) = cc.wgpu_render_state.as_ref() {
             viewport::install(rs);
             app.gpu = true;
@@ -266,31 +278,6 @@ impl SurfaceCraftApp {
             app.dialogs = craft_dialogs::Dialogs::new(std::sync::Arc::new(move || ctx.request_repaint()));
         }
         app
-    }
-
-    /// Executes a command the way every UI control does, updating the status line.
-    pub fn run_command(&mut self, id: &str, params: Value) -> Result<Value, EngineError> {
-        let had = self.session.doc.summaries().len();
-        let r = self.session.execute(id, params);
-        // the status line names the tool the way the ribbon does
-        let name = surfacecraft_engine::cmd::find(id).map_or_else(|| id.to_string(), crate::workflow::label_of);
-        match &r {
-            Ok(_) => {
-                self.status = tf("status.done", &[("name", &name)]);
-                if had == 0 && !self.session.doc.summaries().is_empty() {
-                    self.fit_pending = true;
-                }
-                if id == "deviation.compute" {
-                    // a new map is what the Deviation tab shows
-                    crate::dock::show_tab(&mut self.workspace, crate::dock::Panel::Deviation);
-                }
-            }
-            Err(e) => {
-                let error = crate::i18n::engine_message(&e.to_string());
-                self.status = tf("status.failed", &[("name", &name), ("error", &error)]);
-            }
-        }
-        r
     }
 
     /// Opens a command in the tool panel and prefills its parameters; the ribbon follows to the
@@ -316,31 +303,6 @@ impl SurfaceCraftApp {
         self.cmd_panel.cancel_preview();
     }
 
-    /// Runs the open tool with its edited parameters. A command that changed the document closes
-    /// its tool (the guide shows what comes next); a failed one, or one that only reports
-    /// (statistics, information), stays open with its message or result. Returns whether it ran
-    /// without an error.
-    pub fn run_palette(&mut self) -> bool {
-        self.field_pick = None;
-        let Some(id) = self.palette_command else {
-            self.status = t("status.choose_command").to_string();
-            return false;
-        };
-        match serde_json::from_str::<Value>(&self.palette_params) {
-            Ok(v) => {
-                let ok = self.run_command(id, v).is_ok();
-                if ok && surfacecraft_engine::cmd::find(id).is_some_and(|c| c.undoable) {
-                    self.close_tool();
-                }
-                ok
-            }
-            Err(e) => {
-                self.status = tf("status.params_not_json", &[("error", &e.to_string())]);
-                false
-            }
-        }
-    }
-
     /// What the guide reads from the session: the kinds in the document and what ran.
     #[must_use]
     pub fn progress(&self) -> crate::guide::Progress {
@@ -363,83 +325,10 @@ impl SurfaceCraftApp {
         json!({ "commands": cmds })
     }
 
-    /// Answers control-channel requests (bridged MCP) between frames.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn poll_control(&mut self) {
-        let Some(rx) = self.control.as_ref() else { return };
-        let reqs: Vec<crate::control::Request> = rx.try_iter().collect();
-        for r in reqs {
-            let reply = match r.method.as_str() {
-                "engine.execute" => {
-                    let cmd = r.params.get("command").and_then(Value::as_str).unwrap_or("").to_string();
-                    let params = r.params.get("params").cloned().unwrap_or(Value::Null);
-                    match self.run_command(&cmd, params) {
-                        Ok(v) => json!({"ok": v}),
-                        Err(e) => json!({"err": e}),
-                    }
-                }
-                "ui.screenshot" => {
-                    let dim = |k: &str, d: u64| r.params.get(k).and_then(Value::as_u64).unwrap_or(d) as u32;
-                    let cam = self.camera.clone();
-                    match crate::shot::screenshot_png(
-                        &mut self.session,
-                        Some(&cam),
-                        dim("width", 800),
-                        dim("height", 600),
-                    ) {
-                        Some(png) => json!({"png": surfacecraft_doc::base64::encode(&png)}),
-                        None => json!({"err": "no renderer"}),
-                    }
-                }
-                other => json!({"err": format!("unknown method {other}")}),
-            };
-            let _ = r.reply.send(reply);
-        }
-    }
-
-    /// Imports files the browser picked (web build).
-    #[cfg(target_arch = "wasm32")]
-    pub(crate) fn poll_inbox(&mut self) {
-        let files: Vec<(String, Vec<u8>)> = self.inbox.borrow_mut().drain(..).collect();
-        for (name, bytes) in files {
-            let lower = name.to_lowercase();
-            let ext = lower.rsplit('.').next().unwrap_or("").to_string();
-            let stem = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s).to_string();
-            let data = surfacecraft_doc::base64::encode(&bytes);
-            let r = if ext == "step" || ext == "stp" {
-                self.run_command("import.step", json!({"data": data, "name": stem}))
-            } else {
-                self.run_command("mesh.import", json!({"data": data, "format": ext, "name": stem}))
-            };
-            if r.is_ok() {
-                self.fit_pending = true;
-            }
-        }
-    }
-
-    /// Downloads the selected object: a mesh as STL, a body or surface as STEP (web build).
-    #[cfg(target_arch = "wasm32")]
-    pub(crate) fn download_selected(&mut self) {
-        let Some(id) = self.selected_object else {
-            self.status = t("status.select_first").to_string();
-            return;
-        };
-        let (cmd, params, file) = match self.session.doc.kind_of(id) {
-            Some(ObjectKind::Mesh) => ("mesh.export", json!({"object": id.0, "format": "stl"}), "mesh.stl"),
-            Some(ObjectKind::Body | ObjectKind::Surface) => ("export.step", json!({"objects": [id.0]}), "model.step"),
-            _ => {
-                self.status = t("status.download_kinds").to_string();
-                return;
-            }
-        };
-        if let Ok(v) = self.run_command(cmd, params)
-            && let Some(Ok(bytes)) = v.get("data").and_then(Value::as_str).map(surfacecraft_doc::base64::decode)
-        {
-            crate::web::download(file, &bytes);
-        }
-    }
-
     pub(crate) fn shortcuts(&mut self, ui: &mut egui::Ui) {
+        if self.is_busy() {
+            return;
+        }
         let (undo, redo, search) = ui.input(|i| {
             let z = i.modifiers.command && i.key_pressed(egui::Key::Z);
             (
@@ -587,43 +476,6 @@ impl SurfaceCraftApp {
             }
             self.guide_panel(ui);
         });
-    }
-
-    /// Uses `p` as the assistant's language model.
-    pub fn set_provider(&mut self, p: Box<dyn surfacecraft_ai::Provider>) {
-        self.provider = Some(p);
-    }
-
-    /// Runs the assistant on the current goal with a picture of the viewport.
-    pub fn ask_assistant(&mut self) {
-        let Some(mut p) = self.provider.take() else {
-            self.status = t("assistant.no_provider_status").to_string();
-            return;
-        };
-        let mode = if self.assistant_align { surfacecraft_ai::Mode::Align } else { surfacecraft_ai::Mode::Workflow };
-        let cam = self.camera.clone();
-        let png = crate::shot::screenshot_png(&mut self.session, Some(&cam), 512, 384);
-        let goal = self.assistant_goal.clone();
-        self.status = match surfacecraft_ai::run(&mut self.session, p.as_mut(), mode, &goal, png.as_deref(), 20) {
-            Ok(o) => tf("assistant.done", &[("summary", &o.summary), ("n", &o.steps.len().to_string())]),
-            Err(e) => tf("assistant.failed", &[("error", &crate::i18n::engine_message(&e.to_string()))]),
-        };
-        self.provider = Some(p);
-        self.fit_pending = true;
-    }
-
-    fn assistant_panel(&mut self, ui: &mut egui::Ui) {
-        ui.strong(t("assistant.title"));
-        ui.horizontal(|ui| {
-            ui.radio_value(&mut self.assistant_align, true, t("assistant.align"));
-            ui.radio_value(&mut self.assistant_align, false, t("assistant.workflow"));
-        });
-        let l = ui.label(t("assistant.goal"));
-        ui.add(egui::TextEdit::singleline(&mut self.assistant_goal).hint_text(t("assistant.goal_hint")))
-            .labelled_by(l.id);
-        if ui.button(t("assistant.ask")).clicked() {
-            self.ask_assistant();
-        }
     }
 
     /// The command log: every call as the JSON a script or MCP client would send.
@@ -910,15 +762,4 @@ fn example(p: &Value, root: &Value) -> Value {
 #[must_use]
 pub fn kind_color(kind: ObjectKind) -> [f32; 4] {
     Tokens::resolve(crate::theme::Preset::Light).object(kind)
-}
-
-fn default_provider() -> Option<Box<dyn surfacecraft_ai::Provider>> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        surfacecraft_ai::CommandProvider::from_env().map(|p| Box::new(p) as Box<dyn surfacecraft_ai::Provider>)
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        None
-    }
 }

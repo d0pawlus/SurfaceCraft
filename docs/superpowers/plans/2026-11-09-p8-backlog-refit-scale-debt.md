@@ -45,9 +45,12 @@
 | H8 | Cechy: sweep po splajnie, loft z krzywymi prowadzącymi, split z obiema stronami | `kernel/feature.rs`, `engine/cmd/feature.rs` | Sonnet | 3 (po U1) |
 | H9 | Retopologia: układ dopasowany do konturu regionu, kontrola odwróconych łat, `surface.from_curves` dla regionów bez 4 rogów | `fit/{retopo,features}.rs` | Sonnet | 3 |
 | H10 | Kanał sterowania: wiele instancji, token poza plikiem tymczasowym; web: mniejszy bundle | `ui-egui/control.rs`, `crates/mcp`, profile | Haiku | 3 |
+| H11 | Fit Surface, raport dopasowania (luki względem `tangency-labs/solidcraft` #14373–#14375, dopisane 2026-11-11): maski wykluczeń w `surface.fit` (trójkąty lub punkty pomijane w dopasowaniu, źródło bez zmian, wykluczenie widoczne w wyniku); pokrycie pomiarem (które części dziedziny płata mają pod sobą skan, a które są ekstrapolacją lub dziurą); liczniki próbek: kwalifikujące się, zmierzone, wykluczone, nieudane | `engine/cmd/surface.rs`, `fit/resample.rs` | Sonnet | 3 (po H4) |
 
 Poza zakresem (decyzje lub zasoby właściciela): podpisywanie wydań, dostawca LLM, fork egui w `craft-ui`, repo korpusu,
-GPU w CI, warstwa inspekcji (wymiary, GD&T).
+GPU w CI, warstwa inspekcji (wymiary, GD&T). Odłożone do potwierdzenia kształtu API przez maintainerów SolidCraft
+(#14373–#14375): tożsamość i rewizja źródła z wykrywaniem nieaktualnych danych, jednostki i transformacje wystąpień,
+twarde G1 na szwach, jawnie edytowalne sąsiedztwo w planerze brył.
 
 ## Upstream
 Zgłoszenia idą do `tangency-labs/solidcraft` (repo `tangency-labs/solidcore` to lustro tylko do odczytu), jako praca

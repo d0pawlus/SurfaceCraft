@@ -6,7 +6,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 use surfacecraft_doc::{Document, History, ObjectId};
-use surfacecraft_geom::Mesh;
+use surfacecraft_geom::{Cancel, Mesh};
 
 /// One executed command, for the UI log and macro recording.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -66,14 +66,18 @@ pub struct Session {
     pub doc: Document,
     /// Undo/redo.
     pub history: History,
-    /// Every command executed, oldest first (capped).
-    pub log: Vec<LogEntry>,
+    /// Every command executed, oldest first (capped). Entries are shared: a fork of the session
+    /// copies pointers, not the parameters (which may hold a whole imported file).
+    pub log: Vec<Arc<LogEntry>>,
     /// Whether commands may touch the file system (false on the web and in sandboxed MCP).
     pub allow_files: bool,
     /// Body display meshes.
     pub tess: crate::display::TessCache,
     /// Deviation maps by mesh id. Only valid ones are kept: see [`Session::live_map`].
     pub maps: HashMap<ObjectId, DeviationMap>,
+    /// Set to ask the command that is running to stop (see [`crate::job::Job::cancel`]). Only
+    /// the long loops of a few commands look at it; nothing sets it outside a background job.
+    pub cancel: Cancel,
     /// Moves on with every executed command (see [`Session::epoch`]).
     epoch: u64,
 }
@@ -124,11 +128,42 @@ impl Session {
             Ok(v) => v.clone(),
             Err(e) => serde_json::to_value(e).unwrap_or(Value::Null),
         };
-        self.log.push(LogEntry { command: spec.id.to_string(), params, ok: mapped.is_ok(), outcome });
+        self.push_log(LogEntry { command: spec.id.to_string(), params, ok: mapped.is_ok(), outcome });
+        mapped
+    }
+
+    fn push_log(&mut self, entry: LogEntry) {
+        self.log.push(Arc::new(entry));
         if self.log.len() > LOG_CAP {
             self.log.remove(0);
         }
-        mapped
+    }
+
+    /// A second session in the state of this one, and its own cancellation flag. Cheap: the
+    /// geometry, the undo snapshots and the log entries are reference-counted, so the fork copies
+    /// the object lists of the current document and one pointer per undo step, log entry and
+    /// cache entry; no parameter of a logged command and no mesh is copied. A
+    /// background job runs a command on the fork while the front end keeps showing this session;
+    /// when the job is done the fork is the session, and when it is abandoned this one still is.
+    #[must_use]
+    pub fn fork(&self) -> Session {
+        Session {
+            doc: self.doc.clone(),
+            history: self.history.clone(),
+            log: self.log.clone(),
+            allow_files: self.allow_files,
+            tess: self.tess.clone(),
+            maps: self.maps.clone(),
+            cancel: Cancel::new(),
+            epoch: self.epoch,
+        }
+    }
+
+    /// Records that command `id` was started with `params` and cancelled before it finished: a
+    /// failed entry in the log and nothing else (the document and the history are untouched).
+    pub fn note_cancelled(&mut self, id: &str, params: Value) {
+        let outcome = serde_json::to_value(EngineError::Failed(cmd::CANCELLED.into())).unwrap_or(Value::Null);
+        self.push_log(LogEntry { command: id.to_string(), params, ok: false, outcome });
     }
 
     /// Runs read-only command `id` on a shared session, without a log entry or a history step. Only

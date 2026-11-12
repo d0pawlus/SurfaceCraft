@@ -18,7 +18,7 @@ use grow::Ctx;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use surfacecraft_geom::{Mesh, Point3, Vec3};
+use surfacecraft_geom::{Cancel, Mesh, Point3, Vec3};
 
 /// Segmentation settings.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -182,6 +182,13 @@ pub fn segment(mesh: &Mesh, opts: &SegmentOptions) -> Vec<Segment> {
     segment_with_stats(mesh, opts).0
 }
 
+/// [`segment`] that gives up when `cancel` is set: `None` then, checked between the seeds of the
+/// region growth and between the later phases, so a cancelled run ends within a moment.
+#[must_use]
+pub fn segment_cancellable(mesh: &Mesh, opts: &SegmentOptions, cancel: &Cancel) -> Option<Vec<Segment>> {
+    run(mesh, opts, cancel).map(|(segs, _)| segs)
+}
+
 /// Work of one [`segment`] run that does not show in its result.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SegmentStats {
@@ -194,9 +201,14 @@ pub struct SegmentStats {
 /// [`segment`] and what the run did besides (per run, unlike the global counters of `stats`).
 #[must_use]
 pub fn segment_with_stats(mesh: &Mesh, opts: &SegmentOptions) -> (Vec<Segment>, SegmentStats) {
+    run(mesh, opts, &Cancel::new()).unwrap_or_default()
+}
+
+/// The segmentation; `None` when `cancel` was set before it finished.
+fn run(mesh: &Mesh, opts: &SegmentOptions, cancel: &Cancel) -> Option<(Vec<Segment>, SegmentStats)> {
     let nt = mesh.triangle_count();
     if nt == 0 || mesh.validate().is_err() {
-        return (Vec::new(), SegmentStats::default());
+        return Some((Vec::new(), SegmentStats::default()));
     }
     let tol = if opts.tolerance.is_finite() && opts.tolerance > 0.0 { opts.tolerance } else { FALLBACK_TOLERANCE };
     let cos = opts.max_angle_deg.clamp(1.0, 89.0).to_radians().cos();
@@ -219,16 +231,22 @@ pub fn segment_with_stats(mesh: &Mesh, opts: &SegmentOptions) -> (Vec<Segment>, 
         cos,
     };
     let sw = crate::stats::Stopwatch::start();
-    let (found, stats) = seeds::grow_regions(&ctx, &order, opts.min_triangles);
+    let (found, stats) = seeds::grow_regions(&ctx, &order, opts.min_triangles, cancel);
     sw.stop(crate::stats::Phase::Regions);
+    if cancel.is_cancelled() {
+        return None;
+    }
     let out = final_fits(mesh, &normals, found, tol);
     let sw = crate::stats::Stopwatch::start();
-    let out = relax::relax_boundaries(mesh, &normals, &nb, out, tol);
+    let out = relax::relax_boundaries(mesh, &normals, &nb, out, tol, cancel);
     sw.stop(crate::stats::Phase::Relax);
+    if cancel.is_cancelled() {
+        return None;
+    }
     let sw = crate::stats::Stopwatch::start();
     let merged = merge::merge_adjacent(mesh, &normals, &nb, out, tol);
     sw.stop(crate::stats::Phase::Merge);
-    (merged, stats)
+    (!cancel.is_cancelled()).then_some((merged, stats))
 }
 
 /// The automatic fit of every region on its final triangles (the growth fit saw fewer); one that

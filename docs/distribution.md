@@ -132,9 +132,40 @@ the Windows application id.
 
 ## Web build size
 
-`cargo xtask web` runs `wasm-opt -Oz` on the bundle when `wasm-opt` (binaryen) is on PATH and prints
+`cargo xtask web` runs `wasm-opt` on the bundles (`-O3` with threads, `-Oz` without) when `wasm-opt` (binaryen) is on PATH and prints
 the size before and after. Without it the bundle is left unoptimised and the build still succeeds.
 CI does not install binaryen.
+
+## Web build: two bundles, one with threads
+
+`cargo xtask web` writes two bundles into `apps/surfacecraft-web/dist` and an `index.html` that
+picks one:
+
+- `mt/`: built with shared wasm memory (`+atomics,+bulk-memory,+mutable-globals`), so heavy commands
+  run in web workers and `surfacecraft_geom::par` spreads over them. That needs a standard library
+  built with the same features (`-Z build-std=std,panic_abort`), so this one build uses a nightly
+  toolchain, pinned by date in `xtask/src/web.rs` (`cargo xtask web-toolchain` prints it; install it
+  with the `rust-src` component). Its allocator gives every thread its own heap
+  (`orx-parallel-wasm-allocator`; std's allocator for wasm takes one lock per call), and `wasm-opt`
+  runs with `-O3`.
+- `st/`: the bundle without threads, built on stable as before (`wasm-opt -Oz`).
+
+The page loads `mt/` only when it is cross-origin isolated and can create a shared memory, and
+`?threads=0` was not asked for; otherwise, and when `mt/` fails to start, it loads `st/`, where a
+heavy command runs on the page's thread after a warning. The browser gives a page shared memory
+only when it is cross-origin isolated, so `cargo xtask web` writes a `vercel.json` into `dist` with
+`Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` for every
+path (every resource of the page is same-origin). `vercel build` copies them into
+`.vercel/output/config.json`; the deploy workflow fails before uploading if they are missing.
+`?threads=N` sets the number of workers (default: logical cores minus one, at most 16).
+
+Everything else stays on stable: `cargo xtask wasm` (in CI) checks the crates for a browser without
+threads, and the CI job `web bundle with threads (type check)` runs `cargo xtask web --check`, which
+type-checks the threaded configuration on the pinned nightly. `cargo xtask web --no-threads` builds
+only `st/`.
+
+If a worker of the pool dies (a panic aborts in wasm), the running command is reported as failed,
+the pool is not used again and heavy commands run on the page's thread until the page is reloaded.
 
 ## Web deployment (surfacecraft.pawlus.dev)
 

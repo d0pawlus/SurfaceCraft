@@ -915,5 +915,15 @@
   "param.sketch.constrain.at": "Position",
   "param.sketch.edit_constraint.at": "Position",
   "assistant.done": "Assistant: {summary} (commands run: {n})",
-  "assistant.failed": "The assistant failed: {error}"
+  "assistant.failed": "The assistant failed: {error}",
+  "busy.running": "Running: {name}",
+  "busy.elapsed": "{seconds} s",
+  "busy.hint": "The view shows the document from before this command.",
+  "busy.cancel": "Cancel command",
+  "busy.cancel_hint": "Stop waiting for this command and keep the document as it was",
+  "busy.in_place": "This browser page has no background threads, so the page will not respond until the command has finished.",
+  "status.running": "{name}: running…",
+  "status.busy": "{name} is still running",
+  "status.cancelled": "{name}: cancelled",
+  "status.finishing": "The cancelled command is still finishing; try again in a moment"
 }

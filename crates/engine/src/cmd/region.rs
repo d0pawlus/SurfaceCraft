@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use surfacecraft_doc::{ObjectId, ObjectKind};
-use surfacecraft_fit::segment::{SegmentOptions, grow_smooth, region_points, segment};
+use surfacecraft_fit::segment::{SegmentOptions, grow_smooth, region_points, segment_cancellable};
 use surfacecraft_fit::{PrimitiveKind, fit_auto};
 use surfacecraft_geom::{Mesh, Point3};
 
@@ -145,7 +145,7 @@ pub(crate) fn auto_segment(s: &mut Session, i: AutoIn) -> CmdResult<RegionsOut> 
     if i.replace {
         s.doc.regions.retain(|r| r.mesh != mesh);
     }
-    let segs = segment(&m, o);
+    let segs = segment_cancellable(&m, o, &s.cancel).ok_or_else(super::cancelled)?;
     let mut out = Vec::new();
     let mut assigned = 0;
     for (k, seg) in segs.into_iter().enumerate() {
@@ -725,7 +725,7 @@ fn resegment(s: &mut Session, i: ResegmentIn) -> CmdResult<RegionChangeOut> {
         return Err(CmdError::Params("the regions hold no triangles".into()));
     }
     // the triangles alone form the sub-mesh, so its outer edges bound the growth
-    let segs = segment(&m.submesh(&all), o);
+    let segs = segment_cancellable(&m.submesh(&all), o, &s.cancel).ok_or_else(super::cancelled)?;
     if segs.is_empty() {
         return Err(CmdError::Failed(format!(
             "no surface of at least {} triangles was found in the {} triangles of the regions; they are kept as they were",

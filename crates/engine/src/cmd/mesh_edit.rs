@@ -378,9 +378,12 @@ pub struct SmoothIn {
 
 fn smooth(s: &mut Session, i: SmoothIn) -> CmdResult<EditOut> {
     let angle = positive(i.feature_angle_deg, "feature_angle_deg", 40.0)?;
+    let cancel = s.cancel.clone();
     edit_mesh(s, &i.object, |m, o| {
         let feat = if angle >= 180.0 { None } else { Some(angle) };
-        o.max_displacement = Some(edit::smooth(m, i.iterations.unwrap_or(5), i.fix_boundary.unwrap_or(true), feat));
+        let moved =
+            edit::smooth_cancellable(m, i.iterations.unwrap_or(5), i.fix_boundary.unwrap_or(true), feat, &cancel);
+        o.max_displacement = Some(moved.ok_or_else(super::cancelled)?);
         Ok(())
     })
 }
