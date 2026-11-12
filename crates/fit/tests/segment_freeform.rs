@@ -285,3 +285,14 @@ fn corrugated_plate_keeps_its_six_cylinders() {
     assert!(segs.iter().all(|s| !s.freeform), "{report:?}");
     assert_eq!(segs, plain, "nothing was consolidated");
 }
+
+/// With a noise above the tolerance no fit can be judged against it: nothing is consolidated, the
+/// result is the one of `freeform: false`.
+#[test]
+fn noise_above_the_tolerance_consolidates_nothing() {
+    let mesh = organic_blob(25_000, 20.0, 1.2, 0.7, 0.02);
+    let noisy = segment(&mesh, &SegmentOptions { noise: Some(0.5), ..SegmentOptions::default() });
+    let plain = segment(&mesh, &SegmentOptions { freeform: false, ..SegmentOptions::default() });
+    assert_eq!(noisy, plain);
+    assert!(noisy.iter().all(|s| !s.freeform));
+}

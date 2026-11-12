@@ -26,11 +26,27 @@ pub enum NoiseSource {
     Fallback,
 }
 
-/// The noise used and where it came from.
+/// How much the noise estimates of the blocks of a mesh differ.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct NoiseSpread {
+    /// Blocks measured (those with enough triangles and a reliable estimate).
+    pub blocks: usize,
+    /// Smallest block estimate (sigma, mm).
+    pub smallest: f64,
+    /// Largest block estimate (sigma, mm).
+    pub largest: f64,
+}
+
+/// The noise used, where it came from, and what the report adds.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct NoiseUsed {
     pub sigma: f64,
     pub source: NoiseSource,
+    /// The spread of the blocks, when at least two were measured.
+    pub spread: Option<NoiseSpread>,
+    /// The noise is above the fitting tolerance: no primitive can be judged, and nothing is
+    /// consolidated into freeform areas.
+    pub above_tolerance: bool,
 }
 
 /// The mesh is cut into this many blocks along each axis of its box to see whether the noise is the
@@ -42,11 +58,16 @@ const MIN_BLOCK_TRIANGLES: usize = 300;
 /// factor (the estimator reads 0.0307 to 0.0333 for a true 0.03 on every shape and density, so
 /// a factor of two is far outside its own spread).
 const HETEROGENEOUS_RATIO: f64 = 2.0;
+/// Noise below this share of the tolerance changes no decision at that tolerance: estimates (of
+/// blocks, and of the mesh) are raised to it before they are compared or used, so a clean
+/// tessellated part (an estimate of 1e-6 mm) is uniform and clean, not "different" from a part
+/// with 0.001 mm.
+const NOISE_FLOOR_SHARE: f64 = 0.05;
 
 /// The estimated noise (sigma, mm) of `mesh`, when it can be trusted: enough smooth samples.
 fn reliable_noise(mesh: &Mesh) -> Option<f64> {
     let e = noise_estimate(mesh);
-    (e.smooth && e.sigma.is_finite() && e.sigma > 0.0).then_some(e.sigma)
+    (e.smooth && e.sigma.is_finite() && e.sigma >= 0.0).then_some(e.sigma)
 }
 
 /// Estimates of the blocks of `mesh` (those with enough triangles and a reliable estimate).
@@ -70,12 +91,17 @@ fn block_noise(mesh: &Mesh) -> Vec<f64> {
         .collect()
 }
 
-/// Is the noise of `mesh` the same all over it (as far as it can be told)?
-fn is_uniform(mesh: &Mesh) -> bool {
+/// The spread of the block estimates (`None` for fewer than two) and whether the noise is uniform:
+/// the largest estimate is within [`HETEROGENEOUS_RATIO`] of the smallest, both raised to `floor`.
+fn uniformity(mesh: &Mesh, floor: f64) -> (Option<NoiseSpread>, bool) {
     let blocks = block_noise(mesh);
-    let lo = blocks.iter().copied().fold(f64::INFINITY, f64::min);
-    let hi = blocks.iter().copied().fold(0.0, f64::max);
-    blocks.len() < 2 || hi <= HETEROGENEOUS_RATIO * lo
+    if blocks.len() < 2 {
+        return (None, true);
+    }
+    let smallest = blocks.iter().copied().fold(f64::INFINITY, f64::min);
+    let largest = blocks.iter().copied().fold(0.0, f64::max);
+    let uniform = largest.max(floor) <= HETEROGENEOUS_RATIO * smallest.max(floor);
+    (Some(NoiseSpread { blocks: blocks.len(), smallest, largest }), uniform)
 }
 
 /// Options for segmenting with the noise filled in, and the noise used (`None` for the report when
@@ -83,6 +109,7 @@ fn is_uniform(mesh: &Mesh) -> bool {
 /// caller; else measured on `target`, the geometry that is segmented (the whole mesh, or the
 /// selected triangles as a mesh of their own), when that is reliable and uniform; else, for a
 /// selection too small to measure, on the `whole` mesh when that is uniform; else the fallback.
+/// Estimates are raised to a floor of [`NOISE_FLOOR_SHARE`] of the tolerance.
 pub(super) fn with_noise(
     whole: &Mesh,
     target: &Mesh,
@@ -96,22 +123,44 @@ pub(super) fn with_noise(
     if !options.freeform {
         return Ok((options.clone(), None));
     }
-    if let Some(sigma) = options.noise {
-        return Ok((options.clone(), Some(NoiseUsed { sigma, source: NoiseSource::Given })));
-    }
-    let measured = match reliable_noise(target) {
-        Some(sigma) => is_uniform(target).then_some((sigma, NoiseSource::Estimated)),
-        None => reliable_noise(whole).filter(|_| is_uniform(whole)).map(|sigma| (sigma, NoiseSource::EstimatedMesh)),
+    let tolerance = options.tolerance;
+    let used = |sigma: f64, source: NoiseSource, spread: Option<NoiseSpread>| NoiseUsed {
+        sigma,
+        source,
+        spread,
+        above_tolerance: sigma > tolerance && source != NoiseSource::Fallback,
     };
-    Ok(match measured {
-        Some((sigma, source)) => {
-            (SegmentOptions { noise: Some(sigma), ..options.clone() }, Some(NoiseUsed { sigma, source }))
+    if let Some(sigma) = options.noise {
+        let n = used(sigma, NoiseSource::Given, None);
+        return Ok((options.clone(), Some(n)));
+    }
+    let floor = NOISE_FLOOR_SHARE * tolerance;
+    let (measured, spread) = measure(whole, target, floor);
+    let noise = match measured {
+        Some((sigma, source)) => used(sigma.max(floor), source, spread),
+        None => used(fallback_noise(tolerance), NoiseSource::Fallback, spread),
+    };
+    let options = if noise.source == NoiseSource::Fallback {
+        options.clone()
+    } else {
+        SegmentOptions { noise: Some(noise.sigma), ..options.clone() }
+    };
+    Ok((options, Some(noise)))
+}
+
+/// The noise of `target`, else of `whole` (see [`with_noise`]), and the spread of the blocks seen.
+fn measure(whole: &Mesh, target: &Mesh, floor: f64) -> (Option<(f64, NoiseSource)>, Option<NoiseSpread>) {
+    if let Some(sigma) = reliable_noise(target) {
+        let (spread, uniform) = uniformity(target, floor);
+        return (uniform.then_some((sigma, NoiseSource::Estimated)), spread);
+    }
+    match reliable_noise(whole) {
+        Some(sigma) => {
+            let (spread, uniform) = uniformity(whole, floor);
+            (uniform.then_some((sigma, NoiseSource::EstimatedMesh)), spread)
         }
-        None => {
-            let sigma = fallback_noise(options.tolerance);
-            (options.clone(), Some(NoiseUsed { sigma, source: NoiseSource::Fallback }))
-        }
-    })
+        None => (None, None),
+    }
 }
 
 #[cfg(test)]

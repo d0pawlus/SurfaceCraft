@@ -228,3 +228,91 @@ fn a_mesh_with_very_different_noise_in_its_parts_uses_the_fallback() {
     let out = s.execute("region.auto_segment", json!({"mesh": "scan"})).unwrap();
     assert_eq!((out["noise_source"].clone(), out["noise_used"].clone()), (json!("fallback"), json!(0.05)), "{out}");
 }
+
+// --- uniformity of the noise, in absolute terms --------------------------------------------------
+
+/// A 100 x 100 mm plate at x offset `x0` with noise `sigma` (0 for none): left flat, with a wavy
+/// organic patch on its far third when `wavy`.
+fn halves(x0: f64, sigma: f64, wavy: bool, seed: u64) -> Mesh {
+    halves_at(150, x0, sigma, wavy, seed)
+}
+
+/// [`halves`] with `n` cells a side.
+fn halves_at(n: usize, x0: f64, sigma: f64, wavy: bool, seed: u64) -> Mesh {
+    let mut m = sheet(100.0, 100.0, n, |x, y| {
+        let z = if wavy { 2.5 * (0.3 * x).sin() * (0.25 * y + 1.0).sin() * smoothstep((x - 60.0) / 10.0) } else { 0.0 };
+        Point3::new(x0 + x, y, z)
+    });
+    if sigma > 0.0 {
+        synth::add_noise(&mut m, sigma, &mut Rng::new(seed));
+    }
+    m
+}
+
+fn two_parts(left_sigma: f64, right_sigma: f64) -> Mesh {
+    let mut m = halves(0.0, left_sigma, true, 1);
+    m.append(&halves(200.0, right_sigma, false, 2));
+    m
+}
+
+fn segment_report(mesh: Mesh) -> Value {
+    let mut s = Session::new();
+    s.doc.add_mesh("scan", mesh);
+    s.execute("region.auto_segment", json!({"mesh": "scan"})).unwrap()
+}
+
+/// A clean CAD-like mesh (no noise at all) with an organic patch: every block is below the floor
+/// (5 % of the tolerance, 0.01 mm), so the noise is uniform and clean: estimated, at the floor.
+#[test]
+fn a_clean_mesh_with_an_organic_patch_is_uniform_and_estimated_at_the_floor() {
+    let out = segment_report(two_parts(0.0, 0.0));
+    assert_eq!(out["noise_source"], "estimated", "{out}");
+    assert!((out["noise_used"].as_f64().unwrap() - 0.01).abs() < 1e-9, "{out}");
+    assert!(
+        out["regions"].as_array().unwrap().iter().any(|r| r["freeform"] == true),
+        "the patch is consolidated: {out}"
+    );
+    assert!(
+        out.get("noise_spread").is_none() || out["noise_spread"]["largest"].as_f64().unwrap() <= 0.01 + 1e-12,
+        "{out}"
+    );
+}
+
+/// Halves with 0.01 and 0.03 at tolerance 0.2: the larger estimate is three times the smaller
+/// (both above the floor), so the noise is not uniform: fallback, with the spread reported.
+#[test]
+fn halves_with_noise_001_and_003_are_mixed_and_report_their_spread() {
+    let out = segment_report(two_parts(0.03, 0.01));
+    assert_eq!((out["noise_source"].clone(), out["noise_used"].clone()), (json!("fallback"), json!(0.05)), "{out}");
+    let spread = &out["noise_spread"];
+    assert!(spread["blocks"].as_u64().unwrap() >= 2, "{out}");
+    assert!(spread["largest"].as_f64().unwrap() > 2.0 * spread["smallest"].as_f64().unwrap(), "{out}");
+}
+
+/// 0.01 against 0.1: clearly mixed.
+#[test]
+fn halves_with_noise_001_and_01_fall_back() {
+    let out = segment_report(two_parts(0.1, 0.01));
+    assert_eq!(out["noise_source"], "fallback", "{out}");
+}
+
+/// Noise below the floor in one part and a little above in the other is still uniform at the floor.
+#[test]
+fn halves_below_the_floor_are_uniform() {
+    let out = segment_report(two_parts(0.0, 0.006));
+    assert_eq!(out["noise_source"], "estimated", "{out}");
+}
+
+/// Noise above the tolerance: no primitive can be judged. The estimate is reported with a flag
+/// and nothing is consolidated (the fragments stay as before).
+#[test]
+fn noise_above_the_tolerance_is_flagged_and_nothing_is_consolidated() {
+    // 2.5 mm cells: at 0.4 mm of noise the normals stay within what the estimator can read
+    let mut m = halves_at(40, 0.0, 0.4, true, 3);
+    m.append(&halves_at(40, 200.0, 0.4, false, 4));
+    let out = segment_report(m);
+    assert_eq!(out["noise_source"], "estimated", "{out}");
+    assert!(out["noise_used"].as_f64().unwrap() > 0.2, "{out}");
+    assert_eq!(out["noise_above_tolerance"], true, "{out}");
+    assert!(out["regions"].as_array().unwrap().iter().all(|r| r["freeform"] == false), "{out}");
+}

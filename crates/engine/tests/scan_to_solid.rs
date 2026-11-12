@@ -68,6 +68,7 @@ fn gate_scan_to_solid_rebuilds_a_chamfered_pin_in_one_call() {
     // `auto` (the default) keeps a prismatic scan on the primitives method: genuine primitives
     // lost to freeform regions would push the primitive share below half and flip it to the wrap
     assert_eq!(out["method"], "primitives", "{out}");
+    assert_eq!(out["attempts"].as_array().unwrap().len(), 1, "a pass with the first method is one attempt: {out}");
     assert!(out["issues"].as_array().unwrap().is_empty(), "{out}");
     assert_eq!(out["body"]["faces"], cad.faces.len(), "{out}");
     let volume = out["body"]["volume"].as_f64().unwrap();
@@ -84,6 +85,20 @@ fn gate_scan_to_solid_rebuilds_a_chamfered_pin_in_one_call() {
     s.execute("edit.undo", Value::Null).unwrap();
     assert!(s.doc.bodies.is_empty() && s.doc.primitives.is_empty() && s.doc.regions.is_empty());
     assert_eq!(s.doc.meshes[0].mesh.triangle_count(), raw_triangles);
+}
+
+/// `auto` on the cleaned bracket: the primitives do not close a solid, the freeform wrap does, and
+/// `auto` returns it (the twin of the next test, which forces the primitives method to see a verdict
+/// that is not a pass). The attempts say what was tried.
+#[test]
+fn auto_on_the_three_shell_scan_passes_with_the_freeform_wrap() {
+    let mut s = Session::new();
+    s.execute("mesh.synth", json!({"shape": "bracket", "noise": 0.03, "name": "scan"})).unwrap();
+    let out = s.execute("scan.to_solid", json!({"scan": "scan"})).unwrap();
+    assert_eq!((out["method"].clone(), out["verdict"].clone()), (json!("freeform"), json!("pass")), "{out}");
+    let attempts = out["attempts"].as_array().unwrap();
+    assert!(attempts.last().is_some_and(|a| a["method"] == "freeform" && a["returned"] == true), "{out}");
+    assert!(attempts.iter().filter(|a| a["returned"] == true).count() == 1, "{out}");
 }
 
 #[test]
@@ -186,6 +201,7 @@ fn gate_scan_to_solid_wraps_an_organic_scan_in_patches() {
     eprintln!("organic: {}", serde_json::to_string(&json!({"verdict": out["verdict"], "method": out["method"], "patches": out["patches"], "body": out["body"], "deviation": out["deviation"], "issues": out["issues"]})).unwrap());
     assert_eq!(out["method"], "freeform", "{out}");
     assert_eq!(out["verdict"], "pass", "{out}");
+    assert_eq!(out["attempts"].as_array().unwrap().len(), 1, "an organic scan that passes is one attempt: {out}");
     assert!(out["patches"].as_u64().unwrap() > 0, "{out}");
     assert!(out["body"]["volume"].as_f64().is_some_and(|v| v > 0.0), "a closed solid: {out}");
     assert!(out["deviation"]["within"].as_f64().unwrap() >= 0.99, "{out}");

@@ -10,7 +10,7 @@ mod edit;
 #[path = "region_noise.rs"]
 mod noise;
 use edit::*;
-use noise::{NoiseSource, with_noise};
+use noise::{NoiseSource, NoiseSpread, with_noise};
 use surfacecraft_doc::{ObjectId, ObjectKind};
 use surfacecraft_fit::segment::{Segment, SegmentOptions, grow_smooth, region_points, segment_cancellable};
 use surfacecraft_fit::{PrimitiveKind, fit_auto};
@@ -158,6 +158,13 @@ pub struct RegionsOut {
     /// `fallback` (no reliable estimate; only small regions are consolidated).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub noise_source: Option<NoiseSource>,
+    /// The smallest and largest noise measured on blocks of the mesh, when two or more were
+    /// measured (a spread above a factor of two is why `fallback` is chosen).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noise_spread: Option<NoiseSpread>,
+    /// The noise is above the tolerance: no primitive can be judged and nothing is consolidated.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub noise_above_tolerance: bool,
 }
 
 /// Adds the region of one segment found (`number` names it): a freeform area has no kind and no
@@ -198,6 +205,8 @@ pub(crate) fn auto_segment(s: &mut Session, i: AutoIn) -> CmdResult<RegionsOut> 
         unassigned: m.triangle_count().saturating_sub(assigned),
         noise_used: noise.map(|n| n.sigma),
         noise_source: noise.map(|n| n.source),
+        noise_spread: noise.and_then(|n| n.spread),
+        noise_above_tolerance: noise.is_some_and(|n| n.above_tolerance),
     })
 }
 
@@ -303,7 +312,14 @@ fn split(s: &mut Session, i: SplitIn) -> CmdResult<RegionsOut> {
         classify(s, rid)?;
         out.push(info(s, rid)?);
     }
-    Ok(RegionsOut { regions: out, unassigned: 0, noise_used: None, noise_source: None })
+    Ok(RegionsOut {
+        regions: out,
+        unassigned: 0,
+        noise_used: None,
+        noise_source: None,
+        noise_spread: None,
+        noise_above_tolerance: false,
+    })
 }
 
 /// List parameters.
@@ -319,7 +335,14 @@ fn list(s: &mut Session, i: ListIn) -> CmdResult<RegionsOut> {
     let mesh = i.mesh.map(|m| m.resolve(s, ObjectKind::Mesh)).transpose()?;
     let ids: Vec<ObjectId> = s.doc.regions.iter().filter(|r| mesh.is_none_or(|m| r.mesh == m)).map(|r| r.id).collect();
     let regions = ids.into_iter().map(|id| info(s, id)).collect::<CmdResult<_>>()?;
-    Ok(RegionsOut { regions, unassigned: 0, noise_used: None, noise_source: None })
+    Ok(RegionsOut {
+        regions,
+        unassigned: 0,
+        noise_used: None,
+        noise_source: None,
+        noise_spread: None,
+        noise_above_tolerance: false,
+    })
 }
 
 /// Resegment parameters.
@@ -390,6 +413,8 @@ fn resegment(s: &mut Session, i: ResegmentIn) -> CmdResult<RegionChangeOut> {
         unassigned,
         noise_used: noise.map(|n| n.sigma),
         noise_source: noise.map(|n| n.source),
+        noise_spread: noise.and_then(|n| n.spread),
+        noise_above_tolerance: noise.is_some_and(|n| n.above_tolerance),
     })
 }
 

@@ -28,6 +28,12 @@ pub struct RegionChangeOut {
     /// Where it came from (see `region.auto_segment`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub noise_source: Option<NoiseSource>,
+    /// The smallest and largest noise measured on blocks (see `region.auto_segment`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noise_spread: Option<NoiseSpread>,
+    /// The noise is above the tolerance: nothing is consolidated.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub noise_above_tolerance: bool,
 }
 
 /// Sets the flags of `tris` in `f` (indices out of range are ignored).
@@ -188,7 +194,14 @@ pub(super) fn enlarge(s: &mut Session, i: EnlargeIn) -> CmdResult<RegionChangeOu
     }
     drop_regions(s, &emptied);
     classify(s, id)?;
-    Ok(RegionChangeOut { regions: report(s, &touched), unassigned: 0, noise_used: None, noise_source: None })
+    Ok(RegionChangeOut {
+        regions: report(s, &touched),
+        unassigned: 0,
+        noise_used: None,
+        noise_source: None,
+        noise_spread: None,
+        noise_above_tolerance: false,
+    })
 }
 
 /// Shrink parameters.
@@ -246,7 +259,14 @@ pub(super) fn shrink(s: &mut Session, i: ShrinkIn) -> CmdResult<RegionChangeOut>
         classify(s, id)?;
     }
     let unassigned = unassigned_of(s, mesh, &removed);
-    Ok(RegionChangeOut { regions: report(s, &[(id, false)]), unassigned, noise_used: None, noise_source: None })
+    Ok(RegionChangeOut {
+        regions: report(s, &[(id, false)]),
+        unassigned,
+        noise_used: None,
+        noise_source: None,
+        noise_spread: None,
+        noise_above_tolerance: false,
+    })
 }
 
 /// Separate parameters.
@@ -291,7 +311,14 @@ pub(super) fn separate(s: &mut Session, i: SeparateIn) -> CmdResult<RegionChange
         touched.push((rid, k > 0));
     }
     let unassigned = unassigned_of(s, r.mesh, &r.triangles);
-    Ok(RegionChangeOut { regions: report(s, &touched), unassigned, noise_used: None, noise_source: None })
+    Ok(RegionChangeOut {
+        regions: report(s, &touched),
+        unassigned,
+        noise_used: None,
+        noise_source: None,
+        noise_spread: None,
+        noise_above_tolerance: false,
+    })
 }
 
 /// A sphere selection: the triangles whose centroid lies inside it.
@@ -407,5 +434,12 @@ pub(super) fn insert(s: &mut Session, i: InsertIn) -> CmdResult<RegionChangeOut>
     classify(s, rid)?;
     let mut out = vec![(rid, true)];
     out.extend(touched);
-    Ok(RegionChangeOut { regions: report(s, &out), unassigned: 0, noise_used: None, noise_source: None })
+    Ok(RegionChangeOut {
+        regions: report(s, &out),
+        unassigned: 0,
+        noise_used: None,
+        noise_source: None,
+        noise_spread: None,
+        noise_above_tolerance: false,
+    })
 }

@@ -275,7 +275,9 @@ fn run(mesh: &Mesh, opts: &SegmentOptions, cancel: &Cancel) -> Option<(Vec<Segme
         cos,
     };
     let fset = freeform_settings(opts, nt, seed_tris, tol);
-    let hints = opts.freeform.then_some(seeds::FreeformHints { weak_tris: fset.strong_tris });
+    // with noise above the tolerance no fit can be judged: nothing is consolidated
+    let consolidate = opts.freeform && !(fset.noise_known && fset.noise > tol);
+    let hints = consolidate.then_some(seeds::FreeformHints { weak_tris: fset.strong_tris });
     let sw = crate::stats::Stopwatch::start();
     let (found, stats) = seeds::grow_regions(&ctx, &order, opts.min_triangles, hints, cancel);
     sw.stop(crate::stats::Phase::Regions);
@@ -296,7 +298,7 @@ fn run(mesh: &Mesh, opts: &SegmentOptions, cancel: &Cancel) -> Option<(Vec<Segme
         return None;
     }
     let sw = crate::stats::Stopwatch::start();
-    let merged = if opts.freeform { freeform::consolidate(mesh, &normals, &nb, merged, &fset) } else { merged };
+    let merged = if consolidate { freeform::consolidate(mesh, &normals, &nb, merged, &fset) } else { merged };
     sw.stop(crate::stats::Phase::Freeform);
     Some((merged, stats))
 }

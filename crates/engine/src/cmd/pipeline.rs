@@ -20,6 +20,8 @@ use surfacecraft_deviation::noise_estimate;
 use surfacecraft_doc::{ObjectId, ObjectKind};
 use surfacecraft_fit::PrimitiveKind;
 
+#[path = "pipeline_auto.rs"]
+mod auto;
 #[path = "pipeline_freeform.rs"]
 mod freeform;
 
@@ -682,27 +684,42 @@ fn relate(s: &mut Session, modelled: &[Modelled], sigma: Option<f64>) -> usize {
     auto_constrain(s, params).map_or(0, |r| if r.applied { r.relations.len() } else { 0 })
 }
 
-fn to_solid(s: &mut Session, i: ToSolidIn) -> CmdResult<ToSolidOut> {
+fn to_solid(s: &mut Session, i: ToSolidIn) -> CmdResult<auto::ToSolidReport> {
     let set = settings(s, &i)?;
     let scan_report = prepare(s, &i, set.scan)?;
-    if i.method == Method::Freeform {
-        return freeform::freeform_solid(s, &set, scan_report);
-    }
+    auto::run(s, &i, &set, scan_report)
+}
+
+/// Segments the scan into regions (unless the caller's regions are reused).
+fn segment_scan(s: &mut Session, i: &ToSolidIn, set: &Settings) -> CmdResult<()> {
     if !i.reuse_regions {
         auto_segment(s, AutoIn { mesh: ObjRef::Id(set.scan.0), options: Default::default(), replace: true })?;
     }
-    let (list, unassigned) = candidates(s, set.scan);
-    let total = triangle_count(s, set.scan);
+    Ok(())
+}
+
+/// The smallest region the primitives method models, and the RMS above which a fit is no primitive.
+fn region_limits(set: &Settings, total: usize, scan_report: &ScanSummary) -> (usize, f64) {
     let min_triangles = set
         .min_triangles
         .unwrap_or_else(|| ((total as f64 * MIN_REGION_SHARE).ceil() as usize).max(MIN_REGION_TRIANGLES));
-    let rms_limit = NOISE_PRIMITIVE_MM.max(2.0 * scan_report.noise_sigma.unwrap_or(0.0));
-    if i.method == Method::Auto
-        && !i.reuse_regions
-        && primitive_share(&list, min_triangles, rms_limit, total) < MIN_MODELLED_SHARE
-    {
-        return freeform::freeform_solid(s, &set, scan_report);
-    }
+    (min_triangles, NOISE_PRIMITIVE_MM.max(2.0 * scan_report.noise_sigma.unwrap_or(0.0)))
+}
+
+/// Share of the scan's triangles in the regions a primitive fits (freeform regions have no kind and
+/// never count): the heuristic that orders the attempts of `method: auto`.
+fn scan_primitive_share(s: &Session, set: &Settings, scan_report: &ScanSummary) -> f64 {
+    let (list, _) = candidates(s, set.scan);
+    let total = triangle_count(s, set.scan);
+    let (min_triangles, rms_limit) = region_limits(set, total, scan_report);
+    primitive_share(&list, min_triangles, rms_limit, total)
+}
+
+/// The primitives method on the regions the scan has: fits, relates and builds.
+fn primitives_solid(s: &mut Session, i: &ToSolidIn, set: &Settings, scan_report: ScanSummary) -> CmdResult<ToSolidOut> {
+    let (list, unassigned) = candidates(s, set.scan);
+    let total = triangle_count(s, set.scan);
+    let (min_triangles, rms_limit) = region_limits(set, total, &scan_report);
     let (modelled, left) = fit_regions(s, &list, min_triangles, rms_limit);
     let relations = if i.constrain { relate(s, &modelled, scan_report.noise_sigma) } else { 0 };
     let mut o = Outcome {
@@ -717,9 +734,9 @@ fn to_solid(s: &mut Session, i: ToSolidIn) -> CmdResult<ToSolidOut> {
         holes_left: scan_report.holes_left,
         non_manifold: scan_report.non_manifold_edges,
     };
-    build(s, &set, &mut o)?;
-    let issues = issues_of(&o, &set, total);
-    let next = next_steps(&o, &issues, &set);
+    build(s, set, &mut o)?;
+    let issues = issues_of(&o, set, total);
+    let next = next_steps(&o, &issues, set);
     let verdict = verdict_of(&o, &issues);
     let left_out_regions = o.left_out.len();
     let left_out_triangles = o.left_out.iter().map(|l| l.triangles).sum();
@@ -752,8 +769,8 @@ pub static COMMANDS: &[CommandSpec] = &[command!(
     "Scan to solid",
     "Solid",
     true,
-    "From raw scan `scan` to a closed solid in one step, measured against the scan. Prismatic parts (`method` primitives): cleans the scan, segments it, fits a primitive to each sizeable region, relates the primitives and builds the solid. Organic parts, castings and body panels (`method` freeform): wraps the whole scan in a watertight network of patches. `method` auto (default) chooses by how much of the scan primitives fit. Returns `verdict` (pass, review or fail), the deviation, `issues`, and `next_steps` with ready parameters. A poor model is a verdict, not an error; regions and primitives stay for manual work. `reuse_regions` models corrected regions again (without cleaning).",
+    "From raw scan `scan` to a closed solid in one step, measured against the scan. Prismatic parts (`method` primitives): cleans the scan, segments it, fits a primitive to each sizeable region, relates the primitives and builds the solid. Organic parts, castings and body panels (`method` freeform): wraps the whole scan in a watertight network of patches. `method` auto (default) tries first the method that the share of the scan primitives fit suggests; when that does not end in a pass it tries the other too and returns the better result (`attempts` lists them). Returns `verdict` (pass, review or fail), the deviation, `issues`, and `next_steps` with ready parameters. A poor model is a verdict, not an error; regions and primitives stay for manual work. `reuse_regions` models corrected regions again (without cleaning).",
     ToSolidIn,
-    ToSolidOut,
+    auto::ToSolidReport,
     to_solid
 )];
