@@ -6,10 +6,11 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use surfacecraft_doc::{ObjectId, ObjectKind, QuadObject, SurfaceObject};
+use surfacecraft_fit::boundary::{Outline, cleaned_outline};
 use surfacecraft_fit::mls::ScanSurface;
 use surfacecraft_fit::orient::{FlipReport, flipped_patches, repair_orientation, repair_patches};
 use surfacecraft_fit::patch::{deviation, edge_normal_jumps};
-use surfacecraft_fit::retopo::{QuadMesh, RetopoOptions, retopo};
+use surfacecraft_fit::retopo::{QuadMesh, RetopoOptions, retopo, snap_to_outline};
 use surfacecraft_fit::segment::region_points;
 use surfacecraft_geom::{Bvh, KdTree, Mesh, Point3, Vec3};
 use surfacecraft_kernel::nurbs::{is_closed, sheet_from_bezier_network};
@@ -81,6 +82,12 @@ pub struct RetopoOut {
     pub closed: bool,
     /// Quads whose orientation is inverted against the scan normals (should be 0).
     pub folded: usize,
+    /// Open regions: free boundary loops of the layout conformed to the region outline.
+    pub outline_loops_conformed: usize,
+    /// Open regions: free boundary loops left as they were (no matching outline loop or order mismatch).
+    pub outline_loops_skipped: usize,
+    /// Open regions: faces added between the layout and the outline.
+    pub outline_ring_faces: usize,
     /// Quads whose patch was turned against the scan and that were turned around (repaired).
     pub repaired_patches: usize,
     /// Quads whose patch still runs against the scan (should be 0; `surface.auto` then refuses the layout).
@@ -203,6 +210,9 @@ pub(super) fn retopo_cmd(s: &mut Session, i: RetopoIn) -> CmdResult<RetopoOut> {
         euler: quads.euler(),
         closed: boundary.is_empty(),
         folded,
+        outline_loops_conformed: rep.boundary.conformed,
+        outline_loops_skipped: rep.boundary.skipped,
+        outline_ring_faces: rep.boundary.ring_faces,
         repaired_patches: flips.repaired,
         flipped_patches: flips.failed,
         snap_max,
@@ -269,6 +279,30 @@ pub(super) fn layout_radius(l: &QuadMesh, spacing: f64) -> f64 {
     (0.8 * layout_edge(l)).max(3.0 * spacing)
 }
 
+/// New boundary vertices of a split move onto the outline when within this fraction of the old edge length.
+const OUTLINE_SNAP_FRACTION: f64 = 0.4;
+
+/// The outline of the region under layout `q` (empty for a closed mesh).
+pub(super) fn outline_for(s: &Session, q: &QuadObject) -> CmdResult<Outline> {
+    let m =
+        s.doc.mesh(q.mesh).map(|m| m.mesh.clone()).ok_or_else(|| CmdError::Params(format!("no mesh {}", q.mesh)))?;
+    let sub = match q.region {
+        Some(r) => {
+            let tris =
+                s.doc.region(r).map(|r| r.triangles.to_vec()).ok_or_else(|| CmdError::Params("no region".into()))?;
+            m.submesh(&tris)
+        }
+        None => (*m).clone(),
+    };
+    Ok(cleaned_outline(&sub).0)
+}
+
+/// One split of the layout with its new free-boundary vertices put back onto the outline.
+pub(super) fn split_conformed(layout: &QuadMesh, scan: &ScanSurface, outline: &Outline, radius: f64) -> QuadMesh {
+    let split = layout.split(&projector(scan, radius));
+    snap_to_outline(&split, outline, OUTLINE_SNAP_FRACTION * layout_edge(layout))
+}
+
 /// Checks an unstructured layout read from a document (hostile files).
 pub(super) fn check_layout(q: &QuadObject) -> CmdResult<()> {
     let n = q.vertices.len();
@@ -315,7 +349,8 @@ pub(super) fn split_unstructured(s: &mut Session, id: ObjectId) -> CmdResult<Qua
     let (pts, point_normals, spacing) = scan_for(s, &q)?;
     let scan = ScanSurface::oriented(&pts, &point_normals);
     let layout = layout_of(&q);
-    let mut split = layout.split(&projector(&scan, layout_radius(&layout, spacing)));
+    let outline = outline_for(s, &q)?;
+    let mut split = split_conformed(&layout, &scan, &outline, layout_radius(&layout, spacing));
     let flips = orientation_check(&mut split, &scan, (&pts, &point_normals), spacing);
     let snap_max = {
         let bvh_pts = ScanSurface::new(&pts);
@@ -344,6 +379,7 @@ pub(super) fn auto_unstructured(s: &mut Session, q: &QuadObject, tol: f64, i: &A
         return Err(CmdError::Params(format!("the layout has more than max_patches = {max_patches} quads")));
     }
     let tree = KdTree::build(&pts);
+    let outline = outline_for(s, q)?;
     let mut refinements = 0usize;
     let mut flipped = false;
     let mut repaired = 0usize;
@@ -366,7 +402,7 @@ pub(super) fn auto_unstructured(s: &mut Session, q: &QuadObject, tol: f64, i: &A
         let dev = deviation(&set, &pts, 12);
         let can_split = layout.faces.len() * 4 <= max_patches && refinements < 3;
         if dev.max > tol && can_split {
-            layout = layout.split(&projector(&scan, radius));
+            layout = split_conformed(&layout, &scan, &outline, radius);
             refinements += 1;
             continue;
         }

@@ -1,9 +1,10 @@
 //! Working-mesh preparation, level chain, fallback layout and layout statistics.
 use super::field::boundary_neighbours;
-use super::{MAX_WORK_TRIANGLES, PolyMesh};
+use super::{ConformReport, MAX_WORK_TRIANGLES, PolyMesh, conform_to_outline};
+use crate::boundary::cleaned_outline;
 use std::collections::BTreeMap;
 use surfacecraft_geom::edit::{DecimateOptions, compact, decimate};
-use surfacecraft_geom::{Bvh, Mesh, synth};
+use surfacecraft_geom::{Bvh, KdTree, Mesh, Point3, Vec3, synth};
 
 pub(super) fn euler_of(m: &PolyMesh) -> i64 {
     let mut e = std::collections::BTreeSet::new();
@@ -135,4 +136,16 @@ pub(super) fn fallback(work: &Mesh, target_faces: usize, bvh: &Bvh) -> PolyMesh 
         normals.push(*n);
     }
     PolyMesh { vertices, normals, faces: m.triangles.iter().map(|t| t.to_vec()).collect() }
+}
+
+/// Conforms the layout of an open mesh to its outline (a closed mesh is left alone).
+pub(super) fn conform_layout(mesh: &Mesh, poly: &mut PolyMesh, edge: f64) -> ConformReport {
+    let (outline, clean) = cleaned_outline(mesh);
+    if outline.loops.is_empty() {
+        return ConformReport::default();
+    }
+    let normals = clean.vertex_normals();
+    let tree = KdTree::build(&clean.positions);
+    let normal_at = |p: &Point3| -> Option<Vec3> { tree.nearest(p).and_then(|(i, _)| normals.get(i)).copied() };
+    conform_to_outline(poly, &outline, edge, &normal_at)
 }

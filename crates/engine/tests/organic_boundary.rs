@@ -201,6 +201,12 @@ fn measure(s: &mut Session, mesh: &Mesh, tris: &[u32], target: usize) -> Measure
     let bvh = Bvh::build(&tess);
     let pts = region_vertices(mesh, tris);
     let max_all = pts.iter().filter_map(|p| bvh.closest(p, f64::INFINITY)).map(|h| h.distance).fold(0.0, f64::max);
+    let mut worst: Vec<(f64, Point3)> =
+        pts.iter().filter_map(|p| bvh.closest(p, f64::INFINITY).map(|h| (h.distance, *p))).collect();
+    worst.sort_by(|a, b| b.0.total_cmp(&a.0));
+    for (d, p) in worst.iter().take(8) {
+        eprintln!("  worst {d:.3} mm at ({:.2}, {:.2}, {:.2})", p.x, p.y, p.z);
+    }
     Measured {
         outside: auto["uncovered"].as_f64().unwrap(),
         max_all,

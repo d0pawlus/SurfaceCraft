@@ -10,6 +10,7 @@
 )]
 
 pub mod auto;
+pub mod boundary;
 pub mod charts;
 pub mod constrain;
 pub mod features;

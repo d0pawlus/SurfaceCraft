@@ -25,6 +25,7 @@
 //! coarse decimation (every triangle into three quads) and says so in the report.
 use surfacecraft_geom::{Bvh, Mesh, Point3, Vec3};
 
+mod conform;
 mod extract;
 mod field;
 mod polymesh;
@@ -32,9 +33,12 @@ mod polymesh;
 mod tests;
 mod util;
 
+pub use conform::{ConformReport, conform_to_outline, snap_to_outline};
 use extract::extract;
 use field::{Level, init_orientation, init_positions, level_of, prolong, smooth_orientation, smooth_positions};
-use util::{build_levels, euler_of, euler_of_mesh, fallback, irregular_fraction, is_closed, working_mesh};
+use util::{
+    build_levels, conform_layout, euler_of, euler_of_mesh, fallback, irregular_fraction, is_closed, working_mesh,
+};
 
 /// Largest polygon the extraction keeps.
 pub(super) const MAX_POLY: usize = 8;
@@ -111,6 +115,8 @@ pub struct RetopoReport {
     pub euler_ok: bool,
     /// Why the fallback was used.
     pub note: Option<String>,
+    /// How the layout was conformed to the outline of an open region.
+    pub boundary: ConformReport,
 }
 
 /// Retopologises `mesh` into a quad-dominant polygon mesh of about `opts.target_faces` faces.
@@ -118,6 +124,13 @@ pub struct RetopoReport {
 /// # Errors
 /// An error message when the mesh is empty or invalid.
 pub fn retopo(mesh: &Mesh, opts: &RetopoOptions) -> Result<(PolyMesh, RetopoReport), String> {
+    let (mut poly, mut report) = lay_out(mesh, opts)?;
+    report.boundary = conform_layout(mesh, &mut poly, report.edge_length);
+    Ok((poly, report))
+}
+
+/// The layout of the fields (or the fallback), before it is conformed to the region outline.
+fn lay_out(mesh: &Mesh, opts: &RetopoOptions) -> Result<(PolyMesh, RetopoReport), String> {
     mesh.validate().map_err(|e| e.to_string())?;
     if mesh.triangle_count() < 4 {
         return Err("the mesh has too few triangles".into());
@@ -146,6 +159,7 @@ pub fn retopo(mesh: &Mesh, opts: &RetopoOptions) -> Result<(PolyMesh, RetopoRepo
             irregular_fraction: irregular_fraction(&f),
             euler_ok: !closed || euler_of(&f) == chi,
             note: Some("fallback layout requested".into()),
+            boundary: ConformReport::default(),
         };
         return Ok((f, report));
     }
@@ -180,6 +194,7 @@ pub fn retopo(mesh: &Mesh, opts: &RetopoOptions) -> Result<(PolyMesh, RetopoRepo
         irregular_fraction: 0.0,
         euler_ok: true,
         note: None,
+        boundary: ConformReport::default(),
     };
     let extracted = extract(finest, &o, &p, rho, &bvh);
     let mut chosen: Option<PolyMesh> = None;
