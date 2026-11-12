@@ -249,41 +249,30 @@ fn tangent(points: &[Point3], k: usize) -> Vec3 {
     normalize(points[(k + 1) % n] - points[(k + n - 1) % n]).unwrap_or_else(Vec3::x)
 }
 
-/// The outline of one boundary loop, or `None` for loops too short to matter.
-fn outline_loop(mesh: &Mesh, normals: &[Vec3], tree: &KdTree, ids: &[u32], spacing: f64) -> Option<OutlineLoop> {
-    let raw: Vec<Point3> = ids.iter().filter_map(|&v| mesh.positions.get(v as usize).copied()).collect();
-    let length: f64 = (0..raw.len()).map(|k| (raw[(k + 1) % raw.len()] - raw[k]).norm()).sum();
-    if raw.len() < 3 || length < MIN_LOOP_SPACINGS * spacing {
-        return None;
-    }
-    let count = ((length / spacing).ceil() as usize).max(MIN_POINTS);
-    let step = length / count as f64;
-    let passes = (2.0 * (SMOOTH_SPACINGS * spacing / step).powi(2)).round().max(1.0) as usize;
-    let sampled = resample(&raw, count);
-    let smoothed = smooth(&sampled, passes, &BTreeSet::new());
+/// Smoothed polyline of a resampled loop with its corners: corners keep a lightly smoothed
+/// position and the arcs between them are smoothed around them.
+fn smooth_with_corners(sampled: &[Point3], passes: usize, spacing: f64) -> (Vec<Point3>, Vec<usize>) {
+    let smoothed = smooth(sampled, passes, &BTreeSet::new());
     let smoothed_step =
         (0..smoothed.len()).map(|k| (smoothed[(k + 1) % smoothed.len()] - smoothed[k]).norm()).sum::<f64>()
             / smoothed.len() as f64;
     let window = (CORNER_SPACINGS * spacing / smoothed_step.max(1e-9)).round() as usize;
     let corners = find_corners(&smoothed, window);
-    // corners keep a lightly smoothed position, the arcs between them are smoothed around them
-    let light = smooth(&sampled, 3, &BTreeSet::new());
+    let light = smooth(sampled, 3, &BTreeSet::new());
     let pinned: BTreeSet<usize> = corners.iter().copied().collect();
-    let mut base = smooth(&sampled, passes, &pinned);
+    let mut base = smooth(sampled, passes, &pinned);
     for &c in &corners {
         base[c] = light[c];
     }
-    let base = smooth(&base, passes, &pinned);
-    let normal_at = |p: &Point3| tree.nearest(p).and_then(|(i, _)| normals.get(i)).copied().unwrap_or_else(Vec3::z);
+    (smooth(&base, passes, &pinned), corners)
+}
+
+/// The curve pushed outward by `delta` per point (corners along the bisector of their sides).
+fn offset_loop(base: &[Point3], corners: Vec<usize>, outward: &[Vec3], delta: &[f64]) -> OutlineLoop {
     let n = base.len();
-    let outward: Vec<Vec3> =
-        (0..n).map(|k| normalize(tangent(&base, k).cross(&normal_at(&base[k]))).unwrap_or_else(Vec3::y)).collect();
-    let probe = OutlineLoop { points: base.clone(), corners: corners.clone(), outward: outward.clone() };
-    let delta = enclosing_offsets(&probe, &raw, spacing);
-    let mut points = Vec::with_capacity(n);
-    let mut dirs = Vec::with_capacity(n);
+    let (mut points, mut dirs) = (Vec::with_capacity(n), Vec::with_capacity(n));
     for k in 0..n {
-        if pinned.contains(&k) {
+        if corners.contains(&k) {
             let (before, after) = (outward[(k + n - 1) % n], outward[(k + 1) % n]);
             let d = normalize(before + after).unwrap_or(before);
             let reach = delta[(k + n - 1) % n].max(delta[k]).max(delta[(k + 1) % n]);
@@ -294,7 +283,26 @@ fn outline_loop(mesh: &Mesh, normals: &[Vec3], tree: &KdTree, ids: &[u32], spaci
             dirs.push(outward[k]);
         }
     }
-    Some(OutlineLoop { points, corners, outward: dirs })
+    OutlineLoop { points, corners, outward: dirs }
+}
+
+/// The outline of one boundary loop, or `None` for loops too short to matter.
+fn outline_loop(mesh: &Mesh, normals: &[Vec3], tree: &KdTree, ids: &[u32], spacing: f64) -> Option<OutlineLoop> {
+    let raw: Vec<Point3> = ids.iter().filter_map(|&v| mesh.positions.get(v as usize).copied()).collect();
+    let length: f64 = (0..raw.len()).map(|k| (raw[(k + 1) % raw.len()] - raw[k]).norm()).sum();
+    if raw.len() < 3 || length < MIN_LOOP_SPACINGS * spacing {
+        return None;
+    }
+    let count = ((length / spacing).ceil() as usize).max(MIN_POINTS);
+    let step = length / count as f64;
+    let passes = (2.0 * (SMOOTH_SPACINGS * spacing / step).powi(2)).round().max(1.0) as usize;
+    let (base, corners) = smooth_with_corners(&resample(&raw, count), passes, spacing);
+    let normal_at = |p: &Point3| tree.nearest(p).and_then(|(i, _)| normals.get(i)).copied().unwrap_or_else(Vec3::z);
+    let outward: Vec<Vec3> = (0..base.len())
+        .map(|k| normalize(tangent(&base, k).cross(&normal_at(&base[k]))).unwrap_or_else(Vec3::y))
+        .collect();
+    let probe = OutlineLoop { points: base.clone(), corners: corners.clone(), outward: outward.clone() };
+    Some(offset_loop(&base, corners, &outward, &enclosing_offsets(&probe, &raw, spacing)))
 }
 
 /// Per point of `base`, how far outward it must move so that the curve contains every raw

@@ -134,7 +134,7 @@ pub(super) fn retopo_cmd(s: &mut Session, i: RetopoIn) -> CmdResult<RetopoOut> {
     let normals = m.vertex_normals();
     let (pts, point_normals) = region_points(&m, &normals, &tris);
     let scan = ScanSurface::oriented(&pts, &point_normals);
-    // layout from the fields; folded quads (rare, at field defects) trigger the fallback layout
+    // layout from the fields; folded or flipped quads (rare, at field defects) trigger the fallback layout
     let spacing = mean_edge(&m, &tris);
     let mut attempt = 0;
     let (quads, rep, field_faces, field_quads, folded, flips) = loop {
@@ -217,7 +217,7 @@ pub(super) fn retopo_cmd(s: &mut Session, i: RetopoIn) -> CmdResult<RetopoOut> {
         flipped_patches: flips.failed,
         snap_max,
         note: if attempt > 0 {
-            Some("the field layout had folded quads; the fallback layout was used".into())
+            Some("the field layout had folded or flipped quads; the fallback layout was used".into())
         } else {
             rep.note
         },

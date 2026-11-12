@@ -157,51 +157,90 @@ fn sector_corner(theta: f64, spoke_angles: &[(f64, usize)]) -> usize {
     if j == (i + 1) % n { j } else { i }
 }
 
-/// Every region split into one patch per corner (see the module documentation).
-pub(crate) fn ngon_patches(recs: &[RegionRec], curves: &[Vec<Vec3>], first_new_id: u32, degree: usize) -> Patches {
-    let halves: Vec<(Vec<Vec3>, Vec<Vec3>)> = curves.iter().map(|c| split_bezier(c, 0.5)).collect();
-    let mid_id = |c: usize| first_new_id + c as u32;
-    let centre_base = first_new_id + curves.len() as u32;
-    let mut out = Patches::default();
-    out.extra_points.extend(halves.iter().map(|h| h.0.last().copied().map_or([0.0; 3], a3)));
-    for (r, rec) in recs.iter().enumerate() {
+/// Cut curves shared by all regions, and the ids of the points the split adds.
+struct Split<'a> {
+    curves: &'a [Vec<Vec3>],
+    /// First and second half of every curve (de Casteljau at its midpoint).
+    halves: Vec<(Vec<Vec3>, Vec<Vec3>)>,
+    first_new_id: u32,
+    degree: usize,
+}
+
+impl Split<'_> {
+    fn mid_id(&self, curve: usize) -> u32 {
+        self.first_new_id + curve as u32
+    }
+
+    fn centre_id(&self, region: usize) -> u32 {
+        self.first_new_id + self.curves.len() as u32 + region as u32
+    }
+
+    /// Control points of the first (`first`) or second half of side `side`, read from corner `side`
+    /// (first half) or toward corner `side + 1` (second half).
+    fn half(&self, rec: &RegionRec, side: usize, first: bool) -> Vec<Vec3> {
+        let Some((lo, hi)) = rec.sides.get(side).and_then(|&c| self.halves.get(c)) else { return Vec::new() };
+        match (first, rec.forward.get(side).copied().unwrap_or(true)) {
+            (true, true) => lo.clone(),
+            (true, false) => reversed(hi),
+            (false, true) => hi.clone(),
+            (false, false) => reversed(lo),
+        }
+    }
+
+    /// The patches of region `r` (one per corner) and the centre point.
+    fn region(&self, r: usize, rec: &RegionRec) -> (Vec<(NetN, [u32; 4])>, Vec3) {
         let n = rec.corners.len();
         let pts: Vec<Point3> = rec.points.iter().map(|p| Point3::from(*p)).collect();
         let axis = rec.mean_normal.try_normalize(1e-12).unwrap_or_else(Vec3::z);
         let surface = Surface::new(&pts, axis);
         let centroid = rec.points.iter().sum::<Vec3>() / rec.points.len().max(1) as f64;
         let centre = surface.snap(&centroid);
+        let mids: Vec<Vec3> = (0..n)
+            .map(|k| {
+                rec.sides.get(k).and_then(|&c| self.halves.get(c)).and_then(|h| h.0.last().copied()).unwrap_or(centre)
+            })
+            .collect();
+        let spokes: Vec<Vec<Vec3>> = mids.iter().map(|m| spoke(&surface, &centre, m, self.degree)).collect();
+        let assigned = partition(rec, &centre, &mids, &axis);
+        let patches = (0..n)
+            .map(|k| {
+                let prev = (k + n - 1) % n;
+                let (bottom, left) = (self.half(rec, k, true), reversed(&self.half(rec, prev, false)));
+                let (right, top) = (reversed(&spokes[k]), reversed(&spokes[prev]));
+                let ids = [rec.corners[k], self.mid_id(rec.sides[k]), self.centre_id(r), self.mid_id(rec.sides[prev])];
+                finish_net([&bottom, &right, &top, &left], ids, &assigned[k], &rec.mean_normal)
+            })
+            .collect();
+        (patches, centre)
+    }
+}
+
+/// The region's points split by the angle around the centre between neighbouring spokes: the
+/// points of the patch at corner `k`.
+fn partition(rec: &RegionRec, centre: &Vec3, mids: &[Vec3], axis: &Vec3) -> Vec<Vec<Vec3>> {
+    let e1 = any_perpendicular(axis);
+    let e2 = axis.cross(&e1);
+    let mut angles: Vec<(f64, usize)> =
+        mids.iter().enumerate().map(|(k, m)| (angle_around(m, centre, &e1, &e2), k)).collect();
+    angles.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut assigned: Vec<Vec<Vec3>> = vec![Vec::new(); mids.len()];
+    for p in &rec.points {
+        assigned[sector_corner(angle_around(p, centre, &e1, &e2), &angles)].push(*p);
+    }
+    assigned
+}
+
+/// Every region split into one patch per corner (see the module documentation). New point ids
+/// start at `first_new_id`: one per curve (its midpoint), then one per region (its centre).
+pub(crate) fn ngon_patches(recs: &[RegionRec], curves: &[Vec<Vec3>], first_new_id: u32, degree: usize) -> Patches {
+    let halves = curves.iter().map(|c| split_bezier(c, 0.5)).collect();
+    let split = Split { curves, halves, first_new_id, degree };
+    let mut out = Patches::default();
+    out.extra_points.extend(split.halves.iter().map(|h| h.0.last().copied().map_or([0.0; 3], a3)));
+    for (r, rec) in recs.iter().enumerate() {
+        let (patches, centre) = split.region(r, rec);
         out.extra_points.push(a3(centre));
-        let mids: Vec<Vec3> = (0..n).map(|k| halves[rec.sides[k]].0.last().copied().unwrap_or(centre)).collect();
-        let spokes: Vec<Vec<Vec3>> = mids.iter().map(|m| spoke(&surface, &centre, m, degree)).collect();
-        // sector partition of the region's points
-        let e1 = any_perpendicular(&axis);
-        let e2 = axis.cross(&e1);
-        let mut angles: Vec<(f64, usize)> =
-            mids.iter().enumerate().map(|(k, m)| (angle_around(m, &centre, &e1, &e2), k)).collect();
-        angles.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let mut assigned: Vec<Vec<Vec3>> = vec![Vec::new(); n];
-        for p in &rec.points {
-            assigned[sector_corner(angle_around(p, &centre, &e1, &e2), &angles)].push(*p);
-        }
-        for k in 0..n {
-            let prev = (k + n - 1) % n;
-            // the first half of side k leaves corner k, the second half of side prev arrives at it
-            let half = |side: usize, first: bool| -> Vec<Vec3> {
-                let (lo, hi) = &halves[rec.sides[side]];
-                match (first, rec.forward[side]) {
-                    (true, true) => lo.clone(),
-                    (true, false) => reversed(hi),
-                    (false, true) => hi.clone(),
-                    (false, false) => reversed(lo),
-                }
-            };
-            let bottom = half(k, true);
-            let left = reversed(&half(prev, false));
-            let right = reversed(&spokes[k]);
-            let top = reversed(&spokes[prev]);
-            let ids = [rec.corners[k], mid_id(rec.sides[k]), centre_base + r as u32, mid_id(rec.sides[prev])];
-            let (net, corners) = finish_net([&bottom, &right, &top, &left], ids, &assigned[k], &rec.mean_normal);
+        for (k, (net, corners)) in patches.into_iter().enumerate() {
             out.nets.push(net);
             out.corners.push(corners);
             out.region_triangles.push(if k == 0 { rec.triangles.clone() } else { Vec::new() });
