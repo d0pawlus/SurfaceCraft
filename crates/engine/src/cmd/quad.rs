@@ -48,6 +48,12 @@ pub struct QuadInfo {
     pub creases: (Vec<usize>, Vec<usize>),
     /// Largest distance of a cage vertex from the scan after snapping (mm).
     pub snap_max: f64,
+    /// Unstructured split: quads turned against the scan that were repaired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repaired_patches: Option<usize>,
+    /// Unstructured split: quads still turned against the scan (should be 0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flipped_patches: Option<usize>,
 }
 
 fn points_of(s: &Session, mesh: ObjectId, region: Option<ObjectId>) -> CmdResult<(Arc<Mesh>, Vec<Point3>, Vec<Vec3>)> {
@@ -108,7 +114,15 @@ fn snap(s: &mut Session, id: ObjectId) -> CmdResult<QuadInfo> {
         mq.vertices = verts;
     }
     let q = s.doc.quad(id).ok_or_else(|| CmdError::Params(format!("no quad layout {id}")))?;
-    Ok(QuadInfo { id, nu: q.nu, nv: q.nv, creases: (q.crease_u.clone(), q.crease_v.clone()), snap_max: max })
+    Ok(QuadInfo {
+        id,
+        nu: q.nu,
+        nv: q.nv,
+        creases: (q.crease_u.clone(), q.crease_v.clone()),
+        snap_max: max,
+        repaired_patches: None,
+        flipped_patches: None,
+    })
 }
 
 /// Create parameters.
@@ -269,7 +283,15 @@ fn crease(s: &mut Session, i: CreaseIn) -> CmdResult<QuadInfo> {
         list.dedup();
     }
     let q = s.doc.quad(id).ok_or_else(|| CmdError::Params(format!("no quad layout {id}")))?;
-    Ok(QuadInfo { id, nu: q.nu, nv: q.nv, creases: (q.crease_u.clone(), q.crease_v.clone()), snap_max: 0.0 })
+    Ok(QuadInfo {
+        id,
+        nu: q.nu,
+        nv: q.nv,
+        creases: (q.crease_u.clone(), q.crease_v.clone()),
+        snap_max: 0.0,
+        repaired_patches: None,
+        flipped_patches: None,
+    })
 }
 
 /// AutoSurface parameters.
@@ -335,6 +357,12 @@ pub struct AutoOut {
     /// Unstructured layouts: quads of the final layout whose orientation is inverted against the scan normals.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub folded: Option<usize>,
+    /// Unstructured layouts: flipped patches (normal against the scan) that were repaired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repaired_patches: Option<usize>,
+    /// Unstructured layouts: flipped patches left in the result (a network with one is an error, so 0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flipped_patches: Option<usize>,
     /// Unstructured layouts: how many times the layout was split to reach the tolerance.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refinements: Option<usize>,
@@ -437,6 +465,8 @@ fn auto(s: &mut Session, i: AutoIn) -> CmdResult<AutoOut> {
         refinements: None,
         uncovered: None,
         folded: None,
+        repaired_patches: None,
+        flipped_patches: None,
     })
 }
 

@@ -7,10 +7,11 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use surfacecraft_doc::{ObjectId, ObjectKind, QuadObject, SurfaceObject};
 use surfacecraft_fit::mls::ScanSurface;
-use surfacecraft_fit::patch::{build_patches, deviation, edge_normal_jumps};
+use surfacecraft_fit::orient::{FlipReport, flipped_patches, repair_orientation, repair_patches};
+use surfacecraft_fit::patch::{deviation, edge_normal_jumps};
 use surfacecraft_fit::retopo::{QuadMesh, RetopoOptions, retopo};
 use surfacecraft_fit::segment::region_points;
-use surfacecraft_geom::{Bvh, Mesh, Point3, Vec3};
+use surfacecraft_geom::{Bvh, KdTree, Mesh, Point3, Vec3};
 use surfacecraft_kernel::nurbs::{is_closed, sheet_from_bezier_network};
 
 /// Mean triangle edge length of `tris` (the scan's sampling distance), mm.
@@ -80,6 +81,10 @@ pub struct RetopoOut {
     pub closed: bool,
     /// Quads whose orientation is inverted against the scan normals (should be 0).
     pub folded: usize,
+    /// Quads whose patch was turned against the scan and that were turned around (repaired).
+    pub repaired_patches: usize,
+    /// Quads whose patch still runs against the scan (should be 0; `surface.auto` then refuses the layout).
+    pub flipped_patches: usize,
     /// Largest distance of a layout vertex from the scan (mm).
     pub snap_max: f64,
     /// Why the fallback was used.
@@ -123,8 +128,9 @@ pub(super) fn retopo_cmd(s: &mut Session, i: RetopoIn) -> CmdResult<RetopoOut> {
     let (pts, point_normals) = region_points(&m, &normals, &tris);
     let scan = ScanSurface::oriented(&pts, &point_normals);
     // layout from the fields; folded quads (rare, at field defects) trigger the fallback layout
+    let spacing = mean_edge(&m, &tris);
     let mut attempt = 0;
-    let (quads, rep, field_faces, field_quads, folded) = loop {
+    let (quads, rep, field_faces, field_quads, folded, flips) = loop {
         let (mut poly, rep) =
             retopo(&sub, &RetopoOptions { force_fallback: attempt > 0, ..opts.clone() }).map_err(CmdError::Failed)?;
         let radius = (0.6 * rep.edge_length).max(3.0 * mean_edge(&m, &tris));
@@ -143,9 +149,10 @@ pub(super) fn retopo_cmd(s: &mut Session, i: RetopoIn) -> CmdResult<RetopoOut> {
             None => poly.split_to_quads(&project),
         };
         quads.relax(8, &project);
+        let flips = orientation_check(&mut quads, &scan, (&pts, &point_normals), spacing);
         let folded = quads.folded();
-        if folded == 0 || attempt > 0 {
-            break (quads, rep, field_faces, field_quads, folded);
+        if (folded == 0 && flips.failed == 0) || attempt > 0 {
+            break (quads, rep, field_faces, field_quads, folded, flips);
         }
         attempt += 1;
     };
@@ -196,6 +203,8 @@ pub(super) fn retopo_cmd(s: &mut Session, i: RetopoIn) -> CmdResult<RetopoOut> {
         euler: quads.euler(),
         closed: boundary.is_empty(),
         folded,
+        repaired_patches: flips.repaired,
+        flipped_patches: flips.failed,
         snap_max,
         note: if attempt > 0 {
             Some("the field layout had folded quads; the fallback layout was used".into())
@@ -203,6 +212,21 @@ pub(super) fn retopo_cmd(s: &mut Session, i: RetopoIn) -> CmdResult<RetopoOut> {
             rep.note
         },
     })
+}
+
+/// Detects quads whose patch runs against the scan and turns them around (the change persists in
+/// `layout`); `scan_points` are the scan points with their oriented normals.
+pub(super) fn orientation_check(
+    layout: &mut QuadMesh,
+    scan: &ScanSurface,
+    scan_points: (&[Point3], &[Vec3]),
+    spacing: f64,
+) -> FlipReport {
+    let (pts, normals) = scan_points;
+    let tree = KdTree::build(pts);
+    let reference = |p: &Point3| tree.nearest(p).and_then(|(k, _)| normals.get(k)).copied();
+    let radius = layout_radius(layout, spacing);
+    repair_orientation(layout, scan, radius, &reference)
 }
 
 /// The unstructured layout of a quad object.
@@ -271,7 +295,15 @@ pub(super) fn scan_for(s: &Session, q: &QuadObject) -> CmdResult<(Vec<Point3>, V
 }
 
 pub(super) fn info_of(q: &QuadObject, snap_max: f64) -> QuadInfo {
-    QuadInfo { id: q.id, nu: q.nu, nv: q.nv, creases: (q.crease_u.clone(), q.crease_v.clone()), snap_max }
+    QuadInfo {
+        id: q.id,
+        nu: q.nu,
+        nv: q.nv,
+        creases: (q.crease_u.clone(), q.crease_v.clone()),
+        snap_max,
+        repaired_patches: None,
+        flipped_patches: None,
+    }
 }
 
 pub(super) fn split_unstructured(s: &mut Session, id: ObjectId) -> CmdResult<QuadInfo> {
@@ -283,7 +315,8 @@ pub(super) fn split_unstructured(s: &mut Session, id: ObjectId) -> CmdResult<Qua
     let (pts, point_normals, spacing) = scan_for(s, &q)?;
     let scan = ScanSurface::oriented(&pts, &point_normals);
     let layout = layout_of(&q);
-    let split = layout.split(&projector(&scan, layout_radius(&layout, spacing)));
+    let mut split = layout.split(&projector(&scan, layout_radius(&layout, spacing)));
+    let flips = orientation_check(&mut split, &scan, (&pts, &point_normals), spacing);
     let snap_max = {
         let bvh_pts = ScanSurface::new(&pts);
         split.vertices.iter().filter_map(|p| bvh_pts.nearest(p)).map(|x| x.1).fold(0.0, f64::max)
@@ -294,7 +327,7 @@ pub(super) fn split_unstructured(s: &mut Session, id: ObjectId) -> CmdResult<Qua
         m.faces = split.faces;
     }
     let q = s.doc.quad(id).ok_or_else(|| CmdError::Params(format!("no quad layout {id}")))?;
-    Ok(info_of(q, snap_max))
+    Ok(QuadInfo { repaired_patches: Some(flips.repaired), flipped_patches: Some(flips.failed), ..info_of(q, snap_max) })
 }
 
 /// AutoSurface of an unstructured layout: bicubic patches, refined until within `tol`.
@@ -310,11 +343,23 @@ pub(super) fn auto_unstructured(s: &mut Session, q: &QuadObject, tol: f64, i: &A
     if layout.faces.len() > max_patches {
         return Err(CmdError::Params(format!("the layout has more than max_patches = {max_patches} quads")));
     }
+    let tree = KdTree::build(&pts);
     let mut refinements = 0usize;
     let mut flipped = false;
+    let mut repaired = 0usize;
     loop {
         let radius = layout_radius(&layout, spacing);
-        let set = build_patches(&layout, &scan, radius);
+        // the reference normal of the scan; a layout turned around as a whole reads it reversed
+        let sign = if flipped { -1.0 } else { 1.0 };
+        let reference = |p: &Point3| tree.nearest(p).and_then(|(k, _)| point_normals.get(k)).map(|n| n * sign);
+        let (set, report) = repair_patches(&mut layout, &scan, radius, &reference);
+        repaired += report.repaired;
+        if report.failed > 0 {
+            return Err(CmdError::Failed(format!(
+                "{} patches stay flipped against the scan after repair; retopologise again (fewer quads) or clean the region",
+                report.failed
+            )));
+        }
         if set.nets.len() != layout.faces.len() {
             return Err(CmdError::Failed("the layout has quads with missing edges".into()));
         }
@@ -387,6 +432,8 @@ pub(super) fn auto_unstructured(s: &mut Session, q: &QuadObject, tol: f64, i: &A
             refinements: Some(refinements),
             uncovered: Some(dev.uncovered),
             folded: Some(layout.folded()),
+            repaired_patches: Some(repaired),
+            flipped_patches: Some(flipped_patches(&set, &reference).len()),
         });
     }
 }

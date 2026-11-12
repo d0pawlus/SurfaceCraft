@@ -15,6 +15,7 @@ pub mod constrain;
 pub mod features;
 pub mod lm;
 pub mod mls;
+pub mod orient;
 pub mod outline;
 pub mod patch;
 pub mod plane;
