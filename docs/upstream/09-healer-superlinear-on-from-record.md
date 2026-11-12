@@ -86,6 +86,6 @@ scan. Our limit follows from it: `MAX_NETWORK_PATCHES = 120 000`.
 true)`, no healer) and, when that conversion fails, retries with the healer (`from_record(rec, false)`); records up to
 2 000 faces take the healer path first. It checks no provenance of the record. `crates/kernel/src/nurbs.rs` builds a
 network of more than 2 000 patches without the healer, after its own checks (shared boundary curves and corners, every
-edge in at most two faces, every shared edge traversed in opposite directions, a closed component enclosing a positive
-volume). So a large body from a source other than that builder is converted without healing unless the trusted
+edge in at most two faces, neighbouring patches made to agree in direction, and a single closed component turned outward
+by the exact signed volume of its patches; several closed components keep the orientation they were given). So a large body from a source other than that builder is converted without healing unless the trusted
 conversion fails first, and the healer's cost stays what the table above shows if that fallback is taken.

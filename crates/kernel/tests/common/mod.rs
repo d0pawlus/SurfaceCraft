@@ -158,3 +158,87 @@ pub fn flip_patch(net: &mut Network, f: usize) {
 pub fn edges_are_consistent(record: &Brep) -> bool {
     record.edges.iter().all(|e| e.uses.len() == 2 && e.uses[0].upper != e.uses[1].upper)
 }
+
+/// The network of patches given as functions `(u, v) -> point` that are polynomials of degree
+/// `degree` (1 or 2) in each parameter; corner ids follow the corner positions.
+pub fn network_from_fns(fns: &[&dyn Fn(f64, f64) -> [f64; 3]], degree: usize) -> Network {
+    let mut ids: BTreeMap<[i64; 3], u32> = BTreeMap::new();
+    let mut patches = Vec::new();
+    let mut corners = Vec::new();
+    for f in fns {
+        let grid: Vec<Vec<[f64; 3]>> = (0..=degree)
+            .map(|i| (0..=degree).map(|j| f(i as f64 / degree as f64, j as f64 / degree as f64)).collect())
+            .collect();
+        let net = if degree == 1 { grid } else { bezier_of_samples(&grid) };
+        let mut id = |p: [f64; 3]| {
+            let next = ids.len() as u32;
+            *ids.entry(p.map(|x| (x * 1e6).round() as i64)).or_insert(next)
+        };
+        corners.push([id(f(0.0, 0.0)), id(f(1.0, 0.0)), id(f(1.0, 1.0)), id(f(0.0, 1.0))]);
+        patches.push(net);
+    }
+    Network { patches, corners, radius: 0.0 }
+}
+
+/// Bézier control net of degree 2 from the samples at 0, 1/2 and 1 in each parameter.
+fn bezier_of_samples(g: &[Vec<[f64; 3]>]) -> Vec<Vec<[f64; 3]>> {
+    let mid = |a: [f64; 3], m: [f64; 3], b: [f64; 3]| -> [f64; 3] {
+        std::array::from_fn(|k| 2.0 * m[k] - 0.5 * a[k] - 0.5 * b[k])
+    };
+    let rows: Vec<Vec<[f64; 3]>> = g.iter().map(|r| vec![r[0], mid(r[0], r[1], r[2]), r[2]]).collect();
+    let middle: Vec<[f64; 3]> = (0..3).map(|j| mid(rows[0][j], rows[1][j], rows[2][j])).collect();
+    vec![rows[0].clone(), middle, rows[2].clone()]
+}
+
+/// The faces of the record have the control nets of the network, in the order and orientation given.
+pub fn faces_are_as_given(record: &Brep, net: &Network) -> bool {
+    record.faces.len() == net.patches.len()
+        && record
+            .faces
+            .iter()
+            .zip(&net.patches)
+            .all(|(f, p)| matches!(&f.surface, Surface::Spline { points, .. } if points == p))
+}
+
+/// 64 bit FNV-1a of the record's JSON: a fingerprint of the whole record.
+pub fn record_fingerprint(record: &Brep) -> u64 {
+    let text = serde_json::to_string(record).unwrap_or_default();
+    text.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// The thin enclosure of the review: the region between z = 0 and z = 0.01 + (u - v)^2 over the unit
+/// square, six biquadratic patches (top, bottom, four ruled walls), all oriented outward. Its
+/// volume is 0.01 + 1/6.
+pub fn thin_enclosure() -> Network {
+    let z = |x: f64, y: f64| 0.01 + (x - y) * (x - y);
+    let top = |u: f64, v: f64| [u, v, z(u, v)];
+    let bottom = |u: f64, v: f64| [v, u, 0.0];
+    let w0 = |u: f64, v: f64| [0.0, v, u * z(0.0, v)];
+    let w1 = |u: f64, v: f64| [1.0, u, v * z(1.0, u)];
+    let w2 = |u: f64, v: f64| [u, 0.0, v * z(u, 0.0)];
+    let w3 = |u: f64, v: f64| [v, 1.0, u * z(v, 1.0)];
+    network_from_fns(&[&top, &bottom, &w0, &w1, &w2, &w3], 2)
+}
+
+/// A box `1 x 1 x 0.001` at `origin`, six bilinear patches oriented outward.
+pub fn thin_box(origin: [f64; 3]) -> Network {
+    let p = |x: f64, y: f64, z: f64| [origin[0] + x, origin[1] + y, origin[2] + z * 0.001];
+    let bottom = |u: f64, v: f64| p(v, u, 0.0);
+    let top = |u: f64, v: f64| p(u, v, 1.0);
+    let front = |u: f64, v: f64| p(u, 0.0, v);
+    let back = |u: f64, v: f64| p(v, 1.0, u);
+    let left = |u: f64, v: f64| p(0.0, v, u);
+    let right = |u: f64, v: f64| p(1.0, u, v);
+    network_from_fns(&[&bottom, &top, &front, &back, &left, &right], 1)
+}
+
+/// Two coincident sheets with opposite normals: closed, consistent, and no volume at all.
+pub fn pillow() -> Network {
+    let sheet = |u: f64, v: f64| [u, v, 0.0];
+    let mut net = network_from_fns(&[&sheet], 1);
+    let c = net.corners[0];
+    net.patches.push(net.patches[0].clone());
+    net.corners.push(c);
+    flip_patch(&mut net, 1);
+    net
+}

@@ -15,6 +15,7 @@ use solidcore::nurbs::srf_basic::Surface as Nurb;
 use solidcore::query::api_queries::surface_closest_point;
 use solidcore::surface::surface::{Surface as KSurface, SurfaceKind};
 
+mod bezier_volume;
 mod network_check;
 mod orientation;
 mod trim;
@@ -518,13 +519,22 @@ pub(crate) fn canonicalize(mut b: Brep) -> Brep {
 /// must be consistent over the layout. With every edge used twice the shell is closed and the
 /// result is a solid. At most [`MAX_NETWORK_PATCHES`] patches; above 2000 the kernel's healer is
 /// skipped as in [`sheet_from_bezier_network_as_is`] (it grows faster than linearly).
+///
+/// Orientation (where the healer is skipped): patches that run against a neighbour are flipped,
+/// the lowest patch of a connected component keeping its side; a network with exactly one closed
+/// component is turned outward when it encloses a negative volume, and refused when the volume
+/// cannot be told from zero. With several closed components (a cavity) each keeps the
+/// orientation it was given. See the `orientation` module.
 pub fn sheet_from_bezier_network(patches: &[Vec<Vec<[f64; 3]>>], corners: &[[u32; 4]]) -> Result<Brep> {
     bezier_network(patches, corners, true)
 }
 
 /// [`sheet_from_bezier_network`] without the kernel's healer: for networks of thousands of
 /// patches, where the healer takes minutes. The checks of this function still apply (finite
-/// control points, shared boundary curves and corners, every edge used at most twice).
+/// control points, shared boundary curves and corners, every edge used at most twice) and the
+/// orientation pass of [`sheet_from_bezier_network`]: neighbouring patches are made to agree
+/// (the lowest patch of a component keeps its side), a single closed component is turned
+/// outward, several closed components keep the orientation they were given.
 ///
 /// # Errors
 /// As [`sheet_from_bezier_network`].

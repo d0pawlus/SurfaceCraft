@@ -3,7 +3,10 @@
 //! builds it as a record of its own and checks it without the budget.
 mod common;
 
-use common::{cube_sphere, edges_are_consistent, flip_patch, n_for, sphere_volume};
+use common::{
+    cube_sphere, edges_are_consistent, faces_are_as_given, flip_patch, n_for, pillow, record_fingerprint,
+    sphere_volume, thin_box, thin_enclosure,
+};
 use surfacecraft_kernel::nurbs::{
     MAX_NETWORK_PATCHES, is_closed, sheet_from_bezier_network, sheet_from_bezier_network_as_is,
 };
@@ -132,4 +135,50 @@ fn an_inside_out_network_with_a_flipped_patch_is_turned_outward() {
     let sheet = sheet_from_bezier_network_as_is(&net.patches, &net.corners).expect("repaired");
     let volume = solid::volume(&sheet).expect("volume");
     assert!(volume > 0.0 && (volume - baseline).abs() <= 1e-9 * baseline, "volume {volume} vs {baseline}");
+}
+
+#[test]
+fn a_thin_enclosure_keeps_its_outward_orientation() {
+    let net = thin_enclosure();
+    let sheet = sheet_from_bezier_network_as_is(&net.patches, &net.corners).expect("builds");
+    assert!(is_closed(&sheet) && faces_are_as_given(&sheet, &net));
+    let volume = solid::volume(&sheet).expect("volume");
+    assert!((volume - (0.01 + 1.0 / 6.0)).abs() < 1e-9, "volume {volume}");
+}
+
+#[test]
+fn a_thin_box_far_from_the_origin_keeps_its_orientation() {
+    let net = thin_box([1.0e6; 3]);
+    let sheet = sheet_from_bezier_network_as_is(&net.patches, &net.corners).expect("builds");
+    assert!(is_closed(&sheet) && faces_are_as_given(&sheet, &net));
+}
+
+#[test]
+fn an_inside_out_thin_enclosure_is_turned_outward() {
+    let given = thin_enclosure();
+    let mut net = thin_enclosure();
+    (0..net.patches.len()).for_each(|f| flip_patch(&mut net, f));
+    let sheet = sheet_from_bezier_network_as_is(&net.patches, &net.corners).expect("turned outward");
+    assert!(faces_are_as_given(&sheet, &given));
+}
+
+#[test]
+fn a_closed_network_without_volume_is_refused() {
+    let net = pillow();
+    let text = sheet_from_bezier_network_as_is(&net.patches, &net.corners).map(|_| ()).map_err(|e| e.to_string());
+    assert!(text.as_ref().is_err_and(|m| m.contains("volume")), "{text:?}");
+}
+
+/// Fingerprint of the 12 150 patch record built before the orientation pass existed.
+const RECORD_FINGERPRINT_12150: u64 = 7_837_018_526_937_721_461;
+
+#[test]
+fn the_record_of_a_consistent_network_is_what_it_was_before_the_pass() {
+    let net = cube_sphere(n_for(12_000), RADIUS);
+    let sheet = sheet_from_bezier_network_as_is(&net.patches, &net.corners).expect("builds");
+    assert!(faces_are_as_given(
+        &sheet,
+        &common::Network { patches: net.patches.clone(), corners: net.corners.clone(), radius: net.radius }
+    ));
+    assert_eq!(record_fingerprint(&sheet), RECORD_FINGERPRINT_12150);
 }
