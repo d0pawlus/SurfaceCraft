@@ -15,7 +15,11 @@ use solidcore::nurbs::srf_basic::Surface as Nurb;
 use solidcore::query::api_queries::surface_closest_point;
 use solidcore::surface::surface::{Surface as KSurface, SurfaceKind};
 
+mod bezier_volume;
+mod network_check;
+mod orientation;
 mod trim;
+pub use network_check::MAX_NETWORK_PATCHES;
 pub use trim::{MAX_OUTLINE_CORNERS, trimmed_sheet};
 
 /// Largest control net accepted (per direction).
@@ -513,14 +517,24 @@ pub(crate) fn canonicalize(mut b: Brep) -> Brep {
 /// `[n][n]`, `[0][n]`. Patches that share a layout edge must carry identical control points
 /// along it (checked), so the kernel sees one shared edge; faces are oriented by `u × v`, which
 /// must be consistent over the layout. With every edge used twice the shell is closed and the
-/// result is a solid.
+/// result is a solid. At most [`MAX_NETWORK_PATCHES`] patches; above 2000 the kernel's healer is
+/// skipped as in [`sheet_from_bezier_network_as_is`] (it grows faster than linearly).
+///
+/// Orientation (where the healer is skipped): patches that run against a neighbour are flipped,
+/// the lowest patch of a connected component keeping its side; a network with exactly one closed
+/// component is turned outward when it encloses a negative volume, and refused when the volume
+/// cannot be told from zero. With several closed components (a cavity) each keeps the
+/// orientation it was given. See the `orientation` module.
 pub fn sheet_from_bezier_network(patches: &[Vec<Vec<[f64; 3]>>], corners: &[[u32; 4]]) -> Result<Brep> {
     bezier_network(patches, corners, true)
 }
 
 /// [`sheet_from_bezier_network`] without the kernel's healer: for networks of thousands of
 /// patches, where the healer takes minutes. The checks of this function still apply (finite
-/// control points, shared boundary curves and corners, every edge used at most twice).
+/// control points, shared boundary curves and corners, every edge used at most twice) and the
+/// orientation pass of [`sheet_from_bezier_network`]: neighbouring patches are made to agree
+/// (the lowest patch of a component keeps its side), a single closed component is turned
+/// outward, several closed components keep the orientation they were given.
 ///
 /// # Errors
 /// As [`sheet_from_bezier_network`].
@@ -530,8 +544,10 @@ pub fn sheet_from_bezier_network_as_is(patches: &[Vec<Vec<[f64; 3]>>], corners: 
 
 fn bezier_network(patches: &[Vec<Vec<[f64; 3]>>], corners: &[[u32; 4]], heal: bool) -> Result<Brep> {
     let nf = patches.len();
-    if nf == 0 || corners.len() != nf {
-        return Err(KernelError::Argument("the network needs at least one patch and one corner list per patch".into()));
+    network_check::check_patch_count(nf)?;
+    let heal = heal && network_check::heal_allowed(nf);
+    if corners.len() != nf {
+        return Err(KernelError::Argument("the network needs one corner list per patch".into()));
     }
     let n = patches.first().map_or(0, |p| p.len().saturating_sub(1));
     if n == 0 || n > 8 || patches.iter().any(|p| p.len() != n + 1 || p.iter().any(|r| r.len() != n + 1)) {
@@ -547,7 +563,11 @@ fn bezier_network(patches: &[Vec<Vec<[f64; 3]>>], corners: &[[u32; 4]], heal: bo
     let mut vertex_pts: Vec<Option<[f64; 3]>> = vec![None; nv];
     let mut knots = vec![0.0; n + 1];
     knots.extend(std::iter::repeat_n(1.0, n + 1));
+    // without the healer the orientation is settled here: patches against their neighbours and a
+    // wholly inside-out component are flipped (a flip transposes the net)
+    let flip = if heal { vec![false; nf] } else { orientation::flips(patches, corners)? };
     let at = |f: usize, i: usize, j: usize| -> [f64; 3] {
+        let (i, j) = if flip.get(f).copied().unwrap_or(false) { (j, i) } else { (i, j) };
         patches.get(f).and_then(|p| p.get(i)).and_then(|r| r.get(j)).copied().unwrap_or([0.0; 3])
     };
     let tol = 1e-7;
@@ -569,7 +589,10 @@ fn bezier_network(patches: &[Vec<Vec<[f64; 3]>>], corners: &[[u32; 4]], heal: bo
     let mut faces: Vec<Face> = Vec::with_capacity(nf);
     let mut oriented = Vec::with_capacity(nf);
     for f in 0..nf {
-        let c = corners.get(f).copied().unwrap_or([0; 4]);
+        let mut c = corners.get(f).copied().unwrap_or([0; 4]);
+        if flip.get(f).copied().unwrap_or(false) {
+            c = orientation::flipped_corners(c);
+        }
         for (k, &vid) in c.iter().enumerate() {
             let p = match k {
                 0 => at(f, 0, 0),
@@ -663,7 +686,7 @@ fn bezier_network(patches: &[Vec<Vec<[f64; 3]>>], corners: &[[u32; 4]], heal: bo
         vertices,
     };
     let brep = canonicalize(brep);
-    brep.validate().map_err(|e| op_err("record validate", e))?;
+    network_check::validate_network_record(&brep)?;
     // The healer may rework a network of scan-fitted patches (it then cannot say which entity is
     // which, and the conversion refuses). The network is consistent by construction (shared curves
     // and vertices are checked above), so it is then taken as it is.

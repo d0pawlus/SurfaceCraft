@@ -600,3 +600,353 @@ fn set_text(e: &mut SketchEditor, text: &str) {
         p.text = text.into();
     }
 }
+
+/// The polyline of the drag tests: points (0, 0), (10, 0), (10, 5); lines 0-1 and 1-2.
+fn polyline() -> Sketch {
+    let mut s = Sketch::default();
+    for p in [[0.0, 0.0], [10.0, 0.0], [10.0, 5.0]] {
+        s.add_point(p);
+    }
+    s.entities.push(Entity::Line { a: 0, b: 1 });
+    s.entities.push(Entity::Line { a: 1, b: 2 });
+    s
+}
+
+#[test]
+fn dragging_a_free_corner_puts_the_point_at_the_cursor() {
+    let sk = polyline();
+    let mut e = editor(Tool::Select);
+    assert!(e.drag_begin(&sk, 2, [10.0, 5.0]));
+    e.drag_update([12.25, 7.5]);
+    let cmds = e.drag_end();
+    assert_eq!(cmds.len(), 1, "one drag, one command");
+    assert_eq!(cmds[0].id, "sketch.move_point");
+    assert_eq!(cmds[0].params, json!({"sketch": 1, "point": 2, "to": [12.25, 7.5]}));
+    let moved = surfacecraft_ui_egui::sketch_editor::drag::moved(&sk, 2, [12.25, 7.5]).expect("solves");
+    let p = moved.points[2];
+    assert!((p[0] - 12.25).abs() < 1e-6 && (p[1] - 7.5).abs() < 1e-6, "{p:?}");
+    assert!(e.drag.is_none(), "the drag is over");
+}
+
+#[test]
+fn dragging_a_corner_of_a_constrained_rectangle_keeps_it_a_rectangle() {
+    let mut sk = Sketch::default();
+    for p in [[0.0, 0.0], [10.0, 0.0], [10.0, 5.0], [0.0, 5.0]] {
+        sk.add_point(p);
+    }
+    for (a, b) in [(0, 1), (1, 2), (2, 3), (3, 0)] {
+        sk.entities.push(Entity::Line { a, b });
+    }
+    sk.constraints.extend([
+        Constraint::Horizontal { line: 0 },
+        Constraint::Horizontal { line: 2 },
+        Constraint::Vertical { line: 1 },
+        Constraint::Vertical { line: 3 },
+        Constraint::Fix { point: 0, at: [0.0, 0.0] },
+    ]);
+    let mut e = editor(Tool::Select);
+    assert!(e.drag_begin(&sk, 2, [10.0, 5.0]));
+    e.drag_update([14.0, 9.0]);
+    let cmds = e.drag_end();
+    assert_eq!(cmds.len(), 1);
+    let after = surfacecraft_ui_egui::sketch_editor::drag::moved(&sk, 2, [14.0, 9.0]).expect("solves");
+    let (a, b, c, d) = (after.points[0], after.points[1], after.points[2], after.points[3]);
+    let tol = 1e-9;
+    assert!((a[1] - b[1]).abs() < tol && (c[1] - d[1]).abs() < tol, "horizontal sides");
+    assert!((b[0] - c[0]).abs() < tol && (d[0] - a[0]).abs() < tol, "vertical sides");
+    assert!(a[0].abs() < tol && a[1].abs() < tol, "the fixed corner stays");
+}
+
+#[test]
+fn dragging_a_fully_dimensioned_point_moves_nothing_and_issues_no_command() {
+    let mut sk = polyline();
+    sk.constraints.push(Constraint::Fix { point: 2, at: [10.0, 5.0] });
+    let mut e = editor(Tool::Select);
+    assert!(e.drag_begin(&sk, 2, [3.0, 3.0]));
+    e.drag_update([4.0, 1.0]);
+    assert!(e.drag_end().is_empty(), "the solver puts the fixed point back: no command");
+}
+
+#[test]
+fn drags_only_start_in_the_select_tool_on_a_real_point() {
+    let sk = polyline();
+    let mut e = editor(Tool::Line);
+    assert!(!e.drag_begin(&sk, 2, [10.0, 5.0]), "no drag while drawing");
+    let mut e = editor(Tool::Select);
+    assert!(!e.drag_begin(&sk, 99, [0.0, 0.0]), "no such point");
+    assert!(e.drag_end().is_empty());
+}
+
+#[test]
+fn escape_during_a_drag_cancels_it_without_a_command() {
+    let sk = polyline();
+    let mut e = editor(Tool::Select);
+    assert!(e.drag_begin(&sk, 2, [10.0, 5.0]));
+    e.drag_update([12.0, 7.0]);
+    e.escape();
+    assert!(e.drag.is_none());
+    assert!(e.drag_end().is_empty());
+}
+
+/// Presses on `from`, moves to `to` in steps and releases there (the egui drag threshold is passed
+/// by the intermediate moves).
+fn drag_by_mouse(h: &mut Harness<'static, SurfaceCraftApp>, from: egui::Pos2, to: egui::Pos2) {
+    h.hover_at(from);
+    h.run();
+    h.drag_at(from);
+    h.run();
+    for t in [0.25_f32, 0.5, 0.75, 1.0] {
+        h.hover_at(from + (to - from) * t);
+        h.run();
+    }
+    h.drop_at(to);
+    h.run();
+}
+
+#[test]
+fn a_mouse_drag_of_a_point_is_one_command_and_one_undo_step() {
+    let mut app = SurfaceCraftApp::headless();
+    let id = new_sketch_on_xy(&mut app);
+    app.run_command("sketch.add", json!({"sketch": id.0, "entities": [{"polygon": {"points": [[0.0, 0.0], [10.0, 0.0], [10.0, 5.0], [0.0, 5.0]]}}]})).unwrap();
+    let mut h = harness(app);
+    h.run();
+    no_snaps(&mut h);
+    let (log0, undo0) = (h.state().session.log.len(), h.state().session.history.undo_labels().len());
+    let from = screen_of(h.state(), id, [10.0, 5.0]);
+    let to = screen_of(h.state(), id, [14.5, 3.25]);
+    drag_by_mouse(&mut h, from, to);
+    let app = h.state();
+    assert_eq!(app.session.log.len(), log0 + 1, "one command for the drag");
+    assert_eq!(app.session.log.last().map(|e| e.command.as_str()), Some("sketch.move_point"));
+    assert_eq!(app.session.history.undo_labels().len(), undo0 + 1, "one undo step");
+    let p = app.session.doc.sketch(id).expect("sketch").sketch.points[2];
+    assert!((p[0] - 14.5).abs() < 0.05 && (p[1] - 3.25).abs() < 0.05, "the corner follows the pointer: {p:?}");
+}
+
+#[test]
+fn esc_during_a_mouse_drag_leaves_the_document_unchanged() {
+    let mut app = SurfaceCraftApp::headless();
+    let id = new_sketch_on_xy(&mut app);
+    app.run_command("sketch.add", json!({"sketch": id.0, "entities": [{"line": {"from": [0.0, 0.0], "to": [10.0, 0.0]}}, {"line": {"from": [10.0, 0.0], "to": [10.0, 5.0]}}]})).unwrap();
+    let mut h = harness(app);
+    h.run();
+    no_snaps(&mut h);
+    let before = surfacecraft_doc::format::to_json(&h.state().session.doc).expect("json");
+    let log0 = h.state().session.log.len();
+    let from = screen_of(h.state(), id, [10.0, 0.0]);
+    let to = screen_of(h.state(), id, [13.0, -4.0]);
+    h.hover_at(from);
+    h.run();
+    h.drag_at(from);
+    h.run();
+    h.hover_at(to);
+    h.run();
+    h.key_press(egui::Key::Escape);
+    h.run();
+    h.drop_at(to);
+    h.run();
+    let app = h.state();
+    assert_eq!(surfacecraft_doc::format::to_json(&app.session.doc).expect("json"), before, "document hash unchanged");
+    assert_eq!(app.session.log.len(), log0);
+}
+
+/// A sketch on the XY plane, edited (the camera looks onto it), as the tests above start.
+fn new_sketch_on_xy(app: &mut SurfaceCraftApp) -> ObjectId {
+    app.new_sketch_on([0.0, 0.0, 1.0]);
+    app.sketch_editor.target.expect("editing")
+}
+
+#[test]
+fn sketch_drawings_are_tessellated_once_and_again_only_when_the_sketch_changes() {
+    let mut app = SurfaceCraftApp::headless();
+    let a = new_sketch_on_xy(&mut app);
+    app.run_command(
+        "sketch.add",
+        json!({"sketch": a.0, "entities": [{"line": {"from": [0.0, 0.0], "to": [10.0, 0.0]}}]}),
+    )
+    .unwrap();
+    let other = new_sketch_on_xy(&mut app);
+    app.run_command(
+        "sketch.add",
+        json!({"sketch": other.0, "entities": [{"line": {"from": [0.0, 0.0], "to": [4.0, 4.0]}}]}),
+    )
+    .unwrap();
+    app.begin_sketch_edit(a);
+    let mut h = harness(app);
+    h.run();
+    let first = h.state().sketch_cache.tessellations;
+    assert_eq!(first, 2, "the edited sketch and the reference sketch, once each");
+    for _ in 0..5 {
+        h.run();
+    }
+    assert_eq!(h.state().sketch_cache.tessellations, first, "no document change, no tessellation");
+    h.state_mut()
+        .run_command(
+            "sketch.add",
+            json!({"sketch": other.0, "entities": [{"line": {"from": [1.0, 1.0], "to": [2.0, 3.0]}}]}),
+        )
+        .unwrap();
+    h.run();
+    assert_eq!(h.state().sketch_cache.tessellations, first + 1, "the changed sketch once");
+    h.run();
+    assert_eq!(h.state().sketch_cache.tessellations, first + 1);
+    h.state_mut()
+        .run_command(
+            "sketch.add",
+            json!({"sketch": a.0, "entities": [{"line": {"from": [0.0, 5.0], "to": [3.0, 5.0]}}]}),
+        )
+        .unwrap();
+    h.run();
+    assert_eq!(h.state().sketch_cache.tessellations, first + 2, "only the edited sketch this time");
+}
+
+/// A 10 x 5 rectangle on a sketch of the XY plane, edited and rendered.
+fn rect_harness() -> (Harness<'static, SurfaceCraftApp>, ObjectId) {
+    let mut app = SurfaceCraftApp::headless();
+    let id = new_sketch_on_xy(&mut app);
+    app.run_command("sketch.add", json!({"sketch": id.0, "entities": [{"polygon": {"points": [[0.0, 0.0], [10.0, 0.0], [10.0, 5.0], [0.0, 5.0]]}}]})).unwrap();
+    let mut h = harness(app);
+    h.run();
+    no_snaps(&mut h);
+    (h, id)
+}
+
+fn point_of(h: &Harness<'static, SurfaceCraftApp>, id: ObjectId, i: usize) -> [f64; 2] {
+    h.state().session.doc.sketch(id).expect("sketch").sketch.points[i]
+}
+
+#[test]
+fn a_drag_whose_first_movement_is_far_still_moves_the_pressed_point() {
+    let (mut h, id) = rect_harness();
+    let from = screen_of(h.state(), id, [10.0, 5.0]);
+    // the first reported pointer position is about 40 px away, far beyond the pick radius
+    let far = from + egui::vec2(40.0, 25.0);
+    h.hover_at(from);
+    h.run();
+    h.drag_at(from);
+    h.run();
+    h.hover_at(far);
+    h.run();
+    h.drop_at(far);
+    h.run();
+    let moved = point_of(&h, id, 2);
+    assert!((moved[0] - 10.0).abs() > 0.5 || (moved[1] - 5.0).abs() > 0.5, "the pressed corner moved: {moved:?}");
+    assert_eq!(h.state().session.log.last().map(|e| e.command.as_str()), Some("sketch.move_point"));
+    assert_eq!(point_of(&h, id, 1), [10.0, 0.0], "no other point was picked");
+}
+
+#[test]
+fn a_drag_passing_over_another_point_keeps_the_pressed_point() {
+    let (mut h, id) = rect_harness();
+    let from = screen_of(h.state(), id, [10.0, 5.0]);
+    let over_other = screen_of(h.state(), id, [10.0, 0.0]);
+    let end = screen_of(h.state(), id, [14.0, -3.0]);
+    h.hover_at(from);
+    h.run();
+    h.drag_at(from);
+    h.run();
+    // the first movement lands exactly on a neighbouring corner
+    h.hover_at(over_other);
+    h.run();
+    h.hover_at(end);
+    h.run();
+    h.drop_at(end);
+    h.run();
+    let p2 = point_of(&h, id, 2);
+    assert!((p2[0] - 14.0).abs() < 0.1 && (p2[1] + 3.0).abs() < 0.1, "the pressed corner follows: {p2:?}");
+    assert_eq!(point_of(&h, id, 1), [10.0, 0.0], "the corner passed over stays");
+}
+
+#[test]
+fn undo_during_a_drag_cancels_it_and_commits_nothing() {
+    let mut app = SurfaceCraftApp::headless();
+    let id = new_sketch_on_xy(&mut app);
+    app.run_command(
+        "sketch.add",
+        json!({"sketch": id.0, "entities": [{"line": {"from": [0.0, 0.0], "to": [10.0, 0.0]}}]}),
+    )
+    .unwrap();
+    app.run_command(
+        "sketch.add",
+        json!({"sketch": id.0, "entities": [{"line": {"from": [20.0, 0.0], "to": [25.0, 0.0]}}]}),
+    )
+    .unwrap();
+    let mut h = harness(app);
+    h.run();
+    no_snaps(&mut h);
+    let from = screen_of(h.state(), id, [25.0, 0.0]);
+    let mid = screen_of(h.state(), id, [27.0, 3.0]);
+    let end = screen_of(h.state(), id, [30.0, 6.0]);
+    h.hover_at(from);
+    h.run();
+    h.drag_at(from);
+    h.run();
+    h.hover_at(mid);
+    h.run();
+    assert!(h.state().sketch_editor.drag.is_some(), "the drag is under way");
+    // undo while the button is held: the dragged point disappears from the sketch
+    h.state_mut().run_command("edit.undo", Value::Null).unwrap();
+    h.hover_at(end);
+    h.run();
+    assert!(h.state().sketch_editor.drag.is_none(), "the drag was cancelled");
+    let after_undo = surfacecraft_doc::format::to_json(&h.state().session.doc).expect("json");
+    let log = h.state().session.log.len();
+    h.drop_at(end);
+    h.run();
+    assert_eq!(h.state().session.log.len(), log, "no command on release");
+    assert_eq!(surfacecraft_doc::format::to_json(&h.state().session.doc).expect("json"), after_undo);
+}
+
+#[test]
+fn a_drag_is_cancelled_when_the_sketch_differs_from_its_baseline() {
+    let sk = polyline();
+    let mut e = editor(Tool::Select);
+    assert!(e.drag_begin(&sk, 2, [10.0, 5.0]));
+    e.drag_update([12.0, 7.0]);
+    e.drag_check(ObjectId(1), &sk);
+    assert!(e.drag.is_some(), "the same sketch keeps the drag");
+    let mut other = sk.clone();
+    other.constraints.push(Constraint::Horizontal { line: 0 });
+    e.drag_check(ObjectId(1), &other);
+    assert!(e.drag.is_none(), "a changed sketch cancels it");
+    assert!(e.drag_end().is_empty());
+    assert!(e.drag_begin(&sk, 2, [10.0, 5.0]));
+    e.drag_check(ObjectId(2), &sk);
+    assert!(e.drag.is_none(), "another sketch cancels it");
+}
+
+#[test]
+fn a_drag_onto_a_collapsed_dimensioned_line_keeps_the_last_valid_preview() {
+    let mut sk = Sketch::default();
+    sk.add_point([0.0, 0.0]);
+    sk.add_point([10.0, 0.0]);
+    sk.entities.push(Entity::Line { a: 0, b: 1 });
+    sk.constraints.push(Constraint::Length { line: 0, value: 10.0 });
+    let mut e = editor(Tool::Select);
+    assert!(e.drag_begin(&sk, 1, [10.0, 0.0]));
+    e.drag_update([4.0, 3.0]);
+    let valid = e.drag.as_ref().expect("drag").preview.clone();
+    e.drag_update([0.0, 0.0]);
+    let preview = e.drag.as_ref().expect("drag").preview.clone();
+    let (a, b) = (preview.points[0], preview.points[1]);
+    assert!(((a[0] - b[0]).hypot(a[1] - b[1]) - 10.0).abs() < 1e-9, "the preview keeps the length");
+    assert_ne!(preview, valid, "the preview moved on from the earlier valid state toward (0, 0)");
+    let cmds = e.drag_end();
+    assert_eq!(cmds.len(), 1, "the release commits the preview");
+    // executing the release command on the same sketch reproduces the preview exactly
+    let mut session = Session::new();
+    let id = session.doc.add_sketch("s", sk);
+    assert_eq!(id, ObjectId(1));
+    session.execute(cmds[0].id, cmds[0].params.clone()).expect("the committed move");
+    assert_eq!(session.doc.sketch(id).expect("sketch").sketch.points, preview.points);
+}
+#[test]
+fn drag_press_picks_the_point_under_the_press_not_under_the_pointer() {
+    let sk = polyline();
+    let mut e = editor(Tool::Select);
+    // pressed on (10, 5); the pointer is already on (10, 0) when the drag is reported
+    assert!(e.drag_press(&sk, [10.0, 5.0], [10.0, 0.0], 0.5));
+    assert_eq!(e.drag.as_ref().map(|d| d.point), Some(2));
+    e.escape();
+    assert!(!e.drag_press(&sk, [50.0, 50.0], [10.0, 0.0], 0.5), "a press on nothing starts nothing");
+}

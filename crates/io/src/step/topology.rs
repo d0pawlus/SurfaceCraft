@@ -12,7 +12,7 @@
 use super::geom::surface_name;
 use super::p21::{Param, Writer};
 use super::pcurve::FaceGeometry;
-use super::{bad, e, r, s};
+use super::{bad, e, r, s, unsupported};
 use crate::IoError;
 use surfacecraft_kernel::pcurve as kp;
 use surfacecraft_kernel::record::brep::{Brep, Curve2, Loop, Surface};
@@ -76,7 +76,7 @@ impl<'a> ShellWriter<'a> {
             });
         }
         if face.nurbs.is_some() {
-            return Err(bad(format!("not supported yet: STEP export of face {f} on a NURBS form in a sheet")));
+            return Err(unsupported(format!("not supported yet: STEP export of face {f} on a NURBS form")));
         }
         match &face.surface {
             Surface::Plane { origin, u_axis, v_axis } => {
@@ -106,8 +106,8 @@ impl<'a> ShellWriter<'a> {
                     written: face.surface.clone(),
                 })
             }
-            other => Err(bad(format!(
-                "not supported yet: STEP export of face {f}'s {} surface in a sheet",
+            other => Err(unsupported(format!(
+                "not supported yet: STEP export of face {f}'s {} surface",
                 surface_name(other)
             ))),
         }

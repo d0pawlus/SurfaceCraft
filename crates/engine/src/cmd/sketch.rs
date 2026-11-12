@@ -29,6 +29,24 @@ pub struct SketchOut {
     pub report: Option<SolveReport>,
     /// Features that failed when the history was replayed.
     pub failed_features: usize,
+    /// For `sketch.move_point`: where the point ended up and whether it reached the target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moved: Option<MoveOut>,
+}
+
+/// What a point move achieved: a position the constraints cannot hold gives the nearest valid
+/// sketch, so the point may end elsewhere than requested.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct MoveOut {
+    /// The point that was moved.
+    pub point: usize,
+    /// Where the point ended up, sketch coordinates.
+    pub position: [f64; 2],
+    /// Whether the point is at the requested position (a fixed point, or a position the
+    /// constraints cannot hold, is not).
+    pub reached: bool,
+    /// Distance from `position` to the requested position.
+    pub remaining: f64,
 }
 
 fn out(s: &Session, id: ObjectId, failed: usize) -> CmdResult<SketchOut> {
@@ -41,18 +59,25 @@ fn out(s: &Session, id: ObjectId, failed: usize) -> CmdResult<SketchOut> {
         profiles: surfacecraft_sketch::profiles(&o.sketch, 1e-6).len(),
         report: o.report.clone(),
         failed_features: failed,
+        moved: None,
     })
 }
 
-/// Solves a sketch, stores the report and replays the history that depends on it.
-pub(crate) fn resolve(s: &mut Session, id: ObjectId) -> CmdResult<SketchOut> {
+/// Stores a solved sketch and its report, and replays the history that depends on it.
+fn commit_solved(s: &mut Session, id: ObjectId, sk: Sketch, rep: SolveReport) -> CmdResult<SketchOut> {
     let o = s.doc.sketch_mut(id).ok_or_else(|| CmdError::Params(format!("no sketch {id}")))?;
-    let mut sk = o.sketch.clone();
-    let rep = solve(&mut sk).map_err(|e| CmdError::Params(e.to_string()))?;
     o.sketch = sk;
     o.report = Some(rep);
     let failed = crate::replay::replay(s);
     out(s, id, failed)
+}
+
+/// Solves a sketch, stores the report and replays the history that depends on it.
+pub(crate) fn resolve(s: &mut Session, id: ObjectId) -> CmdResult<SketchOut> {
+    let o = s.doc.sketch(id).ok_or_else(|| CmdError::Params(format!("no sketch {id}")))?;
+    let mut sk = o.sketch.clone();
+    let rep = solve(&mut sk).map_err(|e| CmdError::Params(e.to_string()))?;
+    commit_solved(s, id, sk, rep)
 }
 
 /// A plane given by origin and normal (x chosen), or origin and both axes.
@@ -264,6 +289,36 @@ fn edit(s: &mut Session, i: EditIn) -> CmdResult<SketchOut> {
     resolve(s, id)
 }
 
+/// Move-point parameters.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MovePointIn {
+    /// Sketch id or name.
+    pub sketch: ObjRef,
+    /// Point index.
+    pub point: usize,
+    /// New position, sketch coordinates.
+    pub to: [f64; 2],
+}
+
+/// Moves one point to `to` and solves: the constraints pull the rest of the sketch along, and a
+/// point the constraints fix goes back to where they put it (a drag is a soft target). A result
+/// that leaves a constraint unsatisfied is refused before anything is committed or replayed.
+fn move_point(s: &mut Session, i: MovePointIn) -> CmdResult<SketchOut> {
+    let id = i.sketch.resolve(s, ObjectKind::Sketch)?;
+    if !i.to.iter().all(|v| v.is_finite()) {
+        return Err(CmdError::Params("coordinates must be finite".into()));
+    }
+    let o = s.doc.sketch(id).ok_or_else(|| CmdError::Params(format!("no sketch {id}")))?;
+    if i.point >= o.sketch.points.len() {
+        return Err(CmdError::Params(format!("point {} does not exist", i.point)));
+    }
+    let m = surfacecraft_sketch::move_point(&o.sketch, i.point, i.to).map_err(|e| CmdError::Params(e.to_string()))?;
+    let moved = MoveOut { point: i.point, position: m.position, reached: m.reached(), remaining: m.remaining };
+    let done = commit_solved(s, id, m.sketch, m.report)?;
+    Ok(SketchOut { moved: Some(moved), ..done })
+}
+
 /// One sketch.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -470,6 +525,16 @@ pub static COMMANDS: &[CommandSpec] = &[
         EditIn,
         SketchOut,
         edit
+    ),
+    command!(
+        "sketch.move_point",
+        "Move point",
+        "Sketch",
+        true,
+        "Moves point `point` of `sketch` to `to` and solves: the constraints move the rest of the sketch with it, and a point they fix stays where they put it. A position the constraints cannot hold (a dimensioned line collapsed to a point) gives the nearest valid sketch, or an error when none exists; the sketch is never left with an unsatisfied constraint. The result's `moved` gives the achieved `position`, `reached` (false when the constraints held the point elsewhere) and the `remaining` distance. Replays dependent features.",
+        MovePointIn,
+        SketchOut,
+        move_point
     ),
     command!(
         "sketch.solve",

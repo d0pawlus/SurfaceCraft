@@ -121,6 +121,24 @@ where
     }
 }
 
+/// Splits `data` into chunks of `chunk` items and calls `f(chunk_index, chunk)` on each, in parallel
+/// where the caller may fan out; the results are in chunk order. Every chunk is written by one call
+/// only, so the data afterwards does not depend on the threads.
+pub fn map_chunks_mut<T, R, F>(data: &mut [T], chunk: usize, f: F) -> Vec<R>
+where
+    T: Send,
+    R: Send,
+    F: Fn(usize, &mut [T]) -> R + Sync + Send,
+{
+    let chunk = chunk.max(1);
+    if fans_out() {
+        use rayon::prelude::*;
+        data.par_chunks_mut(chunk).enumerate().map(|(k, c)| f(k, c)).collect()
+    } else {
+        data.chunks_mut(chunk).enumerate().map(|(k, c)| f(k, c)).collect()
+    }
+}
+
 /// Runs both closures, in parallel where the caller may fan out; the results are those of
 /// `(a(), b())`.
 pub fn join<A, B, RA, RB>(a: A, b: B) -> (RA, RB)
