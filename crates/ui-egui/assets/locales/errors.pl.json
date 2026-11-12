@@ -563,5 +563,22 @@
   "{}: the constraint is gone": "{}: więz już nie istnieje",
   "{}: the feature is gone": "{}: cecha już nie istnieje",
   "{}: torus, minor radius {}": "{}: torus, mały promień {}",
-  "{}: {}": "{}: {}"
+  "{}: {}": "{}: {}",
+  "the parameters form a cycle: {}": "parametry tworzą cykl: {}",
+  "parameter `{}` is used by {}": "parametr „{}” jest używany przez: {}",
+  "there is no parameter `{}`": "nie ma parametru „{}”",
+  "there is already a parameter `{}`": "parametr „{}” już istnieje",
+  "parameter `{}` is defined twice": "parametr „{}” jest zdefiniowany dwa razy",
+  "parameter `{}` uses `{}`, which is not defined": "parametr „{}” używa „{}”, który nie jest zdefiniowany",
+  "a document holds at most {} parameters": "dokument może mieć najwyżej {} parametrów",
+  "the expression is empty": "wyrażenie jest puste",
+  "division by zero": "dzielenie przez zero",
+  "the square root of a negative number": "pierwiastek z liczby ujemnej",
+  "unknown parameter `{}`": "nieznany parametr „{}”",
+  "an expression is at most {} characters": "wyrażenie ma najwyżej {} znaków",
+  "an expression is written {\"expr\": \"text\"}": "wyrażenie zapisuje się {\"expr\": \"tekst\"}",
+  "expected a number or {\"expr\": \"text\"}": "oczekiwano liczby lub {\"expr\": \"tekst\"}",
+  "only a length, distance, radius or angle takes an expression": "wyrażenie przyjmuje tylko długość, odległość, promień lub kąt",
+  "a parenthesis is not closed": "nawias nie jest zamknięty",
+  "`{}` is not a numeric field that takes an expression": "„{}” nie jest polem liczbowym przyjmującym wyrażenie"
 }

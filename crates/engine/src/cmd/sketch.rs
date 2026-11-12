@@ -1,12 +1,14 @@
 //! `sketch.*`: 2-D sketches with constraints, and sketches from mesh sections.
 use super::{CmdError, CmdResult, CommandSpec, ObjRef};
 use crate::{Session, command};
+mod dimension;
+use dimension::{ConstraintIn, with_constraints, with_edit};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use surfacecraft_doc::{ObjectId, ObjectKind};
 use surfacecraft_geom::{Point3, Vec3, section::section};
 use surfacecraft_sketch::{
-    Constraint, Entity, Sketch, SketchPlane, SolveReport,
+    Entity, Sketch, SketchPlane, SolveReport,
     chains::{Chain2, ChainOptions, ChainReport, fit_chains},
     fit2d::fit_polyline,
     solve,
@@ -63,20 +65,38 @@ fn out(s: &Session, id: ObjectId, failed: usize) -> CmdResult<SketchOut> {
     })
 }
 
-/// Stores a solved sketch and its report, and replays the history that depends on it.
-fn commit_solved(s: &mut Session, id: ObjectId, sk: Sketch, rep: SolveReport) -> CmdResult<SketchOut> {
+/// Why a solved sketch with dimension expressions is not usable: its constraints are not met.
+fn unsatisfied(sk: &Sketch, rep: &SolveReport) -> Option<String> {
+    (!sk.dim_exprs.is_empty() && !rep.is_satisfied())
+        .then(|| format!("its constraints cannot be satisfied ({})", rep.message))
+}
+
+/// Stores a solved sketch and its report, and replays the history that depends on it. A sketch
+/// with dimension expressions that cannot be satisfied is marked, so features reading it fail.
+pub(crate) fn commit_solved(s: &mut Session, id: ObjectId, sk: Sketch, rep: SolveReport) -> CmdResult<SketchOut> {
     let o = s.doc.sketch_mut(id).ok_or_else(|| CmdError::Params(format!("no sketch {id}")))?;
+    o.error = unsatisfied(&sk, &rep);
     o.sketch = sk;
     o.report = Some(rep);
     let failed = crate::replay::replay(s);
     out(s, id, failed)
 }
 
+/// The sketch as it is solved: dimension expressions evaluated into their constraints first.
+pub(crate) fn solved(s: &Session, id: ObjectId) -> CmdResult<(Sketch, SolveReport)> {
+    let o = s.doc.sketch(id).ok_or_else(|| CmdError::Params(format!("no sketch {id}")))?;
+    let mut sk = if o.sketch.dim_exprs.is_empty() {
+        o.sketch.clone()
+    } else {
+        surfacecraft_doc::param_use::apply_dim_exprs(&o.sketch, &s.doc.params).map_err(CmdError::Params)?
+    };
+    let rep = solve(&mut sk).map_err(|e| CmdError::Params(e.to_string()))?;
+    Ok((sk, rep))
+}
+
 /// Solves a sketch, stores the report and replays the history that depends on it.
 pub(crate) fn resolve(s: &mut Session, id: ObjectId) -> CmdResult<SketchOut> {
-    let o = s.doc.sketch(id).ok_or_else(|| CmdError::Params(format!("no sketch {id}")))?;
-    let mut sk = o.sketch.clone();
-    let rep = solve(&mut sk).map_err(|e| CmdError::Params(e.to_string()))?;
+    let (sk, rep) = solved(s, id)?;
     commit_solved(s, id, sk, rep)
 }
 
@@ -244,15 +264,18 @@ pub struct ConstrainIn {
     /// Sketch id or name.
     pub sketch: ObjRef,
     /// Constraints to add (indices refer to the sketch's points and entities).
-    pub constraints: Vec<Constraint>,
+    pub constraints: Vec<ConstraintIn>,
 }
 
 fn constrain(s: &mut Session, i: ConstrainIn) -> CmdResult<SketchOut> {
     let id = i.sketch.resolve(s, ObjectKind::Sketch)?;
-    let o = s.doc.sketch_mut(id).ok_or_else(|| CmdError::Params(format!("no sketch {id}")))?;
-    o.sketch.constraints.extend(i.constraints);
+    let o = s.doc.sketch(id).ok_or_else(|| CmdError::Params(format!("no sketch {id}")))?;
+    let next = with_constraints(&o.sketch, &i.constraints, &s.doc.params)?;
     // validate before touching the history (the engine rolls back on error)
-    o.sketch.validate().map_err(|e| CmdError::Params(e.to_string()))?;
+    next.validate().map_err(|e| CmdError::Params(e.to_string()))?;
+    if let Some(o) = s.doc.sketch_mut(id) {
+        o.sketch = next;
+    }
     resolve(s, id)
 }
 
@@ -266,26 +289,17 @@ pub struct EditIn {
     pub index: usize,
     /// New constraint (omitted → the constraint is removed).
     #[serde(default)]
-    pub constraint: Option<Constraint>,
+    pub constraint: Option<ConstraintIn>,
 }
 
 fn edit(s: &mut Session, i: EditIn) -> CmdResult<SketchOut> {
     let id = i.sketch.resolve(s, ObjectKind::Sketch)?;
-    let o = s.doc.sketch_mut(id).ok_or_else(|| CmdError::Params(format!("no sketch {id}")))?;
-    if i.index >= o.sketch.constraints.len() {
-        return Err(CmdError::Params(format!("constraint {} does not exist", i.index)));
+    let o = s.doc.sketch(id).ok_or_else(|| CmdError::Params(format!("no sketch {id}")))?;
+    let next = with_edit(&o.sketch, i.index, i.constraint.as_ref(), &s.doc.params)?;
+    next.validate().map_err(|e| CmdError::Params(e.to_string()))?;
+    if let Some(o) = s.doc.sketch_mut(id) {
+        o.sketch = next;
     }
-    match i.constraint {
-        Some(c) => {
-            if let Some(slot) = o.sketch.constraints.get_mut(i.index) {
-                *slot = c;
-            }
-        }
-        None => {
-            o.sketch.constraints.remove(i.index);
-        }
-    }
-    o.sketch.validate().map_err(|e| CmdError::Params(e.to_string()))?;
     resolve(s, id)
 }
 

@@ -188,6 +188,32 @@ impl Constraint {
         }
     }
 
+    /// The value of a dimension (length, distance, radius: mm; angle: degrees); `None` for a
+    /// constraint without one.
+    #[must_use]
+    pub fn dimension(&self) -> Option<f64> {
+        match self {
+            Constraint::Distance { value, .. }
+            | Constraint::Length { value, .. }
+            | Constraint::Radius { value, .. } => Some(*value),
+            Constraint::Angle { degrees, .. } => Some(*degrees),
+            _ => None,
+        }
+    }
+
+    /// The same constraint with its dimension set to `v`; `None` for a constraint without one.
+    #[must_use]
+    pub fn with_dimension(&self, v: f64) -> Option<Constraint> {
+        use Constraint as C;
+        match self.clone() {
+            C::Distance { a, b, .. } => Some(C::Distance { a, b, value: v }),
+            C::Length { line, .. } => Some(C::Length { line, value: v }),
+            C::Radius { entity, .. } => Some(C::Radius { entity, value: v }),
+            C::Angle { a, b, .. } => Some(C::Angle { a, b, degrees: v }),
+            _ => None,
+        }
+    }
+
     pub(crate) fn validate(&self, s: &Sketch) -> Result<(), String> {
         let np = s.points.len();
         let pt = |i: usize| if i < np { Ok(()) } else { Err(format!("point {i} does not exist")) };

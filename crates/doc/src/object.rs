@@ -408,6 +408,9 @@ pub struct Document {
     /// kept, their name stays reserved, and the replay brings them back when geometry returns.
     #[serde(default)]
     pub dormant_bodies: Vec<BodyObject>,
+    /// Named parameters that dimensions and feature fields can use as expressions.
+    #[serde(default, skip_serializing_if = "crate::params::ParamTable::is_empty")]
+    pub params: crate::params::ParamTable,
     /// Next free id.
     #[serde(default)]
     pub next_id: u64,
@@ -588,7 +591,7 @@ impl Document {
     pub fn add_sketch(&mut self, name: &str, sketch: surfacecraft_sketch::Sketch) -> ObjectId {
         let id = self.fresh_id();
         let name = self.unique_name(name);
-        self.sketches.push(crate::feature::SketchObject { id, name, sketch, report: None, visible: true });
+        self.sketches.push(crate::feature::SketchObject { id, name, sketch, report: None, error: None, visible: true });
         id
     }
 
@@ -604,6 +607,7 @@ impl Document {
             suppressed: false,
             error: None,
             visible: true,
+            exprs: std::collections::BTreeMap::new(),
         });
         id
     }
