@@ -23,8 +23,8 @@ pub mod profile;
 pub mod solve;
 
 pub use constraint::Constraint;
-pub use profile::{Segment3, open_paths, path_length, path_samples, profiles};
 pub use moving::move_point;
+pub use profile::{Segment3, open_paths, path_length, path_samples, profiles};
 pub use solve::{SATISFIED_TOL, SolveReport, SolveStatus, polish, solve};
 
 use schemars::JsonSchema;

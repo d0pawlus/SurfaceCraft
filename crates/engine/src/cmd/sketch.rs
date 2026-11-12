@@ -294,8 +294,8 @@ fn move_point(s: &mut Session, i: MovePointIn) -> CmdResult<SketchOut> {
     if i.point >= o.sketch.points.len() {
         return Err(CmdError::Params(format!("point {} does not exist", i.point)));
     }
-    let (sk, rep) = surfacecraft_sketch::move_point(&o.sketch, i.point, i.to)
-        .map_err(|e| CmdError::Params(e.to_string()))?;
+    let (sk, rep) =
+        surfacecraft_sketch::move_point(&o.sketch, i.point, i.to).map_err(|e| CmdError::Params(e.to_string()))?;
     commit_solved(s, id, sk, rep)
 }
 

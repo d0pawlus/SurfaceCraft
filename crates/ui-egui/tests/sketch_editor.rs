@@ -861,8 +861,16 @@ fn a_drag_passing_over_another_point_keeps_the_pressed_point() {
 fn undo_during_a_drag_cancels_it_and_commits_nothing() {
     let mut app = SurfaceCraftApp::headless();
     let id = new_sketch_on_xy(&mut app);
-    app.run_command("sketch.add", json!({"sketch": id.0, "entities": [{"line": {"from": [0.0, 0.0], "to": [10.0, 0.0]}}]})).unwrap();
-    app.run_command("sketch.add", json!({"sketch": id.0, "entities": [{"line": {"from": [20.0, 0.0], "to": [25.0, 0.0]}}]})).unwrap();
+    app.run_command(
+        "sketch.add",
+        json!({"sketch": id.0, "entities": [{"line": {"from": [0.0, 0.0], "to": [10.0, 0.0]}}]}),
+    )
+    .unwrap();
+    app.run_command(
+        "sketch.add",
+        json!({"sketch": id.0, "entities": [{"line": {"from": [20.0, 0.0], "to": [25.0, 0.0]}}]}),
+    )
+    .unwrap();
     let mut h = harness(app);
     h.run();
     no_snaps(&mut h);

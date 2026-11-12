@@ -108,8 +108,11 @@ fn hostile_parameters_are_errors() {
 /// One line from (0, 0) to (10, 0) with its length fixed to 10.
 fn length_line(s: &mut Session) {
     polyline(s);
-    s.execute("sketch.constrain", json!({"sketch": "pl", "constraints": [{"type": "length", "line": 0, "value": 10.0}]}))
-        .unwrap();
+    s.execute(
+        "sketch.constrain",
+        json!({"sketch": "pl", "constraints": [{"type": "length", "line": 0, "value": 10.0}]}),
+    )
+    .unwrap();
 }
 
 fn line_length(s: &Session) -> f64 {

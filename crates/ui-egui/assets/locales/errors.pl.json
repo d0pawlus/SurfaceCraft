@@ -356,6 +356,7 @@
   "the closed chain could not be fitted": "nie udało się dopasować zamkniętego łańcucha",
   "the conical face is not turned about the pull direction": "ściana stożkowa nie jest obrotowa względem kierunku wyjmowania",
   "the constraints cannot be satisfied (residual {})": "więzów nie da się spełnić (błąd resztkowy {})",
+  "the constraints cannot be satisfied with the point there": "więzów nie da się spełnić z punktem w tym miejscu",
   "the corner round does not touch its walls": "zaokrąglenie narożnika nie dotyka swoich ścianek",
   "the corner round r = {} is not tangent to its two walls": "zaokrąglenie narożnika r = {} nie jest styczne do swoich dwóch ścianek",
   "the corner round turns the wrong way (a reflex corner)": "zaokrąglenie narożnika skręca w złą stronę (narożnik wklęsły)",
