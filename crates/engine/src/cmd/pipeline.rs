@@ -204,6 +204,10 @@ pub struct DeviationSummary {
     /// Share of the scan's points that were measured (0..1): the rest lie farther than 5 mm from
     /// the solid or face away from it.
     pub coverage: f64,
+    /// Share of the scan's points (0..1) that lie on the solid but face away from it, and so are
+    /// not in `count`: a solid that is inside out, or has faces turned the wrong way, shows here.
+    #[serde(default)]
+    pub not_facing: f64,
     /// Share of the measured points within the tolerance (0..1).
     pub within: f64,
     /// RMS deviation (mm).
@@ -269,6 +273,47 @@ struct Candidate {
     triangles: usize,
     kind: Option<PrimitiveKind>,
     rms: Option<f64>,
+}
+
+/// `inconsistent_orientation` needs at least this share of the missing coverage to lie on the solid
+/// but face away from it; noise at sharp edges alone gives a few percent that do.
+const ORIENTATION_SHARE_OF_MISSING: f64 = 0.5;
+/// Above this share of the scan facing away, it is the scan that is inside out, not the solid.
+const INSIDE_OUT_SHARE: f64 = 0.9;
+
+/// The issue of a coverage below [`MIN_COVERAGE`], told by what is wrong. `scan_inside_out`: nearly
+/// every point faces away (the kernel turns a solid outward, so the scan's normals point inward).
+/// `inconsistent_orientation`: much of what is missing lies on `what` but faces away from it (its
+/// faces are turned the wrong way). Otherwise `low_coverage`: the scan is not near `what`.
+pub(super) fn coverage_issue(d: &DeviationSummary, what: &str) -> Option<Issue> {
+    if d.coverage >= MIN_COVERAGE {
+        return None;
+    }
+    let missing = 1.0 - d.coverage;
+    if d.not_facing >= INSIDE_OUT_SHARE {
+        let msg = format!(
+            "{:.1} % of the scan points face away from {what}: the scan is inside out (its normals point inward); flip the normals of the scan and run again",
+            100.0 * d.not_facing
+        );
+        return Some(issue("scan_inside_out", msg));
+    }
+    if d.not_facing >= ORIENTATION_SHARE_OF_MISSING * missing {
+        let msg = format!(
+            "{:.1} % of the scan points lie on {what} but face away from it (only {:.1} % face it): its faces are turned the wrong way",
+            100.0 * d.not_facing,
+            100.0 * d.coverage
+        );
+        return Some(issue("inconsistent_orientation", msg));
+    }
+    let far = (missing - d.not_facing).max(0.0);
+    let msg = format!(
+        "only {:.1} % of the scan points lie on {what} and face it (at least {:.0} % expected): {:.1} % lie on it but face away, {:.1} % are farther away",
+        100.0 * d.coverage,
+        100.0 * MIN_COVERAGE,
+        100.0 * d.not_facing,
+        100.0 * far
+    );
+    Some(issue("low_coverage", msg))
 }
 
 fn issue(code: &str, message: String) -> Issue {
@@ -399,10 +444,11 @@ fn apply_roles(modelled: &mut [Modelled], faces_of: &[FaceOf]) {
 
 fn summary(c: &CompareOut, scan_vertices: usize) -> DeviationSummary {
     let t = &c.totals;
-    let coverage = if scan_vertices > 0 { t.count as f64 / scan_vertices as f64 } else { 0.0 };
+    let share = |n: usize| if scan_vertices > 0 { (n as f64 / scan_vertices as f64).min(1.0) } else { 0.0 };
     DeviationSummary {
         count: t.count,
-        coverage: coverage.min(1.0),
+        coverage: share(t.count),
+        not_facing: share(t.not_facing),
         within: t.within,
         rms: t.rms,
         max_abs: t.max_abs,
@@ -470,14 +516,7 @@ fn blocking_issues(o: &Outcome, set: &Settings) -> Vec<Issue> {
         list.push(issue("skipped_inputs", msg));
     }
     if let Some(d) = &o.deviation {
-        if d.coverage < MIN_COVERAGE {
-            let msg = format!(
-                "only {:.1} % of the scan points lie on the solid (at least {:.0} % expected)",
-                100.0 * d.coverage,
-                100.0 * MIN_COVERAGE
-            );
-            list.push(issue("low_coverage", msg));
-        }
+        list.extend(coverage_issue(d, "the solid"));
         if d.count > 0 && d.within < set.min_within {
             let msg = format!(
                 "{:.2} % of the measured points are within {} mm ({:.0} % required); max {:.3} mm, RMS {:.3} mm",
@@ -772,3 +811,53 @@ pub static COMMANDS: &[CommandSpec] = &[command!(
     ToSolidOut,
     to_solid
 )];
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    fn summary_of(coverage: f64, not_facing: f64) -> DeviationSummary {
+        DeviationSummary { count: 100, coverage, not_facing, within: 1.0, rms: 0.0, max_abs: 0.0, mean: 0.0 }
+    }
+
+    #[test]
+    fn a_solid_that_covers_the_scan_has_no_coverage_issue() {
+        assert!(coverage_issue(&summary_of(0.95, 0.0), "the solid").is_none());
+    }
+
+    fn code(coverage: f64, not_facing: f64) -> String {
+        coverage_issue(&summary_of(coverage, not_facing), "the solid").expect("an issue").code
+    }
+
+    #[test]
+    fn points_that_lie_on_the_solid_but_face_away_are_an_orientation_issue_not_missing_scan() {
+        assert_eq!(code(0.71, 0.29), "inconsistent_orientation");
+    }
+
+    #[test]
+    fn a_few_percent_facing_away_beside_a_real_gap_is_low_coverage_with_both_figures() {
+        // 85 % cover, 6 % face away, 9 % are far: the gap is the problem
+        let issue = coverage_issue(&summary_of(0.85, 0.06), "the solid").expect("an issue");
+        assert_eq!(issue.code, "low_coverage");
+        assert!(issue.message.contains("85.0 %") && issue.message.contains("6.0 %") && issue.message.contains("9.0 %"));
+    }
+
+    #[test]
+    fn the_orientation_issue_starts_at_half_of_the_missing_share() {
+        // missing 0.20: 0.10 facing away is the boundary
+        assert_eq!(code(0.80, 0.10), "inconsistent_orientation");
+        assert_eq!(code(0.80, 0.0999), "low_coverage");
+    }
+
+    #[test]
+    fn a_scan_whose_points_nearly_all_face_away_is_inside_out() {
+        assert_eq!(code(0.05, 0.95), "scan_inside_out");
+        assert_eq!(code(0.10, 0.90), "scan_inside_out");
+        assert_eq!(code(0.20, 0.80), "inconsistent_orientation");
+    }
+
+    #[test]
+    fn points_far_from_the_solid_are_low_coverage() {
+        assert_eq!(code(0.5, 0.05), "low_coverage");
+    }
+}

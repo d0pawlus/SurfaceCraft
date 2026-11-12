@@ -133,16 +133,37 @@ pub fn counts(body: &Brep) -> Counts {
     Counts { faces: body.faces.len(), edges: body.edges.len(), vertices: body.vertices.len() }
 }
 
-/// Enclosed volume (mm³).
+/// Enclosed volume (mm³). A record the kernel's healer refuses is an error.
 pub fn volume(body: &Brep) -> Result<f64> {
     let b = decode(body)?;
     b.volume(1e-6).map_err(|e| op_err("volume", e))
 }
 
+/// [`volume`] for a body shown to a user (`info`): a record the healer refuses (it would have to
+/// change the topology, as for a patch network that crosses itself) is measured as it is, but only
+/// when that gives a finite positive number; anything else is the healer's error. The record is
+/// not known to come from the oriented network builders (no provenance travels with it), so the
+/// sign is the only check there is: a negative or meaningless value is never shown. Operations
+/// ([`volume`], the hybrid kernel) keep refusing such records.
+pub fn volume_as_built(body: &Brep) -> Result<f64> {
+    match volume(body) {
+        Ok(v) => Ok(v),
+        Err(healer) => {
+            let measured = ops::Body::from_record(body, true)
+                .map_err(|e| op_err("from_record", e))
+                .and_then(|(b, _)| b.volume(1e-6).map_err(|e| op_err("volume", e)));
+            match measured {
+                Ok(v) if v.is_finite() && v > 0.0 => Ok(v),
+                _ => Err(healer),
+            }
+        }
+    }
+}
+
 /// Counts and volume.
 #[must_use]
 pub fn info(body: &Brep) -> BodyInfo {
-    BodyInfo { counts: counts(body), volume: volume(body).ok() }
+    BodyInfo { counts: counts(body), volume: volume_as_built(body).ok() }
 }
 
 /// Applies a row-major rigid 4×4 transform.

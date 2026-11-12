@@ -67,6 +67,9 @@ fn edge_angles(set: &PatchSet) -> Vec<(EdgeKey, Vec<Option<f64>>)> {
                 let (u0, v0) = side_uv(*s0, if *fw0 { t } else { 1.0 - t });
                 let (u1, v1) = side_uv(*s1, if *fw1 { t } else { 1.0 - t });
                 let (a, b) = (normal(n0, u0, v0)?, normal(n1, u1, v1)?);
+                // patches that run the edge the same way round are parametrised against each other:
+                // the angle is the kink of the surface, not an artefact of the parametrisation
+                let b = if fw0 == fw1 { -b } else { b };
                 Some(a.dot(&b).clamp(-1.0, 1.0).acos().to_degrees())
             })
             .collect();
@@ -150,5 +153,28 @@ mod tests {
         };
         let (smooth, _) = jump_stats(&set, &BTreeSet::new());
         assert_eq!((smooth.invalid_samples, smooth.invalid_edges, smooth.count), (0, 0, 1), "{smooth:?}");
+    }
+
+    #[test]
+    fn tangent_patches_parametrised_in_opposite_directions_have_no_jump() {
+        // the second patch is the first one's neighbour with its net transposed: u and v swap, so it
+        // runs the shared edge the same way round as the first
+        let mut transposed = flat([3.0, 0.0], false);
+        let source = transposed;
+        for (i, row) in transposed.iter_mut().enumerate() {
+            for (j, p) in row.iter_mut().enumerate() {
+                *p = source[j][i];
+            }
+        }
+        let set = PatchSet {
+            nets: vec![flat([0.0, 0.0], false), transposed],
+            corners: vec![[0, 1, 2, 3], [1, 2, 5, 4]],
+            vertices: Vec::new(),
+        };
+
+        let (smooth, _) = jump_stats(&set, &BTreeSet::new());
+
+        assert_eq!(smooth.count, 1, "{smooth:?}");
+        assert!(smooth.max_deg < 1e-6, "{smooth:?}");
     }
 }
