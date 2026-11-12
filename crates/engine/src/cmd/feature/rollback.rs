@@ -65,7 +65,7 @@ fn orphan_bodies(active: &[FeatureObject], parked: &[FeatureObject]) -> Vec<Obje
 /// Moves the bodies written only by parked features out of the model into
 /// `Document::dormant_bodies` (with id, name and visibility); the replay brings them back.
 fn park_bodies(s: &mut Session, orphans: &[ObjectId]) {
-    let all: Vec<_> = s.doc.bodies.drain(..).collect();
+    let all = std::mem::take(&mut s.doc.bodies);
     let (parked, live): (Vec<_>, Vec<_>) = all.into_iter().partition(|b| orphans.contains(&b.id));
     s.doc.bodies = live;
     s.doc.dormant_bodies.retain(|d| !parked.iter().any(|p| p.id == d.id));
