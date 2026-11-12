@@ -431,4 +431,25 @@ mod tests {
         let rep = reduce_to_tolerance(&mut noisy, &o, &ToleranceOptions::new(1e-6)).unwrap();
         assert!(rep.met && rep.triangles_after * 10 >= before * 9, "{rep:?}");
     }
+
+    /// The reduction of a mesh big enough to be reduced in parts does not depend on the threads.
+    #[test]
+    fn parts_give_the_same_mesh_on_one_and_many_threads() {
+        let mut orig = synth::sphere(Point3::origin(), 15.0, 330, 170);
+        synth::add_noise(&mut orig, 0.004, &mut Rng::new(2));
+        assert!(orig.triangle_count() >= 100_000, "{}", orig.triangle_count());
+        let run = |threads: usize| {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+            pool.install(|| {
+                let mut m = orig.clone();
+                let rep =
+                    reduce_to_tolerance(&mut m, &DecimateOptions::default(), &ToleranceOptions::new(0.05)).unwrap();
+                (rep, m)
+            })
+        };
+        let ((r1, m1), (r8, m8)) = (run(1), run(8));
+        assert!(r1.met, "{r1:?}");
+        assert_eq!(r1, r8);
+        assert_eq!(m1, m8);
+    }
 }

@@ -210,7 +210,7 @@
   "Largest angle between neighbouring triangles crossed (degrees, default 15).": "Największy kąt między sąsiednimi trójkątami, przez który region może przejść (stopnie, domyślnie 15).",
   "Largest change of a length parameter (mm, default 2).": "Największa zmiana wymiaru długości (mm, domyślnie 2).",
   "Largest change of an angle parameter (degrees, default 5).": "Największa zmiana wymiaru kątowego (stopnie, domyślnie 5).",
-  "Largest hole filled, in boundary edges (default 300, at most 4000).": "Największa wypełniana dziura, liczona w krawędziach brzegu (domyślnie 300, najwyżej 4000).",
+  "Largest hole filled, in boundary edges (default 300, at most 20000; a smooth fill of a hole of thousands of edges takes tens of seconds).": "Największa wypełniana dziura, liczona w krawędziach brzegu (domyślnie 300, najwyżej 20000; gładkie wypełnienie dziury o tysiącach krawędzi trwa kilkadziesiąt sekund).",
   "Largest move of a face (mm, default 1).": "Największe przesunięcie ściany (mm, domyślnie 1).",
   "Leave out points whose normal points away from the face normal (default true).": "Pomiń punkty, których normalna jest zwrócona przeciwnie do normalnej ściany (domyślnie tak).",
   "Leave out points whose normal points away from the primitive's normal (default true).": "Pomija punkty, których normalna jest zwrócona przeciwnie do normalnej kształtu (domyślnie tak).",
