@@ -4,6 +4,7 @@
 //! about 24 KB on each patch, this one a few KB.
 
 use super::p21::{Param, Writer};
+use super::solid_check::check_closed_shell;
 use super::topology::ShellWriter;
 use super::{bad, finish, r, s, unsupported};
 use crate::IoError;
@@ -13,6 +14,9 @@ use surfacecraft_kernel::record::brep::{Brep, OrientedFace, Shell, Surface};
 /// The outer shell's faces when the body is one solid without voids: a single material region
 /// bounded by a single closed face shell.
 fn solid_faces(b: &Brep) -> Result<&[OrientedFace], IoError> {
+    if b.shells.len() != 1 {
+        return Err(unsupported("STEP solid export of a body with more than one shell"));
+    }
     let mut material = b.regions.iter().skip(1).filter(|reg| !reg.void);
     let (Some(region), None) = (material.next(), material.next()) else {
         return Err(unsupported("STEP solid export of a body that is not exactly one solid region"));
@@ -51,6 +55,7 @@ fn check_faces(b: &Brep, faces: &[OrientedFace]) -> Result<(), IoError> {
 fn write_solid(w: Writer, b: &Brep, index: usize) -> Result<(Writer, Param), IoError> {
     let faces = solid_faces(b)?;
     check_faces(b, faces)?;
+    check_closed_shell(b, faces)?;
     let mut sw = ShellWriter::new(w, b);
     let mut entries = Vec::with_capacity(faces.len());
     for of in faces {

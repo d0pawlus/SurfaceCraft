@@ -20,10 +20,13 @@ mod geom;
 pub mod p21;
 mod pcurve;
 mod solid;
+mod solid_check;
 mod topology;
 
 #[cfg(test)]
 mod network_fixture;
+#[cfg(test)]
+mod solid_hardening_tests;
 #[cfg(test)]
 mod solid_tests;
 #[cfg(test)]
