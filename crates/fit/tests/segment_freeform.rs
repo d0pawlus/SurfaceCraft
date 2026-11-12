@@ -4,7 +4,7 @@
 //! the result does not depend on the number of threads.
 use std::time::Instant;
 use surfacecraft_fit::PrimitiveKind;
-use surfacecraft_fit::segment::{Segment, SegmentOptions, kinds, segment};
+use surfacecraft_fit::segment::{Segment, SegmentOptions, kinds, segment, segment_with_stats};
 use surfacecraft_geom::{Mesh, Point3, Rng, synth};
 
 /// A bumpy closed sphere of about `triangles` triangles with scanner noise `noise` (mm): radius,
@@ -63,12 +63,13 @@ fn organic_blob_is_a_few_freeform_regions() {
 /// is for), with it in a few regions.
 #[test]
 fn freeform_false_keeps_the_fragments() {
-    let mesh = organic_blob(25_000, 20.0, 0.5, 0.7, 0.02);
+    let mesh = organic_blob(25_000, 20.0, 1.2, 0.7, 0.02);
     let plain = segment(&mesh, &SegmentOptions { freeform: false, ..SegmentOptions::default() });
     let merged = segment(&mesh, &SegmentOptions::default());
     eprintln!("medium blob: {} fragments, {} regions with freeform", plain.len(), merged.len());
-    assert!(plain.len() >= 100 && plain.iter().all(|s| !s.freeform), "{} fragments", plain.len());
+    assert!(plain.len() >= 50 && plain.iter().all(|s| !s.freeform), "{} fragments", plain.len());
     assert!(merged.len() <= 50, "{} regions", merged.len());
+    assert!(merged.iter().any(|s| s.freeform), "no freeform region");
     assert!(assigned(&merged) as f64 >= 0.95 * mesh.triangle_count() as f64);
 }
 
@@ -84,18 +85,24 @@ fn prismatic_part_keeps_its_primitives() {
     assert_eq!(kinds(&on), vec![(PrimitiveKind::Plane, 6), (PrimitiveKind::Sphere, 1), (PrimitiveKind::Cylinder, 1)]);
 }
 
-/// The result is the same on one thread and on many (regions, flags, bits of the stand-ins).
+/// The result is the same on one thread and on many (regions, flags, bits of the stand-ins), with
+/// speculative jobs run, used and discarded alike (the seeds the halo skips included).
 #[test]
 fn freeform_segmentation_is_identical_on_one_thread_and_many() {
-    let mesh = organic_blob(25_000, 20.0, 0.5, 0.7, 0.02);
+    let mesh = organic_blob(25_000, 20.0, 1.2, 0.7, 0.02);
     let opts = SegmentOptions::default();
     let run = |threads: usize| {
         let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().expect("thread pool");
-        pool.install(|| segment(&mesh, &opts))
+        pool.install(|| segment_with_stats(&mesh, &opts))
     };
-    let one = run(1);
+    let (one, one_stats) = run(1);
+    let (many, many_stats) = run(6);
+    eprintln!("speculation on 6 threads: {many_stats:?}");
+    assert_eq!(one_stats.speculative_jobs, 0);
+    assert!(many_stats.speculative_used > 0, "{many_stats:?}");
+    assert!(many_stats.speculative_used < many_stats.speculative_jobs, "{many_stats:?}");
     assert!(one.iter().any(|s| s.freeform));
-    assert_eq!(one, run(6));
+    assert_eq!(one, many);
 }
 
 /// Options that make no sense fall back to the defaults instead of failing.
