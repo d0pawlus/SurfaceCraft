@@ -277,7 +277,7 @@ impl Session {
         }
         let live: Vec<ObjectId> = self.doc.bodies.iter().map(|b| b.id).collect();
         self.tess.entries.retain(|id, _| live.contains(id));
-        for b in self.doc.bodies.iter().filter(|b| b.visible) {
+        for b in self.doc.bodies.iter().filter(|b| b.shown()) {
             let key = Arc::as_ptr(&b.brep) as usize;
             let (mesh, topo) = match self.tess.entries.get(&b.id) {
                 Some((k, m, t)) if *k == key => (m.clone(), t.clone()),

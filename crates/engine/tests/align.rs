@@ -98,8 +98,8 @@ fn principal_and_center_and_undo() {
     s.execute("align.center", json!({"object": "box"})).unwrap();
     let b = s.doc.bbox();
     assert!(b.center().coords.norm() < 1e-9);
+    // a proposal takes no undo step: one undo takes back the centring
     s.execute("align.principal", json!({"object": "box", "apply": false})).unwrap();
-    s.execute("edit.undo", Value::Null).unwrap();
     s.execute("edit.undo", Value::Null).unwrap();
     assert!((s.doc.bbox().center().x - 530.0).abs() < 1e-9);
 }

@@ -293,29 +293,53 @@ pub fn replay_doc(doc: &mut Document) -> usize {
             }
         }
     }
-    // write the results back into body objects
+    write_back(doc, &bodies, &consumed, &feature_bodies);
+    drop_orphan_dormant(doc);
+    failed
+}
+
+/// Writes the results into the body objects. A body whose feature produced no geometry leaves the
+/// model but is kept in `dormant_bodies` with its id, name and visibility; when geometry returns
+/// it comes back as the same object.
+fn write_back(
+    doc: &mut Document,
+    bodies: &HashMap<ObjectId, Brep>,
+    consumed: &[ObjectId],
+    feature_bodies: &[ObjectId],
+) {
     for id in feature_bodies {
-        match bodies.get(&id) {
-            Some(b) => {
-                if let Some(obj) = doc.body_mut(id) {
-                    if *obj.brep != *b {
-                        obj.brep = Arc::new(b.clone());
-                    }
-                    obj.visible = !consumed.contains(&id);
-                } else {
-                    let name = format!("body {}", id.0);
-                    doc.bodies.push(surfacecraft_doc::BodyObject {
-                        id,
-                        name,
-                        brep: Arc::new(b.clone()),
-                        visible: true,
-                    });
-                }
+        let Some(brep) = bodies.get(id) else {
+            if let Some(pos) = doc.bodies.iter().position(|o| o.id == *id) {
+                let obj = doc.bodies.remove(pos);
+                doc.dormant_bodies.retain(|o| o.id != *id);
+                doc.dormant_bodies.push(obj);
             }
-            None => {
-                doc.bodies.retain(|o| o.id != id);
+            continue;
+        };
+        if doc.body(*id).is_none() {
+            let revived = doc.dormant_bodies.iter().position(|o| o.id == *id).map(|pos| doc.dormant_bodies.remove(pos));
+            let obj = revived.unwrap_or_else(|| surfacecraft_doc::BodyObject {
+                id: *id,
+                name: format!("body {}", id.0),
+                brep: Arc::new(brep.clone()),
+                visible: true,
+                consumed: false,
+            });
+            doc.bodies.push(obj);
+        }
+        if let Some(obj) = doc.body_mut(*id) {
+            if *obj.brep != *brep {
+                obj.brep = Arc::new(brep.clone());
             }
+            obj.consumed = consumed.contains(id);
         }
     }
-    failed
+}
+
+/// Dormant bodies whose feature is gone (deleted) do not linger.
+fn drop_orphan_dormant(doc: &mut Document) {
+    let has_feature = |id: ObjectId| doc.features.iter().chain(doc.rolled_back.iter()).any(|f| f.body == id);
+    let keep: Vec<bool> = doc.dormant_bodies.iter().map(|b| has_feature(b.id)).collect();
+    let mut keep = keep.into_iter();
+    doc.dormant_bodies.retain(|_| keep.next().unwrap_or(false));
 }

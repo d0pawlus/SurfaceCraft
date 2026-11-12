@@ -32,7 +32,7 @@ const MIN_COVERAGE: f64 = 0.9;
 /// Default size limit of the holes `mesh.clean` fills (edges of the boundary loop).
 const FILL_HOLES_MAX_EDGES: usize = 400;
 /// Largest hole `mesh.fill_holes` accepts (edges), offered when holes were left open.
-const MAX_FILL_EDGES: usize = 4000;
+const MAX_FILL_EDGES: usize = surfacecraft_geom::edit::MAX_FILL_EDGES;
 /// A region is modelled when it holds at least this share of the scan's triangles...
 const MIN_REGION_SHARE: f64 = 0.01;
 /// ...and never fewer triangles than this.

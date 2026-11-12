@@ -194,6 +194,33 @@ fn read_stl(bytes: &[u8], limits: &Limits) -> Result<Mesh, IoError> {
     if binary_fits || !looks_ascii { read_stl_binary(bytes, limits) } else { read_stl_ascii(bytes, limits) }
 }
 
+/// Triangles of a binary STL parsed per parallel task.
+const STL_CHUNK: usize = 1 << 14;
+
+/// Why a chunk of a binary STL was refused (the first in file order is reported).
+enum StlFault {
+    Truncated,
+    NonFinite(usize),
+}
+
+/// Parses the triangles from index `first` on into `corners` (three points per triangle).
+fn parse_stl_chunk(bytes: &[u8], first: usize, corners: &mut [Point3]) -> Result<(), StlFault> {
+    for (k, tri) in corners.chunks_mut(3).enumerate() {
+        let base = 84 + (first + k) * 50 + 12;
+        for (c, slot) in tri.iter_mut().enumerate() {
+            let at = base + c * 12;
+            let (Some(x), Some(y), Some(z)) = (le_f32(bytes, at), le_f32(bytes, at + 4), le_f32(bytes, at + 8)) else {
+                return Err(StlFault::Truncated);
+            };
+            *slot = Point3::new(f64::from(x), f64::from(y), f64::from(z));
+        }
+        if tri.iter().any(|p| !surfacecraft_geom::finite(p)) {
+            return Err(StlFault::NonFinite(first + k));
+        }
+    }
+    Ok(())
+}
+
 fn read_stl_binary(bytes: &[u8], limits: &Limits) -> Result<Mesh, IoError> {
     let n = le_u32(bytes, 80).ok_or_else(|| bad("STL", "file shorter than the 84-byte header"))? as usize;
     let available = bytes.len().saturating_sub(84) / 50;
@@ -203,25 +230,20 @@ fn read_stl_binary(bytes: &[u8], limits: &Limits) -> Result<Mesh, IoError> {
     if n > limits.max_triangles {
         return Err(IoError::Limit(format!("{n} triangles exceed the limit of {}", limits.max_triangles)));
     }
-    let mut positions = Vec::with_capacity(n * 3);
-    let mut triangles = Vec::with_capacity(n);
-    for t in 0..n {
-        let base = 84 + t * 50 + 12;
-        let mut corners = [Point3::origin(); 3];
-        for (k, c) in corners.iter_mut().enumerate() {
-            let at = base + k * 12;
-            let (Some(x), Some(y), Some(z)) = (le_f32(bytes, at), le_f32(bytes, at + 4), le_f32(bytes, at + 8)) else {
-                return Err(bad("STL", "truncated triangle"));
-            };
-            *c = Point3::new(f64::from(x), f64::from(y), f64::from(z));
-        }
-        if corners.iter().any(|p| !surfacecraft_geom::finite(p)) {
-            return Err(bad("STL", format!("triangle {t} has a non-finite coordinate")));
-        }
-        let i = positions.len() as u32;
-        positions.extend_from_slice(&corners);
-        triangles.push([i, i + 1, i + 2]);
+    if n.checked_mul(3).is_none_or(|c| c > u32::MAX as usize) {
+        return Err(IoError::Limit(format!("{n} triangles need more vertices than an index can address")));
     }
+    // chunks are parsed in parallel; the file order of the points and of the faults is kept
+    let mut positions = vec![Point3::origin(); n * 3];
+    let faults = surfacecraft_geom::par::map_chunks_mut(&mut positions, STL_CHUNK * 3, |k, corners| {
+        parse_stl_chunk(bytes, k * STL_CHUNK, corners)
+    });
+    match faults.into_iter().find_map(Result::err) {
+        Some(StlFault::Truncated) => return Err(bad("STL", "truncated triangle")),
+        Some(StlFault::NonFinite(t)) => return Err(bad("STL", format!("triangle {t} has a non-finite coordinate"))),
+        None => {}
+    }
+    let triangles = surfacecraft_geom::par::map(n, |t| [3 * t as u32, 3 * t as u32 + 1, 3 * t as u32 + 2]);
     let mut m = Mesh { positions, triangles };
     m.weld(0.0);
     Ok(m)
@@ -632,6 +654,46 @@ mod tests {
         let obj = "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nf -4/1/1 -3/2/2 -2 -1\n";
         let m = read_mesh(obj.as_bytes(), MeshFormat::Obj, &Limits::default()).unwrap();
         assert_eq!(m.triangle_count(), 2);
+    }
+
+    /// A binary STL of a bumpy strip, more triangles than one parse chunk holds.
+    fn big_stl() -> (Vec<u8>, Mesh) {
+        let strip = surfacecraft_geom::synth::plane(Point3::origin(), Vec3::x(), Vec3::y(), 30.0, 20.0, 150, 100);
+        let wavy = Mesh {
+            positions: strip.positions.iter().map(|p| Point3::new(p.x, p.y, (p.x * 0.7).sin())).collect(),
+            triangles: strip.triangles,
+        };
+        assert!(wavy.triangle_count() > 3 * STL_CHUNK / 2);
+        (write_mesh(&wavy, MeshFormat::Stl), wavy)
+    }
+
+    fn in_pool<T: Send>(threads: usize, f: impl FnOnce() -> T + Send) -> T {
+        rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap().install(f)
+    }
+
+    #[test]
+    fn binary_stl_is_the_same_on_one_and_many_threads() {
+        let (bytes, wavy) = big_stl();
+        let read = || read_mesh(&bytes, MeshFormat::Stl, &Limits::default()).unwrap();
+        let (one, many) = (in_pool(1, read), in_pool(8, read));
+        assert_eq!(one, many);
+        assert_eq!(one.triangle_count(), wavy.triangle_count());
+        assert_eq!(one.vertex_count(), wavy.vertex_count());
+    }
+
+    #[test]
+    fn the_first_bad_triangle_of_a_binary_stl_is_reported_on_any_thread_count() {
+        let (mut bytes, _) = big_stl();
+        for t in [STL_CHUNK + 5, 5000] {
+            let at = 84 + t * 50 + 12;
+            bytes[at..at + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+        }
+        let msg = |threads| {
+            in_pool(threads, || read_mesh(&bytes, MeshFormat::Stl, &Limits::default()).unwrap_err().to_string())
+        };
+        let (a, b) = (msg(1), msg(8));
+        assert_eq!(a, b);
+        assert!(a.contains("triangle 5000"), "{a}");
     }
 
     #[test]

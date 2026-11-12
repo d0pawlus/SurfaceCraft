@@ -13,6 +13,7 @@ pub mod auto;
 pub mod boundary;
 pub mod charts;
 pub mod constrain;
+pub mod coverage;
 pub mod features;
 mod features_ngon;
 pub mod lm;

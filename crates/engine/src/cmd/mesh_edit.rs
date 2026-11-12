@@ -253,7 +253,7 @@ fn small(s: &mut Session, i: SmallIn) -> CmdResult<EditOut> {
 pub struct FillIn {
     /// Mesh id or name.
     pub object: ObjRef,
-    /// Largest hole filled, in boundary edges (default 300, at most 4000).
+    /// Largest hole filled, in boundary edges (default 300, at most 20000; a smooth fill of a hole of thousands of edges takes tens of seconds).
     #[serde(default)]
     pub max_edges: Option<usize>,
     /// Curvature-following fill (refined, thin-plate faired); `false` = flat (default true).

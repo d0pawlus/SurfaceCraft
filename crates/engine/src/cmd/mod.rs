@@ -36,9 +36,12 @@ pub mod stream;
 pub mod surface;
 mod surface_check;
 mod surface_fit;
+mod surface_mask;
 mod surface_pieces;
+mod surface_report;
 pub mod working;
 pub mod wrap;
+mod wrap_rounds;
 
 /// An error from a command's `run`.
 #[derive(Clone, Debug, PartialEq)]
@@ -199,6 +202,7 @@ pub fn find(id: &str) -> Option<&'static CommandSpec> {
 
 /// Commands too slow to run on every parameter change (a front end skips their live preview).
 const HEAVY: &[&str] = &[
+    "align.auto",
     "align.icp",
     "body.compare",
     "body.from_regions",
