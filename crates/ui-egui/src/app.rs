@@ -37,6 +37,8 @@ pub struct SurfaceCraftApp {
     pub(crate) keys_free: bool,
     /// The sketch editing mode (G5).
     pub sketch_editor: crate::sketch_editor::SketchEditor,
+    /// The tessellated sketch drawings (see [`crate::sketch_cache`]).
+    pub sketch_cache: crate::sketch_cache::SketchDrawCache,
     /// The Properties panel's form and live preview.
     pub cmd_panel: crate::command_panel::CommandPanel,
     /// The feature history's editor.
@@ -130,6 +132,7 @@ impl SurfaceCraftApp {
             focus_search: false,
             keys_free: false,
             sketch_editor: crate::sketch_editor::SketchEditor::default(),
+            sketch_cache: Default::default(),
             cmd_panel: Default::default(),
             hist_panel: Default::default(),
             deviation: Default::default(),

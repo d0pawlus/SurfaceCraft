@@ -38,9 +38,25 @@ pub fn from_json(text: &str) -> Result<Document, String> {
         }
     }
     let mut doc = env.document;
-    let max_id = doc.meshes.iter().map(|m| m.id.0).chain(doc.bodies.iter().map(|b| b.id.0)).max().unwrap_or(0);
-    doc.next_id = doc.next_id.max(max_id);
+    repair_counter(&mut doc)?;
     Ok(doc)
+}
+
+/// Brings the id counter above every id of the file, parked and dormant objects included, so a
+/// later creation never reuses one. A file that uses an id twice, or has no free id left, is
+/// refused.
+fn repair_counter(doc: &mut Document) -> Result<(), String> {
+    let mut ids = doc.all_ids();
+    ids.sort_unstable();
+    if let Some(w) = ids.windows(2).find(|w| w[0] == w[1]) {
+        return Err(format!("the project uses object id {} more than once", w[0]));
+    }
+    let max_id = ids.last().copied().unwrap_or(0).max(doc.next_id);
+    if max_id == u64::MAX {
+        return Err("the project has no free object ids left".into());
+    }
+    doc.next_id = max_id;
+    Ok(())
 }
 
 /// Serde adapter: a mesh as `{"vertices": n, "triangles": m, "positions": b64(f64 LE), "indices": b64(u32 LE)}`.
@@ -107,6 +123,67 @@ pub mod mesh_b64 {
 mod tests {
     use super::*;
     use surfacecraft_geom::synth;
+
+    /// A document with a body and a parked feature, saved with the counter set to `next_id`, then
+    /// edited as JSON by `edit`.
+    fn project_json(next_id: u64, edit: impl Fn(&mut serde_json::Value)) -> String {
+        let mut d = Document::new();
+        let b = surfacecraft_kernel::solid::make_box([0.0; 3], [1.0, 2.0, 3.0]).unwrap();
+        let body = d.add_body("box", b.clone());
+        let parked = d.add_feature("base", crate::FeatureOp::Base { brep: std::sync::Arc::new(b) }, body);
+        let f = d.features.remove(0);
+        d.rolled_back.push(f);
+        d.next_id = next_id;
+        let mut v: serde_json::Value = serde_json::from_str(&to_json(&d).unwrap()).unwrap();
+        assert!(parked.0 > 0);
+        edit(&mut v);
+        v.to_string()
+    }
+
+    #[test]
+    fn loading_takes_the_counter_above_parked_and_dormant_ids() {
+        let text = project_json(0, |v| {
+            let d = &mut v["document"];
+            let dormant = d["bodies"][0].clone();
+            d["bodies"] = serde_json::json!([]);
+            let mut dormant = dormant;
+            dormant["id"] = serde_json::json!(40);
+            d["dormant_bodies"] = serde_json::json!([dormant]);
+            d["rolled_back"][0]["id"] = serde_json::json!(90);
+        });
+        let mut doc = from_json(&text).expect("loads");
+        assert_eq!(doc.next_id, 90, "the highest id of any store");
+        assert!(!doc.all_ids().contains(&doc.fresh_id().0), "a new id is free");
+    }
+
+    #[test]
+    fn duplicate_ids_are_refused() {
+        let active_vs_parked = project_json(5, |v| {
+            let d = &mut v["document"];
+            let id = d["bodies"][0]["id"].clone();
+            d["rolled_back"][0]["id"] = id;
+        });
+        let err = from_json(&active_vs_parked).expect_err("duplicate");
+        assert!(err.contains("more than once"), "{err}");
+        let parked_vs_parked = project_json(5, |v| {
+            let d = &mut v["document"];
+            let f = d["rolled_back"][0].clone();
+            d["rolled_back"] = serde_json::json!([f.clone(), f]);
+        });
+        assert!(from_json(&parked_vs_parked).is_err());
+        let dormant_vs_active = project_json(5, |v| {
+            let d = &mut v["document"];
+            d["dormant_bodies"] = serde_json::json!([d["bodies"][0].clone()]);
+        });
+        assert!(from_json(&dormant_vs_active).is_err());
+    }
+
+    #[test]
+    fn an_exhausted_counter_is_an_error_not_a_wrap() {
+        let text = project_json(u64::MAX, |_| {});
+        let err = from_json(&text).expect_err("exhausted");
+        assert!(err.contains("no free object ids"), "{err}");
+    }
 
     #[test]
     fn project_roundtrip() {

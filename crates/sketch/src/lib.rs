@@ -18,12 +18,14 @@
 pub mod chains;
 pub mod constraint;
 pub mod fit2d;
+pub mod moving;
 pub mod profile;
 pub mod solve;
 
 pub use constraint::Constraint;
+pub use moving::{Moved, REACH_TOL, move_point};
 pub use profile::{Segment3, open_paths, path_length, path_samples, profiles};
-pub use solve::{SolveReport, SolveStatus, polish, solve};
+pub use solve::{SATISFIED_TOL, SolveReport, SolveStatus, polish, solve};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

@@ -107,7 +107,7 @@ impl SurfaceCraftApp {
     /// camera-orbit and picking gestures (panning with the right/middle button and zooming
     /// with the wheel stay the viewport's).
     pub(crate) fn sketch_input(&mut self, ui: &mut egui::Ui, resp: &egui::Response, rect: Rect) {
-        let Some((_, _, sk, _)) = self.current_sketch() else {
+        let Some((sketch_id, _, sk, _)) = self.current_sketch() else {
             self.sketch_editor.end();
             return;
         };
@@ -118,6 +118,7 @@ impl SurfaceCraftApp {
         let keyboard_free = !ui.ctx().egui_wants_keyboard_input();
         let ed = &mut self.sketch_editor;
         ed.sanitize(&sk);
+        ed.drag_check(sketch_id, &sk);
         let over_chrome = |p: Pos2, ed: &SketchEditor| ed.chrome.iter().any(|r| rect_of(*r).contains(p));
         let to_plane = |p: Pos2| view.to_plane(p.x - rect.min.x, p.y - rect.min.y);
         ed.hover = resp
@@ -157,6 +158,26 @@ impl SurfaceCraftApp {
                 ed.notice = Some("sketch.notice.value");
             }
         }
+        // a drag of a point: press on it in the select tool, move, release (Alt+drag orbits)
+        let alt = ui.input(|i| i.modifiers.alt);
+        // the point is the one under the press: egui reports the drag only after its threshold, so
+        // the pointer may already be elsewhere
+        let press = ui.input(|i| i.pointer.press_origin());
+        if resp.drag_started_by(egui::PointerButton::Primary)
+            && !alt
+            && let Some(p0) = press.filter(|p| !over_chrome(*p, ed)).and_then(to_plane)
+            && let Some(now) = resp.interact_pointer_pos().and_then(to_plane)
+        {
+            ed.drag_press(&sk, p0, now, tol);
+        }
+        if resp.dragged_by(egui::PointerButton::Primary)
+            && let Some(q) = resp.interact_pointer_pos().and_then(to_plane)
+        {
+            ed.drag_update(q);
+        }
+        if resp.drag_stopped_by(egui::PointerButton::Primary) {
+            cmds.extend(ed.drag_end());
+        }
         if resp.clicked_by(egui::PointerButton::Primary)
             && let Some(pos) = resp.interact_pointer_pos()
             && !over_chrome(pos, ed)
@@ -184,7 +205,11 @@ impl SurfaceCraftApp {
     /// sketch with its constraints and dimensions, the rubber band, the snap marker and the
     /// editor's controls.
     pub(crate) fn sketch_overlay(&mut self, ui: &mut egui::Ui, rect: Rect) {
-        let Some((_, name, sk, report)) = self.current_sketch() else { return };
+        let Some((sketch_id, name, sk, report)) = self.current_sketch() else { return };
+        // while a point is dragged the sketch is drawn as the solver leaves it
+        let sk = self.sketch_editor.drag.as_ref().map_or(sk, |d| d.preview.clone());
+        let doc = &self.session.doc;
+        self.sketch_cache.retain(|id| doc.sketch(id).is_some());
         let view = PlaneView::new(&self.camera, &sk.plane, rect.width(), rect.height());
         let tk = self.tokens.clone();
         let metrics = self.settings.theme.density.metrics();
@@ -232,11 +257,9 @@ impl SurfaceCraftApp {
             if Some(o.id) == self.sketch_editor.target || !o.visible {
                 continue;
             }
-            for e in 0..o.sketch.entities.len() {
-                let pts: Vec<Pos2> = snap::entity_polyline(&o.sketch, e, 48)
-                    .iter()
-                    .filter_map(|p| view.project(&o.sketch.plane.to_3d(*p)).map(at))
-                    .collect();
+            for line_pts in self.sketch_cache.lines(o.id, &o.sketch, 48) {
+                let pts: Vec<Pos2> =
+                    line_pts.iter().filter_map(|p| view.project(&o.sketch.plane.to_3d(*p)).map(at)).collect();
                 line(&painter, &pts, 1.0, Token::TextMuted);
             }
         }
@@ -258,8 +281,9 @@ impl SurfaceCraftApp {
         });
 
         // the sketch
-        for e in 0..sk.entities.len() {
-            let pts: Vec<Pos2> = snap::entity_polyline(&sk, e, 64).iter().filter_map(|p| sp(*p)).collect();
+        let lines = self.sketch_cache.lines(sketch_id, &sk, 64).to_vec();
+        for (e, line_pts) in lines.iter().enumerate() {
+            let pts: Vec<Pos2> = line_pts.iter().filter_map(|p| sp(*p)).collect();
             let token = if bad.contains(&e) {
                 Token::StatusError
             } else if ed.picks.contains(&Hit::Entity(e)) || hover_hit == Some(Hit::Entity(e)) {
