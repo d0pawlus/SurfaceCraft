@@ -6,6 +6,7 @@ use super::{CmdError, CmdResult, CommandSpec};
 use crate::{Session, command};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use surfacecraft_doc::LengthUnit;
 #[cfg(not(target_arch = "wasm32"))]
 use surfacecraft_geom::chunked::{StoreParams, StoreSummary};
 use surfacecraft_io::MeshFormat;
@@ -24,6 +25,9 @@ pub struct ImportStreamIn {
     /// Scale applied on import (e.g. 25.4 for inches to mm). Default 1.
     #[serde(default)]
     pub scale: Option<f64>,
+    /// Unit of the file's coordinates, as for `mesh.import`: the store is written in millimetres.
+    #[serde(default)]
+    pub units: Option<LengthUnit>,
     /// Triangles per chunk, 64 - 262144 (default 65536). Also the memory unit of the import: the
     /// import needs about 54 MiB + 4 x chunk_triangles x (400 + 80 x levels) bytes (252 MiB at the
     /// defaults, at most about 1.1 GB), whatever the size of the file; the spill files take 72
@@ -182,7 +186,7 @@ fn import_stream(s: &mut Session, i: ImportStreamIn) -> CmdResult<StoreOut> {
     let store = params_of(&i)?;
     let opts = StreamImportOptions {
         format: i.format,
-        scale: i.scale.unwrap_or(1.0),
+        scale: crate::cmd::mesh::units::import_scale(i.scale, i.units).unwrap_or(1.0),
         store,
         overwrite: i.overwrite.unwrap_or(false),
         ..StreamImportOptions::default()

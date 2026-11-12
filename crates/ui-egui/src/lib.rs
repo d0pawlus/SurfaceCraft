@@ -29,6 +29,7 @@ pub mod guide_panel;
 pub mod history_panel;
 pub mod i18n;
 pub mod icons;
+pub mod import_units;
 pub mod jobs;
 pub mod navbar;
 pub mod ribbon;

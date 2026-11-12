@@ -123,7 +123,12 @@ impl SurfaceCraftApp {
             return false;
         };
         match serde_json::from_str::<Value>(&self.palette_params) {
-            Ok(v) => self.launch(id, v, After::CloseTool),
+            Ok(v) => {
+                if let Some(units) = crate::import_units::chosen(id, &v) {
+                    self.settings.import_units = units;
+                }
+                self.launch(id, v, After::CloseTool)
+            }
             Err(e) => {
                 self.status = tf("status.params_not_json", &[("error", &e.to_string())]);
                 false
@@ -239,6 +244,12 @@ impl SurfaceCraftApp {
 
     /// What the control that launched the command asked for.
     fn finish(&mut self, after: After, id: &str, result: Result<Value, EngineError>) {
+        if let Ok(v) = &result
+            && matches!(id, "mesh.import" | "mesh.set_units")
+            && let Some(text) = crate::import_units::warning_text(v)
+        {
+            self.status = text;
+        }
         match after {
             After::Nothing => {}
             After::CloseTool => {
@@ -316,10 +327,11 @@ impl SurfaceCraftApp {
             let ext = lower.rsplit('.').next().unwrap_or("").to_string();
             let stem = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s).to_string();
             let data = surfacecraft_doc::base64::encode(&bytes);
+            let units = self.settings.import_units;
             let (id, params) = if ext == "step" || ext == "stp" {
                 ("import.step", json!({"data": data, "name": stem}))
             } else {
-                ("mesh.import", json!({"data": data, "format": ext, "name": stem}))
+                ("mesh.import", json!({"data": data, "format": ext, "name": stem, "units": units}))
             };
             self.launch(id, params, After::Fit);
         }

@@ -10,8 +10,28 @@ tool `align_icp`), or call `execute` with `command` and `params`.
 
 - `mesh.import`: `path` (STL, OBJ, PLY or XYZ) or base64 `data` with `format`. Over MCP file
   paths are off unless the server runs with `--allow-files`, so send `data` inline.
-- `scale` converts units (25.4 for inches to millimetres). `name` names the mesh.
-- `mesh.info` reports triangles, bounding box and area. Check the units with it first.
+- `scale` multiplies the coordinates on import (for an odd factor). `name` names the mesh.
+- `mesh.info` reports triangles, bounding box, area and `source_units`. Check the size with it first.
+
+### Units
+
+STL, OBJ, PLY and XYZ files carry no length unit, and SurfaceCraft works in millimetres. Say which
+unit the file is in with `units`: `mm` (default), `cm`, `m`, `in`, `ft` or `um`. The mesh is
+converted to millimetres on import (exact factors: cm 10, m 1000, in 25.4, ft 304.8, um 0.001), and
+the object remembers the unit in `source_units`. Normals, colours and per-vertex data go with it.
+
+- `mesh.import` with `"units": "m"` for a scan saved in metres. `mesh.import_stream` takes `units`
+  too: the store is written in millimetres, bounds and error bounds included.
+- A file read in the wrong unit is not rescaled silently. A size that looks like a unit mistake
+  (largest side below 1 mm, or above 20 000 mm) comes back as `scale_warning` with code
+  `suspicious_scale`, with the call that fixes it. The same warning is in `mesh.info`, `scan.qa`
+  and `scan.to_solid`. The rule uses the largest axis extent of the vertices, ignoring the
+  extreme vertices at each end; below 1 mm it looks like metres or inches, below 0.02 mm it is
+  definitely not millimetres, above 20 000 mm it looks like micrometres or another unit.
+- `mesh.set_units` converts a mesh imported already, with `from`: the unit its coordinates really
+  are in. Regions, primitives and quad layouts over it are rescaled with it; a fitted surface
+  refuses the conversion. One undo step. A mesh converted once cannot be converted again.
+- `mesh.export` and the STEP and IGES exports write millimetres, as before.
 
 ## Scale (photogrammetry)
 

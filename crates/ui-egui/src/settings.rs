@@ -23,6 +23,8 @@ pub struct UiSettings {
     pub workspace: Option<Workspace>,
     /// The [`LAYOUT_VERSION`] the layout was saved under.
     pub layout_version: u32,
+    /// The unit the last scan import chose (the import form starts with it).
+    pub import_units: surfacecraft_doc::LengthUnit,
 }
 
 impl UiSettings {

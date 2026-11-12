@@ -300,8 +300,9 @@ impl SurfaceCraftApp {
         // in front; a layout that refuses keeps the panel where it is
         let _ = crate::dock::set_visible(&mut self.workspace, crate::dock::Panel::Properties, true);
         let schema = surfacecraft_engine::cmd::find(id).map(|c| (c.input)()).unwrap_or(Value::Null);
-        self.palette_params =
-            serde_json::to_string_pretty(&template(&schema, &self.pick_context())).unwrap_or_else(|_| "{}".into());
+        let params = template(&schema, &self.pick_context());
+        let params = crate::import_units::prefilled(id, params, self.settings.import_units);
+        self.palette_params = serde_json::to_string_pretty(&params).unwrap_or_else(|_| "{}".into());
     }
 
     /// Closes the open tool without running it: the tool panel shows the guide again.

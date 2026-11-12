@@ -4,12 +4,14 @@ use crate::{Session, command};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use surfacecraft_doc::{ObjectId, ObjectKind, base64};
+use surfacecraft_doc::{LengthUnit, ObjectId, ObjectKind, base64};
 use surfacecraft_geom::{Mesh, Point3, PointCloud, ReconParams, Rng, Transform, Vec3, reconstruct, synth};
 use surfacecraft_io::{Limits, MeshFormat, Scan, read_points, read_scan, write_mesh};
 
 mod deps;
 mod scale;
+pub(crate) mod size_check;
+pub(crate) mod units;
 
 /// Facts about a mesh.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -31,6 +33,11 @@ pub struct MeshInfo {
     /// The working copy, when there is one: the geometry edits act on (`mesh.working_begin`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub working: Option<WorkingInfo>,
+    /// The unit the file was in when imported (the geometry is millimetres).
+    pub source_units: LengthUnit,
+    /// Present when the size looks like a unit mistake (`suspicious_scale`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scale_warning: Option<size_check::ScaleWarning>,
 }
 
 /// Size of a working copy.
@@ -68,6 +75,8 @@ pub(crate) fn mesh_info(s: &Session, id: ObjectId) -> CmdResult<MeshInfo> {
         bbox_max,
         area: m.mesh.area(),
         working,
+        source_units: m.source_units,
+        scale_warning: size_check::scale_warning(&m.mesh),
     })
 }
 
@@ -127,6 +136,9 @@ pub struct ImportIn {
     /// reconstructed into a mesh on import.
     #[serde(default)]
     pub reconstruct: Option<ReconstructOpts>,
+    /// Unit of the file's coordinates, converted to millimetres.
+    #[serde(default)]
+    pub units: Option<LengthUnit>,
 }
 
 /// What reconstructing a point cloud did.
@@ -163,6 +175,8 @@ pub struct ImportOut {
     /// Present when the input was a point cloud.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub point_cloud: Option<CloudInfo>,
+    /// Factor every coordinate was multiplied by on import (`scale` times the unit; 1 when none).
+    pub scale_factor: f64,
 }
 
 type Loaded = (Vec<u8>, String, MeshFormat);
@@ -232,15 +246,19 @@ fn from_cloud(mut cloud: PointCloud, scale: Option<f64>, opts: &ReconstructOpts)
 fn import(s: &mut Session, i: ImportIn) -> CmdResult<ImportOut> {
     let (bytes, default_name, fmt) = load(s, &i.path, &i.data, i.format)?;
     let name = i.name.clone().unwrap_or(default_name);
+    let scale = units::import_scale(i.scale, i.units);
+    let scale_factor = scale.unwrap_or(1.0);
     let (mesh, cloud) = match read_scan(&bytes, fmt, &read_limits())? {
-        Scan::Mesh(m) => (scaled(m, i.scale)?, None),
+        Scan::Mesh(m) => (scaled(m, scale)?, None),
         Scan::Points(c) => {
-            let (m, info) = from_cloud(c, i.scale, &i.reconstruct.clone().unwrap_or_default())?;
+            let (m, info) = from_cloud(c, scale, &i.reconstruct.clone().unwrap_or_default())?;
             (m, Some(info))
         }
     };
     let id = s.doc.add_mesh(&name, mesh);
-    Ok(ImportOut { mesh: mesh_info(s, id)?, point_cloud: cloud })
+    let obj = s.doc.mesh_mut(id).ok_or_else(|| CmdError::Failed(format!("mesh {id} vanished on import")))?;
+    obj.source_units = i.units.unwrap_or_default();
+    Ok(ImportOut { mesh: mesh_info(s, id)?, point_cloud: cloud, scale_factor })
 }
 
 /// Reconstruction parameters: a file as for `mesh.import`, whose points (vertices, when it has
@@ -288,7 +306,7 @@ fn reconstruct_cmd(s: &mut Session, i: ReconstructIn) -> CmdResult<ImportOut> {
     };
     let (mesh, info) = from_cloud(cloud, i.scale, &opts)?;
     let id = s.doc.add_mesh(i.name.as_deref().unwrap_or(&default_name), mesh);
-    Ok(ImportOut { mesh: mesh_info(s, id)?, point_cloud: Some(info) })
+    Ok(ImportOut { mesh: mesh_info(s, id)?, point_cloud: Some(info), scale_factor: i.scale.unwrap_or(1.0) })
 }
 
 /// Export parameters.
@@ -548,10 +566,20 @@ pub static COMMANDS: &[CommandSpec] = &[
         "Import mesh…",
         "Mesh",
         true,
-        "Imports STL/OBJ/PLY/XYZ from `path` or base64 `data` (+`format`), optional `scale`, `name`; a point cloud (no faces) is reconstructed into a mesh (`reconstruct` settings).",
+        "Imports STL/OBJ/PLY/XYZ from `path` or base64 `data` (+`format`), optional `scale`, `name`, `units`; a point cloud (no faces) is reconstructed into a mesh (`reconstruct` settings).",
         ImportIn,
         ImportOut,
         import
+    ),
+    command!(
+        "mesh.set_units",
+        "Set units...",
+        "Mesh",
+        true,
+        "Rescales a mesh imported in the wrong unit: `from` is its real unit.",
+        units::SetUnitsIn,
+        units::SetUnitsOut,
+        units::set_units
     ),
     command!(
         "mesh.reconstruct",

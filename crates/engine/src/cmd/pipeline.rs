@@ -6,6 +6,7 @@
 use super::body::BodyOut;
 use super::deviation::{NOISE_PRIMITIVE_MM, positive, yes};
 use super::hybrid::{FaceOf, FromRegionsIn, from_regions};
+use super::mesh::size_check;
 use super::mesh_edit::{CleanIn, clean};
 use super::primitive::{AutoConstrainIn, FitIn, KindChoice, auto_constrain, fit_cmd};
 use super::qa::{CompareIn, CompareOut, Finding, QaIn, compare, scan_qa};
@@ -682,7 +683,21 @@ fn relate(s: &mut Session, modelled: &[Modelled], sigma: Option<f64>) -> usize {
     auto_constrain(s, params).map_or(0, |r| if r.applied { r.relations.len() } else { 0 })
 }
 
+/// `scan.to_solid`: the run, and a size that looks like a unit mistake (P9-U1) is one of its issues.
 fn to_solid(s: &mut Session, i: ToSolidIn) -> CmdResult<ToSolidOut> {
+    let scan = i.scan.resolve(s, ObjectKind::Mesh)?;
+    let size = s.doc.mesh(scan).and_then(|m| size_check::scale_warning(&m.mesh));
+    let mut out = run_to_solid(s, i)?;
+    if let Some(w) = size {
+        out.issues.push(Issue { code: w.code.clone(), message: format!("{}. {}", w.message, w.suggestion) });
+        if matches!(out.verdict, Verdict::Pass) {
+            out.verdict = Verdict::Review;
+        }
+    }
+    Ok(out)
+}
+
+fn run_to_solid(s: &mut Session, i: ToSolidIn) -> CmdResult<ToSolidOut> {
     let set = settings(s, &i)?;
     let scan_report = prepare(s, &i, set.scan)?;
     if i.method == Method::Freeform {

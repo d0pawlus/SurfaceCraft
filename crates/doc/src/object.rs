@@ -91,7 +91,7 @@ macro_rules! object_common {
 }
 
 mod mesh_object;
-pub use mesh_object::MeshObject;
+pub use mesh_object::{LengthUnit, MeshObject};
 
 /// A B-rep body, held as the kernel's neutral record.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -536,7 +536,14 @@ impl Document {
     pub fn add_mesh(&mut self, name: &str, mesh: Mesh) -> ObjectId {
         let id = self.fresh_id();
         let name = self.unique_name(name);
-        self.meshes.push(MeshObject { id, name, mesh: Arc::new(mesh), visible: true, working: None });
+        self.meshes.push(MeshObject {
+            id,
+            name,
+            mesh: Arc::new(mesh),
+            visible: true,
+            working: None,
+            source_units: LengthUnit::Mm,
+        });
         id
     }
 
