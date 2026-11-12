@@ -203,6 +203,10 @@ pub struct DeviationSummary {
     /// Share of the scan's points that were measured (0..1): the rest lie farther than 5 mm from
     /// the solid or face away from it.
     pub coverage: f64,
+    /// Share of the scan's points (0..1) that lie on the solid but face away from it, and so are
+    /// not in `count`: a solid that is inside out, or has faces turned the wrong way, shows here.
+    #[serde(default)]
+    pub not_facing: f64,
     /// Share of the measured points within the tolerance (0..1).
     pub within: f64,
     /// RMS deviation (mm).
@@ -268,6 +272,30 @@ struct Candidate {
     triangles: usize,
     kind: Option<PrimitiveKind>,
     rms: Option<f64>,
+}
+
+/// The issue of a coverage below [`MIN_COVERAGE`], told by what is wrong. `low_coverage`: part of
+/// the scan is not near `what`. `inconsistent_orientation`: the scan is there, but its points face
+/// away from the surface (the solid is inside out or has faces turned the wrong way), which is a
+/// defect of the solid and not a part of the scan it misses.
+pub(super) fn coverage_issue(d: &DeviationSummary, what: &str) -> Option<Issue> {
+    if d.coverage >= MIN_COVERAGE {
+        return None;
+    }
+    if d.coverage + d.not_facing >= MIN_COVERAGE {
+        let msg = format!(
+            "{:.1} % of the scan points lie on {what} but face away from it (only {:.1} % face it): its faces are turned the wrong way",
+            100.0 * d.not_facing,
+            100.0 * d.coverage
+        );
+        return Some(issue("inconsistent_orientation", msg));
+    }
+    let msg = format!(
+        "only {:.1} % of the scan points lie on {what} (at least {:.0} % expected)",
+        100.0 * (d.coverage + d.not_facing),
+        100.0 * MIN_COVERAGE
+    );
+    Some(issue("low_coverage", msg))
 }
 
 fn issue(code: &str, message: String) -> Issue {
@@ -398,10 +426,11 @@ fn apply_roles(modelled: &mut [Modelled], faces_of: &[FaceOf]) {
 
 fn summary(c: &CompareOut, scan_vertices: usize) -> DeviationSummary {
     let t = &c.totals;
-    let coverage = if scan_vertices > 0 { t.count as f64 / scan_vertices as f64 } else { 0.0 };
+    let share = |n: usize| if scan_vertices > 0 { (n as f64 / scan_vertices as f64).min(1.0) } else { 0.0 };
     DeviationSummary {
         count: t.count,
-        coverage: coverage.min(1.0),
+        coverage: share(t.count),
+        not_facing: share(t.not_facing),
         within: t.within,
         rms: t.rms,
         max_abs: t.max_abs,
@@ -469,14 +498,7 @@ fn blocking_issues(o: &Outcome, set: &Settings) -> Vec<Issue> {
         list.push(issue("skipped_inputs", msg));
     }
     if let Some(d) = &o.deviation {
-        if d.coverage < MIN_COVERAGE {
-            let msg = format!(
-                "only {:.1} % of the scan points lie on the solid (at least {:.0} % expected)",
-                100.0 * d.coverage,
-                100.0 * MIN_COVERAGE
-            );
-            list.push(issue("low_coverage", msg));
-        }
+        list.extend(coverage_issue(d, "the solid"));
         if d.count > 0 && d.within < set.min_within {
             let msg = format!(
                 "{:.2} % of the measured points are within {} mm ({:.0} % required); max {:.3} mm, RMS {:.3} mm",

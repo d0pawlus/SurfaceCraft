@@ -134,8 +134,15 @@ pub fn counts(body: &Brep) -> Counts {
 }
 
 /// Enclosed volume (mm³).
+///
+/// A record the healer cannot take (it would have to change the topology, as for a patch network
+/// that crosses itself) is measured as it is: the volume is the integral over its faces, which the
+/// orientation pass of the network builders has turned outward.
 pub fn volume(body: &Brep) -> Result<f64> {
-    let b = decode(body)?;
+    let b = match decode(body) {
+        Ok(b) => b,
+        Err(healer) => ops::Body::from_record(body, true).map(|(b, _)| b).map_err(|_| healer)?,
+    };
     b.volume(1e-6).map_err(|e| op_err("volume", e))
 }
 

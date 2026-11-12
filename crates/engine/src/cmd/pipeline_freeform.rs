@@ -2,7 +2,7 @@
 //! (`surface.wrap`) and measured against the scan, for parts no set of primitives describes.
 use super::{
     DeviationSummary, MAX_FILL_EDGES, MIN_COVERAGE, Method, NextStep, ScanSummary, Settings, ToSolidOut, Verdict,
-    issue, message_of, step, summary,
+    coverage_issue, issue, message_of, step, summary,
 };
 use crate::Session;
 use crate::cmd::qa::{CompareIn, compare};
@@ -17,14 +17,7 @@ fn issues_of(w: &WrapOut, d: &DeviationSummary, set: &Settings, report: &ScanSum
         let msg = "the patch network is not closed (the scan has open boundaries): the result is a sheet, not a solid";
         list.push(issue("open_surface", msg.to_string()));
     }
-    if d.coverage < MIN_COVERAGE {
-        let msg = format!(
-            "only {:.1} % of the scan points lie on the patches (at least {:.0} % expected)",
-            100.0 * d.coverage,
-            100.0 * MIN_COVERAGE
-        );
-        list.push(issue("low_coverage", msg));
-    }
+    list.extend(coverage_issue(d, "the patches"));
     if d.count > 0 && d.within < set.min_within {
         let msg = format!(
             "{:.2} % of the measured points are within {} mm ({:.0} % required); max {:.3} mm, RMS {:.3} mm; {} patches{}",

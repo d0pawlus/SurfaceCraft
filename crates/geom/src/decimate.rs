@@ -2,7 +2,7 @@
 //! feature-edge constraint planes, link-condition and normal-flip checks, optionally guarded by
 //! a measured deviation from the original surface. The collapse loop is in [`crate::collapse`];
 //! with a guard a large mesh is first reduced in independent parts (see [`crate::partition`]).
-use crate::collapse::{Collapser, Quadric, plane_quadric};
+use crate::collapse::{Collapser, Quadric, plane_quadric, vertex_origins};
 use crate::edit::compact;
 use crate::{Bvh, Mesh, Point3, Vec3, tri};
 use std::collections::HashMap;
@@ -58,17 +58,18 @@ pub(crate) fn decimate_guarded(mesh: &mut Mesh, opts: &DecimateOptions, mut guar
     let mut tris = std::mem::take(&mut mesh.triangles);
     let mut pos = std::mem::take(&mut mesh.positions);
     let (mut q, mut locked) = setup(&tris, &pos, opts);
+    let mut origin = vertex_origins(&tris, &pos);
     let max_cost = opts.max_error.filter(|e| e.is_finite() && *e > 0.0).map(|e| e * e);
     if let Some(g) = guard.as_mut()
         && tris.len() >= PARTS_FROM_TRIANGLES
     {
-        let whole = crate::partition::Whole { tris, pos, q, locked };
+        let whole = crate::partition::Whole { tris, pos, q, origin, locked };
         let done = crate::partition::reduce_in_parts(whole, g, opts, max_cost);
-        (tris, pos, q, locked) = (done.tris, done.pos, done.q, done.locked);
+        (tris, pos, q, origin, locked) = (done.tris, done.pos, done.q, done.origin, done.locked);
     }
-    let mut c = Collapser::new(tris, pos, q, locked, guard, true);
+    let mut c = Collapser::new(tris, pos, q, origin, locked, guard, true);
     c.run(opts.target_triangles, max_cost);
-    let (tris, pos, _) = c.finish();
+    let (tris, pos, ..) = c.finish();
     mesh.positions = pos;
     mesh.triangles = tris;
     compact(mesh);
@@ -123,4 +124,50 @@ fn setup(tris: &[[u32; 3]], pos: &[Point3], opts: &DecimateOptions) -> (Vec<Quad
         }
     }
     (q, locked)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Rng, synth};
+
+    const SEEDS: u64 = 20;
+
+    /// Reduces a noisy plate, much thinner than it is wide, to `target` triangles with the
+    /// collapse loop and returns how many of the triangles left face away from the original
+    /// orientation of their corners (the sum of the normals of the triangles each stands for).
+    fn turned_against_the_surface(seed: u64, target: usize, guard: bool) -> usize {
+        let mut m = synth::rounded_cuboid(Point3::origin(), Vec3::new(40.0, 40.0, 1.0), 0.4, 30);
+        synth::add_noise(&mut m, 0.05, &mut Rng::new(seed));
+        let opts = DecimateOptions { target_triangles: target, feature_angle_deg: 181.0, ..DecimateOptions::default() };
+        let (q, locked) = setup(&m.triangles, &m.positions, &opts);
+        let origin = vertex_origins(&m.triangles, &m.positions);
+        let mut c = Collapser::new(m.triangles.clone(), m.positions.clone(), q, origin, locked, None, true);
+        c.orient_guard = guard;
+        c.run(target, None);
+        let (tris, pos, _, origin) = c.finish();
+        tris.iter()
+            .filter(|t| {
+                let n = tri::cross(&pos[t[0] as usize], &pos[t[1] as usize], &pos[t[2] as usize]);
+                let r: Vec3 = t.iter().map(|&v| origin[v as usize]).sum();
+                n.dot(&r) <= 0.0
+            })
+            .count()
+    }
+
+    #[test]
+    fn a_reduction_never_returns_a_triangle_turned_against_the_surface() {
+        for target in [4, 12, 60] {
+            let turned: usize = (1..=SEEDS).map(|seed| turned_against_the_surface(seed, target, true)).sum();
+            assert_eq!(turned, 0, "{SEEDS} seeds reduced to {target} triangles");
+        }
+    }
+
+    /// The test above is only worth something if the reduction does turn triangles without the guard.
+    #[test]
+    fn without_the_guard_the_same_reductions_do_turn_triangles() {
+        let turned: usize =
+            [4, 12, 60].iter().flat_map(|&t| (1..=SEEDS).map(move |s| turned_against_the_surface(s, t, false))).sum();
+        assert!(turned > 0, "the plates never needed the guard");
+    }
 }

@@ -382,7 +382,8 @@ fn side_uv(s: usize, t: f64) -> (f64, f64) {
 }
 
 /// Angles (rad) between the normals of the two patches on both sides of every interior edge,
-/// sampled at 7 interior points of the edge.
+/// sampled at 7 interior points of the edge: 0 where the surface is smooth across the edge, π where
+/// it folds back on itself. Patches parametrised in opposite directions are accounted for.
 #[must_use]
 pub fn edge_normal_jumps(set: &PatchSet) -> Vec<f64> {
     let mut by_edge: BTreeMap<(u32, u32), Vec<(usize, usize, bool)>> = BTreeMap::new();
@@ -403,6 +404,10 @@ pub fn edge_normal_jumps(set: &PatchSet) -> Vec<f64> {
             let (u0, v0) = side_uv(*s0, if *fw0 { t } else { 1.0 - t });
             let (u1, v1) = side_uv(*s1, if *fw1 { t } else { 1.0 - t });
             if let (Some(a), Some(b)) = (normal(n0, u0, v0), normal(n1, u1, v1)) {
+                // patches that run the edge the same way round are parametrised against each
+                // other: their normals are compared with one turned, so the angle is the kink of
+                // the surface and not an artefact of the parametrisation
+                let b = if fw0 == fw1 { -b } else { b };
                 worst = worst.max(a.dot(&b).clamp(-1.0, 1.0).acos());
             }
         }
@@ -568,5 +573,56 @@ mod tests {
         );
         assert!(dev.max < 0.2, "{dev:?}");
         assert!(worst.to_degrees() < 5.0);
+    }
+
+    /// A flat bilinear net on the quad `c0`, `c1` (along u), `c3` (along v).
+    fn flat_net(c0: [f64; 3], c1: [f64; 3], c3: [f64; 3]) -> Net {
+        let at = |i: usize, j: usize| -> [f64; 3] {
+            let (s, t) = (i as f64 / 3.0, j as f64 / 3.0);
+            std::array::from_fn(|k| c0[k] + (c1[k] - c0[k]) * s + (c3[k] - c0[k]) * t)
+        };
+        std::array::from_fn(|i| std::array::from_fn(|j| at(i, j)))
+    }
+
+    /// Two tangent flat patches (x in 0..1 and 1..2) sharing the edge x = 1, the second one given
+    /// as in `corners`: `[2, 1, 5, 4]` runs the shared edge against the first (consistent),
+    /// `[2, 4, 5, 1]` runs it the same way and is parametrised the other way round.
+    fn tangent_pair(second: [u32; 4]) -> PatchSet {
+        let v = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0], [2.0, 1.0, 0.0], [2.0, 0.0, 0.0]];
+        let net = |c: [u32; 4]| flat_net(v[c[0] as usize], v[c[1] as usize], v[c[3] as usize]);
+        let first = [0, 1, 2, 3];
+        PatchSet { nets: vec![net(first), net(second)], corners: vec![first, second], vertices: v.to_vec() }
+    }
+
+    #[test]
+    fn tangent_patches_parametrised_in_opposite_directions_have_no_normal_jump() {
+        // Arrange
+        let consistent = tangent_pair([2, 1, 5, 4]);
+        let opposite = tangent_pair([2, 4, 5, 1]);
+
+        // Act
+        let (a, b) = (edge_normal_jumps(&consistent), edge_normal_jumps(&opposite));
+
+        // Assert
+        assert_eq!(a.len(), 1);
+        assert_eq!(b.len(), 1);
+        assert!(a[0].to_degrees() < 1e-6, "consistent pair: {} deg", a[0].to_degrees());
+        assert!(b[0].to_degrees() < 1e-6, "opposite parametrisation: {} deg", b[0].to_degrees());
+    }
+
+    #[test]
+    fn a_patch_folded_back_over_its_neighbour_still_jumps_by_180_degrees() {
+        // the second patch lies over the first (x in 0..1 again), joined at x = 1, consistently wound
+        let v = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]];
+        let fold = PatchSet {
+            nets: vec![flat_net(v[0], v[1], v[3]), flat_net(v[2], v[1], v[3])],
+            corners: vec![[0, 1, 2, 3], [2, 1, 4, 5]],
+            vertices: v.to_vec(),
+        };
+
+        let jumps = edge_normal_jumps(&fold);
+
+        assert_eq!(jumps.len(), 1);
+        assert!((jumps[0].to_degrees() - 180.0).abs() < 1e-6, "{} deg", jumps[0].to_degrees());
     }
 }

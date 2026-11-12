@@ -116,6 +116,41 @@ fn one_transposed_patch_is_turned_back() {
     }
 }
 
+/// A network with one reversed patch is oriented at every size: with the healer (up to 2000
+/// patches, behind the healing entry point) and without it (above 2000, and the `as_is` entry).
+#[test]
+fn a_reversed_patch_is_turned_back_at_24_300_and_3000_patches() {
+    for count in [24, 300, 3_000] {
+        let baseline = baseline_volume(count);
+        let mut net = cube_sphere(n_for(count), RADIUS);
+        let middle = net.patches.len() / 2;
+        flip_patch(&mut net, middle);
+        for (entry, sheet) in [
+            ("as_is", sheet_from_bezier_network_as_is(&net.patches, &net.corners)),
+            ("healing", sheet_from_bezier_network(&net.patches, &net.corners)),
+        ] {
+            let sheet = sheet.unwrap_or_else(|e| panic!("{count} patches, {entry}: {e}"));
+            assert!(is_closed(&sheet) && edges_are_consistent(&sheet), "{count} patches, {entry}");
+            let volume = solid::volume(&sheet).unwrap_or_else(|e| panic!("{count} patches, {entry}: volume: {e}"));
+            assert!(
+                volume.is_finite() && volume > 0.0 && (volume - baseline).abs() <= 1e-9 * baseline,
+                "{count} patches, {entry}: volume {volume} vs {baseline}"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_inside_out_network_below_2000_patches_is_turned_outward_behind_the_healing_entry() {
+    let baseline = baseline_volume(300);
+    let mut net = cube_sphere(n_for(300), RADIUS);
+    (0..net.patches.len()).for_each(|f| flip_patch(&mut net, f));
+    let sheet = sheet_from_bezier_network(&net.patches, &net.corners).expect("turned outward");
+    assert!(is_closed(&sheet) && edges_are_consistent(&sheet));
+    let volume = solid::volume(&sheet).expect("volume");
+    assert!(volume > 0.0 && (volume - baseline).abs() <= 1e-9 * baseline, "volume {volume} vs {baseline}");
+}
+
 #[test]
 fn an_inside_out_network_is_turned_outward() {
     let baseline = baseline_volume(2_100);

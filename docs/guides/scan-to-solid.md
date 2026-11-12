@@ -62,7 +62,13 @@ Primitives:
 - `no_solid`: the planner found no closed shape. Run `body.plan_regions` with the primitives and
   read each `role` and `reason`. A missing wall or floor is usually a region that was left out.
 - `skipped_inputs`: a primitive could not be built in; `modelled[].skipped` says why.
-- `low_coverage`: part of the scan has no face. Look at `left_out` and at `unassigned_triangles`.
+- `low_coverage`: part of the scan has no face (it lies farther than 5 mm from the solid). Look at
+  `left_out` and at `unassigned_triangles`.
+- `inconsistent_orientation`: the scan lies on the solid, but `deviation.not_facing` of its points
+  face away from it, so the solid is inside out or has faces turned the wrong way. This is a defect
+  of the solid, not a part of the scan it misses. It is a verdict of `fail`. A part much smaller
+  than the tolerance (a scan in metres with a tolerance in millimetres) is the usual cause: check
+  the units of the scan and run again with a tolerance that is small against the part.
 - `out_of_tolerance`: `body.refit_faces` moves the faces onto the scan; `worst_faces` says where.
   It is offered only when the solid covers the scan.
 - `left_out_regions` with an RMS reason: the region is freeform. `surface.fit` it and build with

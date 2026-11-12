@@ -520,8 +520,8 @@ pub(crate) fn canonicalize(mut b: Brep) -> Brep {
 /// result is a solid. At most [`MAX_NETWORK_PATCHES`] patches; above 2000 the kernel's healer is
 /// skipped as in [`sheet_from_bezier_network_as_is`] (it grows faster than linearly).
 ///
-/// Orientation (where the healer is skipped): patches that run against a neighbour are flipped,
-/// the lowest patch of a connected component keeping its side; a network with exactly one closed
+/// Orientation (for every size, before the healer too): patches that run against a neighbour are
+/// flipped, the lowest patch of a connected component keeping its side; a network with exactly one closed
 /// component is turned outward when it encloses a negative volume, and refused when the volume
 /// cannot be told from zero. With several closed components (a cavity) each keeps the
 /// orientation it was given. See the `orientation` module.
@@ -540,6 +540,16 @@ pub fn sheet_from_bezier_network(patches: &[Vec<Vec<[f64; 3]>>], corners: &[[u32
 /// As [`sheet_from_bezier_network`].
 pub fn sheet_from_bezier_network_as_is(patches: &[Vec<Vec<[f64; 3]>>], corners: &[[u32; 4]]) -> Result<Brep> {
     bezier_network(patches, corners, false)
+}
+
+/// The patches to flip. With the healer, a network that cannot be oriented here (a twisted one, or
+/// one whose volume cannot be told from zero) is left to the healer as it was before this pass
+/// ran for it; without the healer it is refused.
+fn network_flips(heal: bool, patches: &[Vec<Vec<[f64; 3]>>], corners: &[[u32; 4]]) -> Result<Vec<bool>> {
+    match orientation::flips(patches, corners) {
+        Err(_) if heal => Ok(vec![false; corners.len()]),
+        flips => flips,
+    }
 }
 
 fn bezier_network(patches: &[Vec<Vec<[f64; 3]>>], corners: &[[u32; 4]], heal: bool) -> Result<Brep> {
@@ -563,9 +573,9 @@ fn bezier_network(patches: &[Vec<Vec<[f64; 3]>>], corners: &[[u32; 4]], heal: bo
     let mut vertex_pts: Vec<Option<[f64; 3]>> = vec![None; nv];
     let mut knots = vec![0.0; n + 1];
     knots.extend(std::iter::repeat_n(1.0, n + 1));
-    // without the healer the orientation is settled here: patches against their neighbours and a
+    // the orientation is settled here, whatever the size: patches against their neighbours and a
     // wholly inside-out component are flipped (a flip transposes the net)
-    let flip = if heal { vec![false; nf] } else { orientation::flips(patches, corners)? };
+    let flip = network_flips(heal, patches, corners)?;
     let at = |f: usize, i: usize, j: usize| -> [f64; 3] {
         let (i, j) = if flip.get(f).copied().unwrap_or(false) { (j, i) } else { (i, j) };
         patches.get(f).and_then(|p| p.get(i)).and_then(|r| r.get(j)).copied().unwrap_or([0.0; 3])

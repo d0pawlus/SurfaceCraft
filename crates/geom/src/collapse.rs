@@ -1,9 +1,15 @@
 //! The edge-collapse loop of the decimation: a heap of candidate edges ordered by quadric cost,
 //! each collapse checked (link condition, flipped faces, optionally the measured guard) before it
-//! is made. State and steps are split into methods of [`Collapser`]; the order of the checks and
-//! of the heap is that of the original single function, so results are unchanged.
+//! is made. State and steps are split into methods of [`Collapser`].
+//!
+//! Orientation. A collapse is refused when it turns a triangle against the surface it came from.
+//! Every vertex carries the sum of the area-weighted normals of the original triangles it stands
+//! for (merged like the quadrics), so a triangle is compared with the original orientation of its
+//! whole neighbourhood and not only with its own previous normal: a chain of collapses that each
+//! turn a triangle by a few tens of degrees can no longer fold it over the surface (the way a thin
+//! wall or a part smaller than the budget is crumpled).
 use crate::decimate::Guard;
-use crate::{Bvh, Point3, par, tri};
+use crate::{Bvh, Point3, Vec3, par, tri};
 use nalgebra::{Matrix4, Vector4};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
@@ -19,6 +25,19 @@ const GUARD_SKIP: f64 = 0.25;
 const GUARD_VALENCE: usize = 32;
 /// Edges from which on the first candidates are costed in parallel.
 const SEED_PARALLEL_MIN: usize = 20_000;
+
+/// The original orientation of every vertex: the sum of the area-weighted normals (the cross
+/// products) of the triangles around it.
+pub(crate) fn vertex_origins(tris: &[[u32; 3]], pos: &[Point3]) -> Vec<Vec3> {
+    let mut origin = vec![Vec3::zeros(); pos.len()];
+    for t in tris {
+        let n = tri::cross(&pos[t[0] as usize], &pos[t[1] as usize], &pos[t[2] as usize]);
+        for &v in t {
+            origin[v as usize] += n;
+        }
+    }
+    origin
+}
 
 pub(crate) fn plane_quadric(n: &crate::Vec3, p: &Point3, w: f64) -> Quadric {
     let v = Vector4::new(n.x, n.y, n.z, -n.dot(&p.coords));
@@ -96,6 +115,8 @@ pub(crate) struct Collapser<'a> {
     tris: Vec<[u32; 3]>,
     pos: Vec<Point3>,
     q: Vec<Quadric>,
+    /// Sum of the area-weighted normals of the original triangles each vertex stands for.
+    origin: Vec<Vec3>,
     locked: Vec<bool>,
     alive_t: Vec<bool>,
     alive_v: Vec<bool>,
@@ -105,15 +126,22 @@ pub(crate) struct Collapser<'a> {
     seen_pair: HashSet<(u32, u32)>,
     guard: Option<Guard<'a>>,
     live: usize,
+    /// Tests switch the orientation check off to show what it prevents, and count its refusals.
+    #[cfg(test)]
+    pub(crate) orient_guard: bool,
+    #[cfg(test)]
+    pub(crate) turns_refused: std::sync::atomic::AtomicUsize,
 }
 
 impl<'a> Collapser<'a> {
-    /// Starts from `tris` over `pos` with the vertex quadrics `q` and the vertices that must not
-    /// move (`locked`); every edge is a candidate (costed in parallel when `parallel_seed`).
+    /// Starts from `tris` over `pos` with the vertex quadrics `q`, the original orientation of each
+    /// vertex (`origin`, see [`vertex_origins`]) and the vertices that must not move (`locked`);
+    /// every edge is a candidate (costed in parallel when `parallel_seed`).
     pub(crate) fn new(
         tris: Vec<[u32; 3]>,
         pos: Vec<Point3>,
         q: Vec<Quadric>,
+        origin: Vec<Vec3>,
         locked: Vec<bool>,
         guard: Option<Guard<'a>>,
         parallel_seed: bool,
@@ -135,10 +163,15 @@ impl<'a> Collapser<'a> {
             tris,
             pos,
             q,
+            origin,
             locked,
             vfaces,
             guard,
             live,
+            #[cfg(test)]
+            orient_guard: true,
+            #[cfg(test)]
+            turns_refused: std::sync::atomic::AtomicUsize::new(0),
         };
         s.seed(parallel_seed);
         s
@@ -263,8 +296,27 @@ impl<'a> Collapser<'a> {
             {
                 return None;
             }
+            if self.turns_against_origin(&t, (a, b), &old, &new) {
+                #[cfg(test)]
+                self.turns_refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return None;
+            }
         }
         Some(fan)
+    }
+
+    /// Does the collapse of `b` into `a` turn the triangle `t` (normals `old` before, `new` after)
+    /// from the side of the original surface its corners stand for to the other? A triangle that
+    /// already disagrees with them (noise) is not held to it.
+    fn turns_against_origin(&self, t: &[u32; 3], (a, b): (u32, u32), old: &Vec3, new: &Vec3) -> bool {
+        #[cfg(test)]
+        if !self.orient_guard {
+            return false;
+        }
+        let at = |v: u32| self.origin[v as usize];
+        let before: Vec3 = t.iter().map(|&v| at(v)).sum();
+        let after: Vec3 = t.iter().map(|&v| if v == a || v == b { at(a) + at(b) } else { at(v) }).sum();
+        old.dot(&before) > 0.0 && new.dot(&after) <= 0.0
     }
 
     /// Makes the collapse of `c.b` into `c.a` and queues the edges around the merged vertex again.
@@ -295,6 +347,8 @@ impl<'a> Collapser<'a> {
         self.pos[a as usize] = plan.to;
         let qb = self.q[b as usize];
         self.q[a as usize] += qb;
+        let ob = self.origin[b as usize];
+        self.origin[a as usize] += ob;
         self.stamp[a as usize] = self.stamp[a as usize].wrapping_add(1);
         let mut nbs: Vec<u32> =
             self.vfaces[a as usize].iter().flat_map(|&f| self.tris[f as usize]).filter(|&x| x != a).collect();
@@ -319,11 +373,77 @@ impl<'a> Collapser<'a> {
         }
     }
 
-    /// The surviving triangles, positions and quadrics (vertex numbers unchanged).
-    pub(crate) fn finish(self) -> (Vec<[u32; 3]>, Vec<Point3>, Vec<Quadric>) {
-        let Self { mut tris, pos, q, alive_t, .. } = self;
+    /// The surviving triangles, positions, quadrics and original orientations (vertex numbers
+    /// unchanged).
+    pub(crate) fn finish(self) -> (Vec<[u32; 3]>, Vec<Point3>, Vec<Quadric>, Vec<Vec3>) {
+        let Self { mut tris, pos, q, origin, alive_t, .. } = self;
         let mut k = alive_t.iter();
         tris.retain(|_| k.next().copied().unwrap_or(false));
-        (tris, pos, q)
+        (tris, pos, q, origin)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tetrahedron whose vertex orientations are `origin`.
+    fn tetrahedron(origin: [Vec3; 4]) -> Collapser<'static> {
+        let pos = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+            Point3::new(0.0, 0.0, 1.0),
+        ];
+        let tris = vec![[0, 2, 1], [0, 1, 3], [1, 2, 3], [0, 3, 2]];
+        Collapser::new(tris, pos, vec![Quadric::zeros(); 4], origin.to_vec(), vec![false; 4], None, false)
+    }
+
+    fn up() -> Vec3 {
+        Vec3::z()
+    }
+
+    #[test]
+    fn a_triangle_turned_over_the_surface_it_stood_on_is_refused() {
+        // Arrange: every corner of the triangle stands for upward triangles
+        let c = tetrahedron([up(); 4]);
+
+        // Act / Assert: facing up before; facing down, sideways (89 degrees) or up after
+        assert!(c.turns_against_origin(&[0, 2, 1], (0, 3), &up(), &-up()));
+        let sideways = Vec3::new(89f64.to_radians().sin(), 0.0, 89f64.to_radians().cos());
+        assert!(!c.turns_against_origin(&[0, 2, 1], (0, 3), &up(), &sideways));
+        assert!(!c.turns_against_origin(&[0, 2, 1], (0, 3), &up(), &up()));
+    }
+
+    #[test]
+    fn a_triangle_that_already_faces_away_is_not_held_to_it() {
+        let c = tetrahedron([up(); 4]);
+
+        assert!(!c.turns_against_origin(&[0, 2, 1], (0, 3), &-up(), &-up()));
+    }
+
+    #[test]
+    fn a_merge_that_brings_in_more_of_the_opposite_side_than_the_triangle_stands_for_is_refused() {
+        // vertex 3 stands for twice as much downward surface as vertex 0 does upward surface
+        let c = tetrahedron([up(), Vec3::zeros(), Vec3::zeros(), -2.0 * up()]);
+
+        assert!(c.turns_against_origin(&[0, 2, 1], (0, 3), &up(), &up()));
+    }
+
+    #[test]
+    fn vertices_that_stand_for_the_same_side_merge_freely() {
+        let c = tetrahedron([up(); 4]);
+
+        assert!(!c.turns_against_origin(&[0, 2, 1], (0, 1), &up(), &Vec3::new(0.3, 0.0, 1.0)));
+    }
+
+    #[test]
+    fn the_orientation_of_a_vertex_is_the_sum_of_the_normals_of_its_triangles() {
+        let pos = [Point3::new(0.0, 0.0, 0.0), Point3::new(2.0, 0.0, 0.0), Point3::new(0.0, 2.0, 0.0)];
+
+        let origin = vertex_origins(&[[0, 1, 2]], &pos);
+
+        // the cross product of the two edges: twice the area, along +z
+        assert!(origin.iter().all(|o| (o - Vec3::new(0.0, 0.0, 4.0)).norm() < 1e-12), "{origin:?}");
     }
 }
