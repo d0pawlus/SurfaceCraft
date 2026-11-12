@@ -31,6 +31,7 @@ pub struct AlignOut {
 
 fn apply_to(s: &mut Session, id: ObjectId, also: &[ObjRef], t: &Transform, apply: bool) -> CmdResult<()> {
     if !apply {
+        s.mark_unchanged();
         return Ok(());
     }
     let mut ids = vec![id];

@@ -259,7 +259,7 @@ pub fn auto_pose(mesh: &Mesh, mode: LevelMode) -> Result<AutoPose, AlignError> {
     let rims = rim::rim_faces(mesh, &set);
     let sample = sample_vertices(&mesh.positions);
     let ctx = Context { set: &set, rims: &rims, sample: &sample };
-    let turned = turned::detect(&set).and_then(|t| turned_pose(&ctx, &rims, &t.axis, mode));
+    let turned = turned::detect(&set, &sample).and_then(|t| turned_pose(&ctx, &rims, &t.axis, mode));
     match turned.or_else(|| prismatic(&ctx, &rims, mode)) {
         Some(p) => Ok(p),
         None => fallback(mesh, &set, mode),

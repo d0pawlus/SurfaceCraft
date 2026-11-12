@@ -2,8 +2,9 @@
 //! great circle (the side) plus two poles (the end faces). Detection finds the axis from the
 //! circle; the end faces' planes then give it exactly (see `auto`).
 use crate::faces::FaceSet;
+use crate::frame::extent;
 use nalgebra::SymmetricEigen;
-use surfacecraft_geom::{Mat3, Vec3, any_perpendicular, normalize};
+use surfacecraft_geom::{Mat3, Point3, Vec3, any_perpendicular, normalize};
 
 /// Normals this close to the equator (|n·a| below the sine of 11.5 degrees) are side normals.
 const BAND: f64 = 0.2;
@@ -20,6 +21,15 @@ const OCCUPIED_SHARE: f64 = 0.3;
 /// ... and the four heaviest bins hold at most this share (a box has 4 bins with everything).
 const MAX_TOP_FOUR: f64 = 0.45;
 const REFINE_ROUNDS: usize = 3;
+/// Sectors around the axis in which the outer radius is compared.
+const SECTORS: usize = 12;
+/// The outer radius differs between sectors by at most this share of its mean (an ellipse of
+/// radii 12 and 10 differs by 18 %; a keyway narrower than a sector changes nothing).
+const MAX_RADIUS_SPREAD: f64 = 0.03;
+/// Every sector holds at least this share of the sampled vertices.
+const MIN_SECTOR_SHARE: f64 = 0.005;
+/// The outer radius of a sector: this quantile of its vertices' distances from the axis.
+const OUTER_QUANTILE: f64 = 0.99;
 
 /// The axis of a turned part.
 pub(crate) struct Turned {
@@ -28,7 +38,10 @@ pub(crate) struct Turned {
 }
 
 /// Is the part rotationally symmetric about some axis, with its area mostly on the side?
-pub(crate) fn detect(set: &FaceSet) -> Option<Turned> {
+///
+/// The normals only nominate an axis (an elliptical extrusion has normals all around too); the
+/// vertices then confirm the rotational symmetry (see [`is_revolved`]).
+pub(crate) fn detect(set: &FaceSet, sample: &[Point3]) -> Option<Turned> {
     let mut cov = Mat3::zeros();
     for f in &set.faces {
         cov += (f.n * f.n.transpose()) * f.w;
@@ -43,7 +56,39 @@ pub(crate) fn detect(set: &FaceSet) -> Option<Turned> {
         }
     }
     let (_, seed) = best?;
-    Some(Turned { axis: refine(set, seed) })
+    let axis = refine(set, seed);
+    is_revolved(sample, &axis).then_some(Turned { axis })
+}
+
+/// Is the outer radius about `axis` the same in every sector of the circumference? The centre is
+/// the middle of the sample's extent across the axis. A flat wider than a sector (or deeper than
+/// 3 % of the radius) breaks it, a narrow keyway does not.
+pub(crate) fn is_revolved(sample: &[Point3], axis: &Vec3) -> bool {
+    let u = any_perpendicular(axis);
+    let v = axis.cross(&u);
+    let (u0, u1) = extent(sample, &u);
+    let (v0, v1) = extent(sample, &v);
+    let (cu, cv) = (0.5 * (u0 + u1), 0.5 * (v0 + v1));
+    let mut radii: Vec<Vec<f64>> = vec![Vec::new(); SECTORS];
+    for p in sample {
+        let (a, b) = (p.coords.dot(&u) - cu, p.coords.dot(&v) - cv);
+        let phi = b.atan2(a) + std::f64::consts::PI;
+        let k = ((phi / std::f64::consts::TAU * SECTORS as f64) as usize).min(SECTORS - 1);
+        if let Some(r) = radii.get_mut(k) {
+            r.push(a.hypot(b));
+        }
+    }
+    let outer: Vec<f64> = radii
+        .iter_mut()
+        .filter(|r| !r.is_empty() && r.len() as f64 >= MIN_SECTOR_SHARE * sample.len() as f64)
+        .filter_map(|r| {
+            r.sort_by(f64::total_cmp);
+            r.get(((r.len() - 1) as f64 * OUTER_QUANTILE).round() as usize).copied()
+        })
+        .collect();
+    let mean = outer.iter().sum::<f64>() / outer.len().max(1) as f64;
+    let (lo, hi) = outer.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), &r| (l.min(r), h.max(r)));
+    outer.len() == SECTORS && mean > 0.0 && (hi - lo) <= MAX_RADIUS_SPREAD * mean
 }
 
 /// The share of the area on the side of a body of revolution about `axis`, or `None` when the
@@ -94,26 +139,29 @@ mod tests {
     use super::*;
     use surfacecraft_geom::{Point3, Rng, Transform, synth};
 
-    fn set_of(m: &surfacecraft_geom::Mesh) -> FaceSet {
+    fn set_of(m: &surfacecraft_geom::Mesh) -> FaceSet<'_> {
         FaceSet::new(m).unwrap()
+    }
+
+    fn sample_of(m: &surfacecraft_geom::Mesh) -> Vec<Point3> {
+        crate::frame::sample_vertices(&m.positions)
     }
 
     #[test]
     fn a_pin_is_turned_about_its_axis() {
-        let mut m = synth::cylinder(Point3::origin(), Vec3::z(), 12.0, 30.0, 120, 40);
-        m.append(&synth::plane(Point3::new(-12.0, -12.0, 0.0), Vec3::x(), Vec3::y(), 24.0, 24.0, 12, 12));
+        let m = synth::cylinder(Point3::origin(), Vec3::z(), 12.0, 30.0, 120, 40);
         let t = Transform::rotation_axis_angle(&Vec3::new(1.0, 0.4, -0.2), 0.9);
         let mut moved = m.transformed(&t);
         synth::add_noise(&mut moved, 0.03, &mut Rng::new(1));
-        let turned = detect(&set_of(&moved)).expect("a cylinder is turned");
+        let turned = detect(&set_of(&moved), &sample_of(&moved)).expect("a cylinder is turned");
         assert!(turned.axis.dot(&t.apply_vec(&Vec3::z())).abs() > 0.999, "{:?}", turned.axis);
     }
 
     #[test]
     fn boxes_and_blobs_are_not_turned() {
         let b = synth::cuboid(Point3::origin(), Vec3::new(40.0, 30.0, 15.0), 10);
-        assert!(detect(&set_of(&b)).is_none());
+        assert!(detect(&set_of(&b), &sample_of(&b)).is_none());
         let s = synth::sphere(Point3::origin(), 20.0, 48, 24);
-        assert!(detect(&set_of(&s)).is_none(), "a sphere's side is only a tenth of its area");
+        assert!(detect(&set_of(&s), &sample_of(&s)).is_none(), "a sphere's side is only a tenth of its area");
     }
 }

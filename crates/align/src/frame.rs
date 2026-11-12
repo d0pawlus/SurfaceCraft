@@ -41,7 +41,7 @@ pub enum InPlane {
 
 /// What `side_frame` needs of the mesh.
 pub(crate) struct Context<'a> {
-    pub set: &'a FaceSet,
+    pub set: &'a FaceSet<'a>,
     pub rims: &'a [PlaneFace],
     pub sample: &'a [Point3],
 }

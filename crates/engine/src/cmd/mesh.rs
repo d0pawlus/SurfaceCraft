@@ -8,6 +8,7 @@ use surfacecraft_doc::{ObjectId, ObjectKind, base64};
 use surfacecraft_geom::{Mesh, Point3, PointCloud, ReconParams, Rng, Transform, Vec3, reconstruct, synth};
 use surfacecraft_io::{Limits, MeshFormat, Scan, read_points, read_scan, write_mesh};
 
+mod deps;
 mod scale;
 
 /// Facts about a mesh.
@@ -607,7 +608,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         "Scale from a length",
         "Mesh",
         true,
-        "Scales `object` uniformly so the distance between the scan points `from` and `to` becomes the true `length` (mm), about `origin` (default: the mesh centroid). Reports the factor. Do it before fitting: primitives and surfaces already fitted are not scaled.",
+        "Scales `object` uniformly so the distance between the scan points `from` and `to` becomes the true `length` (mm), about `origin` (default: the mesh centroid). Reports the factor. Regions, primitives fitted to them and quad layouts over the mesh are scaled with it; fitted surfaces cannot be, and their presence is an error.",
         scale::ScaleIn,
         scale::ScaleOut,
         scale::scale_from_length

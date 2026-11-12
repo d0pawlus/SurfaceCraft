@@ -257,6 +257,78 @@ fn gate_p9_auto_turned_part() {
     }
 }
 
+/// An open extrusion of an ellipse (radii 12 and 10, major axis at 45 degrees), 30 high, densely
+/// sampled: its side normals cover every azimuth, but it is not a body of revolution.
+fn elliptical_extrusion() -> Mesh {
+    let mut m = synth::cylinder(Point3::origin(), Vec3::z(), 12.0, 30.0, 360, 30);
+    let turn = Transform::rotation_axis_angle(&Vec3::z(), 45.0_f64.to_radians());
+    for p in &mut m.positions {
+        *p = turn.apply(&Point3::new(p.x, p.y * 10.0 / 12.0, p.z));
+    }
+    m
+}
+
+/// The long side (45 degrees) lands on x within 0.2 degrees; the axis on z; not a turned part.
+#[test]
+fn p9_auto_elliptical_extrusion_is_not_turned() {
+    let mesh = noisy(elliptical_extrusion(), 0.02, 4);
+    let long = Vec3::new(1.0, 1.0, 0.0);
+    for (k, pose) in poses().iter().take(3).enumerate() {
+        let mut s = session_with(&mesh, pose);
+        let out = s.execute("align.auto", json!({"object": "part"})).unwrap();
+        assert_ne!(out["method"], "turned", "pose {k}: {out}");
+        let net = matrix_of(&out).then_after(pose);
+        let along = line_tilt_deg(&net.apply_vec(&long), &Vec3::x());
+        let axis = line_tilt_deg(&net.apply_vec(&Vec3::z()), &Vec3::z());
+        eprintln!("ellipse pose {k}: long side {along:.4} deg off x, axis {axis:.4} deg off z, {}", out["method"]);
+        assert!(along < 0.2, "pose {k}: long side {along} deg off x");
+        assert!(axis < 0.1, "pose {k}: axis {axis} deg off z");
+    }
+}
+
+/// A pin of revolution (tube with two flat end caps) with its side cut by `cut`.
+fn pin_with(cut: impl Fn(&mut Point3)) -> Mesh {
+    let mut m = synth::cylinder(Point3::origin(), Vec3::z(), 12.0, 30.0, 240, 30);
+    for k in [0.0, 30.0] {
+        let mut cap = synth::plane(Point3::new(-12.0, -12.0, k), Vec3::x(), Vec3::y(), 24.0, 24.0, 24, 24);
+        for p in &mut cap.positions {
+            if p.x.hypot(p.y) > 12.0 {
+                let f = 12.0 / p.x.hypot(p.y);
+                *p = Point3::new(p.x * f, p.y * f, p.z);
+            }
+        }
+        m.append(&cap);
+    }
+    for p in &mut m.positions {
+        cut(p);
+    }
+    m
+}
+
+/// A narrow keyway (a 14 degree slot, 2 mm deep) leaves the part mostly rotational: it stays a
+/// turned part. A wide flat (x <= 9, 82 degrees of the circumference) does not: it is laid on
+/// its largest flat face like a prism. Documented in the guide.
+#[test]
+fn p9_auto_keyway_stays_turned_and_a_wide_flat_does_not() {
+    let keyway = pin_with(|p| {
+        let r = p.x.hypot(p.y);
+        if r > 11.9 && p.y.atan2(p.x).abs() < 7.0_f64.to_radians() && p.z > 1.0 && p.z < 29.0 {
+            let f = 10.0 / r;
+            *p = Point3::new(p.x * f, p.y * f, p.z);
+        }
+    });
+    let pose = &poses()[2];
+    let mut s = session_with(&keyway, pose);
+    let out = s.execute("align.auto", json!({"object": "part"})).unwrap();
+    assert_eq!(out["method"], "turned", "{out}");
+    let axis = line_tilt_deg(&matrix_of(&out).then_after(pose).apply_vec(&Vec3::z()), &Vec3::z());
+    assert!(axis < 0.1, "keyway: axis {axis}");
+    let flat = pin_with(|p| p.x = p.x.min(9.0));
+    let mut s = session_with(&flat, pose);
+    let out = s.execute("align.auto", json!({"object": "part"})).unwrap();
+    assert_ne!(out["method"], "turned", "{out}");
+}
+
 /// Gate: a bracket scanned without its bottom face: the open rim stands for it and the pose equals
 /// the closed bracket's (0.1 mm, 0.2°).
 #[test]
@@ -367,10 +439,43 @@ fn p9_auto_proposes_then_applies_in_one_undo_step() {
     assert_ne!(mesh_hash(&s, "part"), before);
     s.execute("edit.undo", Value::Null).unwrap();
     assert_eq!(mesh_hash(&s, "part"), before, "one undo restores the part");
-    // the preview of the GUI sees the moved part without touching this session
-    let preview = s.preview("align.auto", json!({"object": "part", "apply": true})).unwrap();
-    assert_ne!(mesh_hash(&preview, "part"), before);
+    // `align.auto` is heavy: the GUI's live preview refuses it (a large mesh is not processed on
+    // every parameter change); the cheaper `align.symmetry` previews
+    assert!(s.preview("align.auto", json!({"object": "part", "apply": true})).is_err());
     assert_eq!(mesh_hash(&s, "part"), before);
+}
+
+/// A proposal records no history entry: an undone edit can still be redone after any number of
+/// proposals, and the undo depth does not move. `apply: true` is exactly one step.
+#[test]
+fn p9_proposals_leave_undo_and_redo_alone() {
+    let m = noisy(mirrored_part(), 0.02, 7);
+    let mut s = session_with(&m, &poses()[1]);
+    s.execute("mesh.transform", json!({"object": "part", "translate": [5.0, 0.0, 0.0]})).unwrap();
+    let edited = mesh_hash(&s, "part");
+    s.execute("edit.undo", Value::Null).unwrap();
+    let depth = s.history.undo_labels().len();
+    for _ in 0..4 {
+        for cmd in ["align.auto", "align.symmetry", "align.principal"] {
+            if cmd != "align.principal" {
+                s.execute(cmd, json!({"object": "part"})).unwrap(); // the default only proposes
+            }
+            s.execute(cmd, json!({"object": "part", "apply": false})).unwrap();
+        }
+    }
+    assert_eq!(
+        s.history.undo_labels().len(),
+        depth,
+        "proposals must not use undo capacity: {:?}",
+        s.history.undo_labels()
+    );
+    s.execute("edit.redo", Value::Null).unwrap();
+    assert_eq!(mesh_hash(&s, "part"), edited, "the undone edit is still there to redo");
+    let depth = s.history.undo_labels().len();
+    s.execute("align.auto", json!({"object": "part", "apply": true})).unwrap();
+    assert_eq!(s.history.undo_labels().len(), depth + 1, "apply is exactly one step");
+    s.execute("edit.undo", Value::Null).unwrap();
+    assert_eq!(mesh_hash(&s, "part"), edited);
 }
 
 #[test]
@@ -520,6 +625,112 @@ fn gate_p9_scale_from_length_restores_size() {
     let want = truth.bbox().size();
     assert!(((size - want).norm() / want.norm()) < 1e-9);
     assert!((m2.centroid() - c0).norm() < 1e-9);
+}
+
+fn scale_by_two(s: &mut Session) -> Value {
+    s.execute(
+        "mesh.scale_from_length",
+        json!({"object": "scan", "from": [0, 0, 0], "to": [1, 0, 0], "length": 2.0, "origin": [0.0, 0.0, 0.0]}),
+    )
+    .unwrap()
+}
+
+/// What depends on a mesh is scaled with it: a region's RMS, a fitted cylinder's radius, position
+/// and RMS (and it still fits the scaled mesh), a quad layout (it lies on the scaled mesh).
+#[test]
+fn p9_scale_rescales_regions_primitives_and_quads() {
+    let mut s = Session::new();
+    s.execute(
+        "mesh.synth",
+        json!({"shape": "cylinder", "size": [10.0, 30.0], "resolution": 64, "noise": 0.02, "name": "scan"}),
+    )
+    .unwrap();
+    let seg = s.execute("region.auto_segment", json!({"mesh": "scan"})).unwrap();
+    let cyl = seg["regions"].as_array().unwrap().iter().find(|r| r["kind"] == "cylinder").unwrap().clone();
+    s.execute("primitive.fit", json!({"region": cyl["id"]})).unwrap();
+    let (region0, prim0) = (s.doc.regions.clone(), s.doc.primitives[0].clone());
+    let mesh0 = s.doc.meshes[0].mesh.clone();
+    let out = scale_by_two(&mut s);
+    assert!(out["regions"].as_u64().unwrap() > 0, "{out}");
+    assert_eq!(out["primitives"].as_u64(), Some(1), "{out}");
+    for (a, b) in region0.iter().zip(&s.doc.regions) {
+        let (ra, rb) = (a.rms.unwrap_or(0.0), b.rms.unwrap_or(0.0));
+        assert!((rb - 2.0 * ra).abs() < 1e-12, "region rms {ra} -> {rb}");
+    }
+    let p1 = &s.doc.primitives[0];
+    let (
+        surfacecraft_fit::primitive::Primitive::Cylinder { point: q0, axis: a0, radius: r0 },
+        surfacecraft_fit::primitive::Primitive::Cylinder { point: q1, axis: a1, radius: r1 },
+    ) = (&prim0.primitive, &p1.primitive)
+    else {
+        panic!("a cylinder was fitted: {:?}", prim0.primitive)
+    };
+    assert!((r1 - 2.0 * r0).abs() < 1e-9 && a0 == a1, "radius {r0} -> {r1}");
+    assert!((p1.rms - 2.0 * prim0.rms).abs() < 1e-12);
+    // it still fits the scaled mesh: the vertices of the region sit at distance ~ radius from the axis
+    let region = s.doc.regions.iter().find(|r| r.id.0 == cyl["id"].as_u64().unwrap()).unwrap();
+    let mesh1 = s.doc.meshes[0].mesh.clone();
+    let spread = |m: &Mesh, q: &[f64; 3], a: &[f64; 3], r: f64| {
+        let (q, a) = (Vec3::from(*q), Vec3::from(*a));
+        let mut sq = 0.0;
+        let mut n = 0.0;
+        for t in region.triangles.iter() {
+            for &v in &m.triangles[*t as usize] {
+                let d = m.positions[v as usize].coords - q;
+                sq += ((d - a * d.dot(&a)).norm() - r).powi(2);
+                n += 1.0;
+            }
+        }
+        (sq / n).sqrt()
+    };
+    let (before, after) = (spread(&mesh0, q0, a0, *r0), spread(&mesh1, q1, a1, *r1));
+    assert!((after - 2.0 * before).abs() < 1e-9 + 1e-6 * before, "fit residual {before} -> {after}");
+    assert!(after < 0.2, "the cylinder still fits the scaled scan: {after}");
+}
+
+/// A quad layout is scaled with its mesh: it lies on the scaled scan exactly as far as it lay on the
+/// original (twice the millimetres).
+#[test]
+fn p9_scale_rescales_a_quad_layout() {
+    let mut s = Session::new();
+    s.execute("mesh.synth", json!({"shape": "wave", "resolution": 40, "noise": 0.01, "seed": 5, "name": "scan"}))
+        .unwrap();
+    s.execute("quad.create", json!({"mesh": "scan", "target_quads": 12})).unwrap();
+    let (quad0, mesh0) = (s.doc.quads[0].clone(), s.doc.meshes[0].mesh.clone());
+    let out = scale_by_two(&mut s);
+    assert_eq!(out["quads"].as_u64(), Some(1), "{out}");
+    let (b0, b1) = (surfacecraft_geom::Bvh::build(&mesh0), surfacecraft_geom::Bvh::build(&s.doc.meshes[0].mesh));
+    let off = |bvh: &surfacecraft_geom::Bvh, verts: &[[f64; 3]]| {
+        verts
+            .iter()
+            .map(|v| bvh.closest(&Point3::from(*v), f64::INFINITY).map_or(f64::NAN, |h| h.distance))
+            .fold(0.0, f64::max)
+    };
+    let q1 = &s.doc.quads[0];
+    let (d0, d1) = (off(&b0, &quad0.vertices), off(&b1, &q1.vertices));
+    assert!(d0.is_finite() && (d1 - 2.0 * d0).abs() < 1e-9 + 1e-6 * d0, "quad distance {d0} -> {d1}");
+    assert!(d1 < 0.5, "the quad layout lies on the scaled scan: {d1}");
+    assert!((q1.domain[0][1] - 2.0 * quad0.domain[0][1]).abs() < 1e-9, "the frame domain is scaled");
+}
+
+/// A fitted freeform surface cannot be rescaled: the command refuses, names it, and changes nothing.
+#[test]
+fn p9_scale_refuses_when_a_fitted_surface_depends_on_the_mesh() {
+    let mut s = Session::new();
+    s.execute("mesh.synth", json!({"shape": "wave", "resolution": 40, "noise": 0.01, "seed": 5, "name": "scan"}))
+        .unwrap();
+    let n = s.doc.meshes[0].mesh.triangle_count() as u32;
+    s.execute("region.create", json!({"mesh": "scan", "triangles": (0..n).collect::<Vec<u32>>(), "name": "free"}))
+        .unwrap();
+    s.execute("surface.fit", json!({"region": "free"})).unwrap();
+    let before = mesh_hash(&s, "scan");
+    let depth = s.history.undo_labels().len();
+    let err = s
+        .execute("mesh.scale_from_length", json!({"object": "scan", "from": [0, 0, 0], "to": [1, 0, 0], "length": 2.0}))
+        .unwrap_err();
+    assert!(err.to_string().contains("surfaces"), "{err}");
+    assert_eq!(mesh_hash(&s, "scan"), before);
+    assert_eq!(s.history.undo_labels().len(), depth);
 }
 
 #[test]

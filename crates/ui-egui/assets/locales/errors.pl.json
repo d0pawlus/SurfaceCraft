@@ -439,6 +439,7 @@
   "the sketch would be too large": "szkic byłby za duży",
   "the snapped surface would be degenerate": "dociągnięta powierzchnia byłaby zdegenerowana",
   "the surface has no face": "powierzchnia nie ma ściany",
+  "the surfaces {} were fitted to this mesh and cannot be rescaled: delete them and fit again after scaling": "powierzchnie {} zostały dopasowane do tej siatki i nie dają się przeskalować: usuń je i dopasuj ponownie po skalowaniu",
   "the symmetry plane has no normal": "płaszczyzna symetrii nie ma normalnej",
   "the symmetry plane normal is opposite to the axis": "normalna płaszczyzny symetrii jest przeciwna do osi",
   "the target has no triangles": "cel nie ma trójkątów",

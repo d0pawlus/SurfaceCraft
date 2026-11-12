@@ -39,13 +39,16 @@ const FLATNESS: f64 = 0.02;
 /// One triangle.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Face {
+    /// Index of the triangle in the mesh.
+    pub tri: u32,
     pub n: Vec3,
     pub c: Point3,
     pub w: f64,
 }
 
 /// The usable triangles of a mesh with their totals.
-pub(crate) struct FaceSet {
+pub(crate) struct FaceSet<'m> {
+    pub mesh: &'m Mesh,
     pub faces: Vec<Face>,
     pub total: f64,
     pub diag: f64,
@@ -80,12 +83,12 @@ fn face_of(mesh: &Mesh, vertex_normals: &[Vec3], i: usize) -> Option<Face> {
     let own = cross / len;
     let blend: Vec3 = corner.iter().filter_map(|&v| vertex_normals.get(v as usize)).sum();
     let n = normalize(blend).filter(|b| b.dot(&own) > 0.0).unwrap_or(own);
-    Some(Face { n, c: centre, w: 0.5 * len })
+    Some(Face { tri: i as u32, n, c: centre, w: 0.5 * len })
 }
 
-impl FaceSet {
+impl<'m> FaceSet<'m> {
     /// The triangles of `mesh` with an area and finite corners; `None` when there are none.
-    pub(crate) fn new(mesh: &Mesh) -> Option<Self> {
+    pub(crate) fn new(mesh: &'m Mesh) -> Option<Self> {
         let vertex_normals = mesh.vertex_normals();
         let faces: Vec<Face> =
             par::map(mesh.triangle_count(), |i| face_of(mesh, &vertex_normals, i)).into_iter().flatten().collect();
@@ -98,7 +101,7 @@ impl FaceSet {
         if !(diag > 0.0) || !diag.is_finite() {
             return None;
         }
-        Some(Self { faces, total, diag, centroid: Point3::from(sum / total) })
+        Some(Self { mesh, faces, total, diag, centroid: Point3::from(sum / total) })
     }
 }
 
@@ -250,19 +253,36 @@ pub(crate) fn plane_face(set: &FaceSet, seed: &Vec3) -> Option<PlaneFace> {
     Some(PlaneFace { normal, point, area, half_width: half, rim: false })
 }
 
+/// The share of a triangle's area where its linear height is above `t`, given the heights of
+/// its corners (exact: the triangle is clipped by the level line).
+pub(crate) fn fraction_above(heights: [f64; 3], t: f64) -> f64 {
+    let mut h = heights;
+    h.sort_by(f64::total_cmp);
+    let [h0, h1, h2] = h;
+    if t >= h2 {
+        0.0
+    } else if t < h0 {
+        1.0
+    } else if t >= h1 {
+        (h2 - t) * (h2 - t) / ((h2 - h0) * (h2 - h1))
+    } else {
+        1.0 - (t - h0) * (t - h0) / ((h2 - h0) * (h1 - h0))
+    }
+}
+
 /// How much of the surface lies on the minority side of the plane of `face` (beyond twice the
 /// slab half width), and the direction pointing into the majority side (where the material is).
-/// A face a part can stand on has nothing on its minority side.
+/// A face a part can stand on has nothing on its minority side. Triangles that cross the
+/// tolerance planes are clipped, so the area on each side does not depend on how the surface is
+/// divided into triangles.
 pub(crate) fn material_side(set: &FaceSet, face: &PlaneFace) -> (f64, Vec3) {
     let tol = 2.0 * face.half_width;
     let (mut pos, mut neg) = (0.0_f64, 0.0_f64);
     for f in &set.faces {
-        let s = (f.c - face.point).dot(&face.normal);
-        if s > tol {
-            pos += f.w;
-        } else if s < -tol {
-            neg += f.w;
-        }
+        let Some(corners) = set.mesh.triangle(f.tri as usize) else { continue };
+        let d = corners.map(|p| (p - face.point).dot(&face.normal));
+        pos += f.w * fraction_above(d, tol);
+        neg += f.w * (1.0 - fraction_above(d, -tol));
     }
     let up = if pos >= neg { face.normal } else { -face.normal };
     (pos.min(neg) / set.total, up)
@@ -273,15 +293,16 @@ mod tests {
     use super::*;
     use surfacecraft_geom::{Rng, synth};
 
-    fn noisy_box() -> FaceSet {
+    fn noisy_box() -> Mesh {
         let mut m = synth::cuboid(Point3::new(1.0, 2.0, 3.0), Vec3::new(60.0, 40.0, 20.0), 30);
         synth::add_noise(&mut m, 0.05, &mut Rng::new(3));
-        FaceSet::new(&m).unwrap()
+        m
     }
 
     #[test]
     fn dominant_directions_find_the_six_faces() {
-        let set = noisy_box();
+        let mesh = noisy_box();
+        let set = FaceSet::new(&mesh).unwrap();
         let dirs = dominant_directions(&set, 10);
         assert_eq!(dirs.len(), 6, "{dirs:?}");
         for axis in [Vec3::x(), Vec3::y(), Vec3::z()] {
@@ -292,7 +313,8 @@ mod tests {
 
     #[test]
     fn plane_face_is_exact_and_keeps_opposite_faces_apart() {
-        let set = noisy_box();
+        let mesh = noisy_box();
+        let set = FaceSet::new(&mesh).unwrap();
         let top = plane_face(&set, &Vec3::new(0.05, 0.0, 1.0)).unwrap();
         assert!(top.normal.dot(&Vec3::z()) > 0.999_999, "{:?}", top.normal);
         assert!((top.point.z - 23.0).abs() < 0.01, "{}", top.point.z);
@@ -301,6 +323,43 @@ mod tests {
         assert!((bottom.point.z - 3.0).abs() < 0.01);
         let (minority, up) = material_side(&set, &bottom);
         assert!(minority < 1e-3 && up.dot(&Vec3::z()) > 0.99, "{minority} {up:?}");
+    }
+
+    #[test]
+    fn a_crossing_triangle_counts_the_area_on_each_side() {
+        // heights [-1, 1, 1]: a quarter of the area lies below 0
+        assert!((1.0 - fraction_above([-1.0, 1.0, 1.0], 0.0) - 0.25).abs() < 1e-15);
+        assert_eq!(fraction_above([1.0, 2.0, 3.0], 0.5), 1.0);
+        assert_eq!(fraction_above([1.0, 2.0, 3.0], 3.0), 0.0);
+        assert!((fraction_above([0.0, 0.0, 2.0], 1.0) - 0.25).abs() < 1e-15);
+        assert_eq!(fraction_above([0.0, 0.0, 0.0], 0.0), 0.0);
+    }
+
+    /// A sheet crossing the base plane diagonally: the overhang is the same for a 2-triangle and
+    /// a 40 x 40 triangulation of it, and equals the analytic area.
+    #[test]
+    fn the_support_test_does_not_depend_on_the_triangulation() {
+        let tilt = |n: usize| {
+            let mut m = synth::plane(Point3::origin(), Vec3::x(), Vec3::y(), 20.0, 10.0, n, n);
+            for p in &mut m.positions {
+                p.z = 0.5 * (p.x - 12.0); // crosses z = 0 at x = 12, 40 % along the sheet
+            }
+            m
+        };
+        let base = PlaneFace { normal: Vec3::z(), point: Point3::origin(), area: 1.0, half_width: 0.25, rim: false };
+        let results: Vec<f64> = [1usize, 2, 7, 40]
+            .iter()
+            .map(|&n| {
+                let m = tilt(n);
+                let set = FaceSet::new(&m).unwrap();
+                material_side(&set, &base).0 * set.total
+            })
+            .collect();
+        let want = 70.0 * 1.25_f64.sqrt(); // the sheet is tilted: its area is 1.118 times its footprint
+        // below the tolerance plane z = -0.5: x < 11, area 11 x 10; above z = 0.5: x > 13: 7 x 10
+        for r in &results {
+            assert!((r - want).abs() < 1e-9 * want, "{results:?}");
+        }
     }
 
     #[test]
