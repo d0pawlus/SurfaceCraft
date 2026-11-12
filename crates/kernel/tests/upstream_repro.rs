@@ -357,3 +357,24 @@ fn healer_time_is_close_to_linear_in_the_face_count() {
     let (small, large) = (time(13), time(26));
     assert!(large <= 6.0 * small, "1 014 faces took {small:.2} s, 4 056 faces {large:.2} s (x{:.1})", large / small);
 }
+
+/// Problem 9b: the trusted conversion (no healer) of a large record is not linear either.
+///
+/// Input: cube sphere records of 60 000 and 240 000 bicubic patches (n = 100 and 200),
+/// `Body::from_record(.., true)`.
+/// Expected: four times the faces take at most six times as long.
+/// Actual: 2.0 s and 21.5 s, a factor of 10.7 (9.8 in a repeat; also 0.59 s at 16 224, 1.04 s at 30 246,
+/// 6.4 s at 120 984 faces). Read in the sources, not profiled: `fill_shells` inserts every face with
+/// `post_insert_faceuse`, which checks `shell.faces.contains(&f)` before each push (a linear scan).
+#[test]
+#[ignore = "solidcore 4f2da85: from_record(.., true) of a 240 000 face shell is super-linear (about 25 s)"]
+fn trusted_from_record_time_is_close_to_linear_in_the_face_count() {
+    let time = |n: usize| {
+        let record = common::record_of(&common::cube_sphere(n, 50.0));
+        let start = std::time::Instant::now();
+        ops::Body::from_record(&record, true).expect("from_record without the healer");
+        start.elapsed().as_secs_f64()
+    };
+    let (small, large) = (time(100), time(200));
+    assert!(large <= 6.0 * small, "60 000 faces took {small:.2} s, 240 000 faces {large:.2} s (x{:.1})", large / small);
+}

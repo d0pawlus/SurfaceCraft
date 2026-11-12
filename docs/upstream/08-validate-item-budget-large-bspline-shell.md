@@ -59,7 +59,7 @@ user meets.
 ## Our workaround
 
 `crates/kernel/src/nurbs/network_check.rs`: a network we assemble ourselves is checked with `validate_built` and
-bounded by our own `MAX_NETWORK_PATCHES` (250 000). `from_record` already uses `validate_built` internally, so nothing
+bounded by our own `MAX_NETWORK_PATCHES` (120 000). `from_record` already uses `validate_built` internally, so nothing
 else changes. Tests: `crates/kernel/tests/large_network.rs` (12 000, 16 000 and 60 000 patches, closed, volume within
 1e-3 of the sphere).
 

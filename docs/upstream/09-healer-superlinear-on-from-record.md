@@ -58,9 +58,34 @@ that finds nothing to do).
 Not measured: which healer stage takes the time (no profile), whether the cost depends on the topology (a cube sphere has
 valence 3 and 4 vertices only), the release profile.
 
+## The conversion without the healer is not linear either (large shells)
+
+`from_record(&record, true)` on the same cube spheres (`ci` profile, shared machine, one run each):
+
+| faces | `from_record(.., true)` | time / faces (us) |
+|---|---|---|
+| 16 224 | 0.59 s | 36 |
+| 30 246 | 1.04 s | 34 |
+| 60 000 | 2.01 s | 34 |
+| 120 984 | 6.45 s | 53 |
+| 240 000 | 21.5 s | 89 |
+
+Linear up to about 60 000 faces, then growing: four times the faces (60 000 to 240 000) took 10.7 times as long (9.8 in a repeat). Through
+SurfaceCraft's builder (adds our record check and the `to_record` that follows) the build is 3.4 s at 60 000 patches,
+10.8 s at 120 984 and 37 s at 240 000; `solid::volume` of the body (a decode and a measurement) 9.5 s, 24.9 s and 111 s.
+Read in the sources, not profiled: in `fill_shells` every face goes through `post_insert_faceuse`
+(`solidcore/src/topology/brep/p10.rs`, about line 1556), which tests `shell.faces.contains(&f)` before pushing, a linear
+scan per face, so the loop is quadratic in the faces of one shell (at 240 000 faces that is on the order of
+3e10 comparisons). Repro test: `trusted_from_record_time_is_close_to_linear_in_the_face_count` in
+`crates/kernel/tests/upstream_repro.rs` (`#[ignore]`, about 25 s). Expected: a set (or a flag on the face) instead of a
+scan. Our limit follows from it: `MAX_NETWORK_PATCHES = 120 000`.
+
 ## Our workaround
 
-`crates/kernel/src/solid.rs`: records with more than 2 000 faces go to the kernel without the healer
-(`HEAL_FACE_LIMIT`), and `crates/kernel/src/nurbs.rs` builds a network of more than 2 000 patches without it. A record of
-that size is a patch network this crate assembled and checked itself (shared boundary curves, every edge in two faces).
-The healer is therefore never available for large imported bodies.
+`crates/kernel/src/solid.rs`: `decode` first converts a record with more than 2 000 faces as trusted (`from_record(rec,
+true)`, no healer) and, when that conversion fails, retries with the healer (`from_record(rec, false)`); records up to
+2 000 faces take the healer path first. It checks no provenance of the record. `crates/kernel/src/nurbs.rs` builds a
+network of more than 2 000 patches without the healer, after its own checks (shared boundary curves and corners, every
+edge in at most two faces, every shared edge traversed in opposite directions, a closed component enclosing a positive
+volume). So a large body from a source other than that builder is converted without healing unless the trusted
+conversion fails first, and the healer's cost stays what the table above shows if that fallback is taken.

@@ -3,7 +3,7 @@
 //! builds it as a record of its own and checks it without the budget.
 mod common;
 
-use common::{cube_sphere, n_for, sphere_volume};
+use common::{cube_sphere, edges_are_consistent, flip_patch, n_for, sphere_volume};
 use surfacecraft_kernel::nurbs::{
     MAX_NETWORK_PATCHES, is_closed, sheet_from_bezier_network, sheet_from_bezier_network_as_is,
 };
@@ -64,10 +64,72 @@ fn network_with_a_missing_patch_is_an_open_sheet() {
 }
 
 #[test]
-fn empty_and_oversized_networks_are_refused() {
-    assert!(sheet_from_bezier_network_as_is(&[], &[]).is_err());
+fn empty_and_oversized_networks_are_refused_by_the_size_guard() {
+    let message = |r: surfacecraft_kernel::Result<_>| match r {
+        Ok(_) => String::new(),
+        Err(e) => e.to_string(),
+    };
+    assert!(message(sheet_from_bezier_network_as_is(&[], &[])).contains("patches, got 0"));
+    // refused before any geometry is looked at: the message names the limit, not a shared edge
     let net = cube_sphere(2, RADIUS);
     let many: Vec<_> = net.patches.iter().cycle().take(MAX_NETWORK_PATCHES + 1).cloned().collect();
     let corners: Vec<_> = net.corners.iter().cycle().take(MAX_NETWORK_PATCHES + 1).copied().collect();
-    assert!(sheet_from_bezier_network_as_is(&many, &corners).is_err());
+    let text = message(sheet_from_bezier_network_as_is(&many, &corners));
+    assert!(text.contains(&format!("patches, got {}", MAX_NETWORK_PATCHES + 1)), "{text}");
+}
+
+/// 12 150 patches, built and measured before the orientation pass existed (the same as today).
+const VOLUME_12150: f64 = 523_493.698_562_392_9;
+
+#[test]
+fn the_normal_network_is_unchanged_by_the_orientation_pass() {
+    let net = cube_sphere(n_for(12_000), RADIUS);
+    let sheet = sheet_from_bezier_network_as_is(&net.patches, &net.corners).expect("builds");
+    assert_eq!(sheet.faces.len(), 12_150);
+    assert!(edges_are_consistent(&sheet));
+    let volume = solid::volume(&sheet).expect("volume");
+    assert!((volume - VOLUME_12150).abs() <= 1e-9 * VOLUME_12150, "volume {volume}");
+}
+
+/// A network of more than 2000 patches goes through the build without the healer.
+fn baseline_volume(count: usize) -> f64 {
+    let net = cube_sphere(n_for(count), RADIUS);
+    let sheet = sheet_from_bezier_network_as_is(&net.patches, &net.corners).expect("builds");
+    solid::volume(&sheet).expect("volume")
+}
+
+#[test]
+fn one_transposed_patch_is_turned_back() {
+    let baseline = baseline_volume(2_100);
+    let mut net = cube_sphere(n_for(2_100), RADIUS);
+    flip_patch(&mut net, 1_000);
+    for sheet in [
+        sheet_from_bezier_network_as_is(&net.patches, &net.corners).expect("repaired"),
+        sheet_from_bezier_network(&net.patches, &net.corners).expect("repaired"),
+    ] {
+        assert!(is_closed(&sheet) && edges_are_consistent(&sheet));
+        let volume = solid::volume(&sheet).expect("volume");
+        assert!((volume - baseline).abs() <= 1e-9 * baseline, "volume {volume} vs {baseline}");
+    }
+}
+
+#[test]
+fn an_inside_out_network_is_turned_outward() {
+    let baseline = baseline_volume(2_100);
+    let mut net = cube_sphere(n_for(2_100), RADIUS);
+    (0..net.patches.len()).for_each(|f| flip_patch(&mut net, f));
+    let sheet = sheet_from_bezier_network_as_is(&net.patches, &net.corners).expect("turned outward");
+    assert!(is_closed(&sheet) && edges_are_consistent(&sheet));
+    let volume = solid::volume(&sheet).expect("volume");
+    assert!(volume > 0.0 && (volume - baseline).abs() <= 1e-9 * baseline, "volume {volume} vs {baseline}");
+}
+
+#[test]
+fn an_inside_out_network_with_a_flipped_patch_is_turned_outward() {
+    let baseline = baseline_volume(2_100);
+    let mut net = cube_sphere(n_for(2_100), RADIUS);
+    (0..net.patches.len()).filter(|f| f % 7 != 0).for_each(|f| flip_patch(&mut net, f));
+    let sheet = sheet_from_bezier_network_as_is(&net.patches, &net.corners).expect("repaired");
+    let volume = solid::volume(&sheet).expect("volume");
+    assert!(volume > 0.0 && (volume - baseline).abs() <= 1e-9 * baseline, "volume {volume} vs {baseline}");
 }

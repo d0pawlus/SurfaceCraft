@@ -16,6 +16,7 @@ use solidcore::query::api_queries::surface_closest_point;
 use solidcore::surface::surface::{Surface as KSurface, SurfaceKind};
 
 mod network_check;
+mod orientation;
 mod trim;
 pub use network_check::MAX_NETWORK_PATCHES;
 pub use trim::{MAX_OUTLINE_CORNERS, trimmed_sheet};
@@ -552,7 +553,11 @@ fn bezier_network(patches: &[Vec<Vec<[f64; 3]>>], corners: &[[u32; 4]], heal: bo
     let mut vertex_pts: Vec<Option<[f64; 3]>> = vec![None; nv];
     let mut knots = vec![0.0; n + 1];
     knots.extend(std::iter::repeat_n(1.0, n + 1));
+    // without the healer the orientation is settled here: patches against their neighbours and a
+    // wholly inside-out component are flipped (a flip transposes the net)
+    let flip = if heal { vec![false; nf] } else { orientation::flips(patches, corners)? };
     let at = |f: usize, i: usize, j: usize| -> [f64; 3] {
+        let (i, j) = if flip.get(f).copied().unwrap_or(false) { (j, i) } else { (i, j) };
         patches.get(f).and_then(|p| p.get(i)).and_then(|r| r.get(j)).copied().unwrap_or([0.0; 3])
     };
     let tol = 1e-7;
@@ -574,7 +579,10 @@ fn bezier_network(patches: &[Vec<Vec<[f64; 3]>>], corners: &[[u32; 4]], heal: bo
     let mut faces: Vec<Face> = Vec::with_capacity(nf);
     let mut oriented = Vec::with_capacity(nf);
     for f in 0..nf {
-        let c = corners.get(f).copied().unwrap_or([0; 4]);
+        let mut c = corners.get(f).copied().unwrap_or([0; 4]);
+        if flip.get(f).copied().unwrap_or(false) {
+            c = orientation::flipped_corners(c);
+        }
         for (k, &vid) in c.iter().enumerate() {
             let p = match k {
                 0 => at(f, 0, 0),

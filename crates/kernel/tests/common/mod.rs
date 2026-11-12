@@ -144,3 +144,17 @@ pub fn record_of(net: &Network) -> Brep {
         vertices,
     }
 }
+
+/// Patch `f` turned around: its net transposed and its corners `[c0, c3, c2, c1]` (its normal
+/// reversed, boundary curves unchanged).
+pub fn flip_patch(net: &mut Network, f: usize) {
+    let old = net.patches[f].clone();
+    net.patches[f] = (0..old.len()).map(|i| (0..old.len()).map(|j| old[j][i]).collect()).collect();
+    let c = net.corners[f];
+    net.corners[f] = [c[0], c[3], c[2], c[1]];
+}
+
+/// Every edge of the record is traversed in opposite directions by its two faces.
+pub fn edges_are_consistent(record: &Brep) -> bool {
+    record.edges.iter().all(|e| e.uses.len() == 2 && e.uses[0].upper != e.uses[1].upper)
+}
