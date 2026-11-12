@@ -33,7 +33,9 @@ Freeform (`surface.wrap` inside):
   the patches on a new conforming triangle mesh, so neighbours always share their boundary curves
   (no T-junctions, no gaps). `levels` of the result lists patches and fit per round.
 - A scan without open boundaries gives a solid; one with holes gives a sheet (`open_surface`).
-- Sharp edges and thin walls are kept; the patches meet G0 (no tangent continuity is claimed).
+- Patches meet in position (`continuity: g0`, what `scan.to_solid` uses). Tangent patches
+  (`surface.wrap` with `continuity: g1`) are experimental: on 13 real scans they reached the
+  tolerance on 7 where `g0` did on 9, and needed 56 % more patches and 2 to 3 times the time.
 
 Primitives:
 

@@ -197,12 +197,12 @@ pub fn build_patches(q: &QuadMesh, scan: &ScanSurface, radius: f64) -> PatchSet 
 }
 
 /// A scan triangle faces like a layout face when the cosine between their normals is at least this.
-const WRAP_FACING_COS: f64 = 0.3;
+pub(crate) const WRAP_FACING_COS: f64 = 0.3;
 /// Inverse of the 2 × 2 matrix of the inner Bernstein values at 1/3 and 2/3.
 const INNER_INVERSE: [[f64; 2]; 2] = [[3.0, -1.5], [-1.5, 3.0]];
 
 /// The cubic from `a` to `b` through the scan points under the chord at 1/3 and 2/3.
-fn wrap_curve(a: Vec3, b: Vec3, project: &dyn Fn(Vec3) -> Vec3) -> [Vec3; 4] {
+pub(crate) fn wrap_curve(a: Vec3, b: Vec3, project: &dyn Fn(Vec3) -> Vec3) -> [Vec3; 4] {
     let q1 = project(a + (b - a) / 3.0);
     let q2 = project(a + (b - a) * (2.0 / 3.0));
     [a, (a * -5.0 + q1 * 18.0 - q2 * 9.0 + b * 2.0) / 6.0, (a * 2.0 - q1 * 9.0 + q2 * 18.0 - b * 5.0) / 6.0, b]
@@ -211,7 +211,7 @@ fn wrap_curve(a: Vec3, b: Vec3, project: &dyn Fn(Vec3) -> Vec3) -> [Vec3; 4] {
 /// The net with the boundary curves `bot` (c0 → c1), `right` (c1 → c2), `top` (c3 → c2), `left`
 /// (c0 → c3); its four inner points are set so the patch passes through the scan points under its
 /// samples at 1/3 and 2/3.
-fn wrap_net(
+pub(crate) fn wrap_net(
     bot: &[Vec3; 4],
     right: &[Vec3; 4],
     top: &[Vec3; 4],
@@ -337,7 +337,7 @@ pub fn wrap_patches(coarse: &Mesh, scan: &Bvh, reach: f64) -> PatchSet {
     set
 }
 
-fn bern(t: f64) -> [f64; 4] {
+pub(crate) fn bern(t: f64) -> [f64; 4] {
     let s = 1.0 - t;
     [s * s * s, 3.0 * t * s * s, 3.0 * t * t * s, t * t * t]
 }
@@ -345,6 +345,44 @@ fn bern(t: f64) -> [f64; 4] {
 fn dbern(t: f64) -> [f64; 4] {
     let s = 1.0 - t;
     [-3.0 * s * s, 3.0 * s * s - 6.0 * t * s, 6.0 * t * s - 3.0 * t * t, 3.0 * t * t]
+}
+
+/// Weights `B_i(u) B_j(v)` of the 4 × 4 control points of a patch at `(u, v)`.
+pub(crate) fn tensor_weights(u: f64, v: f64) -> [[f64; 4]; 4] {
+    let (bu, bv) = (bern(u), bern(v));
+    let mut w = [[0.0; 4]; 4];
+    for i in 0..4 {
+        for j in 0..4 {
+            w[i][j] = bu[i] * bv[j];
+        }
+    }
+    w
+}
+
+/// Weights `3 B_k(t)` of the control-point differences `P_k(next row) - P_k(boundary)`: the cross-boundary
+/// derivative of a patch side at `t` is the sum of these differences with these weights.
+pub(crate) fn cross_weights(t: f64) -> [f64; 4] {
+    bern(t).map(|b| 3.0 * b)
+}
+
+/// Sum of the control points of `p` that `skip` does not name, each weighted by `B_i(u) B_j(v)`.
+pub(crate) fn weighted_sum(p: &[[Vec3; 4]; 4], u: f64, v: f64, skip: &dyn Fn(usize, usize) -> bool) -> Vec3 {
+    let w = tensor_weights(u, v);
+    let mut sum = Vec3::zeros();
+    for i in 0..4 {
+        for j in 0..4 {
+            if !skip(i, j) {
+                sum += p[i][j] * w[i][j];
+            }
+        }
+    }
+    sum
+}
+
+/// Derivative at `t` of the cubic Bézier curve with control points `c`.
+pub(crate) fn bezier_tangent(c: &[Vec3; 4], t: f64) -> Vec3 {
+    let s = 1.0 - t;
+    ((c[1] - c[0]) * (s * s) + (c[2] - c[1]) * (2.0 * t * s) + (c[3] - c[2]) * (t * t)) * 3.0
 }
 
 /// The point and the two partial derivatives of `net` at `(u, v)`.
