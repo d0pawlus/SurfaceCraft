@@ -11,8 +11,9 @@
 //! same curve. A region with exactly four corners becomes one Bézier patch of that degree: its
 //! four boundary curves are the feature curves, its interior control points are a regularised
 //! least-squares fit of the region's vertices (parameters from the Coons patch of the
-//! boundary, refined by closest-point iterations). Regions that are not four-sided are listed as
-//! skipped. Sharp edges stay sharp: the patches meet there without any tangent continuity.
+//! boundary, refined by closest-point iterations). Regions whose boundary is not one outline, or
+//! that have no three distinct corners, are listed as skipped. Sharp edges stay sharp: the patches
+//! meet there without any tangent continuity.
 use crate::features_ngon::{RegionRec, ngon_patches, quad_patches};
 use nalgebra::DMatrix;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};

@@ -169,7 +169,7 @@ fn from_curves(s: &mut Session, i: FromCurvesIn) -> CmdResult<FromCurvesOut> {
     let warning = if !within {
         Some(format!("max deviation {max:.4} mm exceeds {tol} mm: raise `degree` or check the edge angle"))
     } else if !net.skipped.is_empty() {
-        Some(format!("{} region(s) skipped (not four-sided)", net.skipped.len()))
+        Some(format!("{} region(s) skipped (see `skipped` for the reason)", net.skipped.len()))
     } else {
         None
     };

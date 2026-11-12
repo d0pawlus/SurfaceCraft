@@ -530,7 +530,7 @@
   "{} points exceed the limit of {}": "liczba punktów {} przekracza limit {}",
   "{} quads (unstructured), {} vertices": "czworokąty: {} (układ nieregularny), wierzchołki: {}",
   "{} r = {}": "{} r = {}",
-  "{} region(s) skipped (not four-sided)": "pominięte regiony: {} (nie są czworoboczne)",
+  "{} region(s) skipped (see `skipped` for the reason)": "pominięte regiony: {} (przyczyny w polu „pominięte”)",
   "{} source points; at least 6 are needed": "liczba punktów źródłowych: {}; potrzeba co najmniej 6",
   "{} triangles exceed the limit of {}": "liczba trójkątów {} przekracza limit {}",
   "{} triangles of {}, {}": "trójkąty: {} z {}, {}",
