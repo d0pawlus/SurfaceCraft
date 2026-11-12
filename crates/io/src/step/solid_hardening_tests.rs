@@ -111,7 +111,10 @@ fn near_equal_interior_knots_stay_distinct_and_valid() {
     let tiny = [0.0, 0.0, 0.0, 0.0, 1e-15, 1e-15, 1e-15, 1e-15];
     assert_eq!(checked_knots(&tiny, 3).unwrap(), (vec![0.0, 1e-15], vec![4, 4]));
     // a knot repeated more often than the degree allows is an error
-    assert!(checked_knots(&[0.0, 0.0, 0.0, 0.0, 0.5, 0.5, 0.5, 0.5, 1.0, 1.0, 1.0, 1.0], 3).is_err());
+    // a full break inside is a valid record (the kernel accepts it); one more repeat is not
+    assert!(checked_knots(&[0.0, 0.0, 0.0, 0.0, 0.5, 0.5, 0.5, 0.5, 1.0, 1.0, 1.0, 1.0], 3).is_ok());
+    assert!(checked_knots(&[0.0, 0.0, 0.5, 0.5, 1.0, 1.0], 1).is_ok());
+    assert!(checked_knots(&[0.0, 0.0, 0.0, 0.0, 0.5, 0.5, 0.5, 0.5, 0.5, 1.0, 1.0, 1.0, 1.0], 3).is_err());
     assert!(checked_knots(&[0.0; 5], 3).is_err());
 }
 

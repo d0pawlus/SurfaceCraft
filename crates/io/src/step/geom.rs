@@ -31,13 +31,11 @@ pub(super) fn knots_of(full: &[f64]) -> (Vec<f64>, Vec<usize>) {
     (k, m)
 }
 
-/// [`knots_of`], checked against the degree: a knot may repeat `degree + 1` times at an end and
-/// `degree` times inside, or the spline is not one.
+/// [`knots_of`], checked against the degree: a knot may repeat at most `degree + 1` times (a full
+/// break, which the kernel's record validator also accepts), or the spline is not one.
 pub(super) fn checked_knots(full: &[f64], degree: usize) -> Result<(Vec<f64>, Vec<usize>), IoError> {
     let (k, m) = knots_of(full);
-    let last = m.len().saturating_sub(1);
-    let bad_at =
-        m.iter().copied().enumerate().find(|&(i, c)| c > if i == 0 || i == last { degree + 1 } else { degree });
+    let bad_at = m.iter().copied().enumerate().find(|&(_, c)| c > degree + 1);
     match bad_at {
         Some((i, c)) => {
             let at = k.get(i).copied().unwrap_or(f64::NAN);
