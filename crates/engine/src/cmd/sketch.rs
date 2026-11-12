@@ -264,6 +264,35 @@ fn edit(s: &mut Session, i: EditIn) -> CmdResult<SketchOut> {
     resolve(s, id)
 }
 
+/// Move-point parameters.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MovePointIn {
+    /// Sketch id or name.
+    pub sketch: ObjRef,
+    /// Point index.
+    pub point: usize,
+    /// New position, sketch coordinates.
+    pub to: [f64; 2],
+}
+
+/// Moves one point to `to` and solves: the constraints pull the rest of the sketch along, and a
+/// point the constraints fix goes back to where they put it (a drag is a soft target).
+fn move_point(s: &mut Session, i: MovePointIn) -> CmdResult<SketchOut> {
+    let id = i.sketch.resolve(s, ObjectKind::Sketch)?;
+    if !i.to.iter().all(|v| v.is_finite()) {
+        return Err(CmdError::Params("coordinates must be finite".into()));
+    }
+    let o = s.doc.sketch_mut(id).ok_or_else(|| CmdError::Params(format!("no sketch {id}")))?;
+    let p = o
+        .sketch
+        .points
+        .get_mut(i.point)
+        .ok_or_else(|| CmdError::Params(format!("point {} does not exist", i.point)))?;
+    *p = i.to;
+    resolve(s, id)
+}
+
 /// One sketch.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -470,6 +499,16 @@ pub static COMMANDS: &[CommandSpec] = &[
         EditIn,
         SketchOut,
         edit
+    ),
+    command!(
+        "sketch.move_point",
+        "Move point",
+        "Sketch",
+        true,
+        "Moves point `point` of `sketch` to `to` and solves: the constraints move the rest of the sketch with it, and a point they fix stays where they put it. Replays dependent features.",
+        MovePointIn,
+        SketchOut,
+        move_point
     ),
     command!(
         "sketch.solve",

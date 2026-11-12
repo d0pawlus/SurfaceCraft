@@ -157,6 +157,23 @@ impl SurfaceCraftApp {
                 ed.notice = Some("sketch.notice.value");
             }
         }
+        // a drag of a point: press on it in the select tool, move, release (Alt+drag orbits)
+        let alt = ui.input(|i| i.modifiers.alt);
+        if resp.drag_started_by(egui::PointerButton::Primary)
+            && !alt
+            && let Some(q) = resp.interact_pointer_pos().filter(|p| !over_chrome(*p, ed)).and_then(to_plane)
+            && let Some(Hit::Point(i)) = snap::pick(&sk, q, tol, Want::Point)
+        {
+            ed.drag_begin(&sk, i, q);
+        }
+        if resp.dragged_by(egui::PointerButton::Primary)
+            && let Some(q) = resp.interact_pointer_pos().and_then(to_plane)
+        {
+            ed.drag_update(q);
+        }
+        if resp.drag_stopped_by(egui::PointerButton::Primary) {
+            cmds.extend(ed.drag_end());
+        }
         if resp.clicked_by(egui::PointerButton::Primary)
             && let Some(pos) = resp.interact_pointer_pos()
             && !over_chrome(pos, ed)
@@ -185,6 +202,8 @@ impl SurfaceCraftApp {
     /// editor's controls.
     pub(crate) fn sketch_overlay(&mut self, ui: &mut egui::Ui, rect: Rect) {
         let Some((_, name, sk, report)) = self.current_sketch() else { return };
+        // while a point is dragged the sketch is drawn as the solver leaves it
+        let sk = self.sketch_editor.drag.as_ref().map_or(sk, |d| d.preview.clone());
         let view = PlaneView::new(&self.camera, &sk.plane, rect.width(), rect.height());
         let tk = self.tokens.clone();
         let metrics = self.settings.theme.density.metrics();
