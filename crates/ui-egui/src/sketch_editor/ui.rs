@@ -107,7 +107,7 @@ impl SurfaceCraftApp {
     /// camera-orbit and picking gestures (panning with the right/middle button and zooming
     /// with the wheel stay the viewport's).
     pub(crate) fn sketch_input(&mut self, ui: &mut egui::Ui, resp: &egui::Response, rect: Rect) {
-        let Some((_, _, sk, _)) = self.current_sketch() else {
+        let Some((sketch_id, _, sk, _)) = self.current_sketch() else {
             self.sketch_editor.end();
             return;
         };
@@ -118,6 +118,7 @@ impl SurfaceCraftApp {
         let keyboard_free = !ui.ctx().egui_wants_keyboard_input();
         let ed = &mut self.sketch_editor;
         ed.sanitize(&sk);
+        ed.drag_check(sketch_id, &sk);
         let over_chrome = |p: Pos2, ed: &SketchEditor| ed.chrome.iter().any(|r| rect_of(*r).contains(p));
         let to_plane = |p: Pos2| view.to_plane(p.x - rect.min.x, p.y - rect.min.y);
         ed.hover = resp
@@ -159,12 +160,15 @@ impl SurfaceCraftApp {
         }
         // a drag of a point: press on it in the select tool, move, release (Alt+drag orbits)
         let alt = ui.input(|i| i.modifiers.alt);
+        // the point is the one under the press: egui reports the drag only after its threshold, so
+        // the pointer may already be elsewhere
+        let press = ui.input(|i| i.pointer.press_origin());
         if resp.drag_started_by(egui::PointerButton::Primary)
             && !alt
-            && let Some(q) = resp.interact_pointer_pos().filter(|p| !over_chrome(*p, ed)).and_then(to_plane)
-            && let Some(Hit::Point(i)) = snap::pick(&sk, q, tol, Want::Point)
+            && let Some(p0) = press.filter(|p| !over_chrome(*p, ed)).and_then(to_plane)
+            && let Some(now) = resp.interact_pointer_pos().and_then(to_plane)
         {
-            ed.drag_begin(&sk, i, q);
+            ed.drag_press(&sk, p0, now, tol);
         }
         if resp.dragged_by(egui::PointerButton::Primary)
             && let Some(q) = resp.interact_pointer_pos().and_then(to_plane)
