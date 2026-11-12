@@ -9,7 +9,7 @@
 //! the quadrics and budgets the parts end with, so no error history is lost.
 use crate::collapse::{Collapser, Quadric};
 use crate::decimate::Guard;
-use crate::{Bvh, Point3, par};
+use crate::{Bvh, Point3, Vec3, par};
 
 /// Largest number of triangles of a part.
 const PART_TRIANGLES: usize = 40_000;
@@ -23,13 +23,26 @@ pub(crate) struct Whole {
     pub tris: Vec<[u32; 3]>,
     pub pos: Vec<Point3>,
     pub q: Vec<Quadric>,
+    pub origin: Vec<Vec3>,
     pub locked: Vec<bool>,
+    /// Collapses the parts refused for turning a triangle against its surface.
+    pub refused: usize,
+}
+
+/// A vertex a part ends with: its number in the mesh, position, quadric, original orientation and budget.
+struct VertexOut {
+    id: u32,
+    pos: Point3,
+    q: Quadric,
+    origin: Vec3,
+    budget: f64,
 }
 
 /// What one part ends with: triangles in mesh vertex numbers and the state of the vertices left.
 struct PartOut {
     tris: Vec<[u32; 3]>,
-    vertices: Vec<(u32, Point3, Quadric, f64)>,
+    vertices: Vec<VertexOut>,
+    refused: usize,
 }
 
 /// Splits triangle ids into parts of at most [`PART_TRIANGLES`], each in ascending order.
@@ -87,20 +100,25 @@ fn reduce_part(
     let ltris: Vec<[u32; 3]> = ids.iter().map(|&t| whole.tris[t as usize].map(local)).collect();
     let lpos: Vec<Point3> = gids.iter().map(|&v| whole.pos[v as usize]).collect();
     let lq: Vec<Quadric> = gids.iter().map(|&v| whole.q[v as usize]).collect();
+    let lorigin: Vec<Vec3> = gids.iter().map(|&v| whole.origin[v as usize]).collect();
     let llocked: Vec<bool> = gids.iter().map(|&v| whole.locked[v as usize] || owner[v as usize] == SEAM).collect();
     let mut budget: Vec<f64> = gids.iter().map(|&v| g.1[v as usize]).collect();
-    let mut c = Collapser::new(ltris, lpos, lq, llocked.clone(), Some(Guard { bvh: g.0, budget: &mut budget }), false);
+    let mut c =
+        Collapser::new(ltris, lpos, lq, lorigin, llocked.clone(), Some(Guard { bvh: g.0, budget: &mut budget }), false);
     c.run(floor, max_cost);
-    let (tris, pos, q) = c.finish();
+    let refused = c.turns_refused();
+    let (tris, pos, q, origin) = c.finish();
     let mut used = vec![false; gids.len()];
     for t in &tris {
         for &v in t {
             used[v as usize] = true;
         }
     }
-    let vertices =
-        (0..gids.len()).filter(|&v| used[v] && !llocked[v]).map(|v| (gids[v], pos[v], q[v], budget[v])).collect();
-    PartOut { tris: tris.iter().map(|t| t.map(|v| gids[v as usize])).collect(), vertices }
+    let vertices = (0..gids.len())
+        .filter(|&v| used[v] && !llocked[v])
+        .map(|v| VertexOut { id: gids[v], pos: pos[v], q: q[v], origin: origin[v], budget: budget[v] })
+        .collect();
+    PartOut { tris: tris.iter().map(|t| t.map(|v| gids[v as usize])).collect(), vertices, refused }
 }
 
 /// Reduces `whole` part by part and returns what is left, compact (vertex numbers by ascending
@@ -134,18 +152,19 @@ pub(crate) fn reduce_in_parts(
             reduce_part(&whole, ids, &owner, (bvh, budget), floor, max_cost)
         })
     };
-    let Whole { tris: _, mut pos, mut q, locked } = whole;
+    let Whole { tris: _, mut pos, mut q, mut origin, locked, refused: _ } = whole;
+    let mut refused = 0;
     let mut budget = std::mem::take(guard.budget);
     let mut tris: Vec<[u32; 3]> = Vec::new();
     for out in outs {
+        refused += out.refused;
         tris.extend(out.tris);
-        for (v, p, qv, b) in out.vertices {
-            pos[v as usize] = p;
-            q[v as usize] = qv;
-            budget[v as usize] = b;
+        for v in out.vertices {
+            let id = v.id as usize;
+            (pos[id], q[id], origin[id], budget[id]) = (v.pos, v.q, v.origin, v.budget);
         }
     }
-    compact_whole(Whole { tris, pos, q, locked }, budget, guard)
+    compact_whole(Whole { tris, pos, q, origin, locked, refused }, budget, guard)
 }
 
 /// Renumbers the vertices in use by ascending number; the matching budgets go to `guard`.
@@ -166,7 +185,9 @@ fn compact_whole(whole: Whole, budget: Vec<f64>, guard: &mut Guard<'_>) -> Whole
         tris: whole.tris.iter().map(|t| t.map(|v| new_id[v as usize])).collect(),
         pos: kept.iter().map(|&v| whole.pos[v]).collect(),
         q: kept.iter().map(|&v| whole.q[v]).collect(),
+        origin: kept.iter().map(|&v| whole.origin[v]).collect(),
         locked: kept.iter().map(|&v| whole.locked[v]).collect(),
+        refused: whole.refused,
     }
 }
 
