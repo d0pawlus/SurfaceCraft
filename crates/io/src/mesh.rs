@@ -688,10 +688,12 @@ mod tests {
             let at = 84 + t * 50 + 12;
             bytes[at..at + 4].copy_from_slice(&f32::NAN.to_le_bytes());
         }
-        let msg = |threads| in_pool(threads, || read_mesh(&bytes, MeshFormat::Stl, &Limits::default()).unwrap_err().to_string());
+        let msg = |threads| {
+            in_pool(threads, || read_mesh(&bytes, MeshFormat::Stl, &Limits::default()).unwrap_err().to_string())
+        };
         let (a, b) = (msg(1), msg(8));
         assert_eq!(a, b);
-        assert!(a.contains(&"triangle 5000"), "{a}");
+        assert!(a.contains("triangle 5000"), "{a}");
     }
 
     #[test]
