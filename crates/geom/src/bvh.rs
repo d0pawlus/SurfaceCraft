@@ -167,6 +167,21 @@ impl Bvh {
     /// Closest point on the surface to `q` within `max_dist` (∞ for unbounded).
     #[must_use]
     pub fn closest(&self, q: &Point3, max_dist: f64) -> Option<SurfaceHit> {
+        self.closest_where(q, max_dist, &|_| true)
+    }
+
+    /// [`Bvh::closest`] among the triangles whose normal makes an angle with one of `facing` whose
+    /// cosine is at least `min_cos`. On a thin wall the plain closest point can lie on the far
+    /// side; this one stays on the side that faces like `facing`.
+    #[must_use]
+    pub fn closest_facing(&self, q: &Point3, max_dist: f64, facing: &[Vec3], min_cos: f64) -> Option<SurfaceHit> {
+        self.closest_where(q, max_dist, &|i| {
+            self.triangle_normal(i).is_some_and(|n| facing.iter().any(|f| n.dot(f) >= min_cos))
+        })
+    }
+
+    /// Closest point among the triangles `keep` accepts.
+    fn closest_where(&self, q: &Point3, max_dist: f64, keep: &dyn Fn(usize) -> bool) -> Option<SurfaceHit> {
         if self.nodes.is_empty() || !crate::finite(q) {
             return None;
         }
@@ -183,7 +198,7 @@ impl Bvh {
                     if let Some([a, b, c]) = self.tris.get(ti as usize) {
                         let p = tri::closest_point(q, a, b, c);
                         let d2 = (p - q).norm_squared();
-                        if d2 < best_d2 {
+                        if d2 < best_d2 && keep(ti as usize) {
                             best_d2 = d2;
                             best = Some(SurfaceHit { triangle: ti as usize, point: p, distance: d2.sqrt() });
                         }

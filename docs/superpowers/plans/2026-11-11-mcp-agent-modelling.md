@@ -92,3 +92,29 @@ command to run instead).
 
 None new: the gates use synthetic scans. The local corpus pass (`docs/integration.md`) should try
 `scan.to_solid` on real scans and record how often it reaches `pass`.
+
+## Addendum 2026-11-12: organic parts (owner's goal)
+
+The local corpus is castings, body panels and suspension parts; a primitives-only command models
+none of them, and the owner's goal is exactly those parts. Findings on the 13 scans:
+
+| Finding | Cause | Change |
+|---|---|---|
+| `quad.retopo` + `surface.auto` on whole scans: folded quads on every scan, deviations of 4 to 62 mm, 5 errors | the MLS projection averaged both sides of a thin wall; the G1 construction assumes a smooth surface, while a quarter of the layout edges of these parts are sharper than 60 degrees | `ScanSurface::oriented` (projection only onto points that face the same way); a new construction that assumes no smoothness |
+| a body of thousands of patches: 20 to 65 s per kernel call | the kernel healer runs on every decode and grows faster than linearly | records above 2000 faces go to the kernel without the healer; `sheet_from_bezier_network_as_is` |
+| scans with non-manifold edges cannot be wrapped | a patch edge may have two patches | `edit::remove_non_manifold`, then small holes filled |
+
+Design: `surface.wrap` (`crates/engine/src/cmd/wrap.rs`, `fit::patch::wrap_patches`). The scan is
+reduced with `geom::reduce` to a coarse mesh within a budget (4 tolerances, halved per round);
+every triangle becomes three bicubic patches whose boundary curves and inner points are taken
+from the scan on the side the triangle faces (`Bvh::closest_facing`); the network is measured and
+the budget halved until `min_within` is met or `max_patches` is reached. `scan.to_solid` gains
+`method` (`auto`, `primitives`, `freeform`); `auto` takes freeform when less than half of the scan
+lies in regions a primitive fits.
+
+Gate: `gate_scan_to_solid_wraps_an_organic_scan_in_patches` (a wavy ball, sigma = 0.03: `pass`,
+closed solid, at least 99 % within 0.2 mm, STEP export, one undo step). Local: 
+`local_corpus_scan_to_solid`.
+
+Open: patches are G0 (no tangent continuity); parts that need more than 12000 patches; the solid
+STEP writer of the kernel takes about 24 KB per patch; scans of a million triangles take minutes.

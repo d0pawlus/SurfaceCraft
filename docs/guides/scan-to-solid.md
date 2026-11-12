@@ -1,8 +1,14 @@
 # Scan to solid in one call
 
 `scan.to_solid` takes a raw scan to a closed solid and measures the solid against the scan. It
-suits parts made of planes, cylinders, cones, spheres and tori (machined and prismatic parts).
-Use the step-by-step guides when the part is organic or when you need a feature history.
+has two methods and chooses between them itself (`method: auto`):
+
+- `primitives`: planes, cylinders, cones, spheres and tori fitted to regions; for machined and
+  prismatic parts. A few analytic faces, exact dimensions.
+- `freeform`: a watertight network of bicubic patches over the whole scan; for castings, body
+  panels and organic shapes. Thousands of small faces that follow the scan.
+
+Use the step-by-step guides when you need a feature history.
 
 ## The short path
 
@@ -13,6 +19,19 @@ Use the step-by-step guides when the part is organic or when you need a feature 
 - A scan of more than a million triangles: call with `queued: true` and read it with `job_wait`.
 
 ## What it does
+
+`auto` segments the scan; when less than half of its triangles lie in regions a primitive fits,
+the freeform method runs. Pass `method` to choose yourself.
+
+Freeform (`surface.wrap` inside):
+
+- Cleans the scan, then reduces it to a coarse mesh that stays within a budget of the scan.
+- Every coarse triangle becomes three patches fitted to the scan; neighbours share their edges.
+- The budget is halved until `min_within` of the scan is within `tolerance`, or 12000 patches.
+- A scan without open boundaries gives a solid; one with holes gives a sheet (`open_surface`).
+- Sharp edges and thin walls are kept; the patches meet G0 (no tangent continuity is claimed).
+
+Primitives:
 
 - Cleans the scan (`clean`, default true): debris, spikes, holes up to `fill_holes_max_edges`.
   Not with `reuse_regions`: cleaning changes the triangles and would drop the regions.
@@ -45,8 +64,13 @@ Use the step-by-step guides when the part is organic or when you need a feature 
 - `left_out_regions` with an RMS reason: the region is freeform. `surface.fit` it and build with
   `body.from_regions`, passing the primitives of `modelled` and the surface in `surfaces`.
 - `unassigned_triangles`: `region.grow` from a seed, or `region.resegment` with a looser tolerance.
-- `mostly_freeform`: less than half of the scan lies in regions a primitive fits (a body panel,
-  a casting, an organic shape). This command will not model it: follow guide `fit-surfaces`.
+- `mostly_freeform` (only with `method: primitives`): less than half of the scan lies in regions
+  a primitive fits. Run again with `method: freeform`.
+- `open_surface` (freeform): the network is a sheet because the scan has open boundaries. Fill
+  the holes (`mesh.fill_holes`) and run again, or `surface.thicken` the sheet when the part is a
+  shell.
+- `out_of_tolerance` (freeform): the part needs more patches than the limit. `surface.wrap` with
+  a larger `max_patches` (up to 60000); the STEP file grows with the patch count.
 - `non_manifold_edges`: edges shared by three or more triangles are left after cleaning; the
   regions and holes next to them are unreliable. `mesh.reconstruct` builds a new mesh from the
   points of the file.

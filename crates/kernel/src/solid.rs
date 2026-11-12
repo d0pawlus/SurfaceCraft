@@ -24,8 +24,19 @@ pub struct BodyInfo {
     pub volume: Option<f64>,
 }
 
+/// A record with more faces than this goes to the kernel without its healer: the healer takes
+/// 20 s at 4000 scan-fitted patches and a minute at 7000 (measured), and every operation decodes
+/// its body again. Such records are patch networks this crate built and checked itself.
+const HEAL_FACE_LIMIT: usize = 2000;
+
 pub(crate) fn decode(rec: &Brep) -> Result<ops::Body> {
-    ops::Body::from_record(rec, false).map(|(b, _)| b).map_err(|e| op_err("from_record", e))
+    let trusted = rec.faces.len() > HEAL_FACE_LIMIT;
+    match ops::Body::from_record(rec, trusted) {
+        Ok((b, _)) => Ok(b),
+        // a large record the kernel does not take as it is still gets the healer's attempt
+        Err(_) if trusted => ops::Body::from_record(rec, false).map(|(b, _)| b).map_err(|e| op_err("from_record", e)),
+        Err(e) => Err(op_err("from_record", e)),
+    }
 }
 
 pub(crate) fn encode(body: &ops::Body) -> Result<Brep> {

@@ -5,9 +5,17 @@
 use nalgebra::{Matrix3, Matrix6, SymmetricEigen, Vector6};
 use surfacecraft_geom::{KdTree, Point3, Vec3, normalize};
 
+/// Scan vertices whose normal makes less than about 72 degrees with the hint lie on the same
+/// side of the part as the point being projected.
+const SAME_SIDE_COS: f64 = 0.3;
+/// A projection that moves the point farther than this many supports is a runaway of the quadric.
+const MAX_MOVE_SUPPORTS: f64 = 2.0;
+
 /// A scan prepared for projection.
 pub struct ScanSurface {
     pts: Vec<Point3>,
+    /// Normal of every point; empty when the scan was given without normals.
+    normals: Vec<Vec3>,
     tree: KdTree,
 }
 
@@ -16,7 +24,33 @@ impl ScanSurface {
     #[must_use]
     pub fn new(points: &[Point3]) -> Self {
         let pts: Vec<Point3> = points.iter().copied().filter(surfacecraft_geom::finite).collect();
-        Self { tree: KdTree::build(&pts), pts }
+        Self { tree: KdTree::build(&pts), pts, normals: Vec::new() }
+    }
+
+    /// The scan vertices with their normals. A projection then uses only the vertices that face
+    /// the same way as its hint, so the two sides of a thin wall (both inside one support) are
+    /// not averaged into one surface. Lengths that differ give a scan without normals.
+    #[must_use]
+    pub fn oriented(points: &[Point3], normals: &[Vec3]) -> Self {
+        if points.len() != normals.len() {
+            return Self::new(points);
+        }
+        let (pts, normals): (Vec<Point3>, Vec<Vec3>) = points
+            .iter()
+            .zip(normals)
+            .filter(|(p, n)| surfacecraft_geom::finite(p) && n.iter().all(|v| v.is_finite()))
+            .map(|(p, n)| (*p, *n))
+            .unzip();
+        Self { tree: KdTree::build(&pts), pts, normals }
+    }
+
+    /// The vertices within `r` of `at` on the side `hint` points to (all of them without normals).
+    fn support(&self, at: &Point3, r: f64, hint: &Vec3) -> Vec<usize> {
+        let mut idx = self.tree.within(at, r);
+        if !self.normals.is_empty() {
+            idx.retain(|&i| self.normals.get(i).is_some_and(|n| n.dot(hint) > SAME_SIDE_COS));
+        }
+        idx
     }
 
     /// Number of scan points.
@@ -50,11 +84,11 @@ impl ScanSurface {
         let mut out: Option<(Point3, Vec3)> = None;
         for it in 0..3 {
             let mut r = radius;
-            let mut idx = self.tree.within(&cur, r);
+            let mut idx = self.support(&cur, r, hint);
             let mut grow = 0;
             while idx.len() < 12 && grow < 3 {
                 r *= 1.6;
-                idx = self.tree.within(&cur, r);
+                idx = self.support(&cur, r, hint);
                 grow += 1;
             }
             if idx.len() < 6 {
@@ -90,6 +124,9 @@ impl ScanSurface {
             let p = c + e1 * x + e2 * y + n * z;
             let nn = normalize(n - e1 * zx - e2 * zy)?;
             let nn = if nn.dot(hint) < 0.0 { -nn } else { nn };
+            if !surfacecraft_geom::finite(&p) || (p - q).norm() > MAX_MOVE_SUPPORTS * r {
+                return out;
+            }
             out = Some((p, nn));
             if (p - cur).norm() < 1e-9 * (1.0 + radius) && it > 0 {
                 break;
@@ -142,6 +179,29 @@ fn local_frame(pts: &[Point3], idx: &[usize], at: &Point3, r: f64, hint: &Vec3) 
 mod tests {
     use super::*;
     use surfacecraft_geom::{Rng, synth};
+
+    #[test]
+    fn a_thin_wall_projects_onto_the_side_the_hint_faces() {
+        // two parallel sheets 1 mm apart, both inside the 5 mm support
+        let mut pts = Vec::new();
+        let mut normals = Vec::new();
+        for i in 0..40 {
+            for j in 0..40 {
+                let (x, y) = (f64::from(i) * 0.5, f64::from(j) * 0.5);
+                pts.push(Point3::new(x, y, 0.5));
+                normals.push(Vec3::z());
+                pts.push(Point3::new(x, y, -0.5));
+                normals.push(-Vec3::z());
+            }
+        }
+        let q = Point3::new(10.0, 10.0, 0.2);
+        let blind = ScanSurface::new(&pts).project(&q, 5.0, &Vec3::z()).unwrap().0;
+        assert!(blind.z.abs() < 0.2, "without normals the two sheets average out: z = {}", blind.z);
+        let s = ScanSurface::oriented(&pts, &normals);
+        let top = s.project(&q, 5.0, &Vec3::z()).unwrap().0;
+        let bottom = s.project(&q, 5.0, &-Vec3::z()).unwrap().0;
+        assert!((top.z - 0.5).abs() < 1e-6 && (bottom.z + 0.5).abs() < 1e-6, "top {} bottom {}", top.z, bottom.z);
+    }
 
     #[test]
     fn projection_onto_a_noisy_sphere_averages_the_noise() {

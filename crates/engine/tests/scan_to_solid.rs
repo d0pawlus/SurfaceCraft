@@ -142,6 +142,7 @@ fn bad_parameters_are_refused_and_change_nothing() {
         json!({"scan": "scan", "min_within": 1.5}),
         json!({"scan": "scan", "reuse_regions": true}),
         json!({"scan": "scan", "unknown": 1}),
+        json!({"scan": "scan", "method": "magic"}),
     ] {
         let r = s.execute("scan.to_solid", params.clone());
         assert!(matches!(r, Err(EngineError::InvalidParams(_))), "{params}: {r:?}");
@@ -150,33 +151,90 @@ fn bad_parameters_are_refused_and_change_nothing() {
     assert!(s.doc.regions.is_empty() && s.doc.primitives.is_empty() && s.doc.bodies.is_empty());
 }
 
-#[test]
-fn a_freeform_scan_is_named_as_such_and_pointed_at_the_surface_guide() {
-    // Arrange: a ball with a wavy skin; no plane, cylinder, cone, sphere or torus fits it
+/// A ball r = 20 with a wavy skin (bumps of up to 3 mm, about 25 mm apart): no plane, cylinder,
+/// cone, sphere or torus fits it. Returned as a raw scan (noise sigma = 0.03 mm).
+fn organic_scan_session() -> Session {
     let mut s = Session::new();
-    s.execute("mesh.synth", json!({"shape": "sphere", "resolution": 48, "name": "scan"})).unwrap();
+    s.execute("mesh.synth", json!({"shape": "sphere", "resolution": 64, "name": "scan"})).unwrap();
     let id = s.doc.find_by_name("scan").unwrap().0;
     let mut mesh = (*s.doc.mesh(id).unwrap().mesh).clone();
     for v in &mut mesh.positions {
-        let k = 1.0 + 0.15 * (0.9 * v.x).sin() * (1.1 * v.y).cos() + 0.1 * (1.3 * v.z).sin();
+        let k = 1.0 + 0.1 * (0.25 * v.x).sin() * (0.3 * v.y).cos() + 0.05 * (0.35 * v.z).sin();
         *v *= k;
     }
-    let mut s = Session::new();
-    s.doc.add_mesh("scan", mesh);
+    synth::add_noise(&mut mesh, 0.03, &mut Rng::new(5));
+    let mut out = Session::new();
+    out.doc.add_mesh("scan", mesh);
+    out
+}
+
+#[test]
+fn gate_scan_to_solid_wraps_an_organic_scan_in_patches() {
+    // Arrange
+    let mut s = organic_scan_session();
 
     // Act
     let out = s.execute("scan.to_solid", json!({"scan": "scan"})).unwrap();
 
+    // Assert: auto chose the freeform method and the solid passed
+    eprintln!("organic: {}", serde_json::to_string(&json!({"verdict": out["verdict"], "method": out["method"], "patches": out["patches"], "body": out["body"], "deviation": out["deviation"], "issues": out["issues"]})).unwrap());
+    assert_eq!(out["method"], "freeform", "{out}");
+    assert_eq!(out["verdict"], "pass", "{out}");
+    assert!(out["patches"].as_u64().unwrap() > 0, "{out}");
+    assert!(out["body"]["volume"].as_f64().is_some_and(|v| v > 0.0), "a closed solid: {out}");
+    assert!(out["deviation"]["within"].as_f64().unwrap() >= 0.99, "{out}");
+    assert!(out["deviation"]["coverage"].as_f64().unwrap() >= 0.9, "{out}");
+    // the suggested export runs as it is
+    let step = &out["next_steps"][0];
+    assert_eq!(step["command"], "export.step", "{out}");
+    let exported = s.execute("export.step", step["params"].clone()).unwrap();
+    assert!(exported["data"].as_str().is_some_and(|d| !d.is_empty()));
+    // one undo step takes the whole run back
+    s.execute("edit.undo", Value::Null).unwrap();
+    assert!(s.doc.bodies.is_empty());
+}
+
+#[test]
+fn method_primitives_on_an_organic_scan_says_it_is_freeform() {
+    // Arrange
+    let mut s = organic_scan_session();
+
+    // Act
+    let out = s.execute("scan.to_solid", json!({"scan": "scan", "method": "primitives"})).unwrap();
+
     // Assert
+    assert_eq!(out["method"], "primitives", "{out}");
     assert_eq!(out["verdict"], "fail", "{out}");
     assert!(codes(&out["issues"]).contains(&"mostly_freeform".to_string()), "{out}");
     let steps = out["next_steps"].as_array().unwrap();
-    assert!(steps.iter().any(|st| st["params"]["topic"] == "fit-surfaces"), "{out}");
-    assert!(steps.iter().all(|st| st["params"]["reuse_regions"] != true), "{out}");
+    assert!(steps.iter().any(|st| st["command"] == "scan.to_solid" && st["params"]["method"] == "freeform"), "{out}");
     for st in steps {
         let r = s.execute(st["command"].as_str().unwrap(), st["params"].clone());
         assert!(!matches!(r, Err(EngineError::InvalidParams(_) | EngineError::UnknownCommand(_))), "{st}: {r:?}");
     }
+}
+
+#[test]
+fn an_open_organic_scan_becomes_a_sheet_under_review() {
+    // Arrange: the upper part of the organic scan, one large open boundary
+    let s = organic_scan_session();
+    let id = s.doc.find_by_name("scan").unwrap().0;
+    let mut mesh = (*s.doc.mesh(id).unwrap().mesh).clone();
+    let keep: Vec<[u32; 3]> =
+        mesh.triangles.iter().copied().filter(|t| t.iter().all(|&v| mesh.positions[v as usize].z > -5.0)).collect();
+    mesh.triangles = keep;
+    let mut s = Session::new();
+    s.doc.add_mesh("scan", mesh);
+
+    // Act
+    let out =
+        s.execute("scan.to_solid", json!({"scan": "scan", "method": "freeform", "fill_holes_max_edges": 10})).unwrap();
+
+    // Assert
+    assert_eq!(out["verdict"], "review", "{out}");
+    assert!(codes(&out["issues"]).contains(&"open_surface".to_string()), "{out}");
+    assert!(out["body"]["volume"].as_f64().is_none_or(|v| v == 0.0), "a sheet has no volume: {out}");
+    assert!(out["deviation"]["within"].as_f64().unwrap() >= 0.99, "{out}");
 }
 
 #[test]

@@ -12,6 +12,9 @@ description: Driving SurfaceCraft from an agent — MCP server, bridged mode, CL
 - The short path is three calls: `mesh_import`, `scan_to_solid`, `export_step`. `scan.to_solid` returns
   `verdict` (`pass`, `review`, `fail`), the deviation against the scan, `issues` and `next_steps` with ready
   parameters; a poor model is a verdict, not an error. Guide: `guide_read` topic `scan-to-solid`.
+- `scan.to_solid` has two methods (`method`: `auto`, `primitives`, `freeform`). Organic parts, castings and
+  body panels go through `freeform` (`surface.wrap`: a watertight patch network over the whole scan); judge
+  scan-to-CAD work on such scans first, they are what the product is for.
 - The default listing is compact: one tool per area (`verb`, `params`) plus the commands of `FEATURED`
   (`crates/mcp/src/lib.rs`) with their input schema. `--tools full` (or `SURFACECRAFT_MCP_TOOLS=full`) lists one
   tool per command with output schemas (about 380 KB). A command that an agent needs on the short path

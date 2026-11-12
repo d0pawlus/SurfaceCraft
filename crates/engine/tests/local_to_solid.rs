@@ -41,9 +41,11 @@ fn run_one(number: usize, path: &std::path::Path) -> Result<String, String> {
     let seconds = started.elapsed().as_secs_f64();
     let verdict = out["verdict"].as_str().unwrap_or("?").to_string();
     eprintln!(
-        "C{number:02} triangles {} verdict {verdict} in {seconds:.1} s; modelled {} left out {} ({} tri) unassigned {}; \
+        "C{number:02} triangles {} method {} patches {} verdict {verdict} in {seconds:.1} s; modelled {} left out {} ({} tri) unassigned {}; \
          faces {} volume {} coverage {} within {} rms {} max {}; sigma {}; holes left {}; issues {:?}; steps {:?}",
         info["triangles"],
+        out["method"],
+        out["patches"],
         out["modelled"].as_array().map_or(0, Vec::len),
         out["left_out_regions"],
         out["left_out_triangles"],

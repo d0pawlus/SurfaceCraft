@@ -925,5 +925,7 @@
   "status.running": "{name}: running…",
   "status.busy": "{name} is still running",
   "status.cancelled": "{name}: cancelled",
-  "status.finishing": "The cancelled command is still finishing; try again in a moment"
+  "status.finishing": "The cancelled command is still finishing; try again in a moment",
+  "cmd.surface.wrap": "Wrap scan in patches",
+  "cmd.surface.wrap.hint": "Covers the whole scan with a watertight network of patches fitted to it; for castings, body panels and organic shapes."
 }

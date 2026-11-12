@@ -3,6 +3,15 @@
 Fit NURBS patches to regions that are not planes, cylinders or other primitives, or build a
 patch network over a whole scan.
 
+## A whole scan
+
+- `surface.wrap` with `mesh`: a watertight network of bicubic patches over the whole scan, for
+  castings, body panels and organic shapes. `tolerance` (default 0.2 mm), `min_within` (default
+  0.99) and `max_patches` (default 12000, at most 60000). The result is a solid when the scan is
+  closed, else a sheet; `deviation` gives `within`, `rms`, `p99` and `max`.
+- It keeps sharp edges and thin walls (the patches meet G0). `scan.to_solid` with
+  `method: freeform` runs it after cleaning and measures the result with `body.compare`.
+
 ## Regions
 
 - Make the region first: `region.auto_segment`, `region.grow` or `region.create` (see

@@ -196,6 +196,147 @@ pub fn build_patches(q: &QuadMesh, scan: &ScanSurface, radius: f64) -> PatchSet 
     set
 }
 
+/// A scan triangle faces like a layout face when the cosine between their normals is at least this.
+const WRAP_FACING_COS: f64 = 0.3;
+/// Inverse of the 2 × 2 matrix of the inner Bernstein values at 1/3 and 2/3.
+const INNER_INVERSE: [[f64; 2]; 2] = [[3.0, -1.5], [-1.5, 3.0]];
+
+/// The cubic from `a` to `b` through the scan points under the chord at 1/3 and 2/3.
+fn wrap_curve(a: Vec3, b: Vec3, project: &dyn Fn(Vec3) -> Vec3) -> [Vec3; 4] {
+    let q1 = project(a + (b - a) / 3.0);
+    let q2 = project(a + (b - a) * (2.0 / 3.0));
+    [a, (a * -5.0 + q1 * 18.0 - q2 * 9.0 + b * 2.0) / 6.0, (a * 2.0 - q1 * 9.0 + q2 * 18.0 - b * 5.0) / 6.0, b]
+}
+
+/// The net with the boundary curves `bot` (c0 → c1), `right` (c1 → c2), `top` (c3 → c2), `left`
+/// (c0 → c3); its four inner points are set so the patch passes through the scan points under its
+/// samples at 1/3 and 2/3.
+fn wrap_net(
+    bot: &[Vec3; 4],
+    right: &[Vec3; 4],
+    top: &[Vec3; 4],
+    left: &[Vec3; 4],
+    project: &dyn Fn(Vec3) -> Vec3,
+) -> Net {
+    let mut p = [[Vec3::zeros(); 4]; 4];
+    for k in 0..4 {
+        p[k][0] = bot[k];
+        p[3][k] = right[k];
+        p[k][3] = top[k];
+        p[0][k] = left[k];
+    }
+    // first guess: each inner point continues its two nearest boundary rows
+    p[1][1] = p[1][0] + p[0][1] - p[0][0];
+    p[2][1] = p[2][0] + p[3][1] - p[3][0];
+    p[1][2] = p[1][3] + p[0][2] - p[0][3];
+    p[2][2] = p[2][3] + p[3][2] - p[3][3];
+    let mut net = [[[0.0; 3]; 4]; 4];
+    for i in 0..4 {
+        for j in 0..4 {
+            net[i][j] = a3(p[i][j]);
+        }
+    }
+    let mut residual = [[Vec3::zeros(); 2]; 2];
+    for (a, row) in residual.iter_mut().enumerate() {
+        for (b, r) in row.iter_mut().enumerate() {
+            let (at, _, _) = eval(&net, (a + 1) as f64 / 3.0, (b + 1) as f64 / 3.0);
+            *r = project(at) - at;
+        }
+    }
+    for i in 0..2 {
+        for j in 0..2 {
+            let mut d = Vec3::zeros();
+            for (a, row) in residual.iter().enumerate() {
+                for (b, r) in row.iter().enumerate() {
+                    d += r * (INNER_INVERSE[i][a] * INNER_INVERSE[j][b]);
+                }
+            }
+            net[i + 1][j + 1] = a3(p[i + 1][j + 1] + d);
+        }
+    }
+    net
+}
+
+/// Wraps the coarse triangle mesh `coarse` (a reduction of the scan: manifold, close to it) in
+/// bicubic patches fitted to the scan `scan`: every triangle becomes three quads around its
+/// centre, every quad one patch.
+///
+/// Patches share their boundary curves, so the network is watertight; nothing is assumed about
+/// smoothness, so sharp edges and thin walls of the part stay sharp (the patches are G0 and follow
+/// the scan as closely as their size allows). Every point is taken from the side of the scan that
+/// faces like the coarse triangle it belongs to, within `reach` of its first guess.
+#[must_use]
+pub fn wrap_patches(coarse: &Mesh, scan: &Bvh, reach: f64) -> PatchSet {
+    let face_normal: Vec<Vec3> = coarse
+        .triangles
+        .iter()
+        .map(|t| {
+            let p = |k: usize| coarse.positions.get(t[k] as usize).map_or_else(Vec3::zeros, |p| p.coords);
+            normalize((p(1) - p(0)).cross(&(p(2) - p(0)))).unwrap_or_else(Vec3::z)
+        })
+        .collect();
+    let project = |at: Vec3, facing: &[Vec3]| -> Vec3 {
+        scan.closest_facing(&Point3::from(at), reach, facing, WRAP_FACING_COS).map_or(at, |h| h.point.coords)
+    };
+    let mut vertices: Vec<Vec3> =
+        coarse.positions.iter().map(|p| scan.closest(p, reach).map_or(p.coords, |h| h.point.coords)).collect();
+    // the faces on each edge, then one midpoint per edge
+    let mut edge_faces: BTreeMap<(u32, u32), Vec<usize>> = BTreeMap::new();
+    for (f, t) in coarse.triangles.iter().enumerate() {
+        for k in 0..3 {
+            let (a, b) = (t[k], t[(k + 1) % 3]);
+            edge_faces.entry((a.min(b), a.max(b))).or_default().push(f);
+        }
+    }
+    let mut mid: BTreeMap<(u32, u32), u32> = BTreeMap::new();
+    let mut curves: BTreeMap<(u32, u32), [Vec3; 4]> = BTreeMap::new();
+    for (&(a, b), faces) in &edge_faces {
+        let (Some(&pa), Some(&pb)) = (vertices.get(a as usize), vertices.get(b as usize)) else { continue };
+        let facing: Vec<Vec3> = faces.iter().filter_map(|&f| face_normal.get(f).copied()).collect();
+        let on_edge = |at: Vec3| project(at, &facing);
+        let m = vertices.len() as u32;
+        let pm = on_edge((pa + pb) * 0.5);
+        vertices.push(pm);
+        mid.insert((a, b), m);
+        curves.insert((a, m), wrap_curve(pa, pm, &on_edge));
+        curves.insert((b, m), wrap_curve(pb, pm, &on_edge));
+    }
+    let side = |curves: &BTreeMap<(u32, u32), [Vec3; 4]>, a: u32, b: u32| -> Option<[Vec3; 4]> {
+        let c = curves.get(&(a.min(b), a.max(b)))?;
+        Some(if a < b { *c } else { [c[3], c[2], c[1], c[0]] })
+    };
+    let mut set = PatchSet::default();
+    for (f, t) in coarse.triangles.iter().enumerate() {
+        let Some(&nf) = face_normal.get(f) else { continue };
+        let on_face = |at: Vec3| project(at, &[nf]);
+        let corner = |k: usize| vertices.get(t[k] as usize).copied();
+        let (Some(p0), Some(p1), Some(p2)) = (corner(0), corner(1), corner(2)) else { continue };
+        let m: Vec<Option<u32>> =
+            (0..3).map(|k| mid.get(&(t[k].min(t[(k + 1) % 3]), t[k].max(t[(k + 1) % 3]))).copied()).collect();
+        let (Some(m0), Some(m1), Some(m2)) = (m[0], m[1], m[2]) else { continue };
+        let g = vertices.len() as u32;
+        let pg = on_face((p0 + p1 + p2) / 3.0);
+        vertices.push(pg);
+        for &mk in &[m0, m1, m2] {
+            if let Some(&pm) = vertices.get(mk as usize) {
+                curves.insert((mk, g), wrap_curve(pm, pg, &on_face));
+            }
+        }
+        // quad k: corner k, the midpoint after it, the centre, the midpoint before it
+        for (c0, c1, c3) in [(t[0], m0, m2), (t[1], m1, m0), (t[2], m2, m1)] {
+            let (Some(bot), Some(right), Some(top), Some(left)) =
+                (side(&curves, c0, c1), side(&curves, c1, g), side(&curves, c3, g), side(&curves, c0, c3))
+            else {
+                continue;
+            };
+            set.nets.push(wrap_net(&bot, &right, &top, &left, &on_face));
+            set.corners.push([c0, c1, g, c3]);
+        }
+    }
+    set.vertices = vertices.into_iter().map(a3).collect();
+    set
+}
+
 fn bern(t: f64) -> [f64; 4] {
     let s = 1.0 - t;
     [s * s * s, 3.0 * t * s * s, 3.0 * t * t * s, t * t * t]

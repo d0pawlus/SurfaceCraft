@@ -97,7 +97,8 @@ cargo run --release -p surfacecraft-cli -- assist align "put the part on the wor
 ```
 
 - **MCP server.** Scan to STEP in three calls: `mesh_import`, `scan_to_solid`, `export_step`.
-  `scan_to_solid` cleans, segments, fits, builds the solid and measures it against the scan; it
+  `scan_to_solid` cleans the scan, builds the solid (primitives for prismatic parts, a patch
+  network for organic parts, castings and body panels) and measures it against the scan; it
   answers with a verdict (`pass`, `review`, `fail`), the deviation and the next steps to take.
   Every registry command is callable as a tool. The default listing is compact (42 KB: one tool
   per command area plus the workflow commands); `--tools full` lists one tool per command.

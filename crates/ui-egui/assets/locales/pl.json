@@ -925,5 +925,7 @@
   "status.running": "{name}: trwa…",
   "status.busy": "{name} jeszcze trwa",
   "status.cancelled": "{name}: anulowano",
-  "status.finishing": "Anulowane polecenie jeszcze się kończy; spróbuj za chwilę"
+  "status.finishing": "Anulowane polecenie jeszcze się kończy; spróbuj za chwilę",
+  "cmd.surface.wrap": "Owiń skan płatami",
+  "cmd.surface.wrap.hint": "Pokrywa cały skan szczelną siatką płatów dopasowanych do skanu; do odlewów, karoserii i kształtów organicznych."
 }

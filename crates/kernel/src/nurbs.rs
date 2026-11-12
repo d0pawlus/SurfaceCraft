@@ -515,6 +515,20 @@ pub(crate) fn canonicalize(mut b: Brep) -> Brep {
 /// must be consistent over the layout. With every edge used twice the shell is closed and the
 /// result is a solid.
 pub fn sheet_from_bezier_network(patches: &[Vec<Vec<[f64; 3]>>], corners: &[[u32; 4]]) -> Result<Brep> {
+    bezier_network(patches, corners, true)
+}
+
+/// [`sheet_from_bezier_network`] without the kernel's healer: for networks of thousands of
+/// patches, where the healer takes minutes. The checks of this function still apply (finite
+/// control points, shared boundary curves and corners, every edge used at most twice).
+///
+/// # Errors
+/// As [`sheet_from_bezier_network`].
+pub fn sheet_from_bezier_network_as_is(patches: &[Vec<Vec<[f64; 3]>>], corners: &[[u32; 4]]) -> Result<Brep> {
+    bezier_network(patches, corners, false)
+}
+
+fn bezier_network(patches: &[Vec<Vec<[f64; 3]>>], corners: &[[u32; 4]], heal: bool) -> Result<Brep> {
     let nf = patches.len();
     if nf == 0 || corners.len() != nf {
         return Err(KernelError::Argument("the network needs at least one patch and one corner list per patch".into()));
@@ -650,7 +664,17 @@ pub fn sheet_from_bezier_network(patches: &[Vec<Vec<[f64; 3]>>], corners: &[[u32
     };
     let brep = canonicalize(brep);
     brep.validate().map_err(|e| op_err("record validate", e))?;
-    let (body, _) = solidcore_ops::Body::from_record(&brep, false).map_err(|e| op_err("from_record", e))?;
+    // The healer may rework a network of scan-fitted patches (it then cannot say which entity is
+    // which, and the conversion refuses). The network is consistent by construction (shared curves
+    // and vertices are checked above), so it is then taken as it is.
+    let body = match (heal, solidcore_ops::Body::from_record(&brep, !heal)) {
+        (_, Ok((body, _))) => body,
+        (false, Err(e)) => return Err(op_err("from_record", e)),
+        (true, Err(healed)) => match solidcore_ops::Body::from_record(&brep, true) {
+            Ok((body, _)) => body,
+            Err(_) => return Err(op_err("from_record", healed)),
+        },
+    };
     body.to_record().map(|(r, _)| r).map_err(|e| op_err("to_record", e))
 }
 

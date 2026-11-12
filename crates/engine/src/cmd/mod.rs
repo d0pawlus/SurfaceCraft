@@ -38,6 +38,7 @@ mod surface_check;
 mod surface_fit;
 mod surface_pieces;
 pub mod working;
+pub mod wrap;
 
 /// An error from a command's `run`.
 #[derive(Clone, Debug, PartialEq)]
@@ -172,6 +173,7 @@ static REGISTRY: LazyLock<Vec<CommandSpec>> = LazyLock::new(|| {
     v.extend_from_slice(primitive::COMMANDS);
     v.extend_from_slice(qa::COMMANDS);
     v.extend_from_slice(quad::COMMANDS);
+    v.extend_from_slice(wrap::COMMANDS);
     v.extend_from_slice(refit::COMMANDS);
     v.extend_from_slice(region::COMMANDS);
     v.extend_from_slice(section::COMMANDS);
@@ -239,6 +241,7 @@ const HEAVY: &[&str] = &[
     "surface.fit",
     "surface.thicken",
     "surface.trim_to_region",
+    "surface.wrap",
 ];
 
 /// Whether command `id` is too slow to preview live (see [`Session::preview`]).

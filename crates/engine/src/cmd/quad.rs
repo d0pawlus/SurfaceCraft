@@ -275,8 +275,8 @@ fn retopo_cmd(s: &mut Session, i: RetopoIn) -> CmdResult<RetopoOut> {
     }
     let sub = m.submesh(&tris);
     let normals = m.vertex_normals();
-    let (pts, _) = region_points(&m, &normals, &tris);
-    let scan = ScanSurface::new(&pts);
+    let (pts, point_normals) = region_points(&m, &normals, &tris);
+    let scan = ScanSurface::oriented(&pts, &point_normals);
     // layout from the fields; folded quads (rare, at field defects) trigger the fallback layout
     let mut attempt = 0;
     let (quads, rep, field_faces, field_quads, folded) = loop {
@@ -412,7 +412,8 @@ fn check_layout(q: &QuadObject) -> CmdResult<()> {
     Ok(())
 }
 
-fn scan_for(s: &Session, q: &QuadObject) -> CmdResult<(Vec<Point3>, f64)> {
+/// The scan points under layout `q`, their normals and the mean edge length of the scan there.
+fn scan_for(s: &Session, q: &QuadObject) -> CmdResult<(Vec<Point3>, Vec<Vec3>, f64)> {
     let m =
         s.doc.mesh(q.mesh).map(|m| m.mesh.clone()).ok_or_else(|| CmdError::Params(format!("no mesh {}", q.mesh)))?;
     let tris: Vec<u32> = match q.region {
@@ -420,8 +421,8 @@ fn scan_for(s: &Session, q: &QuadObject) -> CmdResult<(Vec<Point3>, f64)> {
         None => (0..m.triangle_count() as u32).collect(),
     };
     let normals = m.vertex_normals();
-    let (pts, _) = region_points(&m, &normals, &tris);
-    Ok((pts, mean_edge(&m, &tris)))
+    let (pts, point_normals) = region_points(&m, &normals, &tris);
+    Ok((pts, point_normals, mean_edge(&m, &tris)))
 }
 
 fn info_of(q: &QuadObject, snap_max: f64) -> QuadInfo {
@@ -434,8 +435,8 @@ fn split_unstructured(s: &mut Session, id: ObjectId) -> CmdResult<QuadInfo> {
     if q.faces.len() * 4 > MAX_LAYOUT_QUADS {
         return Err(CmdError::Params(format!("the layout would exceed {MAX_LAYOUT_QUADS} quads")));
     }
-    let (pts, spacing) = scan_for(s, &q)?;
-    let scan = ScanSurface::new(&pts);
+    let (pts, point_normals, spacing) = scan_for(s, &q)?;
+    let scan = ScanSurface::oriented(&pts, &point_normals);
     let layout = layout_of(&q);
     let split = layout.split(&projector(&scan, layout_radius(&layout, spacing)));
     let snap_max = {
@@ -491,8 +492,8 @@ fn snap_cmd(s: &mut Session, i: QuadIn) -> CmdResult<QuadInfo> {
     let id = i.object.resolve(s, ObjectKind::Quad)?;
     if let Some(q) = s.doc.quad(id).filter(|q| q.is_unstructured()).cloned() {
         check_layout(&q)?;
-        let (pts, spacing) = scan_for(s, &q)?;
-        let scan = ScanSurface::new(&pts);
+        let (pts, point_normals, spacing) = scan_for(s, &q)?;
+        let scan = ScanSurface::oriented(&pts, &point_normals);
         let layout = layout_of(&q);
         let project = projector(&scan, layout_radius(&layout, spacing));
         let mut snap_max: f64 = 0.0;
@@ -627,11 +628,11 @@ pub struct AutoOut {
 /// AutoSurface of an unstructured layout: bicubic patches, refined until within `tol`.
 fn auto_unstructured(s: &mut Session, q: &QuadObject, tol: f64, i: &AutoIn) -> CmdResult<AutoOut> {
     check_layout(q)?;
-    let (pts, spacing) = scan_for(s, q)?;
+    let (pts, point_normals, spacing) = scan_for(s, q)?;
     if pts.len() < 20 {
         return Err(CmdError::Failed("the region has too few points".into()));
     }
-    let scan = ScanSurface::new(&pts);
+    let scan = ScanSurface::oriented(&pts, &point_normals);
     let max_patches = i.max_patches.unwrap_or(6000).clamp(1, MAX_LAYOUT_QUADS);
     let mut layout = layout_of(q);
     if layout.faces.len() > max_patches {
