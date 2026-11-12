@@ -40,6 +40,18 @@ pub struct SolveReport {
 
 const TOL: f64 = 1e-10;
 
+/// Largest residual at which a solve still counts as satisfying its constraints (the bound of
+/// [`SolveStatus::Failed`]).
+pub const SATISFIED_TOL: f64 = 1e-6;
+
+impl SolveReport {
+    /// Are all constraints met, redundant ones included (residual within [`SATISFIED_TOL`])?
+    #[must_use]
+    pub fn is_satisfied(&self) -> bool {
+        self.residual.is_finite() && self.residual <= SATISFIED_TOL
+    }
+}
+
 fn unknowns(s: &Sketch, l: &Layout) -> Vec<f64> {
     let mut x: Vec<f64> = s.points.iter().flat_map(|p| [p[0], p[1]]).collect();
     x.resize(l.n, 0.0);
@@ -203,7 +215,7 @@ pub fn solve(s: &mut Sketch) -> Result<SolveReport, SketchError> {
         )
     } else if !redundant.is_empty() {
         (SolveStatus::OverDefined, format!("sketch is overdefined: constraints {redundant:?} are redundant"))
-    } else if residual > 1e-6 {
+    } else if residual > SATISFIED_TOL {
         (SolveStatus::Failed, format!("the constraints cannot be satisfied (residual {residual:.3e})"))
     } else if dof == 0 {
         (SolveStatus::FullyDefined, "fully defined".into())

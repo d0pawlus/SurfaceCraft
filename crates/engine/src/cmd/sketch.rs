@@ -44,15 +44,21 @@ fn out(s: &Session, id: ObjectId, failed: usize) -> CmdResult<SketchOut> {
     })
 }
 
-/// Solves a sketch, stores the report and replays the history that depends on it.
-pub(crate) fn resolve(s: &mut Session, id: ObjectId) -> CmdResult<SketchOut> {
+/// Stores a solved sketch and its report, and replays the history that depends on it.
+fn commit_solved(s: &mut Session, id: ObjectId, sk: Sketch, rep: SolveReport) -> CmdResult<SketchOut> {
     let o = s.doc.sketch_mut(id).ok_or_else(|| CmdError::Params(format!("no sketch {id}")))?;
-    let mut sk = o.sketch.clone();
-    let rep = solve(&mut sk).map_err(|e| CmdError::Params(e.to_string()))?;
     o.sketch = sk;
     o.report = Some(rep);
     let failed = crate::replay::replay(s);
     out(s, id, failed)
+}
+
+/// Solves a sketch, stores the report and replays the history that depends on it.
+pub(crate) fn resolve(s: &mut Session, id: ObjectId) -> CmdResult<SketchOut> {
+    let o = s.doc.sketch(id).ok_or_else(|| CmdError::Params(format!("no sketch {id}")))?;
+    let mut sk = o.sketch.clone();
+    let rep = solve(&mut sk).map_err(|e| CmdError::Params(e.to_string()))?;
+    commit_solved(s, id, sk, rep)
 }
 
 /// A plane given by origin and normal (x chosen), or origin and both axes.
@@ -277,20 +283,20 @@ pub struct MovePointIn {
 }
 
 /// Moves one point to `to` and solves: the constraints pull the rest of the sketch along, and a
-/// point the constraints fix goes back to where they put it (a drag is a soft target).
+/// point the constraints fix goes back to where they put it (a drag is a soft target). A result
+/// that leaves a constraint unsatisfied is refused before anything is committed or replayed.
 fn move_point(s: &mut Session, i: MovePointIn) -> CmdResult<SketchOut> {
     let id = i.sketch.resolve(s, ObjectKind::Sketch)?;
     if !i.to.iter().all(|v| v.is_finite()) {
         return Err(CmdError::Params("coordinates must be finite".into()));
     }
-    let o = s.doc.sketch_mut(id).ok_or_else(|| CmdError::Params(format!("no sketch {id}")))?;
-    let p = o
-        .sketch
-        .points
-        .get_mut(i.point)
-        .ok_or_else(|| CmdError::Params(format!("point {} does not exist", i.point)))?;
-    *p = i.to;
-    resolve(s, id)
+    let o = s.doc.sketch(id).ok_or_else(|| CmdError::Params(format!("no sketch {id}")))?;
+    if i.point >= o.sketch.points.len() {
+        return Err(CmdError::Params(format!("point {} does not exist", i.point)));
+    }
+    let (sk, rep) = surfacecraft_sketch::move_point(&o.sketch, i.point, i.to)
+        .map_err(|e| CmdError::Params(e.to_string()))?;
+    commit_solved(s, id, sk, rep)
 }
 
 /// One sketch.
@@ -505,7 +511,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         "Move point",
         "Sketch",
         true,
-        "Moves point `point` of `sketch` to `to` and solves: the constraints move the rest of the sketch with it, and a point they fix stays where they put it. Replays dependent features.",
+        "Moves point `point` of `sketch` to `to` and solves: the constraints move the rest of the sketch with it, and a point they fix stays where they put it. A position the constraints cannot hold (a dimensioned line collapsed to a point) gives the nearest valid sketch, or an error when none exists; the sketch is never left with an unsatisfied constraint. Replays dependent features.",
         MovePointIn,
         SketchOut,
         move_point

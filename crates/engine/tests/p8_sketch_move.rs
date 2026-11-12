@@ -104,3 +104,69 @@ fn hostile_parameters_are_errors() {
         assert!(s.execute("sketch.move_point", v.clone()).is_err(), "{v} must be refused");
     }
 }
+
+/// One line from (0, 0) to (10, 0) with its length fixed to 10.
+fn length_line(s: &mut Session) {
+    polyline(s);
+    s.execute("sketch.constrain", json!({"sketch": "pl", "constraints": [{"type": "length", "line": 0, "value": 10.0}]}))
+        .unwrap();
+}
+
+fn line_length(s: &Session) -> f64 {
+    let (a, b) = (point(s, 0), point(s, 1));
+    (a[0] - b[0]).hypot(a[1] - b[1])
+}
+
+#[test]
+fn a_move_that_collapses_a_dimensioned_line_never_commits_a_broken_sketch() {
+    let mut s = Session::new();
+    length_line(&mut s);
+    let before = s.doc.sketches[0].sketch.clone();
+    let r = s.execute("sketch.move_point", json!({"sketch": "pl", "point": 1, "to": [0.0, 0.0]}));
+    match r {
+        Err(_) => assert_eq!(s.doc.sketches[0].sketch, before, "a refused move changes nothing"),
+        Ok(v) => {
+            assert!(v["report"]["residual"].as_f64().unwrap() <= 1e-6, "{v}");
+            assert!((line_length(&s) - 10.0).abs() < 1e-9, "the length holds: {}", line_length(&s));
+        }
+    }
+}
+
+#[test]
+fn a_move_onto_the_degenerate_position_gives_the_nearest_valid_sketch() {
+    let mut s = Session::new();
+    length_line(&mut s);
+    s.execute("sketch.move_point", json!({"sketch": "pl", "point": 1, "to": [0.0, 0.0]})).unwrap();
+    assert!((line_length(&s) - 10.0).abs() < 1e-9, "the length holds: {}", line_length(&s));
+    let p = point(&s, 1);
+    assert!(p[0].hypot(p[1]) < 3.0 || (point(&s, 0)[0] - p[0]).hypot(point(&s, 0)[1] - p[1]) > 9.0, "{p:?}");
+}
+
+#[test]
+fn contradicting_dimensions_refuse_the_move_and_leave_the_document_alone() {
+    let mut s = Session::new();
+    length_line(&mut s);
+    // a second length on the same line that contradicts the first cannot be met
+    let added = s.execute(
+        "sketch.constrain",
+        json!({"sketch": "pl", "constraints": [{"type": "length", "line": 0, "value": 12.0}]}),
+    );
+    assert!(added.is_ok(), "{added:?}");
+    let before = s.doc.sketches[0].sketch.clone();
+    let r = s.execute("sketch.move_point", json!({"sketch": "pl", "point": 2, "to": [11.0, 6.0]}));
+    assert!(r.is_err(), "an unsatisfied sketch is never committed: {r:?}");
+    assert_eq!(s.doc.sketches[0].sketch, before);
+}
+
+#[test]
+fn redundant_but_satisfied_constraints_still_allow_a_move() {
+    let mut s = Session::new();
+    length_line(&mut s);
+    s.execute(
+        "sketch.constrain",
+        json!({"sketch": "pl", "constraints": [{"type": "length", "line": 0, "value": 10.0}]}),
+    )
+    .unwrap();
+    s.execute("sketch.move_point", json!({"sketch": "pl", "point": 2, "to": [12.0, 7.0]})).unwrap();
+    assert!((line_length(&s) - 10.0).abs() < 1e-9);
+}
