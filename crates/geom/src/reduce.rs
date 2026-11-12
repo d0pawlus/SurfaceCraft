@@ -71,6 +71,9 @@ pub struct ToleranceReport {
     pub iterations: usize,
     /// Did the result meet the share and the hard cap? `false` when the rounds ran out.
     pub met: bool,
+    /// Collapses refused in the last round because they would have turned a triangle against the
+    /// surface it came from (attempts; see [`crate::edit::DecimateReport`]).
+    pub turns_refused: usize,
 }
 
 struct Measured {
@@ -178,7 +181,7 @@ pub fn reduce_to_tolerance_scaled(
     for round in 1..=rounds {
         let mut cand = orig.clone();
         let mut working = budget.clone();
-        decimate_guarded(&mut cand, opts, Some(Guard { bvh: &bvh_orig, budget: &mut working }));
+        let decimated = decimate_guarded(&mut cand, opts, Some(Guard { bvh: &bvh_orig, budget: &mut working }));
         let m = measure(&orig, &used, &bvh_orig, &cand);
         let forward = stats(&m.forward, tol.tolerance);
         let backward = stats(&m.backward, tol.tolerance);
@@ -194,6 +197,7 @@ pub fn reduce_to_tolerance_scaled(
             reduced_to_original: backward,
             iterations: round,
             met,
+            turns_refused: decimated.turns_refused,
         };
         *mesh = cand;
         if met || round == rounds {
@@ -451,5 +455,18 @@ mod tests {
         assert!(r1.met, "{r1:?}");
         assert_eq!(r1, r8);
         assert_eq!(m1, m8);
+    }
+
+    /// The report carries what the orientation guard refused, so a caller can see why a reduction
+    /// of a thin wall stops where it does.
+    #[test]
+    fn the_report_counts_the_collapses_refused_to_keep_a_thin_plate_unfolded() {
+        let mut plate = synth::rounded_cuboid(Point3::origin(), Vec3::new(40.0, 40.0, 1.0), 0.4, 30);
+        synth::add_noise(&mut plate, 0.05, &mut Rng::new(3));
+        let report = reduce_to_tolerance(&mut plate, &DecimateOptions::default(), &ToleranceOptions::new(1.6)).unwrap();
+        assert!(report.turns_refused > 0, "{report:?}");
+        let mut ball = synth::sphere(Point3::origin(), 5.0, 32, 16);
+        let smooth = reduce_to_tolerance(&mut ball, &DecimateOptions::default(), &ToleranceOptions::new(0.05)).unwrap();
+        assert_eq!(smooth.turns_refused, 0, "{smooth:?}");
     }
 }
