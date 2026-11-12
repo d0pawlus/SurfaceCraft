@@ -1,16 +1,15 @@
 //! The feature history: every feature of the parametric tree with its state, suppress/restore
 //! (`feature.suppress`), the error of a failed feature, and editing its parameters through the
-//! same form as the command panel (`feature.edit`).
-//!
-//! Gap: the engine replays the whole history, there is no roll-back marker (a "replay up to
-//! here" position) to drag; suppressing a feature is the closest it offers.
+//! same form as the command panel (`feature.edit`). The roll-back marker (`feature.rollback`) sits
+//! between the active and the rolled-back features: click it to restore every feature, drag it to
+//! another position to roll the body back to that step. Rolled-back features are greyed out.
 use crate::app::SurfaceCraftApp;
 use crate::command_panel::CtxData;
 use crate::forms;
 use crate::i18n::{t, tf};
 use crate::theme::Token;
 use serde_json::{Map, Value, json};
-use surfacecraft_doc::{FeatureOp, ObjectId};
+use surfacecraft_doc::{FeatureObject, FeatureOp, ObjectId};
 
 /// State of the history panel.
 #[derive(Default)]
@@ -20,6 +19,9 @@ pub struct HistoryPanel {
     original: Map<String, Value>,
     value: Value,
     schema: Value,
+    /// Height of each feature row on the last frame, in history order (where a dragged marker
+    /// is dropped).
+    row_centres: Vec<f32>,
 }
 
 /// One feature row.
@@ -30,25 +32,35 @@ struct Row {
     suppressed: bool,
     error: Option<String>,
     base: bool,
+    rolled_back: bool,
 }
 
+/// The features in history order: the active ones, then the parked ones behind the marker.
 fn rows(app: &SurfaceCraftApp) -> Vec<Row> {
+    let active = app.session.doc.features.len();
     app.session
         .doc
         .features
         .iter()
-        .map(|f| Row {
-            id: f.id,
-            name: f.name.clone(),
-            kind: serde_json::to_value(&f.op)
-                .ok()
-                .and_then(|v| v.get("kind").and_then(Value::as_str).map(str::to_string))
-                .unwrap_or_default(),
-            suppressed: f.suppressed,
-            error: f.error.clone(),
-            base: matches!(f.op, FeatureOp::Base { .. }),
-        })
+        .chain(app.session.doc.rolled_back.iter())
+        .enumerate()
+        .map(|(k, f)| row_of(f, k >= active))
         .collect()
+}
+
+fn row_of(f: &FeatureObject, rolled_back: bool) -> Row {
+    Row {
+        id: f.id,
+        name: f.name.clone(),
+        kind: serde_json::to_value(&f.op)
+            .ok()
+            .and_then(|v| v.get("kind").and_then(Value::as_str).map(str::to_string))
+            .unwrap_or_default(),
+        suppressed: f.suppressed,
+        error: f.error.clone(),
+        base: matches!(f.op, FeatureOp::Base { .. }),
+        rolled_back,
+    }
 }
 
 /// A schema guessed from a value (features without a command of their own).
@@ -88,18 +100,46 @@ fn schema_for(kind: &str, op: &Map<String, Value>) -> Value {
     root
 }
 
+/// What the user asked for in the tree this frame.
+#[derive(Default)]
+struct Asks {
+    suppress: Option<(ObjectId, bool)>,
+    edit: Option<ObjectId>,
+    /// The `to` of a `feature.rollback`.
+    roll: Option<Value>,
+}
+
 /// Draws the feature tree above the undo list.
 pub fn feature_tree(app: &mut SurfaceCraftApp, ui: &mut egui::Ui) {
     let rows = rows(app);
     if rows.is_empty() {
         return;
     }
+    let marker = app.session.doc.features.len();
     ui.strong(tf("history.features", &[("n", &rows.len().to_string())]));
-    ui.weak(t("history.no_rollback"));
-    let mut suppress: Option<(ObjectId, bool)> = None;
-    let mut edit: Option<ObjectId> = None;
-    for r in &rows {
-        ui.push_id(r.id.0, |ui| {
+    let mut asks = Asks::default();
+    let mut centres = Vec::with_capacity(rows.len());
+    for (k, r) in rows.iter().enumerate() {
+        if k == marker {
+            marker_line(app, ui, &mut asks, rows.len());
+        }
+        let centre = ui.push_id(r.id.0, |ui| feature_row(app, ui, r, &mut asks)).inner;
+        centres.push(centre);
+    }
+    if marker == rows.len() {
+        marker_line(app, ui, &mut asks, rows.len());
+    }
+    app.hist_panel.row_centres = centres;
+    run_asks(app, asks);
+    edit_form(app, ui);
+    ui.separator();
+}
+
+/// One feature: its checkbox, its edit and roll-back buttons and its error. Returns the height
+/// of its centre.
+fn feature_row(app: &SurfaceCraftApp, ui: &mut egui::Ui, r: &Row, asks: &mut Asks) -> f32 {
+    let inner = ui.vertical(|ui| {
+        ui.add_enabled_ui(!r.rolled_back, |ui| {
             ui.horizontal(|ui| {
                 let mut active = !r.suppressed;
                 if ui
@@ -107,28 +147,63 @@ pub fn feature_tree(app: &mut SurfaceCraftApp, ui: &mut egui::Ui) {
                     .on_hover_text(t("history.suppress_hint"))
                     .changed()
                 {
-                    suppress = Some((r.id, !active));
+                    asks.suppress = Some((r.id, !active));
                 }
                 if !r.base && ui.small_button(t("history.edit")).on_hover_text(t("history.edit_hint")).clicked() {
-                    edit = Some(r.id);
+                    asks.edit = Some(r.id);
+                }
+                if !r.rolled_back
+                    && !r.base
+                    && ui.small_button(t("history.roll_here")).on_hover_text(t("history.roll_here_hint")).clicked()
+                {
+                    asks.roll = Some(json!({"feature": r.id.0}));
                 }
             });
-            if let Some(e) = &r.error {
-                ui.colored_label(
-                    app.tokens.color(Token::StatusError),
-                    tf("history.failed", &[("name", &r.name), ("error", &crate::i18n::engine_message(e))]),
-                );
-            }
         });
+        if let Some(e) = &r.error {
+            ui.colored_label(
+                app.tokens.color(Token::StatusError),
+                tf("history.failed", &[("name", &r.name), ("error", &crate::i18n::engine_message(e))]),
+            );
+        }
+    });
+    inner.response.rect.center().y
+}
+
+/// The roll-back marker between the active and the parked features. A click restores every
+/// feature; a drag drops the marker in front of the feature under the pointer.
+fn marker_line(app: &SurfaceCraftApp, ui: &mut egui::Ui, asks: &mut Asks, count: usize) {
+    let label =
+        egui::Label::new(egui::RichText::new(t("history.marker")).color(app.tokens.color(Token::AccentPrimary)))
+            .sense(egui::Sense::click_and_drag());
+    let resp = ui.add(label).on_hover_text(t("history.marker_hint"));
+    if resp.clicked() {
+        asks.roll = Some(json!("end"));
     }
-    if let Some((id, suppressed)) = suppress {
+    if resp.drag_stopped()
+        && let Some(y) = ui.ctx().input(|i| i.pointer.interact_pos()).map(|p| p.y)
+    {
+        let before = app.hist_panel.row_centres.iter().filter(|c| **c < y).count();
+        asks.roll = Some(if before >= count { json!("end") } else { json!({"index": before}) });
+    }
+}
+
+fn run_asks(app: &mut SurfaceCraftApp, asks: Asks) {
+    if let Some((id, suppressed)) = asks.suppress {
         let _ = app.run_command("feature.suppress", json!({"feature": id.0, "suppressed": suppressed}));
     }
-    if let Some(id) = edit {
+    if let Some(to) = asks.roll {
+        let _ = app.run_command("feature.rollback", json!({"to": to}));
+    }
+    if let Some(id) = asks.edit {
         begin_edit(app, id);
     }
-    edit_form(app, ui);
-    ui.separator();
+}
+
+/// Is the feature greyed out, behind the roll-back marker?
+#[must_use]
+pub fn is_rolled_back(app: &SurfaceCraftApp, id: ObjectId) -> bool {
+    app.session.doc.rolled_back.iter().any(|f| f.id == id)
 }
 
 /// Opens the parameter form of feature `id`.

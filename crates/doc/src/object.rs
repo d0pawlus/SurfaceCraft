@@ -102,17 +102,49 @@ pub struct BodyObject {
     pub name: String,
     /// Geometry.
     pub brep: Arc<Brep>,
-    /// Shown in the viewport.
+    /// The user's visibility choice (kept across replays, roll-backs and failed restorations).
     #[serde(default = "yes")]
     pub visible: bool,
+    /// Used up by a boolean as its tool: set by the replay, hides the body whatever `visible` says.
+    #[serde(default)]
+    pub consumed: bool,
 }
 
 impl BodyObject {
     fn describe(&self) -> String {
         format!("{} faces, {} edges", self.brep.faces.len(), self.brep.edges.len())
     }
+
+    /// Is the body drawn: not hidden by the user and not consumed by a boolean?
+    #[must_use]
+    pub fn shown(&self) -> bool {
+        self.visible && !self.consumed
+    }
 }
-object_common!(BodyObject, ObjectKind::Body);
+
+impl Object for BodyObject {
+    fn id(&self) -> ObjectId {
+        self.id
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn name_mut(&mut self) -> &mut String {
+        &mut self.name
+    }
+    fn visible(&self) -> bool {
+        self.shown()
+    }
+    fn visible_mut(&mut self) -> &mut bool {
+        &mut self.visible
+    }
+    fn kind(&self) -> ObjectKind {
+        ObjectKind::Body
+    }
+    fn detail(&self) -> String {
+        self.describe()
+    }
+}
 
 /// A persistent region: triangles of one mesh, optionally classified by a fitted primitive.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -367,6 +399,15 @@ pub struct Document {
     /// Features, in history order.
     #[serde(default)]
     pub features: Vec<crate::feature::FeatureObject>,
+    /// Features after the roll-back marker, parked in history order: not replayed, empty when the
+    /// marker is at the end. Projects saved before the marker existed load with none.
+    #[serde(default)]
+    pub rolled_back: Vec<crate::feature::FeatureObject>,
+    /// Bodies of the history that have no geometry at the moment (written only by parked features,
+    /// or by features that fail to replay): not in the model, but their id, name and visibility are
+    /// kept, their name stays reserved, and the replay brings them back when geometry returns.
+    #[serde(default)]
+    pub dormant_bodies: Vec<BodyObject>,
     /// Next free id.
     #[serde(default)]
     pub next_id: u64,
@@ -453,7 +494,7 @@ impl Document {
 
     /// Reserves a fresh id.
     pub fn fresh_id(&mut self) -> ObjectId {
-        self.next_id += 1;
+        self.next_id = self.next_id.saturating_add(1);
         ObjectId(self.next_id)
     }
 
@@ -467,10 +508,21 @@ impl Document {
         (2..).map(|i| format!("{base} {i}")).find(|n| !self.name_taken(n)).unwrap_or_else(|| base.to_string())
     }
 
+    /// Every object id in use: the active stores, the parked features and the dormant bodies.
+    #[must_use]
+    pub fn all_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = Vec::new();
+        stores!(self, s => ids.extend(s.iter().map(|o| o.id().0)));
+        ids.extend(self.rolled_back.iter().map(|f| f.id.0));
+        ids.extend(self.dormant_bodies.iter().map(|b| b.id.0));
+        ids
+    }
+
     fn name_taken(&self, n: &str) -> bool {
         let mut taken = false;
         stores!(self, s => taken |= s.iter().any(|o| o.name() == n));
-        taken
+        // parked features and bodies are inactive but keep their names
+        taken || self.rolled_back.iter().any(|f| f.name == n) || self.dormant_bodies.iter().any(|b| b.name == n)
     }
 
     /// Adds a mesh and returns its id.
@@ -485,7 +537,7 @@ impl Document {
     pub fn add_body(&mut self, name: &str, brep: Brep) -> ObjectId {
         let id = self.fresh_id();
         let name = self.unique_name(name);
-        self.bodies.push(BodyObject { id, name, brep: Arc::new(brep), visible: true });
+        self.bodies.push(BodyObject { id, name, brep: Arc::new(brep), visible: true, consumed: false });
         id
     }
 
@@ -677,6 +729,7 @@ impl Document {
     pub fn remove(&mut self, id: ObjectId) -> bool {
         let before = self.summaries().len();
         stores!(mut self, s => s.retain(|o| o.id() != id));
+        self.dormant_bodies.retain(|b| b.id != id);
         self.regions.retain(|r| r.mesh != id);
         self.quads.retain(|q| q.mesh != id);
         for p in &mut self.primitives {
@@ -763,7 +816,7 @@ impl Document {
         for p in self.primitives.iter().filter(|p| p.visible) {
             add(p.patch.bbox());
         }
-        for body in self.bodies.iter().filter(|b| b.visible) {
+        for body in self.bodies.iter().filter(|b| b.shown()) {
             add(Aabb::from_points(&body.brep.vertices.iter().map(|v| Point3::from(v.point)).collect::<Vec<_>>()));
         }
         b
