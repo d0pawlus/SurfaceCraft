@@ -47,7 +47,8 @@ tool `align_icp`), or call `execute` with `command` and `params`.
   - `mode`: `largest_face` (default) puts that face exactly on z = 0; `all_faces` rotates the
     frame by the area-weighted least-squares compromise over all faces within 10 degrees of an
     axis, so a part whose top is 1 degree off its base is tilted by a fraction of that degree
-    instead of keeping the base exactly flat. The base centre stays on z = 0.
+    instead of keeping the base exactly flat. The base centre stays on z = 0. `mode` has no effect
+    on a turned part, whose axis comes from its end face.
   - The result carries the 4x4 `matrix`, `angle_degrees` and `translation_mm` (how far it moves
     the part), `method` (`planar_face`, `open_rim`, `turned` or `principal_fallback`), the `base`
     face (area, share of the surface, normal, centre, whether it is a rim, `overhang`), `axis`

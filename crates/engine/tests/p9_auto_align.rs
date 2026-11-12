@@ -526,6 +526,7 @@ fn gate_p9_scale_from_length_restores_size() {
 fn p9_scale_from_length_rejects_hostile_input() {
     let mut s = Session::new();
     s.doc.add_mesh("scan", synth::bracket());
+    let before = mesh_hash(&s, "scan");
     let ok = json!({"object": "scan", "from": [0, 0, 0], "to": [10, 0, 0], "length": 20.0});
     let mut bad = |patch: Value| {
         let mut p = ok.clone();
@@ -544,7 +545,6 @@ fn p9_scale_from_length_rejects_hostile_input() {
     bad(json!({"from": [0, 0]}));
     bad(json!({"origin": [0.0, 0.0, f64::INFINITY]}));
     bad(json!({"object": "nothing"}));
-    let before = mesh_hash(&s, "scan");
     assert_eq!(mesh_hash(&s, "scan"), before, "a rejected scale leaves the mesh alone");
     // the legal call works and is one undo step
     let out = s.execute("mesh.scale_from_length", ok).unwrap();
