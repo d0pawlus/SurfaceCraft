@@ -225,11 +225,15 @@ pub fn reduce_to_tolerance_scaled(
 
 /// Detail levels after one more stage: `levels[v] + 1` (at most `max_level`) for every seed vertex
 /// and its neighbours up to `depth` rings away, the others unchanged. A vertex index outside the
-/// mesh is ignored; `levels` shorter than the mesh counts as zeros.
+/// mesh is ignored; `levels` shorter than the mesh counts as zeros. A mesh whose triangles name
+/// vertices it does not have gets its levels back unchanged.
 #[must_use]
 pub fn raise_levels(mesh: &Mesh, seeds: &[u32], levels: &[u8], depth: usize, max_level: u8) -> Vec<u8> {
     let nv = mesh.positions.len();
     let mut out: Vec<u8> = (0..nv).map(|v| levels.get(v).copied().unwrap_or(0)).collect();
+    if mesh.triangles.iter().flatten().any(|&v| v as usize >= nv) {
+        return out;
+    }
     let rings = vertex_rings(mesh);
     let mut reached = vec![false; nv];
     let mut frontier: Vec<u32> = Vec::new();
@@ -405,6 +409,8 @@ mod tests {
         assert!(touched > 1 && touched < m.positions.len());
         let twice = raise_levels(&m, &[0], &raise_levels(&m, &[0], &up, 1, 2), 1, 2);
         assert_eq!(twice[0], 2);
+        let broken = Mesh { positions: vec![Point3::origin()], triangles: vec![[0, 1, 2]] };
+        assert_eq!(raise_levels(&broken, &[0], &[3], 2, 4), vec![3]);
     }
 
     #[test]
