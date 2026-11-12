@@ -14,8 +14,9 @@ use std::path::Path;
 use std::process::Command;
 
 /// The nightly of the threaded build (with the `rust-src` component). `cargo xtask web-toolchain`
-/// prints it for the deploy workflow, so the pin lives here only.
-pub(crate) const NIGHTLY: &str = "nightly-2026-11-01";
+/// prints it for the workflows, so the pin lives here only. It is a nightly of the 1.99 cycle:
+/// the compiler generation of the stable toolchain the rest of the workspace builds with.
+pub(crate) const NIGHTLY: &str = "nightly-2026-08-01";
 
 /// The page's stack (solidcore needs 8 MiB) and the browser backend of getrandom: what
 /// `.cargo/config.toml` sets for wasm, repeated because RUSTFLAGS replaces that entry.
