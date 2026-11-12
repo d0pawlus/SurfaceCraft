@@ -367,6 +367,10 @@ pub struct Document {
     /// Features, in history order.
     #[serde(default)]
     pub features: Vec<crate::feature::FeatureObject>,
+    /// Features after the roll-back marker, parked in history order: not replayed, empty when the
+    /// marker is at the end. Projects saved before the marker existed load with none.
+    #[serde(default)]
+    pub rolled_back: Vec<crate::feature::FeatureObject>,
     /// Next free id.
     #[serde(default)]
     pub next_id: u64,

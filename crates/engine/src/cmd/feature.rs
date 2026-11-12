@@ -4,7 +4,9 @@ use crate::{Session, command};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use surfacecraft_doc::{BoolOp, FeatureOp, Mode, ObjectId, ObjectKind, Side};
+use surfacecraft_doc::{BoolOp, FeatureObject, FeatureOp, Mode, ObjectId, ObjectKind, Side};
+
+mod rollback;
 use surfacecraft_geom::{Point3, Vec3};
 
 /// Result of a feature command.
@@ -355,49 +357,68 @@ pub struct TreeNode {
     pub suppressed: bool,
     /// Error of the last replay.
     pub error: Option<String>,
+    /// Behind the roll-back marker: not replayed.
+    #[serde(default)]
+    pub rolled_back: bool,
 }
 
 /// The history.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct TreeOut {
-    /// Features in order.
+    /// Features in order, rolled-back ones last (see [`TreeNode::rolled_back`]).
     pub features: Vec<TreeNode>,
     /// Features that failed.
     pub failed_features: usize,
+    /// Roll-back marker: the number of active features (equal to the feature count at the end).
+    #[serde(default)]
+    pub marker: usize,
+}
+
+/// The features that feature `f` depends on, among `earlier` (in history order).
+fn dependencies(s: &Session, earlier: &[&FeatureObject], f: &FeatureObject) -> (Vec<ObjectId>, Option<ObjectId>) {
+    let mut deps = Vec::new();
+    let mut sketch = None;
+    for input in f.op.inputs() {
+        if s.doc.kind_of(input) == Some(ObjectKind::Sketch) {
+            sketch = Some(input);
+        }
+        // the last earlier feature writing that body
+        if let Some(w) = earlier.iter().rev().find(|g| g.body == input) {
+            deps.push(w.id);
+        }
+    }
+    // a feature also follows the previous writer of its own body
+    if let Some(w) = earlier.iter().rev().find(|g| g.body == f.body)
+        && !deps.contains(&w.id)
+    {
+        deps.push(w.id);
+    }
+    (deps, sketch)
 }
 
 fn tree_of(s: &Session, failed: usize) -> TreeOut {
-    let mut nodes = Vec::new();
-    for (k, f) in s.doc.features.iter().enumerate() {
-        let mut deps = Vec::new();
-        let mut sketch = None;
-        for input in f.op.inputs() {
-            if s.doc.kind_of(input) == Some(ObjectKind::Sketch) {
-                sketch = Some(input);
+    let all: Vec<&FeatureObject> = s.doc.features.iter().chain(s.doc.rolled_back.iter()).collect();
+    let marker = s.doc.features.len();
+    let nodes = all
+        .iter()
+        .enumerate()
+        .map(|(k, f)| {
+            let earlier = all.get(..k).unwrap_or_default();
+            let (depends_on, sketch) = dependencies(s, earlier, f);
+            TreeNode {
+                id: f.id,
+                name: f.name.clone(),
+                op: f.op.label().into(),
+                body: f.body,
+                depends_on,
+                sketch,
+                suppressed: f.suppressed,
+                error: f.error.clone(),
+                rolled_back: k >= marker,
             }
-            // the last earlier feature writing that body
-            if let Some(w) = s.doc.features.iter().take(k).rev().find(|g| g.body == input) {
-                deps.push(w.id);
-            }
-        }
-        // a feature also follows the previous writer of its own body
-        if let Some(w) = s.doc.features.iter().take(k).rev().find(|g| g.body == f.body)
-            && !deps.contains(&w.id)
-        {
-            deps.push(w.id);
-        }
-        nodes.push(TreeNode {
-            id: f.id,
-            name: f.name.clone(),
-            op: f.op.label().into(),
-            body: f.body,
-            depends_on: deps,
-            sketch,
-            suppressed: f.suppressed,
-            error: f.error.clone(),
-        });
-    }
-    TreeOut { features: nodes, failed_features: failed }
+        })
+        .collect();
+    TreeOut { features: nodes, failed_features: failed, marker }
 }
 
 fn tree(s: &mut Session, _: super::NoParams) -> CmdResult<TreeOut> {
@@ -910,6 +931,16 @@ pub static COMMANDS: &[CommandSpec] = &[
         SuggestDraftIn,
         SuggestDraftOut,
         suggest_draft
+    ),
+    command!(
+        "feature.rollback",
+        "Roll back",
+        "Feature",
+        true,
+        "Moves the roll-back marker of the history to `to` (`\"end\"`, `{\"index\": n}` or `{\"feature\": ref}`): the features from there on are parked and not replayed, so the bodies are as they were at that step; features added now go before the parked ones; `end` restores every feature. Reports the marker and each feature's `rolled_back`.",
+        rollback::RollbackIn,
+        TreeOut,
+        rollback::rollback
     ),
     command!(
         "feature.extrude",
