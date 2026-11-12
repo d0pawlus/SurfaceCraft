@@ -118,8 +118,16 @@ fn jacobian(s: &Sketch, l: &Layout, x: &[f64], m: usize) -> DMatrix<f64> {
     j
 }
 
+/// Largest absolute value; infinite when any value is not finite (`f64::max` would drop a NaN).
 fn max_abs(v: &[f64]) -> f64 {
+    if v.iter().any(|x| !x.is_finite()) {
+        return f64::INFINITY;
+    }
     v.iter().fold(0.0f64, |m, x| m.max(x.abs()))
+}
+
+fn overflow() -> SketchError {
+    SketchError::Value("a constraint overflows: the sketch coordinates are too large to solve".into())
 }
 
 /// Solves the sketch in place and reports its state.
@@ -128,6 +136,9 @@ pub fn solve(s: &mut Sketch) -> Result<SolveReport, SketchError> {
     let l = Layout::of(s);
     let mut x = unknowns(s, &l);
     let (mut f, _) = residuals(s, &l, &x);
+    if !f.iter().all(|v| v.is_finite()) {
+        return Err(overflow());
+    }
     let m = f.len();
     let mut cost: f64 = f.iter().map(|v| v * v).sum();
     let mut lambda = 1e-6;
@@ -166,6 +177,9 @@ pub fn solve(s: &mut Sketch) -> Result<SolveReport, SketchError> {
         }
     }
     let residual = max_abs(&f);
+    if !residual.is_finite() || !x.iter().all(|v| v.is_finite()) {
+        return Err(overflow());
+    }
     write_back(s, &l, &x);
     // rank analysis: rows in order, a constraint is redundant when its rows add no rank
     let (f2, ranges) = residuals(s, &l, &x);

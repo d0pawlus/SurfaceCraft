@@ -927,14 +927,19 @@ fn a_drag_onto_a_collapsed_dimensioned_line_keeps_the_last_valid_preview() {
     e.drag_update([4.0, 3.0]);
     let valid = e.drag.as_ref().expect("drag").preview.clone();
     e.drag_update([0.0, 0.0]);
-    let d = e.drag.as_ref().expect("drag");
-    let (a, b) = (d.preview.points[0], d.preview.points[1]);
+    let preview = e.drag.as_ref().expect("drag").preview.clone();
+    let (a, b) = (preview.points[0], preview.points[1]);
     assert!(((a[0] - b[0]).hypot(a[1] - b[1]) - 10.0).abs() < 1e-9, "the preview keeps the length");
+    assert_ne!(preview, valid, "the preview moved on from the earlier valid state toward (0, 0)");
     let cmds = e.drag_end();
-    assert!(cmds.len() <= 1);
-    assert!(valid.points.len() == 2);
+    assert_eq!(cmds.len(), 1, "the release commits the preview");
+    // executing the release command on the same sketch reproduces the preview exactly
+    let mut session = Session::new();
+    let id = session.doc.add_sketch("s", sk);
+    assert_eq!(id, ObjectId(1));
+    session.execute(cmds[0].id, cmds[0].params.clone()).expect("the committed move");
+    assert_eq!(session.doc.sketch(id).expect("sketch").sketch.points, preview.points);
 }
-
 #[test]
 fn drag_press_picks_the_point_under_the_press_not_under_the_pointer() {
     let sk = polyline();

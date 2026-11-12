@@ -139,10 +139,96 @@ fn a_move_that_collapses_a_dimensioned_line_never_commits_a_broken_sketch() {
 fn a_move_onto_the_degenerate_position_gives_the_nearest_valid_sketch() {
     let mut s = Session::new();
     length_line(&mut s);
-    s.execute("sketch.move_point", json!({"sketch": "pl", "point": 1, "to": [0.0, 0.0]})).unwrap();
+    let r = s.execute("sketch.move_point", json!({"sketch": "pl", "point": 1, "to": [0.0, 0.0]})).unwrap();
     assert!((line_length(&s) - 10.0).abs() < 1e-9, "the length holds: {}", line_length(&s));
+    assert_eq!(r["moved"]["reached"], false, "the collapse was not reachable: {r}");
     let p = point(&s, 1);
-    assert!(p[0].hypot(p[1]) < 3.0 || (point(&s, 0)[0] - p[0]).hypot(point(&s, 0)[1] - p[1]) > 9.0, "{p:?}");
+    assert_eq!(json!(p), r["moved"]["position"], "the reported position is the document's point");
+    // nearest valid: the point went toward the target along the segment (it stays on the x axis)
+    // and ended closer to the target than where it started (distance 10)
+    assert!(p[1].abs() < 1e-9, "{p:?}");
+    let left = r["moved"]["remaining"].as_f64().unwrap();
+    assert!(left < 10.0 - 1.0 && left > 0.0, "closer to the target than the start: {left}");
+    assert!((left - p[0].hypot(p[1])).abs() < 1e-9, "remaining is the distance to the target (0, 0)");
+}
+
+#[test]
+fn a_full_move_reports_reached_and_a_blocked_move_reports_the_achieved_position() {
+    let mut s = Session::new();
+    polyline(&mut s);
+    let r = s.execute("sketch.move_point", json!({"sketch": "pl", "point": 2, "to": [12.0, 7.0]})).unwrap();
+    assert_eq!(r["moved"]["reached"], true, "{r}");
+    assert_eq!(r["moved"]["position"], json!(point(&s, 2)));
+    assert!(r["moved"]["remaining"].as_f64().unwrap() < 1e-6);
+    let mut blocked = Session::new();
+    polyline(&mut blocked);
+    blocked
+        .execute(
+            "sketch.constrain",
+            json!({"sketch": "pl", "constraints": [{"type": "fix", "point": 2, "at": [10.0, 5.0]}]}),
+        )
+        .unwrap();
+    let r = blocked.execute("sketch.move_point", json!({"sketch": "pl", "point": 2, "to": [14.0, 9.0]})).unwrap();
+    assert_eq!(r["moved"]["reached"], false, "a fixed point stays: {r}");
+    assert_eq!(r["moved"]["position"], json!(point(&blocked, 2)));
+    assert!((r["moved"]["remaining"].as_f64().unwrap() - 32.0_f64.sqrt()).abs() < 1e-6);
+}
+
+#[test]
+fn a_sketch_that_is_already_unsatisfied_refuses_the_move_and_says_what_to_do() {
+    let mut s = Session::new();
+    length_line(&mut s);
+    s.execute(
+        "sketch.constrain",
+        json!({"sketch": "pl", "constraints": [{"type": "length", "line": 0, "value": 12.0}]}),
+    )
+    .unwrap();
+    let err = s.execute("sketch.move_point", json!({"sketch": "pl", "point": 2, "to": [11.0, 6.0]})).unwrap_err();
+    assert!(err.to_string().contains("edit or remove the conflicting constraint"), "{err}");
+}
+
+/// Two lines with huge coordinates, line 0 from (0, 0) to (1e200, 0) and line 1 from (5, 5) to
+/// (5, 1e200), made perpendicular: the dot product of their directions is exactly 0.
+fn huge_perpendicular(s: &mut Session) {
+    s.execute(
+        "sketch.create",
+        json!({"name": "huge", "plane": {"origin": [0.0, 0.0, 0.0], "x": [1.0, 0.0, 0.0], "y": [0.0, 1.0, 0.0]}}),
+    )
+    .unwrap();
+    s.execute(
+        "sketch.add",
+        json!({"sketch": "huge", "entities": [{"line": {"from": [0.0, 0.0], "to": [1e200, 0.0]}}, {"line": {"from": [5.0, 5.0], "to": [5.0, 1e200]}}]}),
+    )
+    .unwrap();
+    s.execute(
+        "sketch.constrain",
+        json!({"sketch": "huge", "constraints": [{"type": "perpendicular", "a": 0, "b": 1}]}),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_move_whose_residual_overflows_is_refused_and_leaves_the_document_alone() {
+    let mut s = Session::new();
+    huge_perpendicular(&mut s);
+    let before = s.doc.sketches[0].sketch.clone();
+    // the first line now points along (1e200, 1e200): the dot product is inf / inf
+    let r = s.execute("sketch.move_point", json!({"sketch": "huge", "point": 1, "to": [1e200, 1e200]}));
+    assert!(r.is_err(), "a NaN residual is never accepted as satisfied: {r:?}");
+    assert_eq!(s.doc.sketches[0].sketch, before);
+}
+
+#[test]
+fn a_solve_with_an_overflowing_constraint_is_an_error() {
+    use surfacecraft_sketch::{Constraint, Sketch};
+    let mut sk = Sketch::default();
+    sk.add_line([0.0, 0.0], [1e200, 1e200]);
+    sk.add_line([5.0, 5.0], [5.0, 1e200]);
+    sk.constraints.push(Constraint::Perpendicular { a: 0, b: 1 });
+    let mut s = Session::new();
+    s.doc.add_sketch("overflow", sk);
+    let r = s.execute("sketch.solve", json!({"sketch": "overflow"}));
+    assert!(r.is_err(), "{r:?}");
 }
 
 #[test]

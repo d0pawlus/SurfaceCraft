@@ -34,7 +34,7 @@ pub struct Drag {
 /// when the point does not exist or the constraints cannot be satisfied.
 #[must_use]
 pub fn moved(sk: &Sketch, point: usize, to: [f64; 2]) -> Option<Sketch> {
-    move_point(sk, point, to).ok().map(|(next, _)| next)
+    move_point(sk, point, to).ok().map(|m| m.sketch)
 }
 
 /// Did any point end up somewhere else?

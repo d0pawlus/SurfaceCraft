@@ -62,13 +62,14 @@ fn orphan_bodies(active: &[FeatureObject], parked: &[FeatureObject]) -> Vec<Obje
     parked.iter().map(|f| f.body).filter(|body| !active.iter().any(|f| f.body == *body)).collect()
 }
 
-/// Moves the bodies written only by parked features out of the model (with their name and flags,
-/// into `Document::rolled_back_bodies`) and brings back the ones the active features write again.
+/// Moves the bodies written only by parked features out of the model into
+/// `Document::dormant_bodies` (with id, name and visibility); the replay brings them back.
 fn park_bodies(s: &mut Session, orphans: &[ObjectId]) {
-    let all: Vec<_> = s.doc.bodies.drain(..).chain(s.doc.rolled_back_bodies.drain(..)).collect();
+    let all: Vec<_> = s.doc.bodies.drain(..).collect();
     let (parked, live): (Vec<_>, Vec<_>) = all.into_iter().partition(|b| orphans.contains(&b.id));
     s.doc.bodies = live;
-    s.doc.rolled_back_bodies = parked;
+    s.doc.dormant_bodies.retain(|d| !parked.iter().any(|p| p.id == d.id));
+    s.doc.dormant_bodies.extend(parked);
 }
 
 /// Moves the marker and replays the active part.

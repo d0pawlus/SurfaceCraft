@@ -199,6 +199,59 @@ fn rolling_forward_restores_the_body_with_its_name_and_id() {
     s.execute("feature.rollback", json!({"to": "end"})).unwrap();
     assert_eq!(body_named(&s, "block"), Some(id), "same id, same name");
     assert!((block_volume(&s) - BLOCK_CUT).abs() / BLOCK_CUT < 1e-6);
+    let body = s.doc.body(id).expect("body");
+    assert!(!body.visible && !body.shown(), "the user's choice to hide the body survives the round trip");
+}
+
+#[test]
+fn a_hidden_body_stays_hidden_after_editing_an_unrelated_feature() {
+    let mut s = Session::new();
+    extrude_and_cut(&mut s);
+    extrude_square(&mut s, "other");
+    let other = body_named(&s, "other").expect("other");
+    s.doc.set_visible(other, false);
+    s.execute("feature.edit", json!({"feature": "extrude", "set": {"distance": 12.0}})).unwrap();
+    assert!(!s.doc.body(other).expect("other").shown(), "a replay does not unhide it");
+    assert!(s.doc.body(body_named(&s, "block").expect("block")).expect("block").shown());
+}
+
+#[test]
+fn a_failed_roll_forward_keeps_the_body_identity_for_the_repair() {
+    let mut s = Session::new();
+    s.execute(
+        "sketch.create",
+        json!({"name": "base", "plane": {"origin": [0.0, 0.0, 0.0], "x": [1.0, 0.0, 0.0], "y": [0.0, 1.0, 0.0]}}),
+    )
+    .unwrap();
+    s.execute(
+        "sketch.add",
+        json!({"sketch": "base", "entities": [{"polygon": {"points": [[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]]}}]}),
+    )
+    .unwrap();
+    let ext = s.execute("feature.extrude", json!({"sketch": "base", "distance": 2.0, "name": "block"})).unwrap();
+    let (feature, id) = (id_of(&ext), body_named(&s, "block").expect("block"));
+    s.doc.set_visible(id, false);
+    s.execute("feature.rollback", json!({"to": {"index": 0}})).unwrap();
+    s.execute("doc.delete", json!({"object": "base"})).unwrap();
+    let tree = s.execute("feature.rollback", json!({"to": "end"})).unwrap();
+    assert_eq!(tree["failed_features"], 1, "the extrusion lost its sketch: {tree}");
+    assert!(body_named(&s, "block").is_none(), "no geometry, so not in the model");
+    assert_ne!(s.doc.unique_name("block"), "block", "the name stays reserved");
+    // repair: a new sketch for the same feature
+    s.execute(
+        "sketch.create",
+        json!({"name": "fixed", "plane": {"origin": [0.0, 0.0, 0.0], "x": [1.0, 0.0, 0.0], "y": [0.0, 1.0, 0.0]}}),
+    )
+    .unwrap();
+    s.execute(
+        "sketch.add",
+        json!({"sketch": "fixed", "entities": [{"polygon": {"points": [[0.0, 0.0], [3.0, 0.0], [3.0, 3.0], [0.0, 3.0]]}}]}),
+    )
+    .unwrap();
+    let sk = s.doc.sketches.iter().find(|o| o.name == "fixed").expect("sketch").id.0;
+    s.execute("feature.edit", json!({"feature": feature, "set": {"sketch": sk}})).unwrap();
+    assert_eq!(body_named(&s, "block"), Some(id), "same id and name after the repair");
+    assert!(!s.doc.body(id).expect("body").visible, "and the user's visibility");
 }
 
 #[test]
