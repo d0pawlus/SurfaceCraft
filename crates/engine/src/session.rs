@@ -80,6 +80,9 @@ pub struct Session {
     pub cancel: Cancel,
     /// Moves on with every executed command (see [`Session::epoch`]).
     epoch: u64,
+    /// Set by a command that left the document as it was (a proposal): the session then records
+    /// no undo step, so redo history and undo depth stay as they were.
+    unchanged: bool,
 }
 
 const LOG_CAP: usize = 1000;
@@ -106,10 +109,11 @@ impl Session {
     pub fn execute(&mut self, id: &str, params: Value) -> Result<Value, EngineError> {
         let spec = cmd::find(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
         let before = spec.undoable.then(|| self.doc.clone());
+        self.unchanged = false;
         let result = run_guarded(spec, self, params.clone());
         let mapped = match result {
             Ok(v) => {
-                if let Some(b) = before {
+                if let Some(b) = before.filter(|_| !self.unchanged) {
                     self.history.push(spec.id, b);
                 }
                 Ok(v)
@@ -130,6 +134,12 @@ impl Session {
         };
         self.push_log(LogEntry { command: spec.id.to_string(), params, ok: mapped.is_ok(), outcome });
         mapped
+    }
+
+    /// Called by a command that changed nothing in the document (it only proposed): the call is
+    /// logged but takes no undo step and does not clear the redo history.
+    pub fn mark_unchanged(&mut self) {
+        self.unchanged = true;
     }
 
     fn push_log(&mut self, entry: LogEntry) {
@@ -156,6 +166,7 @@ impl Session {
             maps: self.maps.clone(),
             cancel: Cancel::new(),
             epoch: self.epoch,
+            unchanged: false,
         }
     }
 
