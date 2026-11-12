@@ -78,19 +78,40 @@ patch network over a whole scan.
   `angle`, default 35 degrees) and fits one Bezier patch to every four-sided smooth region,
   bounded by the shared feature curves. `degree` (2 to 8, default 5), `min_triangles` (default
   30) and `tolerance` apply.
+- Regions with 3, 5, 6 or more corners are handled by splitting the whole network the same way:
+  every feature curve is cut at its midpoint, every region gets a centre and one curve from it
+  to each side midpoint, and a region with n corners becomes n four-sided patches (a network of
+  four-sided regions only is not split). The patches share their boundary curves, so the
+  network stays watertight. A crease of a scan that is resampled coarsely is blurred over two
+  triangles; lower `angle` (for example to 20 degrees) when creases of about 55 degrees are
+  missed.
 
 ## Quad layouts
 
 - `quad.create` with `region` or `mesh` and `target_quads` (default 64): a structured layout,
   snapped to the scan.
 - `quad.retopo` with `region` or `mesh`: a field-aligned quad-dominant layout over a closed or
-  wrapped region. `target_quads` sets its density.
+  wrapped region. `target_quads` sets its density. With `conform_boundary: true` (experimental, off by default) the layout of an open region is
+  conformed to the outline of the region: the outline is smoothed, its corners are kept, and it is
+  pushed outward just far enough to contain every vertex of the region. The layout's free
+  boundary is moved onto it, and a ring of faces closes the gap where the lattice stopped short
+  (see `outline_conformed`, `outline_loops_conformed` and `outline_ring_faces` in the result).
+  Every change is validated; if any quad of the final layout is improper (not a simple polygon of
+  positive area), the plain layout without conforming is returned and `outline_conformed` is
+  false with the reason. `quad.split` and `surface.auto` take the same parameter and then put
+  split boundary vertices back onto the outline. Every split (conforming or not) is checked on the
+  real geometry and rejected as a whole if it would break a proper quad (`split_rejected`,
+  `splits_rejected`). Quads whose patch would run
+  against the scan are turned around (`repaired_patches`); `flipped_patches` counts those that
+  could not be repaired.
 - `quad.snap` projects the cage onto the scan. `quad.split` and `quad.merge` change the density.
 - `quad.crease` marks crease lines `u_lines` and `v_lines` (their indices), so patches meet
   without smoothing there. `remove` clears them.
 - `surface.auto` with `object` (a layout) makes one patch per quad: `tolerance` (default 0.2
   mm), `name`, `make_solid` (also a solid when the network is closed, default true), and
-  `max_patches`.
+  `max_patches`. Patches that run against the scan are repaired before the network is built
+  (`repaired_patches`); if one cannot be, the command fails instead of returning a network with
+  a flipped patch.
 
 ## Trim and thicken
 

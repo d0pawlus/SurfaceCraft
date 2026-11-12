@@ -48,7 +48,7 @@ pub struct FromCurvesOut {
     pub surface: ObjectId,
     /// Smooth regions the sharp edges cut the scan into.
     pub regions: usize,
-    /// Four-sided regions turned into patches.
+    /// Patches made (one per four-sided region; with any other region every region is split, see the summary).
     pub patches: usize,
     /// Feature curves fitted (each shared by the patches on both sides).
     pub curves: usize,
@@ -104,7 +104,7 @@ fn from_curves(s: &mut Session, i: FromCurvesIn) -> CmdResult<FromCurvesOut> {
     let net = feature_network(&m, &tris, &opts).map_err(CmdError::Params)?;
     if net.nets.is_empty() {
         return Err(CmdError::Failed(format!(
-            "no four-sided smooth region found ({} regions; {}): lower `angle` or raise `min_triangles`",
+            "no smooth region with at least three corners found ({} regions; {}): lower `angle` or raise `min_triangles`",
             net.regions,
             net.skipped.first().map_or("none skipped", String::as_str)
         )));
@@ -169,7 +169,7 @@ fn from_curves(s: &mut Session, i: FromCurvesIn) -> CmdResult<FromCurvesOut> {
     let warning = if !within {
         Some(format!("max deviation {max:.4} mm exceeds {tol} mm: raise `degree` or check the edge angle"))
     } else if !net.skipped.is_empty() {
-        Some(format!("{} region(s) skipped (not four-sided)", net.skipped.len()))
+        Some(format!("{} region(s) skipped (see `skipped` for the reason)", net.skipped.len()))
     } else {
         None
     };
@@ -196,7 +196,7 @@ pub static COMMANDS: &[CommandSpec] = &[command!(
     "Patches from feature curves",
     "Freeform",
     true,
-    "Cuts `region`/`mesh` at its sharp edges (dihedral angle > `angle`) and fits one Bézier patch to every four-sided smooth region, bounded by the shared feature curves; a closed network also makes a solid.",
+    "Cuts `region`/`mesh` at its sharp edges (dihedral angle > `angle`) and fits one Bézier patch to every four-sided smooth region, bounded by the shared feature curves; when a region has 3, 5, 6 or more corners every region is split (n corners: n patches around a centre, curves cut at their midpoints) so the network stays watertight; a closed network also makes a solid.",
     FromCurvesIn,
     FromCurvesOut,
     from_curves
