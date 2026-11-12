@@ -54,6 +54,9 @@ pub struct QuadInfo {
     /// Unstructured split: quads still turned against the scan (should be 0).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub flipped_patches: Option<usize>,
+    /// Unstructured layouts: patches that could not be checked against the scan orientation (reported, not assumed fine).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unverified_patches: Option<usize>,
 }
 
 fn points_of(s: &Session, mesh: ObjectId, region: Option<ObjectId>) -> CmdResult<(Arc<Mesh>, Vec<Point3>, Vec<Vec3>)> {
@@ -122,6 +125,7 @@ fn snap(s: &mut Session, id: ObjectId) -> CmdResult<QuadInfo> {
         snap_max: max,
         repaired_patches: None,
         flipped_patches: None,
+        unverified_patches: None,
     })
 }
 
@@ -291,6 +295,7 @@ fn crease(s: &mut Session, i: CreaseIn) -> CmdResult<QuadInfo> {
         snap_max: 0.0,
         repaired_patches: None,
         flipped_patches: None,
+        unverified_patches: None,
     })
 }
 
@@ -363,6 +368,9 @@ pub struct AutoOut {
     /// Unstructured layouts: flipped patches left in the result (a network with one is an error, so 0).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub flipped_patches: Option<usize>,
+    /// Unstructured layouts: patches that could not be checked against the scan orientation (reported, not assumed fine).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unverified_patches: Option<usize>,
     /// Unstructured layouts: how many times the layout was split to reach the tolerance.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refinements: Option<usize>,
@@ -467,6 +475,7 @@ fn auto(s: &mut Session, i: AutoIn) -> CmdResult<AutoOut> {
         folded: None,
         repaired_patches: None,
         flipped_patches: None,
+        unverified_patches: None,
     })
 }
 

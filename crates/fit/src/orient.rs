@@ -20,17 +20,30 @@ use surfacecraft_geom::{KdTree, Point3, Vec3};
 /// (the mean of its layout vertex normals), so a thin wall's other face is never consulted.
 pub type NormalAt<'a> = &'a dyn Fn(&Point3, &Vec3) -> Option<Vec3>;
 
-/// Scan points looked at when choosing the reference normal.
-const REFERENCE_NEIGHBOURS: usize = 24;
+/// Scan points looked at when choosing the reference normal, widened step by step up to the last
+/// (the bounded support: a patch whose side has no sample among them is not verified).
+const REFERENCE_NEIGHBOURS: [usize; 3] = [24, 96, 384];
+/// Fewest same-side reference samples (of five) a patch needs to be judged.
+const MIN_SAMPLES: usize = 3;
 
 /// The normal (times `sign`) of the scan point nearest to `p` that faces the same side as `hint`.
 /// Points of an opposite wall, however close, have normals against `hint` and are skipped.
 #[must_use]
 pub fn same_side_normal(tree: &KdTree, normals: &[Vec3], sign: f64, p: &Point3, hint: &Vec3) -> Option<Vec3> {
-    tree.knn(p, REFERENCE_NEIGHBOURS)
-        .into_iter()
-        .filter_map(|(k, _)| normals.get(k).map(|n| n * sign))
-        .find(|n| n.dot(hint) > 0.0)
+    REFERENCE_NEIGHBOURS.iter().find_map(|&k| {
+        tree.knn(p, k).into_iter().filter_map(|(i, _)| normals.get(i).map(|n| n * sign)).find(|n| n.dot(hint) > 0.0)
+    })
+}
+
+/// What the check could say about a patch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// Verified: the patch faces the scan.
+    Sound,
+    /// Verified: the patch runs against the scan.
+    Flipped,
+    /// Not verified: too few same-side reference samples, or an undefined layout normal.
+    Unknown,
 }
 
 /// Mean of the layout normals at the corners of patch `i`.
@@ -48,6 +61,8 @@ pub struct FlipReport {
     pub repaired: usize,
     /// Patches that are still flipped.
     pub failed: usize,
+    /// Patches that could not be verified either way (never counted as fine).
+    pub unverified: usize,
 }
 
 fn point_of(net: &Net, u: f64, v: f64) -> Point3 {
@@ -55,8 +70,11 @@ fn point_of(net: &Net, u: f64, v: f64) -> Point3 {
     Point3::from(p)
 }
 
-/// Is the patch turned against the scan?
-fn is_flipped(net: &Net, hint: &Vec3, reference: NormalAt) -> bool {
+/// Is the patch turned against the scan, or can that not be said?
+fn judge(net: &Net, hint: &Vec3, reference: NormalAt) -> Verdict {
+    if hint.norm() < 1e-9 || !hint.iter().all(|x| x.is_finite()) {
+        return Verdict::Unknown;
+    }
     let (mut against, mut counted, mut centre_against) = (0usize, 0usize, false);
     for (k, &(u, v)) in SAMPLES.iter().enumerate() {
         let (Some(n), Some(r)) = (normal(net, u, v), reference(&point_of(net, u, v), hint)) else { continue };
@@ -66,18 +84,34 @@ fn is_flipped(net: &Net, hint: &Vec3, reference: NormalAt) -> bool {
             centre_against |= k == 0;
         }
     }
-    centre_against || (counted > 0 && against * 2 > counted)
+    if counted < MIN_SAMPLES {
+        Verdict::Unknown
+    } else if centre_against || against * 2 > counted {
+        Verdict::Flipped
+    } else {
+        Verdict::Sound
+    }
 }
 
-/// Indices of the flipped patches of `set`.
+/// The verdict on every patch of `set`.
+fn verdicts(set: &PatchSet, layout_normals: &[Vec3], reference: NormalAt) -> Vec<Verdict> {
+    set.nets.iter().enumerate().map(|(i, n)| judge(n, &side_hint(set, layout_normals, i), reference)).collect()
+}
+
+fn indices_of(v: &[Verdict], wanted: Verdict) -> Vec<usize> {
+    v.iter().enumerate().filter(|(_, x)| **x == wanted).map(|(i, _)| i).collect()
+}
+
+/// Indices of the patches verified to be flipped.
 #[must_use]
 pub fn flipped_patches(set: &PatchSet, layout_normals: &[Vec3], reference: NormalAt) -> Vec<usize> {
-    set.nets
-        .iter()
-        .enumerate()
-        .filter(|(i, n)| is_flipped(n, &side_hint(set, layout_normals, *i), reference))
-        .map(|(i, _)| i)
-        .collect()
+    indices_of(&verdicts(set, layout_normals, reference), Verdict::Flipped)
+}
+
+/// Indices of the patches that could not be verified.
+#[must_use]
+pub fn unverified_patches(set: &PatchSet, layout_normals: &[Vec3], reference: NormalAt) -> Vec<usize> {
+    indices_of(&verdicts(set, layout_normals, reference), Verdict::Unknown)
 }
 
 /// The patch with the interior control points of the Coons blend of its boundary curves.
@@ -138,8 +172,9 @@ fn turn_around(
 /// Detects flipped patches of `layout` and turns the quads around that cause them (the change
 /// persists in `layout`). Patches the turn does not cure are counted as failed.
 pub fn repair_orientation(layout: &mut QuadMesh, scan: &ScanSurface, radius: f64, reference: NormalAt) -> FlipReport {
-    let (_, first, left) = turn_around(layout, scan, radius, reference);
-    FlipReport { repaired: first.len().saturating_sub(left.len()), failed: left.len() }
+    let (set, first, left) = turn_around(layout, scan, radius, reference);
+    let unverified = unverified_patches(&set, &layout.normals, reference).len();
+    FlipReport { repaired: first.len().saturating_sub(left.len()), failed: left.len(), unverified }
 }
 
 /// [`repair_orientation`], then a flat interior for the patches that are still flipped. Returns
@@ -155,14 +190,15 @@ pub fn repair_patches(
     for &i in &left {
         if let Some(net) = set.nets.get(i) {
             let flat = flat_interior(net);
-            if is_flipped(&flat, &side_hint(&set, &layout.normals, i), reference) {
+            if judge(&flat, &side_hint(&set, &layout.normals, i), reference) == Verdict::Flipped {
                 failed += 1;
             } else if let Some(slot) = set.nets.get_mut(i) {
                 *slot = flat;
             }
         }
     }
-    (set, FlipReport { repaired: first.len().saturating_sub(failed), failed })
+    let unverified = unverified_patches(&set, &layout.normals, reference).len();
+    (set, FlipReport { repaired: first.len().saturating_sub(failed), failed, unverified })
 }
 
 #[cfg(test)]
@@ -209,7 +245,7 @@ mod tests {
         let set = build_patches(&layout, &scan, 3.0);
         assert_eq!(flipped_patches(&set, &layout.normals, &outward), vec![k]);
         let report = repair_orientation(&mut layout, &scan, 3.0, &outward);
-        assert_eq!(report, FlipReport { repaired: 1, failed: 0 });
+        assert_eq!(report, FlipReport { repaired: 1, ..FlipReport::default() });
         let set = build_patches(&layout, &scan, 3.0);
         assert!(flipped_patches(&set, &layout.normals, &outward).is_empty());
     }
@@ -254,6 +290,37 @@ mod tests {
         let k = layout.faces.len() / 2;
         layout.faces[k].swap(1, 3);
         let report = repair_orientation(&mut layout, &scan, 3.0, &reference);
-        assert_eq!(report, FlipReport { repaired: 1, failed: 0 });
+        assert_eq!(report, FlipReport { repaired: 1, ..FlipReport::default() });
+    }
+
+    /// Only the opposite wall (normals -z) is sampled near the patch: nothing qualifies, and that
+    /// is "not verified", never "fine".
+    #[test]
+    fn a_patch_without_same_side_samples_is_unverified_not_fine() {
+        let (mut layout, scan) = cap_layout();
+        let pts: Vec<Point3> = (0..30)
+            .flat_map(|j| (0..30).map(move |i| Point3::new(i as f64 / 3.0 - 5.0, j as f64 / 3.0 - 5.0, -0.01)))
+            .collect();
+        let normals = vec![-Vec3::z(); pts.len()];
+        let tree = KdTree::build(&pts);
+        let reference = |p: &Point3, h: &Vec3| same_side_normal(&tree, &normals, 1.0, p, h);
+        let k = layout.faces.len() / 2;
+        layout.faces[k].swap(1, 3);
+        let set = build_patches(&layout, &scan, 3.0);
+        assert!(flipped_patches(&set, &layout.normals, &reference).is_empty());
+        assert_eq!(unverified_patches(&set, &layout.normals, &reference).len(), layout.faces.len());
+        let report = repair_orientation(&mut layout, &scan, 3.0, &reference);
+        assert_eq!(report, FlipReport { unverified: 25, ..FlipReport::default() });
+    }
+
+    /// A cancelling (zero) layout normal leaves no side to compare with.
+    #[test]
+    fn a_zero_layout_normal_is_unverified() {
+        let (mut layout, scan) = cap_layout();
+        layout.normals.iter_mut().for_each(|n| *n = Vec3::zeros());
+        let set = build_patches(&layout, &scan, 3.0);
+        let reference = |_: &Point3, _: &Vec3| Some(Vec3::z());
+        assert_eq!(unverified_patches(&set, &layout.normals, &reference).len(), layout.faces.len());
+        assert!(flipped_patches(&set, &layout.normals, &reference).is_empty());
     }
 }

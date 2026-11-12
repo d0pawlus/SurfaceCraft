@@ -6,7 +6,11 @@
 //! Every boundary loop of the layout is matched to the outline loop most of its vertices are
 //! closest to, and the order is checked: the arc positions of the loop's vertices must run once
 //! around the outline in the loop's direction (a mismatch leaves the loop as it is and is
-//! reported). A boundary vertex within [`SNAP_FRACTION`] of an edge length of the outline (or
+//! reported). The loop is conformed in one transaction: a single solve gives every boundary
+//! vertex its arc (forced corners are anchors; between anchors the arcs keep the cyclic order and
+//! a minimum gap, as close to the projections as possible), the snapped vertices and the ring are
+//! built on a copy, and every face the change touches is validated; any failure rolls the loop
+//! back to the layout as it was and says why. A boundary vertex within [`SNAP_FRACTION`] of an edge length of the outline (or
 //! beyond it) moves onto it; every other one gets a partner vertex on the outline, and each
 //! boundary edge becomes a ring face `b[i+1], b[i], u[i], corners…, u[i+1]` with the outline
 //! corners between the two partners as extra vertices (so a corner makes a pentagon, not a
@@ -14,6 +18,7 @@
 use super::PolyMesh;
 use crate::boundary::{Outline, OutlineLoop};
 use std::collections::{BTreeMap, BTreeSet};
+use surfacecraft_geom::any_perpendicular;
 use surfacecraft_geom::{Point3, Vec3};
 
 /// A boundary vertex closer than this fraction of the edge length to the outline moves onto it.
@@ -26,8 +31,11 @@ const PULL_BACK_FRACTION: f64 = 0.6;
 /// The boundary vertex nearest (along the outline) to an outline corner becomes that corner when
 /// it is within this fraction of the edge length of it.
 const FORCE_CORNER_FRACTION: f64 = 0.75;
-/// Two partners closer than this fraction of the edge length are one point.
+/// Neighbouring boundary vertices keep at least this fraction of the edge length of arc between them.
 const MIN_PARTNER_GAP_FRACTION: f64 = 0.05;
+/// A boundary vertex farther than this fraction of the edge length (plus the slack) from the
+/// outline belongs to a dent of the layout and gets no partner.
+const DEEP_FRACTION: f64 = 1.0;
 /// Share of a layout loop's vertices that must be closest to one outline loop.
 const MATCH_SHARE: f64 = 0.7;
 
@@ -40,6 +48,11 @@ pub struct ConformReport {
     pub conformed: usize,
     /// Loops left alone (no matching outline loop, or the order did not match).
     pub skipped: usize,
+    /// Loops rolled back to the layout as it was (a span too short for its vertices, or an
+    /// invalid face after snapping).
+    pub rolled_back: usize,
+    /// Why the first unconformed loop was left as it is.
+    pub reason: Option<&'static str>,
     /// Boundary vertices moved onto the outline.
     pub snapped: usize,
     /// Faces added.
@@ -123,11 +136,15 @@ fn arc_positions(lp: &OutlineLoop, points: &[Point3], edge: f64) -> Option<Vec<f
     ((sum - total).abs() < 0.35 * total).then_some(unwrapped)
 }
 
-/// Vertices and faces of one conformed loop.
-struct Ring {
-    faces: Vec<Vec<u32>>,
+/// Gives the scan normal near a point on the side `hint` points to.
+pub type SideNormal<'a> = &'a dyn Fn(&Point3, &Vec3) -> Option<Vec3>;
+
+/// Everything one loop's conforming changes, built on the side.
+#[derive(Default)]
+struct Plan {
     moved: Vec<(u32, Point3)>,
     added: Vec<(Point3, Vec3)>,
+    faces: Vec<Vec<u32>>,
 }
 
 /// Partner of a boundary vertex on the outline: the vertex itself when it was snapped, else a new one.
@@ -154,83 +171,150 @@ fn forced_corners(lp: &OutlineLoop, arcs: &[f64], edge: f64) -> BTreeMap<usize, 
         if let Some((i, &a)) = best
             && gap(a) <= FORCE_CORNER_FRACTION * edge
         {
-            forced.insert(i, (ca, pt));
+            // the corner's arc on the same revolution as the vertex
+            forced.insert(i, (a + (ca - a + 0.5 * total).rem_euclid(total) - 0.5 * total, pt));
         }
     }
     forced
 }
 
-/// Snaps the boundary vertices that are close to (or beyond) the outline and creates a partner
-/// vertex on the outline for every other one.
-fn partners(
-    poly: &PolyMesh,
-    lp: &OutlineLoop,
-    ids: &[u32],
-    arcs: &[f64],
-    (edge, slack): (f64, f64),
-    normal_at: &dyn Fn(&Point3) -> Option<Vec3>,
-) -> (Vec<Partner>, Ring) {
-    let base = poly.vertices.len() as u32;
-    let mut ring = Ring { faces: Vec::new(), moved: Vec::new(), added: Vec::new() };
-    let mut out = Vec::with_capacity(ids.len());
-    let forced = forced_corners(lp, arcs, edge);
-    // a partner never lands within `min_gap` of the previous one: it slides along the outline
-    let min_gap = MIN_PARTNER_GAP_FRACTION * edge;
-    for (i, (&id, &arc)) in ids.iter().zip(arcs).enumerate() {
-        if let Some(&(ca, pt)) = forced.get(&i) {
-            ring.moved.push((id, pt));
-            out.push(Partner { id, arc: ca });
-            continue;
-        }
-        let Some(p) = poly.vertices.get(id as usize) else { continue };
-        let mut arc = arc;
-        let mut at = lp.at(arc);
-        if let (Some(prev), Some(prev_pt)) = (out.last(), out.last().and_then(|q| lp.at(q.arc)))
-            && at.is_some_and(|(o, _)| (o - prev_pt.0).norm() < min_gap)
-        {
-            arc = prev.arc + min_gap;
-            at = lp.at(arc);
-        }
-        let Some((o, dir)) = at else { continue };
-        let d = (p - o).norm();
-        let beyond = (p - o).dot(&dir) > 0.0;
-        if d < SNAP_FRACTION * edge + slack || (beyond && d < PULL_BACK_FRACTION * edge + slack) {
-            ring.moved.push((id, o));
-            out.push(Partner { id, arc });
-        } else {
-            let n = normal_at(&o).or_else(|| poly.normals.get(id as usize).copied()).unwrap_or_else(Vec3::z);
-            out.push(Partner { id: base + ring.added.len() as u32, arc });
-            ring.added.push((o, n));
-        }
+/// The arcs of every vertex of a span between the anchors `a` and `b` (exclusive), clamped to leave
+/// `gap` between neighbours and to both anchors, as close to `targets` as that allows.
+fn spread_span(targets: &[f64], (a, xa): (usize, f64), (xb, count): (f64, usize), gap: f64, total: f64) -> Vec<f64> {
+    let n = targets.len();
+    let mut out: Vec<f64> = Vec::with_capacity(count);
+    for k in 1..=count {
+        let j = (a + k) % n;
+        // targets are unwrapped from vertex 0: the vertices before the anchor are one revolution on
+        let t = targets[j] + if j < a { total } else { 0.0 };
+        let (lo, hi) = (xa + k as f64 * gap, xb - (count + 1 - k) as f64 * gap);
+        let x = t.clamp(lo, hi);
+        out.push(out.last().map_or(x, |&prev| x.max(prev + gap)));
     }
-    (out, ring)
+    out
 }
 
-/// The ring face over boundary edge `i`: `b[i+1], b[i], u[i], corners…, u[i+1]`.
-fn ring_face(
+/// One solve for all arcs of the loop: forced corners are anchors, the vertices between two
+/// anchors get arcs that keep their order and `gap` between neighbours (also to the anchors and
+/// across the closing pair). `None` when a span is too short for its vertices.
+fn solve_arcs(
     lp: &OutlineLoop,
-    corner_arcs: &[(f64, usize)],
-    (b0, b1): (u32, u32),
+    targets: &[f64],
+    forced: &BTreeMap<usize, (f64, Point3)>,
+    gap: f64,
+) -> Option<Vec<f64>> {
+    let (_, total) = lp.arc_lengths();
+    let n = targets.len();
+    let mut anchors: Vec<(usize, f64)> = forced.iter().map(|(&i, &(a, _))| (i, a)).collect();
+    if anchors.is_empty() {
+        anchors.push((0, *targets.first()?));
+    }
+    let mut arcs = vec![0.0; n];
+    for (k, &(a, xa)) in anchors.iter().enumerate() {
+        let (b, xb_raw) = anchors[(k + 1) % anchors.len()];
+        let xb = xb_raw + total * (((xa - xb_raw) / total).floor() + 1.0).max(0.0);
+        let count = if anchors.len() == 1 { n - 1 } else { (b + n - a - 1) % n };
+        if xb - xa < (count + 1) as f64 * gap {
+            return None;
+        }
+        arcs[a] = xa;
+        for (j, x) in spread_span(targets, (a, xa), (xb, count), gap, total).into_iter().enumerate() {
+            arcs[(a + 1 + j) % n] = x;
+        }
+    }
+    Some(arcs)
+}
+
+/// The plan for one loop: snaps close (or overhanging) vertices onto the outline, gives the other
+/// near vertices a partner on it, and builds the ring faces. `near` are the indices of the loop
+/// vertices within reach of the outline (`arcs` and `forced` are indexed like `near`); the deep
+/// vertices between two near ones (a dent of the layout) end up in one ring face with them.
+fn plan_loop(
+    poly: &PolyMesh,
+    lp: &OutlineLoop,
+    (ids, near): (&[u32], &[usize]),
+    (arcs, forced): (&[f64], &BTreeMap<usize, (f64, Point3)>),
+    (edge, slack): (f64, f64),
+    side_normal: SideNormal,
+) -> Plan {
+    let base = poly.vertices.len() as u32;
+    let mut plan = Plan::default();
+    let mut partners: Vec<Partner> = Vec::with_capacity(near.len());
+    for (k, (&i, &arc)) in near.iter().zip(arcs).enumerate() {
+        let id = ids[i];
+        if let Some(&(ca, pt)) = forced.get(&k) {
+            plan.moved.push((id, pt));
+            partners.push(Partner { id, arc: ca });
+            continue;
+        }
+        let (Some(p), Some((o, dir))) = (poly.vertices.get(id as usize), lp.at(arc)) else { continue };
+        let (d, beyond) = ((p - o).norm(), (p - o).dot(&dir) > 0.0);
+        if d < SNAP_FRACTION * edge + slack || (beyond && d < PULL_BACK_FRACTION * edge + slack) {
+            plan.moved.push((id, o));
+            partners.push(Partner { id, arc });
+        } else {
+            let hint = poly.normals.get(id as usize).copied().unwrap_or_else(Vec3::z);
+            partners.push(Partner { id: base + plan.added.len() as u32, arc });
+            plan.added.push((o, side_normal(&o, &hint).unwrap_or(hint)));
+        }
+    }
+    let (arc_at, total) = lp.arc_lengths();
+    let corner_arcs: Vec<(f64, usize)> = lp.corners.iter().filter_map(|&c| arc_at.get(c).map(|&a| (a, c))).collect();
+    let n = ids.len();
+    for t in 0..partners.len().min(near.len()) {
+        let (p, u) = (near[t], (t + 1) % near.len());
+        let q = near[u];
+        // b[q], the deep vertices back to b[p]
+        let mut chain = vec![ids[q]];
+        let mut k = (q + n - 1) % n;
+        while k != p {
+            chain.push(ids[k]);
+            k = (k + n - 1) % n;
+        }
+        chain.push(ids[p]);
+        let hint = poly.normals.get(ids[p] as usize).copied().unwrap_or_else(Vec3::z);
+        let ctx = RingCtx { lp, corner_arcs: &corner_arcs, total, edge, base, hint };
+        let face = ring_face(&ctx, &chain, (&partners[t], &partners[u]), &mut plan, side_normal);
+        plan.faces.extend(face);
+    }
+    plan
+}
+
+struct RingCtx<'a> {
+    lp: &'a OutlineLoop,
+    corner_arcs: &'a [(f64, usize)],
+    total: f64,
+    edge: f64,
+    base: u32,
+    hint: Vec3,
+}
+
+/// The ring face over a run of boundary vertices: `chain` (the far end back to the near end), then
+/// `u0, corners…, u1` on the outline.
+fn ring_face(
+    ctx: &RingCtx,
+    chain: &[u32],
     (p0, p1): (&Partner, &Partner),
-    ctx: (f64, f64, u32),
-    ring: &mut Ring,
-    normal_at: &dyn Fn(&Point3) -> Option<Vec3>,
+    plan: &mut Plan,
+    side_normal: SideNormal,
 ) -> Option<Vec<u32>> {
-    let (total, edge, base) = ctx;
+    let total = ctx.total;
     let s0 = p0.arc.rem_euclid(total);
     let s1 = s0 + (p1.arc - p0.arc).rem_euclid(total);
-    let mut cycle = vec![b1, b0, p0.id];
+    let mut cycle = chain.to_vec();
+    cycle.push(p0.id);
     // corners strictly inside the interval, in unwrapped arc order (the stored order is not)
-    let mut inside: Vec<(f64, usize)> = corner_arcs
+    let mut inside: Vec<(f64, usize)> = ctx
+        .corner_arcs
         .iter()
         .map(|&(arc, c)| (s0 + (arc - s0).rem_euclid(total), c))
-        .filter(|&(a, _)| a > s0 + CORNER_FRACTION * edge && a < s1 - CORNER_FRACTION * edge)
+        .filter(|&(a, _)| a > s0 + CORNER_FRACTION * ctx.edge && a < s1 - CORNER_FRACTION * ctx.edge)
         .collect();
     inside.sort_by(|a, b| a.0.total_cmp(&b.0));
     for (_, c) in inside {
-        if let (Some(&pt), Some(n)) = (lp.points.get(c), lp.outward.get(c)) {
-            cycle.push(base + ring.added.len() as u32);
-            ring.added.push((pt, normal_at(&pt).unwrap_or(*n)));
+        if let Some(&pt) = ctx.lp.points.get(c) {
+            cycle.push(ctx.base + plan.added.len() as u32);
+            plan.added.push((pt, side_normal(&pt, &ctx.hint).unwrap_or(ctx.hint)));
         }
     }
     cycle.push(p1.id);
@@ -241,33 +325,51 @@ fn ring_face(
     (cycle.len() >= 3).then_some(cycle)
 }
 
-fn build_ring(
-    poly: &PolyMesh,
-    lp: &OutlineLoop,
-    ids: &[u32],
-    arcs: &[f64],
-    (edge, slack): (f64, f64),
-    normal_at: &dyn Fn(&Point3) -> Option<Vec3>,
-) -> Ring {
-    let base = poly.vertices.len() as u32;
-    let (partner, mut ring) = partners(poly, lp, ids, arcs, (edge, slack), normal_at);
-    let (arc_at, total) = lp.arc_lengths();
-    let corner_arcs: Vec<(f64, usize)> = lp.corners.iter().filter_map(|&c| arc_at.get(c).map(|&a| (a, c))).collect();
-    let m = partner.len().min(ids.len());
-    for i in 0..m {
-        let j = (i + 1) % m;
-        let face = ring_face(
-            lp,
-            &corner_arcs,
-            (ids[i], ids[j]),
-            (&partner[i], &partner[j]),
-            (total, edge, base),
-            &mut ring,
-            normal_at,
-        );
-        ring.faces.extend(face);
+fn segments_cross(a: (f64, f64), b: (f64, f64), c: (f64, f64), d: (f64, f64)) -> bool {
+    let o = |p: (f64, f64), q: (f64, f64), r: (f64, f64)| (q.0 - p.0) * (r.1 - p.1) - (q.1 - p.1) * (r.0 - p.0);
+    o(a, b, c) * o(a, b, d) < 0.0 && o(c, d, a) * o(c, d, b) < 0.0
+}
+
+/// Is the face a proper polygon in its local surface frame (the plane of its summed vertex
+/// normals): no zero-length edge, positive area, no self-intersection?
+fn face_is_proper(pts: &[(Point3, Vec3)]) -> bool {
+    let n = pts.len();
+    let normal: Vec3 = pts.iter().map(|p| p.1).sum();
+    let Some(axis) = normal.try_normalize(1e-9) else { return false };
+    let e1 = any_perpendicular(&axis);
+    let e2 = axis.cross(&e1);
+    let flat: Vec<(f64, f64)> = pts.iter().map(|p| (p.0.coords.dot(&e1), p.0.coords.dot(&e2))).collect();
+    let area: f64 =
+        (0..n).map(|k| flat[k].0 * flat[(k + 1) % n].1 - flat[(k + 1) % n].0 * flat[k].1).sum::<f64>() / 2.0;
+    let edges_ok = (0..n).all(|k| (pts[(k + 1) % n].0 - pts[k].0).norm() > 1e-9);
+    let simple = (0..n).all(|i| {
+        (i + 2..n)
+            .filter(|&j| (j + 1) % n != i)
+            .all(|j| !segments_cross(flat[i], flat[(i + 1) % n], flat[j], flat[(j + 1) % n]))
+    });
+    area > 1e-12 && edges_ok && simple
+}
+
+/// Does every face the plan touches (old faces with a moved vertex, and the ring faces) stay proper?
+fn plan_is_valid(poly: &PolyMesh, plan: &Plan) -> bool {
+    let mut verts = poly.vertices.clone();
+    let mut normals = poly.normals.clone();
+    for &(id, p) in &plan.moved {
+        if let Some(v) = verts.get_mut(id as usize) {
+            *v = p;
+        }
     }
-    ring
+    for &(p, n) in &plan.added {
+        verts.push(p);
+        normals.push(n);
+    }
+    let moved: BTreeSet<u32> = plan.moved.iter().map(|m| m.0).collect();
+    let touched = poly.faces.iter().filter(|f| f.iter().any(|v| moved.contains(v))).chain(plan.faces.iter());
+    touched.into_iter().all(|f| {
+        let pts: Vec<(Point3, Vec3)> =
+            f.iter().filter_map(|&v| verts.get(v as usize).copied().zip(normals.get(v as usize).copied())).collect();
+        pts.len() == f.len() && pts.len() >= 3 && face_is_proper(&pts)
+    })
 }
 
 /// Moves the free-boundary vertices of `layout` that are within `max_move` of `outline` onto it
@@ -291,142 +393,68 @@ pub fn snap_to_outline(layout: &super::QuadMesh, outline: &Outline, max_move: f6
     out
 }
 
-/// Does the face have no zero-length edge and a positive area along its vertex normals?
-fn face_is_proper(poly: &PolyMesh, f: &[u32]) -> bool {
-    let pts: Vec<(Point3, Vec3)> = f
-        .iter()
-        .filter_map(|&v| poly.vertices.get(v as usize).copied().zip(poly.normals.get(v as usize).copied()))
+/// The plan of one loop, or why it cannot be conformed.
+fn try_loop(
+    poly: &PolyMesh,
+    lp: &OutlineLoop,
+    ids: &[u32],
+    (edge, slack): (f64, f64),
+    side_normal: SideNormal,
+) -> Result<Plan, &'static str> {
+    let points: Vec<Point3> = ids.iter().filter_map(|&v| poly.vertices.get(v as usize).copied()).collect();
+    let targets = arc_positions(lp, &points, edge).ok_or("the loop does not run once around the outline")?;
+    // vertices farther from the outline than the reach are a dent of the layout: no partner for them
+    let near: Vec<usize> = (0..points.len())
+        .filter(|&i| lp.closest(&points[i]).is_some_and(|h| h.2 <= DEEP_FRACTION * edge + slack))
         .collect();
-    if pts.len() != f.len() || pts.len() < 3 {
-        return false;
+    if near.len() < 2 {
+        return Err("fewer than two layout vertices are within reach of the outline");
     }
-    let n = pts.len();
-    if (0..n).any(|k| (pts[(k + 1) % n].0 - pts[k].0).norm() < 1e-9) {
-        return false;
-    }
-    let normal: Vec3 = pts.iter().map(|p| p.1).sum();
-    let p0 = pts[0].0;
-    let area: f64 = (1..n - 1).map(|k| (pts[k].0 - p0).cross(&(pts[k + 1].0 - p0)).dot(&normal)).sum();
-    area > 1e-12
+    let near_targets: Vec<f64> = near.iter().map(|&i| targets[i]).collect();
+    let forced = forced_corners(lp, &near_targets, edge);
+    let arcs = solve_arcs(lp, &near_targets, &forced, MIN_PARTNER_GAP_FRACTION * edge)
+        .ok_or("a span between corners is too short for its vertices")?;
+    let plan = plan_loop(poly, lp, (ids, &near), (&arcs, &forced), (edge, slack), side_normal);
+    if plan_is_valid(poly, &plan) { Ok(plan) } else { Err("snapping would leave an invalid face") }
 }
 
 /// Conforms the free boundary of `poly` to `outline` (see the module documentation). `edge` is
-/// the edge length of the layout; `normal_at` gives the scan normal near a point.
-pub fn conform_to_outline(
-    poly: &mut PolyMesh,
-    outline: &Outline,
-    edge: f64,
-    normal_at: &dyn Fn(&Point3) -> Option<Vec3>,
-) -> ConformReport {
+/// the edge length of the layout; `side_normal` gives the scan normal near a point on the side a
+/// hint normal points to. A loop that cannot be conformed is left exactly as it was.
+pub fn conform_to_outline(poly: &mut PolyMesh, outline: &Outline, edge: f64, side_normal: SideNormal) -> ConformReport {
     let loops = free_loops(&poly.faces);
     let mut report = ConformReport { loops: loops.len(), ..ConformReport::default() };
     for ids in &loops {
         let points: Vec<Point3> = ids.iter().filter_map(|&v| poly.vertices.get(v as usize).copied()).collect();
-        let found = matching_loop(outline, &points).and_then(|k| outline.loops.get(k));
-        let arcs = found.and_then(|lp| arc_positions(lp, &points, edge));
-        let (Some(lp), Some(arcs)) = (found, arcs) else {
+        let Some(lp) = matching_loop(outline, &points).and_then(|k| outline.loops.get(k)) else {
             report.skipped += 1;
+            report.reason.get_or_insert("no outline loop matches the layout loop");
             continue;
         };
-        let ring = build_ring(poly, lp, ids, &arcs, (edge, outline.slack), normal_at);
-        report.conformed += 1;
-        report.snapped += ring.moved.len();
-        for (id, p) in ring.moved {
-            if let Some(v) = poly.vertices.get_mut(id as usize) {
-                *v = p;
+        match try_loop(poly, lp, ids, (edge, outline.slack), side_normal) {
+            Ok(plan) => {
+                report.conformed += 1;
+                report.snapped += plan.moved.len();
+                report.ring_faces += plan.faces.len();
+                for (id, p) in plan.moved {
+                    if let Some(v) = poly.vertices.get_mut(id as usize) {
+                        *v = p;
+                    }
+                }
+                for (p, n) in plan.added {
+                    poly.vertices.push(p);
+                    poly.normals.push(n);
+                }
+                poly.faces.extend(plan.faces);
+            }
+            Err(why) => {
+                report.rolled_back += 1;
+                report.reason.get_or_insert(why);
             }
         }
-        for (p, n) in ring.added {
-            poly.vertices.push(p);
-            poly.normals.push(n);
-        }
-        let valid: Vec<Vec<u32>> = ring.faces.into_iter().filter(|f| face_is_proper(poly, f)).collect();
-        report.ring_faces += valid.len();
-        poly.faces.extend(valid);
     }
     report
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The square [0, 10]², region on the left of the travel direction, four corners.
-    fn square() -> Outline {
-        let pts = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)];
-        let h = std::f64::consts::FRAC_1_SQRT_2;
-        let outward = [(-h, -h), (h, -h), (h, h), (-h, h)];
-        let lp = OutlineLoop {
-            points: pts.iter().map(|p| Point3::new(p.0, p.1, 0.0)).collect(),
-            corners: vec![0, 1, 2, 3],
-            outward: outward.iter().map(|o| Vec3::new(o.0, o.1, 0.0)).collect(),
-        };
-        Outline { loops: vec![lp], slack: 0.0 }
-    }
-
-    fn poly(points: &[(f64, f64)]) -> PolyMesh {
-        PolyMesh {
-            vertices: points.iter().map(|p| Point3::new(p.0, p.1, 0.0)).collect(),
-            normals: vec![Vec3::z(); points.len()],
-            faces: vec![(0..points.len() as u32).collect()],
-        }
-    }
-
-    fn normal_at(_: &Point3) -> Option<Vec3> {
-        Some(Vec3::z())
-    }
-
-    fn segments_cross(a: (f64, f64), b: (f64, f64), c: (f64, f64), d: (f64, f64)) -> bool {
-        let o = |p: (f64, f64), q: (f64, f64), r: (f64, f64)| (q.0 - p.0) * (r.1 - p.1) - (q.1 - p.1) * (r.0 - p.0);
-        o(a, b, c) * o(a, b, d) < -1e-12 && o(c, d, a) * o(c, d, b) < -1e-12
-    }
-
-    /// Simple polygon with positive (counter-clockwise) area.
-    fn assert_simple(poly: &PolyMesh, f: &[u32]) {
-        let p: Vec<(f64, f64)> =
-            f.iter().map(|&v| (poly.vertices[v as usize].x, poly.vertices[v as usize].y)).collect();
-        let n = p.len();
-        let area: f64 = (0..n).map(|k| p[k].0 * p[(k + 1) % n].1 - p[(k + 1) % n].0 * p[k].1).sum::<f64>() / 2.0;
-        assert!(area > 1e-9, "area {area} of {p:?}");
-        for i in 0..n {
-            assert!((p[i].0 - p[(i + 1) % n].0).hypot(p[i].1 - p[(i + 1) % n].1) > 1e-9, "zero edge in {p:?}");
-            for j in i + 2..n {
-                if (j + 1) % n != i {
-                    assert!(!segments_cross(p[i], p[(i + 1) % n], p[j], p[(j + 1) % n]), "self-intersection {p:?}");
-                }
-            }
-        }
-    }
-
-    /// Two neighbours that project onto the same outline point are not both snapped onto it.
-    #[test]
-    fn neighbours_projecting_to_one_point_leave_no_zero_length_edge() {
-        let mut m = poly(&[
-            (-0.1, 0.0),
-            (0.0, -0.1),
-            (10.0, -0.1),
-            (10.1, 0.0),
-            (10.1, 10.0),
-            (10.0, 10.1),
-            (0.0, 10.1),
-            (-0.1, 10.0),
-        ]);
-        conform_to_outline(&mut m, &square(), 4.0, &normal_at);
-        for f in &m.faces {
-            assert_simple(&m, f);
-        }
-    }
-
-    /// An interval that wraps past the start of the loop gets its corners in arc order.
-    #[test]
-    fn wrapped_ring_intervals_insert_corners_in_arc_order() {
-        // perimeter 40; vertices project to arcs 25, 5(+40), 8 and 18(+40)
-        let mut m = poly(&[(5.0, 8.0), (5.0, 2.0), (8.0, 2.0), (8.0, 8.0)]);
-        let report = conform_to_outline(&mut m, &square(), 2.0, &normal_at);
-        assert_eq!(report.conformed, 1, "{report:?}");
-        assert!(m.faces.len() > 1);
-        for f in &m.faces {
-            assert_simple(&m, f);
-        }
-    }
-}
+mod tests;

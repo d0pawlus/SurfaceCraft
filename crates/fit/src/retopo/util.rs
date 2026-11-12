@@ -2,6 +2,7 @@
 use super::field::boundary_neighbours;
 use super::{ConformReport, MAX_WORK_TRIANGLES, PolyMesh, conform_to_outline};
 use crate::boundary::cleaned_outline;
+use crate::orient::same_side_normal;
 use std::collections::BTreeMap;
 use surfacecraft_geom::edit::{DecimateOptions, compact, decimate};
 use surfacecraft_geom::{Bvh, KdTree, Mesh, Point3, Vec3, synth};
@@ -146,6 +147,6 @@ pub(super) fn conform_layout(mesh: &Mesh, poly: &mut PolyMesh, edge: f64) -> Con
     }
     let normals = clean.vertex_normals();
     let tree = KdTree::build(&clean.positions);
-    let normal_at = |p: &Point3| -> Option<Vec3> { tree.nearest(p).and_then(|(i, _)| normals.get(i)).copied() };
-    conform_to_outline(poly, &outline, edge, &normal_at)
+    let side_normal = |p: &Point3, hint: &Vec3| -> Option<Vec3> { same_side_normal(&tree, &normals, 1.0, p, hint) };
+    conform_to_outline(poly, &outline, edge, &side_normal)
 }

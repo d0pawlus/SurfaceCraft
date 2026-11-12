@@ -85,14 +85,20 @@ pub struct RetopoOut {
     pub folded: usize,
     /// Open regions: free boundary loops of the layout conformed to the region outline.
     pub outline_loops_conformed: usize,
-    /// Open regions: free boundary loops left as they were (no matching outline loop or order mismatch).
+    /// Open regions: free boundary loops left exactly as they were (no matching outline loop, order
+    /// mismatch, a span too short for its vertices, or an invalid face after snapping).
     pub outline_loops_skipped: usize,
+    /// Why the first such loop was left as it was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outline_unconformed_reason: Option<String>,
     /// Open regions: faces added between the layout and the outline.
     pub outline_ring_faces: usize,
     /// Quads whose patch was turned against the scan and that were turned around (repaired).
     pub repaired_patches: usize,
     /// Quads whose patch still runs against the scan (should be 0; `surface.auto` then refuses the layout).
     pub flipped_patches: usize,
+    /// Quads whose patch could not be checked against the scan orientation (no samples on its side).
+    pub unverified_patches: usize,
     /// Largest distance of a layout vertex from the scan (mm).
     pub snap_max: f64,
     /// Why the fallback was used.
@@ -290,10 +296,12 @@ pub(super) fn retopo_cmd(s: &mut Session, i: RetopoIn) -> CmdResult<RetopoOut> {
         closed: boundary.is_empty(),
         folded: fit.folded,
         outline_loops_conformed: fit.rep.boundary.conformed,
-        outline_loops_skipped: fit.rep.boundary.skipped,
+        outline_loops_skipped: fit.rep.boundary.skipped + fit.rep.boundary.rolled_back,
+        outline_unconformed_reason: fit.rep.boundary.reason.map(str::to_string),
         outline_ring_faces: fit.rep.boundary.ring_faces,
         repaired_patches: fit.flips.repaired,
         flipped_patches: fit.flips.failed,
+        unverified_patches: fit.flips.unverified,
         snap_max,
         note: if attempt > 0 {
             Some("the field layout had folded or flipped quads; the fallback layout was used".into())
@@ -416,6 +424,7 @@ pub(super) fn info_of(q: &QuadObject, snap_max: f64) -> QuadInfo {
         snap_max,
         repaired_patches: None,
         flipped_patches: None,
+        unverified_patches: None,
     }
 }
 
@@ -441,7 +450,12 @@ pub(super) fn split_unstructured(s: &mut Session, id: ObjectId) -> CmdResult<Qua
         m.faces = split.faces;
     }
     let q = s.doc.quad(id).ok_or_else(|| CmdError::Params(format!("no quad layout {id}")))?;
-    Ok(QuadInfo { repaired_patches: Some(flips.repaired), flipped_patches: Some(flips.failed), ..info_of(q, snap_max) })
+    Ok(QuadInfo {
+        repaired_patches: Some(flips.repaired),
+        flipped_patches: Some(flips.failed),
+        unverified_patches: Some(flips.unverified),
+        ..info_of(q, snap_max)
+    })
 }
 
 /// Refinements of an AutoSurface layout allowed before it is accepted as it is.
@@ -464,6 +478,7 @@ struct Measured {
     set: PatchSet,
     dev: Deviation,
     repaired: usize,
+    unverified: usize,
 }
 
 /// Facts about the accepted fit that the report needs besides the surface.
@@ -502,7 +517,7 @@ fn repair_and_measure(layout: &mut QuadMesh, scan: &LayoutScan, tree: &KdTree, f
         return Err(CmdError::Failed("the layout has quads with missing edges".into()));
     }
     let dev = deviation(&set, &scan.pts, 12);
-    Ok(Measured { radius, set, dev, repaired: report.repaired })
+    Ok(Measured { radius, set, dev, repaired: report.repaired, unverified: report.unverified })
 }
 
 /// Turns every quad of `layout` around, together with its normal.
@@ -560,12 +575,20 @@ fn finish_auto(s: &mut Session, ctx: &AutoContext<'_>, sheet: Brep, step: &Measu
     let jmax = jumps.iter().copied().fold(0.0, f64::max).to_degrees();
     let jmean = (jumps.iter().sum::<f64>() / jumps.len().max(1) as f64).to_degrees();
     let within = step.dev.max <= ctx.tol;
-    let warning = (!within).then(|| {
-        format!(
+    let mut notes: Vec<String> = Vec::new();
+    if !within {
+        notes.push(format!(
             "max deviation {:.4} mm exceeds {} mm after {} refinements; raise max_patches or retopologise finer",
             step.dev.max, ctx.tol, accepted.refinements
-        )
-    });
+        ));
+    }
+    if step.unverified > 0 {
+        notes.push(format!(
+            "{} patches could not be checked against the scan orientation (no scan samples on their side); inspect them",
+            step.unverified
+        ));
+    }
+    let warning = (!notes.is_empty()).then(|| notes.join("; "));
     let (sid, solid, patches) = store_auto_surface(s, ctx.q, ctx.i, sheet, &step.dev, accepted.closed);
     AutoOut {
         blocks: vec![AutoBlock { id: sid, patches, rms: step.dev.rms, max: step.dev.max }],
@@ -582,6 +605,7 @@ fn finish_auto(s: &mut Session, ctx: &AutoContext<'_>, sheet: Brep, step: &Measu
         folded: Some(accepted.folded),
         repaired_patches: Some(accepted.repaired),
         flipped_patches: Some(accepted.flipped_patches),
+        unverified_patches: Some(step.unverified),
     }
 }
 
