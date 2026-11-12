@@ -937,5 +937,8 @@
   "status.cancelled": "{name}: anulowano",
   "status.finishing": "Anulowane polecenie jeszcze się kończy; spróbuj za chwilę",
   "cmd.surface.wrap": "Owiń skan płatami",
-  "cmd.surface.wrap.hint": "Pokrywa cały skan szczelną siatką płatów dopasowanych do skanu; do odlewów, karoserii i kształtów organicznych."
+  "cmd.surface.wrap.hint": "Pokrywa cały skan szczelną siatką płatów dopasowanych do skanu; do odlewów, karoserii i kształtów organicznych.",
+  "param.exclude_triangles": "Wyklucz trójkąty",
+  "param.exclude_spheres": "Wyklucz kule",
+  "param.exclude_boxes": "Wyklucz prostopadłościany"
 }

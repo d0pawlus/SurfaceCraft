@@ -33,6 +33,17 @@ pub struct HeightGrid {
     pub fold: f64,
 }
 
+impl HeightGrid {
+    /// `[[u0, u1], [v0, v1]]` of the grid in the plane frame (the corner nodes), `None` for an
+    /// empty grid.
+    #[must_use]
+    pub fn domain(&self) -> Option<[[f64; 2]; 2]> {
+        let (a, b) = (self.grid.first()?.first()?, self.grid.last()?.last()?);
+        let at = |p: &[f64; 3], axis: &Vec3| (Point3::new(p[0], p[1], p[2]) - self.origin).dot(axis);
+        Some([[at(a, &self.u), at(b, &self.u)], [at(a, &self.v), at(b, &self.v)]])
+    }
+}
+
 /// Resamples `points` onto an `nu × nv` grid over their best-fit plane. `None` for fewer than
 /// 10 points, a degenerate spread, or a region that folds over its plane.
 #[must_use]
