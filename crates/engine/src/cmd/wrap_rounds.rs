@@ -8,13 +8,19 @@
 //! Both refine the coarse *triangle mesh*, never single patches: every round lays the patches on a
 //! fresh, manifold, conforming mesh (`fit::patch::wrap_patches`), so neighbouring patches always
 //! share a whole boundary curve and no T-junction can open a gap, whatever the refinement.
+//!
+//! `max_patches` is a hard bound for every round (three patches per coarse triangle). A first round
+//! that does not fit is cut to the cap ([`trim_to_cap`]). A later round that would not fit is not
+//! dropped: the largest refinement that does fit is searched for ([`search_cap`]) — the worst
+//! missed regions first in the adaptive layout (how many of the scan vertices ranked by their
+//! deviation get more detail), the budget in the uniform one — so the whole cap is spent.
 use super::wrap::WrapDeviation;
+use super::wrap_cap::{End, decimate_options, search_cap, trim_to_cap};
 use super::{CmdError, CmdResult};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use surfacecraft_fit::patch::{PatchSet, tessellate, wrap_patches};
-use surfacecraft_geom::edit::{DecimateOptions, decimate, remove_non_manifold};
-use surfacecraft_geom::reduce::{ToleranceOptions, raise_levels, reduce_to_tolerance, reduce_to_tolerance_scaled};
+use surfacecraft_geom::reduce::{ToleranceOptions, raise_levels, reduce_to_tolerance_scaled};
 use surfacecraft_geom::{Bvh, Mesh, Point3};
 
 /// Patches per coarse triangle.
@@ -36,10 +42,13 @@ const LEVEL_RINGS: usize = 2;
 const REACH_BUDGETS: f64 = 6.0;
 /// Scan points measured at most (evenly strided).
 const MAX_SAMPLES: usize = 200_000;
-/// Times the budget is doubled to bring the coarse mesh under the patch limit.
-const CAP_DOUBLINGS: usize = 4;
 /// Tessellation of a patch for the measurement (quads per side).
 const MEASURE_GRID: usize = 6;
+/// Smallest change of the logarithm of the number of vertices refined the adaptive search tells
+/// apart (5 %).
+const VERTEX_STEP: f64 = 0.05;
+/// Smallest change of the logarithm of the budget the uniform search tells apart (2 %).
+const UNIFORM_STEP: f64 = 0.02;
 
 /// How the coarse mesh is refined.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,6 +78,17 @@ impl Refine {
     }
 }
 
+/// Why a round was cut to the patch cap instead of being built as the budget asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PartialReason {
+    /// The first coarse mesh was bigger than `max_patches` allows and was cut to it.
+    FirstRoundOverCap,
+    /// The next refinement was bigger than `max_patches` allows: the largest one that fits was built
+    /// (adaptive: the worst missed regions first; uniform: the budget between the two rounds).
+    NextRoundOverCap,
+}
+
 /// What one refinement round produced.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema)]
 pub struct WrapLevel {
@@ -84,6 +104,16 @@ pub struct WrapLevel {
     pub within: f64,
     /// Scan vertices asked to keep more detail than in the first round (adaptive layout).
     pub refined_vertices: usize,
+    /// Set when `max_patches` cut this round; absent when the round is what the budget asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial: Option<PartialReason>,
+    /// Reductions of the scan spent searching for the largest refinement that fits the cap.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub probes: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// One round: the coarse mesh, its patches and their deviation.
@@ -93,6 +123,8 @@ pub(super) struct Round {
     pub(super) budget: f64,
     pub(super) capped: bool,
     pub(super) deviation: WrapDeviation,
+    partial: Option<PartialReason>,
+    probes: usize,
 }
 
 /// The scan, its acceleration structure and the points the patches are measured at.
@@ -104,6 +136,7 @@ pub(super) struct Target<'a> {
     pub(super) tolerance: f64,
     pub(super) min_within: f64,
     max_triangles: usize,
+    max_patches: usize,
 }
 
 impl<'a> Target<'a> {
@@ -117,6 +150,7 @@ impl<'a> Target<'a> {
             tolerance,
             min_within,
             max_triangles: (max_patches / PATCHES_PER_TRIANGLE).max(4),
+            max_patches,
         }
     }
 }
@@ -126,31 +160,6 @@ pub(super) struct Wrapped {
     pub(super) best: Round,
     pub(super) rounds: usize,
     pub(super) levels: Vec<WrapLevel>,
-}
-
-fn decimate_options() -> DecimateOptions {
-    DecimateOptions { target_triangles: 0, max_error: None, feature_angle_deg: 181.0, preserve_boundary: true }
-}
-
-/// Brings `coarse` under `max_triangles`: the budget is doubled (the reduction is still measured
-/// against the surface, so the shape survives) and only as a last resort the mesh is cut to the
-/// count. The mesh is made manifold (a reduction can pinch the surface; the network needs at most
-/// two triangles on an edge).
-fn fit_to_limit(mut coarse: Mesh, budget: f64, max_triangles: usize) -> Mesh {
-    let opts = decimate_options();
-    let mut wider = budget;
-    for _ in 0..CAP_DOUBLINGS {
-        if coarse.triangle_count() <= max_triangles {
-            break;
-        }
-        wider *= 2.0;
-        let _report = reduce_to_tolerance(&mut coarse, &opts, &ToleranceOptions::new(wider));
-    }
-    if coarse.triangle_count() > max_triangles {
-        decimate(&mut coarse, &DecimateOptions { target_triangles: max_triangles, ..opts });
-    }
-    remove_non_manifold(&mut coarse);
-    coarse
 }
 
 /// The scan reduced within `budget`, more finely where `scale` is below 1. An invalid mesh is left
@@ -180,105 +189,228 @@ fn deviation_of(d: &[f64], tolerance: f64) -> WrapDeviation {
     WrapDeviation { count, within, rms, p99, max: d.last().copied().unwrap_or(0.0) }
 }
 
-/// Lays the patches on `coarse` and measures them; also returns the distance of every sample.
-fn build_round(t: &Target, coarse: &Mesh, budget: f64, capped: bool) -> (Round, Vec<f64>) {
-    let set = wrap_patches(coarse, &t.bvh, REACH_BUDGETS * budget);
-    let d = distances(&set, &t.samples);
-    let deviation = deviation_of(&d, t.tolerance);
-    (Round { set, coarse_triangles: coarse.triangle_count(), budget, capped, deviation }, d)
+/// A coarse mesh ready to be wrapped, and how it came about.
+struct Laid {
+    mesh: Mesh,
+    budget: f64,
+    partial: Option<PartialReason>,
+    probes: usize,
+    refined_vertices: usize,
 }
 
-fn level_of(round: usize, r: &Round, refined_vertices: usize) -> WrapLevel {
-    WrapLevel {
-        round,
-        budget: r.budget,
-        coarse_triangles: r.coarse_triangles,
-        patches: r.set.nets.len(),
-        within: r.deviation.within,
-        refined_vertices,
+fn over_the_cap() -> CmdError {
+    CmdError::Failed("the scan cannot be represented within max_patches: raise it".into())
+}
+
+/// The rounds so far.
+#[derive(Default)]
+struct Run {
+    best: Option<Round>,
+    log: Vec<WrapLevel>,
+    /// Did `max_patches` cut a round, or stop the refinement?
+    hit_cap: bool,
+}
+
+impl Run {
+    /// Lays the patches on `laid`, logs the round and keeps it when it fits the scan better than the
+    /// best so far (an equal share keeps the earlier, smaller one). Returns the distance of every
+    /// sample and whether the round reached `min_within`.
+    fn add(&mut self, t: &Target, laid: Laid) -> (Vec<f64>, bool) {
+        let set = wrap_patches(&laid.mesh, &t.bvh, REACH_BUDGETS * laid.budget);
+        let d = distances(&set, &t.samples);
+        let deviation = deviation_of(&d, t.tolerance);
+        let round = Round {
+            set,
+            coarse_triangles: laid.mesh.triangle_count(),
+            budget: laid.budget,
+            capped: false,
+            deviation,
+            partial: laid.partial,
+            probes: laid.probes,
+        };
+        self.log.push(WrapLevel {
+            round: self.log.len() + 1,
+            budget: round.budget,
+            coarse_triangles: round.coarse_triangles,
+            patches: round.set.nets.len(),
+            within: round.deviation.within,
+            refined_vertices: laid.refined_vertices,
+            partial: round.partial,
+            probes: round.probes,
+        });
+        self.hit_cap |= round.partial.is_some();
+        let met = round.deviation.within >= t.min_within;
+        // never more patches than the cap, whatever the layout did (three per triangle by construction)
+        let fits = round.set.nets.len() <= t.max_patches;
+        self.best = match self.best.take() {
+            Some(b) if !fits || b.deviation.within >= round.deviation.within => Some(b),
+            None if !fits => None,
+            _ => Some(round),
+        };
+        (d, met && fits)
+    }
+
+    /// The best round, flagged as capped when the cap cut a round or stopped the refinement and the
+    /// tolerance was still missed.
+    fn finish(self, t: &Target) -> CmdResult<Wrapped> {
+        let rounds = self.log.len();
+        let capped = self.hit_cap;
+        let best = self.best.ok_or_else(over_the_cap)?;
+        let capped = capped && best.deviation.within < t.min_within;
+        Ok(Wrapped { best: Round { capped, ..best }, rounds, levels: self.log })
     }
 }
 
-/// Keeps `round` when it fits the scan better than `best`.
-fn keep_better(best: Option<Round>, round: Round) -> Option<Round> {
-    match best {
-        Some(b) if b.deviation.within >= round.deviation.within => Some(b),
-        _ => Some(round),
+/// The first round, bigger than the cap: cut to it.
+fn first_round_over(t: &Target, raw: Mesh, budget: f64) -> CmdResult<Laid> {
+    let mesh = trim_to_cap(raw, t.max_triangles, true).ok_or_else(over_the_cap)?;
+    Ok(Laid { mesh, budget, partial: Some(PartialReason::FirstRoundOverCap), probes: 0, refined_vertices: 0 })
+}
+
+/// The round the budget asked for, bigger than the cap, cut to it by the decimation: detail stays
+/// where the quadric error is highest. Costs no reduction of the scan.
+fn trimmed(t: &Target, raw: Mesh, budget: f64, refined_vertices: usize) -> Option<Laid> {
+    let mesh = trim_to_cap(raw, t.max_triangles, false)?;
+    Some(Laid { mesh, budget, partial: Some(PartialReason::NextRoundOverCap), probes: 0, refined_vertices })
+}
+
+/// A uniform round bigger than the cap: the round cut to the cap is built first; when it misses the
+/// tolerance the budget between the last round and this one that just fits is searched for (the
+/// better of the two is kept). Returns that second round, or `None` when there is none to build.
+fn uniform_over(t: &Target, run: &mut Run, raw: Mesh, budget: f64, last: usize) -> Option<Laid> {
+    let ends = (End { x: -(2.0 * budget).ln(), triangles: last }, End { x: -budget.ln(), triangles: raw.triangle_count() });
+    if let Some(cut) = trimmed(t, raw, budget, 0)
+        && run.add(t, cut).1
+    {
+        return None;
     }
+    let (found, probes) = search_cap(t.max_triangles, ends, UNIFORM_STEP, |x| reduce_scan(t.scan, (-x).exp(), &[]));
+    let f = found?;
+    Some(Laid { mesh: f.mesh, budget: (-f.x).exp(), partial: Some(PartialReason::NextRoundOverCap), probes, refined_vertices: 0 })
 }
 
-fn failed() -> CmdError {
-    CmdError::Failed("the scan could not be wrapped".into())
-}
-
-/// The uniform layout: the budget of the whole scan is halved each round.
+/// The uniform layout: the budget of the whole scan is halved each round. A round that would not
+/// fit the cap is replaced by rounds that do (see [`uniform_over`]).
 fn uniform_rounds(t: &Target) -> CmdResult<Wrapped> {
-    let mut best: Option<Round> = None;
-    let mut levels = Vec::new();
+    let mut run = Run::default();
     let mut budget = FIRST_BUDGET * t.tolerance;
+    let mut last = 0;
     for round in 1..=UNIFORM_ROUNDS {
         let raw = reduce_scan(t.scan, budget, &[]);
-        let capped = raw.triangle_count() > t.max_triangles;
-        let coarse = fit_to_limit(raw, budget, t.max_triangles);
-        let (r, _) = build_round(t, &coarse, budget, capped);
-        levels.push(level_of(round, &r, 0));
-        let done = capped || r.deviation.within >= t.min_within;
-        best = keep_better(best, r);
-        if done {
+        let laid = if raw.triangle_count() <= t.max_triangles {
+            Laid { mesh: raw, budget, partial: None, probes: 0, refined_vertices: 0 }
+        } else if round == 1 {
+            first_round_over(t, raw, budget)?
+        } else {
+            run.hit_cap = true;
+            let Some(l) = uniform_over(t, &mut run, raw, budget, last) else { break };
+            l
+        };
+        let partial = laid.partial.is_some();
+        last = laid.mesh.triangle_count();
+        let (_, met) = run.add(t, laid);
+        if partial || met {
             break;
         }
         budget *= 0.5;
     }
-    let rounds = levels.len();
-    best.map(|best| Wrapped { best, rounds, levels }).ok_or_else(failed)
+    run.finish(t)
 }
 
-/// Scan vertices whose sample is farther from the patches than the tolerance.
+/// Scan vertices whose sample is farther from the patches than the tolerance, the farthest first.
 fn missed_vertices(t: &Target, d: &[f64]) -> Vec<u32> {
-    d.iter()
+    let mut missed: Vec<(f64, u32)> = d
+        .iter()
         .enumerate()
         .filter(|(_, x)| **x > t.tolerance)
-        .map(|(k, _)| u32::try_from(k * t.stride).unwrap_or(u32::MAX))
-        .collect()
+        .map(|(k, x)| (*x, u32::try_from(k * t.stride).unwrap_or(u32::MAX)))
+        .collect();
+    missed.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    missed.into_iter().map(|(_, v)| v).collect()
 }
 
 fn scale_of(levels: &[u8]) -> Vec<f64> {
     levels.iter().map(|&l| 0.5f64.powi(i32::from(l))).collect()
 }
 
+fn refined_count(levels: &[u8]) -> usize {
+    levels.iter().filter(|&&l| l > 0).count()
+}
+
+/// The levels with detail raised around the `count` worst missed vertices of `ranked`.
+fn raised(t: &Target, levels: &[u8], ranked: &[u32], count: usize) -> Vec<u8> {
+    raise_levels(t.scan, ranked.get(..count).unwrap_or(ranked), levels, LEVEL_RINGS, MAX_LEVEL)
+}
+
+/// What the adaptive layout has when it asks for the next round.
+struct Adaptive<'a> {
+    levels: &'a [u8],
+    /// Missed vertices of the last round, the worst first.
+    ranked: &'a [u32],
+    /// Triangles of the last round.
+    last: usize,
+}
+
+/// The next adaptive round, bigger than the cap: first the round cut to the cap (see [`trimmed`]),
+/// then the number of worst missed vertices that get more detail is searched so that the mesh just
+/// fits; the better of the two is kept. Returns the second round, or `None` when there is none to
+/// build (the first met the tolerance, or no refinement fits).
+fn next_round_over(t: &Target, run: &mut Run, a: &Adaptive, raw: Mesh, budget: f64) -> Option<Laid> {
+    let raw_count = raw.triangle_count();
+    let all = refined_count(&raised(t, a.levels, a.ranked, a.ranked.len()));
+    if let Some(cut) = trimmed(t, raw, budget, all)
+        && run.add(t, cut).1
+    {
+        return None;
+    }
+    // the count rises steeply with the first vertices refined: the search runs on ln(1 + count)
+    let ends = (End { x: 0.0, triangles: a.last }, End { x: (a.ranked.len() as f64).ln_1p(), triangles: raw_count });
+    let levels_of = |x: f64| raised(t, a.levels, a.ranked, x.exp_m1().round() as usize);
+    let probe = |x: f64| reduce_scan(t.scan, budget, &scale_of(&levels_of(x)));
+    let (found, probes) = search_cap(t.max_triangles, ends, VERTEX_STEP, probe);
+    let f = found?;
+    let refined_vertices = refined_count(&levels_of(f.x));
+    Some(Laid { mesh: f.mesh, budget, partial: Some(PartialReason::NextRoundOverCap), probes, refined_vertices })
+}
+
 /// The adaptive layout: detail levels are raised around the scan points the patches miss, the
 /// coarse mesh is reduced again from the scan with the new levels. A round whose mesh would not
-/// fit `max_patches` is not built: the best earlier round is returned, flagged as capped.
+/// fit `max_patches` is built with as many of the worst missed vertices refined as fit.
 fn adaptive_rounds(t: &Target) -> CmdResult<Wrapped> {
-    let mut best: Option<Round> = None;
-    let mut log = Vec::new();
+    let mut run = Run::default();
     let mut levels: Vec<u8> = vec![0; t.scan.positions.len()];
+    // the levels of the last round (those the next round raises)
+    let mut base = levels.clone();
+    let mut ranked: Vec<u32> = Vec::new();
+    let mut last = 0;
     let budget = ADAPTIVE_FIRST_BUDGET * t.tolerance;
     for round in 1..=ADAPTIVE_ROUNDS {
         let raw = reduce_scan(t.scan, budget, &scale_of(&levels));
-        let over = raw.triangle_count() > t.max_triangles;
-        if over && round > 1 {
-            best = best.map(|b| Round { capped: true, ..b });
+        let laid = if raw.triangle_count() <= t.max_triangles {
+            Laid { mesh: raw, budget, partial: None, probes: 0, refined_vertices: refined_count(&levels) }
+        } else if round == 1 {
+            first_round_over(t, raw, budget)?
+        } else {
+            run.hit_cap = true;
+            let a = Adaptive { levels: &base, ranked: &ranked, last };
+            let Some(l) = next_round_over(t, &mut run, &a, raw, budget) else { break };
+            l
+        };
+        let partial = laid.partial.is_some();
+        last = laid.mesh.triangle_count();
+        let (d, met) = run.add(t, laid);
+        ranked = missed_vertices(t, &d);
+        if partial || met || ranked.is_empty() {
             break;
         }
-        let coarse = if over { fit_to_limit(raw, budget, t.max_triangles) } else { raw };
-        let (r, d) = build_round(t, &coarse, budget, over);
-        let refined = levels.iter().filter(|&&l| l > 0).count();
-        log.push(level_of(round, &r, refined));
-        let done = over || r.deviation.within >= t.min_within;
-        best = keep_better(best, r);
-        let seeds = missed_vertices(t, &d);
-        if done || seeds.is_empty() {
-            break;
-        }
-        let next = raise_levels(t.scan, &seeds, &levels, LEVEL_RINGS, MAX_LEVEL);
+        let next = raise_levels(t.scan, &ranked, &levels, LEVEL_RINGS, MAX_LEVEL);
         if next == levels {
             break;
         }
+        base = levels;
         levels = next;
     }
-    let rounds = log.len();
-    best.map(|best| Wrapped { best, rounds, levels: log }).ok_or_else(failed)
+    run.finish(t)
 }
 
 /// Wraps the scan until `min_within` of the samples are within the tolerance, or the rounds or the

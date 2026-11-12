@@ -262,6 +262,7 @@
   "Mesh.": "Skan.",
   "Mirror parameters.": "Ustawienia odbicia lustrzanego.",
   "Model the regions the scan already has instead of segmenting it (default false). For a\nsecond run after the regions were corrected by hand.": "Użyj regionów, które skan już ma, zamiast dzielić go od nowa (domyślnie nie). Przydatne przy drugim podejściu, po ręcznej poprawie regionów.",
+  "Most patches of the network of method `freeform` (default 12000, at most 60000). A network\nthat stops at this limit short of the tolerance is built once more with a larger limit\nwhen that is likely to help; see `retry` of the result.": "Największa liczba płatów siatki metody „freeform” (domyślnie 12000, najwyżej 60000). Siatka, która zatrzymała się na tym limicie przed osiągnięciem tolerancji, jest budowana jeszcze raz z większym limitem, gdy to prawdopodobnie pomoże; zobacz „retry” w wyniku.",
   "Most patches the network may have (default 12000, at most 60000).": "Największa liczba płatów w siatce (domyślnie 12000, najwyżej 60000).",
   "Most pieces (1 to 64, default 16).": "Największa liczba płatów (od 1 do 64, domyślnie 16).",
   "Move the mesh (default false: the command only proposes the pose).": "Przesuwa skan (domyślnie nie: polecenie tylko proponuje ułożenie).",

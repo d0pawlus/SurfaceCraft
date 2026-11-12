@@ -10,6 +10,7 @@ use super::mesh_edit::{CleanIn, clean};
 use super::primitive::{AutoConstrainIn, FitIn, KindChoice, auto_constrain, fit_cmd};
 use super::qa::{CompareIn, CompareOut, Finding, QaIn, compare, scan_qa};
 use super::region::{AutoIn, auto_segment};
+use super::wrap::PATCH_LIMIT;
 use super::{CmdError, CmdResult, CommandSpec, ObjRef};
 use crate::{Session, command};
 use schemars::JsonSchema;
@@ -99,6 +100,11 @@ pub struct ToSolidIn {
     /// coaxial, equal radii (default true).
     #[serde(default = "yes")]
     pub constrain: bool,
+    /// Most patches of the network of method `freeform` (default 12000, at most 60000). A network
+    /// that stops at this limit short of the tolerance is built once more with a larger limit
+    /// when that is likely to help; see `retry` of the result.
+    #[serde(default)]
+    pub max_patches: Option<usize>,
     /// Name of the solid (default "solid").
     #[serde(default)]
     pub name: Option<String>,
@@ -227,6 +233,9 @@ pub struct ToSolidOut {
     /// Patches of the network (method `freeform`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub patches: Option<usize>,
+    /// The network was built a second time with a larger patch limit (method `freeform`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<freeform::CapRetry>,
     /// Tolerance used (mm).
     pub tolerance: f64,
     /// The solid against the scan, when a solid was built.
@@ -259,6 +268,7 @@ struct Settings {
     tolerance: f64,
     min_within: f64,
     min_triangles: Option<usize>,
+    max_patches: Option<usize>,
     name: String,
 }
 
@@ -291,11 +301,17 @@ fn settings(s: &Session, i: &ToSolidIn) -> CmdResult<Settings> {
     if i.reuse_regions && s.doc.regions_of(scan).next().is_none() {
         return Err(CmdError::Params("reuse_regions: the scan has no regions (run without it to segment)".into()));
     }
+    if let Some(m) = i.max_patches
+        && !(freeform::MIN_PATCHES..=PATCH_LIMIT).contains(&m)
+    {
+        return Err(CmdError::Params(format!("max_patches must be {}..={PATCH_LIMIT}", freeform::MIN_PATCHES)));
+    }
     Ok(Settings {
         scan,
         tolerance,
         min_within,
         min_triangles: i.min_region_triangles,
+        max_patches: i.max_patches,
         name: i.name.clone().unwrap_or_else(|| "solid".to_string()),
     })
 }
@@ -731,6 +747,7 @@ fn to_solid(s: &mut Session, i: ToSolidIn) -> CmdResult<ToSolidOut> {
         scan: set.scan,
         body: o.body,
         patches: None,
+        retry: None,
         tolerance: set.tolerance,
         deviation: o.deviation,
         worst_faces: o.worst_faces,

@@ -8,7 +8,39 @@ use crate::Session;
 use crate::cmd::qa::{CompareIn, compare};
 use crate::cmd::wrap::{PATCH_LIMIT, WrapIn, WrapOut, wrap};
 use crate::cmd::{CmdResult, ObjRef};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+
+/// Smallest `max_patches` (the one of `surface.wrap`).
+pub(super) const MIN_PATCHES: usize = 12;
+/// The first attempt must have put at least this share of the scan within the tolerance for a retry:
+/// below it a larger limit is unlikely to reach a pass (measured on real scans: 30 % at 12 000
+/// patches became 59 % at 30 000 and 77 % at 60 000).
+const RETRY_MIN_WITHIN: f64 = 0.25;
+/// Scans with more triangles are not wrapped a second time (the reduction of the scan is the cost).
+const RETRY_MAX_TRIANGLES: usize = 1_500_000;
+/// The limit of the second attempt is this many times the first, at most `PATCH_LIMIT`.
+const RETRY_FACTOR: usize = 5;
+
+/// The second attempt of the network with a larger patch limit.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+pub struct CapRetry {
+    /// `max_patches` of the first attempt, which stopped at it short of the tolerance.
+    pub cap_from: usize,
+    /// `max_patches` of the second attempt.
+    pub cap_to: usize,
+    /// Patches of the first attempt.
+    pub patches_from: usize,
+    /// Patches of the second attempt.
+    pub patches_to: usize,
+    /// Share of the scan within the tolerance after the first attempt (0..1).
+    pub within_from: f64,
+    /// Share of the scan within the tolerance after the second attempt (0..1).
+    pub within_to: f64,
+    /// Is the second attempt the result? It is when it fits the scan better than the first.
+    pub kept: bool,
+}
 
 /// What keeps a wrapped scan from a pass.
 fn issues_of(w: &WrapOut, d: &DeviationSummary, set: &Settings, report: &ScanSummary) -> Vec<super::Issue> {
@@ -61,7 +93,7 @@ fn next_steps(w: &WrapOut, issues: &[super::Issue], set: &Settings) -> Vec<NextS
         let again = json!({"scan": set.scan, "method": "freeform", "tolerance": set.tolerance});
         steps.push(step("scan.to_solid", again, "wraps the repaired scan"));
     }
-    if has("out_of_tolerance") && w.patches < PATCH_LIMIT {
+    if has("out_of_tolerance") && w.cap_used < PATCH_LIMIT {
         let why = "a finer network: more and smaller patches (a second body; delete the first)";
         let params = json!({"mesh": set.scan, "tolerance": set.tolerance, "max_patches": PATCH_LIMIT});
         steps.push(step("surface.wrap", params, why));
@@ -86,11 +118,12 @@ fn failed(set: &Settings, report: ScanSummary, why: &str) -> ToSolidOut {
         json!({"topic": "scan-to-solid"}),
         "what each verdict and issue means and how to go on by hand",
     )];
-    out(set, report, Verdict::Fail, None, None, issues, next)
+    out(set, None, report, Verdict::Fail, None, None, issues, next)
 }
 
 fn out(
     set: &Settings,
+    retry: Option<CapRetry>,
     report: ScanSummary,
     verdict: Verdict,
     w: Option<&WrapOut>,
@@ -104,6 +137,7 @@ fn out(
         scan: set.scan,
         body: w.map(|w| w.body.clone()),
         patches: w.map(|w| w.patches),
+        retry,
         tolerance: set.tolerance,
         deviation,
         worst_faces: Vec::new(),
@@ -119,20 +153,58 @@ fn out(
     }
 }
 
+fn wrap_with(s: &mut Session, set: &Settings, max_patches: Option<usize>) -> CmdResult<WrapOut> {
+    wrap(
+        s,
+        WrapIn {
+            mesh: ObjRef::Id(set.scan.0),
+            tolerance: Some(set.tolerance),
+            min_within: Some(set.min_within),
+            max_patches,
+            refine: None,
+            name: Some(set.name.clone()),
+        },
+    )
+}
+
+/// Wraps the scan a second time with a larger limit when the first attempt stopped at its limit short
+/// of the tolerance, reached at least [`RETRY_MIN_WITHIN`] and the scan is not too big, and keeps
+/// the better of the two (the other body is removed). One retry at most; a failed one leaves the
+/// first attempt as it is.
+fn retry_larger(s: &mut Session, set: &Settings, first: WrapOut) -> (WrapOut, Option<CapRetry>) {
+    let cap_from = first.cap_used;
+    let cap_to = cap_from.saturating_mul(RETRY_FACTOR).min(PATCH_LIMIT);
+    let triangles = s.doc.mesh(set.scan).map_or(usize::MAX, |m| m.mesh.triangle_count());
+    let worth = first.capped
+        && cap_to > cap_from
+        && first.deviation.within >= RETRY_MIN_WITHIN
+        && triangles <= RETRY_MAX_TRIANGLES;
+    if !worth {
+        return (first, None);
+    }
+    let Ok(second) = wrap_with(s, set, Some(cap_to)) else { return (first, None) };
+    let kept = second.deviation.within > first.deviation.within;
+    let info = CapRetry {
+        cap_from,
+        cap_to,
+        patches_from: first.patches,
+        patches_to: second.patches,
+        within_from: first.deviation.within,
+        within_to: second.deviation.within,
+        kept,
+    };
+    let (keep, drop) = if kept { (second, first) } else { (first, second) };
+    s.doc.remove(drop.body.id);
+    (keep, Some(info))
+}
+
 /// Wraps the scan and judges the result.
 pub(super) fn freeform_solid(s: &mut Session, set: &Settings, report: ScanSummary) -> CmdResult<ToSolidOut> {
-    let params = WrapIn {
-        mesh: ObjRef::Id(set.scan.0),
-        tolerance: Some(set.tolerance),
-        min_within: Some(set.min_within),
-        max_patches: None,
-        refine: None,
-        name: Some(set.name.clone()),
-    };
-    let w = match wrap(s, params) {
+    let first = match wrap_with(s, set, set.max_patches) {
         Ok(w) => w,
         Err(e) => return Ok(failed(set, report, message_of(&e))),
     };
+    let (w, retry) = retry_larger(s, set, first);
     let cmp = compare(
         s,
         CompareIn {
@@ -155,5 +227,5 @@ pub(super) fn freeform_solid(s: &mut Session, set: &Settings, report: ScanSummar
     } else {
         Verdict::Fail
     };
-    Ok(out(set, report, verdict, Some(&w), Some(d), issues, next))
+    Ok(out(set, retry, report, verdict, Some(&w), Some(d), issues, next))
 }
