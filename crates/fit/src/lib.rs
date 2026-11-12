@@ -13,6 +13,7 @@ pub mod auto;
 pub mod charts;
 pub mod constrain;
 pub mod features;
+mod features_ngon;
 pub mod lm;
 pub mod mls;
 pub mod orient;

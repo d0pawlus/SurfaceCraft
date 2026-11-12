@@ -13,9 +13,10 @@
 //! least-squares fit of the region's vertices (parameters from the Coons patch of the
 //! boundary, refined by closest-point iterations). Regions that are not four-sided are listed as
 //! skipped. Sharp edges stay sharp: the patches meet there without any tangent continuity.
+use crate::features_ngon::{RegionRec, ngon_patches, quad_patches};
 use nalgebra::DMatrix;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use surfacecraft_geom::{KdTree, Mesh, Point3, Vec3, normalize};
+use surfacecraft_geom::{KdTree, Mesh, Point3, Vec3};
 
 /// Control net `net[i][j]` of a Bézier patch of any degree (`i` along u, `j` along v).
 pub type NetN = Vec<Vec<[f64; 3]>>;
@@ -129,7 +130,7 @@ fn bezier_point(c: &[Vec3], t: f64) -> Vec3 {
 
 /// Degree-`n` Bézier curve through the first and last point of `pts`, least squares over the
 /// rest (chord-length parameters).
-fn fit_curve(pts: &[Vec3], n: usize) -> Vec<Vec3> {
+pub(crate) fn fit_curve(pts: &[Vec3], n: usize) -> Vec<Vec3> {
     let (a, b) = (pts[0], pts[pts.len() - 1]);
     let m = pts.len();
     let mut ts = vec![0.0; m];
@@ -172,6 +173,19 @@ fn fit_curve(pts: &[Vec3], n: usize) -> Vec<Vec3> {
     }
     out.push(b);
     if out.iter().any(|p| !p.iter().all(|x| x.is_finite())) { line } else { out }
+}
+
+/// De Casteljau split of the Bézier curve `c` at `t`: the control points of both parts.
+pub(crate) fn split_bezier(c: &[Vec3], t: f64) -> (Vec<Vec3>, Vec<Vec3>) {
+    let n = c.len();
+    let (mut left, mut right) = (Vec::with_capacity(n), vec![Vec3::zeros(); n]);
+    let mut row = c.to_vec();
+    for k in 0..n {
+        left.push(row[0]);
+        right[n - 1 - k] = row[n - 1 - k];
+        row = row.windows(2).map(|w| w[0] * (1.0 - t) + w[1] * t).collect();
+    }
+    (left, right)
 }
 
 struct Coons<'a> {
@@ -235,7 +249,7 @@ fn locate(f: &dyn Fn(f64, f64) -> Vec3, p: &Vec3, start: Option<(f64, f64)>) -> 
 }
 
 /// The interior of one patch: boundary control points fixed, interior least squares to `points`.
-fn fit_interior(net: &mut NetN, points: &[Vec3]) {
+pub(crate) fn fit_interior(net: &mut NetN, points: &[Vec3]) {
     let n = net.len() - 1;
     if n < 2 || points.len() < 8 {
         return;
@@ -514,6 +528,7 @@ pub fn feature_network(mesh: &Mesh, tris: &[u32], opts: &FeatureOptions) -> Resu
     };
     let nrm = sub.vertex_normals();
     let degree = opts.degree;
+    let mut recs: Vec<RegionRec> = Vec::new();
     let mut side_ids: BTreeMap<(u32, u32, u32, usize), usize> = BTreeMap::new();
     let mut side_curves: Vec<Vec<Vec3>> = Vec::new();
     for (&rid, set) in &boundary {
@@ -579,9 +594,9 @@ pub fn feature_network(mesh: &Mesh, tris: &[u32], opts: &FeatureOptions) -> Resu
         }
         // the same cluster must not appear twice
         let distinct: BTreeSet<u32> = corners.iter().map(|c| c.0).collect();
-        if corners.len() != 4 || distinct.len() != 4 {
+        if corners.len() < 3 || distinct.len() != corners.len() {
             out.skipped.push(format!(
-                "region of {} triangles has {} corners (a patch needs 4)",
+                "region of {} triangles has {} corners (a patch needs at least 3, all distinct)",
                 tri_ids.len(),
                 corners.len()
             ));
@@ -589,118 +604,64 @@ pub fn feature_network(mesh: &Mesh, tris: &[u32], opts: &FeatureOptions) -> Resu
         }
         // loop vertex at walk position
         let at = |step: usize| lp[(origin + step) % m];
-        let mut sides: Vec<(u32, u32, Vec<Vec3>)> = Vec::new();
-        for c in 0..4 {
-            let (ca, first_a, last_a) = corners[c];
-            let (cb, first_b, _) = corners[(c + 1) % 4];
-            let _ = first_a;
+        let count = corners.len();
+        let mut rec = RegionRec {
+            corners: corners.iter().map(|c| c.0).collect(),
+            sides: Vec::with_capacity(count),
+            forward: Vec::with_capacity(count),
+            points: Vec::new(),
+            mean_normal: lp.iter().map(|&v| nrm[v as usize]).sum(),
+            triangles: tri_ids,
+        };
+        // register the sides (canonical direction: smaller corner id first)
+        for c in 0..count {
+            let (ca, _, last_a) = corners[c];
+            let (cb, first_b, _) = corners[(c + 1) % count];
             let mut pts = vec![cpoints[ca as usize]];
-            let end = if (c + 1) % 4 == 0 { m + first_b } else { first_b };
+            let end = if (c + 1) % count == 0 { m + first_b } else { first_b };
             for step in (last_a + 1)..end {
                 pts.push(sub.positions[at(step % m) as usize].coords);
             }
             pts.push(cpoints[cb as usize]);
-            sides.push((ca, cb, pts));
-        }
-        // outward orientation: the loop runs counter-clockwise seen from the side the normals
-        // point to (triangle winding); flip the corner order when the vertex normals disagree
-        let mut area_n = Vec3::zeros();
-        let c0 = cpoints[corners[0].0 as usize];
-        for c in 1..3 {
-            let (a, b) = (cpoints[corners[c].0 as usize] - c0, cpoints[corners[c + 1].0 as usize] - c0);
-            area_n += a.cross(&b);
-        }
-        let mean_n: Vec3 = lp.iter().map(|&v| nrm[v as usize]).sum();
-        let _ = normalize(mean_n);
-        let _ = area_n;
-        // register the four sides (canonical direction: smaller corner id first)
-        let mut ids = [0usize; 4];
-        let mut dir = [true; 4];
-        for (k, (a, b, pts)) in sides.iter().enumerate() {
-            let forward = a < b;
-            let mut canon = pts.clone();
+            let forward = ca < cb;
             if !forward {
-                canon.reverse();
+                pts.reverse();
             }
-            let (lo, hi) = (*a.min(b), *a.max(b));
+            let (lo, hi) = (ca.min(cb), ca.max(cb));
             // first interior vertex id keeps two curves between the same corners apart
-            let tagv = if canon.len() > 2 {
-                let q = canon[1];
+            let tagv = if pts.len() > 2 {
+                let q = pts[1];
                 ((q.x * 1e3).round() as i64 as u32) ^ ((q.y * 1e3).round() as i64 as u32).rotate_left(11)
             } else {
                 u32::MAX
             };
-            let key = (lo, hi, tagv, canon.len());
-            let id = *side_ids.entry(key).or_insert_with(|| {
-                side_curves.push(fit_curve(&canon, degree));
+            let id = *side_ids.entry((lo, hi, tagv, pts.len())).or_insert_with(|| {
+                side_curves.push(fit_curve(&pts, degree));
                 side_curves.len() - 1
             });
-            ids[k] = id;
-            dir[k] = forward;
+            rec.sides.push(id);
+            rec.forward.push(forward);
         }
-        let oriented = |k: usize, from_start: bool| -> Vec<Vec3> {
-            // control points of side k read from its loop start (`from_start`) or reversed
-            let c = &side_curves[ids[k]];
-            let mut v = c.clone();
-            if !dir[k] {
-                v.reverse();
+        let mut seen: BTreeSet<u32> = BTreeSet::new();
+        for t in 0..nt {
+            if region[t] == rid {
+                seen.extend(sub.triangles[t]);
             }
-            if !from_start {
-                v.reverse();
-            }
-            v
-        };
-        let n = degree;
-        let mut net: NetN = vec![vec![[0.0; 3]; n + 1]; n + 1];
-        let s01 = oriented(0, true); // c0 → c1
-        let s12 = oriented(1, true); // c1 → c2
-        let s32 = oriented(2, false); // c3 → c2
-        let s03 = oriented(3, false); // c0 → c3
-        for k in 0..=n {
-            net[k][0] = a3(s01[k]);
-            net[n][k] = a3(s12[k]);
-            net[k][n] = a3(s32[k]);
-            net[0][k] = a3(s03[k]);
         }
-        let pts: Vec<Vec3> = {
-            let mut set: BTreeSet<u32> = BTreeSet::new();
-            for t in 0..nt {
-                if region[t] == rid {
-                    set.extend(sub.triangles[t]);
-                }
-            }
-            set.into_iter().map(|v| sub.positions[v as usize].coords).collect()
-        };
-        fit_interior(&mut net, &pts);
-        // orientation: u × v must agree with the outward normals of the region
-        let (_, du, dv) = {
-            let p = eval_net(&net, 0.5, 0.5);
-            let h = 1e-3;
-            (
-                p,
-                eval_net(&net, 0.5 + h, 0.5) - eval_net(&net, 0.5 - h, 0.5),
-                eval_net(&net, 0.5, 0.5 + h) - eval_net(&net, 0.5, 0.5 - h),
-            )
-        };
-        let outward = du.cross(&dv).dot(&mean_n);
-        let cs = [corners[0].0, corners[1].0, corners[2].0, corners[3].0];
-        if outward < 0.0 {
-            // swap u and v: transposes the net and the corner order c0, c3, c2, c1
-            let mut t = net.clone();
-            for i in 0..=n {
-                for j in 0..=n {
-                    t[i][j] = net[j][i];
-                }
-            }
-            out.nets.push(t);
-            out.corners.push([cs[0], cs[3], cs[2], cs[1]]);
-        } else {
-            out.nets.push(net);
-            out.corners.push(cs);
-        }
-        out.region_triangles.push(tri_ids);
+        rec.points = seen.into_iter().map(|v| sub.positions[v as usize].coords).collect();
+        recs.push(rec);
     }
     out.curves = side_curves.len();
+    let patches = if recs.iter().all(|r| r.corners.len() == 4) {
+        quad_patches(&recs, &side_curves)
+    } else {
+        let first_new = out.corner_points.len() as u32;
+        ngon_patches(&recs, &side_curves, first_new, degree)
+    };
+    out.corner_points.extend(patches.extra_points.iter().copied());
+    out.nets = patches.nets;
+    out.corners = patches.corners;
+    out.region_triangles = patches.region_triangles;
     Ok(out)
 }
 
@@ -737,5 +698,16 @@ mod tests {
         // bad parameters are errors
         assert!(feature_network(&m, &all, &FeatureOptions { degree: 1, ..FeatureOptions::default() }).is_err());
         assert!(feature_network(&m, &all, &FeatureOptions { angle_deg: 0.0, ..FeatureOptions::default() }).is_err());
+    }
+
+    #[test]
+    fn split_bezier_halves_reproduce_the_curve() {
+        let c: Vec<Vec3> = (0..6).map(|k| Vec3::new(k as f64, ((k * k) % 5) as f64, (k % 2) as f64)).collect();
+        let (lo, hi) = split_bezier(&c, 0.5);
+        assert_eq!(lo.last(), hi.first());
+        for t in [0.0, 0.3, 0.77, 1.0] {
+            assert!((bezier_point(&lo, t) - bezier_point(&c, 0.5 * t)).norm() < 1e-12);
+            assert!((bezier_point(&hi, t) - bezier_point(&c, 0.5 + 0.5 * t)).norm() < 1e-12);
+        }
     }
 }
