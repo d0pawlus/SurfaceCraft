@@ -1,7 +1,8 @@
 //! Hole filling: boundary loops triangulated by ear clipping in the loop's mean plane; the smooth
 //! variant refines the patch (centroid splits and Delaunay flips) and fairs it with the
 //! surrounding ring held fixed (membrane, then thin-plate iterations).
-use crate::{Mesh, Point3, Vec3, tri};
+use crate::ear::{ear_clip, fan_fill};
+use crate::{Mesh, Point3, Vec3, par, tri};
 use std::collections::{HashMap, HashSet};
 
 /// Closed boundary loops as vertex lists, each in the direction of its triangles' edges.
@@ -71,9 +72,19 @@ pub struct FillReport {
     pub added_triangles: usize,
 }
 
-/// Fills boundary loops with at most `max_edges` edges. `smooth` refines and fairs the patch so
-/// it follows the surrounding curvature, and keeps the sharp edges and corners the hole lies
-/// over; otherwise the patch is flat (ear clipping only).
+/// The longest loop filled (boundary edges). Ear clipping takes about n² steps, so the bound is
+/// time, not correctness; see the measurement of a 5 000-edge hole in `crates/io/tests/h2_perf.rs`.
+pub const MAX_FILL_EDGES: usize = 20_000;
+
+/// Rings of triangles around a loop copied into the workspace of its patch: more than the
+/// sharpening (two rings) and the fairing (one) read.
+const WORKSPACE_RINGS: usize = 3;
+
+/// Fills boundary loops with at most `max_edges` edges (and at most [`MAX_FILL_EDGES`]). `smooth`
+/// refines and fairs the patch so it follows the surrounding curvature, and keeps the sharp edges
+/// and corners the hole lies over; otherwise the patch is flat (ear clipping only). Every hole is
+/// filled from the mesh as it was before any was filled, so the holes are independent (they run in
+/// parallel) and the result does not depend on the number of threads.
 pub fn fill_holes(mesh: &mut Mesh, max_edges: usize, smooth: bool) -> FillReport {
     fill_holes_with(mesh, max_edges, smooth, smooth)
 }
@@ -82,124 +93,126 @@ pub fn fill_holes(mesh: &mut Mesh, max_edges: usize, smooth: bool) -> FillReport
 /// switch.
 pub(crate) fn fill_holes_with(mesh: &mut Mesh, max_edges: usize, smooth: bool, sharpen: bool) -> FillReport {
     let mut rep = FillReport::default();
-    let max_edges = max_edges.clamp(3, 4000);
-    let loops = boundary_loops(mesh);
-    // the surface around every hole is read from the mesh as it is before any is filled
-    let around =
-        (smooth && sharpen && loops.iter().any(|lp| lp.len() <= max_edges)).then(|| crate::crease::Around::new(mesh));
-    for lp in loops {
-        if lp.len() > max_edges {
-            rep.skipped += 1;
-            continue;
-        }
-        // fill triangles run against the loop direction
-        let rev: Vec<u32> = lp.iter().rev().copied().collect();
-        let first_new = mesh.triangles.len();
-        let first_vertex = mesh.positions.len();
-        let ok = ear_clip(mesh, &rev);
-        if !ok {
-            fan_fill(mesh, &rev);
-        }
-        if smooth {
-            refine_and_fair(mesh, first_new, &lp);
-            if let Some(around) = &around {
-                crate::crease::sharpen_patch(mesh, around, first_new, first_vertex, &lp);
-            }
-        }
+    let max_edges = max_edges.clamp(3, MAX_FILL_EDGES);
+    let (todo, long): (Vec<Vec<u32>>, Vec<Vec<u32>>) =
+        boundary_loops(mesh).into_iter().partition(|lp| lp.len() <= max_edges);
+    rep.skipped = long.len();
+    drop(long);
+    if todo.is_empty() {
+        return rep;
+    }
+    let faces = VertexFaces::new(mesh);
+    let source: &Mesh = mesh;
+    let fill = |lp: &Vec<u32>| fill_in_workspace(source, &faces, lp, smooth, sharpen);
+    // a single hole stays on this thread (the crease tests read a thread-local reason)
+    let patches: Vec<Patch> = if todo.len() < 2 { todo.iter().map(fill).collect() } else { par::map_slice(&todo, fill) };
+    for patch in patches {
         rep.filled += 1;
-        rep.added_triangles += mesh.triangles.len() - first_new;
+        rep.added_triangles += patch.triangles.len();
+        patch.append_to(mesh);
     }
     rep
 }
 
-fn loop_frame(mesh: &Mesh, lp: &[u32]) -> (Point3, Vec3, Vec3, Vec3) {
-    // Newell normal and centroid
-    let mut n = Vec3::zeros();
-    let mut c = Vec3::zeros();
-    for (k, &a) in lp.iter().enumerate() {
-        let p = mesh.positions[a as usize];
-        let q = mesh.positions[lp[(k + 1) % lp.len()] as usize];
-        n += Vec3::new((p.y - q.y) * (p.z + q.z), (p.z - q.z) * (p.x + q.x), (p.x - q.x) * (p.y + q.y));
-        c += p.coords;
-    }
-    let n = crate::normalize(n).unwrap_or_else(Vec3::z);
-    let x = crate::any_perpendicular(&n);
-    let y = n.cross(&x);
-    (Point3::from(c / lp.len() as f64), x, y, n)
+/// The triangles around every vertex of a mesh (compressed rows).
+struct VertexFaces {
+    start: Vec<u32>,
+    faces: Vec<u32>,
 }
 
-/// Ear clipping in the loop's mean plane; false when the projected polygon is not simple enough.
-fn ear_clip(mesh: &mut Mesh, lp: &[u32]) -> bool {
-    let (o, x, y, _) = loop_frame(mesh, lp);
-    let p2: Vec<[f64; 2]> = lp
-        .iter()
-        .map(|&v| {
-            let d = mesh.positions[v as usize] - o;
-            [d.dot(&x), d.dot(&y)]
-        })
-        .collect();
-    let mut idx: Vec<usize> = (0..lp.len()).collect();
-    // orientation of the projected polygon
-    let area2: f64 = (0..p2.len())
-        .map(|k| {
-            let (a, b) = (p2[k], p2[(k + 1) % p2.len()]);
-            a[0] * b[1] - b[0] * a[1]
-        })
-        .sum();
-    let sign = if area2 >= 0.0 { 1.0 } else { -1.0 };
-    let cross = |a: [f64; 2], b: [f64; 2], c: [f64; 2]| (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
-    let mut out: Vec<[u32; 3]> = Vec::with_capacity(lp.len());
-    let mut guard = 0;
-    while idx.len() > 3 {
-        guard += 1;
-        if guard > lp.len() * lp.len() + 10 {
-            return false;
-        }
-        let m = idx.len();
-        let mut best: Option<(usize, f64)> = None;
-        for k in 0..m {
-            let (ia, ib, ic) = (idx[(k + m - 1) % m], idx[k], idx[(k + 1) % m]);
-            let (a, b, c) = (p2[ia], p2[ib], p2[ic]);
-            let cr = cross(a, b, c) * sign;
-            if cr <= 1e-15 {
-                continue;
+impl VertexFaces {
+    fn new(mesh: &Mesh) -> Self {
+        let mut start = vec![0u32; mesh.positions.len() + 1];
+        for t in &mesh.triangles {
+            for &v in t {
+                start[v as usize + 1] += 1;
             }
-            let inside = idx.iter().any(|&j| {
-                if j == ia || j == ib || j == ic {
-                    return false;
+        }
+        for i in 1..start.len() {
+            start[i] += start[i - 1];
+        }
+        let mut next = start.clone();
+        let mut faces = vec![0u32; start.last().copied().unwrap_or(0) as usize];
+        for (i, t) in mesh.triangles.iter().enumerate() {
+            for &v in t {
+                faces[next[v as usize] as usize] = i as u32;
+                next[v as usize] += 1;
+            }
+        }
+        Self { start, faces }
+    }
+
+    fn of(&self, v: u32) -> &[u32] {
+        let (a, b) = (self.start[v as usize] as usize, self.start[v as usize + 1] as usize);
+        &self.faces[a..b]
+    }
+}
+
+/// What filling one hole added, in the vertex numbers of its workspace.
+struct Patch {
+    /// Mesh vertex of every workspace vertex that was in the mesh.
+    origin: Vec<u32>,
+    /// New vertices (workspace numbers from `origin.len()` on).
+    positions: Vec<Point3>,
+    /// New triangles.
+    triangles: Vec<[u32; 3]>,
+}
+
+impl Patch {
+    fn append_to(self, mesh: &mut Mesh) {
+        let (base, first) = (self.origin.len() as u32, mesh.positions.len() as u32);
+        let map = |v: u32| if v < base { self.origin[v as usize] } else { first + (v - base) };
+        mesh.triangles.extend(self.triangles.iter().map(|t| t.map(map)));
+        mesh.positions.extend(self.positions);
+    }
+}
+
+/// Fills the loop `lp` in a copy of the triangles around it, which is all the fairing and the
+/// sharpening read; the copy numbers its vertices in the order of the mesh's, so the patch is the
+/// one the whole mesh would give.
+fn fill_in_workspace(mesh: &Mesh, faces: &VertexFaces, lp: &[u32], smooth: bool, sharpen: bool) -> Patch {
+    let mut tris: Vec<u32> = Vec::new();
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut front: Vec<u32> = lp.to_vec();
+    for _ in 0..WORKSPACE_RINGS {
+        let mut next = Vec::new();
+        for &v in &front {
+            for &t in faces.of(v) {
+                if seen.insert(t) {
+                    tris.push(t);
+                    next.extend(mesh.triangles[t as usize]);
                 }
-                let p = p2[j];
-                cross(a, b, p) * sign > 0.0 && cross(b, c, p) * sign > 0.0 && cross(c, a, p) * sign > 0.0
-            });
-            if inside {
-                continue;
-            }
-            // prefer well-shaped ears: area over squared longest edge
-            let l = |u: [f64; 2], v: [f64; 2]| (u[0] - v[0]).powi(2) + (u[1] - v[1]).powi(2);
-            let q = cr / l(a, b).max(l(b, c)).max(l(c, a)).max(1e-300);
-            if best.is_none_or(|(_, bq)| q > bq) {
-                best = Some((k, q));
             }
         }
-        let Some((k, _)) = best else { return false };
-        let (ia, ib, ic) = (idx[(k + m - 1) % m], idx[k], idx[(k + 1) % m]);
-        out.push([lp[ia], lp[ib], lp[ic]]);
-        idx.remove(k);
+        front = next;
     }
-    if let [a, b, c] = idx.as_slice() {
-        out.push([lp[*a], lp[*b], lp[*c]]);
+    tris.sort_unstable();
+    let mut origin: Vec<u32> = tris.iter().flat_map(|&t| mesh.triangles[t as usize]).chain(lp.iter().copied()).collect();
+    origin.sort_unstable();
+    origin.dedup();
+    let local = |v: u32| origin.binary_search(&v).map_or(0, |k| k as u32);
+    let mut work = Mesh {
+        positions: origin.iter().map(|&v| mesh.positions[v as usize]).collect(),
+        triangles: tris.iter().map(|&t| mesh.triangles[t as usize].map(local)).collect(),
+    };
+    let lp: Vec<u32> = lp.iter().map(|&v| local(v)).collect();
+    let around = (smooth && sharpen).then(|| crate::crease::Around::new(&work));
+    let (first_tri, first_vertex) = (work.triangles.len(), work.positions.len());
+    // fill triangles run against the loop direction
+    let rev: Vec<u32> = lp.iter().rev().copied().collect();
+    if !ear_clip(&mut work, &rev) {
+        fan_fill(&mut work, &rev);
     }
-    mesh.triangles.extend(out);
-    true
-}
-
-/// Fan around a new centre vertex (fallback for loops that do not project to a simple polygon).
-fn fan_fill(mesh: &mut Mesh, lp: &[u32]) {
-    let (o, _, _, _) = loop_frame(mesh, lp);
-    let c = mesh.positions.len() as u32;
-    mesh.positions.push(o);
-    for k in 0..lp.len() {
-        mesh.triangles.push([lp[k], lp[(k + 1) % lp.len()], c]);
+    if smooth {
+        refine_and_fair(&mut work, first_tri, &lp);
+        if let Some(around) = &around {
+            crate::crease::sharpen_patch(&mut work, around, first_tri, first_vertex, &lp);
+        }
+    }
+    Patch {
+        origin,
+        positions: work.positions.split_off(first_vertex),
+        triangles: work.triangles.split_off(first_tri),
     }
 }
 
@@ -442,5 +455,76 @@ fn fair_patch(mesh: &mut Mesh, first_tri: usize, first_vertex: usize) {
                 mesh.positions[v as usize][axis] = x[k];
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Rng, synth};
+
+    fn in_pool<T: Send>(threads: usize, f: impl FnOnce() -> T + Send) -> T {
+        rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap().install(f)
+    }
+
+    /// A sphere with holes punched around `count` well-spread vertices.
+    fn punched(count: usize) -> Mesh {
+        let m = synth::sphere(Point3::origin(), 10.0, 120, 60);
+        let mut rng = Rng::new(3);
+        let seeds: Vec<Point3> = (0..count).map(|_| m.positions[rng.index(m.positions.len())]).collect();
+        let triangles = m
+            .triangles
+            .iter()
+            .copied()
+            .filter(|t| {
+                let c = (m.positions[t[0] as usize].coords + m.positions[t[1] as usize].coords + m.positions[t[2] as usize].coords) / 3.0;
+                seeds.iter().all(|s| (c - s.coords).norm() > 1.2)
+            })
+            .collect();
+        Mesh { positions: m.positions, triangles }
+    }
+
+    #[test]
+    fn filled_holes_are_the_same_on_one_and_many_threads() {
+        let holed = punched(12);
+        let before = boundary_loops(&holed).len();
+        assert!(before >= 6, "{before}");
+        for smooth in [false, true] {
+            let run = |threads: usize| {
+                in_pool(threads, || {
+                    let mut m = holed.clone();
+                    let rep = fill_holes(&mut m, 4000, smooth);
+                    (rep, m)
+                })
+            };
+            let ((r1, m1), (r8, m8)) = (run(1), run(8));
+            assert_eq!(r1, r8);
+            assert_eq!(m1, m8, "smooth = {smooth}");
+            assert_eq!(r1.filled, before);
+            assert!(boundary_loops(&m1).is_empty(), "holes left");
+            assert!(m1.validate().is_ok());
+        }
+    }
+
+    /// A disc of 4 500 boundary edges (past the former limit of 4 000) is filled flat.
+    #[test]
+    fn a_hole_beyond_four_thousand_edges_is_filled() {
+        let n = 4500;
+        let mut positions: Vec<Point3> = (0..n)
+            .map(|k| {
+                let a = std::f64::consts::TAU * k as f64 / n as f64;
+                let r = 20.0 + (9.0 * a).sin();
+                Point3::new(r * a.cos(), r * a.sin(), 0.0)
+            })
+            .collect();
+        positions.push(Point3::origin());
+        let triangles = (0..n as u32).map(|k| [n as u32, k, (k + 1) % n as u32]).collect();
+        let mut m = Mesh { positions, triangles };
+        let loops = boundary_loops(&m);
+        assert_eq!(loops.iter().map(Vec::len).collect::<Vec<_>>(), vec![n]);
+        let rep = fill_holes(&mut m, 5000, false);
+        assert_eq!((rep.filled, rep.skipped, rep.added_triangles), (1, 0, n - 2));
+        assert!(boundary_loops(&m).is_empty());
+        assert_eq!(fill_holes(&mut Mesh::default(), 5000, false), FillReport::default());
     }
 }

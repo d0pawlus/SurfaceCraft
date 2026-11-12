@@ -20,6 +20,7 @@ pub mod chunked;
 pub mod cloud;
 mod crease;
 mod decimate;
+mod ear;
 pub mod edit;
 mod holes;
 pub mod kdtree;
