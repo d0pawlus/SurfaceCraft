@@ -71,6 +71,20 @@ fn finish(s: &Session, text: String, path: Option<String>, bodies: usize, conten
     }
 }
 
+/// The STEP text of solid bodies: our compact writer (shared vertices, edge curves and control
+/// points; a few KB per spline patch) for what it supports, the solidcore exporter (about 24 KB
+/// per patch) for the rest. A record the compact writer rejects as invalid stays an error.
+fn solids_text(name: &str, items: &[(String, Brep)]) -> CmdResult<String> {
+    let bodies: Vec<&Brep> = items.iter().map(|(_, b)| b).collect();
+    match surfacecraft_io::step::write_solids(name, &bodies) {
+        Err(surfacecraft_io::IoError::Unsupported(_)) => {
+            let refs: Vec<(&str, &Brep)> = items.iter().map(|(n, b)| (n.as_str(), b)).collect();
+            Ok(surfacecraft_kernel::step::export_solids(&refs)?)
+        }
+        other => Ok(other?),
+    }
+}
+
 fn export_step(s: &mut Session, i: ExportIn) -> CmdResult<ExportOut> {
     let items = collect(s, &i.objects)?;
     let name = i.name.unwrap_or_else(|| "surfacecraft".into());
@@ -80,8 +94,7 @@ fn export_step(s: &mut Session, i: ExportIn) -> CmdResult<ExportOut> {
         let text = surfacecraft_io::step::write_sheets(&name, &refs)?;
         finish(s, text, i.path, items.len(), "sheets")
     } else if sheets == 0 {
-        let refs: Vec<(&str, &Brep)> = items.iter().map(|(n, b)| (n.as_str(), b)).collect();
-        let text = surfacecraft_kernel::step::export_solids(&refs)?;
+        let text = solids_text(&name, &items)?;
         finish(s, text, i.path, items.len(), "solids")
     } else {
         Err(CmdError::Params("sheets and solids go to separate STEP files: export them in two calls".into()))

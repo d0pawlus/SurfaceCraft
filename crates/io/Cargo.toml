@@ -16,5 +16,8 @@ serde.workspace = true
 thiserror.workspace = true
 schemars.workspace = true
 
+[dev-dependencies]
+rayon.workspace = true
+
 [lints]
 workspace = true

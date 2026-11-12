@@ -37,6 +37,7 @@ pub mod select;
 pub mod settings;
 pub mod shell;
 pub mod shot;
+pub mod sketch_cache;
 pub mod sketch_editor;
 pub mod theme;
 pub mod viewcube;
