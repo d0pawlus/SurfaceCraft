@@ -149,3 +149,61 @@ fn bad_parameters_are_refused_and_change_nothing() {
     assert_eq!(s.doc.meshes.len(), 1);
     assert!(s.doc.regions.is_empty() && s.doc.primitives.is_empty() && s.doc.bodies.is_empty());
 }
+
+#[test]
+fn a_freeform_scan_is_named_as_such_and_pointed_at_the_surface_guide() {
+    // Arrange: a ball with a wavy skin; no plane, cylinder, cone, sphere or torus fits it
+    let mut s = Session::new();
+    s.execute("mesh.synth", json!({"shape": "sphere", "resolution": 48, "name": "scan"})).unwrap();
+    let id = s.doc.find_by_name("scan").unwrap().0;
+    let mut mesh = (*s.doc.mesh(id).unwrap().mesh).clone();
+    for v in &mut mesh.positions {
+        let k = 1.0 + 0.15 * (0.9 * v.x).sin() * (1.1 * v.y).cos() + 0.1 * (1.3 * v.z).sin();
+        *v *= k;
+    }
+    let mut s = Session::new();
+    s.doc.add_mesh("scan", mesh);
+
+    // Act
+    let out = s.execute("scan.to_solid", json!({"scan": "scan"})).unwrap();
+
+    // Assert
+    assert_eq!(out["verdict"], "fail", "{out}");
+    assert!(codes(&out["issues"]).contains(&"mostly_freeform".to_string()), "{out}");
+    let steps = out["next_steps"].as_array().unwrap();
+    assert!(steps.iter().any(|st| st["params"]["topic"] == "fit-surfaces"), "{out}");
+    assert!(steps.iter().all(|st| st["params"]["reuse_regions"] != true), "{out}");
+    for st in steps {
+        let r = s.execute(st["command"].as_str().unwrap(), st["params"].clone());
+        assert!(!matches!(r, Err(EngineError::InvalidParams(_) | EngineError::UnknownCommand(_))), "{st}: {r:?}");
+    }
+}
+
+#[test]
+fn a_scan_with_non_manifold_edges_gets_a_verdict_not_an_error() {
+    // Arrange: the pin scan with a fin, a third triangle on an edge of the surface
+    let mut scratch = Session::new();
+    let cad = chamfered_pin(&mut scratch);
+    let mut s = raw_scan_session(&cad, 8);
+    s.execute("mesh.clean", json!({"object": "scan", "fill_holes_max_edges": 400})).unwrap();
+    let id = s.doc.find_by_name("scan").unwrap().0;
+    let mut mesh = (*s.doc.mesh(id).unwrap().mesh).clone();
+    let [a, b, c] = mesh.triangles[0];
+    let apex = mesh.positions[a as usize] + (mesh.positions[b as usize] - mesh.positions[c as usize]);
+    let tip = mesh.positions.len() as u32;
+    mesh.positions.push(apex);
+    mesh.triangles.push([a, b, tip]);
+    let mut s = Session::new();
+    s.doc.add_mesh("scan", mesh);
+    let qa = s.execute("scan.qa", json!({"object": "scan"})).unwrap();
+    assert!(qa["non_manifold_edges"].as_u64().unwrap() > 0, "{qa}");
+
+    // Act
+    let out = s.execute("scan.to_solid", json!({"scan": "scan", "clean": false})).unwrap();
+
+    // Assert
+    assert!(out["scan_report"]["non_manifold_edges"].as_u64().unwrap() > 0, "{out}");
+    if out["verdict"] != "pass" {
+        assert!(codes(&out["issues"]).contains(&"non_manifold_edges".to_string()), "{out}");
+    }
+}

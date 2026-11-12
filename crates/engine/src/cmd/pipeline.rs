@@ -8,7 +8,7 @@ use super::deviation::{NOISE_PRIMITIVE_MM, positive, yes};
 use super::hybrid::{FaceOf, FromRegionsIn, from_regions};
 use super::mesh_edit::{CleanIn, clean};
 use super::primitive::{AutoConstrainIn, FitIn, KindChoice, auto_constrain, fit_cmd};
-use super::qa::{CompareIn, CompareOut, Finding, QaIn, Severity, compare, scan_qa};
+use super::qa::{CompareIn, CompareOut, Finding, QaIn, compare, scan_qa};
 use super::region::{AutoIn, auto_segment};
 use super::{CmdError, CmdResult, CommandSpec, ObjRef};
 use crate::{Session, command};
@@ -42,6 +42,10 @@ const MAX_LISTED_LEFT_OUT: usize = 20;
 const MAX_LISTED_FACES: usize = 5;
 /// Left-out regions offered to `surface.fit` in the next steps.
 const MAX_SURFACE_HINTS: usize = 3;
+/// A scan with less than this share of its triangles in modelled regions is mostly freeform.
+const MIN_MODELLED_SHARE: f64 = 0.5;
+/// Findings of the quality check that stop the run: nothing can be computed on such a mesh.
+const BLOCKING_FINDINGS: [&str; 2] = ["invalid_mesh", "empty_mesh"];
 
 /// Parameters of `scan.to_solid`.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -124,6 +128,8 @@ pub struct ScanSummary {
     pub holes_filled: usize,
     /// Holes left open (above the size limit).
     pub holes_left: usize,
+    /// Edges shared by three or more triangles, after cleaning.
+    pub non_manifold_edges: usize,
     /// Estimated scanner noise sigma after cleaning (mm); null when it cannot be estimated.
     pub noise_sigma: Option<f64>,
     /// Findings of the quality check before cleaning.
@@ -375,6 +381,7 @@ struct Outcome {
     left_out: Vec<LeftOut>,
     unassigned: usize,
     holes_left: usize,
+    non_manifold: usize,
 }
 
 impl Outcome {
@@ -388,6 +395,14 @@ impl Outcome {
 
     fn covered(&self) -> bool {
         self.deviation.as_ref().is_some_and(|d| d.coverage >= MIN_COVERAGE)
+    }
+
+    /// Share of the scan's triangles in the regions that became primitives.
+    fn modelled_share(&self, total_triangles: usize) -> f64 {
+        if total_triangles == 0 {
+            return 0.0;
+        }
+        self.modelled.iter().map(|m| m.triangles).sum::<usize>() as f64 / total_triangles as f64
     }
 }
 
@@ -423,7 +438,7 @@ fn blocking_issues(o: &Outcome, set: &Settings) -> Vec<Issue> {
             );
             list.push(issue("low_coverage", msg));
         }
-        if d.within < set.min_within {
+        if d.count > 0 && d.within < set.min_within {
             let msg = format!(
                 "{:.2} % of the measured points are within {} mm ({:.0} % required); max {:.3} mm, RMS {:.3} mm",
                 100.0 * d.within,
@@ -441,6 +456,14 @@ fn blocking_issues(o: &Outcome, set: &Settings) -> Vec<Issue> {
 /// Context for a run that did not pass: what the solid was not built from.
 fn context_issues(o: &Outcome, total_triangles: usize) -> Vec<Issue> {
     let mut list = Vec::new();
+    let share = o.modelled_share(total_triangles);
+    if share < MIN_MODELLED_SHARE {
+        let msg = format!(
+            "only {:.0} % of the scan lies in regions a primitive fits: the part is mostly freeform, and this command models planes, cylinders, cones, spheres and tori",
+            100.0 * share
+        );
+        list.push(issue("mostly_freeform", msg));
+    }
     let left: usize = o.left_out.iter().map(|l| l.triangles).sum();
     if left > 0 {
         let msg = format!("{} regions ({left} triangles) were not modelled", o.left_out.len());
@@ -452,6 +475,13 @@ fn context_issues(o: &Outcome, total_triangles: usize) -> Vec<Issue> {
     }
     if o.holes_left > 0 {
         list.push(issue("scan_defects", format!("{} holes of the scan were too large to fill", o.holes_left)));
+    }
+    if o.non_manifold > 0 {
+        let msg = format!(
+            "{} edges are shared by three or more triangles; regions and holes next to them are unreliable",
+            o.non_manifold
+        );
+        list.push(issue("non_manifold_edges", msg));
     }
     list
 }
@@ -472,7 +502,12 @@ fn next_steps(o: &Outcome, issues: &[Issue], set: &Settings) -> Vec<NextStep> {
         let why = "reports the role of each primitive and why an input is skipped, before any cut";
         steps.push(step("body.plan_regions", json!({"primitives": primitives}), why));
     }
+    if has("mostly_freeform") {
+        let why = "the freeform path: fit surfaces to the regions and build the solid from them";
+        steps.push(step("guide.read", json!({"topic": "fit-surfaces"}), why));
+    }
     if has("out_of_tolerance")
+        && o.covered()
         && let Some(b) = &o.body
     {
         let why = "moves the analytic faces of the solid onto the scan (planes shift, radii change)";
@@ -487,7 +522,7 @@ fn next_steps(o: &Outcome, issues: &[Issue], set: &Settings) -> Vec<NextStep> {
         let why = "fills the holes that were too large (this drops the regions), then model the scan again";
         steps.push(step("mesh.fill_holes", json!({"object": o.scan, "max_edges": MAX_FILL_EDGES}), why));
         steps.push(step("scan.to_solid", json!({"scan": o.scan}), "segments and models the repaired scan"));
-    } else {
+    } else if !has("mostly_freeform") {
         let why = "after correcting the regions (region.merge, region.split, region.grow, region.resegment), model them again";
         steps.push(step("scan.to_solid", json!({"scan": o.scan, "reuse_regions": true}), why));
     }
@@ -512,10 +547,10 @@ fn verdict_of(o: &Outcome, issues: &[Issue]) -> Verdict {
 /// Cleans the scan when asked and reports what the scan was and is.
 fn prepare(s: &mut Session, i: &ToSolidIn, scan: ObjectId) -> CmdResult<ScanSummary> {
     let qa = scan_qa(s, QaIn { object: ObjRef::Id(scan.0) })?;
-    if let Some(f) = qa.findings.iter().find(|f| f.severity == Severity::Error) {
+    if let Some(f) = qa.findings.iter().find(|f| BLOCKING_FINDINGS.contains(&f.code.as_str())) {
         return Err(CmdError::Failed(format!("the scan cannot be modelled: {}", f.message)));
     }
-    let (mut filled, mut left) = (0, qa.holes);
+    let (mut filled, mut left, mut non_manifold) = (0, qa.holes, qa.non_manifold_edges);
     if i.clean && !i.reuse_regions {
         let edit = clean(
             s,
@@ -529,6 +564,10 @@ fn prepare(s: &mut Session, i: &ToSolidIn, scan: ObjectId) -> CmdResult<ScanSumm
         )?;
         filled = edit.holes_filled.unwrap_or(0);
         left = edit.holes_left.unwrap_or(0);
+        if non_manifold > 0 {
+            // cleaning removes debris and spikes, which is where most such edges are
+            non_manifold = scan_qa(s, QaIn { object: ObjRef::Id(scan.0) })?.non_manifold_edges;
+        }
     }
     let noise = s.doc.mesh(scan).map(|m| noise_estimate(&m.mesh)).filter(|e| e.smooth).map(|e| e.sigma);
     Ok(ScanSummary {
@@ -537,6 +576,7 @@ fn prepare(s: &mut Session, i: &ToSolidIn, scan: ObjectId) -> CmdResult<ScanSumm
         holes_before: qa.holes,
         holes_filled: filled,
         holes_left: left,
+        non_manifold_edges: non_manifold,
         noise_sigma: noise,
         findings: qa.findings,
     })
@@ -623,6 +663,7 @@ fn to_solid(s: &mut Session, i: ToSolidIn) -> CmdResult<ToSolidOut> {
         left_out: left,
         unassigned,
         holes_left: scan_report.holes_left,
+        non_manifold: scan_report.non_manifold_edges,
     };
     build(s, &set, &mut o)?;
     let issues = issues_of(&o, &set, total);

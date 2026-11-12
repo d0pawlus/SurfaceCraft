@@ -41,9 +41,15 @@ Use the step-by-step guides when the part is organic or when you need a feature 
 - `skipped_inputs`: a primitive could not be built in; `modelled[].skipped` says why.
 - `low_coverage`: part of the scan has no face. Look at `left_out` and at `unassigned_triangles`.
 - `out_of_tolerance`: `body.refit_faces` moves the faces onto the scan; `worst_faces` says where.
+  It is offered only when the solid covers the scan.
 - `left_out_regions` with an RMS reason: the region is freeform. `surface.fit` it and build with
   `body.from_regions`, passing the primitives of `modelled` and the surface in `surfaces`.
 - `unassigned_triangles`: `region.grow` from a seed, or `region.resegment` with a looser tolerance.
+- `mostly_freeform`: less than half of the scan lies in regions a primitive fits (a body panel,
+  a casting, an organic shape). This command will not model it: follow guide `fit-surfaces`.
+- `non_manifold_edges`: edges shared by three or more triangles are left after cleaning; the
+  regions and holes next to them are unreliable. `mesh.reconstruct` builds a new mesh from the
+  points of the file.
 - `scan_defects`: holes too large to fill; `mesh.fill_holes` with a larger `max_edges` (it drops
   the regions), then `scan.to_solid` again without `reuse_regions`.
 

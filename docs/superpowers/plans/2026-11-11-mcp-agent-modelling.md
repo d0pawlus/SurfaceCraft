@@ -22,7 +22,8 @@ the bridged mode exist (M6, P8-E1, P8-E2); this plan closes what an agent still 
 One undoable command that runs the proven steps in order and judges the result. It calls the
 existing handlers directly (one undo step, one log entry), so it adds no geometry code.
 
-1. `scan.qa`; a blocking finding (invalid or empty mesh) stops the run.
+1. `scan.qa`; an invalid or empty mesh stops the run. Non-manifold edges do not: they are counted
+   again after cleaning and reported as an issue.
 2. `mesh.clean` with hole filling (`clean`, default true; `fill_holes_max_edges`, default 400).
 3. Regions: `region.auto_segment`, or the scan's existing regions with `reuse_regions` (the agent
    fixes regions by hand and runs again; no cleaning then, as cleaning would drop the regions).
@@ -41,7 +42,8 @@ Output: the ids made (`regions`, `primitives`, `body`), the step reports in shor
   `tolerance` >= `min_within`, default 0.99), `review` (a solid, with issues), `fail` (no solid, or a
   solid that covers less than 90 % of the scan points);
 - `issues`: `{code, message}` with stable codes (`skipped_inputs`, `low_coverage`,
-  `out_of_tolerance`, `left_out_regions`, `unassigned_triangles`, `no_solid`, `scan_defects`);
+  `out_of_tolerance`, `left_out_regions`, `unassigned_triangles`, `no_solid`, `scan_defects`,
+  `mostly_freeform`, `non_manifold_edges`);
 - `next_steps`: `{command, params, why}`, ready to call (`export.step` on a pass; `surface.fit` for
   a large left-out region; `body.plan_regions` for skipped inputs; `body.refit_faces` for faces out
   of tolerance).
