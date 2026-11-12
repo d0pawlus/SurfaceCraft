@@ -220,6 +220,26 @@ fn advice(round: &Round, tolerance: f64) -> String {
     format!("{:.1} % of the scan is within {tolerance} mm (p99 {:.3} mm); {why}", 100.0 * d.within, d.p99)
 }
 
+/// The tolerance is a larger share of the part than this: the reduction has nothing to hold on to.
+pub(crate) const MAX_TOLERANCE_SHARE: f64 = 0.05;
+
+/// Advice when the tolerance is not small against the part (a scan in metres, a tolerance in mm).
+pub(crate) fn scale_warning(tolerance: f64, diagonal: f64) -> Option<String> {
+    (diagonal.is_finite() && tolerance > MAX_TOLERANCE_SHARE * diagonal).then(|| {
+        format!(
+            "the tolerance {tolerance} is {:.0} % of the size of the part (diagonal {diagonal:.4}): check the units of the scan; the coarse mesh is reduced within a budget of several tolerances, so a part this small is not resolved",
+            100.0 * tolerance / diagonal
+        )
+    })
+}
+
+/// Advice when a closed network has no positive volume: its faces are not consistently oriented.
+fn orientation_warning(closed: bool, volume: Option<f64>) -> Option<String> {
+    (closed && !volume.is_some_and(|v| v.is_finite() && v > 0.0)).then(|| {
+        "the network is closed but the body has no positive volume: its faces are not consistently oriented".into()
+    })
+}
+
 pub(crate) fn wrap(s: &mut Session, i: WrapIn) -> CmdResult<WrapOut> {
     let id = i.mesh.resolve(s, ObjectKind::Mesh)?;
     let set = settings(&i)?;
@@ -238,9 +258,18 @@ pub(crate) fn wrap(s: &mut Session, i: WrapIn) -> CmdResult<WrapOut> {
     let jump_mean = (jumps.iter().sum::<f64>() / jumps.len().max(1) as f64).to_degrees();
     let (smooth, sharp) = jump_stats(&round.set, &round.creases);
     let body = s.doc.add_body(i.name.as_deref().unwrap_or("wrap"), sheet);
+    let body_info = body_out(s, body)?;
+    let warnings: Vec<String> = [
+        (round.deviation.within < set.min_within).then(|| advice(&round, set.tolerance)),
+        scale_warning(set.tolerance, scan.bbox().diagonal()),
+        orientation_warning(closed, body_info.volume),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     let within_tolerance = round.deviation.within >= set.min_within;
     Ok(WrapOut {
-        body: body_out(s, body)?,
+        body: body_info,
         closed,
         patches: round.set.nets.len(),
         coarse_triangles: round.coarse_triangles,
@@ -260,7 +289,7 @@ pub(crate) fn wrap(s: &mut Session, i: WrapIn) -> CmdResult<WrapOut> {
         g0_patches: round.g0_patches,
         smooth_jump: smooth.into(),
         crease_angle_mean_deg: (sharp.count > 0).then_some(sharp.mean_deg),
-        warning: (!within_tolerance).then(|| advice(&round, set.tolerance)),
+        warning: (!warnings.is_empty()).then(|| warnings.join("; ")),
     })
 }
 

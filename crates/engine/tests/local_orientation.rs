@@ -47,7 +47,12 @@ fn old_jumps(set: &surfacecraft_fit::patch::PatchSet) -> Vec<f64> {
             let t = f64::from(k) / 8.0;
             let uv = |s: usize, fw: bool| {
                 let t = if fw { t } else { 1.0 - t };
-                match s { 0 => (t, 0.0), 1 => (1.0, t), 2 => (1.0 - t, 1.0), _ => (0.0, 1.0 - t) }
+                match s {
+                    0 => (t, 0.0),
+                    1 => (1.0, t),
+                    2 => (1.0 - t, 1.0),
+                    _ => (0.0, 1.0 - t),
+                }
             };
             let (u0, v0) = uv(*s0, *fw0);
             let (u1, v1) = uv(*s1, *fw1);
@@ -99,7 +104,12 @@ fn scan_report(scan: &Mesh) -> String {
     let v = signed_volume(scan);
     format!(
         "extent {:.4} x {:.4} x {:.4}, area {:.4}, signed volume {:.5}, 2V/A {:.5}",
-        hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2], area, v, 2.0 * v / area
+        hi[0] - lo[0],
+        hi[1] - lo[1],
+        hi[2] - lo[2],
+        area,
+        v,
+        2.0 * v / area
     )
 }
 
@@ -116,8 +126,13 @@ fn dihedral_report(m: &Mesh) -> String {
     let mut same_dir = 0usize;
     for ((a, b), fs) in &edges {
         let [f0, f1] = fs.as_slice() else { continue };
-        let dir = |f: usize| { let t = m.triangles[f]; (0..3).any(|k| t[k] == *a && t[(k + 1) % 3] == *b) };
-        if dir(*f0) == dir(*f1) { same_dir += 1; }
+        let dir = |f: usize| {
+            let t = m.triangles[f];
+            (0..3).any(|k| t[k] == *a && t[(k + 1) % 3] == *b)
+        };
+        if dir(*f0) == dir(*f1) {
+            same_dir += 1;
+        }
         if let (Some(n0), Some(n1)) = (m.face_normal(*f0), m.face_normal(*f1)) {
             let ang = n0.dot(&n1).clamp(-1.0, 1.0).acos().to_degrees();
             bins[((ang / 30.0) as usize).min(5)] += 1;
@@ -130,9 +145,15 @@ fn budget_sweep(scan: &Mesh) {
     let bvh = Bvh::build(scan);
     for budget in [1.6, 0.4, 0.1, 0.03, 0.01, 0.003, 0.001] {
         let mut coarse = scan.clone();
-        let opts = DecimateOptions { target_triangles: 0, max_error: None, feature_angle_deg: 181.0, preserve_boundary: true };
+        let opts =
+            DecimateOptions { target_triangles: 0, max_error: None, feature_angle_deg: 181.0, preserve_boundary: true };
         let _ = reduce_to_tolerance(&mut coarse, &opts, &ToleranceOptions::new(budget));
-        eprintln!("sweep budget {budget}: {} triangles, {} disagree, {}", coarse.triangle_count(), disagreeing(&coarse, &bvh), dihedral_report(&coarse));
+        eprintln!(
+            "sweep budget {budget}: {} triangles, {} disagree, {}",
+            coarse.triangle_count(),
+            disagreeing(&coarse, &bvh),
+            dihedral_report(&coarse)
+        );
     }
 }
 
@@ -141,7 +162,8 @@ fn coarse_report(scan: &Mesh) -> String {
         budget_sweep(scan);
     }
     let mut coarse = scan.clone();
-    let opts = DecimateOptions { target_triangles: 0, max_error: None, feature_angle_deg: 181.0, preserve_boundary: true };
+    let opts =
+        DecimateOptions { target_triangles: 0, max_error: None, feature_angle_deg: 181.0, preserve_boundary: true };
     let _ = reduce_to_tolerance(&mut coarse, &opts, &ToleranceOptions::new(FIRST_BUDGET * TOLERANCE));
     remove_non_manifold(&mut coarse);
     let bvh = Bvh::build(scan);
@@ -152,7 +174,15 @@ fn coarse_report(scan: &Mesh) -> String {
     jumps.sort_by(f64::total_cmp);
     let mut old = old_jumps(&set);
     old.sort_by(f64::total_cmp);
-    eprintln!("old statistic: p50 {:.1} p99 {:.1} max {:.1}; new: p50 {:.1} p99 {:.1} max {:.1}", percentile_deg(&old, 0.5), percentile_deg(&old, 0.99), percentile_deg(&old, 1.0), percentile_deg(&jumps, 0.5), percentile_deg(&jumps, 0.99), percentile_deg(&jumps, 1.0));
+    eprintln!(
+        "old statistic: p50 {:.1} p99 {:.1} max {:.1}; new: p50 {:.1} p99 {:.1} max {:.1}",
+        percentile_deg(&old, 0.5),
+        percentile_deg(&old, 0.99),
+        percentile_deg(&old, 1.0),
+        percentile_deg(&jumps, 0.5),
+        percentile_deg(&jumps, 0.99),
+        percentile_deg(&jumps, 1.0)
+    );
     let mean = jumps.iter().sum::<f64>() / jumps.len().max(1) as f64;
     format!(
         "coarse {} triangles, {} disagree with the scan normal, volume sign {:+}, patches {}, jump mean {:.1} p50 {:.1} p99 {:.1} max {:.1}",
@@ -168,8 +198,13 @@ fn coarse_report(scan: &Mesh) -> String {
 }
 
 fn compare(s: &mut Session, w: &Value, facing: bool) -> String {
-    match s.execute("body.compare", json!({"body": w["body"]["id"], "scan": "scan", "tolerance": TOLERANCE, "facing": facing})) {
-        Ok(c) => format!("count {} within {:.4}", c["totals"]["count"], c["totals"]["within"].as_f64().unwrap_or(f64::NAN)),
+    match s.execute(
+        "body.compare",
+        json!({"body": w["body"]["id"], "scan": "scan", "tolerance": TOLERANCE, "facing": facing}),
+    ) {
+        Ok(c) => {
+            format!("count {} within {:.4}", c["totals"]["count"], c["totals"]["within"].as_f64().unwrap_or(f64::NAN))
+        }
         Err(e) => format!("error {}", e.to_string().chars().take(80).collect::<String>()),
     }
 }
@@ -222,7 +257,11 @@ fn run_one(number: usize, path: &std::path::Path) {
     };
     eprintln!(
         "C{number:02} wrap: patches {} closed {} within {:.4} reported volume {} jump mean {:.1}",
-        w["patches"], w["closed"], w["deviation"]["within"].as_f64().unwrap_or(f64::NAN), w["body"]["volume"], w["normal_jump_mean_deg"].as_f64().unwrap_or(f64::NAN)
+        w["patches"],
+        w["closed"],
+        w["deviation"]["within"].as_f64().unwrap_or(f64::NAN),
+        w["body"]["volume"],
+        w["normal_jump_mean_deg"].as_f64().unwrap_or(f64::NAN)
     );
     eprintln!("C{number:02} compare facing {}; unfiltered {}", compare(&mut s, &w, true), compare(&mut s, &w, false));
     eprintln!("C{number:02} {}", body_report(&s, &w, &scan));

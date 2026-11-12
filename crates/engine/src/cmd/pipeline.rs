@@ -779,3 +779,29 @@ pub static COMMANDS: &[CommandSpec] = &[command!(
     ToSolidOut,
     to_solid
 )];
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    fn summary_of(coverage: f64, not_facing: f64) -> DeviationSummary {
+        DeviationSummary { count: 100, coverage, not_facing, within: 1.0, rms: 0.0, max_abs: 0.0, mean: 0.0 }
+    }
+
+    #[test]
+    fn a_solid_that_covers_the_scan_has_no_coverage_issue() {
+        assert!(coverage_issue(&summary_of(0.95, 0.0), "the solid").is_none());
+    }
+
+    #[test]
+    fn points_that_lie_on_the_solid_but_face_away_are_an_orientation_issue_not_missing_scan() {
+        let issue = coverage_issue(&summary_of(0.71, 0.29), "the patches").expect("an issue");
+        assert_eq!(issue.code, "inconsistent_orientation");
+    }
+
+    #[test]
+    fn points_far_from_the_solid_are_low_coverage() {
+        let issue = coverage_issue(&summary_of(0.5, 0.05), "the solid").expect("an issue");
+        assert_eq!(issue.code, "low_coverage");
+    }
+}

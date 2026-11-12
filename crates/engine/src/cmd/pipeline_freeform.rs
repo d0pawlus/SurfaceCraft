@@ -6,7 +6,7 @@ use super::{
 };
 use crate::Session;
 use crate::cmd::qa::{CompareIn, compare};
-use crate::cmd::wrap::{PATCH_LIMIT, WrapIn, WrapOut, wrap};
+use crate::cmd::wrap::{PATCH_LIMIT, WrapIn, WrapOut, scale_warning, wrap};
 use crate::cmd::{CmdResult, ObjRef};
 use serde_json::json;
 
@@ -141,7 +141,11 @@ pub(super) fn freeform_solid(s: &mut Session, set: &Settings, report: ScanSummar
     )?;
     let vertices = s.doc.mesh(set.scan).map_or(0, |m| m.mesh.vertex_count());
     let d = summary(&cmp, vertices);
-    let issues = issues_of(&w, &d, set, &report);
+    let mut issues = issues_of(&w, &d, set, &report);
+    let diagonal = s.doc.mesh(set.scan).map_or(f64::NAN, |m| m.mesh.bbox().diagonal());
+    if let Some(msg) = scale_warning(set.tolerance, diagonal) {
+        issues.insert(0, issue("tolerance_exceeds_part", msg));
+    }
     let next = next_steps(&w, &issues, set);
     let verdict = if issues.is_empty() {
         Verdict::Pass

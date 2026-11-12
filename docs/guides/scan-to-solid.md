@@ -66,11 +66,14 @@ Primitives:
 - `skipped_inputs`: a primitive could not be built in; `modelled[].skipped` says why.
 - `low_coverage`: part of the scan has no face (it lies farther than 5 mm from the solid). Look at
   `left_out` and at `unassigned_triangles`.
-- `inconsistent_orientation`: the scan lies on the solid, but `deviation.not_facing` of its points
+- `inconsistent_orientation`: the scan lies on the solid, but a share (`not_facing` in `deviation`) of its points
   face away from it, so the solid is inside out or has faces turned the wrong way. This is a defect
-  of the solid, not a part of the scan it misses. It is a verdict of `fail`. A part much smaller
-  than the tolerance (a scan in metres with a tolerance in millimetres) is the usual cause: check
-  the units of the scan and run again with a tolerance that is small against the part.
+  of the solid, not a part of the scan it misses. It is a verdict of `fail`. A part not much
+  larger than the tolerance (a scan in metres with a tolerance in millimetres) produced it on a
+  real scan: see `tolerance_exceeds_part`.
+- `tolerance_exceeds_part` (freeform): the tolerance is more than 5 % of the size of the part, so the
+  coarse mesh is not resolved and the result cannot be trusted whatever the deviation says. Check the
+  units of the scan (`mesh.scale_from_length`) or give a tolerance in the units of the scan.
 - `out_of_tolerance`: `body.refit_faces` moves the faces onto the scan; `worst_faces` says where.
   It is offered only when the solid covers the scan.
 - `left_out_regions` with an RMS reason: the region is freeform. `surface.fit` it and build with

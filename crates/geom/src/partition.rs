@@ -100,7 +100,8 @@ fn reduce_part(
     let lorigin: Vec<Vec3> = gids.iter().map(|&v| whole.origin[v as usize]).collect();
     let llocked: Vec<bool> = gids.iter().map(|&v| whole.locked[v as usize] || owner[v as usize] == SEAM).collect();
     let mut budget: Vec<f64> = gids.iter().map(|&v| g.1[v as usize]).collect();
-    let mut c = Collapser::new(ltris, lpos, lq, lorigin, llocked.clone(), Some(Guard { bvh: g.0, budget: &mut budget }), false);
+    let mut c =
+        Collapser::new(ltris, lpos, lq, lorigin, llocked.clone(), Some(Guard { bvh: g.0, budget: &mut budget }), false);
     c.run(floor, max_cost);
     let (tris, pos, q, origin) = c.finish();
     let mut used = vec![false; gids.len()];
