@@ -77,7 +77,7 @@ that uses it in one undo step.
   A change that would stop another parameter from evaluating (`h = sqrt(w - 10)` with `w = 5`) is
   refused whole.
 - `param.list` shows each parameter with its expression, value and users; `param.eval` calculates
-  an expression without storing it; `param.rename` rewrites every use of a name; `param.delete`
+  an expression without storing it; `param.rename` rewrites every use of a name (refused whole, naming the offender, if a rewritten expression would be too long or no longer evaluate); `param.delete`
   is refused, with the list of users, while anything uses the parameter. Features rolled back by
   `feature.rollback` count as users, and their expressions are re-evaluated when they come back.
 - The language: numbers (`40`, `1.5e-3`), `+ - * / ^`, parentheses, unary minus, parameter names,
@@ -93,8 +93,10 @@ that uses it in one undo step.
   (`distance`, `draft_deg`, `angle_deg`, `size`, `thickness`, `count`, `degree`, and each
   component of a vector such as `translate` or `plane_normal`), also inside `feature.edit`'s
   `set`. A count must come out whole (to within 1e-9 of an integer) and at most 100000. A plain
-  number given later for the same field replaces the expression. `feature.tree` shows the
+  number given later for the same field replaces the expression (`sketch.edit_constraint` reports the replaced text as `expression_cleared`). `feature.tree` shows the
   `expressions` next to the values.
+
+A project whose stored dimensions or feature values differ from what its expressions give is rebuilt when opened; one with an expression that does not parse, uses an undefined parameter or sits on a field that is not a number is refused.
 
 One example, a block whose depth and fillet follow parameters (edge 4 stands for a vertical edge
 of the block: read the real index from the body):

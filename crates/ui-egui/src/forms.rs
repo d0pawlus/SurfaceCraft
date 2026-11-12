@@ -96,6 +96,11 @@ fn is_null_schema(s: &Value) -> bool {
     s.get("type").and_then(Value::as_str) == Some("null")
 }
 
+/// A number or integer schema marked `x-expr`: the first branch of a number-or-expression union.
+fn is_expr_number(s: &Value) -> bool {
+    s.get("x-expr").is_some() && matches!(type_names(s).as_slice(), ["number"] | ["integer"])
+}
+
 fn type_names(s: &Value) -> Vec<&str> {
     match s.get("type") {
         Some(Value::String(x)) => vec![x.as_str()],
@@ -126,6 +131,10 @@ fn classify_depth<'a>(root: &'a Value, schema: &'a Value, depth: u8) -> (Kind, b
         let Some(branches) = s.get(key).and_then(Value::as_array) else { continue };
         let nullable = branches.iter().any(|b| is_null_schema(resolve(root, b)));
         let rest: Vec<&Value> = branches.iter().filter(|b| !is_null_schema(resolve(root, b))).collect();
+        // a number that may also be given as an expression object: the form edits the number
+        if let Some(first) = rest.first().map(|b| resolve(root, b)).filter(|b| is_expr_number(b)) {
+            return (if type_names(first) == ["integer"] { Kind::Int } else { Kind::Num }, nullable, first);
+        }
         if rest.len() == 1 {
             let (k, n, inner) = classify_depth(root, rest[0], depth + 1);
             return (k, n || nullable, inner);
@@ -1024,7 +1033,10 @@ fn tuple_row(ui: &mut egui::Ui, schema: &Value, value: &mut Value, name: &str, l
     let n = schema.get("minItems").and_then(Value::as_u64).unwrap_or(0) as usize;
     let Some(items) = value.as_array_mut() else { return false };
     items.resize(n, json!(0.0));
-    let int = schema.get("items").and_then(|i| i.get("type")).and_then(Value::as_str) == Some("integer");
+    let int = schema.get("items").is_some_and(|i| {
+        let number = i.get("anyOf").and_then(|a| a.get(0)).unwrap_or(i);
+        number.get("type").and_then(Value::as_str) == Some("integer")
+    });
     for (i, v) in items.iter_mut().enumerate() {
         let mut x = v.as_f64().unwrap_or(0.0);
         let axis = ["x", "y", "z", "w"].get(i).copied();
@@ -1216,6 +1228,23 @@ mod tests {
 
     fn schema_of(id: &str) -> Value {
         (cmd::find(id).map(|c| c.input)).map_or(Value::Null, |f| f())
+    }
+
+    #[test]
+    fn a_number_or_expression_union_is_edited_as_a_number() {
+        let number = json!({"type": "number", "x-expr": true});
+        let expr = json!({"type": "object", "properties": {"expr": {"type": "string"}}, "required": ["expr"]});
+        let root = json!({});
+        let union = json!({"anyOf": [number, expr]});
+        assert_eq!(classify(&root, &union).0, Kind::Num);
+        let int = json!({"anyOf": [{"type": "integer", "x-expr": true}, expr]});
+        assert_eq!(classify(&root, &int).0, Kind::Int);
+        let optional = json!({"anyOf": [union, {"type": "null"}]});
+        let (kind, nullable, _) = classify(&root, &optional);
+        assert!(kind == Kind::Num && nullable);
+        // a union of other things is still not a number
+        let other = json!({"anyOf": [{"type": "number"}, {"type": "object"}]});
+        assert_eq!(classify(&root, &other).0, Kind::Any);
     }
 
     #[test]

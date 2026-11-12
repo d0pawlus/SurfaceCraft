@@ -34,6 +34,10 @@ pub struct SketchOut {
     /// For `sketch.move_point`: where the point ended up and whether it reached the target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub moved: Option<MoveOut>,
+    /// For `sketch.edit_constraint`: the expression the edited dimension had, when the edit
+    /// replaced it with a plain number or removed the dimension.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expression_cleared: Option<String>,
 }
 
 /// What a point move achieved: a position the constraints cannot hold gives the nearest valid
@@ -62,6 +66,7 @@ fn out(s: &Session, id: ObjectId, failed: usize) -> CmdResult<SketchOut> {
         report: o.report.clone(),
         failed_features: failed,
         moved: None,
+        expression_cleared: None,
     })
 }
 
@@ -297,10 +302,13 @@ fn edit(s: &mut Session, i: EditIn) -> CmdResult<SketchOut> {
     let o = s.doc.sketch(id).ok_or_else(|| CmdError::Params(format!("no sketch {id}")))?;
     let next = with_edit(&o.sketch, i.index, i.constraint.as_ref(), &s.doc.params)?;
     next.validate().map_err(|e| CmdError::Params(e.to_string()))?;
+    // a plain number (or a removal) wins over the expression the dimension had; say so
+    let cleared =
+        o.sketch.dim_exprs.get(&i.index).filter(|_| i.constraint.as_ref().is_none_or(|c| c.expr.is_none())).cloned();
     if let Some(o) = s.doc.sketch_mut(id) {
         o.sketch = next;
     }
-    resolve(s, id)
+    Ok(SketchOut { expression_cleared: cleared, ..resolve(s, id)? })
 }
 
 /// Move-point parameters.

@@ -88,7 +88,8 @@ fn users_and_renames_cover_parked_features() {
     let users = users_of(&doc, "d");
     assert_eq!(users.iter().filter(|u| u.kind == "feature").count(), 2, "{users:?}");
     assert!(users.iter().all(|u| u.kind != "parameter"), "no parameter uses d: {users:?}");
-    let (sk, f, r) = renamed_references(&doc, "d", "depth").expect("renames");
+    let (sk, f, r) =
+        renamed_references(&doc, &doc.params.renamed("d", "depth").expect("table"), "d", "depth").expect("renames");
     assert!(sk.is_empty());
     assert_eq!(f[0].exprs.get("distance").map(String::as_str), Some("depth"));
     assert_eq!(r[0].exprs.get("distance").map(String::as_str), Some("depth + 1"));

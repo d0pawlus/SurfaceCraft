@@ -1,5 +1,5 @@
 //! A constraint as a command takes it: a dimension's value may be a number or `{"expr": "..."}`.
-use super::super::param::num::expr_object;
+use super::super::param::num::{expr_branch, expr_object};
 use super::super::{CmdError, CmdResult};
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::de::Error as _;
@@ -70,7 +70,30 @@ impl JsonSchema for ConstraintIn {
     }
 
     fn json_schema(g: &mut SchemaGenerator) -> Schema {
-        Constraint::json_schema(g)
+        let mut v = serde_json::to_value(Constraint::json_schema(g)).unwrap_or(Value::Null);
+        if let Some(variants) = v.get_mut("oneOf").and_then(Value::as_array_mut) {
+            variants.iter_mut().for_each(allow_expression);
+        }
+        Schema::try_from(v).unwrap_or_else(|_| Constraint::json_schema(g))
+    }
+}
+
+/// In a variant of the constraint schema, lets the dimension (`value`, `degrees`) also be an
+/// expression object; the number branch is marked `x-expr` and the description moves outward.
+fn allow_expression(variant: &mut Value) {
+    let Some(props) = variant.get_mut("properties").and_then(Value::as_object_mut) else { return };
+    for key in ["value", "degrees"] {
+        let Some(number) = props.get_mut(key) else { continue };
+        let mut number = number.take();
+        let description = number.as_object_mut().and_then(|m| m.remove("description"));
+        if let Some(m) = number.as_object_mut() {
+            m.insert("x-expr".into(), Value::Bool(true));
+        }
+        let mut union = serde_json::json!({"anyOf": [number, expr_branch()]});
+        if let (Some(d), Some(m)) = (description, union.as_object_mut()) {
+            m.insert("description".into(), d);
+        }
+        props.insert(key.into(), union);
     }
 }
 

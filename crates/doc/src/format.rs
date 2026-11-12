@@ -39,7 +39,9 @@ pub fn from_json(text: &str) -> Result<Document, String> {
     }
     let mut doc = env.document;
     repair_counter(&mut doc)?;
-    doc.params = crate::param_use::validate_document(&doc).map_err(|e| format!("parameters: {e}"))?;
+    let (params, stale) = crate::param_use::validate_document(&doc).map_err(|e| format!("parameters: {e}"))?;
+    doc.params = params;
+    doc.needs_recompute = stale;
     Ok(doc)
 }
 

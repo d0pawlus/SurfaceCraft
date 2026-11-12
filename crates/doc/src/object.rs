@@ -411,6 +411,10 @@ pub struct Document {
     /// Named parameters that dimensions and feature fields can use as expressions.
     #[serde(default, skip_serializing_if = "crate::params::ParamTable::is_empty")]
     pub params: crate::params::ParamTable,
+    /// Set when a project was loaded whose cached dimension and feature values differ from what
+    /// its expressions give: the geometry is stale until the engine recomputes it. Never saved.
+    #[serde(skip)]
+    pub needs_recompute: bool,
     /// Next free id.
     #[serde(default)]
     pub next_id: u64,

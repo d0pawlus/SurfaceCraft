@@ -747,6 +747,10 @@ fn example(p: &Value, root: &Value) -> Value {
             return example(def, root);
         }
     }
+    // a number that may also be an expression object: the number
+    if let Some(first) = p.get("anyOf").and_then(|a| a.get(0)).filter(|f| f.get("x-expr").is_some()) {
+        return example(first, root);
+    }
     match p.get("type").and_then(Value::as_str) {
         Some("string") => json!(""),
         Some("number") | Some("integer") => json!(0),

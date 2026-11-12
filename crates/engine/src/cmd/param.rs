@@ -5,7 +5,7 @@ use super::{CmdError, CmdResult, CommandSpec};
 use crate::{Session, command};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use surfacecraft_doc::param_use::{apply_dim_exprs, renamed_references, users_of};
+use surfacecraft_doc::param_use::{apply_dim_exprs, integrity_problems, renamed_references, users_of};
 use surfacecraft_doc::{ObjectId, ParamUser};
 use surfacecraft_sketch::solve;
 
@@ -106,8 +106,9 @@ fn resolve_sketches(s: &mut Session) {
 
 /// Recomputes what depends on the parameters: sketch dimensions, then the whole history (which
 /// evaluates the expressions of the features first). Returns the number of failed features.
-fn recompute(s: &mut Session) -> usize {
+pub(crate) fn recompute(s: &mut Session) -> usize {
     resolve_sketches(s);
+    s.doc.needs_recompute = false;
     crate::replay::replay(s)
 }
 
@@ -119,8 +120,9 @@ fn set(s: &mut Session, i: SetIn) -> CmdResult<SetOut> {
     let created = before.get(&i.name).is_none();
     let value = table.get(&i.name).map_or(0.0, |p| p.value);
     s.doc.params = table;
-    // a new parameter has no users; a redefinition that moved no value changes nothing downstream
-    let failed = if changes.iter().any(|c| c.old.is_some()) {
+    // a new parameter has no users; a redefinition that moved no value changes nothing downstream,
+    // unless the document was loaded with stale values
+    let failed = if s.doc.needs_recompute || changes.iter().any(|c| c.old.is_some()) {
         recompute(s)
     } else {
         s.doc.features.iter().filter(|f| f.error.is_some()).count()
@@ -155,7 +157,17 @@ fn users_text(users: &[ParamUser]) -> String {
     users.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
 }
 
+/// Refuses while a stored expression does not parse: it cannot be said what it uses.
+fn require_integrity(s: &Session) -> CmdResult<()> {
+    let bad = integrity_problems(&s.doc);
+    if bad.is_empty() {
+        return Ok(());
+    }
+    Err(CmdError::Params(format!("the document holds expressions that do not parse: {}", bad.join(", "))))
+}
+
 fn delete(s: &mut Session, i: NameIn) -> CmdResult<DeleteOut> {
+    require_integrity(s)?;
     let users = users_of(&s.doc, &i.name);
     if !users.is_empty() {
         return Err(CmdError::Params(format!("parameter `{}` is used by {}", i.name, users_text(&users))));
@@ -184,10 +196,11 @@ pub struct RenameOut {
 }
 
 fn rename(s: &mut Session, i: RenameIn) -> CmdResult<RenameOut> {
+    require_integrity(s)?;
     let table = s.doc.params.renamed(&i.name, &i.new_name).map_err(|e| CmdError::Params(e.0))?;
     let updated = users_of(&s.doc, &i.name);
     let (sketches, features, parked) =
-        renamed_references(&s.doc, &i.name, &i.new_name).map_err(|e| CmdError::Params(e.0))?;
+        renamed_references(&s.doc, &table, &i.name, &i.new_name).map_err(|e| CmdError::Params(e.0))?;
     s.doc.params = table;
     s.doc.sketches = sketches;
     s.doc.features = features;

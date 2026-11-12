@@ -6,7 +6,7 @@ use crate::{Document, SketchObject};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use surfacecraft_sketch::Sketch;
-use surfacecraft_sketch::expr::{MAX_LEN, rename_in_text};
+use surfacecraft_sketch::expr::{Expr, ExprError, MAX_LEN, rename_in_text};
 
 /// Feature fields that can be given as an expression: the numeric fields of the operations (a
 /// vector field takes one expression per component, as `translate.0`).
@@ -134,18 +134,43 @@ pub fn users_of(doc: &Document, name: &str) -> Vec<ParamUser> {
     out
 }
 
-fn renamed_texts<K: Clone + Ord>(
-    m: &BTreeMap<K, String>,
-    old: &str,
-    new: &str,
-) -> Result<BTreeMap<K, String>, ParamError> {
-    m.iter().map(|(k, t)| rename_in_text(t, old, new).map(|t| (k.clone(), t)).map_err(|e| ParamError(e.0))).collect()
+/// A rewritten expression must still be an expression: short enough, parsing, and evaluating
+/// against the renamed table. `what` names its owner for the error.
+fn checked_text(text: &str, what: &str, table: &ParamTable) -> Result<(), ParamError> {
+    if text.len() > MAX_LEN {
+        return Err(ParamError(format!(
+            "renaming would make the expression of {what} longer than {MAX_LEN} characters"
+        )));
+    }
+    let expr =
+        Expr::parse(text).map_err(|e| ParamError(format!("the expression of {what} would no longer parse: {e}")))?;
+    let lookup = |n: &str| table.get(n).map(|p| p.value).ok_or_else(|| ExprError(format!("unknown parameter `{n}`")));
+    expr.eval(&lookup)
+        .map(|_| ())
+        .map_err(|e| ParamError(format!("the expression of {what} would no longer evaluate: {e}")))
 }
 
-/// The sketches and features with parameter `old` renamed to `new` in their expressions. Nothing
-/// is changed when any of them fails (they all parse, or a corrupt text is refused).
+fn renamed_texts<K: Clone + Ord + std::fmt::Display>(
+    m: &BTreeMap<K, String>,
+    owner: &str,
+    (old, new): (&str, &str),
+    table: &ParamTable,
+) -> Result<BTreeMap<K, String>, ParamError> {
+    m.iter()
+        .map(|(k, t)| {
+            let text = rename_in_text(t, old, new).map_err(|e| ParamError(format!("{owner} `{k}`: {}", e.0)))?;
+            checked_text(&text, &format!("{owner} `{k}`"), table)?;
+            Ok((k.clone(), text))
+        })
+        .collect()
+}
+
+/// The sketches and features with parameter `old` renamed to `new` in their expressions. Every
+/// rewritten text is validated against `table` (the renamed parameter table) first; the first
+/// that is not valid refuses the whole rename and names its owner. Nothing is changed.
 pub fn renamed_references(
     doc: &Document,
+    table: &ParamTable,
     old: &str,
     new: &str,
 ) -> Result<(Vec<SketchObject>, Vec<FeatureObject>, Vec<FeatureObject>), ParamError> {
@@ -153,34 +178,132 @@ pub fn renamed_references(
         .sketches
         .iter()
         .map(|s| {
-            let dim_exprs = renamed_texts(&s.sketch.dim_exprs, old, new)?;
+            let owner = format!("sketch `{}`, constraint", s.name);
+            let dim_exprs = renamed_texts(&s.sketch.dim_exprs, &owner, (old, new), table)?;
             Ok(SketchObject { sketch: Sketch { dim_exprs, ..s.sketch.clone() }, ..s.clone() })
         })
         .collect::<Result<Vec<_>, ParamError>>()?;
     let feats = |list: &[FeatureObject]| {
         list.iter()
-            .map(|f| Ok(FeatureObject { exprs: renamed_texts(&f.exprs, old, new)?, ..f.clone() }))
+            .map(|f| {
+                let owner = format!("feature `{}`, field", f.name);
+                Ok(FeatureObject { exprs: renamed_texts(&f.exprs, &owner, (old, new), table)?, ..f.clone() })
+            })
             .collect::<Result<Vec<_>, ParamError>>()
     };
     Ok((sketches, feats(&doc.features)?, feats(&doc.rolled_back)?))
 }
 
-/// Checks the expressions of a document that came from outside (a project file): the parameter
-/// table is re-evaluated, and every expression field is a known field with a text of sane size.
-pub fn validate_document(doc: &Document) -> Result<ParamTable, String> {
-    let table = doc.params.validated().map_err(|e| e.to_string())?;
+/// Stored expressions that no longer parse (or are over-long): the document is inconsistent, and
+/// until that is repaired no parameter can be deleted or renamed, as nothing says what they use.
+#[must_use]
+pub fn integrity_problems(doc: &Document) -> Vec<String> {
+    let bad = |t: &str| t.len() > MAX_LEN || Expr::parse(t).is_err();
+    let mut out: Vec<String> =
+        doc.params.items().iter().filter(|p| bad(&p.expr)).map(|p| format!("parameter `{}`", p.name)).collect();
     for s in &doc.sketches {
-        s.sketch.validate_dim_exprs().map_err(|e| format!("sketch {}: {e}", s.name))?;
+        out.extend(
+            s.sketch
+                .dim_exprs
+                .iter()
+                .filter(|(_, t)| bad(t))
+                .map(|(k, _)| format!("sketch `{}`, constraint {k}", s.name)),
+        );
     }
     for f in all_features(doc) {
-        for (path, text) in &f.exprs {
-            check_expr_path(path).map_err(|e| format!("feature {}: {e}", f.name))?;
-            if text.len() > MAX_LEN {
-                return Err(format!("feature {}: the expression of `{path}` is too long", f.name));
-            }
-        }
+        out.extend(f.exprs.iter().filter(|(_, t)| bad(t)).map(|(k, _)| format!("feature `{}`, field `{k}`", f.name)));
     }
-    Ok(table)
+    out
+}
+
+/// Within a relative `1e-12` (or absolute for tiny values)?
+fn close(a: f64, b: f64) -> bool {
+    (a - b).abs() <= 1e-12 * a.abs().max(b.abs()).max(1.0)
+}
+
+/// Are two JSON values equal, numbers within [`close`]?
+fn same_json(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => match (x.as_f64(), y.as_f64()) {
+            (Some(x), Some(y)) => close(x, y),
+            _ => x == y,
+        },
+        (Value::Array(x), Value::Array(y)) => x.len() == y.len() && x.iter().zip(y).all(|(p, q)| same_json(p, q)),
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len() && x.iter().all(|(k, p)| y.get(k).is_some_and(|q| same_json(p, q)))
+        }
+        _ => a == b,
+    }
+}
+
+/// Static checks of an expression stored with a feature or a dimension: it parses, uses only
+/// defined parameters, and sits where a number does.
+fn check_text(text: &str, table: &ParamTable) -> Result<(), String> {
+    let e = Expr::parse(text).map_err(|e| e.to_string())?;
+    match e.names().into_iter().find(|n| table.get(n).is_none()) {
+        Some(n) => Err(format!("it uses `{n}`, which is not a defined parameter")),
+        None => Ok(()),
+    }
+}
+
+/// The feature's expressions refer to numeric fields of its operation and use defined parameters.
+fn check_feature(f: &FeatureObject, table: &ParamTable) -> Result<(), String> {
+    let mut v = serde_json::to_value(&f.op).map_err(|e| e.to_string())?;
+    for (path, text) in &f.exprs {
+        let fail = |m: String| format!("feature {}, field `{path}`: {m}", f.name);
+        if text.len() > MAX_LEN {
+            return Err(fail("the expression is too long".into()));
+        }
+        check_expr_path(path).map_err(fail)?;
+        slot(&mut v, path).map_err(fail)?;
+        check_text(text, table).map_err(fail)?;
+    }
+    Ok(())
+}
+
+/// Is the cached value of the feature (its operation) what its expressions give now? An
+/// expression that does not evaluate counts as not matching (the replay will report it).
+fn feature_current(f: &FeatureObject, table: &ParamTable) -> bool {
+    let Ok(now) = apply_feature_exprs(&f.op, &f.exprs, table) else { return false };
+    match (serde_json::to_value(&f.op), serde_json::to_value(&now)) {
+        (Ok(a), Ok(b)) => same_json(&a, &b),
+        _ => false,
+    }
+}
+
+fn sketch_current(s: &SketchObject, table: &ParamTable) -> bool {
+    apply_dim_exprs(&s.sketch, table).is_ok_and(|now| {
+        let dims =
+            |sk: &Sketch| sk.constraints.iter().map(surfacecraft_sketch::Constraint::dimension).collect::<Vec<_>>();
+        let (a, b) = (dims(&s.sketch), dims(&now));
+        a.len() == b.len()
+            && a.iter().zip(&b).all(|(x, y)| match (x, y) {
+                (Some(x), Some(y)) => close(*x, *y),
+                (x, y) => x == y,
+            })
+    })
+}
+
+/// Checks the expressions of a document that came from outside (a project file). The table is
+/// re-evaluated (stored values are not trusted); every expression must parse, use defined
+/// parameters and sit on an existing numeric field or dimension, else the file is refused.
+/// Returns the table and whether the cached values of dimensions, fields or parameters differ
+/// from what the expressions give (`Document::needs_recompute`): the geometry is then stale.
+pub fn validate_document(doc: &Document) -> Result<(ParamTable, bool), String> {
+    let table = doc.params.validated().map_err(|e| e.to_string())?;
+    let mut stale = table.items().iter().zip(doc.params.items()).any(|(a, b)| !close(a.value, b.value));
+    for s in &doc.sketches {
+        s.sketch.validate_dim_exprs().map_err(|e| format!("sketch {}: {e}", s.name))?;
+        for (k, text) in &s.sketch.dim_exprs {
+            check_text(text, &table).map_err(|e| format!("sketch {}, constraint {k}: {e}", s.name))?;
+        }
+        stale |= !sketch_current(s, &table);
+    }
+    for f in all_features(doc) {
+        check_feature(f, &table)?;
+        stale |= !feature_current(f, &table);
+    }
+    Ok((table, stale))
 }
 
 #[cfg(test)]

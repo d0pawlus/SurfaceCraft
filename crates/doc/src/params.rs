@@ -277,7 +277,7 @@ impl ParamTable {
     pub fn users_of(&self, name: &str) -> Vec<ParamUser> {
         self.items
             .iter()
-            .filter(|p| Expr::parse(&p.expr).is_ok_and(|e| e.names().contains(name)))
+            .filter(|p| text_uses(&p.expr, name))
             .map(|p| ParamUser { kind: "parameter".into(), name: p.name.clone(), at: "expression".into() })
             .collect()
     }
@@ -295,10 +295,12 @@ impl ParamTable {
     }
 }
 
-/// Does `text` use the name `name`? (False for text that does not parse.)
+/// Does `text` use the name `name`? Text that does not parse counts as using every name: it can
+/// no longer be told, so nothing it might refer to may be deleted or renamed (see
+/// `param_use::integrity_problems`).
 #[must_use]
 pub fn text_uses(text: &str, name: &str) -> bool {
-    Expr::parse(text).is_ok_and(|e| e.names().contains(name))
+    Expr::parse(text).map_or(true, |e| e.names().contains(name))
 }
 
 /// The names used by any of `texts`.

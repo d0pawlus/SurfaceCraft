@@ -52,6 +52,11 @@ fn open(s: &mut Session, i: PathIn) -> CmdResult<ListOut> {
     s.doc = format::from_json(&text).map_err(CmdError::Failed)?;
     s.history.clear();
     s.maps.clear();
+    // cached dimensions or feature values that differ from their expressions: the geometry in
+    // the file is stale, so it is rebuilt the way a parameter change rebuilds it
+    if s.doc.needs_recompute {
+        super::param::recompute(s);
+    }
     Ok(ListOut { objects: s.doc.summaries() })
 }
 

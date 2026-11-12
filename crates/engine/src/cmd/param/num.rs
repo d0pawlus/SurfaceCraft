@@ -3,8 +3,8 @@
 //! A plain number stays what it was; `{"expr": "w / 2"}` is evaluated against the parameter
 //! table when the command runs, and the text is kept with the thing it set (a sketch dimension, a
 //! feature field) so that a later change of a parameter recomputes it. The JSON Schema of these
-//! types is that of a number (an integer for [`Count`]) with an `x-expr` mark, so that forms keep
-//! their numeric widgets.
+//! types is a union: the number (an integer for [`Count`]), marked `x-expr` so that forms keep
+//! their numeric widgets, or the expression object `{"expr": "text"}`.
 use super::super::{CmdError, CmdResult};
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::de::Error as _;
@@ -14,6 +14,17 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use surfacecraft_doc::ParamTable;
 use surfacecraft_doc::param_use::whole_number;
+
+/// The JSON Schema branch of an expression object: `{"expr": "text"}` and nothing else.
+#[must_use]
+pub fn expr_branch() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {"expr": {"type": "string"}},
+        "required": ["expr"],
+        "additionalProperties": false
+    })
+}
 
 /// A number, or an expression over parameters.
 #[derive(Clone, Debug, PartialEq)]
@@ -87,7 +98,7 @@ impl JsonSchema for Num {
     }
 
     fn json_schema(_: &mut SchemaGenerator) -> Schema {
-        json_schema!({"type": "number", "format": "double", "x-expr": true})
+        json_schema!({"anyOf": [{"type": "number", "format": "double", "x-expr": true}, expr_branch()]})
     }
 }
 
@@ -113,7 +124,7 @@ impl JsonSchema for Count {
     }
 
     fn json_schema(_: &mut SchemaGenerator) -> Schema {
-        json_schema!({"type": "integer", "format": "uint", "minimum": 0, "x-expr": true})
+        json_schema!({"anyOf": [{"type": "integer", "format": "uint", "minimum": 0, "x-expr": true}, expr_branch()]})
     }
 }
 

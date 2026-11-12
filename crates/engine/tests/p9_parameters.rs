@@ -324,11 +324,7 @@ fn gate_save_and_load_keep_parameters_and_expressions() {
     let r = set(&mut loaded, "w", "50");
     assert_eq!(r["failed_features"], 0, "{r}");
     assert!(rel(vol(&loaded, "blk"), 12500.0) < 1e-9, "the loaded document still recomputes");
-    // a project written before the table existed loads without it
-    let mut v: Value = serde_json::from_str(&text).unwrap();
-    v["document"].as_object_mut().unwrap().remove("params");
-    let old = format::from_json(&v.to_string()).unwrap();
-    assert!(old.params.is_empty());
+    // (a project written before the table existed is covered by the round-trip test below)
     // a hand-edited table with a cycle is refused
     let mut v: Value = serde_json::from_str(&text).unwrap();
     v["document"]["params"][0]["expr"] = json!("d");
@@ -430,6 +426,17 @@ fn hostile_expressions_and_names_are_errors() {
         ("feature.extrude", json!({"sketch": "x", "distance": {"expr": big}})),
         ("feature.extrude", json!({"sketch": "x", "distance": {"expr": "1", "other": 1}})),
         ("feature.extrude", json!({"sketch": "x", "distance": {"nope": 1}})),
+        ("feature.extrude", json!({"sketch": "x", "distance": {"expr": 5}})),
+        ("feature.extrude", json!({"sketch": "x", "distance": {"expr": null}})),
+        ("feature.pattern", json!({"body": "x", "count": {"expr": [1]}})),
+        (
+            "sketch.constrain",
+            json!({"sketch": "x", "constraints": [{"type": "length", "line": 0, "value": {"expr": 5}}]}),
+        ),
+        (
+            "sketch.constrain",
+            json!({"sketch": "x", "constraints": [{"type": "angle", "a": 0, "b": 1, "degrees": {"exp": "w"}}]}),
+        ),
         (
             "sketch.constrain",
             json!({"sketch": "x", "constraints": [{"type": "length", "line": 0, "value": {"expr": deep}}]}),
@@ -554,4 +561,213 @@ fn the_example_of_the_guide_runs() {
     assert!(report.ok, "{report:?}");
     let v = vol(&s, "blk");
     assert!(v > 17_900.0 && v < 18_000.0, "a 60 x 30 x 10 block with one 2 mm fillet: {v}");
+}
+
+// ---- review round: transactional rename, integrity, loading, schemas, lost intent ----
+
+fn project_of(s: &Session) -> String {
+    format::to_json(&s.doc).unwrap()
+}
+
+#[test]
+fn rename_that_would_overflow_an_expression_is_refused_and_changes_nothing() {
+    let mut s = Session::new();
+    set(&mut s, "w", "1");
+    small_square(&mut s);
+    let sum = vec!["w"; 171].join("+");
+    assert_eq!(sum.len(), 341);
+    run(&mut s, "feature.extrude", json!({"sketch": "sq", "distance": {"expr": sum}, "name": "peg"}));
+    let before = project_of(&s);
+    let e = refused(&mut s, "param.rename", json!({"name": "w", "new_name": "width"}));
+    assert!(e.contains("extrude") && e.contains("distance"), "the offender is named: {e}");
+    assert_eq!(project_of(&s), before, "the document is byte-identical");
+    let e = refused(&mut s, "param.delete", json!({"name": "w"}));
+    assert!(e.contains("extrude"), "w is still in use: {e}");
+    // a rename that fits is applied everywhere
+    run(&mut s, "param.rename", json!({"name": "w", "new_name": "ww"}));
+    assert_eq!(s.doc.features[0].exprs.get("distance").map(String::len), Some(171 * 2 + 170));
+    assert!(rel(vol(&s, "peg"), 16.0 * 171.0) < 1e-9);
+}
+
+#[test]
+fn an_unparsable_stored_expression_blocks_delete_and_rename() {
+    let mut s = Session::new();
+    block(&mut s);
+    set(&mut s, "free", "1");
+    s.doc.features[0].exprs.insert("distance".into(), "d +".into());
+    let e = refused(&mut s, "param.delete", json!({"name": "free"}));
+    assert!(e.contains("extrude") && e.contains("distance"), "reported: {e}");
+    let e = refused(&mut s, "param.rename", json!({"name": "free", "new_name": "freer"}));
+    assert!(e.contains("extrude"), "{e}");
+    assert!(s.doc.params.get("free").is_some());
+}
+
+fn open_text(s: &mut Session, text: &str) -> Result<Value, EngineError> {
+    let path = std::env::temp_dir().join(format!("p9_open_{}_{}.scproj", std::process::id(), text.len()));
+    std::fs::write(&path, text).unwrap();
+    let r = s.execute("doc.open", json!({"path": path.to_str().unwrap()}));
+    let _ = std::fs::remove_file(&path);
+    r
+}
+
+fn edited_project(s: &Session, edit: impl Fn(&mut Value)) -> String {
+    let mut v: Value = serde_json::from_str(&project_of(s)).unwrap();
+    edit(&mut v["document"]);
+    v.to_string()
+}
+
+#[test]
+fn opening_a_project_whose_cached_geometry_is_stale_recomputes_it() {
+    let mut s = Session::new();
+    block(&mut s);
+    let text = edited_project(&s, |d| d["params"][0]["expr"] = json!("60"));
+    let mut t = Session::new();
+    open_text(&mut t, &text).expect("opens");
+    assert!(rel(vol(&t, "blk"), 60.0 * 30.0 * 10.0) < 1e-9, "geometry follows w = 60: {}", vol(&t, "blk"));
+    assert_eq!(value_of(&mut t, "w"), 60.0);
+    assert_eq!(run(&mut t, "feature.tree", Value::Null)["failed_features"], 0);
+    assert!(!t.doc.needs_recompute);
+    // a document flagged stale is recomputed by param.set even when the value does not change
+    let mut u = Session::new();
+    u.doc = format::from_json(&text).unwrap();
+    assert!(u.doc.needs_recompute);
+    set(&mut u, "w", "60");
+    assert!(rel(vol(&u, "blk"), 60.0 * 30.0 * 10.0) < 1e-9);
+    assert!(!u.doc.needs_recompute);
+}
+
+#[test]
+fn hand_edited_projects_with_bad_expressions_are_load_errors() {
+    let mut s = Session::new();
+    block(&mut s);
+    let bad = |edit: &dyn Fn(&mut Value)| format::from_json(&edited_project(&s, |d| edit(d)));
+    assert!(bad(&|d| d["sketches"][0]["sketch"]["dim_exprs"]["5"] = json!("zz")).is_err(), "missing parameter");
+    assert!(bad(&|d| d["features"][0]["exprs"]["distance"] = json!("zz")).is_err(), "missing parameter in a feature");
+    assert!(bad(&|d| d["features"][0]["exprs"]["nope"] = json!("w")).is_err(), "no such field");
+    assert!(bad(&|d| d["features"][0]["exprs"]["draft_deg.1"] = json!("w")).is_err(), "no such slot");
+    assert!(bad(&|d| d["features"][0]["exprs"]["translate"] = json!("w")).is_err(), "not a field of an extrude");
+    assert!(bad(&|d| d["sketches"][0]["sketch"]["dim_exprs"]["99"] = json!("w")).is_err(), "key past the constraints");
+    assert!(bad(&|d| d["sketches"][0]["sketch"]["dim_exprs"]["1"] = json!("w")).is_err(), "not a dimension");
+    assert!(bad(&|d| d["features"][0]["exprs"]["distance"] = json!("d +")).is_err(), "syntax");
+}
+
+#[test]
+fn a_saved_project_round_trips_byte_identically_without_a_recompute() {
+    let mut s = Session::new();
+    block(&mut s);
+    let text = project_of(&s);
+    let doc = format::from_json(&text).unwrap();
+    assert!(!doc.needs_recompute);
+    assert_eq!(format::to_json(&doc).unwrap(), text);
+    let old = edited_project(&s, |d| {
+        d.as_object_mut().unwrap().remove("params");
+        d["sketches"][0]["sketch"].as_object_mut().unwrap().remove("dim_exprs");
+        d["features"][0].as_object_mut().unwrap().remove("exprs");
+    });
+    let doc = format::from_json(&old).unwrap();
+    assert!(!doc.needs_recompute && doc.params.is_empty());
+}
+
+/// Is `v` valid for the small subset of JSON Schema the number-or-expression fields use?
+fn valid(root: &Value, schema: &Value, v: &Value) -> bool {
+    if let Some(r) = schema.get("$ref").and_then(Value::as_str) {
+        let target = r.strip_prefix("#/").unwrap().split('/').fold(root, |n, k| &n[k]);
+        return valid(root, target, v);
+    }
+    if let Some(b) = schema.get("anyOf").and_then(Value::as_array) {
+        return b.iter().any(|b| valid(root, b, v));
+    }
+    let ty_ok = |t: &str| match t {
+        "number" => v.is_number(),
+        "integer" => v.is_i64() || v.is_u64(),
+        "string" => v.is_string(),
+        "null" => v.is_null(),
+        "object" => v.is_object(),
+        _ => true,
+    };
+    let types: Vec<&str> = match &schema["type"] {
+        Value::String(t) => vec![t.as_str()],
+        Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
+        _ => vec![],
+    };
+    if !types.is_empty() && !types.iter().any(|t| ty_ok(t)) {
+        return false;
+    }
+    let Some(m) = v.as_object() else { return true };
+    let props = schema["properties"].as_object();
+    if schema["additionalProperties"] == json!(false) && m.keys().any(|k| props.is_none_or(|p| !p.contains_key(k))) {
+        return false;
+    }
+    let required = schema["required"].as_array().cloned().unwrap_or_default();
+    required.iter().filter_map(Value::as_str).all(|k| m.contains_key(k))
+        && m.iter().all(|(k, x)| props.and_then(|p| p.get(k)).is_none_or(|ps| valid(root, ps, x)))
+}
+
+/// Every node of `schema` that is a number-or-expression field.
+fn expr_nodes<'a>(n: &'a Value, out: &mut Vec<&'a Value>) {
+    match n {
+        Value::Object(m) => {
+            if m.get("anyOf").is_some() && n.to_string().contains("\"x-expr\"") && m["anyOf"][0].get("x-expr").is_some()
+            {
+                out.push(n);
+            }
+            m.values().for_each(|v| expr_nodes(v, out));
+        }
+        Value::Array(a) => a.iter().for_each(|v| expr_nodes(v, out)),
+        _ => {}
+    }
+}
+
+#[test]
+fn published_schemas_accept_numbers_and_expression_objects() {
+    let mut found = 0;
+    for c in surfacecraft_engine::registry() {
+        let root = (c.input)();
+        let mut nodes = Vec::new();
+        expr_nodes(&root, &mut nodes);
+        for n in nodes {
+            found += 1;
+            let int = n["anyOf"][0]["type"] == "integer";
+            let five = json!(5);
+            assert!(valid(&root, n, &five), "{}: 5 against {n}", c.id);
+            assert!(valid(&root, n, &json!({"expr": "w"})), "{}: expr against {n}", c.id);
+            assert!(!valid(&root, n, &json!({"expr": 5})), "{}: {n}", c.id);
+            assert!(!valid(&root, n, &json!({"exp": "w"})), "{}: {n}", c.id);
+            assert!(!valid(&root, n, &json!({"expr": "w", "x": 1})), "{}: {n}", c.id);
+            assert!(!valid(&root, n, &json!("w")), "{}: {n}", c.id);
+            assert_eq!(valid(&root, n, &json!(1.5)), !int, "{}: 1.5 against {n}", c.id);
+        }
+    }
+    assert!(found >= 30, "feature fields and sketch dimensions advertise expressions: {found}");
+    // the dimensions of a constraint are among them
+    let root = (surfacecraft_engine::registry().iter().find(|c| c.id == "sketch.constrain").unwrap().input)();
+    let mut nodes = Vec::new();
+    expr_nodes(&root, &mut nodes);
+    assert!(nodes.len() >= 4, "length, distance, radius, angle: {}", nodes.len());
+}
+
+#[test]
+fn editing_a_dimension_with_a_plain_number_reports_the_expression_it_replaced() {
+    let mut s = Session::new();
+    block(&mut s);
+    let r = run(
+        &mut s,
+        "sketch.edit_constraint",
+        json!({"sketch": "base", "index": 5, "constraint": {"type": "length", "line": 0, "value": 33.0}}),
+    );
+    assert_eq!(r["expression_cleared"], "w", "{r}");
+    let r = run(
+        &mut s,
+        "sketch.edit_constraint",
+        json!({"sketch": "base", "index": 5, "constraint": {"type": "length", "line": 0, "value": 34.0}}),
+    );
+    assert!(r.get("expression_cleared").is_none(), "nothing to report: {r}");
+    set(&mut s, "w", "7");
+    run(
+        &mut s,
+        "sketch.edit_constraint",
+        json!({"sketch": "base", "index": 6, "constraint": {"type": "length", "line": 1, "value": {"expr": "w"}}}),
+    );
+    let r = run(&mut s, "sketch.edit_constraint", json!({"sketch": "base", "index": 6}));
+    assert_eq!(r["expression_cleared"], "w", "removing a dimension reports it too: {r}");
 }
