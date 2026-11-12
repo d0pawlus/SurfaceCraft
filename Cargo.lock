@@ -2930,7 +2930,9 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "surfacecraft-ai",
+ "surfacecraft-doc",
  "surfacecraft-engine",
+ "surfacecraft-geom",
  "surfacecraft-mcp",
  "surfacecraft-ui-egui",
 ]

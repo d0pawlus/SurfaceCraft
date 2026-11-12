@@ -135,7 +135,7 @@ pub struct RegionsOut {
     pub unassigned: usize,
 }
 
-fn auto_segment(s: &mut Session, i: AutoIn) -> CmdResult<RegionsOut> {
+pub(crate) fn auto_segment(s: &mut Session, i: AutoIn) -> CmdResult<RegionsOut> {
     let mesh = i.mesh.resolve(s, ObjectKind::Mesh)?;
     let o = &i.options;
     if !(o.tolerance.is_finite() && o.tolerance > 0.0) || !o.max_angle_deg.is_finite() {

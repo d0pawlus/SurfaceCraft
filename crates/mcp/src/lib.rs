@@ -1,11 +1,14 @@
 //! SurfaceCraft MCP server (layer L5), spike §3.5 item 17: an own JSON-RPC 2.0 implementation
-//! (one message per line), no `rmcp`. Every engine command is a tool (`mesh.import` →
-//! `mesh_import`); in compact mode one tool per command area instead (`mesh` with `verb` and
-//! `params`). Generic tools: `list_commands`, `describe_command`, `execute`, `batch` (with
+//! (one message per line), no `rmcp`. Every engine command is callable as a tool (`mesh.import`
+//! → `mesh_import`). The listing is compact by default: one tool per command area (`mesh` with
+//! `verb` and `params`) plus the workflow commands in full ([`FEATURED`]); in full mode it is
+//! one tool per command. Generic tools: `list_commands`, `describe_command`, `execute`, `batch` (with
 //! rollback), `undo`, `redo`, `inspect_design`, `screenshot` (when the host can render),
 //! `set_tool_mode` (the listing, at run time), and the queue: `job_status`, `job_wait`,
 //! `job_cancel`. A call with `queued: true` returns a job id at once.
-//! Resources: `surfacecraft://design` (the object list) and `surfacecraft://commands`.
+//! Resources: `surfacecraft://design` (the object list), `surfacecraft://commands` and one
+//! `surfacecraft://guide/<id>` per guide. Prompts: `scan_to_solid`. Results are lean (see
+//! [`lean`]): compact text, rounded floats, and errors that carry what the next call needs.
 //!
 //! The server is transport-free: [`Server::handle`] maps one request value to one response
 //! value (or none, for notifications). The CLI wires it to stdio, or forwards to a running
@@ -19,10 +22,12 @@
     clippy::unreachable
 )]
 
+use jobs::{Jobs, Request, State, View, Wait};
+use lean::{text_result, tool_error, tool_error_with};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, VecDeque};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
+use surfacecraft_engine::cmd::app::{guide_index, guide_markdown};
 use surfacecraft_engine::cmd::find;
 use surfacecraft_engine::{CommandSpec, EngineError, Session, registry};
 
@@ -44,6 +49,10 @@ pub const ENV_AREAS: &str = "SURFACECRAFT_MCP_AREAS";
 /// Tools that are not commands, listed in both modes.
 const GENERAL: &[&str] =
     &["list_commands", "describe_command", "execute", "batch", "undo", "redo", "inspect_design", "screenshot"];
+/// The workflow commands: listed with their full input schema in compact mode too, so the short
+/// path (import, scan to solid, compare, export) needs no `describe_command`.
+pub const FEATURED: &[&str] =
+    &["mesh.import", "scan.qa", "scan.to_solid", "body.compare", "export.step", "guide.read", "app.batch"];
 /// Tools the server answers itself: they act on the listing and the queue, so never queue.
 const OWN: &[&str] = &["set_tool_mode", "job_status", "job_wait", "job_cancel"];
 
@@ -89,9 +98,10 @@ impl Backend for LocalBackend {
     }
 }
 
-/// Which tools `tools/list` shows: one tool per command (full), or one per command area
-/// (compact). `areas` limits either to some areas. The general tools are always listed.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Which tools `tools/list` shows: one per command area plus the featured commands (compact,
+/// the default), or one per command (full). `areas` limits either to some areas. The general
+/// tools are always listed.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolConfig {
     /// One tool per area (`verb` and `params`) instead of one per command.
     pub compact: bool,
@@ -99,13 +109,26 @@ pub struct ToolConfig {
     pub areas: Option<Vec<String>>,
 }
 
+impl Default for ToolConfig {
+    /// Compact, every area: the listing an agent can afford to read.
+    fn default() -> Self {
+        Self { compact: true, areas: None }
+    }
+}
+
 impl ToolConfig {
-    /// Reads `mode` (`full` or `compact`) and `areas` (comma-separated). Absent values give the
-    /// defaults; an unknown mode or area is an error that lists what is valid.
+    /// The full listing: one tool per command, every area.
+    #[must_use]
+    pub fn full() -> Self {
+        Self { compact: false, areas: None }
+    }
+
+    /// Reads `mode` (`compact` or `full`) and `areas` (comma-separated). Absent values give the
+    /// defaults (compact, every area); an unknown mode or area is an error that lists what is valid.
     pub fn parse(mode: Option<&str>, areas: Option<&str>) -> Result<Self, String> {
         let compact = match mode.map(str::trim) {
-            None | Some("" | "full") => false,
-            Some("compact") => true,
+            None | Some("" | "compact") => true,
+            Some("full") => false,
             Some(other) => return Err(format!("unknown tool mode `{other}`: use full or compact")),
         };
         let names: Vec<String> =
@@ -182,195 +205,6 @@ fn known_tool(name: &str) -> bool {
     GENERAL.contains(&name) || OWN.contains(&name) || command_id(name).is_some() || area_tool(name).is_some()
 }
 
-/// Where a job is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum State {
-    Queued,
-    Running,
-    Done,
-    Failed,
-    Cancelled,
-}
-
-impl State {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Queued => "queued",
-            Self::Running => "running",
-            Self::Done => "done",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-        }
-    }
-
-    fn finished(self) -> bool {
-        matches!(self, Self::Done | Self::Failed | Self::Cancelled)
-    }
-}
-
-/// What a job runs: a tool of the listing, or one command (for the resources).
-#[derive(Clone, Debug)]
-enum Request {
-    Tool { name: String, args: Value },
-    Command { id: String, params: Value },
-}
-
-impl Request {
-    fn label(&self) -> String {
-        match self {
-            Self::Tool { name, .. } => name.clone(),
-            Self::Command { id, .. } => id.clone(),
-        }
-    }
-}
-
-/// One job: its request until it starts, then its state and, once finished, its tool result.
-struct Job {
-    label: String,
-    request: Option<Request>,
-    state: State,
-    result: Value,
-}
-
-/// The job table: a FIFO of job ids and the jobs by id.
-#[derive(Default)]
-struct Table {
-    next: u64,
-    queue: VecDeque<u64>,
-    jobs: BTreeMap<u64, Job>,
-    closed: bool,
-}
-
-/// The table shared by the server and its worker.
-#[derive(Default)]
-struct Jobs {
-    table: Mutex<Table>,
-    changed: Condvar,
-}
-
-/// How long a read waits for a job to finish.
-#[derive(Clone, Copy, Debug)]
-enum Wait {
-    /// Not at all: report the state now.
-    Poll,
-    /// Up to this long.
-    For(Duration),
-    /// Until finished.
-    Forever,
-}
-
-/// A job as read: its state and, once finished, its tool result.
-struct View {
-    job: u64,
-    label: String,
-    state: State,
-    result: Value,
-}
-
-impl Jobs {
-    fn lock(&self) -> MutexGuard<'_, Table> {
-        self.table.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Queues `request`. With `capped`, a call is refused while `MAX_OPEN_JOBS` jobs are open.
-    fn submit(&self, request: Request, capped: bool) -> Result<u64, String> {
-        let mut t = self.lock();
-        if capped && t.jobs.len() >= MAX_OPEN_JOBS {
-            return Err(format!("{MAX_OPEN_JOBS} jobs are open; read finished ones with job_wait or job_status first"));
-        }
-        t.next = t.next.saturating_add(1);
-        let id = t.next;
-        let label = request.label();
-        t.jobs.insert(id, Job { label, request: Some(request), state: State::Queued, result: Value::Null });
-        t.queue.push_back(id);
-        self.changed.notify_all();
-        Ok(id)
-    }
-
-    /// The next job to run, its request taken. With `wait`, blocks until there is one; `None`
-    /// when there is none (or the server is gone).
-    fn next(&self, wait: bool) -> Option<(u64, Request)> {
-        let mut t = self.lock();
-        loop {
-            while let Some(id) = t.queue.pop_front() {
-                let Some(job) = t.jobs.get_mut(&id) else { continue };
-                if job.state != State::Queued {
-                    continue; // cancelled before it started
-                }
-                let Some(request) = job.request.take() else { continue };
-                job.state = State::Running;
-                return Some((id, request));
-            }
-            if t.closed || !wait {
-                return None;
-            }
-            t = self.changed.wait(t).unwrap_or_else(PoisonError::into_inner);
-        }
-    }
-
-    /// Records the result of a running job and wakes the readers.
-    fn finish(&self, id: u64, result: Value) {
-        let mut t = self.lock();
-        if let Some(job) = t.jobs.get_mut(&id) {
-            let failed = result.get("isError").and_then(Value::as_bool).unwrap_or(false);
-            job.state = if failed { State::Failed } else { State::Done };
-            job.result = result;
-        }
-        self.changed.notify_all();
-    }
-
-    /// Cancels a job that has not started yet. Returns whether it was cancelled.
-    fn cancel(&self, id: u64) -> bool {
-        let mut t = self.lock();
-        let cancelled = match t.jobs.get_mut(&id) {
-            Some(job) if job.state == State::Queued => {
-                job.state = State::Cancelled;
-                job.request = None;
-                true
-            }
-            _ => false,
-        };
-        self.changed.notify_all();
-        cancelled
-    }
-
-    /// The job's view, waiting as `wait` says. A finished job is taken away: its result is
-    /// read once. `None` for an unknown job (never queued, or already read).
-    fn read(&self, id: u64, wait: Wait) -> Option<View> {
-        let end = match wait {
-            Wait::For(d) => Instant::now().checked_add(d),
-            _ => None,
-        };
-        let mut t = self.lock();
-        loop {
-            let state = t.jobs.get(&id)?.state;
-            if state.finished() {
-                break;
-            }
-            match wait {
-                Wait::Poll => break,
-                Wait::Forever => t = self.changed.wait(t).unwrap_or_else(PoisonError::into_inner),
-                Wait::For(_) => match end {
-                    Some(end) if Instant::now() < end => {
-                        t = match self.changed.wait_timeout(t, end.saturating_duration_since(Instant::now())) {
-                            Ok((guard, _)) => guard,
-                            Err(e) => e.into_inner().0,
-                        };
-                    }
-                    _ => break,
-                },
-            }
-        }
-        let (state, label) = {
-            let job = t.jobs.get(&id)?;
-            (job.state, job.label.clone())
-        };
-        let result =
-            if state.finished() { t.jobs.remove(&id).map_or(Value::Null, |job| job.result) } else { Value::Null };
-        Some(View { job: id, label, state, result })
-    }
-}
-
 /// The worker: runs queued jobs one at a time, in order, until the server is dropped.
 fn work<B: Backend>(backend: Arc<Mutex<B>>, jobs: Arc<Jobs>) {
     while let Some((id, request)) = jobs.next(true) {
@@ -391,10 +225,6 @@ fn run_request<B: Backend>(backend: &Mutex<B>, request: Request) -> Value {
     outcome.unwrap_or_else(|_| tool_error("internal error: a command panicked"))
 }
 
-fn err_text(v: &Value) -> String {
-    serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
-}
-
 fn rpc_error(id: &Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
 }
@@ -403,13 +233,9 @@ fn rpc_ok(id: &Value, result: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "result": result})
 }
 
-fn text_result(v: &Value, is_error: bool) -> Value {
-    json!({"content": [{"type": "text", "text": err_text(v)}], "structuredContent": v, "isError": is_error})
-}
-
-/// A tool result reporting `message` as an error.
-fn tool_error(message: &str) -> Value {
-    text_result(&json!({"error": message}), true)
+/// Every command id.
+fn command_ids() -> Vec<&'static str> {
+    registry().iter().map(|c| c.id).collect()
 }
 
 /// Base64 for PNG payloads.
@@ -439,7 +265,7 @@ fn run_command<B: Backend>(backend: &mut B, id: &str, params: Value) -> Value {
             let failed_batch = id == "app.batch" && v.get("ok").and_then(Value::as_bool) == Some(false);
             text_result(&v, failed_batch)
         }
-        Err(e) => text_result(&e, true),
+        Err(e) => text_result(&lean::with_hints(id, &e, &command_ids()), true),
     }
 }
 
@@ -493,7 +319,8 @@ fn area_command<B: Backend>(backend: &mut B, area: &str, args: &Value) -> Value 
     };
     let id = format!("{area}.{verb}");
     if find(&id).is_none() {
-        return tool_error(&format!("`{area}` has no verb `{verb}`; verbs: {}", verbs(area).join(", ")));
+        let known = verbs(area);
+        return tool_error_with(&format!("`{area}` has no verb `{verb}`; verbs: {}", known.join(", ")), verb, &known);
     }
     run_command(backend, &id, args.get("params").cloned().unwrap_or(Value::Null))
 }
@@ -523,127 +350,18 @@ fn dispatch_tool<B: Backend>(backend: &mut B, name: &str, args: Value) -> Value 
             if let Some(area) = area_tool(other) {
                 return area_command(backend, area, &args);
             }
-            tool_error(&format!("unknown tool `{other}`"))
+            unknown_tool(other)
         }
     }
 }
 
-/// The input schema with the `queued` flag added (the server takes it off before the call runs).
-fn queueable(mut schema: Value) -> Value {
-    if let Some(obj) = schema.as_object_mut() {
-        let props = obj.entry("properties").or_insert_with(|| json!({}));
-        if let Some(props) = props.as_object_mut() {
-            props.insert(
-                "queued".into(),
-                json!({"type": "boolean", "description": "true: return a job id at once and run the call on the worker (see job_status, job_wait, job_cancel)."}),
-            );
-        }
-    }
-    schema
-}
-
-/// A general tool's listing entry.
-fn general(name: &str, description: &str, schema: Value) -> Value {
-    let schema = if OWN.contains(&name) { schema } else { queueable(schema) };
-    json!({"name": name, "description": description, "inputSchema": schema})
-}
-
-/// The general tools: the MCP-level ones, listed in both modes.
-fn general_tools() -> Vec<Value> {
-    let obj = |props: Value, req: &[&str]| json!({"type": "object", "properties": props, "required": req});
-    let job = || json!({"type": "integer", "minimum": 1, "description": "The job id a queued call returned."});
-    vec![
-        general(
-            "list_commands",
-            "List SurfaceCraft commands (optional `filter`). Start with guide_read for the task guides.",
-            obj(json!({"filter": {"type": "string"}}), &[]),
-        ),
-        general(
-            "describe_command",
-            "Input and output JSON Schemas of command `id`.",
-            obj(json!({"id": {"type": "string"}}), &["id"]),
-        ),
-        general(
-            "execute",
-            "Execute command `command` with `params`.",
-            obj(json!({"command": {"type": "string"}, "params": {"type": "object"}}), &["command"]),
-        ),
-        general(
-            "batch",
-            "Execute `commands` ([{command, params}]) in order; on the first failure every step that changed the document is undone. For steps that keep their effects, use app_batch.",
-            obj(json!({"commands": {"type": "array"}}), &["commands"]),
-        ),
-        general("undo", "Undo the last change.", obj(json!({}), &[])),
-        general("redo", "Redo.", obj(json!({}), &[])),
-        general("inspect_design", "Every object of the design with id, kind, name and facts.", obj(json!({}), &[])),
-        general(
-            "screenshot",
-            "PNG of the viewport (when the host can render).",
-            obj(json!({"width": {"type": "integer"}, "height": {"type": "integer"}}), &[]),
-        ),
-        general(
-            "set_tool_mode",
-            "Choose the tool listing from now on: `mode` full (one tool per command) or compact (one tool per area, with verb and params); `areas` limits either to some areas (null or [] for all). Keeps what is not given. Returns the new listing.",
-            obj(
-                json!({
-                    "mode": {"type": "string", "enum": ["full", "compact"]},
-                    "areas": {"type": ["array", "null"], "items": {"type": "string"}}
-                }),
-                &[],
-            ),
-        ),
-        general(
-            "job_status",
-            "State of a queued job: queued, running, done, failed or cancelled. A finished job's result is returned once, then the job is gone.",
-            obj(json!({"job": job()}), &["job"]),
-        ),
-        general(
-            "job_wait",
-            "Waits up to `timeout_ms` (default 60000, at most 600000) for a queued job to finish, then returns its state and result, as job_status does. A still running job is reported as running.",
-            obj(json!({"job": job(), "timeout_ms": {"type": "integer", "minimum": 0}}), &["job"]),
-        ),
-        general(
-            "job_cancel",
-            "Cancels a queued job before it starts (best effort: a running or finished job is reported as it is).",
-            obj(json!({"job": job()}), &["job"]),
-        ),
-    ]
-}
-
-/// One command's listing entry (full mode).
-fn command_tool(c: &CommandSpec) -> Value {
-    json!({
-        "name": tool_name(c.id),
-        "title": c.label,
-        "description": format!("{} ({})", c.summary, c.id),
-        "inputSchema": queueable((c.input)()),
-        "outputSchema": (c.output)(),
-        "annotations": {"readOnlyHint": !c.undoable},
-    })
-}
-
-/// One area's listing entry (compact mode): `verb` and `params`.
-fn area_tool_spec(area: &str) -> Value {
-    let commands = area_commands(area);
-    let lines: Vec<String> = commands.iter().map(|c| format!("- {}: {}", verb_of(c.id), c.summary)).collect();
-    let verb_names = verbs(area);
-    json!({
-        "name": area,
-        "title": format!("{area} commands"),
-        "description": format!(
-            "Commands of the `{area}` area. `verb` picks one, `params` are its parameters (describe_command gives the schema).\n{}",
-            lines.join("\n")
-        ),
-        "inputSchema": queueable(json!({
-            "type": "object",
-            "properties": {
-                "verb": {"type": "string", "enum": verb_names},
-                "params": {"type": "object", "description": "Parameters of the command (see describe_command)."}
-            },
-            "required": ["verb"],
-            "additionalProperties": false
-        })),
-    })
+/// The error for a tool name the server does not know, with the nearest names.
+fn unknown_tool(name: &str) -> Value {
+    let names: Vec<String> = registry().iter().map(|c| tool_name(c.id)).collect();
+    let mut known: Vec<&str> = names.iter().map(String::as_str).collect();
+    known.extend(areas());
+    known.extend(GENERAL.iter().chain(OWN).copied());
+    tool_error_with(&format!("unknown tool `{name}`"), name, &known)
 }
 
 /// The MCP server state.
@@ -652,6 +370,7 @@ pub struct Server<B: Backend> {
     jobs: Arc<Jobs>,
     threaded: bool,
     config: ToolConfig,
+    files: Option<bool>,
     initialized: bool,
 }
 
@@ -673,7 +392,7 @@ impl<B: Backend + Send + 'static> Server<B> {
             .name("surfacecraft-mcp".into())
             .spawn(move || work(worker_backend, worker_jobs))
             .is_ok();
-        Self { backend, jobs, threaded, config: ToolConfig::default(), initialized: false }
+        Self { backend, jobs, threaded, config: ToolConfig::default(), files: None, initialized: false }
     }
 }
 
@@ -682,6 +401,14 @@ impl<B: Backend> Server<B> {
     #[must_use]
     pub fn with_tools(mut self, config: ToolConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    /// The same server, telling the agent whether path parameters work here (`None`, the
+    /// default: not known, as when bridged to an app).
+    #[must_use]
+    pub fn with_files(mut self, allowed: Option<bool>) -> Self {
+        self.files = allowed;
         self
     }
 
@@ -722,7 +449,7 @@ impl<B: Backend> Server<B> {
             obj.remove("queued");
         }
         if !known_tool(name) {
-            return tool_error(&format!("unknown tool `{name}`"));
+            return unknown_tool(name);
         }
         if OWN.contains(&name) {
             if queued {
@@ -817,21 +544,61 @@ impl<B: Backend> Server<B> {
         )
     }
 
-    /// The listing: the general tools, then one tool per command (full) or per area (compact),
-    /// filtered by the configured areas.
+    /// The listing: the general tools, then the featured commands and one tool per area
+    /// (compact) or one tool per command (full), filtered by the configured areas.
     fn tools_list(&self) -> Value {
-        let mut tools = general_tools();
+        let mut tools = listing::general_tools();
         let wanted = |area: &str| self.config.areas.as_ref().is_none_or(|list| list.iter().any(|a| a == area));
         if self.config.compact {
-            for area in areas().into_iter().filter(|a| wanted(a)) {
-                tools.push(area_tool_spec(area));
-            }
+            let featured = FEATURED.iter().filter_map(|id| find(id)).filter(|c| wanted(area_of(c.id)));
+            tools.extend(featured.map(|c| listing::command_tool(c, false)));
+            tools.extend(areas().into_iter().filter(|a| wanted(a)).map(listing::area_tool_spec));
         } else {
-            for c in registry().iter().filter(|c| wanted(area_of(c.id))) {
-                tools.push(command_tool(c));
-            }
+            tools.extend(registry().iter().filter(|c| wanted(area_of(c.id))).map(|c| listing::command_tool(c, true)));
         }
         json!({"tools": tools})
+    }
+
+    /// A command's structured result, run in queue order (for the resources); `None` when the
+    /// command failed.
+    fn command_value(&mut self, id: &str, params: Value) -> Option<Value> {
+        let result = self.call_sync(Request::Command { id: id.to_string(), params });
+        let failed = result.get("isError").and_then(Value::as_bool).unwrap_or(true);
+        if failed { None } else { result.get("structuredContent").cloned() }
+    }
+
+    /// `resources/list`: the design, the commands, and one resource per guide. Answered without
+    /// the worker, so it never waits behind a running job.
+    fn resources_list() -> Value {
+        let mut list = vec![
+            json!({"uri": "surfacecraft://design", "name": "design", "mimeType": "application/json", "description": "Objects of the open design"}),
+            json!({"uri": "surfacecraft://commands", "name": "commands", "mimeType": "application/json", "description": "Every command"}),
+        ];
+        list.extend(guide_index().into_iter().map(|(id, title)| {
+            json!({
+                "uri": format!("{}{id}", prompts::GUIDE_URI),
+                "name": format!("guide: {id}"),
+                "mimeType": "text/markdown",
+                "description": title,
+            })
+        }));
+        json!({"resources": list})
+    }
+
+    /// `resources/read`: the contents of `uri`, or `None` for an unknown resource.
+    fn resource_read(&mut self, uri: &str) -> Option<Value> {
+        let (mime, text) = if let Some(topic) = uri.strip_prefix(prompts::GUIDE_URI) {
+            ("text/markdown", guide_markdown(topic)?.to_string())
+        } else {
+            let id = match uri {
+                "surfacecraft://design" => "doc.list",
+                "surfacecraft://commands" => "app.commands",
+                _ => return None,
+            };
+            let value = self.command_value(id, Value::Null)?;
+            ("application/json", value.to_string())
+        };
+        Some(json!({"contents": [{"uri": uri, "mimeType": mime, "text": text}]}))
     }
 
     /// Handles one JSON-RPC message; `None` for notifications.
@@ -857,9 +624,13 @@ impl<B: Backend> Server<B> {
                     &id,
                     json!({
                         "protocolVersion": version,
-                        "capabilities": {"tools": {"listChanged": false}, "resources": {"listChanged": false}},
+                        "capabilities": {
+                            "tools": {"listChanged": false},
+                            "resources": {"listChanged": false},
+                            "prompts": {"listChanged": false}
+                        },
                         "serverInfo": {"name": "surfacecraft", "version": env!("CARGO_PKG_VERSION")},
-                        "instructions": "SurfaceCraft scan-to-CAD. Every UI action is a tool. Start with guide_read (a guide per task), then list_commands or inspect_design. Meshes: mesh_import (path or base64 data) or mesh_synth. Several steps that keep their effects: app_batch. A long call: queued true, then job_wait."
+                        "instructions": prompts::instructions(self.files)
                     }),
                 )
             }
@@ -873,22 +644,21 @@ impl<B: Backend> Server<B> {
                 let args = params.get("arguments").cloned().unwrap_or(Value::Null);
                 rpc_ok(&id, self.call(&name, args))
             }
-            "resources/list" => rpc_ok(
-                &id,
-                json!({"resources": [
-                    {"uri": "surfacecraft://design", "name": "design", "mimeType": "application/json", "description": "Objects of the open design"},
-                    {"uri": "surfacecraft://commands", "name": "commands", "mimeType": "application/json", "description": "Every command"}
-                ]}),
-            ),
+            "resources/list" => rpc_ok(&id, Self::resources_list()),
             "resources/read" => {
                 let uri = params.get("uri").and_then(Value::as_str).unwrap_or("");
-                let request = match uri {
-                    "surfacecraft://design" => Request::Command { id: "doc.list".into(), params: Value::Null },
-                    "surfacecraft://commands" => Request::Command { id: "app.commands".into(), params: Value::Null },
-                    _ => return Some(rpc_error(&id, -32602, "unknown resource")),
-                };
-                let v = self.call_sync(request).get("structuredContent").cloned().unwrap_or(Value::Null);
-                rpc_ok(&id, json!({"contents": [{"uri": uri, "mimeType": "application/json", "text": v.to_string()}]}))
+                match self.resource_read(uri) {
+                    Some(contents) => rpc_ok(&id, contents),
+                    None => rpc_error(&id, -32602, "unknown resource, or it cannot be read now"),
+                }
+            }
+            "prompts/list" => rpc_ok(&id, prompts::list()),
+            "prompts/get" => {
+                let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+                match prompts::get(name, params.get("arguments").unwrap_or(&Value::Null)) {
+                    Some(prompt) => rpc_ok(&id, prompt),
+                    None => rpc_error(&id, -32602, "unknown prompt"),
+                }
             }
             other => rpc_error(&id, -32601, &format!("method not found: {other}")),
         })
@@ -925,349 +695,17 @@ fn job_result(v: &View) -> Value {
     });
     let content = match v.result.get("content") {
         Some(c) if v.state.finished() => c.clone(),
-        _ => json!([{"type": "text", "text": err_text(&structured)}]),
+        _ => json!([{"type": "text", "text": structured.to_string()}]),
     };
     json!({"content": content, "structuredContent": structured, "isError": false})
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::mpsc::{Receiver, channel};
+mod tests;
 
-    fn server() -> Server<LocalBackend> {
-        Server::new(LocalBackend::new(false))
-    }
-
-    /// One `tools/call` through the protocol.
-    fn call<B: Backend + Send + 'static>(s: &mut Server<B>, name: &str, args: Value) -> Value {
-        s.handle(
-            &json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": name, "arguments": args}}),
-        )
-        .expect("a reply")
-    }
-
-    /// The tool names listed now.
-    fn names<B: Backend + Send + 'static>(s: &mut Server<B>) -> Vec<String> {
-        let t = s.handle(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).expect("a reply");
-        t["result"]["tools"]
-            .as_array()
-            .map(|list| list.iter().filter_map(|x| x["name"].as_str().map(str::to_string)).collect())
-            .unwrap_or_default()
-    }
-
-    fn structured(r: &Value) -> &Value {
-        &r["result"]["structuredContent"]
-    }
-
-    fn object_count(s: &mut Server<LocalBackend>) -> usize {
-        structured(&call(s, "inspect_design", json!({})))["objects"].as_array().map_or(0, Vec::len)
-    }
-
-    #[test]
-    fn handshake_and_tools_cover_every_command() {
-        let mut s = server();
-        let r = s
-            .handle(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}}))
-            .unwrap();
-        assert_eq!(r["result"]["protocolVersion"], "2025-03-26");
-        assert!(s.handle(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).is_none());
-        let t = s.handle(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).unwrap();
-        let names: Vec<String> =
-            t["result"]["tools"].as_array().unwrap().iter().map(|x| x["name"].as_str().unwrap().to_string()).collect();
-        // every command is a tool
-        for c in registry() {
-            assert!(names.contains(&tool_name(c.id)), "missing tool for {}", c.id);
-            assert_eq!(command_id(&tool_name(c.id)), Some(c.id));
-        }
-        assert!(names.len() >= registry().len() + 8);
-    }
-
-    #[test]
-    fn tools_execute_batch_rollback_and_errors() {
-        let mut s = server();
-        let call = |s: &mut Server<LocalBackend>, name: &str, args: Value| {
-            s.handle(&json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": name, "arguments": args}})).unwrap()
-        };
-        let r = call(&mut s, "mesh_synth", json!({"shape": "sphere", "resolution": 16}));
-        assert_eq!(r["result"]["isError"], false, "{r}");
-        let r = call(
-            &mut s,
-            "batch",
-            json!({"commands": [
-                {"command": "body.box", "params": {"size": [1, 1, 1]}},
-                {"command": "body.fillet", "params": {"object": "box", "edges": [999], "size": 1}}
-            ]}),
-        );
-        assert_eq!(r["result"]["isError"], true);
-        assert_eq!(r["result"]["structuredContent"]["rolled_back"], 1);
-        let d = call(&mut s, "inspect_design", json!({}));
-        assert_eq!(d["result"]["structuredContent"]["objects"].as_array().unwrap().len(), 1);
-        let r = call(&mut s, "mesh_import", json!({"path": "/etc/passwd"}));
-        assert_eq!(r["result"]["isError"], true, "file access is off in this server");
-        let r = call(&mut s, "screenshot", json!({}));
-        assert_eq!(r["result"]["isError"], true);
-        assert!(s.handle_line("{not json").unwrap().contains("-32700"));
-        let r = s.handle(&json!({"jsonrpc": "2.0", "id": 3, "method": "nope"})).unwrap();
-        assert_eq!(r["error"]["code"], -32601);
-        let r = s.handle(&json!({"jsonrpc": "2.0", "id": 4, "method": "resources/read", "params": {"uri": "surfacecraft://design"}})).unwrap();
-        assert!(r["result"]["contents"][0]["text"].as_str().unwrap().contains("objects"));
-    }
-
-    /// Hostile messages never panic and always get an answer when they carry an id.
-    #[test]
-    fn hostile_messages_never_panic() {
-        let mut s = server();
-        for line in [
-            "",
-            "[]",
-            "null",
-            "42",
-            r#"{"id": 1}"#,
-            r#"{"id": 1, "method": "tools/call"}"#,
-            r#"{"id": 1, "method": "tools/call", "params": {"name": 5}}"#,
-            r#"{"id": 1, "method": "tools/call", "params": {"name": "execute", "arguments": {"command": "no.such"}}}"#,
-            r#"{"id": 1, "method": "tools/call", "params": {"name": "batch", "arguments": {"commands": [1, 2]}}}"#,
-            r#"{"id": 1, "method": "tools/call", "params": {"name": "screenshot", "arguments": {"width": -5}}}"#,
-            r#"[{"id": 1, "method": "ping"}, {"method": "x"}]"#,
-        ] {
-            let _ = s.handle_line(line);
-        }
-    }
-
-    #[test]
-    fn guide_read_lists_the_guides_and_returns_one() {
-        let mut s = server();
-        let list = call(&mut s, "guide_read", json!({}));
-        assert_eq!(list["result"]["isError"], false, "{list}");
-        let guides = structured(&list)["guides"].as_array().expect("guides");
-        assert_eq!(guides.len(), 7);
-        assert!(guides.iter().all(|g| g["sections"].as_array().is_some_and(|s| !s.is_empty())));
-        let one = call(&mut s, "guide_read", json!({"topic": "build-solid"}));
-        assert!(structured(&one)["guides"][0]["markdown"].as_str().is_some_and(|m| m.contains("body.from_regions")));
-        let bad = call(&mut s, "guide_read", json!({"topic": "nope"}));
-        assert_eq!(bad["result"]["isError"], true);
-    }
-
-    #[test]
-    fn compact_mode_lists_one_tool_per_area_and_dispatches_verbs() {
-        let mut s = Server::new(LocalBackend::new(false)).with_tools(ToolConfig { compact: true, areas: None });
-        let n = names(&mut s);
-        assert!(n.contains(&"mesh".to_string()) && n.contains(&"guide".to_string()), "{n:?}");
-        assert!(!n.iter().any(|t| t == "mesh_import"));
-        assert!(n.contains(&"execute".to_string()) && n.contains(&"job_wait".to_string()));
-        let r = call(&mut s, "mesh", json!({"verb": "synth", "params": {"shape": "sphere", "size": [5.0]}}));
-        assert_eq!(r["result"]["isError"], false, "{r}");
-        let bad = call(&mut s, "mesh", json!({"verb": "nope"}));
-        assert_eq!(bad["result"]["isError"], true);
-        assert_eq!(object_count(&mut s), 1);
-    }
-
-    #[test]
-    fn areas_filter_the_listing_and_set_tool_mode_changes_it_at_run_time() {
-        let mut s = server();
-        assert!(names(&mut s).contains(&"mesh_import".to_string()));
-        let r = call(&mut s, "set_tool_mode", json!({"areas": ["guide", "app"]}));
-        assert_eq!(r["result"]["isError"], false, "{r}");
-        let n = names(&mut s);
-        assert!(n.contains(&"guide_read".to_string()) && n.contains(&"app_batch".to_string()), "{n:?}");
-        assert!(!n.iter().any(|t| t.starts_with("mesh_")));
-        assert!(n.contains(&"list_commands".to_string()), "the general tools stay");
-        let bad = call(&mut s, "set_tool_mode", json!({"areas": ["nope"]}));
-        assert_eq!(bad["result"]["isError"], true);
-        call(&mut s, "set_tool_mode", json!({"mode": "compact"}));
-        let n = names(&mut s);
-        assert!(n.contains(&"app".to_string()) && !n.contains(&"app_batch".to_string()), "{n:?}");
-        call(&mut s, "set_tool_mode", json!({"mode": "full", "areas": null}));
-        assert!(names(&mut s).contains(&"mesh_import".to_string()));
-    }
-
-    #[test]
-    fn app_batch_runs_steps_as_undo_steps_and_stops_at_the_first_error() {
-        let mut s = server();
-        let r = call(
-            &mut s,
-            "app_batch",
-            json!({"commands": [
-                {"command": "body.box", "params": {"size": [1, 1, 1], "name": "a"}},
-                {"command": "body.fillet", "params": {"body": "missing", "edges": [0], "size": 1}},
-                {"command": "body.box", "params": {"size": [2, 2, 2], "name": "b"}}
-            ]}),
-        );
-        assert_eq!(r["result"]["isError"], true, "a failed step is an error result: {r}");
-        assert_eq!(structured(&r)["succeeded"], 1);
-        assert_eq!(structured(&r)["not_run"], 1);
-        assert_eq!(object_count(&mut s), 1);
-        call(&mut s, "undo", json!({}));
-        assert_eq!(object_count(&mut s), 0, "the first step was its own undo step");
-    }
-
-    /// A backend whose `body.box` named `first` waits for the test's go-ahead. It records what
-    /// ran, in order.
-    struct Gate {
-        go: Receiver<()>,
-        ran: Arc<Mutex<Vec<String>>>,
-    }
-
-    impl Backend for Gate {
-        fn execute(&mut self, id: &str, params: Value) -> Result<Value, Value> {
-            let who = format!("{id}:{}", params.get("name").and_then(Value::as_str).unwrap_or("-"));
-            if who == "body.box:first" {
-                let _ = self.go.recv_timeout(Duration::from_secs(20));
-            }
-            if let Ok(mut ran) = self.ran.lock() {
-                ran.push(who);
-            }
-            Ok(json!({"ran": id}))
-        }
-    }
-
-    #[test]
-    fn queued_jobs_run_in_order_and_a_queued_job_can_be_cancelled_before_it_starts() {
-        let (go, gate) = channel::<()>();
-        let ran = Arc::new(Mutex::new(Vec::new()));
-        let mut s = Server::new(Gate { go: gate, ran: Arc::clone(&ran) });
-        let first = call(&mut s, "body_box", json!({"queued": true, "size": [1, 1, 1], "name": "first"}));
-        assert_eq!(first["result"]["isError"], false, "{first}");
-        let job1 = structured(&first)["job"].as_u64().expect("a job id");
-        let second = call(&mut s, "body_box", json!({"queued": true, "size": [2, 2, 2], "name": "second"}));
-        let job2 = structured(&second)["job"].as_u64().expect("a job id");
-        let cancelled = call(&mut s, "job_cancel", json!({"job": job2}));
-        assert_eq!(structured(&cancelled)["state"], "cancelled", "{cancelled}");
-        // the gate is still closed: the first job cannot be done
-        let status = call(&mut s, "job_status", json!({"job": job1}));
-        assert_ne!(structured(&status)["state"], "done", "{status}");
-        go.send(()).expect("release the gate");
-        // a call sent now runs after the first job
-        let third = call(&mut s, "body_box", json!({"size": [3, 3, 3], "name": "third"}));
-        assert_eq!(third["result"]["isError"], false, "{third}");
-        let waited = call(&mut s, "job_wait", json!({"job": job1, "timeout_ms": 10_000}));
-        assert_eq!(structured(&waited)["state"], "done", "{waited}");
-        assert_eq!(structured(&waited)["result"]["ran"], "body.box", "{waited}");
-        let order = ran.lock().map(|r| r.to_vec()).unwrap_or_default();
-        assert_eq!(order, vec!["body.box:first".to_string(), "body.box:third".to_string()]);
-        // a finished job's result is read once
-        let gone = call(&mut s, "job_status", json!({"job": job1}));
-        assert_eq!(gone["result"]["isError"], true, "{gone}");
-    }
-
-    #[test]
-    fn hostile_queue_and_mode_arguments_never_panic() {
-        let mut s = server();
-        for (name, args) in [
-            ("set_tool_mode", json!({"mode": 5})),
-            ("set_tool_mode", json!({"areas": 5})),
-            ("set_tool_mode", json!({"areas": [1, {}]})),
-            ("set_tool_mode", json!({"areas": ["mesh", "mesh", "x\u{0}"]})),
-            ("set_tool_mode", json!({"queued": true})),
-            ("job_wait", json!({"job": "x"})),
-            ("job_wait", json!({"job": 1, "timeout_ms": -1})),
-            ("job_wait", json!({"job": 99_999, "timeout_ms": 1e300})),
-            ("job_status", json!({})),
-            ("job_cancel", json!({"job": null})),
-            ("job_status", json!({"job": 0})),
-            ("body_box", json!({"queued": "yes"})),
-            ("body_box", json!({"queued": true, "size": "x"})),
-            ("mesh", json!({"verb": 3})),
-            ("mesh", json!({"verb": "import", "params": 7})),
-            ("app_batch", json!({"commands": 3})),
-            ("app_batch", json!({"commands": [{"command": "app.batch"}]})),
-            ("app_batch", json!({"commands": [{"command": "x", "extra": 1}]})),
-            ("guide_read", json!({"topic": 4})),
-            ("no_such_tool", json!({})),
-        ] {
-            let r = call(&mut s, name, args);
-            assert!(r["result"]["isError"].is_boolean(), "{name}: {r}");
-        }
-    }
-}
-
-/// Bridged mode: commands go to a running desktop app over its localhost control channel.
 #[cfg(not(target_arch = "wasm32"))]
-pub mod bridge {
-    use super::Backend;
-    use serde_json::{Value, json};
-    use std::io::{BufRead, BufReader, Write};
-    use std::net::TcpStream;
-
-    /// A connection to a running app.
-    pub struct BridgeBackend {
-        stream: TcpStream,
-        reader: BufReader<TcpStream>,
-        token: String,
-        next: u64,
-    }
-
-    impl BridgeBackend {
-        /// Connects using a discovery file `{port, token}`; `None` when no app answers.
-        #[must_use]
-        pub fn connect(discovery: &std::path::Path) -> Option<Self> {
-            let info: Value = serde_json::from_str(&std::fs::read_to_string(discovery).ok()?).ok()?;
-            let port = u16::try_from(info.get("port")?.as_u64()?).ok()?;
-            let token = info.get("token")?.as_str()?.to_string();
-            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-            let stream = TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500)).ok()?;
-            let reader = BufReader::new(stream.try_clone().ok()?);
-            let mut b = Self { stream, reader, token, next: 1 };
-            // a live app answers a harmless command
-            b.request("engine.execute", json!({"command": "app.commands", "params": {"filter": "app."}})).ok()?;
-            Some(b)
-        }
-
-        fn request(&mut self, method: &str, params: Value) -> Result<Value, Value> {
-            let id = self.next;
-            self.next += 1;
-            let msg = json!({"token": self.token, "id": id, "method": method, "params": params});
-            writeln!(self.stream, "{msg}").map_err(|e| json!({"kind": "failed", "message": e.to_string()}))?;
-            let mut line = String::new();
-            self.reader.read_line(&mut line).map_err(|e| json!({"kind": "failed", "message": e.to_string()}))?;
-            let v: Value =
-                serde_json::from_str(&line).map_err(|e| json!({"kind": "failed", "message": e.to_string()}))?;
-            match (v.get("result"), v.get("error")) {
-                (Some(r), _) => Ok(r.clone()),
-                (None, Some(e)) => Err(json!({"kind": "failed", "message": e})),
-                _ => Err(json!({"kind": "failed", "message": "malformed reply"})),
-            }
-        }
-    }
-
-    impl Backend for BridgeBackend {
-        fn execute(&mut self, id: &str, params: Value) -> Result<Value, Value> {
-            let r = self.request("engine.execute", json!({"command": id, "params": params}))?;
-            match (r.get("ok"), r.get("err")) {
-                (Some(v), _) => Ok(v.clone()),
-                (None, Some(e)) => Err(e.clone()),
-                _ => Err(json!({"kind": "failed", "message": "malformed reply"})),
-            }
-        }
-        fn screenshot(&mut self, w: u32, h: u32) -> Option<Vec<u8>> {
-            let r = self.request("ui.screenshot", json!({"width": w, "height": h})).ok()?;
-            let s = r.get("png")?.as_str()?;
-            decode_b64(s)
-        }
-    }
-
-    fn decode_b64(s: &str) -> Option<Vec<u8>> {
-        let val = |c: u8| -> Option<u32> {
-            Some(match c {
-                b'A'..=b'Z' => u32::from(c - b'A'),
-                b'a'..=b'z' => u32::from(c - b'a') + 26,
-                b'0'..=b'9' => u32::from(c - b'0') + 52,
-                b'+' => 62,
-                b'/' => 63,
-                _ => return None,
-            })
-        };
-        let bytes: Vec<u8> = s.bytes().filter(|b| *b != b'=' && !b.is_ascii_whitespace()).collect();
-        let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
-        for chunk in bytes.chunks(4) {
-            let mut n = 0u32;
-            for (k, &c) in chunk.iter().enumerate() {
-                n |= val(c)? << (18 - 6 * k as u32);
-            }
-            let full = [(n >> 16) as u8, (n >> 8) as u8, n as u8];
-            out.extend_from_slice(full.get(..chunk.len().saturating_sub(1))?);
-        }
-        Some(out)
-    }
-}
+pub mod bridge;
+mod jobs;
+pub mod lean;
+mod listing;
+pub mod prompts;

@@ -569,6 +569,8 @@
   "cmd.deviation.stats.hint": "Shows the average and the largest deviation in numbers.",
   "cmd.scan.qa": "Scan quality",
   "cmd.scan.qa.hint": "Lists what to clean in a scan first: holes, debris, bad triangles and noise.",
+  "cmd.scan.to_solid": "Scan to solid",
+  "cmd.scan.to_solid.hint": "Turns a scan into a closed solid in one step and measures it against the scan.",
   "cmd.mesh.import_stream": "Import large scan",
   "cmd.mesh.import_stream.hint": "Loads a very large scan from disk piece by piece into a folder, without filling the memory.",
   "cmd.mesh.store_info": "Large scan info",
@@ -923,5 +925,7 @@
   "status.running": "{name}: running…",
   "status.busy": "{name} is still running",
   "status.cancelled": "{name}: cancelled",
-  "status.finishing": "The cancelled command is still finishing; try again in a moment"
+  "status.finishing": "The cancelled command is still finishing; try again in a moment",
+  "cmd.surface.wrap": "Wrap scan in patches",
+  "cmd.surface.wrap.hint": "Covers the whole scan with a watertight network of patches fitted to it; for castings, body panels and organic shapes."
 }

@@ -25,7 +25,7 @@ const USAGE: &str = "usage:
   surfacecraft-cli exec <command> [<params-json>] [--open <project>] [--save <project>]
   surfacecraft-cli commands [<filter>]
   surfacecraft-cli describe <command>
-  surfacecraft-cli mcp [--local] [--allow-files] [--tools full|compact] [--areas <a,b>]
+  surfacecraft-cli mcp [--local] [--allow-files] [--tools compact|full] [--areas <a,b>]
   surfacecraft-cli assist <align|workflow> <goal> [--open <project>] [--save <project>]
   surfacecraft-cli licences
 
@@ -195,7 +195,7 @@ fn mcp_stdio(local: bool, allow_files: bool, config: surfacecraft_mcp::ToolConfi
     );
     let mut backend = surfacecraft_mcp::LocalBackend::new(allow_files);
     backend.render = Some(Box::new(|s, w, h| surfacecraft_ui_egui::shot::screenshot_png(s, None, w, h)));
-    serve(surfacecraft_mcp::Server::new(backend).with_tools(config));
+    serve(surfacecraft_mcp::Server::new(backend).with_tools(config).with_files(Some(allow_files)));
 }
 
 fn main() -> ExitCode {

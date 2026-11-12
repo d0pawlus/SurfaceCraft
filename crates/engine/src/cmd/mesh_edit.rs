@@ -180,7 +180,7 @@ pub struct CleanIn {
     pub fill_holes_max_edges: Option<usize>,
 }
 
-fn clean(s: &mut Session, i: CleanIn) -> CmdResult<EditOut> {
+pub(crate) fn clean(s: &mut Session, i: CleanIn) -> CmdResult<EditOut> {
     let frac = fraction(i.min_component_fraction, "min_component_fraction", 0.01)?;
     let ratio = i.outlier_ratio.unwrap_or(1.5);
     if !(ratio.is_finite() && ratio >= 0.0) {

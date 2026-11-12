@@ -24,6 +24,8 @@ surfacecraft-engine.workspace = true
 surfacecraft-mcp.workspace = true
 surfacecraft-ai.workspace = true
 surfacecraft-ui-egui.workspace = true
+surfacecraft-doc.workspace = true
+surfacecraft-geom.workspace = true
 serde_json.workspace = true
 
 [lints]

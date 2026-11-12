@@ -83,6 +83,7 @@ fn describe(_s: &mut Session, i: DescribeIn) -> CmdResult<DescribeOut> {
 
 /// The guides, embedded at compile time (the web build and sandboxed hosts have no files).
 const GUIDES: &[(&str, &str)] = &[
+    ("scan-to-solid", include_str!("../../../../docs/guides/scan-to-solid.md")),
     ("align-scan", include_str!("../../../../docs/guides/align-scan.md")),
     ("extract-primitives", include_str!("../../../../docs/guides/extract-primitives.md")),
     ("fit-surfaces", include_str!("../../../../docs/guides/fit-surfaces.md")),
@@ -141,6 +142,18 @@ fn guide_info(id: &str, markdown: &str) -> GuideInfo {
         }
     }
     GuideInfo { id: id.to_string(), title, sections, markdown: None }
+}
+
+/// Id and title of every guide, for a front end that lists them without running a command.
+#[must_use]
+pub fn guide_index() -> Vec<(&'static str, String)> {
+    GUIDES.iter().map(|(id, md)| (*id, guide_info(id, md).title)).collect()
+}
+
+/// The Markdown of guide `id`.
+#[must_use]
+pub fn guide_markdown(id: &str) -> Option<&'static str> {
+    GUIDES.iter().find(|(g, _)| *g == id).map(|(_, md)| *md)
 }
 
 fn read_guide(_s: &mut Session, i: GuideIn) -> CmdResult<GuideOut> {

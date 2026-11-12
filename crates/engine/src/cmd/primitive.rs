@@ -71,7 +71,7 @@ pub struct FitOut {
     pub warning: Option<String>,
 }
 
-fn fit_cmd(s: &mut Session, i: FitIn) -> CmdResult<FitOut> {
+pub(crate) fn fit_cmd(s: &mut Session, i: FitIn) -> CmdResult<FitOut> {
     let (mesh, tris, region) = match (&i.region, &i.mesh, &i.triangles) {
         (Some(r), None, None) => {
             let rid = r.resolve(s, ObjectKind::Region)?;
@@ -752,7 +752,7 @@ fn simulate(
     Ok(ps)
 }
 
-fn auto_constrain(s: &mut Session, i: AutoConstrainIn) -> CmdResult<AutoConstrainOut> {
+pub(crate) fn auto_constrain(s: &mut Session, i: AutoConstrainIn) -> CmdResult<AutoConstrainOut> {
     let angle_tol = i.angle_tol_deg.unwrap_or(3.0);
     let length_tol = i.length_tol.unwrap_or(0.2);
     if !(angle_tol.is_finite() && (0.0..=20.0).contains(&angle_tol)) {

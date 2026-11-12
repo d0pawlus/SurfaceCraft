@@ -569,6 +569,8 @@
   "cmd.deviation.stats.hint": "Pokazuje średnią i największą odchyłkę w liczbach.",
   "cmd.scan.qa": "Jakość skanu",
   "cmd.scan.qa.hint": "Wypisuje, co najpierw oczyścić w skanie: dziury, okruchy, złe trójkąty i szum.",
+  "cmd.scan.to_solid": "Skan na bryłę",
+  "cmd.scan.to_solid.hint": "Zamienia skan w zamkniętą bryłę jednym krokiem i mierzy ją względem skanu.",
   "cmd.mesh.import_stream": "Import dużego skanu",
   "cmd.mesh.import_stream.hint": "Wczytuje bardzo duży skan z dysku kawałek po kawałku do folderu, bez zapełniania pamięci.",
   "cmd.mesh.store_info": "Informacje o dużym skanie",
@@ -923,5 +925,7 @@
   "status.running": "{name}: trwa…",
   "status.busy": "{name} jeszcze trwa",
   "status.cancelled": "{name}: anulowano",
-  "status.finishing": "Anulowane polecenie jeszcze się kończy; spróbuj za chwilę"
+  "status.finishing": "Anulowane polecenie jeszcze się kończy; spróbuj za chwilę",
+  "cmd.surface.wrap": "Owiń skan płatami",
+  "cmd.surface.wrap.hint": "Pokrywa cały skan szczelną siatką płatów dopasowanych do skanu; do odlewów, karoserii i kształtów organicznych."
 }

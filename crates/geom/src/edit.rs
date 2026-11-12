@@ -17,6 +17,35 @@ use nalgebra::{Matrix3, Matrix4, Vector4};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
+/// Removes every triangle on an edge that three or more triangles share, until no such edge is
+/// left; returns how many triangles were removed. What stays is a surface whose edges have one or
+/// two triangles each, with small holes where the extra sheets met it (fill them afterwards).
+pub fn remove_non_manifold(mesh: &mut Mesh) -> usize {
+    let before = mesh.triangles.len();
+    loop {
+        let mut uses: HashMap<(u32, u32), u32> = HashMap::with_capacity(mesh.triangles.len() * 3 / 2);
+        for t in &mesh.triangles {
+            for k in 0..3 {
+                let (a, b) = (t[k], t[(k + 1) % 3]);
+                *uses.entry((a.min(b), a.max(b))).or_insert(0) += 1;
+            }
+        }
+        let on_bad_edge = |t: &[u32; 3]| {
+            (0..3).any(|k| {
+                let (a, b) = (t[k], t[(k + 1) % 3]);
+                uses.get(&(a.min(b), a.max(b))).is_some_and(|c| *c > 2)
+            })
+        };
+        let kept = mesh.triangles.len();
+        mesh.triangles.retain(|t| !on_bad_edge(t));
+        if mesh.triangles.len() == kept {
+            break;
+        }
+    }
+    compact(mesh);
+    before - mesh.triangles.len()
+}
+
 /// Drops vertices no triangle uses; returns how many were dropped.
 pub fn compact(mesh: &mut Mesh) -> usize {
     if mesh.validate().is_err() {
@@ -1020,6 +1049,25 @@ pub fn smooth_cancellable(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fin_on_an_edge_is_removed_with_the_triangles_it_touches() {
+        // two triangles sharing an edge, a third triangle (the fin) on the same edge, one apart
+        let mut m = Mesh {
+            positions: vec![
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(1.0, 0.0, 0.0),
+                Point3::new(0.0, 1.0, 0.0),
+                Point3::new(1.0, 1.0, 0.0),
+                Point3::new(0.5, 0.5, 1.0),
+                Point3::new(2.0, 0.0, 0.0),
+            ],
+            triangles: vec![[0, 1, 2], [1, 3, 2], [1, 2, 4], [1, 5, 3]],
+        };
+        assert_eq!(remove_non_manifold(&mut m), 3);
+        assert_eq!(m.triangles.len(), 1);
+        assert_eq!(remove_non_manifold(&mut m), 0);
+    }
     use crate::{Rng, synth};
 
     #[test]
