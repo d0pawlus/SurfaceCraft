@@ -11,17 +11,17 @@
 
 use super::p21::Param;
 use super::topology::ShellWriter;
-use super::{bad, e, ints, r, reals, s};
+use super::{bad, e, ints, r, reals, s, unsupported};
 use crate::IoError;
 use surfacecraft_kernel::record::brep::{Curve, Frame, Surface};
 
-/// Distinct knots and their multiplicities.
+/// Distinct knots and their multiplicities; only exactly equal knots are one knot.
 pub(super) fn knots_of(full: &[f64]) -> (Vec<f64>, Vec<usize>) {
     let mut k: Vec<f64> = Vec::new();
     let mut m: Vec<usize> = Vec::new();
     for &x in full {
         match (k.last(), m.last_mut()) {
-            (Some(&last), Some(c)) if (x - last).abs() <= 1e-14 * (1.0 + last.abs()) => *c += 1,
+            (Some(&last), Some(c)) if x == last => *c += 1,
             _ => {
                 k.push(x);
                 m.push(1);
@@ -29,6 +29,20 @@ pub(super) fn knots_of(full: &[f64]) -> (Vec<f64>, Vec<usize>) {
         }
     }
     (k, m)
+}
+
+/// [`knots_of`], checked against the degree: a knot may repeat at most `degree + 1` times (a full
+/// break, which the kernel's record validator also accepts), or the spline is not one.
+pub(super) fn checked_knots(full: &[f64], degree: usize) -> Result<(Vec<f64>, Vec<usize>), IoError> {
+    let (k, m) = knots_of(full);
+    let bad_at = m.iter().copied().enumerate().find(|&(_, c)| c > degree + 1);
+    match bad_at {
+        Some((i, c)) => {
+            let at = k.get(i).copied().unwrap_or(f64::NAN);
+            Err(bad(format!("knot {at:e} repeats {c} times in a degree {degree} spline")))
+        }
+        None => Ok((k, m)),
+    }
 }
 
 pub(super) fn degree(knots: &[f64], count: usize) -> Result<usize, IoError> {
@@ -132,7 +146,7 @@ impl ShellWriter<'_> {
     ) -> Result<u64, IoError> {
         check_knots(knots, "B_SPLINE_CURVE")?;
         let deg = degree(knots, points.len())?;
-        let (k, m) = knots_of(knots);
+        let (k, m) = checked_knots(knots, deg)?;
         let Some(ws) = weights else {
             return Ok(self.w.add(
                 "B_SPLINE_CURVE_WITH_KNOTS",
@@ -194,7 +208,7 @@ impl ShellWriter<'_> {
                 let ids = self.point_refs(&pts)?;
                 self.bspline_curve(knots, ids, Some(&ws))
             }
-            other => Err(bad(format!("not supported yet: STEP export of a {} edge in a sheet", curve_name(other)))),
+            other => Err(unsupported(format!("not supported yet: STEP export of a {} edge", curve_name(other)))),
         }
     }
 
@@ -215,8 +229,8 @@ impl ShellWriter<'_> {
         let nv = points.first().map_or(0, Vec::len);
         let (p, q) = (degree(u_knots, points.len())?, degree(v_knots, nv)?);
         let rows = self.net_refs(points, nv)?;
-        let (uk, um) = knots_of(u_knots);
-        let (vk, vm) = knots_of(v_knots);
+        let (uk, um) = checked_knots(u_knots, p)?;
+        let (vk, vm) = checked_knots(v_knots, q)?;
         Ok(self.w.add(
             "B_SPLINE_SURFACE_WITH_KNOTS",
             &[
@@ -251,8 +265,8 @@ impl ShellWriter<'_> {
             rows.push(Param::List(self.point_refs(&pts)?));
             wrows.push(reals(&ws));
         }
-        let (uk, um) = knots_of(u_knots);
-        let (vk, vm) = knots_of(v_knots);
+        let (uk, um) = checked_knots(u_knots, p)?;
+        let (vk, vm) = checked_knots(v_knots, q)?;
         Ok(self.w.add_complex(&[
             ("BOUNDED_SURFACE", vec![]),
             (
@@ -313,9 +327,7 @@ impl ShellWriter<'_> {
                 let ax = self.placement(frame)?;
                 Ok(self.w.add("TOROIDAL_SURFACE", &[s(), r(ax), Param::Real(big), Param::Real(small)]))
             }
-            other => {
-                Err(bad(format!("not supported yet: STEP export of a {} surface in a sheet", surface_name(other))))
-            }
+            other => Err(unsupported(format!("not supported yet: STEP export of a {} surface", surface_name(other)))),
         }
     }
 }
