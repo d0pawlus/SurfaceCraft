@@ -7,7 +7,7 @@
 //! network is measured against the scan. Where the patches miss the tolerance the budget is halved
 //! around the missed points only (`refine: adaptive`, default) or everywhere (`uniform`), and the
 //! wrap repeated; see `wrap_rounds`. The scan tells creases from smooth edges (`crease_deg`): patches
-//! are made tangent across the smooth ones (`continuity: g1`, default) and meet G0 across the creases,
+//! are made tangent across the smooth ones (`continuity: g1`, experimental, opt-in) and meet G0 across the creases,
 //! so sharp edges and thin walls survive.
 use super::body::{BodyOut, body_out};
 use super::deviation::positive;
@@ -60,7 +60,7 @@ pub struct WrapIn {
     /// Edges whose two sides (taken from the scan) differ by more than this angle in degrees are creases and stay sharp; the others are smooth (default 35, 1..60).
     #[serde(default)]
     pub crease_deg: Option<f64>,
-    /// Continuity across the smooth edges: `g1` (default, tangent) or `g0` (positions only).
+    /// Continuity across the smooth edges: `g0` (default, positions only) or `g1` (experimental: tangent patches; costs patches and time and can miss the tolerance on real scans).
     #[serde(default)]
     pub continuity: Option<String>,
     /// Name of the body (default "wrap").
@@ -183,8 +183,8 @@ fn settings(i: &WrapIn) -> CmdResult<Settings> {
         return Err(CmdError::Params(format!("crease_deg must be within 1..={MAX_CREASE_DEG}")));
     }
     let g1 = match i.continuity.as_deref() {
-        None | Some("g1") => true,
-        Some("g0") => false,
+        Some("g1") => true,
+        None | Some("g0") => false,
         Some(other) => return Err(CmdError::Params(format!("continuity must be \"g1\" or \"g0\", not \"{other}\""))),
     };
     let max_patches = i.max_patches.unwrap_or(MAX_PATCHES);
@@ -270,7 +270,7 @@ pub static COMMANDS: &[CommandSpec] = &[command!(
     "Wrap scan in patches",
     "Freeform",
     true,
-    "A watertight network of bicubic patches over the whole scan `mesh`, for parts that are not made of primitives (castings, body panels, organic shapes): the scan is reduced to a coarse mesh within a budget, each triangle becomes three patches fitted to the scan, and the budget is halved (`refine` adaptive: only around the scan points the patches miss, uniform: everywhere) until `min_within` of the scan lies within `tolerance` or `max_patches` is reached. Every round is a conforming mesh, so neighbouring patches always share their boundary. The scan tells creases (edges whose two sides differ by more than `crease_deg`) from smooth edges: patches are made tangent across the smooth ones (`continuity` g1, default; `smooth_jump` reports the normal jump that is left) and meet G0 across the creases, so sharp edges and thin walls are kept. The result is a solid when the network is closed, else a sheet.",
+    "A watertight network of bicubic patches over the whole scan `mesh`, for parts that are not made of primitives (castings, body panels, organic shapes): the scan is reduced to a coarse mesh within a budget, each triangle becomes three patches fitted to the scan, and the budget is halved (`refine` adaptive: only around the scan points the patches miss, uniform: everywhere) until `min_within` of the scan lies within `tolerance` or `max_patches` is reached. Every round is a conforming mesh, so neighbouring patches always share their boundary. The scan tells creases (edges whose two sides differ by more than `crease_deg`) from smooth edges: with `continuity` g1 (experimental, opt-in; default g0) patches are made tangent across the smooth ones (`smooth_jump` reports the normal jump that is left) and meet G0 across the creases, so sharp edges and thin walls are kept. The result is a solid when the network is closed, else a sheet.",
     WrapIn,
     WrapOut,
     wrap

@@ -91,7 +91,7 @@
   "Constrain parameters.": "Ustawienia więzów.",
   "Constraint index.": "Numer więzu.",
   "Constraints to add (indices refer to the sketch's points and entities).": "Więzy do dodania (numery odnoszą się do punktów i elementów szkicu).",
-  "Continuity across the smooth edges: `g1` (default, tangent) or `g0` (positions only).": "Ciągłość na gładkich krawędziach: „g1” (domyślnie, styczność) albo „g0” (tylko położenie).",
+  "Continuity across the smooth edges: `g0` (default, positions only) or `g1` (experimental: tangent patches; costs patches and time and can miss the tolerance on real scans).": "Ciągłość na gładkich krawędziach: „g0” (domyślnie, tylko położenie) albo „g1” (eksperymentalnie: płaty styczne; kosztuje płaty i czas, a na rzeczywistych skanach może nie mieścić się w tolerancji).",
   "Control net `[u, v]`; omitted → the smallest net meeting `tolerance`.": "Siatka kontrolna: liczba punktów w kierunkach U i V. Puste pole: najmniejsza siatka, która mieści się w polu „Tolerancja”.",
   "Convergence: stop when no sample moved more than this between iterations (mm).": "Warunek zakończenia: obliczenia kończą się, gdy między kolejnymi iteracjami żadna próbka nie przesunęła się o więcej niż ta wartość (mm).",
   "Corner of the box with the largest coordinates, mm.": "Narożnik prostopadłościanu o największych współrzędnych, mm.",

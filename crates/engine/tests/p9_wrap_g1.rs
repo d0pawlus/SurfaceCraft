@@ -115,7 +115,7 @@ fn scan_of(m: &Mesh, spacing: f64, seed: u64) -> Mesh {
 fn wrap(scan: Mesh, extra: Value) -> (Session, Value) {
     let mut s = Session::new();
     s.doc.add_mesh("scan", scan);
-    let mut params = json!({"mesh": "scan", "tolerance": TOLERANCE, "min_within": MIN_WITHIN, "max_patches": 60000});
+    let mut params = json!({"mesh": "scan", "tolerance": TOLERANCE, "min_within": MIN_WITHIN, "max_patches": 60000, "continuity": "g1"});
     if let (Some(p), Some(e)) = (params.as_object_mut(), extra.as_object()) {
         p.extend(e.clone());
     }
@@ -361,5 +361,28 @@ fn baseline_g0_numbers() {
         let (s, w) = wrap(scan, json!({"continuity": "g0"}));
         let within = independent_within(&s, &w);
         report(&format!("{name} g0"), &w, within);
+    }
+}
+
+#[test]
+fn the_default_continuity_is_g0_and_identical_to_an_explicit_g0() {
+    // Arrange
+    let run = |extra: Value| {
+        let mut s = Session::new();
+        s.doc.add_mesh("scan", blob_scan(3));
+        let mut params = json!({"mesh": "scan", "tolerance": TOLERANCE});
+        if let (Some(p), Some(e)) = (params.as_object_mut(), extra.as_object()) {
+            p.extend(e.clone());
+        }
+        s.execute("surface.wrap", params).unwrap()
+    };
+
+    // Act
+    let (default, explicit) = (run(json!({})), run(json!({"continuity": "g0"})));
+
+    // Assert
+    assert_eq!(default["continuity"], "g0", "{default}");
+    for key in ["patches", "deviation", "smooth_jump", "crease_edges", "levels", "g0_patches"] {
+        assert_eq!(default[key], explicit[key], "{key}");
     }
 }

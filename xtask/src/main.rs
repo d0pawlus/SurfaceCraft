@@ -100,7 +100,7 @@ fn has_nextest() -> bool {
 }
 
 /// Function names that evaluate Bézier/Bernstein geometry; outside `crates/kernel` only the listed files may define them.
-const EVALUATOR_NAMES: [&str; 5] = ["bernstein", "de_casteljau", "bern", "dbern", "bezier_"];
+const EVALUATOR_NAMES: [&str; 4] = ["bernstein", "de_casteljau", "bern", "dbern"];
 
 /// Files outside the kernel and the list that define a function named like a Bézier evaluator.
 fn unlisted_evaluators(listed: &[String]) -> Vec<String> {

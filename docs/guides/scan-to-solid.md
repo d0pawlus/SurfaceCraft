@@ -27,16 +27,15 @@ Freeform (`surface.wrap` inside):
 
 - Cleans the scan, then reduces it to a coarse mesh that stays within a budget of the scan.
 - Every coarse triangle becomes three patches fitted to the scan; neighbours share their edges.
-  The layout is searched with unconstrained patches, then wrapped once more with tangent ones.
 - The patches are measured against the scan; the budget is halved only around the scan points the
   patches miss (`refine: adaptive`, the default), until `min_within` of the scan is within
   `tolerance`, or 12000 patches. Smooth, well fitted areas keep large patches. Every round lays
   the patches on a new conforming triangle mesh, so neighbours always share their boundary curves
   (no T-junctions, no gaps). `levels` of the result lists patches and fit per round.
 - A scan without open boundaries gives a solid; one with holes gives a sheet (`open_surface`).
-- Creases are taken from the scan and stay sharp (thin walls too); across the smooth edges the
-  patches are tangent, to within a small measured angle (`smooth_jump` in the `surface.wrap` result;
-  patches that could not be made tangent are counted in `g0_patches`).
+- Patches meet in position (`continuity: g0`, what `scan.to_solid` uses). Tangent patches
+  (`surface.wrap` with `continuity: g1`) are experimental: on 13 real scans they reached the
+  tolerance on 7 where `g0` did on 9, and needed 56 % more patches and 2 to 3 times the time.
 
 Primitives:
 
