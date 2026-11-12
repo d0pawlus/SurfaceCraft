@@ -8,6 +8,9 @@ use surfacecraft_align::{Datum, IcpOptions, datum_321, icp_cancellable, kabsch, 
 use surfacecraft_doc::{ObjectId, ObjectKind};
 use surfacecraft_geom::{Bvh, Mesh, Point3, Transform, Vec3};
 
+mod auto;
+mod settle;
+
 /// The motion an alignment applied.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct AlignOut {
@@ -28,6 +31,7 @@ pub struct AlignOut {
 
 fn apply_to(s: &mut Session, id: ObjectId, also: &[ObjRef], t: &Transform, apply: bool) -> CmdResult<()> {
     if !apply {
+        s.mark_unchanged();
         return Ok(());
     }
     let mut ids = vec![id];
@@ -412,5 +416,25 @@ pub static COMMANDS: &[CommandSpec] = &[
         MeshAlignIn,
         AlignOut,
         center
+    ),
+    command!(
+        "align.auto",
+        "Auto align",
+        "Align",
+        true,
+        "Proposes a pose from the scan alone: the largest flat face (or an open rim standing for a missing one) on z = 0 with the part above, the longest side of the footprint on x; a turned part gets its axis on z. `apply` false (default) only reports the 4x4 matrix, how far it moves the part, the evidence and a confidence; `mode` all_faces levels all near-axis-aligned faces by area.",
+        auto::AutoIn,
+        auto::AutoOut,
+        auto::auto
+    ),
+    command!(
+        "align.symmetry",
+        "Align to symmetry plane",
+        "Align",
+        true,
+        "Puts the mirror plane of `object` on the world plane `plane` (yz = x 0, default; xz; xy) by the shortest turn and a slide along that axis. `apply` false (default) only reports the pose and the symmetry residual (RMS distance mesh to mirrored mesh).",
+        settle::SettleIn,
+        settle::SettleOut,
+        settle::settle
     ),
 ];

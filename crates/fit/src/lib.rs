@@ -12,6 +12,7 @@
 pub mod auto;
 pub mod charts;
 pub mod constrain;
+pub mod coverage;
 pub mod features;
 pub mod lm;
 pub mod mls;

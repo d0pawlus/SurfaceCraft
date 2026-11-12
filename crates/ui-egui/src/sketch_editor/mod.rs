@@ -7,6 +7,7 @@
 //! like any other action, so one gesture is one command is one undo step; `Esc` cancels the
 //! gesture in progress without a command. The state machine knows nothing about egui or the GPU
 //! and is tested without them; [`ui`] draws the overlay and feeds the pointer in.
+pub mod drag;
 pub mod snap;
 mod ui;
 pub mod view;
@@ -331,6 +332,8 @@ pub struct SketchEditor {
     pub chrome: Vec<[f32; 4]>,
     /// The strip's details (snap options, hints, the constraint list) are shown.
     pub details_open: bool,
+    /// A point being dragged with the mouse (see [`drag`]).
+    pub drag: Option<drag::Drag>,
 }
 
 impl Default for SketchEditor {
@@ -348,6 +351,7 @@ impl Default for SketchEditor {
             labels: Vec::new(),
             chrome: Vec::new(),
             details_open: false,
+            drag: None,
         }
     }
 }
@@ -401,6 +405,10 @@ impl SketchEditor {
     /// `Esc`: cancels the gesture in progress; with none, drops back to the select tool.
     /// Never issues a command.
     pub fn escape(&mut self) {
+        if self.drag.is_some() {
+            self.drag_cancel();
+            return;
+        }
         let busy =
             !self.gesture.is_empty() || !self.picks.is_empty() || self.pending.is_some() || !self.typed.is_empty();
         if busy {

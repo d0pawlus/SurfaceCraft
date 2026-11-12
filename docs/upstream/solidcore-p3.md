@@ -18,6 +18,8 @@ template fields:
 | 5 | [05-from-record-union-chained-rotated-copies.md](05-from-record-union-chained-rotated-copies.md) | yes | probable: #13737 |
 | 6 | [06-from-record-shell-filleted-pocketed-plate.md](06-from-record-shell-filleted-pocketed-plate.md) | yes | probable: #13737 |
 | 7 | [07-from-record-window-along-plane-normal.md](07-from-record-window-along-plane-normal.md) | yes | probable: #13737 |
+| 8 | [08-validate-item-budget-large-bspline-shell.md](08-validate-item-budget-large-bspline-shell.md) | yes (by design, see the draft) | none found |
+| 9 | [09-healer-superlinear-on-from-record.md](09-healer-superlinear-on-from-record.md) | yes | none found |
 
 Already filed by the owner: #13617 (IGES writer proposal), #13618 (multi-face sheet thicken, NotSolid), #13619 (sheet
 from a B-spline surface). At `4f2da85`: solidcore still has no IGES writer (no IGES writer in the crates; the

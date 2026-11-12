@@ -7,6 +7,8 @@ use surfacecraft_doc::{ObjectId, ObjectKind};
 
 use super::surface_fit::fit_cmd;
 pub use super::surface_fit::{FitIn, FitOut, GapOut, OutlineOut, PieceOut};
+pub use super::surface_mask::{BoxIn, ExclusionOut, SphereIn};
+pub use super::surface_report::{CoverageOut, CoverageShares, SampleCounts};
 
 /// One surface.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
