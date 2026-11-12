@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use surfacecraft_geom::{Point3, Vec3};
 
 /// A boundary vertex closer than this fraction of the edge length to the outline moves onto it.
-const SNAP_FRACTION: f64 = 0.2;
+const SNAP_FRACTION: f64 = 0.3;
 /// An outline corner closer than this fraction of the edge length (along the outline) to a
 /// partner vertex becomes that vertex.
 const CORNER_FRACTION: f64 = 0.2;
@@ -165,7 +165,7 @@ fn partners(
     lp: &OutlineLoop,
     ids: &[u32],
     arcs: &[f64],
-    edge: f64,
+    (edge, slack): (f64, f64),
     normal_at: &dyn Fn(&Point3) -> Option<Vec3>,
 ) -> (Vec<Partner>, Ring) {
     let base = poly.vertices.len() as u32;
@@ -181,7 +181,7 @@ fn partners(
         let (Some(p), Some((o, dir))) = (poly.vertices.get(id as usize), lp.at(arc)) else { continue };
         let d = (p - o).norm();
         let beyond = (p - o).dot(&dir) > 0.0;
-        if d < SNAP_FRACTION * edge || (beyond && d < PULL_BACK_FRACTION * edge) {
+        if d < SNAP_FRACTION * edge + slack || (beyond && d < PULL_BACK_FRACTION * edge + slack) {
             ring.moved.push((id, o));
             out.push(Partner { id, arc });
         } else {
@@ -228,11 +228,11 @@ fn build_ring(
     lp: &OutlineLoop,
     ids: &[u32],
     arcs: &[f64],
-    edge: f64,
+    (edge, slack): (f64, f64),
     normal_at: &dyn Fn(&Point3) -> Option<Vec3>,
 ) -> Ring {
     let base = poly.vertices.len() as u32;
-    let (partner, mut ring) = partners(poly, lp, ids, arcs, edge, normal_at);
+    let (partner, mut ring) = partners(poly, lp, ids, arcs, (edge, slack), normal_at);
     let (arc_at, total) = lp.arc_lengths();
     let corner_arcs: Vec<(f64, usize)> = lp.corners.iter().filter_map(|&c| arc_at.get(c).map(|&a| (a, c))).collect();
     let m = partner.len().min(ids.len());
@@ -291,7 +291,7 @@ pub fn conform_to_outline(
             report.skipped += 1;
             continue;
         };
-        let ring = build_ring(poly, lp, ids, &arcs, edge, normal_at);
+        let ring = build_ring(poly, lp, ids, &arcs, (edge, outline.slack), normal_at);
         report.conformed += 1;
         report.snapped += ring.moved.len();
         report.ring_faces += ring.faces.len();

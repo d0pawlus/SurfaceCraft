@@ -51,6 +51,9 @@ pub struct OutlineLoop {
 pub struct Outline {
     /// Loops, longest first.
     pub loops: Vec<OutlineLoop>,
+    /// The slack added to the enclosing offset everywhere (mm): a layout that already follows the
+    /// raw boundary lies this far inside the outline.
+    pub slack: f64,
 }
 
 /// The closest point of an outline.
@@ -337,7 +340,7 @@ pub fn region_outline(mesh: &Mesh, spacing: f64) -> Outline {
     let mut loops: Vec<OutlineLoop> =
         boundary_loops(mesh).iter().filter_map(|ids| outline_loop(mesh, &normals, &tree, ids, spacing)).collect();
     loops.sort_by(|a, b| b.arc_lengths().1.total_cmp(&a.arc_lengths().1));
-    Outline { loops }
+    Outline { loops, slack: MARGIN_SPACINGS * spacing }
 }
 
 /// Mean edge length of the mesh (the scan's sampling distance).

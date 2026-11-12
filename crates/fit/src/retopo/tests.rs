@@ -55,3 +55,30 @@ fn sphere_layout_is_quad_dominant_and_closed() {
     assert!(q.boundary_edges().is_empty());
     assert_eq!(q.euler(), 2);
 }
+
+/// A layout of a plate that stops short of a notched boundary reaches the notch after conforming.
+#[test]
+fn an_open_layout_reaches_the_outline_and_a_closed_one_is_untouched() {
+    let sphere = synth::sphere(Point3::origin(), 20.0, 80, 40);
+    let (_, rep) = retopo(&sphere, &RetopoOptions { target_faces: 150, ..RetopoOptions::default() }).unwrap();
+    assert_eq!(rep.boundary, ConformReport::default());
+    // a plate with a rectangular bite out of one side
+    let plate = synth::plane(Point3::origin(), Vec3::x(), Vec3::y(), 40.0, 30.0, 56, 42);
+    let keep: Vec<u32> = (0..plate.triangle_count() as u32)
+        .filter(|&t| plate.face_centroid(t as usize).is_some_and(|c| !(c.x > 28.0 && (c.y - 15.0).abs() < 5.0)))
+        .collect();
+    let region = plate.submesh(&keep);
+    let (poly, rep) = retopo(&region, &RetopoOptions { target_faces: 60, ..RetopoOptions::default() }).unwrap();
+    eprintln!("notched plate: {:?}, faces {}", rep.boundary, poly.faces.len());
+    assert_eq!(rep.boundary.conformed, 1, "{:?}", rep.boundary);
+    assert_eq!(rep.boundary.skipped, 0);
+    // every vertex of the region's outline corner area is reached: some layout vertex lies within
+    // a fraction of the edge length of each corner of the bite and of the plate
+    let corners =
+        [(28.0, 10.0), (28.0, 20.0), (40.0, 10.0), (40.0, 20.0), (0.0, 0.0), (40.0, 0.0), (0.0, 30.0), (40.0, 30.0)];
+    for (x, y) in corners {
+        let near =
+            poly.vertices.iter().map(|v| ((v.x - x).powi(2) + (v.y - y).powi(2)).sqrt()).fold(f64::INFINITY, f64::min);
+        assert!(near < 0.5 * rep.edge_length, "corner ({x}, {y}): nearest layout vertex {near}");
+    }
+}
