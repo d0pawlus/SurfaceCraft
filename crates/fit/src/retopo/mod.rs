@@ -33,7 +33,7 @@ mod polymesh;
 mod tests;
 mod util;
 
-pub use conform::{ConformReport, conform_to_outline, snap_to_outline};
+pub use conform::{ConformReport, conform_to_outline, invalid_quads, snap_to_outline};
 use extract::extract;
 use field::{Level, init_orientation, init_positions, level_of, prolong, smooth_orientation, smooth_positions};
 use util::{
@@ -88,11 +88,20 @@ pub struct RetopoOptions {
     pub position_sweeps: usize,
     /// Skip the fields and use the fallback layout (decimation split into quads).
     pub force_fallback: bool,
+    /// Conform the layout of an open region to its outline (default true; the engine turns it off
+    /// when conforming would leave an improper quad).
+    pub conform_boundary: bool,
 }
 
 impl Default for RetopoOptions {
     fn default() -> Self {
-        Self { target_faces: 200, orientation_sweeps: 40, position_sweeps: 40, force_fallback: false }
+        Self {
+            target_faces: 200,
+            orientation_sweeps: 40,
+            position_sweeps: 40,
+            force_fallback: false,
+            conform_boundary: true,
+        }
     }
 }
 
@@ -125,7 +134,9 @@ pub struct RetopoReport {
 /// An error message when the mesh is empty or invalid.
 pub fn retopo(mesh: &Mesh, opts: &RetopoOptions) -> Result<(PolyMesh, RetopoReport), String> {
     let (mut poly, mut report) = lay_out(mesh, opts)?;
-    report.boundary = conform_layout(mesh, &mut poly, report.edge_length);
+    if opts.conform_boundary {
+        report.boundary = conform_layout(mesh, &mut poly, report.edge_length);
+    }
     Ok((poly, report))
 }
 

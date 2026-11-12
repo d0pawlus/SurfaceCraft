@@ -3,7 +3,11 @@ use surfacecraft_geom::Rng;
 
 /// The square [0, 10]², region on the left of the travel direction, four corners.
 fn square() -> Outline {
-    let pts = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)];
+    square_of(10.0)
+}
+
+fn square_of(size: f64) -> Outline {
+    let pts = [(0.0, 0.0), (size, 0.0), (size, size), (0.0, size)];
     let h = std::f64::consts::FRAC_1_SQRT_2;
     let outward = [(-h, -h), (h, -h), (h, h), (-h, h)];
     let lp = OutlineLoop {
@@ -179,4 +183,212 @@ fn random_layouts_are_unchanged_or_conformed_with_gaps_and_valid_faces() {
         }
     }
     assert!(conformed > 20 && left > 0, "conformed {conformed}, left {left}");
+}
+
+/// Improper quads among those the layout is converted to (fan of every face, as `quad.retopo` does).
+fn improper_quads(m: &PolyMesh) -> usize {
+    invalid_quads(&m.split_to_quads(&|p, n| Some((*p, *n))))
+}
+
+/// Bottom-edge vertices at `n` equal steps between two forced corners, `n - 1` of them in between.
+fn bottom_run(between: usize) -> PolyMesh {
+    let mut pts = vec![(0.0, -0.1)];
+    pts.extend((1..=between).map(|k| (10.0 * k as f64 / (between + 1) as f64, -0.1)));
+    pts.extend([(10.0, -0.1), (10.1, 10.0), (0.0, 10.1), (-0.1, 5.0)]);
+    poly(&pts)
+}
+
+/// A span that holds its vertices exactly (199 × 0.05 + 0.05 = 10) must not panic in the bounds;
+/// one vertex more is rolled back, one less is conformed.
+#[test]
+fn an_exactly_full_span_neither_panics_nor_overflows() {
+    for between in [198usize, 199, 200] {
+        let mut m = bottom_run(between);
+        let report = conform_to_outline(&mut m, &square(), 1.0, &up);
+        assert_eq!(report.conformed + report.rolled_back + report.skipped, 1, "{between}: {report:?}");
+        if between == 200 {
+            assert_eq!(report.rolled_back, 1, "{report:?}");
+        }
+        if between == 198 {
+            assert_eq!(report.conformed, 1, "{report:?}");
+        }
+    }
+}
+
+/// An accepted dent polygon whose fan from the arithmetic centre would invert a quad: what the
+/// layout is converted to must be proper, so the loop is rolled back (or decomposed safely).
+#[test]
+fn a_concave_dent_polygon_never_converts_to_an_inverted_quad() {
+    let mut m = poly(&[
+        (10.0, 0.6),
+        (20.0, 20.0),
+        (40.0, 20.0),
+        (50.0, 1.1),
+        (60.0, 20.0),
+        (80.0, 20.0),
+        (90.0, 0.6),
+        (99.5, 50.0),
+        (90.0, 99.4),
+        (10.0, 99.4),
+        (0.5, 50.0),
+    ]);
+    let before = (improper_quads(&m), m.vertices.clone(), m.faces.clone());
+    let report = conform_to_outline(&mut m, &square_of(100.0), 1.0, &up);
+    // conforming must not add an improper quad; here it is rolled back and the layout is as it was
+    assert!(improper_quads(&m) <= before.0, "{report:?}");
+    assert_eq!(report.rolled_back, 1, "{report:?}");
+    assert_eq!((m.vertices, m.faces), (before.1, before.2));
+}
+
+/// After a split, the re-snap must not put two neighbouring vertices on one outline point.
+#[test]
+fn re_snapping_a_split_layout_keeps_its_vertices_apart() {
+    let layout = super::super::QuadMesh {
+        vertices: [(-0.1, 0.0), (0.0, -0.1), (1.0, 0.0), (0.0, 1.0)]
+            .iter()
+            .map(|p| Point3::new(p.0, p.1, 0.0))
+            .collect(),
+        normals: vec![Vec3::z(); 4],
+        faces: vec![[0, 1, 2, 3]],
+    };
+    let split = layout.split(&|p, n| Some((*p, *n)));
+    let (snapped, _) = snap_to_outline(&split, &square(), 1.0, 0.5);
+    for (i, a) in snapped.vertices.iter().enumerate() {
+        for b in &snapped.vertices[i + 1..] {
+            assert!((a - b).norm() > 1e-9, "{a:?} {b:?}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// property test over three outlines on a gently curved surface
+
+fn curved(x: f64, y: f64) -> Point3 {
+    Point3::new(x, y, 0.01 * (x * x + y * y))
+}
+
+fn curved_normal(x: f64, y: f64) -> Vec3 {
+    Vec3::new(-0.02 * x, -0.02 * y, 1.0).normalize()
+}
+
+/// A counter-clockwise polygon on the curved surface as an outline; `corner` marks its sharp vertices.
+fn outline_of(pts: &[(f64, f64)], corner: &dyn Fn(usize) -> bool) -> Outline {
+    let n = pts.len();
+    let out_of = |a: (f64, f64), b: (f64, f64)| {
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let l = dx.hypot(dy);
+        (dy / l, -dx / l)
+    };
+    let outward: Vec<Vec3> = (0..n)
+        .map(|k| {
+            let (a, b) = (out_of(pts[(k + n - 1) % n], pts[k]), out_of(pts[k], pts[(k + 1) % n]));
+            Vec3::new(a.0 + b.0, a.1 + b.1, 0.0).normalize()
+        })
+        .collect();
+    let lp = OutlineLoop {
+        points: pts.iter().map(|p| curved(p.0, p.1)).collect(),
+        corners: (0..n).filter(|&k| corner(k)).collect(),
+        outward,
+    };
+    Outline { loops: vec![lp], slack: 0.0 }
+}
+
+fn shapes() -> Vec<(Outline, (f64, f64), f64)> {
+    let square = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)];
+    let l_shape = [(0.0, 0.0), (10.0, 0.0), (10.0, 4.0), (4.0, 4.0), (4.0, 10.0), (0.0, 10.0)];
+    let circle: Vec<(f64, f64)> = (0..24)
+        .map(|k| {
+            let a = std::f64::consts::TAU * k as f64 / 24.0;
+            (5.0 + 5.0 * a.cos(), 5.0 + 5.0 * a.sin())
+        })
+        .collect();
+    vec![
+        (outline_of(&square, &|_| true), (5.0, 5.0), 5.0),
+        (outline_of(&l_shape, &|_| true), (3.0, 3.0), 4.0),
+        (outline_of(&circle, &|_| false), (5.0, 5.0), 5.0),
+    ]
+}
+
+fn curved_poly(points: &[(f64, f64)]) -> PolyMesh {
+    PolyMesh {
+        vertices: points.iter().map(|p| curved(p.0, p.1)).collect(),
+        normals: points.iter().map(|p| curved_normal(p.0, p.1)).collect(),
+        faces: vec![(0..points.len() as u32).collect()],
+    }
+}
+
+/// The quads `quad.retopo` ends with: the layout converted, split once and re-snapped to the outline.
+fn pipeline(poly: &PolyMesh, outline: &Outline, edge: f64) -> super::super::QuadMesh {
+    let id = |p: &Point3, n: &Vec3| Some((*p, *n));
+    let quads = poly.as_quads().unwrap_or_else(|| poly.split_to_quads(&id));
+    let split = quads.split(&id);
+    snap_to_outline(&split, outline, 0.5 * edge, 0.4 * edge).0
+}
+
+/// What a random layout exercises, counted over all cases.
+#[derive(Default, Debug)]
+struct Seen {
+    seam: usize,
+    dent: usize,
+    forced: usize,
+    rolled_back: usize,
+    conformed: usize,
+}
+
+fn classify(poly: &PolyMesh, outline: &Outline, edge: f64, seen: &mut Seen) {
+    let lp = &outline.loops[0];
+    let raw: Vec<f64> = poly.vertices.iter().map(|p| lp.closest(p).unwrap().0).collect();
+    let n = raw.len();
+    seen.seam += usize::from((0..n - 1).any(|k| raw[k + 1] < raw[k]));
+    seen.dent += usize::from(poly.vertices.iter().any(|p| lp.closest(p).unwrap().2 > edge));
+    let (arcs, total) = lp.arc_lengths();
+    let near_corner = |a: f64| {
+        lp.corners.iter().any(|&c| {
+            let d = (a - arcs[c]).rem_euclid(total);
+            d.min(total - d) <= 0.75 * edge
+        })
+    };
+    seen.forced += usize::from(raw.iter().any(|&a| near_corner(a)));
+}
+
+/// Random layouts around a square, an L and a circle-like outline on a curved surface: conform,
+/// split and re-snap never panic, never add an improper quad compared with not conforming, and a
+/// loop is either conformed (ordered, gapped arcs) or reported and left exactly as it was.
+#[test]
+fn random_layouts_on_three_outlines_conform_split_and_resnap_safely() {
+    let mut rng = Rng::new(11);
+    let mut seen = Seen::default();
+    for case in 0..900 {
+        let (outline, centre, size) = &shapes()[case % 3];
+        let m_count = 3 + rng.index(10);
+        let mut angles: Vec<f64> = (0..m_count).map(|_| rng.range(0.0, std::f64::consts::TAU)).collect();
+        angles.sort_by(f64::total_cmp);
+        let pts: Vec<(f64, f64)> = angles
+            .iter()
+            .map(|a| {
+                let r = rng.range(0.4, 1.25) * size;
+                (centre.0 + r * a.cos(), centre.1 + r * a.sin())
+            })
+            .collect();
+        let edge = rng.range(0.3, 3.0);
+        let mut poly = curved_poly(&pts);
+        let before = (poly.vertices.clone(), poly.faces.clone());
+        let plain = pipeline(&poly, outline, edge);
+        classify(&poly, outline, edge, &mut seen);
+        let report =
+            conform_to_outline(&mut poly, outline, edge, &|p: &Point3, _: &Vec3| Some(curved_normal(p.x, p.y)));
+        if report.conformed == 0 {
+            assert_eq!((poly.vertices.clone(), poly.faces.clone()), before, "case {case}: {report:?}");
+        } else {
+            assert_ordered(&poly, outline, 0.05 * edge);
+        }
+        seen.rolled_back += report.rolled_back;
+        seen.conformed += report.conformed;
+        let last = pipeline(&poly, outline, edge);
+        assert!(invalid_quads(&last) <= invalid_quads(&plain), "case {case}: {report:?}");
+    }
+    assert!(
+        seen.seam > 0 && seen.dent > 0 && seen.forced > 0 && seen.rolled_back > 0 && seen.conformed > 0,
+        "{seen:?}"
+    );
 }

@@ -225,7 +225,7 @@ fn smooth(points: &[Point3], passes: usize, pinned: &BTreeSet<usize>) -> Vec<Poi
 /// Corner indices: local maxima of the chord turning angle above the threshold.
 fn find_corners(points: &[Point3], window: usize) -> Vec<usize> {
     let n = points.len();
-    let w = window.clamp(2, n / 4);
+    let w = window.max(2).min((n / 4).max(2));
     let turn: Vec<f64> = (0..n)
         .map(|k| {
             let (a, b, c) = (points[(k + n - w) % n], points[k], points[(k + w) % n]);

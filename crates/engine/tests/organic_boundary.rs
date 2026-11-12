@@ -186,6 +186,7 @@ struct Measured {
     max_all: f64,
     jump_max: f64,
     flipped: usize,
+    unverified: usize,
     ret: Value,
     auto: Value,
 }
@@ -212,6 +213,7 @@ fn measure(s: &mut Session, mesh: &Mesh, tris: &[u32], target: usize) -> Measure
         max_all,
         jump_max: auto["normal_jump_max_deg"].as_f64().unwrap(),
         flipped: auto["flipped_patches"].as_u64().unwrap_or(u64::MAX) as usize,
+        unverified: auto["unverified_patches"].as_u64().unwrap_or(u64::MAX) as usize,
         ret,
         auto,
     }
@@ -235,6 +237,8 @@ fn check_ragged(name: &str, mesh: &Mesh, tris: &[u32], target: usize) {
     assert!(m.max_all <= 0.2, "{name}: max deviation including boundary points {}", m.max_all);
     assert!(m.jump_max < 30.0, "{name}: normal jump {}", m.jump_max);
     assert_eq!(m.flipped, 0, "{name}: flipped patches");
+    assert_eq!(m.unverified, 0, "{name}: unverified patches");
+    assert_eq!(m.ret["outline_conformed"], true, "{name}: {}", m.ret);
 }
 
 /// Gate P8-H9(1): a 240° wrapped open surface whose region boundary is ragged (boundary
@@ -321,7 +325,61 @@ fn gate_p8_h9_flipped_patch_after_split_is_repaired() {
     assert_eq!(clean["repaired_patches"], 0, "{clean}");
     assert_eq!(a["repaired_patches"], 1, "{a}");
     assert_eq!(a["flipped_patches"], 0, "{a}");
+    assert_eq!(a["unverified_patches"], 0, "{a}");
     assert_eq!(a["closed"], true, "{a}");
     assert!(a["max"].as_f64().unwrap() <= 0.2, "{a}");
     assert!(a["volume"].as_f64().unwrap() > 0.0, "{a}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// re-snapping after a split
+
+/// A one-quad layout in the corner of a flat plate: its first two vertices both lie next to the
+/// plate's outline corner. Splitting it (by `quad.split` and by the refinements of `surface.auto`)
+/// must not put two vertices on one outline point or leave an improper quad.
+#[test]
+fn quad_split_and_refinement_do_not_collapse_boundary_vertices() {
+    use surfacecraft_engine::EngineError;
+    let mut s = Session::new();
+    let plate = synth::plane(Point3::origin(), Vec3::x(), Vec3::y(), 10.0, 10.0, 20, 20);
+    // the corner of the plate's outline nearest the origin (the outline lies a little outside the plate)
+    let outline = surfacecraft_fit::boundary::cleaned_outline(&plate).0;
+    let lp = &outline.loops[0];
+    let c = lp.corners.iter().map(|&k| lp.points[k]).min_by(|a, b| (a.x + a.y).total_cmp(&(b.x + b.y))).unwrap();
+    let mesh = s.doc.add_mesh("plate", plate);
+    let verts = [[c.x - 0.1, c.y, 0.0], [c.x, c.y - 0.1, 0.0], [c.x + 1.0, c.y, 0.0], [c.x, c.y + 1.0, 0.0]];
+    let id = s.doc.add_quad(surfacecraft_doc::QuadObject {
+        id: surfacecraft_doc::ObjectId(0),
+        name: "corner".into(),
+        mesh,
+        region: None,
+        frame: [[0.0; 3]; 4],
+        domain: [[0.0; 2]; 2],
+        nu: 0,
+        nv: 0,
+        vertices: verts.to_vec(),
+        crease_u: Vec::new(),
+        crease_v: Vec::new(),
+        faces: vec![[0, 1, 2, 3]],
+        normals: vec![[0.0, 0.0, 1.0]; 4],
+        visible: true,
+    });
+    let info = s.execute("quad.split", json!({"object": id.0})).unwrap();
+    eprintln!("split: {info}");
+    let q = s.doc.quad(id).unwrap().clone();
+    for (i, a) in q.vertices.iter().enumerate() {
+        for b in &q.vertices[i + 1..] {
+            let d = ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt();
+            assert!(d > 1e-9, "coincident vertices {a:?} {b:?}");
+        }
+    }
+    for f in &q.faces {
+        let p: Vec<[f64; 3]> = f.iter().map(|&v| q.vertices[v as usize]).collect();
+        let area: f64 = (0..4).map(|k| p[k][0] * p[(k + 1) % 4][1] - p[(k + 1) % 4][0] * p[k][1]).sum::<f64>() / 2.0;
+        assert!(area > 0.0, "improper quad {p:?}");
+    }
+    // automatic refinement splits again and again against an unreachable tolerance
+    let auto = s.execute("surface.auto", json!({"object": id.0, "tolerance": 1e-9}));
+    eprintln!("auto: {auto:?}");
+    assert!(!matches!(auto, Err(EngineError::Internal(_))), "{auto:?}");
 }

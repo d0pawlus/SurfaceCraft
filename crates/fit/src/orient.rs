@@ -135,17 +135,20 @@ fn flat_interior(net: &Net) -> Net {
 }
 
 /// Turns the flipped quads of `layout` around where that cures them. Returns the patches built
-/// from the repaired layout and the quads that stayed flipped.
+/// from the repaired layout, the quads that were flipped, and the verdict on every final patch.
+/// Every patch is classified once: a patch depends only on its own quad, so the verdict of an
+/// unchanged one is reused, and the turned ones are judged once on the trial.
 fn turn_around(
     layout: &mut QuadMesh,
     scan: &ScanSurface,
     radius: f64,
     reference: NormalAt,
-) -> (PatchSet, Vec<usize>, Vec<usize>) {
-    let mut set = build_patches(layout, scan, radius);
-    let first = flipped_patches(&set, &layout.normals, reference);
+) -> (PatchSet, Vec<usize>, Vec<Verdict>) {
+    let set = build_patches(layout, scan, radius);
+    let mut verdict = verdicts(&set, &layout.normals, reference);
+    let first = indices_of(&verdict, Verdict::Flipped);
     if first.is_empty() || set.nets.len() != layout.faces.len() {
-        return (set, first.clone(), first);
+        return (set, first, verdict);
     }
     let mut turned = layout.clone();
     for &i in &first {
@@ -155,26 +158,31 @@ fn turn_around(
     }
     let trial = build_patches(&turned, scan, radius);
     if trial.nets.len() != layout.faces.len() {
-        return (set, first.clone(), first);
+        return (set, first, verdict);
     }
-    let still: Vec<usize> = flipped_patches(&trial, &layout.normals, reference);
     // keep the turn only for the quads it cured
-    for &i in first.iter().filter(|i| !still.contains(i)) {
-        if let (Some(f), Some(g)) = (layout.faces.get_mut(i), turned.faces.get(i)) {
+    for &i in &first {
+        let judged = trial.nets.get(i).map(|n| judge(n, &side_hint(&trial, &layout.normals, i), reference));
+        if judged.is_some_and(|v| v != Verdict::Flipped)
+            && let (Some(f), Some(g), Some(slot)) = (layout.faces.get_mut(i), turned.faces.get(i), verdict.get_mut(i))
+        {
             *f = *g;
+            *slot = judged.unwrap_or(Verdict::Unknown);
         }
     }
-    set = build_patches(layout, scan, radius);
-    let left = flipped_patches(&set, &layout.normals, reference);
-    (set, first, left)
+    (build_patches(layout, scan, radius), first, verdict)
 }
 
 /// Detects flipped patches of `layout` and turns the quads around that cause them (the change
 /// persists in `layout`). Patches the turn does not cure are counted as failed.
 pub fn repair_orientation(layout: &mut QuadMesh, scan: &ScanSurface, radius: f64, reference: NormalAt) -> FlipReport {
-    let (set, first, left) = turn_around(layout, scan, radius, reference);
-    let unverified = unverified_patches(&set, &layout.normals, reference).len();
-    FlipReport { repaired: first.len().saturating_sub(left.len()), failed: left.len(), unverified }
+    let (_, first, verdict) = turn_around(layout, scan, radius, reference);
+    let left = indices_of(&verdict, Verdict::Flipped).len();
+    FlipReport {
+        repaired: first.len().saturating_sub(left),
+        failed: left,
+        unverified: indices_of(&verdict, Verdict::Unknown).len(),
+    }
 }
 
 /// [`repair_orientation`], then a flat interior for the patches that are still flipped. Returns
@@ -185,19 +193,20 @@ pub fn repair_patches(
     radius: f64,
     reference: NormalAt,
 ) -> (PatchSet, FlipReport) {
-    let (mut set, first, left) = turn_around(layout, scan, radius, reference);
-    let mut failed = 0usize;
-    for &i in &left {
-        if let Some(net) = set.nets.get(i) {
-            let flat = flat_interior(net);
-            if judge(&flat, &side_hint(&set, &layout.normals, i), reference) == Verdict::Flipped {
-                failed += 1;
-            } else if let Some(slot) = set.nets.get_mut(i) {
-                *slot = flat;
-            }
+    let (mut set, first, mut verdict) = turn_around(layout, scan, radius, reference);
+    for i in indices_of(&verdict, Verdict::Flipped) {
+        let Some(net) = set.nets.get(i) else { continue };
+        let flat = flat_interior(net);
+        let judged = judge(&flat, &side_hint(&set, &layout.normals, i), reference);
+        if judged != Verdict::Flipped
+            && let (Some(slot), Some(v)) = (set.nets.get_mut(i), verdict.get_mut(i))
+        {
+            *slot = flat;
+            *v = judged;
         }
     }
-    let unverified = unverified_patches(&set, &layout.normals, reference).len();
+    let failed = indices_of(&verdict, Verdict::Flipped).len();
+    let unverified = indices_of(&verdict, Verdict::Unknown).len();
     (set, FlipReport { repaired: first.len().saturating_sub(failed), failed, unverified })
 }
 
@@ -322,5 +331,18 @@ mod tests {
         let reference = |_: &Point3, _: &Vec3| Some(Vec3::z());
         assert_eq!(unverified_patches(&set, &layout.normals, &reference).len(), layout.faces.len());
         assert!(flipped_patches(&set, &layout.normals, &reference).is_empty());
+    }
+
+    /// Every patch is classified once per repair when nothing is flipped (5 samples each).
+    #[test]
+    fn each_patch_is_classified_once() {
+        let (mut layout, scan) = cap_layout();
+        let calls = std::cell::Cell::new(0usize);
+        let reference = |_: &Point3, _: &Vec3| {
+            calls.set(calls.get() + 1);
+            Some(Vec3::z())
+        };
+        repair_patches(&mut layout, &scan, 3.0, &reference);
+        assert_eq!(calls.get(), 5 * layout.faces.len());
     }
 }

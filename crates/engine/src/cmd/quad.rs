@@ -57,6 +57,9 @@ pub struct QuadInfo {
     /// Unstructured layouts: patches that could not be checked against the scan orientation (reported, not assumed fine).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unverified_patches: Option<usize>,
+    /// Unstructured layouts: boundary loops whose split vertices could not be put back onto the region outline.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outline_loops_unsnapped: Option<usize>,
 }
 
 fn points_of(s: &Session, mesh: ObjectId, region: Option<ObjectId>) -> CmdResult<(Arc<Mesh>, Vec<Point3>, Vec<Vec3>)> {
@@ -126,6 +129,7 @@ fn snap(s: &mut Session, id: ObjectId) -> CmdResult<QuadInfo> {
         repaired_patches: None,
         flipped_patches: None,
         unverified_patches: None,
+        outline_loops_unsnapped: None,
     })
 }
 
@@ -296,6 +300,7 @@ fn crease(s: &mut Session, i: CreaseIn) -> CmdResult<QuadInfo> {
         repaired_patches: None,
         flipped_patches: None,
         unverified_patches: None,
+        outline_loops_unsnapped: None,
     })
 }
 
@@ -371,6 +376,9 @@ pub struct AutoOut {
     /// Unstructured layouts: patches that could not be checked against the scan orientation (reported, not assumed fine).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unverified_patches: Option<usize>,
+    /// Unstructured layouts: boundary loops whose split vertices could not be put back onto the region outline.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outline_loops_unsnapped: Option<usize>,
     /// Unstructured layouts: how many times the layout was split to reach the tolerance.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refinements: Option<usize>,
@@ -476,6 +484,7 @@ fn auto(s: &mut Session, i: AutoIn) -> CmdResult<AutoOut> {
         repaired_patches: None,
         flipped_patches: None,
         unverified_patches: None,
+        outline_loops_unsnapped: None,
     })
 }
 

@@ -8,9 +8,11 @@ use std::sync::Arc;
 use surfacecraft_doc::{ObjectId, ObjectKind, QuadObject, SurfaceObject};
 use surfacecraft_fit::boundary::{Outline, cleaned_outline};
 use surfacecraft_fit::mls::ScanSurface;
-use surfacecraft_fit::orient::{FlipReport, flipped_patches, repair_orientation, repair_patches, same_side_normal};
+use surfacecraft_fit::orient::{FlipReport, repair_orientation, repair_patches, same_side_normal};
 use surfacecraft_fit::patch::{Deviation, PatchSet, deviation, edge_normal_jumps};
-use surfacecraft_fit::retopo::{QuadMesh, RetopoOptions, RetopoReport, retopo, snap_to_outline};
+use surfacecraft_fit::retopo::{
+    ConformReport, QuadMesh, RetopoOptions, RetopoReport, invalid_quads, retopo, snap_to_outline,
+};
 use surfacecraft_fit::segment::region_points;
 use surfacecraft_geom::{Bvh, KdTree, Mesh, Point3, Vec3};
 use surfacecraft_kernel::nurbs::{is_closed, sheet_from_bezier_network};
@@ -83,6 +85,9 @@ pub struct RetopoOut {
     pub closed: bool,
     /// Quads whose orientation is inverted against the scan normals (should be 0).
     pub folded: usize,
+    /// Open regions: was the layout conformed to the region outline (false when no loop could be,
+    /// or when the final check reverted it)?
+    pub outline_conformed: bool,
     /// Open regions: free boundary loops of the layout conformed to the region outline.
     pub outline_loops_conformed: usize,
     /// Open regions: free boundary loops left exactly as they were (no matching outline loop, order
@@ -136,6 +141,7 @@ fn retopo_options(i: &RetopoIn) -> CmdResult<RetopoOptions> {
         orientation_sweeps: sweeps_in(i.orientation_sweeps, "orientation_sweeps")?,
         position_sweeps: sweeps_in(i.position_sweeps, "position_sweeps")?,
         force_fallback: false,
+        conform_boundary: true,
     })
 }
 
@@ -268,6 +274,31 @@ fn add_retopo_layout(
     })
 }
 
+/// Why the final net gave up conforming.
+const NET_REASON: &str = "conforming to the outline left an improper quad that the unconformed layout does not have";
+
+/// The settled layout, unless conforming the boundary left it with more improper quads than the
+/// same layout without it: then the whole conform is reverted. Returns the layout, its attempt and
+/// the reason when it was reverted.
+fn netted_layout(
+    sub: &Mesh,
+    scan: &LayoutScan,
+    opts: &RetopoOptions,
+) -> CmdResult<(FieldLayout, usize, Option<&'static str>)> {
+    let (fit, attempt) = settled_field_layout(sub, scan, opts)?;
+    let invalid = invalid_quads(&fit.quads);
+    if fit.rep.boundary.conformed == 0 || invalid == 0 {
+        return Ok((fit, attempt, None));
+    }
+    let plain_opts = RetopoOptions { conform_boundary: false, ..opts.clone() };
+    let (plain, plain_attempt) = settled_field_layout(sub, scan, &plain_opts)?;
+    if invalid_quads(&plain.quads) < invalid {
+        Ok((plain, plain_attempt, Some(NET_REASON)))
+    } else {
+        Ok((fit, attempt, None))
+    }
+}
+
 pub(super) fn retopo_cmd(s: &mut Session, i: RetopoIn) -> CmdResult<RetopoOut> {
     let (mesh, region) = retopo_source(s, &i)?;
     let opts = retopo_options(&i)?;
@@ -275,7 +306,7 @@ pub(super) fn retopo_cmd(s: &mut Session, i: RetopoIn) -> CmdResult<RetopoOut> {
     let tris = retopo_triangles(s, &m, region)?;
     let sub = m.submesh(&tris);
     let scan = LayoutScan::of_region(&m, &tris);
-    let (fit, attempt) = settled_field_layout(&sub, &scan, &opts)?;
+    let (fit, attempt, reverted) = netted_layout(&sub, &scan, &opts)?;
     let boundary = fit.quads.boundary_edges();
     let irregular = interior_irregularity(&fit.quads, &boundary);
     let snap_max = layout_snap_max(&fit.quads, &sub);
@@ -297,7 +328,8 @@ pub(super) fn retopo_cmd(s: &mut Session, i: RetopoIn) -> CmdResult<RetopoOut> {
         folded: fit.folded,
         outline_loops_conformed: fit.rep.boundary.conformed,
         outline_loops_skipped: fit.rep.boundary.skipped + fit.rep.boundary.rolled_back,
-        outline_unconformed_reason: fit.rep.boundary.reason.map(str::to_string),
+        outline_conformed: fit.rep.boundary.conformed > 0,
+        outline_unconformed_reason: reverted.or(fit.rep.boundary.reason).map(str::to_string),
         outline_ring_faces: fit.rep.boundary.ring_faces,
         repaired_patches: fit.flips.repaired,
         flipped_patches: fit.flips.failed,
@@ -385,9 +417,15 @@ pub(super) fn outline_for(s: &Session, q: &QuadObject) -> CmdResult<Outline> {
 }
 
 /// One split of the layout with its new free-boundary vertices put back onto the outline.
-pub(super) fn split_conformed(layout: &QuadMesh, scan: &ScanSurface, outline: &Outline, radius: f64) -> QuadMesh {
+pub(super) fn split_conformed(
+    layout: &QuadMesh,
+    scan: &ScanSurface,
+    outline: &Outline,
+    radius: f64,
+) -> (QuadMesh, ConformReport) {
     let split = layout.split(&projector(scan, radius));
-    snap_to_outline(&split, outline, OUTLINE_SNAP_FRACTION * layout_edge(layout))
+    let edge = layout_edge(layout);
+    snap_to_outline(&split, outline, 0.5 * edge, OUTLINE_SNAP_FRACTION * edge)
 }
 
 /// Checks an unstructured layout read from a document (hostile files).
@@ -425,6 +463,7 @@ pub(super) fn info_of(q: &QuadObject, snap_max: f64) -> QuadInfo {
         repaired_patches: None,
         flipped_patches: None,
         unverified_patches: None,
+        outline_loops_unsnapped: None,
     }
 }
 
@@ -438,7 +477,7 @@ pub(super) fn split_unstructured(s: &mut Session, id: ObjectId) -> CmdResult<Qua
     let scan = ScanSurface::oriented(&pts, &point_normals);
     let layout = layout_of(&q);
     let outline = outline_for(s, &q)?;
-    let mut split = split_conformed(&layout, &scan, &outline, layout_radius(&layout, spacing));
+    let (mut split, resnap) = split_conformed(&layout, &scan, &outline, layout_radius(&layout, spacing));
     let flips = orientation_check(&mut split, &scan, (&pts, &point_normals), spacing);
     let snap_max = {
         let bvh_pts = ScanSurface::new(&pts);
@@ -454,6 +493,7 @@ pub(super) fn split_unstructured(s: &mut Session, id: ObjectId) -> CmdResult<Qua
         repaired_patches: Some(flips.repaired),
         flipped_patches: Some(flips.failed),
         unverified_patches: Some(flips.unverified),
+        outline_loops_unsnapped: Some(resnap.rolled_back),
         ..info_of(q, snap_max)
     })
 }
@@ -479,6 +519,8 @@ struct Measured {
     dev: Deviation,
     repaired: usize,
     unverified: usize,
+    /// Patches still flipped after the repair (0: otherwise the fit fails).
+    flipped: usize,
 }
 
 /// Facts about the accepted fit that the report needs besides the surface.
@@ -487,6 +529,7 @@ struct Accepted {
     signed_volume: Option<f64>,
     refinements: usize,
     repaired: usize,
+    unsnapped: usize,
     folded: usize,
     flipped_patches: usize,
 }
@@ -517,7 +560,7 @@ fn repair_and_measure(layout: &mut QuadMesh, scan: &LayoutScan, tree: &KdTree, f
         return Err(CmdError::Failed("the layout has quads with missing edges".into()));
     }
     let dev = deviation(&set, &scan.pts, 12);
-    Ok(Measured { radius, set, dev, repaired: report.repaired, unverified: report.unverified })
+    Ok(Measured { radius, set, dev, repaired: report.repaired, unverified: report.unverified, flipped: report.failed })
 }
 
 /// Turns every quad of `layout` around, together with its normal.
@@ -588,6 +631,12 @@ fn finish_auto(s: &mut Session, ctx: &AutoContext<'_>, sheet: Brep, step: &Measu
             step.unverified
         ));
     }
+    if accepted.unsnapped > 0 {
+        notes.push(format!(
+            "{} boundary loop splits could not be snapped back onto the region outline (kept as they were)",
+            accepted.unsnapped
+        ));
+    }
     let warning = (!notes.is_empty()).then(|| notes.join("; "));
     let (sid, solid, patches) = store_auto_surface(s, ctx.q, ctx.i, sheet, &step.dev, accepted.closed);
     AutoOut {
@@ -606,6 +655,7 @@ fn finish_auto(s: &mut Session, ctx: &AutoContext<'_>, sheet: Brep, step: &Measu
         repaired_patches: Some(accepted.repaired),
         flipped_patches: Some(accepted.flipped_patches),
         unverified_patches: Some(step.unverified),
+        outline_loops_unsnapped: Some(accepted.unsnapped),
     }
 }
 
@@ -615,12 +665,15 @@ fn refine_and_fit(s: &mut Session, ctx: &AutoContext<'_>, mut layout: QuadMesh) 
     let mut refinements = 0usize;
     let mut flipped = false;
     let mut repaired = 0usize;
+    let mut unsnapped = 0usize;
     loop {
         let step = repair_and_measure(&mut layout, &ctx.scan, &ctx.tree, flipped)?;
         repaired += step.repaired;
         let can_split = layout.faces.len() * 4 <= ctx.max_patches && refinements < MAX_AUTO_REFINEMENTS;
         if step.dev.max > ctx.tol && can_split {
-            layout = split_conformed(&layout, &ctx.scan.scan, &ctx.outline, step.radius);
+            let (split, resnap) = split_conformed(&layout, &ctx.scan.scan, &ctx.outline, step.radius);
+            layout = split;
+            unsnapped += resnap.rolled_back;
             refinements += 1;
             continue;
         }
@@ -638,13 +691,9 @@ fn refine_and_fit(s: &mut Session, ctx: &AutoContext<'_>, mut layout: QuadMesh) 
             signed_volume,
             refinements,
             repaired,
+            unsnapped,
             folded: layout.folded(),
-            flipped_patches: flipped_patches(
-                &step.set,
-                &layout.normals,
-                &scan_reference(&ctx.tree, &ctx.scan.point_normals, flipped),
-            )
-            .len(),
+            flipped_patches: step.flipped,
         };
         return Ok(finish_auto(s, ctx, sheet, &step, &accepted));
     }

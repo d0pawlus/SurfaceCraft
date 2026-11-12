@@ -118,6 +118,9 @@ fn arc_positions(lp: &OutlineLoop, points: &[Point3], edge: f64) -> Option<Vec<f
     let (_, total) = lp.arc_lengths();
     let raw: Vec<f64> = points.iter().map(|p| lp.closest(p).map(|h| h.0)).collect::<Option<_>>()?;
     let n = raw.len();
+    if n == 0 || !(total.is_finite() && total > 0.0) || raw.iter().any(|a| !a.is_finite()) {
+        return None;
+    }
     let mut unwrapped = vec![raw[0]];
     let mut sum = 0.0;
     for k in 0..n {
@@ -178,20 +181,30 @@ fn forced_corners(lp: &OutlineLoop, arcs: &[f64], edge: f64) -> BTreeMap<usize, 
     forced
 }
 
-/// The arcs of every vertex of a span between the anchors `a` and `b` (exclusive), clamped to leave
-/// `gap` between neighbours and to both anchors, as close to `targets` as that allows.
-fn spread_span(targets: &[f64], (a, xa): (usize, f64), (xb, count): (f64, usize), gap: f64, total: f64) -> Vec<f64> {
+/// The arcs of every vertex of a span between the anchors `a` and `b` (exclusive), kept `gap`
+/// apart from each other and from both anchors, as close to `targets` as that allows. `None` when
+/// the bounds of a vertex do not leave room (after rounding), so the span is not conformed.
+fn spread_span(
+    targets: &[f64],
+    (a, xa): (usize, f64),
+    (xb, count): (f64, usize),
+    gap: f64,
+    total: f64,
+) -> Option<Vec<f64>> {
     let n = targets.len();
     let mut out: Vec<f64> = Vec::with_capacity(count);
     for k in 1..=count {
         let j = (a + k) % n;
         // targets are unwrapped from vertex 0: the vertices before the anchor are one revolution on
-        let t = targets[j] + if j < a { total } else { 0.0 };
+        let t = targets.get(j).copied()? + if j < a { total } else { 0.0 };
         let (lo, hi) = (xa + k as f64 * gap, xb - (count + 1 - k) as f64 * gap);
-        let x = t.clamp(lo, hi);
+        if !(lo <= hi) || !t.is_finite() {
+            return None;
+        }
+        let x = t.max(lo).min(hi);
         out.push(out.last().map_or(x, |&prev| x.max(prev + gap)));
     }
-    out
+    Some(out)
 }
 
 /// One solve for all arcs of the loop: forced corners are anchors, the vertices between two
@@ -214,11 +227,8 @@ fn solve_arcs(
         let (b, xb_raw) = anchors[(k + 1) % anchors.len()];
         let xb = xb_raw + total * (((xa - xb_raw) / total).floor() + 1.0).max(0.0);
         let count = if anchors.len() == 1 { n - 1 } else { (b + n - a - 1) % n };
-        if xb - xa < (count + 1) as f64 * gap {
-            return None;
-        }
         arcs[a] = xa;
-        for (j, x) in spread_span(targets, (a, xa), (xb, count), gap, total).into_iter().enumerate() {
+        for (j, x) in spread_span(targets, (a, xa), (xb, count), gap, total)?.into_iter().enumerate() {
             arcs[(a + 1 + j) % n] = x;
         }
     }
@@ -350,7 +360,40 @@ fn face_is_proper(pts: &[(Point3, Vec3)]) -> bool {
     area > 1e-12 && edges_ok && simple
 }
 
-/// Does every face the plan touches (old faces with a moved vertex, and the ring faces) stay proper?
+/// Splitting levels a polygon is checked through: the conversion of the layout to quads, and one
+/// refinement split (`quad.split`, the refinements of `surface.auto`).
+const CHECKED_SPLITS: usize = 2;
+
+/// Is the polygon proper, and are all the quads it converts to (the fan of `split_to_quads`, as
+/// `quad.retopo` splits a layout with any non-quad face), and their own splits, proper too?
+fn polygon_and_quads_proper(pts: &[(Point3, Vec3)]) -> bool {
+    if pts.len() < 3 || !face_is_proper(pts) {
+        return false;
+    }
+    let mut level = PolyMesh {
+        vertices: pts.iter().map(|p| p.0).collect(),
+        normals: pts.iter().map(|p| p.1).collect(),
+        faces: vec![(0..pts.len() as u32).collect()],
+    };
+    for _ in 0..CHECKED_SPLITS {
+        let quads = level.split_to_quads(&|p, n| Some((*p, *n)));
+        let proper = quads.faces.iter().all(|f| {
+            let q: Vec<(Point3, Vec3)> = f
+                .iter()
+                .filter_map(|&v| quads.vertices.get(v as usize).copied().zip(quads.normals.get(v as usize).copied()))
+                .collect();
+            q.len() == 4 && face_is_proper(&q)
+        });
+        if !proper {
+            return false;
+        }
+        level = quads.to_poly();
+    }
+    true
+}
+
+/// Does every face the plan touches (old faces with a moved vertex, and the ring faces) stay
+/// proper, also after conversion to quads?
 fn plan_is_valid(poly: &PolyMesh, plan: &Plan) -> bool {
     let mut verts = poly.vertices.clone();
     let mut normals = poly.normals.clone();
@@ -368,29 +411,123 @@ fn plan_is_valid(poly: &PolyMesh, plan: &Plan) -> bool {
     touched.into_iter().all(|f| {
         let pts: Vec<(Point3, Vec3)> =
             f.iter().filter_map(|&v| verts.get(v as usize).copied().zip(normals.get(v as usize).copied())).collect();
-        pts.len() == f.len() && pts.len() >= 3 && face_is_proper(&pts)
+        pts.len() == f.len() && polygon_and_quads_proper(&pts)
     })
 }
 
-/// Moves the free-boundary vertices of `layout` that are within `max_move` of `outline` onto it
-/// (after a split, whose new boundary vertices sit at chord midpoints).
+/// How many quads of `layout` are not proper (positive area, no zero edge, simple) in their local
+/// frame.
 #[must_use]
-pub fn snap_to_outline(layout: &super::QuadMesh, outline: &Outline, max_move: f64) -> super::QuadMesh {
-    let mut out = layout.clone();
-    if outline.loops.is_empty() {
-        return out;
+pub fn invalid_quads(layout: &super::QuadMesh) -> usize {
+    layout
+        .faces
+        .iter()
+        .filter(|f| {
+            let pts: Vec<(Point3, Vec3)> = f
+                .iter()
+                .filter_map(|&v| layout.vertices.get(v as usize).copied().zip(layout.normals.get(v as usize).copied()))
+                .collect();
+            pts.len() != 4 || !face_is_proper(&pts)
+        })
+        .count()
+}
+
+/// The quads that use any vertex of `moved`, with the positions of `verts`: all proper?
+fn touched_quads_proper(layout: &super::QuadMesh, verts: &[Point3], moved: &BTreeSet<u32>) -> bool {
+    layout.faces.iter().filter(|f| f.iter().any(|v| moved.contains(v))).all(|f| {
+        let pts: Vec<(Point3, Vec3)> = f
+            .iter()
+            .filter_map(|&v| verts.get(v as usize).copied().zip(layout.normals.get(v as usize).copied()))
+            .collect();
+        pts.len() == 4 && face_is_proper(&pts)
+    })
+}
+
+/// The new positions of the boundary vertices of one loop of a split layout, solved like the
+/// conform of the loop (order, minimum gap, forced corners), or why it cannot be done.
+fn resnap_loop(
+    layout: &super::QuadMesh,
+    lp: &OutlineLoop,
+    ids: &[u32],
+    (edge, max_move): (f64, f64),
+) -> Result<Vec<(u32, Point3)>, &'static str> {
+    let points: Vec<Point3> = ids.iter().filter_map(|&v| layout.vertices.get(v as usize).copied()).collect();
+    if points.len() != ids.len() {
+        return Err("a loop vertex is missing");
     }
-    for (a, b) in layout.boundary_edges() {
-        for v in [a, b] {
-            let Some(p) = layout.vertices.get(v as usize) else { continue };
-            if let (Some(h), Some(slot)) = (outline.closest(p), out.vertices.get_mut(v as usize))
-                && h.distance <= max_move
-            {
-                *slot = h.point;
+    let targets = arc_positions(lp, &points, edge).ok_or("the loop does not run once around the outline")?;
+    let near: Vec<usize> =
+        (0..points.len()).filter(|&i| lp.closest(&points[i]).is_some_and(|h| h.2 <= max_move)).collect();
+    if near.len() < 2 {
+        return Ok(Vec::new());
+    }
+    let near_targets: Vec<f64> = near.iter().map(|&i| targets[i]).collect();
+    let forced = forced_corners(lp, &near_targets, edge);
+    let arcs = solve_arcs(lp, &near_targets, &forced, MIN_PARTNER_GAP_FRACTION * edge)
+        .ok_or("a span between corners is too short for its vertices")?;
+    Ok(near
+        .iter()
+        .zip(&arcs)
+        .enumerate()
+        .filter_map(|(k, (&i, &arc))| {
+            let at = forced.get(&k).map(|f| f.1).or_else(|| lp.at(arc).map(|a| a.0))?;
+            Some((ids[i], at))
+        })
+        .collect())
+}
+
+/// Puts the free-boundary vertices of a split `layout` that are within `max_move` of `outline`
+/// back onto it: one arc solve per loop (order, minimum gap including the closing pair), the
+/// touched quads validated on a copy. A loop that fails keeps its positions and is reported.
+#[must_use]
+pub fn snap_to_outline(
+    layout: &super::QuadMesh,
+    outline: &Outline,
+    edge: f64,
+    max_move: f64,
+) -> (super::QuadMesh, ConformReport) {
+    let mut out = layout.clone();
+    let faces: Vec<Vec<u32>> = layout.faces.iter().map(|f| f.to_vec()).collect();
+    let loops = free_loops(&faces);
+    let mut report = ConformReport { loops: loops.len(), ..ConformReport::default() };
+    for ids in &loops {
+        let points: Vec<Point3> = ids.iter().filter_map(|&v| layout.vertices.get(v as usize).copied()).collect();
+        let Some(lp) = matching_loop(outline, &points).and_then(|k| outline.loops.get(k)) else {
+            report.skipped += 1;
+            report.reason.get_or_insert("no outline loop matches the layout loop");
+            continue;
+        };
+        let moves = resnap_loop(layout, lp, ids, (edge, max_move)).and_then(|moves| {
+            let mut verts = out.vertices.clone();
+            for &(id, p) in &moves {
+                if let Some(v) = verts.get_mut(id as usize) {
+                    *v = p;
+                }
+            }
+            let moved: BTreeSet<u32> = moves.iter().map(|m| m.0).collect();
+            if touched_quads_proper(&out, &verts, &moved) {
+                Ok(moves)
+            } else {
+                Err("re-snapping would leave an invalid quad")
+            }
+        });
+        match moves {
+            Ok(moves) => {
+                report.conformed += 1;
+                report.snapped += moves.len();
+                for (id, p) in moves {
+                    if let Some(v) = out.vertices.get_mut(id as usize) {
+                        *v = p;
+                    }
+                }
+            }
+            Err(why) => {
+                report.rolled_back += 1;
+                report.reason.get_or_insert(why);
             }
         }
     }
-    out
+    (out, report)
 }
 
 /// The plan of one loop, or why it cannot be conformed.
@@ -402,6 +539,9 @@ fn try_loop(
     side_normal: SideNormal,
 ) -> Result<Plan, &'static str> {
     let points: Vec<Point3> = ids.iter().filter_map(|&v| poly.vertices.get(v as usize).copied()).collect();
+    if points.len() != ids.len() {
+        return Err("a loop vertex is missing");
+    }
     let targets = arc_positions(lp, &points, edge).ok_or("the loop does not run once around the outline")?;
     // vertices farther from the outline than the reach are a dent of the layout: no partner for them
     let near: Vec<usize> = (0..points.len())
