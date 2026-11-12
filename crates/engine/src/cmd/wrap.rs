@@ -79,11 +79,22 @@ pub struct WrapJump {
     pub p99_deg: f64,
     /// Largest (degrees).
     pub max_deg: f64,
+    /// Samples whose patch normal is undefined (collapsed patch): not in the figures above, so any means the continuity is not shown.
+    pub invalid_samples: usize,
+    /// Edges with at least one such sample.
+    pub invalid_edges: usize,
 }
 
 impl From<JumpStats> for WrapJump {
     fn from(j: JumpStats) -> Self {
-        Self { count: j.count, mean_deg: j.mean_deg, p99_deg: j.p99_deg, max_deg: j.max_deg }
+        Self {
+            count: j.count,
+            mean_deg: j.mean_deg,
+            p99_deg: j.p99_deg,
+            max_deg: j.max_deg,
+            invalid_samples: j.invalid_samples,
+            invalid_edges: j.invalid_edges,
+        }
     }
 }
 

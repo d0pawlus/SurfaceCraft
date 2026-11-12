@@ -99,6 +99,44 @@ fn has_nextest() -> bool {
     cargo().args(["nextest", "--version"]).output().is_ok_and(|o| o.status.success())
 }
 
+/// Function names that evaluate Bézier/Bernstein geometry; outside `crates/kernel` only the listed files may define them.
+const EVALUATOR_NAMES: [&str; 5] = ["bernstein", "de_casteljau", "bern", "dbern", "bezier_"];
+
+/// Files outside the kernel and the list that define a function named like a Bézier evaluator.
+fn unlisted_evaluators(listed: &[String]) -> Vec<String> {
+    let mut errors = Vec::new();
+    for dir in ["crates", "apps"] {
+        walk(&root().join(dir), &mut |p| {
+            let r = rel(p);
+            if !p.extension().is_some_and(|e| e == "rs")
+                || r.starts_with("crates/kernel/")
+                || r.contains("/tests/")
+                || listed.contains(&r)
+            {
+                return;
+            }
+            let Ok(s) = std::fs::read_to_string(p) else { return };
+            for line in s.lines() {
+                let Some(rest) = line.trim_start().split("fn ").nth(1) else { continue };
+                let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                let starts = line.trim_start().starts_with("fn ") || line.trim_start().starts_with("pub");
+                if starts
+                    && EVALUATOR_NAMES.iter().any(|n| {
+                        if n.ends_with('_') {
+                            name.starts_with(n)
+                        } else {
+                            name == *n || name.contains(n) && n.len() > 4
+                        }
+                    })
+                {
+                    errors.push(format!("{r} defines `{name}`, a Bézier/Bernstein evaluator, but is not listed in xtask/app-geometry.txt: evaluation goes through the listed files or the kernel"));
+                }
+            }
+        });
+    }
+    errors
+}
+
 fn app_geometry() -> Result<(), String> {
     eprintln!("==> app-geometry");
     let list_path = root().join("xtask").join("app-geometry.txt");
@@ -117,6 +155,7 @@ fn app_geometry() -> Result<(), String> {
         });
     }
     let mut errors = Vec::new();
+    errors.extend(unlisted_evaluators(&listed));
     for m in &marked {
         if !listed.contains(m) {
             errors.push(format!("{m} computes app-side B-rep/NURBS geometry (APP-GEOMETRY marker) but is not listed in xtask/app-geometry.txt"));

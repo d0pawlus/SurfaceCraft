@@ -22,7 +22,10 @@
 //! The patches are the same bicubic nets as before; the surface evaluation they use is
 //! [`crate::patch::eval`] (the listed APP-GEOMETRY file).
 use crate::mls::ScanSurface;
-use crate::patch::{PatchSet, WRAP_FACING_COS, bern, eval, normal, wrap_curve, wrap_net};
+use crate::patch::{
+    PatchSet, WRAP_FACING_COS, bern, bezier_tangent, cross_weights, eval, normal, tensor_weights, weighted_sum,
+    wrap_curve, wrap_net,
+};
 pub use crate::patch_jumps::{JumpStats, jump_stats};
 use crate::wrap_normals::{EdgeKey, Layout, LayoutNormals, edge_faces, edge_slot, key, layout_normals};
 use nalgebra::{SMatrix, SVector};
@@ -85,8 +88,9 @@ const ACCURACY_FLOOR: f64 = 0.02;
 const RIDGE: f64 = 1e-3;
 /// Rounds of fitting the inner control points (each re-projects the samples onto the scan).
 const FIT_PASSES: usize = 3;
-/// Cross product of two side normals below this length gives no crease direction.
-const MIN_CREASE_SIN: f64 = 0.2;
+/// The cross product of two unit side normals shorter than this (about a hundred rounding errors of the
+/// normals) is zero: the two tangent planes are the same plane.
+const PARALLEL_SIN: f64 = 1e-9;
 /// Handle lengths of an edge curve, as shares of its chord.
 const HANDLE_RANGE: (f64, f64) = (0.1, 0.7);
 /// Sideways lean of a handle (share of the chord) at most, and the pull of the lean toward none.
@@ -124,8 +128,7 @@ fn tangent_curve(a: End, b: End, project: &dyn Fn(Vec3) -> Vec3) -> Curve {
     let len = (b.p - a.p).norm();
     let mut n = (SMatrix::<f64, 4, 4>::zeros(), SVector::<f64, 4>::zeros());
     for t in [0.25f64, 0.5, 0.75] {
-        let (b1, b2) = (3.0 * t * (1.0 - t).powi(2), 3.0 * t * t * (1.0 - t));
-        let (b0, b3) = ((1.0 - t).powi(3), t.powi(3));
+        let [b0, b1, b2, b3] = bern(t);
         let r = project(a.p * (1.0 - t) + b.p * t) - a.p * (b0 + b1) - b.p * (b2 + b3);
         let cols =
             [a.t * b1, a.side.map_or(Vec3::zeros(), |s| s * b1), -b.t * b2, b.side.map_or(Vec3::zeros(), |s| -s * b2)];
@@ -155,8 +158,7 @@ fn tangent_curve(a: End, b: End, project: &dyn Fn(Vec3) -> Vec3) -> Curve {
 /// The tangent plane normal along a side: the end normals blended and made perpendicular to the curve.
 fn field_normal(c: &Curve, n0: &Vec3, n1: &Vec3, t: f64) -> Vec3 {
     let n = n0 * (1.0 - t) + n1 * t;
-    let d = ((c[1] - c[0]) * (1.0 - t).powi(2) + (c[2] - c[1]) * (2.0 * t * (1.0 - t)) + (c[3] - c[2]) * (t * t)) * 3.0;
-    let n = match normalize(d) {
+    let n = match normalize(bezier_tangent(c, t)) {
         Some(th) => n - th * n.dot(&th),
         None => n,
     };
@@ -184,29 +186,20 @@ fn add_row(n: &mut Normal12, coef: &SVector<f64, 12>, rhs: f64, weight: f64) {
 
 /// Sum of the boundary control points of `p` weighted by their Bernstein products at `(u, v)`.
 fn ring_value(p: &Grid, u: f64, v: f64) -> Vec3 {
-    let (bu, bv) = (bern(u), bern(v));
-    let mut sum = Vec3::zeros();
-    for i in 0..4 {
-        for j in 0..4 {
-            if inner_slot(i, j).is_none() {
-                sum += p[i][j] * (bu[i] * bv[j]);
-            }
-        }
-    }
-    sum
+    weighted_sum(p, u, v, &|i, j| inner_slot(i, j).is_some())
 }
 
 /// Rows asking the inner points to pass through the scan points `targets` at their parameters.
 fn fit_rows(n: &mut Normal12, p: &Grid, targets: &[((f64, f64), Vec3)]) {
     let weight = 1.0 / (FIT_SIGMA * FIT_SIGMA);
     for &((u, v), target) in targets {
-        let (bu, bv) = (bern(u), bern(v));
+        let w = tensor_weights(u, v);
         let rest = target - ring_value(p, u, v);
         for c in 0..3 {
             let mut coef = SVector::<f64, 12>::zeros();
             for (i, j) in [(1, 1), (1, 2), (2, 1), (2, 2)] {
                 if let Some(s) = inner_slot(i, j) {
-                    coef[s * 3 + c] = bu[i] * bv[j];
+                    coef[s * 3 + c] = w[i][j];
                 }
             }
             add_row(n, &coef, rest[c], weight);
@@ -223,14 +216,14 @@ fn tangent_rows(n: &mut Normal12, p: &Grid, s: usize, field: &SideField, sigma: 
     let weight = 1.0 / (sigma * sigma);
     for t in G1_SAMPLES {
         let nt = field_normal(&curve, &field.n0, &field.n1, t);
-        let b = bern(t);
+        let b = cross_weights(t);
         let mut coef = SVector::<f64, 12>::zeros();
         let mut constant = 0.0;
         for k in 0..4 {
-            constant -= 3.0 * b[k] * nt.dot(&p[base[k].0][base[k].1]);
+            constant -= b[k] * nt.dot(&p[base[k].0][base[k].1]);
             match inner_slot(next[k].0, next[k].1) {
-                Some(slot) => (0..3).for_each(|c| coef[slot * 3 + c] += 3.0 * b[k] * nt[c] / len),
-                None => constant += 3.0 * b[k] * nt.dot(&p[next[k].0][next[k].1]),
+                Some(slot) => (0..3).for_each(|c| coef[slot * 3 + c] += b[k] * nt[c] / len),
+                None => constant += b[k] * nt.dot(&p[next[k].0][next[k].1]),
             }
         }
         add_row(n, &coef, -constant / len, weight);
@@ -359,14 +352,16 @@ impl Layer<'_> {
     }
 }
 
-/// How a crease edge continues: the direction both sides' tangent planes share, toward `toward`.
-fn crease_direction(n1: &Vec3, n2: &Vec3, toward: &Vec3) -> Option<Vec3> {
+/// How a crease edge continues: a unit direction in both side planes (their intersection line), toward
+/// `toward`. Where the planes are numerically the same plane the edge is smooth for this purpose and the
+/// direction is taken in the plane the two normals share, which is in both.
+fn crease_direction(n1: &Vec3, n2: &Vec3, toward: &Vec3) -> Vec3 {
     let c = n1.cross(n2);
-    if c.norm() < MIN_CREASE_SIN * n1.norm() * n2.norm() {
-        return None;
+    if c.norm() > PARALLEL_SIN * n1.norm() * n2.norm() {
+        let d = c.normalize();
+        return if d.dot(toward) < 0.0 { -d } else { d };
     }
-    let d = c.normalize();
-    Some(if d.dot(toward) < 0.0 { -d } else { d })
+    tangent_toward(&normalize(n1 + n2).unwrap_or(*n1), toward)
 }
 
 /// Directions the curves of the coarse edge `a`-`b` leave `a` and `b` along, and the direction `a → b`
@@ -401,9 +396,9 @@ fn edge_tangents(
     let (Some(&f2), true) = (faces.get(1), crease) else { return Some(smooth) };
     let (ma, mb, mm) = (l.corner_normal(f2, a), l.corner_normal(f2, b), l.mid_normal(f2, slot(f2)?));
     Some(EdgeTangents {
-        a: crease_direction(&na, &ma, &(pm - pa)).unwrap_or(smooth.a),
-        b: crease_direction(&nb, &mb, &(pm - pb)).unwrap_or(smooth.b),
-        m: crease_direction(&nm, &mm, &(pb - pa)).unwrap_or(smooth.m),
+        a: crease_direction(&na, &ma, &(pm - pa)),
+        b: crease_direction(&nb, &mb, &(pm - pb)),
+        m: crease_direction(&nm, &mm, &(pb - pa)),
         normals: None,
     })
 }
@@ -490,9 +485,10 @@ fn add_spokes(l: &Layer, tri: &Triangle, nf: Vec3, build: &mut Build) -> u32 {
 }
 
 /// Does the patch face the way the coarse face does, inside and along its boundary (no fold, no inverted
-/// corner)? The boundary is checked at the points the jumps across it are measured at.
+/// corner)? The boundary is checked at the points the jumps across it are measured at. An undefined
+/// normal (a collapsed or singular patch there) is a failure.
 fn follows(net: &crate::patch::Net, nf: &Vec3) -> bool {
-    let faces = |u: f64, v: f64| normal(net, u, v).is_none_or(|n| n.dot(nf) > MIN_FACING);
+    let faces = |u: f64, v: f64| normal(net, u, v).is_some_and(|n| n.dot(nf) > MIN_FACING);
     let inside = CHECK_GRID.iter().all(|&u| CHECK_GRID.iter().all(|&v| faces(u, v)));
     let along = EDGE_CHECK.iter().all(|&t| faces(t, 0.0) && faces(t, 1.0) && faces(0.0, t) && faces(1.0, t));
     inside && along
@@ -649,6 +645,96 @@ mod tests {
         assert!(w.crease_edges >= 12, "the box edges are creases: {}", w.crease_edges);
         assert!(sharp.count > 0 && (sharp.mean_deg - 90.0).abs() < 3.0, "{sharp:?}");
         assert!(smooth.mean_deg < 1.0, "{smooth:?}");
+    }
+
+    fn rotated(deg: f64) -> Vec3 {
+        let a = deg.to_radians();
+        Vec3::new(a.sin(), 0.0, a.cos())
+    }
+
+    #[test]
+    fn a_shallow_crease_direction_lies_in_both_side_planes() {
+        // Arrange: sides 5 degrees apart (far above rounding, below the old 11.5 degree cut-off)
+        let (n1, n2) = (rotated(-2.5), rotated(2.5));
+
+        // Act
+        let d = crease_direction(&n1, &n2, &Vec3::y());
+
+        // Assert
+        assert!(d.dot(&n1).abs() < 1e-12 && d.dot(&n2).abs() < 1e-12, "{d:?}");
+        assert!(d.dot(&Vec3::y()) > 0.99, "{d:?}");
+    }
+
+    #[test]
+    fn a_crease_direction_lies_in_both_planes_down_to_parallel_normals() {
+        for deg in [180.0, 90.0, 1.0, 1e-3, 1e-8, 1e-12, 0.0] {
+            let (n1, n2) = (rotated(0.0), rotated(deg));
+            let d = crease_direction(&n1, &n2, &Vec3::y());
+            assert!(d.dot(&n1).abs() < 1e-9 && d.dot(&n2).abs() < 1e-9, "{deg}: {d:?}");
+            assert!((d.norm() - 1.0).abs() < 1e-12, "{deg}: {d:?}");
+        }
+    }
+
+    #[test]
+    fn a_collapsed_patch_corner_does_not_follow_the_face() {
+        // Arrange: the whole side u = 0 collapsed to one point, so the normal is undefined along it
+        let mut net = [[[0.0; 3]; 4]; 4];
+        for (i, row) in net.iter_mut().enumerate() {
+            for (j, p) in row.iter_mut().enumerate() {
+                *p = [i as f64, j as f64, 0.0];
+            }
+        }
+        for p in net[0].iter_mut() {
+            *p = [0.0, 0.0, 0.0];
+        }
+
+        // Act / Assert
+        assert!(normal(&net, 0.0, 0.5).is_none());
+        assert!(!follows(&net, &Vec3::z()), "an undefined normal must not be accepted");
+    }
+
+    /// A height field with a curved crease: `z = SLOPE |x - 1.5 sin(0.4 y)|`, whose two sides meet at
+    /// 5 degrees. `grid(n, step)` has its lines along the crease curve.
+    fn curved_crease_surface(nx: usize, ny: usize, step: f64) -> Mesh {
+        const SLOPE: f64 = 0.043_66;
+        let mut m = Mesh::default();
+        for j in 0..=ny {
+            for i in 0..=nx {
+                let (u, y) = ((i as f64 - nx as f64 / 2.0) * step, j as f64 * step);
+                let x = u + 1.5 * (0.4 * y).sin();
+                m.positions.push(Point3::new(x, y, SLOPE * u.abs()));
+            }
+        }
+        for j in 0..ny {
+            for i in 0..nx {
+                let a = (j * (nx + 1) + i) as u32;
+                let w = (nx + 1) as u32;
+                m.triangles.push([a, a + 1, a + w + 1]);
+                m.triangles.push([a, a + w + 1, a + w]);
+            }
+        }
+        m
+    }
+
+    #[test]
+    fn a_curved_shallow_crease_leaves_the_smooth_edges_beside_it_tangent() {
+        // Arrange: crease_deg 1 makes the 5 degree crease a crease
+        let scan = curved_crease_surface(40, 40, 0.5);
+        let coarse = curved_crease_surface(4, 4, 5.0);
+        let surface = ScanSurface::oriented(&scan.positions, &scan.vertex_normals());
+        let bvh = Bvh::build(&scan);
+
+        // Act
+        let w = wrap_patches_g1(&coarse, &bvh, &surface, 4.0, &G1Options { g1: true, crease_deg: 1.0 });
+        let (smooth, _) = jump_stats(&w.set, &w.creases);
+
+        // Assert
+        assert!(w.crease_edges >= 2, "the 5 degree crease is found: {}", w.crease_edges);
+        assert_eq!((smooth.invalid_samples, smooth.invalid_edges), (0, 0), "{smooth:?}");
+        assert!(
+            smooth.count > 0 && smooth.mean_deg < 1.0 && smooth.p99_deg < 5.0,
+            "smooth edges beside the crease: {smooth:?}"
+        );
     }
 
     #[test]

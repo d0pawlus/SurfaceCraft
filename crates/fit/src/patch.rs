@@ -347,6 +347,44 @@ fn dbern(t: f64) -> [f64; 4] {
     [-3.0 * s * s, 3.0 * s * s - 6.0 * t * s, 6.0 * t * s - 3.0 * t * t, 3.0 * t * t]
 }
 
+/// Weights `B_i(u) B_j(v)` of the 4 × 4 control points of a patch at `(u, v)`.
+pub(crate) fn tensor_weights(u: f64, v: f64) -> [[f64; 4]; 4] {
+    let (bu, bv) = (bern(u), bern(v));
+    let mut w = [[0.0; 4]; 4];
+    for i in 0..4 {
+        for j in 0..4 {
+            w[i][j] = bu[i] * bv[j];
+        }
+    }
+    w
+}
+
+/// Weights `3 B_k(t)` of the control-point differences `P_k(next row) - P_k(boundary)`: the cross-boundary
+/// derivative of a patch side at `t` is the sum of these differences with these weights.
+pub(crate) fn cross_weights(t: f64) -> [f64; 4] {
+    bern(t).map(|b| 3.0 * b)
+}
+
+/// Sum of the control points of `p` that `skip` does not name, each weighted by `B_i(u) B_j(v)`.
+pub(crate) fn weighted_sum(p: &[[Vec3; 4]; 4], u: f64, v: f64, skip: &dyn Fn(usize, usize) -> bool) -> Vec3 {
+    let w = tensor_weights(u, v);
+    let mut sum = Vec3::zeros();
+    for i in 0..4 {
+        for j in 0..4 {
+            if !skip(i, j) {
+                sum += p[i][j] * w[i][j];
+            }
+        }
+    }
+    sum
+}
+
+/// Derivative at `t` of the cubic Bézier curve with control points `c`.
+pub(crate) fn bezier_tangent(c: &[Vec3; 4], t: f64) -> Vec3 {
+    let s = 1.0 - t;
+    ((c[1] - c[0]) * (s * s) + (c[2] - c[1]) * (2.0 * t * s) + (c[3] - c[2]) * (t * t)) * 3.0
+}
+
 /// The point and the two partial derivatives of `net` at `(u, v)`.
 #[must_use]
 pub fn eval(net: &Net, u: f64, v: f64) -> (Vec3, Vec3, Vec3) {

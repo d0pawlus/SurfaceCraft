@@ -143,6 +143,7 @@ fn num(v: &Value, key: &str) -> f64 {
 
 fn report(name: &str, w: &Value, within: f64) {
     let j = &w["smooth_jump"];
+    eprintln!("{name}: invalid samples {} edges {}", j["invalid_samples"], j["invalid_edges"]);
     eprintln!(
         "{name}: patches {} (g0 fallbacks {}) rounds {} creases {} smooth {} | smooth jump mean {:.3} p99 {:.3} max {:.3} deg over {} edges | crease angle {:.2} deg | within {:.4} (independent {:.4}) | {:.1} s",
         w["patches"],
@@ -164,6 +165,8 @@ fn report(name: &str, w: &Value, within: f64) {
 fn assert_smooth_edges_are_tangent(w: &Value) {
     let j = &w["smooth_jump"];
     assert!(j["count"].as_u64().unwrap() > 0, "{w}");
+    assert_eq!(j["invalid_samples"], 0, "undefined normals hide jumps: {w}");
+    assert_eq!(j["invalid_edges"], 0, "undefined normals hide jumps: {w}");
     assert!(
         num(j, "mean_deg") < MAX_MEAN_JUMP_DEG,
         "mean normal jump {} deg over smooth edges: {w}",
@@ -215,10 +218,10 @@ fn gate_p9_g1_organic_ball_of_scan_to_solid_is_tangent_continuous() {
 
 /// Not met: the ball of `p9_wrap_adaptive.rs`, a smooth part with a cap of ripples (1 mm every 2 mm).
 /// The ripples are as fine as the coarse triangles, so patches fold there (the unconstrained wrap has the
-/// same folds: G0 smooth jump mean 32 deg, p99 170 deg) and tangent patches cannot be fitted: 68 of 480
-/// patches fall back to G0. Measured with G1: smooth jump mean 20.6 deg, p99 179 deg, 45 coarse edges
-/// classified as creases (the ripple flanks are steeper than 35 degrees); 99.8 % within 0.2 mm, 480
-/// patches (G0: 480).
+/// same folds: G0 smooth jump mean 30.3 deg, p99 171.8 deg) and tangent patches cannot be fitted: 96 of 510
+/// patches fall back to G0. Measured with G1 (after the merge of the reworked decimator): smooth jump mean
+/// 17.5 deg, p99 170.7 deg, max 179 deg, 47 coarse edges classified as creases (the ripple flanks are
+/// steeper than 35 degrees); 99.8 % within 0.2 mm, 510 patches (G0: 510).
 #[test]
 #[ignore = "ripples as fine as the coarse triangles fold patches; see the doc comment"]
 fn gate_p9_g1_detail_ball_with_ripples_is_tangent_continuous() {
@@ -287,7 +290,7 @@ fn gate_p9_g1_thin_plate_keeps_both_faces_and_its_rim() {
 /// The coarse mesh of a 1 mm plate (reduced within 1.6 mm of the scan) has triangles of three nearly
 /// collinear vertices along the rim, whose patches fold (the same folds are in the unconstrained wrap);
 /// 27 of the 96 patches fall back to G0. Measured: smooth jump mean 28 deg (G0: 36 deg), p99
-/// 173 deg; rim angle 67 deg (G0: 55 deg) against 90. An edge-flip pass over the coarse mesh was tried: it changed
+/// 173 deg; rim angle 67.3 deg (G0: 55.3 deg) against 90. An edge-flip pass over the coarse mesh was tried: it changed
 /// nothing for the plate and made the lens worse. It needs a quality-aware reduction in `geom::reduce` or a patch layout that
 /// does not split a blunt corner into quads.
 #[test]
