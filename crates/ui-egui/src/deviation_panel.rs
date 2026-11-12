@@ -419,7 +419,7 @@ fn histogram(ui: &mut egui::Ui, tokens: &Tokens, hist: &Histogram, tol: f64) {
     let max = bins.iter().map(|b| b.count).max().unwrap_or(0).max(1) as f32;
     let width = ui.available_width().max(MIN_HISTOGRAM_WIDTH);
     let (rect, chart) = ui.allocate_exact_size(Vec2::new(width, HISTOGRAM_HEIGHT), Sense::hover());
-    chart.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Image, true, t("deviation.histogram")));
+    chart.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Image, true, t("deviation.histogram.name")));
     let painter = ui.painter_at(rect);
     let base = rect.bottom() - AXIS_ROOM;
     let span = (hist.hi - hist.lo).max(f64::MIN_POSITIVE);

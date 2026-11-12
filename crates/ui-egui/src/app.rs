@@ -67,6 +67,9 @@ pub struct SurfaceCraftApp {
     pub tokens: Tokens,
     /// Where the viewport was drawn last frame (screen points).
     pub viewport_rect: Option<egui::Rect>,
+    /// Where the Properties panel and its footer were drawn last frame (tests check the layout).
+    pub tool_panel_rect: Option<egui::Rect>,
+    pub tool_footer_rect: Option<egui::Rect>,
     /// Whether a wgpu render state exists (false in headless tests).
     gpu: bool,
     pub(crate) fit_pending: bool,
@@ -146,6 +149,8 @@ impl SurfaceCraftApp {
             workspace,
             settings,
             viewport_rect: None,
+            tool_panel_rect: None,
+            tool_footer_rect: None,
             gpu: false,
             fit_pending: false,
             bvh_cache: HashMap::new(),
@@ -385,7 +390,7 @@ impl SurfaceCraftApp {
                 for s in of_kind {
                     ui.horizontal(|ui| {
                         // the buttons name their object: a screen reader reads them out of context
-                        let show_hide = format!("{}: {}", t("objects.show_hide"), s.name);
+                        let show_hide = tf("objects.show_hide_named", &[("name", &s.name)]);
                         if self
                             .icon_toggle(ui, &show_hide, if s.visible { "eye" } else { "eye-off" }, !s.visible)
                             .clicked()
@@ -403,7 +408,7 @@ impl SurfaceCraftApp {
                         {
                             self.selected_object = if sel { None } else { Some(s.id) };
                         }
-                        let delete = format!("{}: {}", t("objects.delete"), s.name);
+                        let delete = tf("objects.delete_named", &[("name", &s.name)]);
                         if self.icon_toggle(ui, &delete, "trash", false).clicked() {
                             action = Some(("doc.delete", json!({"object": s.id.0})));
                         }

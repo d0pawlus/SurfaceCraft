@@ -25,8 +25,11 @@ use surfacecraft_geom::Mesh;
 const DEBOUNCE: f64 = 0.25;
 /// Opacity of the previewed geometry.
 const PREVIEW_ALPHA: f32 = 0.45;
-/// Height of the footer before it was measured: OK, Cancel and the preview switch in one row.
-const FOOTER_HEIGHT_GUESS: f32 = 52.0;
+/// Height of the footer before it was measured. A normal footer (buttons, mode switch, messages)
+/// is about 100 px; the layout is redone in the same frame once the real height is known.
+pub const FOOTER_HEIGHT_GUESS: f32 = 104.0;
+/// A footer height change below this (points) is not worth another layout pass.
+const FOOTER_HEIGHT_TOLERANCE: f32 = 0.5;
 
 /// Why a command has no live preview.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -287,6 +290,8 @@ fn body(app: &mut SurfaceCraftApp, panel: &mut CommandPanel, ui: &mut egui::Ui, 
         // another command: a preview of the old one makes no sense
         panel.cancel_preview();
         panel.last_command = Some(id);
+        // the footer of the old tool is not this tool's footer
+        panel.footer_height = 0.0;
     }
     if app.field_pick.as_ref().is_some_and(|f| f.command != id) {
         // picking for another command's form
@@ -301,12 +306,29 @@ fn body(app: &mut SurfaceCraftApp, panel: &mut CommandPanel, ui: &mut egui::Ui, 
     let footer_area = egui::Rect::from_min_max(egui::pos2(area.left(), footer_top), area.max);
     ui.scope_builder(egui::UiBuilder::new().max_rect(form_area), |ui| form_scroll(app, panel, ui, id));
     let footer_used = ui.scope_builder(egui::UiBuilder::new().max_rect(footer_area), |ui| {
-        egui::Frame::NONE.inner_margin(egui::Margin::symmetric(0, 6)).show(ui, |ui| {
-            ui.separator();
-            footer(app, panel, ui, id);
-        })
+        egui::Frame::NONE
+            .inner_margin(egui::Margin::symmetric(0, 6))
+            .show(ui, |ui| {
+                ui.separator();
+                footer(app, panel, ui, id);
+            })
+            .response
+            .rect
     });
-    panel.footer_height = footer_used.response.rect.height();
+    remember_footer_height(ui, panel, footer_used.inner.height());
+    app.tool_panel_rect = Some(area);
+    app.tool_footer_rect = Some(footer_used.inner);
+}
+
+/// Keeps the measured footer height for the next layout. When it changed, the frame is laid out
+/// again at once, so a message that appears or goes away never leaves the footer clipped.
+fn remember_footer_height(ui: &egui::Ui, panel: &mut CommandPanel, measured: f32) {
+    if (measured - panel.footer_height).abs() <= FOOTER_HEIGHT_TOLERANCE {
+        return;
+    }
+    panel.footer_height = measured;
+    ui.ctx().request_discard("the tool footer changed height");
+    ui.ctx().request_repaint();
 }
 
 /// The space the footer takes: what it took last frame, or a guess before it was drawn once.
