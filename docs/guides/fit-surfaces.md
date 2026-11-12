@@ -9,6 +9,10 @@ patch network over a whole scan.
   castings, body panels and organic shapes. `tolerance` (default 0.2 mm), `min_within` (default
   0.99) and `max_patches` (default 12000, at most 60000). The result is a solid when the scan is
   closed, else a sheet; `deviation` gives `within`, `rms`, `p99` and `max`.
+- `refine` (default `adaptive`): the layout is refined only around the scan points the patches
+  miss, so smooth areas keep large patches; `uniform` halves the budget of the whole scan each
+  round (more patches for the same tolerance). `levels` lists the patches and the share within
+  the tolerance of every round, `refine` the layout used.
 - It keeps sharp edges and thin walls (the patches meet G0). `scan.to_solid` with
   `method: freeform` runs it after cleaning and measures the result with `body.compare`.
 

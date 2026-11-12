@@ -126,6 +126,7 @@ pub(super) fn freeform_solid(s: &mut Session, set: &Settings, report: ScanSummar
         tolerance: Some(set.tolerance),
         min_within: Some(set.min_within),
         max_patches: None,
+        refine: None,
         name: Some(set.name.clone()),
     };
     let w = match wrap(s, params) {
