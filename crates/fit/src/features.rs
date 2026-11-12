@@ -249,10 +249,13 @@ fn locate(f: &dyn Fn(f64, f64) -> Vec3, p: &Vec3, start: Option<(f64, f64)>) -> 
     (u, v)
 }
 
+/// Fewest points for the least-squares fit of a patch interior.
+const MIN_FIT_POINTS: usize = 8;
+
 /// The interior of one patch: boundary control points fixed, interior least squares to `points`.
 pub(crate) fn fit_interior(net: &mut NetN, points: &[Vec3]) {
     let n = net.len() - 1;
-    if n < 2 || points.len() < 8 {
+    if n < 2 {
         return;
     }
     let side = |f: &dyn Fn(usize) -> [f64; 3]| -> Vec<Vec3> { (0..=n).map(|k| v3(f(k))).collect() };
@@ -272,6 +275,9 @@ pub(crate) fn fit_interior(net: &mut NetN, points: &[Vec3]) {
             let p = bottom[i] * (1.0 - t) + top[i] * t + left[j] * (1.0 - s) + right[j] * s - corner(i, j);
             net[i][j] = a3(p);
         }
+    }
+    if points.len() < MIN_FIT_POINTS {
+        return; // too few points to solve: the Coons interior stays
     }
     let free = (n - 1) * (n - 1);
     let mut params: Vec<Option<(f64, f64)>> = vec![None; points.len()];

@@ -248,3 +248,36 @@ pub(crate) fn ngon_patches(recs: &[RegionRec], curves: &[Vec<Vec3>], first_new_i
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn planar_curve(a: Vec3, b: Vec3, degree: usize) -> Vec<Vec3> {
+        (0..=degree).map(|k| a + (b - a) * (k as f64 / degree as f64)).collect()
+    }
+
+    /// A sector with no points keeps the Coons interior of its (planar) boundary.
+    #[test]
+    fn a_sector_without_points_gets_the_coons_interior() {
+        let z = 100.0;
+        let p = |x: f64, y: f64| Vec3::new(x, y, z);
+        let (a, b, c, d) = (p(0.0, 0.0), p(10.0, 0.0), p(12.0, 9.0), p(-1.0, 8.0));
+        let degree = 5;
+        let (bottom, right, top, left) = (
+            planar_curve(a, b, degree),
+            planar_curve(b, c, degree),
+            planar_curve(d, c, degree),
+            planar_curve(a, d, degree),
+        );
+        for points in [Vec::new(), vec![p(1.0, 1.0); 3]] {
+            let (net, _) = finish_net([&bottom, &right, &top, &left], [0, 1, 2, 3], &points, &Vec3::z());
+            for row in &net {
+                for q in row {
+                    assert!((q[2] - z).abs() < 1e-9, "{q:?}");
+                }
+            }
+            assert!((eval_net(&net, 0.5, 0.5).z - z).abs() < 1e-9);
+        }
+    }
+}

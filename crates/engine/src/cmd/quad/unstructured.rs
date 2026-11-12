@@ -8,7 +8,7 @@ use std::sync::Arc;
 use surfacecraft_doc::{ObjectId, ObjectKind, QuadObject, SurfaceObject};
 use surfacecraft_fit::boundary::{Outline, cleaned_outline};
 use surfacecraft_fit::mls::ScanSurface;
-use surfacecraft_fit::orient::{FlipReport, flipped_patches, repair_orientation, repair_patches};
+use surfacecraft_fit::orient::{FlipReport, flipped_patches, repair_orientation, repair_patches, same_side_normal};
 use surfacecraft_fit::patch::{Deviation, PatchSet, deviation, edge_normal_jumps};
 use surfacecraft_fit::retopo::{QuadMesh, RetopoOptions, RetopoReport, retopo, snap_to_outline};
 use surfacecraft_fit::segment::region_points;
@@ -313,7 +313,7 @@ pub(super) fn orientation_check(
 ) -> FlipReport {
     let (pts, normals) = scan_points;
     let tree = KdTree::build(pts);
-    let reference = |p: &Point3| tree.nearest(p).and_then(|(k, _)| normals.get(k)).copied();
+    let reference = |p: &Point3, hint: &Vec3| same_side_normal(&tree, normals, 1.0, p, hint);
     let radius = layout_radius(layout, spacing);
     repair_orientation(layout, scan, radius, &reference)
 }
@@ -478,9 +478,13 @@ struct Accepted {
 
 /// The scan normal at a point, the reference of the orientation checks. It is reversed when the
 /// layout has been turned around as a whole.
-fn scan_reference<'a>(tree: &'a KdTree, normals: &'a [Vec3], flipped: bool) -> impl Fn(&Point3) -> Option<Vec3> + 'a {
+fn scan_reference<'a>(
+    tree: &'a KdTree,
+    normals: &'a [Vec3],
+    flipped: bool,
+) -> impl Fn(&Point3, &Vec3) -> Option<Vec3> + 'a {
     let sign = if flipped { -1.0 } else { 1.0 };
-    move |p: &Point3| tree.nearest(p).and_then(|(k, _)| normals.get(k)).map(|n| n * sign)
+    move |p: &Point3, hint: &Vec3| same_side_normal(tree, normals, sign, p, hint)
 }
 
 /// Turns the patches of `layout` that run against the scan around, and measures the fit.
@@ -611,8 +615,12 @@ fn refine_and_fit(s: &mut Session, ctx: &AutoContext<'_>, mut layout: QuadMesh) 
             refinements,
             repaired,
             folded: layout.folded(),
-            flipped_patches: flipped_patches(&step.set, &scan_reference(&ctx.tree, &ctx.scan.point_normals, flipped))
-                .len(),
+            flipped_patches: flipped_patches(
+                &step.set,
+                &layout.normals,
+                &scan_reference(&ctx.tree, &ctx.scan.point_normals, flipped),
+            )
+            .len(),
         };
         return Ok(finish_auto(s, ctx, sheet, &step, &accepted));
     }
