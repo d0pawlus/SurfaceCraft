@@ -62,6 +62,15 @@ fn orphan_bodies(active: &[FeatureObject], parked: &[FeatureObject]) -> Vec<Obje
     parked.iter().map(|f| f.body).filter(|body| !active.iter().any(|f| f.body == *body)).collect()
 }
 
+/// Moves the bodies written only by parked features out of the model (with their name and flags,
+/// into `Document::rolled_back_bodies`) and brings back the ones the active features write again.
+fn park_bodies(s: &mut Session, orphans: &[ObjectId]) {
+    let all: Vec<_> = s.doc.bodies.drain(..).chain(s.doc.rolled_back_bodies.drain(..)).collect();
+    let (parked, live): (Vec<_>, Vec<_>) = all.into_iter().partition(|b| orphans.contains(&b.id));
+    s.doc.bodies = live;
+    s.doc.rolled_back_bodies = parked;
+}
+
 /// Moves the marker and replays the active part.
 pub(super) fn rollback(s: &mut Session, i: RollbackIn) -> CmdResult<TreeOut> {
     let all = all_features(s);
@@ -70,7 +79,7 @@ pub(super) fn rollback(s: &mut Session, i: RollbackIn) -> CmdResult<TreeOut> {
     let orphans = orphan_bodies(&active, &parked);
     s.doc.features = active;
     s.doc.rolled_back = parked;
-    s.doc.bodies.retain(|b| !orphans.contains(&b.id));
+    park_bodies(s, &orphans);
     let failed = crate::replay::replay(s);
     Ok(tree_of(s, failed))
 }

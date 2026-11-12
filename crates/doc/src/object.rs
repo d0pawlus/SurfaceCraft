@@ -371,6 +371,10 @@ pub struct Document {
     /// marker is at the end. Projects saved before the marker existed load with none.
     #[serde(default)]
     pub rolled_back: Vec<crate::feature::FeatureObject>,
+    /// Bodies written only by parked features, kept with their name and flags while the marker is
+    /// before them: they are not in the model, but their names stay reserved.
+    #[serde(default)]
+    pub rolled_back_bodies: Vec<BodyObject>,
     /// Next free id.
     #[serde(default)]
     pub next_id: u64,
@@ -474,7 +478,8 @@ impl Document {
     fn name_taken(&self, n: &str) -> bool {
         let mut taken = false;
         stores!(self, s => taken |= s.iter().any(|o| o.name() == n));
-        taken
+        // parked features and bodies are inactive but keep their names
+        taken || self.rolled_back.iter().any(|f| f.name == n) || self.rolled_back_bodies.iter().any(|b| b.name == n)
     }
 
     /// Adds a mesh and returns its id.

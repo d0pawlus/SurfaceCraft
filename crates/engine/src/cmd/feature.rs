@@ -362,6 +362,17 @@ pub struct TreeNode {
     pub rolled_back: bool,
 }
 
+/// A feature whose last replay failed.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct FeatureFailure {
+    /// Feature id.
+    pub id: ObjectId,
+    /// Name.
+    pub name: String,
+    /// Why it failed.
+    pub error: String,
+}
+
 /// The history.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct TreeOut {
@@ -369,6 +380,9 @@ pub struct TreeOut {
     pub features: Vec<TreeNode>,
     /// Features that failed.
     pub failed_features: usize,
+    /// Which features failed and why (the active ones; a parked feature has not been replayed).
+    #[serde(default)]
+    pub failures: Vec<FeatureFailure>,
     /// Roll-back marker: the number of active features (equal to the feature count at the end).
     #[serde(default)]
     pub marker: usize,
@@ -418,7 +432,13 @@ fn tree_of(s: &Session, failed: usize) -> TreeOut {
             }
         })
         .collect();
-    TreeOut { features: nodes, failed_features: failed, marker }
+    let failures = s
+        .doc
+        .features
+        .iter()
+        .filter_map(|f| f.error.as_ref().map(|e| FeatureFailure { id: f.id, name: f.name.clone(), error: e.clone() }))
+        .collect();
+    TreeOut { features: nodes, failed_features: failed, failures, marker }
 }
 
 fn tree(s: &mut Session, _: super::NoParams) -> CmdResult<TreeOut> {

@@ -163,3 +163,86 @@ fn rolling_back_to_an_index_counts_from_the_first_feature() {
     let rel = (block_volume(&s) - (4000.0)).abs() / 4000.0;
     assert!(rel < 1e-6, "only the extrude is replayed: {}", block_volume(&s));
 }
+
+fn body_named(s: &Session, name: &str) -> Option<surfacecraft_doc::ObjectId> {
+    s.doc.bodies.iter().find(|b| b.name == name).map(|b| b.id)
+}
+
+fn feature_names(s: &Session) -> Vec<String> {
+    s.doc.features.iter().chain(s.doc.rolled_back.iter()).map(|f| f.name.clone()).collect()
+}
+
+/// A second sketch with a 4 x 4 square and an extrusion of it into a new body called `name`.
+fn extrude_square(s: &mut Session, name: &str) {
+    let sk = format!("sq {name}");
+    s.execute(
+        "sketch.create",
+        json!({"name": sk, "plane": {"origin": [0.0, 0.0, 0.0], "x": [1.0, 0.0, 0.0], "y": [0.0, 1.0, 0.0]}}),
+    )
+    .unwrap();
+    s.execute(
+        "sketch.add",
+        json!({"sketch": sk, "entities": [{"polygon": {"points": [[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]]}}]}),
+    )
+    .unwrap();
+    s.execute("feature.extrude", json!({"sketch": sk, "distance": 2.0, "name": name})).unwrap();
+}
+
+#[test]
+fn rolling_forward_restores_the_body_with_its_name_and_id() {
+    let mut s = Session::new();
+    extrude_and_cut(&mut s);
+    let id = body_named(&s, "block").expect("block");
+    s.doc.set_visible(id, false);
+    s.execute("feature.rollback", json!({"to": {"index": 0}})).unwrap();
+    assert!(body_named(&s, "block").is_none(), "the body does not exist before its first feature");
+    s.execute("feature.rollback", json!({"to": "end"})).unwrap();
+    assert_eq!(body_named(&s, "block"), Some(id), "same id, same name");
+    assert!((block_volume(&s) - BLOCK_CUT).abs() / BLOCK_CUT < 1e-6);
+}
+
+#[test]
+fn a_parked_body_name_stays_reserved_while_rolled_back() {
+    let mut s = Session::new();
+    extrude_and_cut(&mut s);
+    let id = body_named(&s, "block").expect("block");
+    s.execute("feature.rollback", json!({"to": {"index": 0}})).unwrap();
+    extrude_square(&mut s, "block");
+    assert!(body_named(&s, "block").is_none(), "the new body does not take the parked name");
+    assert!(body_named(&s, "block 2").is_some(), "the existing clash convention: a numbered name");
+    s.execute("feature.rollback", json!({"to": "end"})).unwrap();
+    assert_eq!(body_named(&s, "block"), Some(id), "later commands that say \"block\" mean the original body");
+    assert!(body_named(&s, "block 2").is_some());
+}
+
+#[test]
+fn parked_feature_names_count_as_taken() {
+    let mut s = Session::new();
+    extrude_and_cut(&mut s);
+    s.execute("feature.rollback", json!({"to": {"index": 0}})).unwrap();
+    extrude_square(&mut s, "other");
+    let names = feature_names(&s);
+    let mut unique = names.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(names.len(), unique.len(), "every feature name is unique: {names:?}");
+}
+
+#[test]
+fn a_parked_fillet_whose_edge_was_consumed_fails_on_roll_forward_and_is_reported() {
+    let mut s = Session::new();
+    let fillet = with_fillet(&mut s);
+    s.execute("feature.rollback", json!({"to": {"feature": fillet}})).unwrap();
+    // the chamfer takes the edge the parked fillet rounds
+    s.execute("feature.chamfer", json!({"body": "block", "edges": [0], "size": 0.2})).unwrap();
+    let tree = s.execute("feature.rollback", json!({"to": "end"})).unwrap();
+    assert_eq!(tree["marker"], 4, "the fillet is back in the history, not lost: {tree}");
+    assert!(s.doc.rolled_back.is_empty());
+    assert_eq!(tree["failed_features"], 1, "{tree}");
+    let failures = tree["failures"].as_array().expect("failures listed");
+    assert_eq!(failures.len(), 1, "{tree}");
+    assert_eq!(failures[0]["id"], json!(fillet));
+    assert!(!failures[0]["error"].as_str().unwrap_or_default().is_empty());
+    assert!(s.doc.feature(surfacecraft_doc::ObjectId(fillet)).expect("fillet").error.is_some(), "marked failed");
+    assert!(block_volume(&s) > 0.0, "the document is consistent: the body is the chamfered block");
+}
