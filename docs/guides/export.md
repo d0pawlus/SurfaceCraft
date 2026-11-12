@@ -10,6 +10,10 @@ returns the file as base64 `data`. The second works over MCP with files off.
   `name`, the product name written into the file.
 - A file holds sheets or solids, not both: export them in separate files. The result's `content`
   says which kind was written.
+- A solid made of thousands of spline patches (the result of `surface.wrap`) is written compactly:
+  vertices, edges and control points once, about 2 KB per bicubic patch. Solids with faces the
+  compact writer does not support (for example intersection-curve edges) go through the solidcore
+  exporter, which needs about 17 to 24 KB per patch.
 - Scan meshes: `mesh.export` with `object`, `path` or none, and `format` (`stl`, `obj` or `ply`).
 - Bringing data in: `import.step` reads the bodies of a STEP file, `mesh.import` reads meshes.
 

@@ -854,6 +854,7 @@
   "param.align_frame": "Wyprostuj szkic",
   "param.angle_tolerance_degrees": "Tolerancja kąta",
   "param.max_patches": "Maks. płatów",
+  "param.refine": "Zagęszczanie",
   "param.control": "Siatka kontrolna",
   "param.angle": "Kąt ostrej krawędzi",
   "param.symmetric": "Obie strony",

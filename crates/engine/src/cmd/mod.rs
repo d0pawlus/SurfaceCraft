@@ -39,6 +39,7 @@ mod surface_fit;
 mod surface_pieces;
 pub mod working;
 pub mod wrap;
+mod wrap_rounds;
 
 /// An error from a command's `run`.
 #[derive(Clone, Debug, PartialEq)]
