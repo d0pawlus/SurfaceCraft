@@ -248,6 +248,10 @@ fn check_text(text: &str, table: &ParamTable) -> Result<(), String> {
 
 /// The feature's expressions refer to numeric fields of its operation and use defined parameters.
 fn check_feature(f: &FeatureObject, table: &ParamTable) -> Result<(), String> {
+    // most features have none: do not serialise an operation (a base body holds a whole B-rep)
+    if f.exprs.is_empty() {
+        return Ok(());
+    }
     let mut v = serde_json::to_value(&f.op).map_err(|e| e.to_string())?;
     for (path, text) in &f.exprs {
         let fail = |m: String| format!("feature {}, field `{path}`: {m}", f.name);
@@ -264,6 +268,9 @@ fn check_feature(f: &FeatureObject, table: &ParamTable) -> Result<(), String> {
 /// Is the cached value of the feature (its operation) what its expressions give now? An
 /// expression that does not evaluate counts as not matching (the replay will report it).
 fn feature_current(f: &FeatureObject, table: &ParamTable) -> bool {
+    if f.exprs.is_empty() {
+        return true;
+    }
     let Ok(now) = apply_feature_exprs(&f.op, &f.exprs, table) else { return false };
     match (serde_json::to_value(&f.op), serde_json::to_value(&now)) {
         (Ok(a), Ok(b)) => same_json(&a, &b),

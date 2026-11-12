@@ -104,3 +104,26 @@ fn a_document_from_outside_is_checked() {
     doc.features[0].exprs = exprs(&[("sketch", "1")]);
     assert!(validate_document(&doc).is_err(), "a non-numeric field");
 }
+
+#[test]
+fn features_without_expressions_are_never_serialised_on_load() {
+    // a base body is a whole B-rep: the checks of a load return before touching the operation
+    let brep = surfacecraft_kernel::solid::make_box([0.0; 3], [1.0, 2.0, 3.0]).expect("box");
+    let mut doc = Document::default();
+    let body = doc.fresh_id();
+    doc.add_feature("base", FeatureOp::Base { brep: std::sync::Arc::new(brep) }, body);
+    let f = &doc.features[0];
+    assert!(f.exprs.is_empty());
+    assert_eq!(check_feature(f, &doc.params), Ok(()));
+    assert!(feature_current(f, &doc.params));
+    // and a document of many such bodies validates at once
+    for k in 0..200 {
+        let b = doc.fresh_id();
+        let brep = surfacecraft_kernel::solid::make_box([0.0; 3], [1.0, 2.0, 3.0 + f64::from(k)]).expect("box");
+        doc.add_feature("base", FeatureOp::Base { brep: std::sync::Arc::new(brep) }, b);
+    }
+    let started = std::time::Instant::now();
+    let (_, stale) = validate_document(&doc).expect("valid");
+    assert!(!stale);
+    assert!(started.elapsed() < std::time::Duration::from_millis(500), "{:?}", started.elapsed());
+}

@@ -7,6 +7,7 @@ use serde_json::Value;
 use surfacecraft_doc::{BoolOp, FeatureObject, FeatureOp, Mode, ObjectId, ObjectKind, Side};
 
 mod exprs;
+use exprs::ClearedExpr;
 mod rollback;
 use super::param::num::{Count, ExprSet, Num, zero3};
 use std::collections::BTreeMap;
@@ -30,6 +31,9 @@ pub struct FeatureOut {
     pub error: Option<String>,
     /// Features that failed in the replay.
     pub failed_features: usize,
+    /// For `feature.edit`: the expressions the edit replaced with plain numbers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expressions_cleared: Vec<ClearedExpr>,
 }
 
 fn report(s: &Session, id: ObjectId, failed: usize) -> CmdResult<FeatureOut> {
@@ -38,7 +42,16 @@ fn report(s: &Session, id: ObjectId, failed: usize) -> CmdResult<FeatureOut> {
     let (volume, faces, edges) = s.doc.body(body).map_or((None, 0, 0), |b| {
         (surfacecraft_kernel::solid::volume(&b.brep).ok(), b.brep.faces.len(), b.brep.edges.len())
     });
-    Ok(FeatureOut { id, body, volume, faces, edges, error: f.error.clone(), failed_features: failed })
+    Ok(FeatureOut {
+        id,
+        body,
+        volume,
+        faces,
+        edges,
+        error: f.error.clone(),
+        failed_features: failed,
+        expressions_cleared: Vec::new(),
+    })
 }
 
 /// Makes sure a body that did not come from a feature enters the history as a base feature.
@@ -291,7 +304,7 @@ fn edit(s: &mut Session, i: EditIn) -> CmdResult<FeatureOut> {
     let Some(set) = i.set.as_object() else {
         return Err(CmdError::Params("`set` is an object of fields".into()));
     };
-    let (op, exprs) = exprs::edited(f, set, &s.doc.params)?;
+    let (op, exprs, cleared) = exprs::edited(f, set, &s.doc.params)?;
     if let Some(f) = s.doc.feature_mut(id) {
         f.op = op;
         f.exprs = exprs;
@@ -300,7 +313,9 @@ fn edit(s: &mut Session, i: EditIn) -> CmdResult<FeatureOut> {
     if let Some(e) = s.doc.feature(id).and_then(|f| f.error.clone()) {
         return Err(CmdError::Failed(format!("the edited feature fails: {e}")));
     }
-    report(s, id, failed)
+    let expressions_cleared =
+        cleared.into_iter().map(|(field, expression)| ClearedExpr { field, expression }).collect();
+    Ok(FeatureOut { expressions_cleared, ..report(s, id, failed)? })
 }
 
 /// Suppress parameters.

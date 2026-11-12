@@ -66,7 +66,7 @@ pub struct SetIn {
 }
 
 /// The sketches and features that fail at the moment.
-fn failures(s: &Session) -> Vec<Failure> {
+pub(crate) fn failures(s: &Session) -> Vec<Failure> {
     let sketches = s.doc.sketches.iter().filter_map(|k| {
         k.error.as_ref().map(|m| Failure { kind: "sketch".into(), name: k.name.clone(), message: m.clone() })
     });

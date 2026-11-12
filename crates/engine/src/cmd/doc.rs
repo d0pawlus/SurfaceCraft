@@ -46,7 +46,21 @@ fn save(s: &mut Session, i: PathIn) -> CmdResult<SaveOut> {
     Ok(SaveOut { path: i.path, bytes: text.len() })
 }
 
-fn open(s: &mut Session, i: PathIn) -> CmdResult<ListOut> {
+/// Result of open.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct OpenOut {
+    /// Every object.
+    pub objects: Vec<ObjectSummary>,
+    /// Whether the file's cached values differed from its parameter expressions, so that its
+    /// dimensions and features were recomputed on opening.
+    pub recomputed: bool,
+    /// Sketches and features that fail (as `param.set` lists them).
+    pub failures: Vec<super::param::Failure>,
+    /// Features that failed.
+    pub failed_features: usize,
+}
+
+fn open(s: &mut Session, i: PathIn) -> CmdResult<OpenOut> {
     let bytes = read_file(s, &i.path)?;
     let text = String::from_utf8(bytes).map_err(|_| CmdError::Failed("project file is not UTF-8".into()))?;
     s.doc = format::from_json(&text).map_err(CmdError::Failed)?;
@@ -54,10 +68,12 @@ fn open(s: &mut Session, i: PathIn) -> CmdResult<ListOut> {
     s.maps.clear();
     // cached dimensions or feature values that differ from their expressions: the geometry in
     // the file is stale, so it is rebuilt the way a parameter change rebuilds it
-    if s.doc.needs_recompute {
+    let recomputed = s.doc.needs_recompute;
+    if recomputed {
         super::param::recompute(s);
     }
-    Ok(ListOut { objects: s.doc.summaries() })
+    let failed_features = s.doc.features.iter().filter(|f| f.error.is_some()).count();
+    Ok(OpenOut { objects: s.doc.summaries(), recomputed, failures: super::param::failures(s), failed_features })
 }
 
 /// One object.
@@ -137,7 +153,7 @@ fn redo(s: &mut Session, _: NoParams) -> CmdResult<StepOut> {
 /// `doc.*` and `edit.*` commands.
 pub static COMMANDS: &[CommandSpec] = &[
     command!("doc.new", "New", "File", false, "Starts an empty document (clears history).", NoParams, ListOut, new),
-    command!("doc.open", "Open…", "File", false, "Opens a project file `path`.", PathIn, ListOut, open),
+    command!("doc.open", "Open…", "File", false, "Opens a project file `path`.", PathIn, OpenOut, open),
     command!("doc.save", "Save…", "File", false, "Saves the project to `path`.", PathIn, SaveOut, save),
     command!(
         "doc.list",
