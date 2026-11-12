@@ -4,8 +4,9 @@
 //! The scan is reduced to a coarse triangle mesh that stays within a budget of the scan
 //! (`geom::reduce`: small triangles where the shape changes, large ones where it is flat), every
 //! triangle becomes three patches fitted to the scan (`fit::patch::wrap_patches`), and the
-//! network is measured against the scan. A budget that leaves too many points outside the
-//! tolerance is halved and the wrap repeated. Nothing is assumed about smoothness, so sharp edges
+//! network is measured against the scan. Where the patches miss the tolerance the budget is halved
+//! around the missed points only (`refine: adaptive`, default) or everywhere (`uniform`), and the
+//! wrap repeated; see `wrap_rounds`. Nothing is assumed about smoothness, so sharp edges
 //! and thin walls survive; the price is that the patches meet G0.
 use super::body::{BodyOut, body_out};
 use super::deviation::positive;
@@ -14,11 +15,11 @@ use crate::{Session, command};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use surfacecraft_doc::ObjectKind;
-use surfacecraft_fit::patch::{PatchSet, edge_normal_jumps, tessellate, wrap_patches};
-use surfacecraft_geom::edit::{DecimateOptions, decimate, fill_holes, remove_non_manifold};
-use surfacecraft_geom::reduce::{ToleranceOptions, reduce_to_tolerance};
-use surfacecraft_geom::{Bvh, Mesh, Point3};
+use surfacecraft_fit::patch::edge_normal_jumps;
+use surfacecraft_geom::edit::{fill_holes, remove_non_manifold};
 use surfacecraft_kernel::nurbs::{is_closed, sheet_from_bezier_network_as_is};
+
+use super::wrap_rounds::{Refine, Target, WrapLevel, wrap_rounds};
 
 /// Default tolerance of the network against the scan (mm).
 const TOLERANCE: f64 = 0.2;
@@ -27,22 +28,8 @@ const MIN_WITHIN: f64 = 0.99;
 /// Default and largest number of patches.
 const MAX_PATCHES: usize = 12_000;
 pub(crate) const PATCH_LIMIT: usize = 60_000;
-/// Patches per coarse triangle.
-const PATCHES_PER_TRIANGLE: usize = 3;
-/// The coarse mesh may leave the scan by this many tolerances in the first round.
-const FIRST_BUDGET: f64 = 4.0;
-/// Rounds at most; each one halves the budget.
-const MAX_ROUNDS: usize = 3;
-/// A patch point is looked for within this many budgets of its first guess.
-const REACH_BUDGETS: f64 = 6.0;
-/// Scan points measured at most (evenly strided).
-const MAX_SAMPLES: usize = 200_000;
-/// Times the budget is doubled to bring the coarse mesh under the patch limit.
-const CAP_DOUBLINGS: usize = 4;
 /// Holes left by removing non-manifold triangles are filled up to this many edges.
 const REPAIR_HOLE_EDGES: usize = 60;
-/// Tessellation of a patch for the measurement (quads per side).
-const MEASURE_GRID: usize = 6;
 
 /// Parameters of `surface.wrap`.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -59,6 +46,9 @@ pub struct WrapIn {
     /// Most patches the network may have (default 12000, at most 60000).
     #[serde(default)]
     pub max_patches: Option<usize>,
+    /// How the layout is refined where the tolerance is missed: `adaptive` (default, only around the missed scan points) or `uniform` (the whole scan).
+    #[serde(default)]
+    pub refine: Option<String>,
     /// Name of the body (default "wrap").
     #[serde(default)]
     pub name: Option<String>,
@@ -94,6 +84,10 @@ pub struct WrapOut {
     pub budget: f64,
     /// Rounds run.
     pub rounds: usize,
+    /// Layout used: `adaptive` or `uniform`.
+    pub refine: String,
+    /// Patches and fit of every round, in order (the result is the best of them).
+    pub levels: Vec<WrapLevel>,
     /// True when `max_patches` stopped the refinement.
     pub capped: bool,
     /// Tolerance used (mm).
@@ -109,83 +103,6 @@ pub struct WrapOut {
     pub warning: Option<String>,
 }
 
-/// One round: the coarse mesh, its patches and their deviation.
-struct Round {
-    set: PatchSet,
-    coarse_triangles: usize,
-    budget: f64,
-    capped: bool,
-    deviation: WrapDeviation,
-}
-
-/// The coarse mesh within `budget` of `scan`. When it has more than `max_triangles`, it is reduced
-/// further with a doubled budget (still measured against the surface, so the shape survives) and
-/// only as a last resort cut to the count. The flag says whether the limit was hit.
-fn coarse_mesh(scan: &Mesh, budget: f64, max_triangles: usize) -> (Mesh, bool) {
-    let mut coarse = scan.clone();
-    let opts =
-        DecimateOptions { target_triangles: 0, max_error: None, feature_angle_deg: 181.0, preserve_boundary: true };
-    // an invalid mesh is left as it is; the caller has validated the scan
-    let _report = reduce_to_tolerance(&mut coarse, &opts, &ToleranceOptions::new(budget));
-    let capped = coarse.triangle_count() > max_triangles;
-    let mut wider = budget;
-    for _ in 0..CAP_DOUBLINGS {
-        if coarse.triangle_count() <= max_triangles {
-            break;
-        }
-        wider *= 2.0;
-        let _report = reduce_to_tolerance(&mut coarse, &opts, &ToleranceOptions::new(wider));
-    }
-    if coarse.triangle_count() > max_triangles {
-        decimate(&mut coarse, &DecimateOptions { target_triangles: max_triangles, ..opts });
-    }
-    // a reduction can pinch the surface; the network needs at most two triangles on an edge
-    remove_non_manifold(&mut coarse);
-    (coarse, capped)
-}
-
-/// Distances of the sample points from the patches.
-fn measure(set: &PatchSet, samples: &[Point3], tolerance: f64) -> WrapDeviation {
-    let bvh = Bvh::build(&tessellate(set, MEASURE_GRID));
-    let mut d: Vec<f64> = samples.iter().filter_map(|p| bvh.closest(p, f64::INFINITY)).map(|h| h.distance).collect();
-    if d.is_empty() {
-        return WrapDeviation::default();
-    }
-    d.sort_by(f64::total_cmp);
-    let count = d.len();
-    let within = d.iter().filter(|x| **x <= tolerance).count() as f64 / count as f64;
-    let rms = (d.iter().map(|x| x * x).sum::<f64>() / count as f64).sqrt();
-    let p99 = d.get(((count - 1) as f64 * 0.99) as usize).copied().unwrap_or(0.0);
-    WrapDeviation { count, within, rms, p99, max: d.last().copied().unwrap_or(0.0) }
-}
-
-/// Wraps `scan`, halving the budget until `min_within` of the samples are within `tolerance`.
-fn wrap_rounds(scan: &Mesh, tolerance: f64, min_within: f64, max_patches: usize) -> CmdResult<(Round, usize)> {
-    let bvh = Bvh::build(scan);
-    let stride = scan.positions.len().div_ceil(MAX_SAMPLES).max(1);
-    let samples: Vec<Point3> = scan.positions.iter().step_by(stride).copied().collect();
-    let max_triangles = (max_patches / PATCHES_PER_TRIANGLE).max(4);
-    let mut best: Option<Round> = None;
-    let mut budget = FIRST_BUDGET * tolerance;
-    let mut rounds = 0;
-    while rounds < MAX_ROUNDS {
-        rounds += 1;
-        let (coarse, capped) = coarse_mesh(scan, budget, max_triangles);
-        let set = wrap_patches(&coarse, &bvh, REACH_BUDGETS * budget);
-        let deviation = measure(&set, &samples, tolerance);
-        let round = Round { set, coarse_triangles: coarse.triangle_count(), budget, capped, deviation };
-        let done = capped || deviation.within >= min_within;
-        if best.as_ref().is_none_or(|b| deviation.within > b.deviation.within) {
-            best = Some(round);
-        }
-        if done {
-            break;
-        }
-        budget *= 0.5;
-    }
-    best.map(|b| (b, rounds)).ok_or_else(|| CmdError::Failed("the scan could not be wrapped".into()))
-}
-
 pub(crate) fn wrap(s: &mut Session, i: WrapIn) -> CmdResult<WrapOut> {
     let id = i.mesh.resolve(s, ObjectKind::Mesh)?;
     let tolerance = positive(i.tolerance.unwrap_or(TOLERANCE), "tolerance")?;
@@ -193,6 +110,7 @@ pub(crate) fn wrap(s: &mut Session, i: WrapIn) -> CmdResult<WrapOut> {
     if !(min_within.is_finite() && (0.0..=1.0).contains(&min_within)) {
         return Err(CmdError::Params("min_within must be within 0..=1".into()));
     }
+    let refine = Refine::parse(i.refine.as_deref())?;
     let max_patches = i.max_patches.unwrap_or(MAX_PATCHES);
     if !(12..=PATCH_LIMIT).contains(&max_patches) {
         return Err(CmdError::Params(format!("max_patches must be 12..={PATCH_LIMIT}")));
@@ -208,7 +126,9 @@ pub(crate) fn wrap(s: &mut Session, i: WrapIn) -> CmdResult<WrapOut> {
     if scan.validate().is_err() || scan.triangle_count() < 4 {
         return Err(CmdError::Failed("the mesh is empty or invalid".into()));
     }
-    let (round, rounds) = wrap_rounds(&scan, tolerance, min_within, max_patches)?;
+    let target = Target::new(&scan, tolerance, min_within, max_patches);
+    let wrapped = wrap_rounds(&target, refine)?;
+    let round = wrapped.best;
     if round.set.nets.is_empty() {
         return Err(CmdError::Failed("the scan gave no patches".into()));
     }
@@ -234,7 +154,9 @@ pub(crate) fn wrap(s: &mut Session, i: WrapIn) -> CmdResult<WrapOut> {
         patches: round.set.nets.len(),
         coarse_triangles: round.coarse_triangles,
         budget: round.budget,
-        rounds,
+        rounds: wrapped.rounds,
+        refine: refine.name().to_string(),
+        levels: wrapped.levels,
         capped: round.capped,
         tolerance,
         deviation: round.deviation,
@@ -250,7 +172,7 @@ pub static COMMANDS: &[CommandSpec] = &[command!(
     "Wrap scan in patches",
     "Freeform",
     true,
-    "A watertight network of bicubic patches over the whole scan `mesh`, for parts that are not made of primitives (castings, body panels, organic shapes): the scan is reduced to a coarse mesh within a budget, each triangle becomes three patches fitted to the scan, and the budget is halved until `min_within` of the scan lies within `tolerance` or `max_patches` is reached. Sharp edges and thin walls are kept (patches meet G0). The result is a solid when the network is closed, else a sheet.",
+    "A watertight network of bicubic patches over the whole scan `mesh`, for parts that are not made of primitives (castings, body panels, organic shapes): the scan is reduced to a coarse mesh within a budget, each triangle becomes three patches fitted to the scan, and the budget is halved (`refine` adaptive: only around the scan points the patches miss, uniform: everywhere) until `min_within` of the scan lies within `tolerance` or `max_patches` is reached. Every round is a conforming mesh, so neighbouring patches always share their boundary. Sharp edges and thin walls are kept (patches meet G0). The result is a solid when the network is closed, else a sheet.",
     WrapIn,
     WrapOut,
     wrap

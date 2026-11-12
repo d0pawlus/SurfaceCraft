@@ -139,6 +139,19 @@ fn tighten(seed: u32, ring: &[Vec<u32>], budget: &mut [f64], mark: &mut [u32], r
 /// reduction; the report says whether the requirement was met. `None` (mesh untouched) for an invalid
 /// mesh or a tolerance or share outside their range.
 pub fn reduce_to_tolerance(mesh: &mut Mesh, opts: &DecimateOptions, tol: &ToleranceOptions) -> Option<ToleranceReport> {
+    reduce_to_tolerance_scaled(mesh, opts, tol, &[])
+}
+
+/// [`reduce_to_tolerance`] with a starting budget per vertex of the input: `scale[v]` multiplies the
+/// starting budget of vertex `v` (1.0 where `scale` is shorter than the mesh), so detail can be
+/// asked for where a later stage found the reduction too coarse. A scale that is not a positive
+/// finite number counts as 1.0. The refinement rounds are the same as without a scale.
+pub fn reduce_to_tolerance_scaled(
+    mesh: &mut Mesh,
+    opts: &DecimateOptions,
+    tol: &ToleranceOptions,
+    scale: &[f64],
+) -> Option<ToleranceReport> {
     let ok_range = tol.tolerance.is_finite() && tol.tolerance > 0.0 && tol.share > 0.0 && tol.share <= 1.0;
     if !ok_range || mesh.validate().is_err() {
         return None;
@@ -155,7 +168,9 @@ pub fn reduce_to_tolerance(mesh: &mut Mesh, opts: &DecimateOptions, tol: &Tolera
     }
     let sampled: Vec<u32> = (0..nv as u32).filter(|&i| used.get(i as usize) == Some(&true)).collect();
     let bvh_orig = Bvh::build(&orig);
-    let mut budget = vec![tol.tolerance * START_FRACTION; nv];
+    let start = tol.tolerance * START_FRACTION;
+    let mut budget: Vec<f64> =
+        (0..nv).map(|v| start * scale.get(v).copied().filter(|x| x.is_finite() && *x > 0.0).unwrap_or(1.0)).collect();
     let mut mark = vec![0u32; nv];
     let mut ring: Option<Vec<Vec<u32>>> = None;
     let mut report = ToleranceReport { triangles_before: orig.triangles.len(), ..ToleranceReport::default() };
@@ -206,6 +221,48 @@ pub fn reduce_to_tolerance(mesh: &mut Mesh, opts: &DecimateOptions, tol: &Tolera
         }
     }
     Some(report)
+}
+
+/// Detail levels after one more stage: `levels[v] + 1` (at most `max_level`) for every seed vertex
+/// and its neighbours up to `depth` rings away, the others unchanged. A vertex index outside the
+/// mesh is ignored; `levels` shorter than the mesh counts as zeros.
+#[must_use]
+pub fn raise_levels(mesh: &Mesh, seeds: &[u32], levels: &[u8], depth: usize, max_level: u8) -> Vec<u8> {
+    let nv = mesh.positions.len();
+    let mut out: Vec<u8> = (0..nv).map(|v| levels.get(v).copied().unwrap_or(0)).collect();
+    let rings = vertex_rings(mesh);
+    let mut reached = vec![false; nv];
+    let mut frontier: Vec<u32> = Vec::new();
+    for &v in seeds {
+        if let Some(r) = reached.get_mut(v as usize)
+            && !*r
+        {
+            *r = true;
+            frontier.push(v);
+        }
+    }
+    let mut all = frontier.clone();
+    for _ in 0..depth {
+        let mut next = Vec::new();
+        for &v in &frontier {
+            for &w in rings.get(v as usize).map_or(&[][..], Vec::as_slice) {
+                if let Some(r) = reached.get_mut(w as usize)
+                    && !*r
+                {
+                    *r = true;
+                    next.push(w);
+                }
+            }
+        }
+        all.extend_from_slice(&next);
+        frontier = next;
+    }
+    for v in all {
+        if let Some(l) = out.get_mut(v as usize) {
+            *l = l.saturating_add(1).min(max_level);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -316,6 +373,38 @@ mod tests {
         assert_eq!(rep.triangles_before, before);
         assert!(rep.triangles_after * 3 <= before, "{rep:?}");
         assert_within(&orig, &m, tol);
+    }
+
+    #[test]
+    fn scaled_start_budget_keeps_more_detail_where_asked() {
+        let orig = synth::sphere(Point3::origin(), 20.0, 96, 48);
+        let o = DecimateOptions::default();
+        let t = ToleranceOptions::new(0.2);
+        let mut plain = orig.clone();
+        reduce_to_tolerance(&mut plain, &o, &t).unwrap();
+        let fine: Vec<f64> = orig.positions.iter().map(|p| if p.x > 0.0 { 0.1 } else { 1.0 }).collect();
+        let mut scaled = orig.clone();
+        reduce_to_tolerance_scaled(&mut scaled, &o, &t, &fine).unwrap();
+        let near = |m: &Mesh| m.positions.iter().filter(|p| p.x > 0.0).count();
+        assert!(near(&scaled) > near(&plain), "{} vs {}", near(&scaled), near(&plain));
+        let mut again = orig.clone();
+        reduce_to_tolerance_scaled(&mut again, &o, &t, &fine).unwrap();
+        assert_eq!(again, scaled);
+        let mut hostile = orig.clone();
+        reduce_to_tolerance_scaled(&mut hostile, &o, &t, &[f64::NAN, -1.0, 0.0, f64::INFINITY]).unwrap();
+        assert_eq!(hostile, plain);
+    }
+
+    #[test]
+    fn raise_levels_reaches_the_rings_and_saturates() {
+        let m = synth::sphere(Point3::origin(), 5.0, 16, 8);
+        let up = raise_levels(&m, &[0, 9999], &[], 1, 2);
+        assert_eq!(up.len(), m.positions.len());
+        assert_eq!(up[0], 1);
+        let touched = up.iter().filter(|&&l| l > 0).count();
+        assert!(touched > 1 && touched < m.positions.len());
+        let twice = raise_levels(&m, &[0], &raise_levels(&m, &[0], &up, 1, 2), 1, 2);
+        assert_eq!(twice[0], 2);
     }
 
     #[test]

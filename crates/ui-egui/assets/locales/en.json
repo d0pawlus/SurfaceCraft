@@ -847,6 +847,7 @@
   "param.align_frame": "Straighten the sketch",
   "param.angle_tolerance_degrees": "Angle tolerance",
   "param.max_patches": "Max patches",
+  "param.refine": "Refinement",
   "param.control": "Control net",
   "param.angle": "Sharp edge angle",
   "param.symmetric": "Both sides",
