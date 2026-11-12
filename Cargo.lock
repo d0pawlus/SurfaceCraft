@@ -3008,6 +3008,7 @@ dependencies = [
 name = "surfacecraft-io"
 version = "0.1.0"
 dependencies = [
+ "rayon",
  "schemars",
  "serde",
  "surfacecraft-doc",

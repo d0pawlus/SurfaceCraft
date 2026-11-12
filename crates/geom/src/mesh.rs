@@ -251,43 +251,30 @@ impl Mesh {
         }
     }
 
-    /// Merges vertices closer than `tol` (grid hashing) and drops triangles that collapse.
-    /// Returns the number of removed vertices. Sorting instead of a hash map keeps it parallel
-    /// and deterministic: the first vertex of every grid cell survives, in index order.
+    /// Merges vertices closer than `tol` (grid cells of edge `tol`) and drops triangles that collapse.
+    /// Returns the number of removed vertices. The first vertex of every grid cell survives, in
+    /// index order; how the cells are resolved (buckets sorted in parallel, see [`crate::weld`])
+    /// does not change the result, whatever the number of threads.
     pub fn weld(&mut self, tol: f64) -> usize {
         let tol = if tol > 0.0 && tol.is_finite() { tol } else { 1e-9 };
-        let inv = 1.0 / tol;
         let n = self.positions.len();
-        let pos = &self.positions;
-        let mut keyed: Vec<([i64; 3], u32)> = crate::par::map(n, |i| {
-            let p = pos.get(i).copied().unwrap_or_else(Point3::origin);
-            ([(p.x * inv).round() as i64, (p.y * inv).round() as i64, (p.z * inv).round() as i64], i as u32)
-        });
-        crate::par::sort_unstable(&mut keyed);
-        // representative (lowest index) of every vertex's cell
-        let mut rep = vec![0u32; n];
-        let mut start = 0;
-        while start < keyed.len() {
-            let key = keyed[start].0;
-            let first = keyed[start].1;
-            let mut end = start;
-            while end < keyed.len() && keyed[end].0 == key {
-                rep[keyed[end].1 as usize] = first;
-                end += 1;
-            }
-            start = end;
-        }
-        drop(keyed);
-        // new ids in order of first occurrence
-        let mut new_id = vec![0u32; n];
+        let mut remap = crate::weld::representatives(&self.positions, 1.0 / tol);
+        // new ids in order of first occurrence; a representative never has a higher index than
+        // its members, so `remap` is rewritten in place
         let mut out: Vec<Point3> = Vec::new();
         for i in 0..n {
-            if rep[i] as usize == i {
-                new_id[i] = out.len() as u32;
-                out.push(self.positions[i]);
+            let r = remap.get(i).copied().unwrap_or(0) as usize;
+            if r == i {
+                if let Some(slot) = remap.get_mut(i) {
+                    *slot = out.len() as u32;
+                }
+                out.extend(self.positions.get(i));
+            } else if let Some(id) = remap.get(r).copied()
+                && let Some(slot) = remap.get_mut(i)
+            {
+                *slot = id;
             }
         }
-        let remap: Vec<u32> = rep.iter().map(|&r| new_id[r as usize]).collect();
         let removed = n - out.len();
         self.positions = out;
         let tris = std::mem::take(&mut self.triangles);

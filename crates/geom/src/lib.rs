@@ -34,6 +34,7 @@ pub mod section;
 pub mod synth;
 pub mod transform;
 pub mod tri;
+mod weld;
 
 pub use aabb::Aabb;
 pub use bvh::{Bvh, SurfaceHit};
