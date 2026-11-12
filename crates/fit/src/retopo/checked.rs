@@ -16,6 +16,10 @@ pub struct CheckedSplit {
     pub rejected: bool,
     /// Was the split kept without re-snapping because re-snapping would have broken a quad?
     pub resnap_dropped: bool,
+    /// Improper quads of the layout before the split (pre-existing defects are not rejected).
+    pub improper_before: usize,
+    /// Improper quads of the returned layout, so a caller can see a layout getting worse.
+    pub improper_after: usize,
 }
 
 /// Does any child of a proper parent come out improper? (`split_to_quads` makes four children per
@@ -37,13 +41,28 @@ pub fn checked_split(
     (edge, max_move): (f64, f64),
 ) -> CheckedSplit {
     let parents = improper_quads(layout);
+    let improper_before = parents.iter().filter(|&&b| b).count();
+    let done = |layout: QuadMesh, report: ConformReport, rejected: bool, resnap_dropped: bool| {
+        let improper_after = improper_quads(&layout).iter().filter(|&&b| b).count();
+        CheckedSplit { layout, report, rejected, resnap_dropped, improper_before, improper_after }
+    };
     let plain = layout.split(project);
-    let (snapped, report) = snap_to_outline(&plain, outline, 0.5 * edge, max_move);
+    // without an outline (conforming off) there is nothing to snap back
+    let (snapped, report) = if outline.loops.is_empty() {
+        (plain.clone(), ConformReport::default())
+    } else {
+        snap_to_outline(&plain, outline, 0.5 * edge, max_move)
+    };
     if !breaks_a_proper_parent(&parents, &snapped) {
-        return CheckedSplit { layout: snapped, report, rejected: false, resnap_dropped: false };
+        return done(snapped, report, false, false);
     }
     if !breaks_a_proper_parent(&parents, &plain) {
-        return CheckedSplit { layout: plain, report: ConformReport::default(), rejected: false, resnap_dropped: true };
+        let dropped = ConformReport {
+            rolled_back: 1,
+            reason: Some("re-snapping would have left an improper quad; the boundary was left off the outline"),
+            ..ConformReport::default()
+        };
+        return done(plain, dropped, false, true);
     }
-    CheckedSplit { layout: layout.clone(), report: ConformReport::default(), rejected: true, resnap_dropped: false }
+    done(layout.clone(), ConformReport::default(), true, false)
 }

@@ -464,3 +464,59 @@ fn the_checked_split_rejects_the_third_kite_split() {
     assert_eq!(three.layout.faces, two.layout.faces);
     assert_eq!(three.layout.vertices, two.layout.vertices);
 }
+
+// ---------------------------------------------------------------------------------------------
+// the improper-quad predicate, on explicit coordinates
+
+fn flat_quad(p: [(f64, f64); 4]) -> super::super::QuadMesh {
+    super::super::QuadMesh {
+        vertices: p.iter().map(|q| Point3::new(q.0, q.1, 0.0)).collect(),
+        normals: vec![Vec3::z(); 4],
+        faces: vec![[0, 1, 2, 3]],
+    }
+}
+
+/// Area 0.5 and no zero edge, but the second edge doubles back over the first.
+#[test]
+fn a_quad_whose_edge_doubles_back_is_improper() {
+    assert_eq!(invalid_quads(&flat_quad([(0.0, 0.0), (2.0, 0.0), (1.0, 0.0), (1.0, 1.0)])), 1);
+}
+
+/// A vertex lying on a non-adjacent edge is a contact, not a simple polygon.
+#[test]
+fn a_quad_with_a_vertex_on_a_non_adjacent_edge_is_improper() {
+    assert_eq!(invalid_quads(&flat_quad([(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (1.0, 0.0)])), 1);
+}
+
+/// Adjacent edges that backtrack onto each other (interior angle 360°).
+#[test]
+fn a_quad_with_backtracking_adjacent_edges_is_improper() {
+    assert_eq!(invalid_quads(&flat_quad([(0.0, 0.0), (3.0, 0.0), (3.0, 1.0), (1.0, 0.0)])), 1);
+}
+
+/// Mildly skewed, convex and mildly concave quads stay proper.
+#[test]
+fn skewed_and_mildly_concave_quads_stay_proper() {
+    assert_eq!(invalid_quads(&flat_quad([(0.0, 0.0), (2.0, 0.3), (2.4, 2.0), (0.2, 1.7)])), 0);
+    assert_eq!(invalid_quads(&flat_quad([(0.0, 0.0), (2.0, 0.0), (0.9, 0.8), (0.0, 2.0)])), 0);
+}
+
+/// Skipped loops count as unsnapped too.
+#[test]
+fn skipped_loops_count_as_unsnapped() {
+    let r =
+        ConformReport { loops: 4, skipped: 1, unchanged: 1, rolled_back: 1, conformed: 1, ..ConformReport::default() };
+    assert_eq!(r.unsnapped(), 3);
+}
+
+/// The checked split reports the improper count before and after, and the dropped re-snap.
+#[test]
+fn the_checked_split_reports_improper_counts_and_a_dropped_resnap() {
+    let id = |p: &Point3, n: &Vec3| Some((*p, *n));
+    let bad = flat_quad([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]);
+    let mut worse = bad.clone();
+    worse.faces = vec![[3, 2, 1, 0]]; // reversed: improper already
+    let step = checked_split(&worse, &id, &Outline::default(), (1.0, 0.4));
+    assert_eq!((step.improper_before, step.improper_after), (1, 4), "pre-existing defects are reported, not rejected");
+    assert!(!step.rejected);
+}

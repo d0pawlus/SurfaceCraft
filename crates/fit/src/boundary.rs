@@ -32,6 +32,10 @@ const MAX_OFFSET_SPACINGS: f64 = 10.0;
 const DILATE_SPACINGS: f64 = 4.0;
 /// Loops shorter than this many spacings are noise (tiny holes) and are ignored.
 const MIN_LOOP_SPACINGS: f64 = 16.0;
+/// Most points a resampled loop may have; a finer spacing leaves the loop without an outline.
+pub const MAX_LOOP_POINTS: usize = 200_000;
+/// Most binomial smoothing passes (bounds the work for degenerate spacings).
+const MAX_SMOOTH_PASSES: usize = 10_000;
 /// Smallest number of points of a resampled loop.
 const MIN_POINTS: usize = 12;
 
@@ -308,9 +312,14 @@ fn outline_loop(mesh: &Mesh, normals: &[Vec3], tree: &KdTree, ids: &[u32], spaci
     if raw.len() < 3 || length < MIN_LOOP_SPACINGS * spacing {
         return None;
     }
-    let count = ((length / spacing).ceil() as usize).max(MIN_POINTS);
+    // the sample count is bounded before any conversion or allocation
+    let ratio = length / spacing;
+    if !(ratio.is_finite() && ratio <= MAX_LOOP_POINTS as f64) {
+        return None;
+    }
+    let count = (ratio.ceil() as usize).max(MIN_POINTS);
     let step = length / count as f64;
-    let passes = (2.0 * (SMOOTH_SPACINGS * spacing / step).powi(2)).round().max(1.0) as usize;
+    let passes = ((2.0 * (SMOOTH_SPACINGS * spacing / step).powi(2)).round().max(1.0) as usize).min(MAX_SMOOTH_PASSES);
     let (base, corners) = smooth_with_corners(&resample(&raw, count), passes, spacing);
     let normal_at = |p: &Point3| tree.nearest(p).and_then(|(i, _)| normals.get(i)).copied().unwrap_or_else(Vec3::z);
     let outward: Vec<Vec3> = (0..base.len())
@@ -335,11 +344,11 @@ fn enclosing_offsets(base: &OutlineLoop, raw: &[Point3], spacing: f64) -> Vec<f6
         }
     }
     let per_index = (total / n as f64).max(1e-9);
-    let radius = ((DILATE_SPACINGS * spacing / per_index).ceil() as usize).max(1);
+    let radius = ((DILATE_SPACINGS * spacing / per_index).ceil() as usize).max(1).min(n);
     let dilated: Vec<f64> = (0..n)
         .map(|k| (0..=2 * radius).map(|d| exceed[(k + 2 * n + d - radius.min(n)) % n]).fold(0.0, f64::max))
         .collect();
-    let passes = (2.0 * (radius as f64 / 3.0).powi(2)).round().max(1.0) as usize;
+    let passes = ((2.0 * (radius as f64 / 3.0).powi(2)).round().max(1.0) as usize).min(MAX_SMOOTH_PASSES);
     let mut cur = dilated;
     for _ in 0..passes {
         let prev = cur.clone();
@@ -436,5 +445,19 @@ mod malformed {
         assert!(two.closest(&Point3::new(0.5, 1.0, 0.0)).is_none());
         let outline = Outline { loops: vec![lp, two], slack: 0.0 };
         assert!(outline.closest(&Point3::origin()).is_none());
+    }
+}
+
+#[cfg(test)]
+mod tiny_spacing {
+    use super::*;
+    use surfacecraft_geom::synth;
+
+    /// A spacing so small that the sample count would overflow is refused (no outline), not allocated.
+    #[test]
+    fn an_absurdly_small_spacing_gives_a_controlled_empty_outline() {
+        let m = synth::plane(Point3::origin(), Vec3::x(), Vec3::y(), 1.0, 1.0, 1, 1);
+        assert!(region_outline(&m, 1e-300).loops.is_empty());
+        assert!(region_outline(&m, f64::MIN_POSITIVE).loops.is_empty());
     }
 }

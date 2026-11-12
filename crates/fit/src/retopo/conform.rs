@@ -68,6 +68,13 @@ impl ConformReport {
     pub fn all_conformed(&self) -> bool {
         self.loops > 0 && self.conformed == self.loops
     }
+
+    /// Loops left off the outline for any reason: no matching outline loop, nothing within reach,
+    /// or rolled back.
+    #[must_use]
+    pub fn unsnapped(&self) -> usize {
+        self.skipped + self.unchanged + self.rolled_back
+    }
 }
 
 /// Free boundary loops of the faces, region on the left.
@@ -351,8 +358,41 @@ fn segments_cross(a: (f64, f64), b: (f64, f64), c: (f64, f64), d: (f64, f64)) ->
     o(a, b, c) * o(a, b, d) < 0.0 && o(c, d, a) * o(c, d, b) < 0.0
 }
 
+/// Distance of `p` from the segment `a`–`b`.
+fn point_segment_distance(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let l2 = dx * dx + dy * dy;
+    let t = if l2 > 0.0 { (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / l2).clamp(0.0, 1.0) } else { 0.0 };
+    (p.0 - (a.0 + t * dx)).hypot(p.1 - (a.1 + t * dy))
+}
+
+/// Do the closed segments touch or cross (a proper crossing, or an end of one within `eps` of the other)?
+fn segments_touch(a: (f64, f64), b: (f64, f64), c: (f64, f64), d: (f64, f64), eps: f64) -> bool {
+    segments_cross(a, b, c, d)
+        || point_segment_distance(a, c, d) <= eps
+        || point_segment_distance(b, c, d) <= eps
+        || point_segment_distance(c, a, b) <= eps
+        || point_segment_distance(d, a, b) <= eps
+}
+
+/// Smallest sine of the turn at a vertex below which two adjacent edges count as collinear.
+const COLLINEAR_SINE: f64 = 1e-9;
+
+/// Do adjacent edges backtrack onto each other (interior angle of 0 or 360 degrees)?
+fn backtracks(flat: &[(f64, f64)]) -> bool {
+    let n = flat.len();
+    (0..n).any(|k| {
+        let (a, b, c) = (flat[(k + n - 1) % n], flat[k], flat[(k + 1) % n]);
+        let (e1, e2) = ((b.0 - a.0, b.1 - a.1), (c.0 - b.0, c.1 - b.1));
+        let (l1, l2) = (e1.0.hypot(e1.1), e2.0.hypot(e2.1));
+        let cross = e1.0 * e2.1 - e1.1 * e2.0;
+        cross.abs() <= COLLINEAR_SINE * l1 * l2 && e1.0 * e2.0 + e1.1 * e2.1 < 0.0
+    })
+}
+
 /// Is the face a proper polygon in its local surface frame (the plane of its summed vertex
-/// normals): no zero-length edge, positive area, no self-intersection?
+/// normals)? Positive area, no zero-length edge, no backtracking adjacent edges, and no contact
+/// at all (crossing, touching, collinear overlap, a vertex on an edge) between non-adjacent edges.
 fn face_is_proper(pts: &[(Point3, Vec3)]) -> bool {
     let n = pts.len();
     let normal: Vec3 = pts.iter().map(|p| p.1).sum();
@@ -363,12 +403,16 @@ fn face_is_proper(pts: &[(Point3, Vec3)]) -> bool {
     let area: f64 =
         (0..n).map(|k| flat[k].0 * flat[(k + 1) % n].1 - flat[(k + 1) % n].0 * flat[k].1).sum::<f64>() / 2.0;
     let edges_ok = (0..n).all(|k| (pts[(k + 1) % n].0 - pts[k].0).norm() > 1e-9);
-    let simple = (0..n).all(|i| {
+    if !(area > 1e-12 && edges_ok) || backtracks(&flat) {
+        return false;
+    }
+    let extent = flat.iter().fold(0.0f64, |m, p| m.max(p.0.abs()).max(p.1.abs()));
+    let eps = 1e-9 * extent.max(1e-9);
+    (0..n).all(|i| {
         (i + 2..n)
             .filter(|&j| (j + 1) % n != i)
-            .all(|j| !segments_cross(flat[i], flat[(i + 1) % n], flat[j], flat[(j + 1) % n]))
-    });
-    area > 1e-12 && edges_ok && simple
+            .all(|j| !segments_touch(flat[i], flat[(i + 1) % n], flat[j], flat[(j + 1) % n], eps))
+    })
 }
 
 /// Splitting levels a polygon is checked through: the conversion of the layout to quads. This is

@@ -55,6 +55,9 @@ pub struct RetopoIn {
     /// Position-field smoothing sweeps per level (default 40, at most 500).
     #[serde(default)]
     pub position_sweeps: Option<usize>,
+    /// Experimental: conform the layout of an open region to a smoothed outline of the region and put split boundary vertices back onto it (default false). Falls back to the plain layout when any quad would be improper.
+    #[serde(default)]
+    pub conform_boundary: Option<bool>,
     /// Name.
     #[serde(default)]
     pub name: Option<String>,
@@ -141,7 +144,7 @@ fn retopo_options(i: &RetopoIn) -> CmdResult<RetopoOptions> {
         orientation_sweeps: sweeps_in(i.orientation_sweeps, "orientation_sweeps")?,
         position_sweeps: sweeps_in(i.position_sweeps, "position_sweeps")?,
         force_fallback: false,
-        conform_boundary: true,
+        conform_boundary: i.conform_boundary.unwrap_or(false),
     })
 }
 
@@ -383,6 +386,9 @@ pub(super) fn layout_of(q: &QuadObject) -> QuadMesh {
 pub struct QuadIn {
     /// Quad layout id or name.
     pub object: ObjRef,
+    /// Experimental: conform the layout of an open region to a smoothed outline of the region and put split boundary vertices back onto it (default false). Falls back to the plain layout when any quad would be improper.
+    #[serde(default)]
+    pub conform_boundary: Option<bool>,
 }
 
 /// Largest unstructured layout (quads) a split or an automatic refinement produces.
@@ -470,10 +476,13 @@ pub(super) fn info_of(q: &QuadObject, snap_max: f64) -> QuadInfo {
         outline_loops_unsnapped: None,
         outline_unsnapped_reason: None,
         split_rejected: None,
+        improper_before: None,
+        improper_after: None,
+        snap_rejected: None,
     }
 }
 
-pub(super) fn split_unstructured(s: &mut Session, id: ObjectId) -> CmdResult<QuadInfo> {
+pub(super) fn split_unstructured(s: &mut Session, id: ObjectId, conform: bool) -> CmdResult<QuadInfo> {
     let q = s.doc.quad(id).cloned().ok_or_else(|| CmdError::Params(format!("no quad layout {id}")))?;
     check_layout(&q)?;
     if q.faces.len() * 4 > MAX_LAYOUT_QUADS {
@@ -482,7 +491,7 @@ pub(super) fn split_unstructured(s: &mut Session, id: ObjectId) -> CmdResult<Qua
     let (pts, point_normals, spacing) = scan_for(s, &q)?;
     let scan = ScanSurface::oriented(&pts, &point_normals);
     let layout = layout_of(&q);
-    let outline = outline_for(s, &q)?;
+    let outline = if conform { outline_for(s, &q)? } else { Outline::default() };
     let step = split_conformed(&layout, &scan, &outline, layout_radius(&layout, spacing));
     let (resnap, rejected) = (step.report, step.rejected);
     let mut split = step.layout;
@@ -505,7 +514,9 @@ pub(super) fn split_unstructured(s: &mut Session, id: ObjectId) -> CmdResult<Qua
         repaired_patches: Some(flips.repaired),
         flipped_patches: Some(flips.failed),
         unverified_patches: Some(flips.unverified),
-        outline_loops_unsnapped: Some(resnap.rolled_back + resnap.unchanged),
+        outline_loops_unsnapped: Some(resnap.unsnapped()),
+        improper_before: Some(step.improper_before),
+        improper_after: Some(step.improper_after),
         outline_unsnapped_reason: resnap.reason.map(str::to_string),
         split_rejected: Some(rejected),
         ..info_of(q, snap_max)
@@ -701,7 +712,7 @@ fn refine_and_fit(s: &mut Session, ctx: &AutoContext<'_>, mut layout: QuadMesh) 
                 splits_rejected += 1;
                 continue;
             }
-            unsnapped += split.report.rolled_back + split.report.unchanged;
+            unsnapped += split.report.unsnapped();
             layout = split.layout;
             refinements += 1;
             continue;
@@ -743,7 +754,7 @@ pub(super) fn auto_unstructured(s: &mut Session, q: &QuadObject, tol: f64, i: &A
     }
     let scan = LayoutScan::from_parts(pts, point_normals, spacing);
     let tree = KdTree::build(&scan.pts);
-    let outline = outline_for(s, q)?;
+    let outline = if i.conform_boundary.unwrap_or(false) { outline_for(s, q)? } else { Outline::default() };
     let ctx = AutoContext { q, i, tol, max_patches, scan, tree, outline };
     refine_and_fit(s, &ctx, layout)
 }

@@ -21,6 +21,7 @@ use std::sync::Arc;
 use surfacecraft_doc::{ObjectId, ObjectKind, QuadObject, SurfaceObject};
 use surfacecraft_fit::mls::ScanSurface;
 use surfacecraft_fit::resample::HeightField;
+use surfacecraft_fit::retopo::{QuadMesh, improper_quads};
 use unstructured::{
     QuadIn, RetopoIn, RetopoOut, auto_unstructured, check_layout, info_of, layout_of, layout_radius, projector,
     retopo_cmd, scan_for, split_unstructured,
@@ -66,6 +67,15 @@ pub struct QuadInfo {
     /// Unstructured split: was the split rejected because it would have broken a proper quad (the layout is then unchanged)?
     #[serde(skip_serializing_if = "Option::is_none")]
     pub split_rejected: Option<bool>,
+    /// Unstructured split: improper quads of the layout before the split.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub improper_before: Option<usize>,
+    /// Unstructured split: improper quads of the layout after it (a rise means the layout got worse).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub improper_after: Option<usize>,
+    /// Unstructured snap: was the projection rejected because it would have turned a proper quad improper (layout unchanged)?
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snap_rejected: Option<bool>,
 }
 
 fn points_of(s: &Session, mesh: ObjectId, region: Option<ObjectId>) -> CmdResult<(Arc<Mesh>, Vec<Point3>, Vec<Vec3>)> {
@@ -138,6 +148,9 @@ fn snap(s: &mut Session, id: ObjectId) -> CmdResult<QuadInfo> {
         outline_loops_unsnapped: None,
         outline_unsnapped_reason: None,
         split_rejected: None,
+        improper_before: None,
+        improper_after: None,
+        snap_rejected: None,
     })
 }
 
@@ -203,7 +216,7 @@ fn create(s: &mut Session, i: CreateIn) -> CmdResult<QuadInfo> {
 fn split(s: &mut Session, i: QuadIn) -> CmdResult<QuadInfo> {
     let id = i.object.resolve(s, ObjectKind::Quad)?;
     if s.doc.quad(id).is_some_and(QuadObject::is_unstructured) {
-        return split_unstructured(s, id);
+        return split_unstructured(s, id, i.conform_boundary.unwrap_or(false));
     }
     let q = s.doc.quad_mut(id).ok_or_else(|| CmdError::Params(format!("no quad layout {id}")))?;
     if q.nu * 2 > MAX_QUADS || q.nv * 2 > MAX_QUADS {
@@ -249,14 +262,18 @@ fn snap_cmd(s: &mut Session, i: QuadIn) -> CmdResult<QuadInfo> {
         for (p, n) in layout.vertices.iter().zip(&layout.normals) {
             let (np, nn) = project(p, n).unwrap_or((*p, *n));
             snap_max = snap_max.max((np - p).norm());
-            vs.push([np.x, np.y, np.z]);
-            ns.push([nn.x, nn.y, nn.z]);
+            vs.push(np);
+            ns.push(nn);
         }
-        if let Some(m) = s.doc.quad_mut(id) {
-            m.vertices = vs;
-            m.normals = ns;
+        // a projection that would turn a proper quad improper (a collapse) is rejected as a whole
+        let candidate = QuadMesh { vertices: vs, normals: ns, faces: layout.faces.clone() };
+        let before = improper_quads(&layout);
+        let breaks = improper_quads(&candidate).iter().zip(&before).any(|(&after, &was)| after && !was);
+        if !breaks && let Some(m) = s.doc.quad_mut(id) {
+            m.vertices = candidate.vertices.iter().map(|p| [p.x, p.y, p.z]).collect();
+            m.normals = candidate.normals.iter().map(|n| [n.x, n.y, n.z]).collect();
         }
-        return Ok(info_of(&q, snap_max));
+        return Ok(QuadInfo { snap_rejected: Some(breaks), ..info_of(&q, if breaks { 0.0 } else { snap_max }) });
     }
     snap(s, id)
 }
@@ -311,6 +328,9 @@ fn crease(s: &mut Session, i: CreaseIn) -> CmdResult<QuadInfo> {
         outline_loops_unsnapped: None,
         outline_unsnapped_reason: None,
         split_rejected: None,
+        improper_before: None,
+        improper_after: None,
+        snap_rejected: None,
     })
 }
 
@@ -332,6 +352,9 @@ pub struct AutoIn {
     /// Unstructured layouts: most patches the automatic refinement may reach (default 6000).
     #[serde(default)]
     pub max_patches: Option<usize>,
+    /// Experimental: conform the layout of an open region to a smoothed outline of the region and put split boundary vertices back onto it (default false). Falls back to the plain layout when any quad would be improper.
+    #[serde(default)]
+    pub conform_boundary: Option<bool>,
 }
 
 /// One block's surface.

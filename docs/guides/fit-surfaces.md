@@ -81,11 +81,17 @@ patch network over a whole scan.
 - `quad.create` with `region` or `mesh` and `target_quads` (default 64): a structured layout,
   snapped to the scan.
 - `quad.retopo` with `region` or `mesh`: a field-aligned quad-dominant layout over a closed or
-  wrapped region. `target_quads` sets its density. On an open region the layout is conformed
-  to the outline of the region: the outline is smoothed, its corners are kept, and it is pushed
-  outward just far enough to contain every vertex of the region. The layout's free boundary is
-  moved onto it, and a ring of faces closes the gap where the lattice stopped short (see
-  `outline_loops_conformed` and `outline_ring_faces` in the result). Quads whose patch would run
+  wrapped region. `target_quads` sets its density. With `conform_boundary: true` (experimental, off by default) the layout of an open region is
+  conformed to the outline of the region: the outline is smoothed, its corners are kept, and it is
+  pushed outward just far enough to contain every vertex of the region. The layout's free
+  boundary is moved onto it, and a ring of faces closes the gap where the lattice stopped short
+  (see `outline_conformed`, `outline_loops_conformed` and `outline_ring_faces` in the result).
+  Every change is validated; if any quad of the final layout is improper (not a simple polygon of
+  positive area), the plain layout without conforming is returned and `outline_conformed` is
+  false with the reason. `quad.split` and `surface.auto` take the same parameter and then put
+  split boundary vertices back onto the outline. Every split (conforming or not) is checked on the
+  real geometry and rejected as a whole if it would break a proper quad (`split_rejected`,
+  `splits_rejected`). Quads whose patch would run
   against the scan are turned around (`repaired_patches`); `flipped_patches` counts those that
   could not be repaired.
 - `quad.snap` projects the cage onto the scan. `quad.split` and `quad.merge` change the density.

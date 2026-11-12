@@ -194,8 +194,11 @@ struct Measured {
 fn measure(s: &mut Session, mesh: &Mesh, tris: &[u32], target: usize) -> Measured {
     let id = s.doc.add_mesh("scan", mesh.clone());
     let region = s.doc.add_region("ragged", id, tris.to_vec());
-    let ret = s.execute("quad.retopo", json!({"region": region.0, "target_quads": target})).unwrap();
-    let auto = s.execute("surface.auto", json!({"object": ret["id"], "tolerance": 0.2})).unwrap();
+    let ret = s
+        .execute("quad.retopo", json!({"region": region.0, "target_quads": target, "conform_boundary": true}))
+        .unwrap();
+    let auto =
+        s.execute("surface.auto", json!({"object": ret["id"], "tolerance": 0.2, "conform_boundary": true})).unwrap();
     let sid = auto["blocks"][0]["id"].as_u64().unwrap();
     let surf = s.doc.surfaces.iter().find(|o| o.id.0 == sid).unwrap().clone();
     let tess = surfacecraft_kernel::tess::tessellate(&surf.sheet, Some(0.005)).unwrap();
@@ -435,4 +438,63 @@ fn a_split_that_would_break_a_proper_quad_is_rejected() {
     let auto = s.execute("surface.auto", json!({"object": id.0, "tolerance": 1e-9})).unwrap();
     assert_eq!(auto["flipped_patches"], 0, "{auto}");
     assert!(auto["splits_rejected"].as_u64().unwrap() >= 1, "{auto}");
+}
+
+/// `quad.snap` must not store a projection that turns a proper quad improper: the last two vertices
+/// of this quad are projected onto the same point by the planar scan.
+#[test]
+fn quad_snap_rejects_a_projection_that_collapses_a_quad() {
+    let mut s = Session::new();
+    let plate = synth::plane(Point3::origin(), Vec3::x(), Vec3::y(), 20.0, 20.0, 40, 40);
+    let mesh = s.doc.add_mesh("plate", plate);
+    let n = 1.0 / 3f64.sqrt();
+    let verts = [[5.0, 5.0, 0.0], [6.0, 5.0, 0.0], [6.0, 6.0, 0.0], [6.0, 6.0, 1.0]];
+    let id = s.doc.add_quad(surfacecraft_doc::QuadObject {
+        id: surfacecraft_doc::ObjectId(0),
+        name: "collapse".into(),
+        mesh,
+        region: None,
+        frame: [[0.0; 3]; 4],
+        domain: [[0.0; 2]; 2],
+        nu: 0,
+        nv: 0,
+        vertices: verts.to_vec(),
+        crease_u: Vec::new(),
+        crease_v: Vec::new(),
+        faces: vec![[0, 1, 2, 3]],
+        normals: vec![[n, -n, n]; 4],
+        visible: true,
+    });
+    let info = s.execute("quad.snap", json!({"object": id.0})).unwrap();
+    eprintln!("snap: {info}");
+    let q = s.doc.quad(id).unwrap();
+    let (a, b) = (q.vertices[2], q.vertices[3]);
+    let apart = ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt();
+    assert!(apart > 1e-9, "the collapsed quad was stored: {info}");
+    assert_eq!(info["snap_rejected"], true, "{info}");
+    assert_eq!(q.vertices, verts.to_vec());
+}
+
+/// By default the boundary conform is off: the ragged pipe keeps main's behaviour (a few percent of
+/// the points outside the layout; main measured 3.84 %).
+#[test]
+fn gate_p8_h9_default_off_keeps_the_old_boundary_behaviour() {
+    let sweep = 240f64.to_radians();
+    let mesh = pipe_mesh(0.025, 4, sweep);
+    let theta0 = 0.3 * sweep;
+    let notch = |c: &Point3| {
+        let arc = (c.y.atan2(c.x) - theta0) * 15.0;
+        c.z > 33.0 && arc.abs() < 3.5
+    };
+    let tris = ragged_region(&mesh, 17, 5, &notch);
+    let mut s = Session::new();
+    let id = s.doc.add_mesh("scan", mesh);
+    let region = s.doc.add_region("ragged", id, tris);
+    let ret = s.execute("quad.retopo", json!({"region": region.0, "target_quads": 80})).unwrap();
+    let auto = s.execute("surface.auto", json!({"object": ret["id"], "tolerance": 0.2})).unwrap();
+    let outside = auto["uncovered"].as_f64().unwrap();
+    eprintln!("default off: outside {:.3} %; retopo {ret}", 100.0 * outside);
+    assert_eq!(ret["outline_conformed"], false, "{ret}");
+    assert_eq!(ret["outline_loops_conformed"], 0, "{ret}");
+    assert!((0.01..0.10).contains(&outside), "outside {outside}");
 }
