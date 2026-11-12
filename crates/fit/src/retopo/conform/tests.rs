@@ -1,4 +1,5 @@
 use super::*;
+use crate::retopo::{checked_split, improper_quads};
 use surfacecraft_geom::Rng;
 
 /// The square [0, 10]², region on the left of the travel direction, four corners.
@@ -186,7 +187,7 @@ fn random_layouts_are_unchanged_or_conformed_with_gaps_and_valid_faces() {
 }
 
 /// Improper quads among those the layout is converted to (fan of every face, as `quad.retopo` does).
-fn improper_quads(m: &PolyMesh) -> usize {
+fn improper_after_conversion(m: &PolyMesh) -> usize {
     invalid_quads(&m.split_to_quads(&|p, n| Some((*p, *n))))
 }
 
@@ -232,10 +233,10 @@ fn a_concave_dent_polygon_never_converts_to_an_inverted_quad() {
         (10.0, 99.4),
         (0.5, 50.0),
     ]);
-    let before = (improper_quads(&m), m.vertices.clone(), m.faces.clone());
+    let before = (improper_after_conversion(&m), m.vertices.clone(), m.faces.clone());
     let report = conform_to_outline(&mut m, &square_of(100.0), 1.0, &up);
     // conforming must not add an improper quad; here it is rolled back and the layout is as it was
-    assert!(improper_quads(&m) <= before.0, "{report:?}");
+    assert!(improper_after_conversion(&m) <= before.0, "{report:?}");
     assert_eq!(report.rolled_back, 1, "{report:?}");
     assert_eq!((m.vertices, m.faces), (before.1, before.2));
 }
@@ -317,12 +318,25 @@ fn curved_poly(points: &[(f64, f64)]) -> PolyMesh {
     }
 }
 
-/// The quads `quad.retopo` ends with: the layout converted, split once and re-snapped to the outline.
-fn pipeline(poly: &PolyMesh, outline: &Outline, edge: f64) -> super::super::QuadMesh {
+/// The quads the layout ends with: converted, then split three times with the checked split. Counts
+/// the rejected splits and asserts that no accepted split broke a proper parent.
+fn run_pipeline(poly: &PolyMesh, outline: &Outline, edge: f64, rejected: &mut usize) -> super::super::QuadMesh {
     let id = |p: &Point3, n: &Vec3| Some((*p, *n));
-    let quads = poly.as_quads().unwrap_or_else(|| poly.split_to_quads(&id));
-    let split = quads.split(&id);
-    snap_to_outline(&split, outline, 0.5 * edge, 0.4 * edge).0
+    let mut quads = poly.as_quads().unwrap_or_else(|| poly.split_to_quads(&id));
+    for _ in 0..3 {
+        let parents = improper_quads(&quads);
+        let step = checked_split(&quads, &id, outline, (edge, 0.4 * edge));
+        if step.rejected {
+            *rejected += 1;
+            assert_eq!(step.layout.faces, quads.faces);
+            break;
+        }
+        for (c, bad) in improper_quads(&step.layout).iter().enumerate() {
+            assert!(!*bad || parents[c / 4], "an accepted split broke a proper quad");
+        }
+        quads = step.layout;
+    }
+    quads
 }
 
 /// What a random layout exercises, counted over all cases.
@@ -333,6 +347,9 @@ struct Seen {
     forced: usize,
     rolled_back: usize,
     conformed: usize,
+    rejected: usize,
+    accepted: usize,
+    refused: usize,
 }
 
 fn classify(poly: &PolyMesh, outline: &Outline, edge: f64, seen: &mut Seen) {
@@ -373,22 +390,77 @@ fn random_layouts_on_three_outlines_conform_split_and_resnap_safely() {
         let edge = rng.range(0.3, 3.0);
         let mut poly = curved_poly(&pts);
         let before = (poly.vertices.clone(), poly.faces.clone());
-        let plain = pipeline(&poly, outline, edge);
         classify(&poly, outline, edge, &mut seen);
         let report =
             conform_to_outline(&mut poly, outline, edge, &|p: &Point3, _: &Vec3| Some(curved_normal(p.x, p.y)));
         if report.conformed == 0 {
             assert_eq!((poly.vertices.clone(), poly.faces.clone()), before, "case {case}: {report:?}");
-        } else {
-            assert_ordered(&poly, outline, 0.05 * edge);
         }
         seen.rolled_back += report.rolled_back;
         seen.conformed += report.conformed;
-        let last = pipeline(&poly, outline, edge);
-        assert!(invalid_quads(&last) <= invalid_quads(&plain), "case {case}: {report:?}");
+        let last = run_pipeline(&poly, outline, edge, &mut seen.rejected);
+        // rule 1: a conformed layout is accepted only with every final quad proper
+        if report.all_conformed() && invalid_quads(&last) == 0 {
+            assert_ordered(&poly, outline, 0.05 * edge);
+            seen.accepted += 1;
+        } else {
+            seen.refused += 1;
+        }
     }
     assert!(
-        seen.seam > 0 && seen.dent > 0 && seen.forced > 0 && seen.rolled_back > 0 && seen.conformed > 0,
+        seen.seam > 0
+            && seen.dent > 0
+            && seen.forced > 0
+            && seen.rolled_back > 0
+            && seen.conformed > 0
+            && seen.rejected > 0
+            && seen.accepted > 0
+            && seen.refused > 0,
         "{seen:?}"
     );
+}
+
+/// A loop with no vertex within reach of the outline is neither "conformed" nor "rolled back":
+/// it is counted as unchanged, and the layout is not called conformed.
+#[test]
+fn a_loop_with_nothing_to_snap_is_counted_as_unchanged() {
+    let mut m = poly(&[(45.0, 45.0), (55.0, 45.0), (55.0, 55.0), (45.0, 55.0)]);
+    let before = (m.vertices.clone(), m.faces.clone());
+    let report = conform_to_outline(&mut m, &square_of(100.0), 1.0, &up);
+    assert_eq!((report.conformed, report.unchanged, report.rolled_back), (0, 1, 0), "{report:?}");
+    assert!(!report.all_conformed());
+    assert_eq!((m.vertices, m.faces), before);
+    // the same after a split: a dense inset ring with every vertex beyond the movement threshold
+    let ring: Vec<(f64, f64)> = (0..40)
+        .map(|k| {
+            let a = std::f64::consts::TAU * f64::from(k) / 40.0;
+            (50.0 + 20.0 * a.cos(), 50.0 + 20.0 * a.sin())
+        })
+        .collect();
+    let layout = poly(&ring).as_quads().unwrap_or_else(|| poly(&ring).split_to_quads(&|p, n| Some((*p, *n))));
+    let (_, resnap) = snap_to_outline(&layout, &square_of(100.0), 1.0, 0.4);
+    assert_eq!((resnap.conformed, resnap.rolled_back), (0, 0), "{resnap:?}");
+    assert_eq!(resnap.unchanged, resnap.loops, "{resnap:?}");
+}
+
+/// The kite quad survives two splits and is rejected at the third, which leaves the layout as it was.
+#[test]
+fn the_checked_split_rejects_the_third_kite_split() {
+    let id = |p: &Point3, n: &Vec3| Some((*p, *n));
+    let kite = super::super::QuadMesh {
+        vertices: [(0.0, 0.0), (1.0, 0.0), (0.45, 0.45), (0.0, 1.0)]
+            .iter()
+            .map(|p| Point3::new(p.0, p.1, 0.0))
+            .collect(),
+        normals: vec![Vec3::z(); 4],
+        faces: vec![[0, 1, 2, 3]],
+    };
+    let outline = Outline::default();
+    let one = checked_split(&kite, &id, &outline, (1.0, 0.4));
+    let two = checked_split(&one.layout, &id, &outline, (1.0, 0.4));
+    assert!(!one.rejected && !two.rejected);
+    let three = checked_split(&two.layout, &id, &outline, (1.0, 0.4));
+    assert!(three.rejected);
+    assert_eq!(three.layout.faces, two.layout.faces);
+    assert_eq!(three.layout.vertices, two.layout.vertices);
 }

@@ -383,3 +383,56 @@ fn quad_split_and_refinement_do_not_collapse_boundary_vertices() {
     eprintln!("auto: {auto:?}");
     assert!(!matches!(auto, Err(EngineError::Internal(_))), "{auto:?}");
 }
+
+/// A kite quad that stays proper through two midpoint/centre splits and breaks at the third: the
+/// third `quad.split` is rejected as a whole and the layout stays as the second split left it.
+#[test]
+fn a_split_that_would_break_a_proper_quad_is_rejected() {
+    let mut s = Session::new();
+    let plate = synth::plane(Point3::origin(), Vec3::x(), Vec3::y(), 60.0, 60.0, 30, 30);
+    let mesh = s.doc.add_mesh("plate", plate);
+    let k = 20.0;
+    let verts =
+        [[10.0, 10.0, 0.0], [10.0 + k, 10.0, 0.0], [10.0 + 0.45 * k, 10.0 + 0.45 * k, 0.0], [10.0, 10.0 + k, 0.0]];
+    let id = s.doc.add_quad(surfacecraft_doc::QuadObject {
+        id: surfacecraft_doc::ObjectId(0),
+        name: "kite".into(),
+        mesh,
+        region: None,
+        frame: [[0.0; 3]; 4],
+        domain: [[0.0; 2]; 2],
+        nu: 0,
+        nv: 0,
+        vertices: verts.to_vec(),
+        crease_u: Vec::new(),
+        crease_v: Vec::new(),
+        faces: vec![[0, 1, 2, 3]],
+        normals: vec![[0.0, 0.0, 1.0]; 4],
+        visible: true,
+    });
+    let improper = |s: &Session| -> usize {
+        let q = s.doc.quad(id).unwrap();
+        q.faces
+            .iter()
+            .filter(|f| {
+                let p: Vec<[f64; 3]> = f.iter().map(|&v| q.vertices[v as usize]).collect();
+                let a: f64 =
+                    (0..4).map(|k| p[k][0] * p[(k + 1) % 4][1] - p[(k + 1) % 4][0] * p[k][1]).sum::<f64>() / 2.0;
+                a <= 1e-9
+            })
+            .count()
+    };
+    s.execute("quad.split", json!({"object": id.0})).unwrap();
+    let second = s.execute("quad.split", json!({"object": id.0})).unwrap();
+    let two_levels = s.doc.quad(id).unwrap().faces.len();
+    assert_eq!((improper(&s), two_levels), (0, 16), "{second}");
+    let third = s.execute("quad.split", json!({"object": id.0})).unwrap();
+    eprintln!("third: {third}");
+    assert_eq!(third["split_rejected"], true, "{third}");
+    assert_eq!(s.doc.quad(id).unwrap().faces.len(), two_levels);
+    assert_eq!(improper(&s), 0);
+    // refinement stops at the rejected split and the network is still returned
+    let auto = s.execute("surface.auto", json!({"object": id.0, "tolerance": 1e-9})).unwrap();
+    assert_eq!(auto["flipped_patches"], 0, "{auto}");
+    assert!(auto["splits_rejected"].as_u64().unwrap() >= 1, "{auto}");
+}

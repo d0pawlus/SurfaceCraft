@@ -11,7 +11,7 @@ use surfacecraft_fit::mls::ScanSurface;
 use surfacecraft_fit::orient::{FlipReport, repair_orientation, repair_patches, same_side_normal};
 use surfacecraft_fit::patch::{Deviation, PatchSet, deviation, edge_normal_jumps};
 use surfacecraft_fit::retopo::{
-    ConformReport, QuadMesh, RetopoOptions, RetopoReport, invalid_quads, retopo, snap_to_outline,
+    CheckedSplit, QuadMesh, RetopoOptions, RetopoReport, checked_split, invalid_quads, retopo,
 };
 use surfacecraft_fit::segment::region_points;
 use surfacecraft_geom::{Bvh, KdTree, Mesh, Point3, Vec3};
@@ -85,8 +85,8 @@ pub struct RetopoOut {
     pub closed: bool,
     /// Quads whose orientation is inverted against the scan normals (should be 0).
     pub folded: usize,
-    /// Open regions: was the layout conformed to the region outline (false when no loop could be,
-    /// or when the final check reverted it)?
+    /// Open regions: is every free boundary loop of the layout conformed to the region outline (false
+    /// when any loop is left as it was, or when the final check reverted the conform)?
     pub outline_conformed: bool,
     /// Open regions: free boundary loops of the layout conformed to the region outline.
     pub outline_loops_conformed: usize,
@@ -188,6 +188,8 @@ struct FieldLayout {
     field_quads: usize,
     folded: usize,
     flips: FlipReport,
+    /// Quads of the split of the field polygons that are improper although their parent polygon is proper.
+    split_defects: usize,
 }
 
 fn field_layout(sub: &Mesh, scan: &LayoutScan, opts: &RetopoOptions, force_fallback: bool) -> CmdResult<FieldLayout> {
@@ -203,23 +205,25 @@ fn field_layout(sub: &Mesh, scan: &LayoutScan, opts: &RetopoOptions, force_fallb
     poly.relax(6, &project);
     let field_faces = poly.faces.len();
     let field_quads = poly.faces.iter().filter(|f| f.len() == 4).count();
-    let mut quads = match poly.as_quads() {
-        Some(q) => q,
-        None => poly.split_to_quads(&project),
+    let (mut quads, was_split) = match poly.as_quads() {
+        Some(q) => (q, false),
+        None => (poly.split_to_quads(&project), true),
     };
     quads.relax(8, &project);
+    // rule: a split is accepted only if no proper polygon turns into improper quads (real geometry)
+    let split_defects = if was_split { surfacecraft_fit::retopo::split_defects(&poly, &quads) } else { 0 };
     let flips = orientation_check(&mut quads, &scan.scan, (&scan.pts, &scan.point_normals), scan.spacing);
     let folded = quads.folded();
-    Ok(FieldLayout { quads, rep, field_faces, field_quads, folded, flips })
+    Ok(FieldLayout { quads, rep, field_faces, field_quads, folded, flips, split_defects })
 }
 
-/// The first layout attempt without folded or flipped quads. The fallback (attempt 1) is accepted
+/// The first layout attempt without folded or flipped quads and without split defects. The fallback (attempt 1) is accepted
 /// whatever it holds. Returns the layout and the attempt that gave it.
 fn settled_field_layout(sub: &Mesh, scan: &LayoutScan, opts: &RetopoOptions) -> CmdResult<(FieldLayout, usize)> {
     let mut attempt = 0;
     loop {
         let layout = field_layout(sub, scan, opts, attempt > 0)?;
-        if (layout.folded == 0 && layout.flips.failed == 0) || attempt > 0 {
+        if (layout.folded == 0 && layout.flips.failed == 0 && layout.split_defects == 0) || attempt > 0 {
             return Ok((layout, attempt));
         }
         attempt += 1;
@@ -275,28 +279,33 @@ fn add_retopo_layout(
 }
 
 /// Why the final net gave up conforming.
-const NET_REASON: &str = "conforming to the outline left an improper quad that the unconformed layout does not have";
+const NET_REASON: &str = "the conformed layout has an improper quad; the layout without conforming is returned";
 
-/// The settled layout, unless conforming the boundary left it with more improper quads than the
-/// same layout without it: then the whole conform is reverted. Returns the layout, its attempt and
-/// the reason when it was reverted.
+/// The final net: a conformed layout is accepted only if every quad of its final geometry (after
+/// all splits, projections and relaxations) is proper. Otherwise `plain` (the same pipeline with
+/// conforming off) is returned and the reason says why. No counts are compared.
+fn net_conformed(
+    conformed: (FieldLayout, usize),
+    plain: impl FnOnce() -> CmdResult<(FieldLayout, usize)>,
+) -> CmdResult<(FieldLayout, usize, Option<&'static str>)> {
+    let (fit, attempt) = conformed;
+    if fit.rep.boundary.conformed == 0 || invalid_quads(&fit.quads) == 0 {
+        return Ok((fit, attempt, None));
+    }
+    let (plain, plain_attempt) = plain()?;
+    Ok((plain, plain_attempt, Some(NET_REASON)))
+}
+
+/// The settled layout through the final net.
 fn netted_layout(
     sub: &Mesh,
     scan: &LayoutScan,
     opts: &RetopoOptions,
 ) -> CmdResult<(FieldLayout, usize, Option<&'static str>)> {
-    let (fit, attempt) = settled_field_layout(sub, scan, opts)?;
-    let invalid = invalid_quads(&fit.quads);
-    if fit.rep.boundary.conformed == 0 || invalid == 0 {
-        return Ok((fit, attempt, None));
-    }
-    let plain_opts = RetopoOptions { conform_boundary: false, ..opts.clone() };
-    let (plain, plain_attempt) = settled_field_layout(sub, scan, &plain_opts)?;
-    if invalid_quads(&plain.quads) < invalid {
-        Ok((plain, plain_attempt, Some(NET_REASON)))
-    } else {
-        Ok((fit, attempt, None))
-    }
+    let conformed = settled_field_layout(sub, scan, opts)?;
+    net_conformed(conformed, || {
+        settled_field_layout(sub, scan, &RetopoOptions { conform_boundary: false, ..opts.clone() })
+    })
 }
 
 pub(super) fn retopo_cmd(s: &mut Session, i: RetopoIn) -> CmdResult<RetopoOut> {
@@ -327,8 +336,8 @@ pub(super) fn retopo_cmd(s: &mut Session, i: RetopoIn) -> CmdResult<RetopoOut> {
         closed: boundary.is_empty(),
         folded: fit.folded,
         outline_loops_conformed: fit.rep.boundary.conformed,
-        outline_loops_skipped: fit.rep.boundary.skipped + fit.rep.boundary.rolled_back,
-        outline_conformed: fit.rep.boundary.conformed > 0,
+        outline_loops_skipped: fit.rep.boundary.skipped + fit.rep.boundary.rolled_back + fit.rep.boundary.unchanged,
+        outline_conformed: fit.rep.boundary.all_conformed(),
         outline_unconformed_reason: reverted.or(fit.rep.boundary.reason).map(str::to_string),
         outline_ring_faces: fit.rep.boundary.ring_faces,
         repaired_patches: fit.flips.repaired,
@@ -416,16 +425,11 @@ pub(super) fn outline_for(s: &Session, q: &QuadObject) -> CmdResult<Outline> {
     Ok(cleaned_outline(&sub).0)
 }
 
-/// One split of the layout with its new free-boundary vertices put back onto the outline.
-pub(super) fn split_conformed(
-    layout: &QuadMesh,
-    scan: &ScanSurface,
-    outline: &Outline,
-    radius: f64,
-) -> (QuadMesh, ConformReport) {
-    let split = layout.split(&projector(scan, radius));
+/// One split of the layout with its new free-boundary vertices put back onto the outline, accepted
+/// only if no proper quad turns improper on the real (projected) geometry.
+pub(super) fn split_conformed(layout: &QuadMesh, scan: &ScanSurface, outline: &Outline, radius: f64) -> CheckedSplit {
     let edge = layout_edge(layout);
-    snap_to_outline(&split, outline, 0.5 * edge, OUTLINE_SNAP_FRACTION * edge)
+    checked_split(layout, &projector(scan, radius), outline, (edge, OUTLINE_SNAP_FRACTION * edge))
 }
 
 /// Checks an unstructured layout read from a document (hostile files).
@@ -464,6 +468,8 @@ pub(super) fn info_of(q: &QuadObject, snap_max: f64) -> QuadInfo {
         flipped_patches: None,
         unverified_patches: None,
         outline_loops_unsnapped: None,
+        outline_unsnapped_reason: None,
+        split_rejected: None,
     }
 }
 
@@ -477,13 +483,19 @@ pub(super) fn split_unstructured(s: &mut Session, id: ObjectId) -> CmdResult<Qua
     let scan = ScanSurface::oriented(&pts, &point_normals);
     let layout = layout_of(&q);
     let outline = outline_for(s, &q)?;
-    let (mut split, resnap) = split_conformed(&layout, &scan, &outline, layout_radius(&layout, spacing));
-    let flips = orientation_check(&mut split, &scan, (&pts, &point_normals), spacing);
+    let step = split_conformed(&layout, &scan, &outline, layout_radius(&layout, spacing));
+    let (resnap, rejected) = (step.report, step.rejected);
+    let mut split = step.layout;
+    let flips = if rejected {
+        FlipReport::default() // the layout is as it was: nothing to check again
+    } else {
+        orientation_check(&mut split, &scan, (&pts, &point_normals), spacing)
+    };
     let snap_max = {
         let bvh_pts = ScanSurface::new(&pts);
         split.vertices.iter().filter_map(|p| bvh_pts.nearest(p)).map(|x| x.1).fold(0.0, f64::max)
     };
-    if let Some(m) = s.doc.quad_mut(id) {
+    if let (false, Some(m)) = (rejected, s.doc.quad_mut(id)) {
         m.vertices = split.vertices.iter().map(|p| [p.x, p.y, p.z]).collect();
         m.normals = split.normals.iter().map(|n| [n.x, n.y, n.z]).collect();
         m.faces = split.faces;
@@ -493,7 +505,9 @@ pub(super) fn split_unstructured(s: &mut Session, id: ObjectId) -> CmdResult<Qua
         repaired_patches: Some(flips.repaired),
         flipped_patches: Some(flips.failed),
         unverified_patches: Some(flips.unverified),
-        outline_loops_unsnapped: Some(resnap.rolled_back),
+        outline_loops_unsnapped: Some(resnap.rolled_back + resnap.unchanged),
+        outline_unsnapped_reason: resnap.reason.map(str::to_string),
+        split_rejected: Some(rejected),
         ..info_of(q, snap_max)
     })
 }
@@ -530,6 +544,7 @@ struct Accepted {
     refinements: usize,
     repaired: usize,
     unsnapped: usize,
+    splits_rejected: usize,
     folded: usize,
     flipped_patches: usize,
 }
@@ -631,6 +646,12 @@ fn finish_auto(s: &mut Session, ctx: &AutoContext<'_>, sheet: Brep, step: &Measu
             step.unverified
         ));
     }
+    if accepted.splits_rejected > 0 {
+        notes.push(
+            "a split of the refinement would have broken a proper quad and was rejected; the layout was not refined further"
+                .to_string(),
+        );
+    }
     if accepted.unsnapped > 0 {
         notes.push(format!(
             "{} boundary loop splits could not be snapped back onto the region outline (kept as they were)",
@@ -656,6 +677,7 @@ fn finish_auto(s: &mut Session, ctx: &AutoContext<'_>, sheet: Brep, step: &Measu
         flipped_patches: Some(accepted.flipped_patches),
         unverified_patches: Some(step.unverified),
         outline_loops_unsnapped: Some(accepted.unsnapped),
+        splits_rejected: Some(accepted.splits_rejected),
     }
 }
 
@@ -666,14 +688,21 @@ fn refine_and_fit(s: &mut Session, ctx: &AutoContext<'_>, mut layout: QuadMesh) 
     let mut flipped = false;
     let mut repaired = 0usize;
     let mut unsnapped = 0usize;
+    let mut splits_rejected = 0usize;
     loop {
         let step = repair_and_measure(&mut layout, &ctx.scan, &ctx.tree, flipped)?;
         repaired += step.repaired;
-        let can_split = layout.faces.len() * 4 <= ctx.max_patches && refinements < MAX_AUTO_REFINEMENTS;
+        let can_split =
+            layout.faces.len() * 4 <= ctx.max_patches && refinements < MAX_AUTO_REFINEMENTS && splits_rejected == 0;
         if step.dev.max > ctx.tol && can_split {
-            let (split, resnap) = split_conformed(&layout, &ctx.scan.scan, &ctx.outline, step.radius);
-            layout = split;
-            unsnapped += resnap.rolled_back;
+            let split = split_conformed(&layout, &ctx.scan.scan, &ctx.outline, step.radius);
+            if split.rejected {
+                // a rejected split stops the refinement: the layout stays as it is
+                splits_rejected += 1;
+                continue;
+            }
+            unsnapped += split.report.rolled_back + split.report.unchanged;
+            layout = split.layout;
             refinements += 1;
             continue;
         }
@@ -692,6 +721,7 @@ fn refine_and_fit(s: &mut Session, ctx: &AutoContext<'_>, mut layout: QuadMesh) 
             refinements,
             repaired,
             unsnapped,
+            splits_rejected,
             folded: layout.folded(),
             flipped_patches: step.flipped,
         };
@@ -716,4 +746,68 @@ pub(super) fn auto_unstructured(s: &mut Session, q: &QuadObject, tol: f64, i: &A
     let outline = outline_for(s, q)?;
     let ctx = AutoContext { q, i, tol, max_patches, scan, tree, outline };
     refine_and_fit(s, &ctx, layout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use surfacecraft_fit::retopo::{ConformReport, Layout};
+
+    /// A layout of `good` proper unit quads and `bad` reversed ones.
+    fn layout(good: usize, bad: usize, conformed: usize) -> FieldLayout {
+        let mut quads = QuadMesh::default();
+        for k in 0..good + bad {
+            let o = 3.0 * k as f64;
+            let mut q = [[o, 0.0], [o + 1.0, 0.0], [o + 1.0, 1.0], [o, 1.0]];
+            if k >= good {
+                q.reverse();
+            }
+            let base = quads.vertices.len() as u32;
+            for p in q {
+                quads.vertices.push(Point3::new(p[0], p[1], 0.0));
+                quads.normals.push(Vec3::z());
+            }
+            quads.faces.push([base, base + 1, base + 2, base + 3]);
+        }
+        let boundary = ConformReport { loops: 1, conformed, ..ConformReport::default() };
+        let rep = RetopoReport {
+            layout: Layout::Field,
+            edge_length: 1.0,
+            work_triangles: 0,
+            quads: good + bad,
+            other_polygons: 0,
+            irregular_fraction: 0.0,
+            euler_ok: true,
+            note: None,
+            boundary,
+        };
+        FieldLayout {
+            quads,
+            rep,
+            field_faces: good + bad,
+            field_quads: good + bad,
+            folded: 0,
+            flips: FlipReport::default(),
+            split_defects: 0,
+        }
+    }
+
+    /// Conforming left one improper quad and the plain layout has one too (a tie): the plain layout
+    /// is returned, with the reason; no counts are compared.
+    #[test]
+    fn a_tie_of_improper_quads_returns_the_plain_layout() {
+        let (out, _, reason) = net_conformed((layout(3, 1, 1), 0), || Ok((layout(3, 1, 0), 0))).unwrap();
+        assert_eq!(reason, Some(NET_REASON));
+        assert_eq!(out.rep.boundary.conformed, 0);
+        assert!(!out.rep.boundary.all_conformed());
+    }
+
+    /// No improper quad: the conformed layout is kept and the plain pipeline is not even run.
+    #[test]
+    fn a_conformed_layout_without_improper_quads_is_kept() {
+        let plain = || -> CmdResult<(FieldLayout, usize)> { Err(CmdError::Failed("must not run".into())) };
+        let (out, _, reason) = net_conformed((layout(4, 0, 1), 0), plain).unwrap();
+        assert_eq!(reason, None);
+        assert!(out.rep.boundary.all_conformed());
+    }
 }

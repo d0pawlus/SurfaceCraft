@@ -82,3 +82,13 @@ fn an_open_layout_reaches_the_outline_and_a_closed_one_is_untouched() {
         assert!(near < 0.5 * rep.edge_length, "corner ({x}, {y}): nearest layout vertex {near}");
     }
 }
+
+/// A polygon mesh with a vertex but no normals (hand-built) is refused by the relaxation, not indexed.
+#[test]
+fn relaxing_a_mesh_with_missing_normals_does_not_panic() {
+    let mut p = PolyMesh { vertices: vec![Point3::origin()], normals: Vec::new(), faces: Vec::new() };
+    p.relax(1, &|q, n| Some((*q, *n)));
+    let mut q = QuadMesh { vertices: vec![Point3::origin()], normals: Vec::new(), faces: Vec::new() };
+    q.relax(1, &|a, n| Some((*a, *n)));
+    assert_eq!(p.vertices.len(), 1);
+}

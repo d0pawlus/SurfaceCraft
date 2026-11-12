@@ -35,6 +35,15 @@ pub(crate) struct RegionRec {
     pub triangles: Vec<u32>,
 }
 
+impl RegionRec {
+    /// Do the parallel vectors agree (one curve and one direction per corner, curves in range)?
+    /// `feature_network` builds them together; a hand-built record may not.
+    fn is_consistent(&self, curve_count: usize) -> bool {
+        let n = self.corners.len();
+        n >= 3 && self.sides.len() == n && self.forward.len() == n && self.sides.iter().all(|&c| c < curve_count)
+    }
+}
+
 /// The patches of a set of regions.
 #[derive(Default)]
 pub(crate) struct Patches {
@@ -65,8 +74,11 @@ fn side_from_start(rec: &RegionRec, k: usize, curves: &[Vec<Vec3>]) -> Vec<Vec3>
 
 /// Fills the boundary of a net from its four sides, fits the interior to `points` and orients
 /// the patch along `mean_normal`; corners `[c0, c1, c2, c3]` go with sides c0→c1, c1→c2, c3→c2, c0→c3.
-fn finish_net(sides: [&[Vec3]; 4], corners: [u32; 4], points: &[Vec3], mean_normal: &Vec3) -> (NetN, [u32; 4]) {
+fn finish_net(sides: [&[Vec3]; 4], corners: [u32; 4], points: &[Vec3], mean_normal: &Vec3) -> Option<(NetN, [u32; 4])> {
     let n = sides[0].len().saturating_sub(1);
+    if n < 2 || sides.iter().any(|s| s.len() != n + 1) {
+        return None;
+    }
     let mut net: NetN = vec![vec![[0.0; 3]; n + 1]; n + 1];
     for k in 0..=n {
         net[k][0] = a3(sides[0][k]);
@@ -79,7 +91,7 @@ fn finish_net(sides: [&[Vec3]; 4], corners: [u32; 4], points: &[Vec3], mean_norm
     let du = eval_net(&net, 0.5 + h, 0.5) - eval_net(&net, 0.5 - h, 0.5);
     let dv = eval_net(&net, 0.5, 0.5 + h) - eval_net(&net, 0.5, 0.5 - h);
     if du.cross(&dv).dot(mean_normal) >= 0.0 {
-        return (net, corners);
+        return Some((net, corners));
     }
     // swap u and v: transposes the net and the corner order c0, c3, c2, c1
     let mut t = net.clone();
@@ -88,18 +100,20 @@ fn finish_net(sides: [&[Vec3]; 4], corners: [u32; 4], points: &[Vec3], mean_norm
             t[i][j] = net[j][i];
         }
     }
-    (t, [corners[0], corners[3], corners[2], corners[1]])
+    Some((t, [corners[0], corners[3], corners[2], corners[1]]))
 }
 
 /// One patch per four-sided region.
 pub(crate) fn quad_patches(recs: &[RegionRec], curves: &[Vec<Vec3>]) -> Patches {
     let mut out = Patches::default();
-    for rec in recs {
+    for rec in recs.iter().filter(|r| r.corners.len() == 4 && r.is_consistent(curves.len())) {
         let s: Vec<Vec<Vec3>> = (0..4).map(|k| side_from_start(rec, k, curves)).collect();
         // c0→c1, c1→c2, c3→c2, c0→c3
         let (top, left) = (reversed(&s[2]), reversed(&s[3]));
         let c = [rec.corners[0], rec.corners[1], rec.corners[2], rec.corners[3]];
-        let (net, corners) = finish_net([&s[0], &s[1], &top, &left], c, &rec.points, &rec.mean_normal);
+        let Some((net, corners)) = finish_net([&s[0], &s[1], &top, &left], c, &rec.points, &rec.mean_normal) else {
+            continue;
+        };
         out.nets.push(net);
         out.corners.push(corners);
         out.region_triangles.push(rec.triangles.clone());
@@ -203,7 +217,7 @@ impl Split<'_> {
         let spokes: Vec<Vec<Vec3>> = mids.iter().map(|m| spoke(&surface, &centre, m, self.degree)).collect();
         let assigned = partition(rec, &centre, &mids, &axis);
         let patches = (0..n)
-            .map(|k| {
+            .filter_map(|k| {
                 let prev = (k + n - 1) % n;
                 let (bottom, left) = (self.half(rec, k, true), reversed(&self.half(rec, prev, false)));
                 let (right, top) = (reversed(&spokes[k]), reversed(&spokes[prev]));
@@ -237,7 +251,7 @@ pub(crate) fn ngon_patches(recs: &[RegionRec], curves: &[Vec<Vec3>], first_new_i
     let split = Split { curves, halves, first_new_id, degree };
     let mut out = Patches::default();
     out.extra_points.extend(split.halves.iter().map(|h| h.0.last().copied().map_or([0.0; 3], a3)));
-    for (r, rec) in recs.iter().enumerate() {
+    for (r, rec) in recs.iter().enumerate().filter(|(_, r)| r.is_consistent(curves.len())) {
         let (patches, centre) = split.region(r, rec);
         out.extra_points.push(a3(centre));
         for (k, (net, corners)) in patches.into_iter().enumerate() {
@@ -271,7 +285,7 @@ mod tests {
             planar_curve(a, d, degree),
         );
         for points in [Vec::new(), vec![p(1.0, 1.0); 3]] {
-            let (net, _) = finish_net([&bottom, &right, &top, &left], [0, 1, 2, 3], &points, &Vec3::z());
+            let (net, _) = finish_net([&bottom, &right, &top, &left], [0, 1, 2, 3], &points, &Vec3::z()).unwrap();
             for row in &net {
                 for q in row {
                     assert!((q[2] - z).abs() < 1e-9, "{q:?}");

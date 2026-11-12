@@ -16,6 +16,9 @@ impl PolyMesh {
     /// Evens out quad sizes and untangles small folds of the extracted layout.
     pub fn relax(&mut self, iterations: usize, project: &dyn Fn(&Point3, &Vec3) -> Option<(Point3, Vec3)>) {
         let nv = self.vertices.len();
+        if self.normals.len() != nv {
+            return; // a vertex without a normal cannot be relaxed
+        }
         let mut nb: Vec<std::collections::BTreeSet<u32>> = vec![Default::default(); nv];
         for f in &self.faces {
             for k in 0..f.len() {

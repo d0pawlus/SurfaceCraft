@@ -72,6 +72,15 @@ pub struct OutlineHit {
 }
 
 impl OutlineLoop {
+    /// Are the parallel vectors consistent (a point and an outward direction each, corners in range)?
+    /// Loops of [`region_outline`] always are; a hand-built one may not be.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.points.len() >= 2
+            && self.points.len() == self.outward.len()
+            && self.corners.iter().all(|&c| c < self.points.len())
+    }
+
     fn segment_count(&self) -> usize {
         self.points.len()
     }
@@ -92,6 +101,9 @@ impl OutlineLoop {
     /// The point at arc length `s` (wrapped) and its outward direction.
     #[must_use]
     pub fn at(&self, s: f64) -> Option<(Point3, Vec3)> {
+        if !self.is_valid() {
+            return None;
+        }
         let (arcs, total) = self.arc_lengths();
         let n = self.points.len();
         if n < 2 || total <= 0.0 {
@@ -111,6 +123,9 @@ impl OutlineLoop {
     /// The closest point of the loop to `q`.
     #[must_use]
     pub fn closest(&self, q: &Point3) -> Option<(f64, Point3, f64, Vec3)> {
+        if !self.is_valid() {
+            return None;
+        }
         let (arcs, total) = self.arc_lengths();
         let n = self.segment_count();
         let mut best: Option<(f64, f64, Point3, Vec3)> = None;
@@ -400,5 +415,26 @@ mod tests {
         }
         let (_, total) = lp.arc_lengths();
         assert!(total > 120.0 && total < 130.0, "{total}");
+    }
+}
+
+#[cfg(test)]
+mod malformed {
+    use super::*;
+
+    /// A loop built by hand with parallel vectors of different lengths answers `None`, never panics.
+    #[test]
+    fn a_hand_built_loop_with_mismatched_vectors_is_refused() {
+        let lp = OutlineLoop { points: vec![Point3::origin()], outward: Vec::new(), corners: Vec::new() };
+        assert!(lp.closest(&Point3::new(1.0, 0.0, 0.0)).is_none());
+        assert!(lp.at(0.5).is_none());
+        let two = OutlineLoop {
+            points: vec![Point3::origin(), Point3::new(1.0, 0.0, 0.0)],
+            outward: vec![Vec3::y()],
+            corners: vec![7],
+        };
+        assert!(two.closest(&Point3::new(0.5, 1.0, 0.0)).is_none());
+        let outline = Outline { loops: vec![lp, two], slack: 0.0 };
+        assert!(outline.closest(&Point3::origin()).is_none());
     }
 }

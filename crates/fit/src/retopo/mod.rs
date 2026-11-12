@@ -25,6 +25,7 @@
 //! coarse decimation (every triangle into three quads) and says so in the report.
 use surfacecraft_geom::{Bvh, Mesh, Point3, Vec3};
 
+mod checked;
 mod conform;
 mod extract;
 mod field;
@@ -33,7 +34,8 @@ mod polymesh;
 mod tests;
 mod util;
 
-pub use conform::{ConformReport, conform_to_outline, invalid_quads, snap_to_outline};
+pub use checked::{CheckedSplit, checked_split};
+pub use conform::{ConformReport, conform_to_outline, improper_quads, invalid_quads, snap_to_outline, split_defects};
 use extract::extract;
 use field::{Level, init_orientation, init_positions, level_of, prolong, smooth_orientation, smooth_positions};
 use util::{

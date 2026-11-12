@@ -60,6 +60,12 @@ pub struct QuadInfo {
     /// Unstructured layouts: boundary loops whose split vertices could not be put back onto the region outline.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outline_loops_unsnapped: Option<usize>,
+    /// Unstructured split: why the first boundary loop was not snapped (nothing within reach, or a rollback).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outline_unsnapped_reason: Option<String>,
+    /// Unstructured split: was the split rejected because it would have broken a proper quad (the layout is then unchanged)?
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub split_rejected: Option<bool>,
 }
 
 fn points_of(s: &Session, mesh: ObjectId, region: Option<ObjectId>) -> CmdResult<(Arc<Mesh>, Vec<Point3>, Vec<Vec3>)> {
@@ -130,6 +136,8 @@ fn snap(s: &mut Session, id: ObjectId) -> CmdResult<QuadInfo> {
         flipped_patches: None,
         unverified_patches: None,
         outline_loops_unsnapped: None,
+        outline_unsnapped_reason: None,
+        split_rejected: None,
     })
 }
 
@@ -301,6 +309,8 @@ fn crease(s: &mut Session, i: CreaseIn) -> CmdResult<QuadInfo> {
         flipped_patches: None,
         unverified_patches: None,
         outline_loops_unsnapped: None,
+        outline_unsnapped_reason: None,
+        split_rejected: None,
     })
 }
 
@@ -379,6 +389,9 @@ pub struct AutoOut {
     /// Unstructured layouts: boundary loops whose split vertices could not be put back onto the region outline.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outline_loops_unsnapped: Option<usize>,
+    /// Unstructured layouts: splits of the automatic refinement rejected because they would have broken a proper quad.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub splits_rejected: Option<usize>,
     /// Unstructured layouts: how many times the layout was split to reach the tolerance.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refinements: Option<usize>,
@@ -485,6 +498,7 @@ fn auto(s: &mut Session, i: AutoIn) -> CmdResult<AutoOut> {
         flipped_patches: None,
         unverified_patches: None,
         outline_loops_unsnapped: None,
+        splits_rejected: None,
     })
 }
 

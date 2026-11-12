@@ -48,6 +48,8 @@ pub struct ConformReport {
     pub conformed: usize,
     /// Loops left alone (no matching outline loop, or the order did not match).
     pub skipped: usize,
+    /// Loops with nothing to snap (no vertex within reach of the outline): left as they were.
+    pub unchanged: usize,
     /// Loops rolled back to the layout as it was (a span too short for its vertices, or an
     /// invalid face after snapping).
     pub rolled_back: usize,
@@ -57,6 +59,15 @@ pub struct ConformReport {
     pub snapped: usize,
     /// Faces added.
     pub ring_faces: usize,
+}
+
+impl ConformReport {
+    /// Is every free boundary loop of the layout conformed (at least one vertex on the outline,
+    /// everything valid)? False for a layout without a free boundary.
+    #[must_use]
+    pub fn all_conformed(&self) -> bool {
+        self.loops > 0 && self.conformed == self.loops
+    }
 }
 
 /// Free boundary loops of the faces, region on the left.
@@ -360,9 +371,9 @@ fn face_is_proper(pts: &[(Point3, Vec3)]) -> bool {
     area > 1e-12 && edges_ok && simple
 }
 
-/// Splitting levels a polygon is checked through: the conversion of the layout to quads, and one
-/// refinement split (`quad.split`, the refinements of `surface.auto`).
-const CHECKED_SPLITS: usize = 2;
+/// Splitting levels a polygon is checked through: the conversion of the layout to quads. This is
+/// an early exit only; the commands validate every real split and the final layout.
+const CHECKED_SPLITS: usize = 1;
 
 /// Is the polygon proper, and are all the quads it converts to (the fan of `split_to_quads`, as
 /// `quad.retopo` splits a layout with any non-quad face), and their own splits, proper too?
@@ -415,21 +426,49 @@ fn plan_is_valid(poly: &PolyMesh, plan: &Plan) -> bool {
     })
 }
 
-/// How many quads of `layout` are not proper (positive area, no zero edge, simple) in their local
-/// frame.
+/// For every quad of `layout`: is it improper (not positive area, a zero edge, or self-intersecting
+/// in its local frame)?
 #[must_use]
-pub fn invalid_quads(layout: &super::QuadMesh) -> usize {
+pub fn improper_quads(layout: &super::QuadMesh) -> Vec<bool> {
     layout
         .faces
         .iter()
-        .filter(|f| {
+        .map(|f| {
             let pts: Vec<(Point3, Vec3)> = f
                 .iter()
                 .filter_map(|&v| layout.vertices.get(v as usize).copied().zip(layout.normals.get(v as usize).copied()))
                 .collect();
             pts.len() != 4 || !face_is_proper(&pts)
         })
-        .count()
+        .collect()
+}
+
+/// How many quads of `layout` are improper.
+#[must_use]
+pub fn invalid_quads(layout: &super::QuadMesh) -> usize {
+    improper_quads(layout).into_iter().filter(|&b| b).count()
+}
+
+/// Children of proper polygons that are improper after `poly` was split into `quads` (the faces
+/// of `quads` come in the order of the faces of `poly`, one per corner each).
+#[must_use]
+pub fn split_defects(poly: &PolyMesh, quads: &super::QuadMesh) -> usize {
+    let child_flags = improper_quads(quads);
+    let mut next = 0usize;
+    let mut defects = 0usize;
+    for f in &poly.faces {
+        let pts: Vec<(Point3, Vec3)> = f
+            .iter()
+            .filter_map(|&v| poly.vertices.get(v as usize).copied().zip(poly.normals.get(v as usize).copied()))
+            .collect();
+        let parent_proper = pts.len() == f.len() && pts.len() >= 3 && face_is_proper(&pts);
+        let end = (next + f.len()).min(child_flags.len());
+        if parent_proper {
+            defects += child_flags[next.min(end)..end].iter().filter(|&&b| b).count();
+        }
+        next = end;
+    }
+    defects
 }
 
 /// The quads that use any vertex of `moved`, with the positions of `verts`: all proper?
@@ -512,6 +551,10 @@ pub fn snap_to_outline(
             }
         });
         match moves {
+            Ok(moves) if moves.is_empty() => {
+                report.unchanged += 1;
+                report.reason.get_or_insert("no layout vertex within reach of the outline");
+            }
             Ok(moves) => {
                 report.conformed += 1;
                 report.snapped += moves.len();
@@ -548,7 +591,7 @@ fn try_loop(
         .filter(|&i| lp.closest(&points[i]).is_some_and(|h| h.2 <= DEEP_FRACTION * edge + slack))
         .collect();
     if near.len() < 2 {
-        return Err("fewer than two layout vertices are within reach of the outline");
+        return Ok(Plan::default()); // nothing within reach: counted as unchanged
     }
     let near_targets: Vec<f64> = near.iter().map(|&i| targets[i]).collect();
     let forced = forced_corners(lp, &near_targets, edge);
@@ -572,6 +615,10 @@ pub fn conform_to_outline(poly: &mut PolyMesh, outline: &Outline, edge: f64, sid
             continue;
         };
         match try_loop(poly, lp, ids, (edge, outline.slack), side_normal) {
+            Ok(plan) if plan.moved.is_empty() && plan.added.is_empty() => {
+                report.unchanged += 1;
+                report.reason.get_or_insert("no layout vertex within reach of the outline");
+            }
             Ok(plan) => {
                 report.conformed += 1;
                 report.snapped += plan.moved.len();
