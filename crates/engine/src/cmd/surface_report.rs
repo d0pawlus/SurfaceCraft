@@ -123,13 +123,52 @@ pub(super) fn summarise_coverage(pieces: &[Option<PieceCoverage>]) -> Option<Cov
 }
 
 /// The counters of a fit of `tris` (the region) into `pieces`. By construction
-/// `eligible = measured + excluded + failed`: `measured` counts the distinct points the pieces
-/// measured (a vertex shared by two pieces once), `failed` is what is left of the kept points.
+/// `eligible = measured + excluded + failed`: `measured` counts the distinct points that at least
+/// one piece measured (a vertex shared by two pieces once, and measured when either projects it),
+/// `failed` is what is left of the kept points.
 pub(super) fn sample_counts(mesh: &Mesh, mask: &Mask, tris: &[u32], pieces: &[Piece]) -> SampleCounts {
     let eligible = region_vertex_count(mesh, tris);
     let kept = mask.kept_ids(mesh, tris).len();
-    let chart_triangles: Vec<u32> = pieces.iter().flat_map(|p| p.triangles.iter().copied()).collect();
-    let in_pieces = mask.kept_ids(mesh, &chart_triangles).len().min(kept);
-    let measured = in_pieces.saturating_sub(pieces.iter().map(|p| p.failed).sum());
+    let sets: Vec<&[u32]> = pieces.iter().map(|p| p.measured_ids.as_slice()).collect();
+    count_samples(eligible, kept, &sets)
+}
+
+/// The counters from the number of points of the region, the number not excluded, and the ids of
+/// the points each piece measured.
+fn count_samples(eligible: usize, kept: usize, measured_by_piece: &[&[u32]]) -> SampleCounts {
+    let mut union: Vec<u32> = measured_by_piece.iter().flat_map(|ids| ids.iter().copied()).collect();
+    union.sort_unstable();
+    union.dedup();
+    let measured = union.len().min(kept);
     SampleCounts { eligible, measured, excluded: eligible.saturating_sub(kept), failed: kept - measured }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_shared_point_that_one_piece_cannot_project_is_measured_once() {
+        // points 0..=9; 4 is shared: piece A fails on it, piece B measures it
+        let a: Vec<u32> = vec![0, 1, 2, 3];
+        let b: Vec<u32> = vec![4, 5, 6, 7, 8];
+        let c = count_samples(10, 10, &[&a, &b]);
+        assert_eq!((c.eligible, c.measured, c.excluded, c.failed), (10, 9, 0, 1), "9 is on no piece");
+    }
+
+    #[test]
+    fn a_shared_point_that_fails_on_both_pieces_is_failed_once() {
+        let a: Vec<u32> = vec![0, 1, 2];
+        let b: Vec<u32> = vec![4, 5];
+        let c = count_samples(6, 6, &[&a, &b]);
+        assert_eq!((c.measured, c.failed), (5, 1), "{c:?}");
+    }
+
+    #[test]
+    fn a_shared_point_measured_by_both_counts_once_and_exclusions_stay_apart() {
+        let a: Vec<u32> = vec![0, 1, 2];
+        let b: Vec<u32> = vec![2, 3];
+        let c = count_samples(6, 5, &[&a, &b]);
+        assert_eq!((c.eligible, c.measured, c.excluded, c.failed), (6, 4, 1, 1));
+    }
 }

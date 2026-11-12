@@ -7,6 +7,7 @@
 use super::{CmdError, CmdResult};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use surfacecraft_geom::{Mesh, Point3, Vec3};
 
 /// Most triangle indices, spheres or boxes one call may give.
@@ -127,8 +128,13 @@ fn centroid(mesh: &Mesh, t: u32) -> Option<Point3> {
     Some(Point3::from((a.coords + b.coords + c.coords) / 3.0))
 }
 
+/// Distance from `p` to `c`; chained `hypot`, so huge finite coordinates do not overflow in a square.
+fn distance(p: &Point3, c: &[f64; 3]) -> f64 {
+    (p.x - c[0]).hypot(p.y - c[1]).hypot(p.z - c[2])
+}
+
 fn inside(p: &Point3, spheres: &[SphereIn], boxes: &[BoxIn]) -> bool {
-    spheres.iter().any(|s| (p - Point3::new(s.center[0], s.center[1], s.center[2])).norm() <= s.radius)
+    spheres.iter().any(|s| distance(p, &s.center) <= s.radius)
         || boxes.iter().any(|b| (0..3).all(|k| p[k] >= b.min[k] && p[k] <= b.max[k]))
 }
 
@@ -206,16 +212,65 @@ impl Mask {
         corner_ids(mesh, tris.iter().copied(), |t| !self.is_excluded(t))
     }
 
+    /// The points of `pts` (raw boundary vertices of the region `tris`) that are still measured:
+    /// those that are a vertex of a triangle of `tris` that is not excluded.
+    pub fn keep_measured(&self, mesh: &Mesh, tris: &[u32], pts: &[Point3]) -> Vec<Point3> {
+        if self.excluded.is_empty() {
+            return pts.to_vec();
+        }
+        let bits = |p: &Point3| [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()];
+        let kept: HashSet<[u64; 3]> =
+            self.kept_ids(mesh, tris).into_iter().filter_map(|v| mesh.positions.get(v as usize)).map(bits).collect();
+        pts.iter().filter(|p| kept.contains(&bits(p))).copied().collect()
+    }
+
+    /// Ids, points and normals (aligned) of the vertices of the triangles of `tris` that are not excluded.
+    pub fn samples(&self, mesh: &Mesh, normals: &[Vec3], tris: &[u32]) -> (Vec<u32>, Vec<Point3>, Vec<Vec3>) {
+        let mut out = (Vec::new(), Vec::new(), Vec::new());
+        for v in self.kept_ids(mesh, tris) {
+            if let (Some(p), Some(n)) = (mesh.positions.get(v as usize), normals.get(v as usize)) {
+                out.0.push(v);
+                out.1.push(*p);
+                out.2.push(*n);
+            }
+        }
+        out
+    }
+
     /// Points and normals of the vertices of the triangles of `tris` that are not excluded.
     pub fn points(&self, mesh: &Mesh, normals: &[Vec3], tris: &[u32]) -> (Vec<Point3>, Vec<Vec3>) {
-        self.kept_ids(mesh, tris)
-            .into_iter()
-            .filter_map(|v| Some((*mesh.positions.get(v as usize)?, *normals.get(v as usize)?)))
-            .unzip()
+        let (_, p, n) = self.samples(mesh, normals, tris);
+        (p, n)
     }
 }
 
 /// Distinct vertices of the triangles of `tris`.
 pub(super) fn region_vertex_count(mesh: &Mesh, tris: &[u32]) -> usize {
     corner_ids(mesh, tris.iter().copied(), |_| true).len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A strip of two triangles: vertices 0 1 2 and 1 3 2.
+    fn strip() -> Mesh {
+        let p = |x: f64, y: f64| Point3::new(x, y, 0.0);
+        Mesh {
+            positions: vec![p(0.0, 0.0), p(1.0, 0.0), p(0.0, 1.0), p(1.0, 1.0)],
+            triangles: vec![[0, 1, 2], [1, 3, 2]],
+        }
+    }
+
+    #[test]
+    fn boundary_samples_of_excluded_triangles_are_dropped_unless_a_kept_triangle_uses_them() {
+        let m = strip();
+        let (mask, _) = Mask::build(&m, &[0, 1], Some(&[1]), None, None).unwrap();
+        let boundary = m.positions.clone();
+        // vertex 3 belongs only to the excluded triangle; 1 and 2 are shared with the kept one
+        let kept = mask.keep_measured(&m, &[0, 1], &boundary);
+        assert_eq!(kept, boundary[..3].to_vec());
+        // no mask: everything stays
+        assert_eq!(Mask::none().keep_measured(&m, &[0, 1], &boundary), boundary);
+    }
 }

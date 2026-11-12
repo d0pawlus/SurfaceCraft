@@ -76,7 +76,9 @@ impl Coverage {
 struct Raster {
     x0: f64,
     y0: f64,
-    cell: f64,
+    /// Cell width and height: the raster covers the domain exactly.
+    cw: f64,
+    ch: f64,
     nx: usize,
     ny: usize,
     data: Vec<bool>,
@@ -92,8 +94,8 @@ impl Raster {
     }
 
     fn mark_point(&mut self, p: [f64; 2]) {
-        let at = |v: f64, o: f64| ((v - o) / self.cell).floor().max(0.0) as usize;
-        let (i, j) = (at(p[0], self.x0).min(self.nx - 1), at(p[1], self.y0).min(self.ny - 1));
+        let at = |v: f64, o: f64, c: f64| ((v - o) / c).floor().max(0.0) as usize;
+        let (i, j) = (at(p[0], self.x0, self.cw).min(self.nx - 1), at(p[1], self.y0, self.ch).min(self.ny - 1));
         self.mark(i, j);
     }
 
@@ -106,10 +108,10 @@ impl Raster {
             t.iter().map(|p| p[1]).fold(f64::INFINITY, f64::min),
             t.iter().map(|p| p[1]).fold(f64::NEG_INFINITY, f64::max),
         );
-        let first = ((ymin - self.y0) / self.cell - 0.5).ceil().max(0.0) as usize;
-        let last = (((ymax - self.y0) / self.cell - 0.5).floor().max(-1.0) + 1.0) as usize;
+        let first = ((ymin - self.y0) / self.ch - 0.5).ceil().max(0.0) as usize;
+        let last = (((ymax - self.y0) / self.ch - 0.5).floor().max(-1.0) + 1.0) as usize;
         for j in first..last.min(self.ny) {
-            let yc = self.y0 + (j as f64 + 0.5) * self.cell;
+            let yc = self.y0 + (j as f64 + 0.5) * self.ch;
             let xs: Vec<f64> = (0..3)
                 .filter_map(|k| {
                     let (a, b) = (t.get(k)?, t.get((k + 1) % 3)?);
@@ -123,8 +125,8 @@ impl Raster {
             if !(lo.is_finite() && hi.is_finite()) {
                 continue;
             }
-            let i0 = ((lo - self.x0) / self.cell - 0.5).ceil().max(0.0) as usize;
-            let i1 = ((hi - self.x0) / self.cell - 0.5).floor();
+            let i0 = ((lo - self.x0) / self.cw - 0.5).ceil().max(0.0) as usize;
+            let i1 = ((hi - self.x0) / self.cw - 0.5).floor();
             if i1 < 0.0 {
                 continue;
             }
@@ -215,8 +217,7 @@ pub fn coverage(tris: &[[[f64; 2]; 3]], domain: [[f64; 2]; 2]) -> Option<Coverag
     let cell = (CELL_EDGE_SHARE * mean_edge(tris)?).max(w.max(h) / MAX_RASTER as f64);
     let nx = ((w / cell).ceil() as usize).clamp(1, MAX_RASTER);
     let ny = ((h / cell).ceil() as usize).clamp(1, MAX_RASTER);
-    let cell = (w / nx as f64).max(h / ny as f64);
-    let mut raster = Raster { x0, y0, cell, nx, ny, data: vec![false; nx * ny] };
+    let mut raster = Raster { x0, y0, cw: w / nx as f64, ch: h / ny as f64, nx, ny, data: vec![false; nx * ny] };
     for t in tris.iter().filter(|t| t.iter().all(|p| p[0].is_finite() && p[1].is_finite())) {
         raster.fill(t);
     }
@@ -286,6 +287,26 @@ mod tests {
         assert!((c.shares.extrapolated - outer).abs() < 0.01, "{:?} vs {outer}", c.shares);
         assert_eq!(c.cells.get((c.rows / 2) * c.cols + c.cols / 2), Some(&Cell::Hole));
         assert_eq!(c.cells.first(), Some(&Cell::Extrapolated));
+    }
+
+    /// A fully triangulated strip: two columns of eight vertices on the short edges.
+    fn strip(long_x: bool) -> Vec<[[f64; 2]; 3]> {
+        let at = |col: f64, k: usize| {
+            let (a, b) = (10.0 * col, k as f64 / 7.0);
+            if long_x { [a, b] } else { [b, a] }
+        };
+        (0..7)
+            .flat_map(|k| [[at(0.0, k), at(1.0, k), at(1.0, k + 1)], [at(0.0, k), at(1.0, k + 1), at(0.0, k + 1)]])
+            .collect()
+    }
+
+    #[test]
+    fn a_thin_strip_is_fully_measured_along_either_axis() {
+        for (long_x, domain) in [(true, [[0.0, 10.0], [0.0, 1.0]]), (false, [[0.0, 1.0], [0.0, 10.0]])] {
+            let c = coverage(&strip(long_x), domain).unwrap();
+            assert!((c.shares.measured - 1.0).abs() < 1e-9, "long_x {long_x}: {:?}", c.shares);
+            assert!(c.cells.iter().all(|&k| k == Cell::Measured), "long_x {long_x}: {:?}", c.rows_as_text());
+        }
     }
 
     #[test]

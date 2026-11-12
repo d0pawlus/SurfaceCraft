@@ -60,6 +60,8 @@ pub(super) struct Piece {
     pub measured: usize,
     /// Points whose projection onto the spline failed (not in `measured`).
     pub failed: usize,
+    /// Sorted mesh vertex ids of the points measured (the others of the piece failed).
+    pub measured_ids: Vec<u32>,
     pub warning: Option<String>,
 }
 
@@ -161,10 +163,20 @@ fn select_net(grid: &HeightGrid, pts: &[Point3], st: &Settings) -> CmdResult<Net
     best.ok_or_else(|| CmdError::Failed("no surface could be fitted".into()))
 }
 
+/// The ids of the points (`pts[k]` is vertex `ids[k]`) whose projection onto `srf` works; all of
+/// them when `measured` says none failed, without projecting again.
+fn measured_ids(srf: &Surface, ids: &[u32], pts: &[Point3], measured: usize) -> CmdResult<Vec<u32>> {
+    if measured == pts.len() {
+        return Ok(ids.to_vec());
+    }
+    let probe = SurfaceProbe::new(srf)?;
+    Ok(ids.iter().zip(pts).filter(|(_, p)| probe.closest([p.x, p.y, p.z]).is_ok()).map(|(&v, _)| v).collect())
+}
+
 /// Fits one chart. `Ok(NotHeightField)` / `Ok(TooFew)` are not errors: the caller may split.
 fn fit_piece(cx: &Ctx, tris: &[u32]) -> CmdResult<Fitted> {
     let st = cx.st;
-    let (pts, nrm) = cx.mask.points(cx.mesh, cx.normals, tris);
+    let (ids, pts, nrm) = cx.mask.samples(cx.mesh, cx.normals, tris);
     if pts.len() < MIN_POINTS {
         return Ok(Fitted::TooFew);
     }
@@ -173,6 +185,7 @@ fn fit_piece(cx: &Ctx, tris: &[u32]) -> CmdResult<Fitted> {
     let Some(grid) = height_grid(&pts, &nrm, g, g) else { return Ok(Fitted::NotHeightField) };
     let net = select_net(&grid, &pts, st)?;
     let (rms, max, measured) = net.stats;
+    let measured_ids = measured_ids(&net.srf, &ids, &pts, measured)?;
     let miss = (max > st.tol).then(|| {
         format!("max deviation {max:.4} mm exceeds the {} mm target; split the region or raise the control net", st.tol)
     });
@@ -188,6 +201,7 @@ fn fit_piece(cx: &Ctx, tris: &[u32]) -> CmdResult<Fitted> {
         max,
         measured,
         failed: pts.len().saturating_sub(measured),
+        measured_ids,
         warning,
     })))
 }

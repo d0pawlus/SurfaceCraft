@@ -358,3 +358,59 @@ fn counters_add_up_over_split_pieces() {
     assert_counters_add_up(&r);
     assert!(r["pieces"].as_array().unwrap().iter().all(|p| p["coverage"].is_object()));
 }
+
+/// Finite but huge parameters must not wrap round into "nothing is inside": a sphere of radius
+/// 2e200 around [1e200, 0, 0] holds the whole mesh, so nothing is left to fit.
+#[test]
+fn huge_finite_volumes_still_exclude() {
+    let m = bossed();
+    let mut s = scene(m.clone(), &all_triangles(&m));
+    for mask in [
+        json!({"exclude_spheres": [{"center": [1e200, 0.0, 0.0], "radius": 2e200}]}),
+        json!({"exclude_spheres": [{"center": [-1e200, 1e200, 1e200], "radius": f64::MAX}]}),
+        json!({"exclude_boxes": [{"min": [-f64::MAX, -f64::MAX, -f64::MAX], "max": [f64::MAX, f64::MAX, f64::MAX]}]}),
+    ] {
+        let mut p = json!({"region": "free"});
+        p.as_object_mut().unwrap().extend(mask.as_object().unwrap().clone());
+        let e = s.execute("surface.fit", p).unwrap_err().to_string();
+        assert!(e.contains("too few points"), "{mask}: {e}");
+    }
+}
+
+/// Boundary samples a mask excludes are in no deviation number either: a 4 mm bump along a
+/// diagonal stretch of an elliptical region makes the surface (and with it the closest points of
+/// the boundary vertices) bulge, so the unmasked outline deviation is large; masking the stretch
+/// removes those vertices from the measurement while the trim outline still follows the whole
+/// region (same corners, area within 1 %). The exact filter is unit-tested in `surface_mask`: this
+/// scene is the behaviour check (it passed before the filter too, the value being small once the
+/// surface ignores the bump).
+#[test]
+fn excluded_boundary_points_do_not_enter_the_outline_deviation() {
+    let ellipse = |x: f64, y: f64| ((x - 30.0) / 27.0).powi(2) + ((y - 20.0) / 17.0).powi(2);
+    let mut m = synth::wave(Point3::origin(), WIDTH, HEIGHT, AMPLITUDE, 90, 60);
+    synth::add_noise(&mut m, 0.02, &mut Rng::new(3));
+    for p in &mut m.positions {
+        if p.x > 40.0 && p.y > 28.0 && ellipse(p.x, p.y) > 0.8 {
+            p.z += 4.0;
+        }
+    }
+    let ids: Vec<u32> = (0..m.triangle_count() as u32)
+        .filter(|&t| {
+            let c = centroid(&m, t as usize);
+            ellipse(c.x, c.y) <= 1.0
+        })
+        .collect();
+    let mut s = scene(m.clone(), &ids);
+    let plain = s.execute("surface.fit", json!({"region": "free", "trim": true})).unwrap();
+    let mask = json!([{"min": [39.0, 27.0, -1e6], "max": [1e6, 1e6, 1e6]}]);
+    let masked = s.execute("surface.fit", json!({"region": "free", "trim": true, "exclude_boxes": mask})).unwrap();
+    let (a, b) = (plain["outline_deviation"].as_f64().unwrap(), masked["outline_deviation"].as_f64().unwrap());
+    eprintln!("h11 outline: unmasked {a:.4} mm, masked {b:.4} mm; trimmed {}", masked["trimmed"]);
+    assert_eq!(masked["trimmed"], true, "{masked}");
+    assert!(a > 0.2, "the raised vertices spoil the unmasked outline deviation: {a}");
+    assert!(b <= 0.1, "masked outline deviation {b}");
+    // the trim follows the whole region: same outline loops and the same area as unmasked
+    assert_eq!(masked["outline"]["corners"], plain["outline"]["corners"]);
+    let (area_a, area_b) = (plain["outline"]["area"].as_f64().unwrap(), masked["outline"]["area"].as_f64().unwrap());
+    assert!((area_a - area_b).abs() < 0.01 * area_a, "outline areas {area_a} vs {area_b} (each in its own fit plane)");
+}

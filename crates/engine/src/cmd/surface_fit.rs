@@ -256,7 +256,8 @@ struct Sheet {
 }
 
 /// The sheet trimmed to the outline of `tris`; the reason as `Err` when it cannot be trimmed.
-fn trim_sheet(mesh: &Mesh, tris: &[u32], p: &Piece, tol: f64) -> Result<(Brep, OutlineOut), String> {
+fn trim_sheet(cx: &Ctx, tris: &[u32], p: &Piece) -> Result<(Brep, OutlineOut), String> {
+    let (mesh, tol) = (cx.mesh, cx.st.outline_tol);
     let outline = region_outline(mesh, tris, &p.grid, tol, MAX_OUTLINE_CORNERS)
         .ok_or("the region has no boundary loop to trim to")?;
     let probe = SurfaceProbe::new(&p.srf).map_err(|e| e.to_string())?;
@@ -271,8 +272,12 @@ fn trim_sheet(mesh: &Mesh, tris: &[u32], p: &Piece, tol: f64) -> Result<(Brep, O
     let sheet = trimmed_sheet(&p.srf, &outer, &holes).map_err(|e| e.to_string())?;
     // in-surface: the boundary vertices lie on the scan, the trim edges on the spline; measure
     // from the vertices' closest points on the spline, so the surface deviation is not counted twice
-    let on_surface = outline
-        .boundary
+    // (the outline follows the whole region, but excluded boundary vertices are not measured)
+    let measured = cx.mask.keep_measured(mesh, tris, &outline.boundary);
+    if measured.is_empty() {
+        return Err("every boundary vertex of the region is excluded, the outline cannot be checked".into());
+    }
+    let on_surface = measured
         .iter()
         .map(|q| probe.closest([q.x, q.y, q.z]).map(|(_, c)| Point3::new(c[0], c[1], c[2])).map_err(|e| e.to_string()))
         .collect::<Result<Vec<_>, _>>()?;
@@ -291,7 +296,8 @@ fn trim_sheet(mesh: &Mesh, tris: &[u32], p: &Piece, tol: f64) -> Result<(Brep, O
 
 /// The sheet of a piece: trimmed to the region outline when `trim`, else the whole rectangle of
 /// the spline's parameter domain. A piece that cannot be trimmed stays untrimmed, and says why.
-fn make_sheet(mesh: &Mesh, p: &Piece, trim: bool, st: &Settings) -> CmdResult<Sheet> {
+fn make_sheet(cx: &Ctx, p: &Piece, trim: bool) -> CmdResult<Sheet> {
+    let st = cx.st;
     if !trim {
         return Ok(Sheet {
             brep: sheet_from_spline(&p.srf)?,
@@ -301,7 +307,7 @@ fn make_sheet(mesh: &Mesh, p: &Piece, trim: bool, st: &Settings) -> CmdResult<Sh
             trim_error: None,
         });
     }
-    let tried = trim_sheet(mesh, &p.triangles, p, st.outline_tol).and_then(|(brep, outline)| {
+    let tried = trim_sheet(cx, &p.triangles, p).and_then(|(brep, outline)| {
         // the delivered face must mesh: a face the kernel's mesher refuses is no sheet to give
         let tess = tessellate_all(&brep, Some(delivered_chord(st.tol))).map_err(|e| e.to_string())?;
         Ok((brep, tess, outline))
@@ -525,7 +531,7 @@ pub(super) fn fit_cmd(s: &mut Session, i: FitIn) -> CmdResult<FitOut> {
     let many = out.pieces.len() > 1;
     // the pieces of a split tile the region only when each is cut to its outline
     let trim = i.trim.unwrap_or(many);
-    let sheets = out.pieces.iter().map(|p| make_sheet(&input.mesh, p, trim, &st)).collect::<CmdResult<Vec<_>>>()?;
+    let sheets = out.pieces.iter().map(|p| make_sheet(&cx, p, trim)).collect::<CmdResult<Vec<_>>>()?;
     let (dev, tess) = delivered(&cx, &out.pieces, &sheets, st.tol)?;
     let gaps = if many { piece_gaps(&input.mesh, &out.pieces, tess.as_deref())? } else { Vec::new() };
     let covers: Vec<Option<PieceCoverage>> = out.pieces.iter().map(|p| piece_coverage(&input.mesh, &mask, p)).collect();
