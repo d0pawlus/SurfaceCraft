@@ -4,8 +4,8 @@
 mod common;
 
 use common::{
-    cube_sphere, edges_are_consistent, faces_are_as_given, flip_patch, n_for, pillow, record_fingerprint,
-    sphere_volume, thin_box, thin_enclosure,
+    block, cube_sphere, edges_are_consistent, elevated, faces_are_as_given, flip_patch, n_for, pillow,
+    record_fingerprint, rotation, sphere_volume, thin_box, thin_enclosure, tilted_pillow, transformed,
 };
 use surfacecraft_kernel::nurbs::{
     MAX_NETWORK_PATCHES, is_closed, sheet_from_bezier_network, sheet_from_bezier_network_as_is,
@@ -181,4 +181,65 @@ fn the_record_of_a_consistent_network_is_what_it_was_before_the_pass() {
         &common::Network { patches: net.patches.clone(), corners: net.corners.clone(), radius: net.radius }
     ));
     assert_eq!(record_fingerprint(&sheet), RECORD_FINGERPRINT_12150);
+}
+
+#[test]
+fn a_tilted_planar_pillow_is_refused() {
+    let net = tilted_pillow();
+    let text = sheet_from_bezier_network_as_is(&net.patches, &net.corners).map(|_| ()).map_err(|e| e.to_string());
+    assert!(text.as_ref().is_err_and(|m| m.contains("volume")), "{text:?}");
+}
+
+/// The thin enclosure turned about an arbitrary axis and moved to coordinates near 1e4.
+fn moved_enclosure() -> common::Network {
+    let axis: [f64; 3] = [0.3, -0.5, 0.8];
+    let len = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
+    let unit = axis.map(|a| a / len);
+    transformed(&thin_enclosure(), rotation(unit, 1.1), [12_345.0, -9_876.0, 4_321.0])
+}
+
+#[test]
+fn a_thin_tilted_enclosure_far_from_the_origin_keeps_its_orientation() {
+    let net = moved_enclosure();
+    let sheet = sheet_from_bezier_network_as_is(&net.patches, &net.corners).expect("builds");
+    assert!(faces_are_as_given(&sheet, &net));
+}
+
+#[test]
+fn an_inside_out_thin_tilted_enclosure_is_turned_outward() {
+    let given = moved_enclosure();
+    let mut net = moved_enclosure();
+    (0..net.patches.len()).for_each(|f| flip_patch(&mut net, f));
+    let sheet = sheet_from_bezier_network_as_is(&net.patches, &net.corners).expect("turned outward");
+    assert!(faces_are_as_given(&sheet, &given));
+}
+
+/// Never flipped wrongly: the result is as given or the network is refused.
+fn assert_not_flipped_wrongly(net: &common::Network) {
+    if let Ok(sheet) = sheet_from_bezier_network_as_is(&net.patches, &net.corners) {
+        assert!(faces_are_as_given(&sheet, net));
+    }
+}
+
+#[test]
+fn a_degree_eight_thin_enclosure_is_never_flipped_wrongly() {
+    let net = elevated(&moved_enclosure(), 8);
+    assert_eq!(net.patches[0].len(), 9);
+    assert_not_flipped_wrongly(&net);
+    // and it is accepted: the volume is far from the rounding noise
+    assert!(sheet_from_bezier_network_as_is(&net.patches, &net.corners).is_ok());
+    // turned inside out it is turned outward or refused
+    let given = net.clone_network();
+    let mut inside_out = net;
+    (0..inside_out.patches.len()).for_each(|f| flip_patch(&mut inside_out, f));
+    if let Ok(sheet) = sheet_from_bezier_network_as_is(&inside_out.patches, &inside_out.corners) {
+        assert!(faces_are_as_given(&sheet, &given));
+    }
+}
+
+#[test]
+fn a_one_millimetre_slab_of_a_metre_is_accepted() {
+    let net = block([0.0; 3], [1000.0, 1000.0, 1.0]);
+    let sheet = sheet_from_bezier_network_as_is(&net.patches, &net.corners).expect("builds");
+    assert!(faces_are_as_given(&sheet, &net));
 }

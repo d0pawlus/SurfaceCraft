@@ -220,9 +220,9 @@ pub fn thin_enclosure() -> Network {
     network_from_fns(&[&top, &bottom, &w0, &w1, &w2, &w3], 2)
 }
 
-/// A box `1 x 1 x 0.001` at `origin`, six bilinear patches oriented outward.
-pub fn thin_box(origin: [f64; 3]) -> Network {
-    let p = |x: f64, y: f64, z: f64| [origin[0] + x, origin[1] + y, origin[2] + z * 0.001];
+/// A box of `size` at `origin`, six bilinear patches oriented outward.
+pub fn block(origin: [f64; 3], size: [f64; 3]) -> Network {
+    let p = |x: f64, y: f64, z: f64| [origin[0] + x * size[0], origin[1] + y * size[1], origin[2] + z * size[2]];
     let bottom = |u: f64, v: f64| p(v, u, 0.0);
     let top = |u: f64, v: f64| p(u, v, 1.0);
     let front = |u: f64, v: f64| p(u, 0.0, v);
@@ -230,6 +230,80 @@ pub fn thin_box(origin: [f64; 3]) -> Network {
     let left = |u: f64, v: f64| p(0.0, v, u);
     let right = |u: f64, v: f64| p(1.0, u, v);
     network_from_fns(&[&bottom, &top, &front, &back, &left, &right], 1)
+}
+
+/// A box `1 x 1 x 0.001` at `origin`.
+pub fn thin_box(origin: [f64; 3]) -> Network {
+    block(origin, [1.0, 1.0, 0.001])
+}
+
+/// The network with every control point mapped by `p -> m p + t` (a rotation keeps the sides).
+pub fn transformed(net: &Network, m: [[f64; 3]; 3], t: [f64; 3]) -> Network {
+    let map =
+        |p: &[f64; 3]| -> [f64; 3] { std::array::from_fn(|i| m[i][0] * p[0] + m[i][1] * p[1] + m[i][2] * p[2] + t[i]) };
+    let patches = net.patches.iter().map(|n| n.iter().map(|r| r.iter().map(map).collect()).collect()).collect();
+    Network { patches, corners: net.corners.clone(), radius: net.radius }
+}
+
+/// A rotation by `angle` about the unit vector `axis`.
+pub fn rotation(axis: [f64; 3], angle: f64) -> [[f64; 3]; 3] {
+    let (s, c) = angle.sin_cos();
+    let t = 1.0 - c;
+    let [x, y, z] = axis;
+    [
+        [t * x * x + c, t * x * y - s * z, t * x * z + s * y],
+        [t * x * y + s * z, t * y * y + c, t * y * z - s * x],
+        [t * x * z - s * y, t * y * z + s * x, t * z * z + c],
+    ]
+}
+
+/// The same surfaces with control nets of degree `to` (exact degree elevation).
+pub fn elevated(net: &Network, to: usize) -> Network {
+    let step = |row: &[[f64; 3]]| -> Vec<[f64; 3]> {
+        let n = row.len() - 1;
+        (0..=n + 1)
+            .map(|i| {
+                let a = i as f64 / (n + 1) as f64;
+                std::array::from_fn(|k| {
+                    let prev = if i > 0 { row[i - 1][k] } else { 0.0 };
+                    let cur = if i <= n { row[i][k] } else { 0.0 };
+                    a * prev + (1.0 - a) * cur
+                })
+            })
+            .collect()
+    };
+    let up = |net: &Vec<Vec<[f64; 3]>>| -> Vec<Vec<[f64; 3]>> {
+        // along v for every row, then along u for every column
+        let rows: Vec<Vec<[f64; 3]>> = net.iter().map(|r| step(r)).collect();
+        let cols: Vec<Vec<[f64; 3]>> =
+            (0..rows[0].len()).map(|j| step(&rows.iter().map(|r| r[j]).collect::<Vec<_>>())).collect();
+        (0..cols[0].len()).map(|i| cols.iter().map(|c| c[i]).collect()).collect()
+    };
+    let patches = net
+        .patches
+        .iter()
+        .map(|p| {
+            let mut cur = p.clone();
+            while cur.len() <= to {
+                cur = up(&cur);
+            }
+            cur
+        })
+        .collect();
+    Network { patches, corners: net.corners.clone(), radius: net.radius }
+}
+
+/// Two biquadratic patches in the plane z = x + y with the same boundary, consistently oriented and
+/// closed: they enclose exactly nothing, but the sums of a volume computation do not cancel to zero.
+pub fn tilted_pillow() -> Network {
+    let a: Vec<Vec<[f64; 3]>> =
+        (0..3).map(|i| (0..3).map(|j| [i as f64 / 2.0, j as f64 / 2.0, (i + j) as f64 / 2.0]).collect()).collect();
+    let mut b = a.clone();
+    b[1][1][0] += 0.125;
+    b[1][1][2] += 0.125;
+    let mut net = Network { patches: vec![a, b], corners: vec![[0, 1, 2, 3], [0, 1, 2, 3]], radius: 0.0 };
+    flip_patch(&mut net, 1);
+    net
 }
 
 /// Two coincident sheets with opposite normals: closed, consistent, and no volume at all.
@@ -241,4 +315,10 @@ pub fn pillow() -> Network {
     net.corners.push(c);
     flip_patch(&mut net, 1);
     net
+}
+
+impl Network {
+    pub fn clone_network(&self) -> Network {
+        Network { patches: self.patches.clone(), corners: self.corners.clone(), radius: self.radius }
+    }
 }

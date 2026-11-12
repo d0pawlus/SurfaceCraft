@@ -13,8 +13,8 @@
 //! 2. Outward direction, only when the network has exactly one closed component (every edge used
 //!    twice): the signed volume of its patches (`bezier_volume`, exact quadrature of the patches
 //!    themselves, not of their control polyhedron) decides, and a component of negative volume is
-//!    flipped as a whole. A volume that is not clearly away from zero, or not finite, is an
-//!    error: the pass does not guess.
+//!    flipped as a whole. A volume that is not clearly larger than the bound of its rounding
+//!    error, or not finite, is an error: the pass does not guess.
 //! 3. Several closed components may nest (a cavity is a closed component with its normals
 //!    pointing into the void): which of them is outer is not decided here, so each keeps the
 //!    orientation it was given after step 1. Open components are not touched beyond step 1.
@@ -22,9 +22,9 @@ use super::bezier_volume::{Rule, Sum};
 use crate::{KernelError, Result};
 use std::collections::HashMap;
 
-/// A volume within this many rounding units (of the sum of the magnitudes of the terms) of zero
-/// has no reliable sign.
-const SIGN_TOLERANCE: f64 = 1e-12;
+/// The volume must exceed the bound of its rounding error (`bezier_volume`, valid before any
+/// cancellation) by this factor for its sign to be trusted.
+const SIGN_SAFETY: f64 = 4.0;
 
 /// The corners of a patch after a flip.
 pub(crate) fn flipped_corners(c: [u32; 4]) -> [u32; 4] {
@@ -157,9 +157,15 @@ fn orient_closed(patches: &[Vec<Vec<[f64; 3]>>], parts: &Components, which: usiz
         }
     }
     let volume = sum.value();
-    if !volume.is_finite() || !sum.magnitude.is_finite() || volume.abs() <= SIGN_TOLERANCE * sum.magnitude {
+    let uncertainty = sum.uncertainty();
+    if !volume.is_finite() || !uncertainty.is_finite() {
+        return Err(KernelError::Argument(
+            "the volume of the closed network overflows or is not a number, so its outward side is unknown".into(),
+        ));
+    }
+    if volume.abs() <= SIGN_SAFETY * uncertainty {
         return Err(KernelError::Argument(format!(
-            "the closed network encloses no volume that can be told from zero ({volume:e}), so its outward side is unknown"
+            "the closed network encloses no volume that can be told from zero ({volume:e} within {uncertainty:e}), so its outward side is unknown"
         )));
     }
     if volume < 0.0 {
