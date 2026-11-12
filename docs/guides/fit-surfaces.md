@@ -13,8 +13,24 @@ patch network over a whole scan.
   miss, so smooth areas keep large patches; `uniform` halves the budget of the whole scan each
   round (more patches for the same tolerance). `levels` lists the patches and the share within
   the tolerance of every round, `refine` the layout used.
-- It keeps sharp edges and thin walls (the patches meet G0). `scan.to_solid` with
-  `method: freeform` runs it after cleaning and measures the result with `body.compare`.
+- The scan tells creases from smooth edges: an edge is a crease when the scan normals on its two
+  sides differ by more than `crease_deg` (default 35, at most 60; a thin wall's two faces are two
+  sides, never averaged). With `continuity: g0` (the default) the patches meet in position only.
+  `continuity: g1` is **experimental, opt-in**: the patches are then made tangent across the smooth
+  edges and meet at the full angle across the creases. On a corpus of 13 real scans (tolerance
+  0.2 mm, cap 12000 patches) `g0` reached 99 % of the points within tolerance on 9 scans, `g1` on 7
+  (two more were capped at 95.6 % and 98.9 %); on the scans that stay above 99 % `g1` needed 56 %
+  more patches in total (16 % to 145 % per scan) and 2 to 3 times the wall time; 15 % to 70 % of the
+  patches fell back to the unconstrained construction (`g0_patches`, poorly shaped coarse
+  triangles); the mean smooth-edge jump was 39.9 degrees with `g0` and 42.5 with `g1`, p99 175 to
+  180 degrees in both (these statistics are polluted by inconsistent patch orientation and are to be
+  re-measured after the orientation fix). On smooth synthetic parts `g1` brings the jump to under
+  1 degree. `crease_edges` and `smooth_edges` count the coarse edges of each kind, `smooth_jump` is
+  the normal jump left across the smooth patch edges (`mean_deg`, `p99_deg`, `max_deg`, and the
+  samples with an undefined normal, `invalid_samples`/`invalid_edges`), `crease_angle_mean_deg` the
+  angle kept across the creases, `g0_patches` the patches that could not be made tangent.
+- `scan.to_solid` with `method: freeform` runs it after cleaning and measures the result with
+  `body.compare`.
 
 ## Regions
 
