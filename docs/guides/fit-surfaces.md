@@ -13,8 +13,18 @@ patch network over a whole scan.
   miss, so smooth areas keep large patches; `uniform` halves the budget of the whole scan each
   round (more patches for the same tolerance). `levels` lists the patches and the share within
   the tolerance of every round, `refine` the layout used.
-- It keeps sharp edges and thin walls (the patches meet G0). `scan.to_solid` with
-  `method: freeform` runs it after cleaning and measures the result with `body.compare`.
+- The scan tells creases from smooth edges: an edge is a crease when the scan normals on its two
+  sides differ by more than `crease_deg` (default 35, at most 60; a thin wall's two faces are two
+  sides, never averaged). The patches are tangent across the smooth edges (`continuity: g1`,
+  default; `g0` gives patches that meet in position only) and meet at the full angle across the
+  creases, so sharp edges and thin walls stay sharp. `crease_edges` and `smooth_edges` count the
+  coarse edges of each kind, `smooth_jump` is the normal jump left across the smooth patch edges
+  (`mean_deg`, `p99_deg`, `max_deg` of the worst jump along each edge), `crease_angle_mean_deg`
+  the angle kept across the creases. `g0_patches` counts patches that could not be made tangent
+  (a folded patch at a degenerate coarse triangle, or a tangent patch that followed the scan clearly
+  worse than the free one, as in fine ripples): they meet their neighbours G0 only.
+- `scan.to_solid` with `method: freeform` runs it after cleaning and measures the result with
+  `body.compare`.
 
 ## Regions
 

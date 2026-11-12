@@ -11,6 +11,20 @@ const SAME_SIDE_COS: f64 = 0.3;
 /// A projection that moves the point farther than this many supports is a runaway of the quadric.
 const MAX_MOVE_SUPPORTS: f64 = 2.0;
 
+/// Which scan vertices a projection may use besides those within its radius.
+pub struct Support<'a> {
+    /// Least cosine between a vertex normal and the hint (scans with normals only).
+    pub min_cos: f64,
+    /// Keeps a vertex position.
+    pub keep: &'a dyn Fn(&Point3) -> bool,
+}
+
+impl Default for Support<'_> {
+    fn default() -> Self {
+        Self { min_cos: SAME_SIDE_COS, keep: &|_| true }
+    }
+}
+
 /// A scan prepared for projection.
 pub struct ScanSurface {
     pts: Vec<Point3>,
@@ -44,12 +58,14 @@ impl ScanSurface {
         Self { tree: KdTree::build(&pts), pts, normals }
     }
 
-    /// The vertices within `r` of `at` on the side `hint` points to (all of them without normals).
-    fn support(&self, at: &Point3, r: f64, hint: &Vec3) -> Vec<usize> {
+    /// The vertices within `r` of `at` on the side `hint` points to (all of them without normals)
+    /// that the filter keeps.
+    fn support(&self, at: &Point3, r: f64, hint: &Vec3, filter: &Support) -> Vec<usize> {
         let mut idx = self.tree.within(at, r);
         if !self.normals.is_empty() {
-            idx.retain(|&i| self.normals.get(i).is_some_and(|n| n.dot(hint) > SAME_SIDE_COS));
+            idx.retain(|&i| self.normals.get(i).is_some_and(|n| n.dot(hint) > filter.min_cos));
         }
+        idx.retain(|&i| self.pts.get(i).is_some_and(|p| (filter.keep)(p)));
         idx
     }
 
@@ -77,6 +93,36 @@ impl ScanSurface {
     /// (up to 3 times) when fewer than 12 vertices are inside it.
     #[must_use]
     pub fn project(&self, q: &Point3, radius: f64, hint: &Vec3) -> Option<(Point3, Vec3)> {
+        self.project_with(q, radius, hint, &Support::default())
+    }
+
+    /// The normal of the plane through the scan vertices `filter` allows around `q` (support grown as
+    /// in [`ScanSurface::project`]), oriented like `hint`. Unlike the quadric of `project` it cannot
+    /// run away on a thin one-sided support, so it is what decides whether two sides agree.
+    #[must_use]
+    pub fn plane_normal(&self, q: &Point3, radius: f64, hint: &Vec3, filter: &Support) -> Option<Vec3> {
+        if !(radius.is_finite() && radius > 0.0) {
+            return None;
+        }
+        let mut r = radius;
+        let mut idx = self.support(q, r, hint, filter);
+        for _ in 0..3 {
+            if idx.len() >= 12 {
+                break;
+            }
+            r *= 1.6;
+            idx = self.support(q, r, hint, filter);
+        }
+        if idx.len() < 6 {
+            return None;
+        }
+        local_frame(&self.pts, &idx, q, r, hint).map(|(_, n, _, _)| n)
+    }
+
+    /// [`ScanSurface::project`] over the scan vertices `filter` allows: a tighter agreement with
+    /// the hint, and only a part of the space (one side of a crease, one sector of a vertex).
+    #[must_use]
+    pub fn project_with(&self, q: &Point3, radius: f64, hint: &Vec3, filter: &Support) -> Option<(Point3, Vec3)> {
         if !(radius.is_finite() && radius > 0.0) || self.pts.is_empty() {
             return None;
         }
@@ -84,11 +130,11 @@ impl ScanSurface {
         let mut out: Option<(Point3, Vec3)> = None;
         for it in 0..3 {
             let mut r = radius;
-            let mut idx = self.support(&cur, r, hint);
+            let mut idx = self.support(&cur, r, hint, filter);
             let mut grow = 0;
             while idx.len() < 12 && grow < 3 {
                 r *= 1.6;
-                idx = self.support(&cur, r, hint);
+                idx = self.support(&cur, r, hint, filter);
                 grow += 1;
             }
             if idx.len() < 6 {

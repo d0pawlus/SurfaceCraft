@@ -848,6 +848,8 @@
   "param.angle_tolerance_degrees": "Tolerancja kąta",
   "param.max_patches": "Maks. płatów",
   "param.refine": "Zagęszczanie",
+  "param.crease_deg": "Kąt załamania",
+  "param.continuity": "Ciągłość",
   "param.control": "Siatka kontrolna",
   "param.angle": "Kąt ostrej krawędzi",
   "param.symmetric": "Obie strony",

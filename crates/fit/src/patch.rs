@@ -197,12 +197,12 @@ pub fn build_patches(q: &QuadMesh, scan: &ScanSurface, radius: f64) -> PatchSet 
 }
 
 /// A scan triangle faces like a layout face when the cosine between their normals is at least this.
-const WRAP_FACING_COS: f64 = 0.3;
+pub(crate) const WRAP_FACING_COS: f64 = 0.3;
 /// Inverse of the 2 × 2 matrix of the inner Bernstein values at 1/3 and 2/3.
 const INNER_INVERSE: [[f64; 2]; 2] = [[3.0, -1.5], [-1.5, 3.0]];
 
 /// The cubic from `a` to `b` through the scan points under the chord at 1/3 and 2/3.
-fn wrap_curve(a: Vec3, b: Vec3, project: &dyn Fn(Vec3) -> Vec3) -> [Vec3; 4] {
+pub(crate) fn wrap_curve(a: Vec3, b: Vec3, project: &dyn Fn(Vec3) -> Vec3) -> [Vec3; 4] {
     let q1 = project(a + (b - a) / 3.0);
     let q2 = project(a + (b - a) * (2.0 / 3.0));
     [a, (a * -5.0 + q1 * 18.0 - q2 * 9.0 + b * 2.0) / 6.0, (a * 2.0 - q1 * 9.0 + q2 * 18.0 - b * 5.0) / 6.0, b]
@@ -211,7 +211,7 @@ fn wrap_curve(a: Vec3, b: Vec3, project: &dyn Fn(Vec3) -> Vec3) -> [Vec3; 4] {
 /// The net with the boundary curves `bot` (c0 → c1), `right` (c1 → c2), `top` (c3 → c2), `left`
 /// (c0 → c3); its four inner points are set so the patch passes through the scan points under its
 /// samples at 1/3 and 2/3.
-fn wrap_net(
+pub(crate) fn wrap_net(
     bot: &[Vec3; 4],
     right: &[Vec3; 4],
     top: &[Vec3; 4],
@@ -337,7 +337,7 @@ pub fn wrap_patches(coarse: &Mesh, scan: &Bvh, reach: f64) -> PatchSet {
     set
 }
 
-fn bern(t: f64) -> [f64; 4] {
+pub(crate) fn bern(t: f64) -> [f64; 4] {
     let s = 1.0 - t;
     [s * s * s, 3.0 * t * s * s, 3.0 * t * t * s, t * t * t]
 }
