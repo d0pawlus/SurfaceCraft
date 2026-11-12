@@ -4,29 +4,47 @@
 //! Fit-and-grow finds a primitive wherever a small patch happens to be flat enough, so a scan of
 //! a car panel or a casting ends in thousands of slivers, each "a plane" or "a cylinder" that
 //! holds a few hundred triangles of millions, with the rest unassigned. Such a fragment is weak
-//! evidence of a primitive: the surface is not one primitive for any length. A region is *weak*
-//! when it holds fewer triangles than [`Settings::strong_tris`] (a share of the scan, never less
-//! than a few seed patches) or when it is a curved primitive spanning less than a radius (a
-//! gentle patch of a surface that a cone or torus fits by chance); a larger, better supported
-//! primitive is kept whatever lies around it.
+//! evidence of a primitive: the surface is not one primitive for any length.
 //!
-//! The weak regions and the unassigned triangles form the *freeform mask*. Its connected pieces,
-//! cut at sharp creases (the face normals of two neighbouring triangles further apart than
-//! the crease angle), that hold at least [`Settings::min_cluster`] weak regions are organic
-//! areas: each becomes one region flagged freeform, unless one primitive fits the whole area
-//! within the tolerance (then the surface was a primitive that a defect fragmented, and the area
-//! becomes that primitive's region). A piece with fewer weak regions (one small
-//! boss, a fillet between two faces) is no cluster of fragments; its regions stay as found, and
-//! so do unassigned triangles that touch no cluster. A strong primitive whose boundary runs
-//! mostly into a freeform area without a crease is an island of it (a patch a cone happens to
-//! fit) and joins the area; one that meets it at creases (a wall, a fillet) stays.
+//! Every region has a *standing*. Being small (fewer triangles than [`Settings::strong_tris`], a
+//! share of the scan never less than a few seed patches) or spanning less than a radius of a
+//! curved primitive only triggers a closer look at its fit; the fit decides:
+//! - the noise level of the scan is the lower quartile of the RMS of its regions (at most a
+//!   quarter of the tolerance); a fit is *sound* when its RMS is within [`SOUND_FACTOR`] of it;
+//! - a large region with a sound fit is [`Standing::Protected`]: it stays a primitive whatever
+//!   lies around it (a mounting face in a sculpted surface), if it is a plane or spans a radius
+//!   of its curved primitive, or if it is a major part of the scan (a shallow cylindrical panel).
+//!   A curved primitive that spans less than a radius and is no major part of the scan is a
+//!   [`Standing::Fragment`] however well it fits (a gentle patch of a freeform surface fits a
+//!   torus within the noise);
+//! - a large region whose fit is above the noise is [`Standing::Plain`]: a primitive of its own
+//!   unless it is an island of a freeform area (below), and a [`Standing::Fragment`] when it also
+//!   spans less than a radius of its curved primitive;
+//! - a small region with a sound fit that is a plane or spans a radius of its curved primitive is
+//!   [`Standing::Neutral`]: it may join a freeform area, but it is no evidence of one (five small
+//!   genuine features joined by tangent fillets all fit at the noise level and span their radii,
+//!   so they stay primitives);
+//! - any other small region (a fit above the noise, or a patch of less than a radius) is a
+//!   [`Standing::Fragment`].
+//!
+//! The fragments, the neutral regions and the unassigned triangles form the *freeform mask*. Its
+//! connected pieces, cut at sharp creases (the face normals of two neighbouring triangles further
+//! apart than the crease angle), that hold at least [`Settings::min_cluster`] fragments are
+//! organic areas: each becomes one region flagged freeform, unless one primitive fits the whole
+//! area within the tolerance (then a defect fragmented a primitive, and the area becomes that
+//! primitive's region). Every triangle goes by its own piece, so a region that spans a crease is
+//! split there. A piece with fewer fragments is no cluster; its regions stay as found, and so do
+//! the unassigned triangles that touch no cluster. A plain primitive whose boundary runs into a
+//! freeform area without a crease, and seldom along one, is an island of it (a patch a cone
+//! happens to fit): it joins the area, which can join more pieces; one that meets the area at
+//! creases (a wall, a fillet) stays.
 //!
 //! Everything is a pure function of the regions, in triangle-index order, so the result does not
 //! depend on the number of threads.
 use super::Segment;
 use super::fits::{fit_kind_tris, fit_tris};
 use crate::primitive::{Primitive, PrimitiveKind};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use surfacecraft_geom::{Mesh, Point3, Vec3};
 
 /// Triangles looked at to measure a region's extent.
@@ -34,7 +52,11 @@ const SAMPLE_TRIANGLES: usize = 1500;
 /// A curved primitive needs its region to span this many radii (or it is a patch of something
 /// else).
 const MIN_SUPPORT: f64 = 1.0;
-/// A strong region is an island of an organic area when at least this share of its boundary
+/// The noise level of a scan is taken as at most this share of the tolerance.
+const NOISE_CAP_SHARE: f64 = 0.25;
+/// A fit is sound when its RMS is within this factor of the noise level.
+const SOUND_FACTOR: f64 = 1.2;
+/// A plain region is an island of an organic area when at least this share of its boundary
 /// edges runs into it without a crease, and at most [`ISLAND_CREASE`] of them are creases (a
 /// wall or a fillet next to a freeform top has the crease along the top and none into it).
 const ISLAND_ORGANIC: f64 = 0.3;
@@ -47,9 +69,12 @@ const NONE: u32 = u32::MAX;
 /// What makes a region weak and a cluster of fragments an organic area.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Settings {
-    /// Regions with fewer triangles are weak evidence of a primitive.
+    /// Regions with fewer triangles are small.
     pub strong_tris: usize,
-    /// Fewest weak regions in one piece of the mask for it to be a freeform area.
+    /// Regions with at least this many triangles are a major part of the scan: a curved primitive
+    /// that large is believed even when it spans less than a radius (a shallow panel).
+    pub dominant_tris: usize,
+    /// Fewest fragments in one piece of the mask for it to be a freeform area.
     pub min_cluster: usize,
     /// Fewest triangles of a freeform area.
     pub min_triangles: usize,
@@ -58,6 +83,50 @@ pub(super) struct Settings {
     pub tolerance: f64,
     /// Cosine of the crease angle: a mask edge turning further is not crossed.
     pub cos_crease: f64,
+}
+
+/// How far a region is trusted to be a primitive (see the module documentation).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Standing {
+    /// Large, sound fit: stays whatever its surroundings.
+    Protected,
+    /// Large, fit above the noise: a primitive unless an island of a freeform area.
+    Plain,
+    /// Small, sound fit: in the mask, but no evidence of an organic area.
+    Neutral,
+    /// Evidence of an organic area (and in the mask).
+    Fragment,
+}
+
+impl Standing {
+    fn in_mask(self) -> bool {
+        matches!(self, Standing::Neutral | Standing::Fragment)
+    }
+}
+
+/// The noise level of the scan: the lower quartile of the regions' RMS, at most
+/// [`NOISE_CAP_SHARE`] of the tolerance (when every region is a fragment the quartile is the
+/// fragments' own misfit, which is no noise).
+fn noise_level(segs: &[Segment], tolerance: f64) -> f64 {
+    let mut rms: Vec<f64> = segs.iter().map(|s| s.rms).filter(|r| r.is_finite()).collect();
+    rms.sort_by(f64::total_cmp);
+    let quartile = rms.get(rms.len().saturating_sub(1) / 4).copied().unwrap_or(f64::INFINITY);
+    quartile.min(NOISE_CAP_SHARE * tolerance)
+}
+
+/// The standing of `seg` for the scan noise `noise`.
+fn standing_of(mesh: &Mesh, seg: &Segment, set: &Settings, noise: f64) -> Standing {
+    let large = seg.triangles.len() >= set.strong_tris;
+    let sound = seg.rms <= SOUND_FACTOR * noise;
+    match (large, sound) {
+        (true, true) if seg.triangles.len() >= set.dominant_tris || curvature_support(mesh, seg) >= MIN_SUPPORT => {
+            Standing::Protected
+        }
+        (true, true) | (true, false) if curvature_support(mesh, seg) < MIN_SUPPORT => Standing::Fragment,
+        (true, _) => Standing::Plain,
+        (false, true) if curvature_support(mesh, seg) >= MIN_SUPPORT => Standing::Neutral,
+        (false, _) => Standing::Fragment,
+    }
 }
 
 /// Corners of at most [`SAMPLE_TRIANGLES`] triangles of `tris`, evenly strided.
@@ -98,12 +167,6 @@ fn curvature_support(mesh: &Mesh, seg: &Segment) -> f64 {
         }
     };
     if radius > 0.0 { chord / radius } else { 0.0 }
-}
-
-/// Is `seg` weak evidence of a primitive: few triangles, or a curved region that spans less
-/// than [`MIN_SUPPORT`] radii.
-fn is_weak(mesh: &Mesh, seg: &Segment, set: &Settings) -> bool {
-    seg.triangles.len() < set.strong_tris || curvature_support(mesh, seg) < MIN_SUPPORT
 }
 
 /// Region index of every triangle ([`NONE`] when in none).
@@ -153,35 +216,6 @@ fn components(nb: &[[u32; 3]], fnorm: &[Option<Vec3>], mask: &[bool], cos_crease
     (label, count as usize)
 }
 
-/// The piece of the mask each weak region belongs to: the one of its first triangle ([`NONE`]
-/// for a strong region).
-fn region_pieces(segs: &[Segment], weak: &[bool], label: &[u32]) -> Vec<u32> {
-    segs.iter()
-        .zip(weak)
-        .map(|(s, &w)| {
-            let first = s.triangles.first().and_then(|&t| label.get(t as usize)).copied();
-            if w { first.unwrap_or(NONE) } else { NONE }
-        })
-        .collect()
-}
-
-/// Which pieces are freeform areas: enough weak regions and enough triangles.
-fn qualifying(region_piece: &[u32], label: &[u32], pieces: usize, set: &Settings) -> Vec<bool> {
-    let mut fragments = vec![0usize; pieces];
-    for &p in region_piece {
-        if let Some(c) = fragments.get_mut(p as usize) {
-            *c += 1;
-        }
-    }
-    let mut size = vec![0usize; pieces];
-    for &l in label.iter().filter(|&&l| l != NONE) {
-        if let Some(c) = size.get_mut(l as usize) {
-            *c += 1;
-        }
-    }
-    fragments.iter().zip(&size).map(|(&f, &n)| f >= set.min_cluster && n >= set.min_triangles).collect()
-}
-
 /// The stand-in primitive a freeform region carries: its least-squares plane (meaningless as a
 /// model of the region, which is why the region is flagged).
 fn stand_in(mesh: &Mesh, normals: &[Vec3], tris: &[u32]) -> (Primitive, f64) {
@@ -196,39 +230,63 @@ fn stand_in(mesh: &Mesh, normals: &[Vec3], tris: &[u32]) -> (Primitive, f64) {
 struct Layout {
     /// Region of every triangle ([`NONE`] for none).
     owner: Vec<u32>,
-    /// Piece of the mask of every free triangle.
+    /// Piece of the mask of every triangle in it ([`NONE`] for the others).
     label: Vec<u32>,
-    /// Piece a region belongs to: a weak region the one of its first triangle, a strong one
-    /// [`NONE`] until it is absorbed.
-    region_piece: Vec<u32>,
     organic: Vec<bool>,
 }
 
 impl Layout {
-    /// The piece triangle `t` belongs to: that of its region, or its own when it is free.
-    fn piece_of(&self, t: usize) -> u32 {
-        match self.owner.get(t).copied() {
-            Some(o) if o != NONE => self.region_piece.get(o as usize).copied().unwrap_or(NONE),
-            _ => self.label.get(t).copied().unwrap_or(NONE),
-        }
-    }
-
     fn is_organic(&self, piece: u32) -> bool {
         self.organic.get(piece as usize).copied().unwrap_or(false)
     }
 }
 
-/// Strong regions whose boundary runs mostly into organic areas without a crease: an island of
-/// the freeform area (a patch of it a cone or a plane happens to fit), with the piece that
-/// borders it most.
-fn islands(nb: &[[u32; 3]], face: &[Option<Vec3>], lay: &Layout, cos_crease: f64) -> Vec<(usize, u32)> {
-    let regions = lay.region_piece.len();
+/// Which pieces are freeform areas: enough fragments (a region counts at its first triangle) and
+/// enough triangles.
+fn qualifying(segs: &[Segment], standing: &[Standing], label: &[u32], pieces: usize, set: &Settings) -> Vec<bool> {
+    let mut fragments = vec![0usize; pieces];
+    for (s, _) in segs.iter().zip(standing).filter(|(_, st)| **st == Standing::Fragment) {
+        let piece = s.triangles.first().and_then(|&t| label.get(t as usize)).copied().unwrap_or(NONE);
+        if let Some(c) = fragments.get_mut(piece as usize) {
+            *c += 1;
+        }
+    }
+    let mut size = vec![0usize; pieces];
+    for &l in label.iter().filter(|&&l| l != NONE) {
+        if let Some(c) = size.get_mut(l as usize) {
+            *c += 1;
+        }
+    }
+    fragments.iter().zip(&size).map(|(&f, &n)| f >= set.min_cluster && n >= set.min_triangles).collect()
+}
+
+/// The layout of the mask for regions of the given `standing`.
+fn layout(
+    mesh: &Mesh,
+    nb: &[[u32; 3]],
+    face: &[Option<Vec3>],
+    segs: &[Segment],
+    standing: &[Standing],
+    set: &Settings,
+) -> Layout {
+    let owner = owners(mesh.triangle_count(), segs);
+    let mask: Vec<bool> =
+        owner.iter().map(|&o| o == NONE || standing.get(o as usize).is_some_and(|st| st.in_mask())).collect();
+    let (label, pieces) = components(nb, face, &mask, set.cos_crease);
+    let organic = qualifying(segs, standing, &label, pieces, set);
+    Layout { owner, label, organic }
+}
+
+/// Plain regions whose boundary runs mostly into organic areas without a crease: islands of a
+/// freeform area (a patch of it a cone or a plane happens to fit).
+fn islands(nb: &[[u32; 3]], face: &[Option<Vec3>], lay: &Layout, standing: &[Standing], cos_crease: f64) -> Vec<usize> {
+    let regions = standing.len();
     let mut edges = vec![0usize; regions];
     let mut creases = vec![0usize; regions];
-    let mut votes: Vec<BTreeMap<u32, usize>> = vec![BTreeMap::new(); regions];
+    let mut organic_edges = vec![0usize; regions];
     for (t, &o) in lay.owner.iter().enumerate().filter(|(_, o)| **o != NONE) {
         let region = o as usize;
-        if lay.region_piece.get(region) != Some(&NONE) {
+        if standing.get(region) != Some(&Standing::Plain) {
             continue;
         }
         for &n in nb.get(t).into_iter().flatten() {
@@ -236,21 +294,19 @@ fn islands(nb: &[[u32; 3]], face: &[Option<Vec3>], lay: &Layout, cos_crease: f64
                 continue;
             }
             edges[region] += 1;
-            let piece = if n == NONE { NONE } else { lay.piece_of(n as usize) };
             if n == NONE || !is_smooth_edge(face, t, n as usize, cos_crease) {
                 creases[region] += 1;
-            } else if lay.is_organic(piece) {
-                *votes[region].entry(piece).or_default() += 1;
+            } else if lay.label.get(n as usize).is_some_and(|&l| lay.is_organic(l)) {
+                organic_edges[region] += 1;
             }
         }
     }
     (0..regions)
-        .filter_map(|r| {
-            let total: usize = votes[r].values().sum();
-            let best = votes[r].iter().max_by_key(|(piece, n)| (**n, std::cmp::Reverse(**piece)))?;
-            let (edge_count, crease_count) = (edges[r] as f64, creases[r] as f64);
-            (total as f64 >= ISLAND_ORGANIC * edge_count && crease_count <= ISLAND_CREASE * edge_count)
-                .then_some((r, *best.0))
+        .filter(|&r| {
+            let total = edges[r] as f64;
+            organic_edges[r] as f64 >= ISLAND_ORGANIC * total
+                && creases[r] as f64 <= ISLAND_CREASE * total
+                && total > 0.0
         })
         .collect()
 }
@@ -269,26 +325,9 @@ fn area_segment(mesh: &Mesh, normals: &[Vec3], tris: Vec<u32>, set: &Settings) -
     }
 }
 
-/// The layout of the mask for the regions flagged `weak`: its pieces and which are organic.
-fn layout(
-    mesh: &Mesh,
-    nb: &[[u32; 3]],
-    face: &[Option<Vec3>],
-    segs: &[Segment],
-    weak: &[bool],
-    set: &Settings,
-) -> Layout {
-    let owner = owners(mesh.triangle_count(), segs);
-    let mask: Vec<bool> = owner.iter().map(|&o| o == NONE || weak.get(o as usize).copied().unwrap_or(false)).collect();
-    let (label, pieces) = components(nb, face, &mask, set.cos_crease);
-    let region_piece = region_pieces(segs, weak, &label);
-    let organic = qualifying(&region_piece, &label, pieces, set);
-    Layout { owner, label, region_piece, organic }
-}
-
-/// Replaces the weak regions and unassigned triangles of every organic area by one freeform
-/// region; everything else is returned as it was (retained regions first, in order, then the
-/// freeform ones by their lowest triangle).
+/// Replaces the fragments of every organic area, the regions among them and the unassigned
+/// triangles between them by one region per area; everything else is returned as it was
+/// (retained regions first, in order, then the new ones by their lowest triangle).
 pub(super) fn consolidate(
     mesh: &Mesh,
     normals: &[Vec3],
@@ -296,37 +335,123 @@ pub(super) fn consolidate(
     segs: Vec<Segment>,
     set: &Settings,
 ) -> Vec<Segment> {
-    let mut weak: Vec<bool> = segs.iter().map(|s| is_weak(mesh, s, set)).collect();
-    if !weak.iter().any(|&w| w) {
+    let noise = noise_level(&segs, set.tolerance);
+    let mut standing: Vec<Standing> = segs.iter().map(|s| standing_of(mesh, s, set, noise)).collect();
+    if !standing.contains(&Standing::Fragment) {
         return segs;
     }
     // raw face normals: the smoothed ones blur a sharp edge into steps too small to cut at
     let face = surfacecraft_geom::par::map(mesh.triangle_count(), |t| mesh.face_normal(t));
-    let mut lay = layout(mesh, nb, &face, &segs, &weak, set);
+    let mut lay = layout(mesh, nb, &face, &segs, &standing, set);
     if !lay.organic.iter().any(|&o| o) {
         return segs;
     }
-    // an absorbed island joins the mask, which can join pieces it separated (a fragment that
-    // was alone on its side of it is then part of the area) and make the next island
+    // an absorbed island is a fragment: it can join pieces it separated (one that was alone on
+    // its side of it) and make the next island
     for _ in 0..ISLAND_PASSES {
-        let found = islands(nb, &face, &lay, set.cos_crease);
+        let found = islands(nb, &face, &lay, &standing, set.cos_crease);
         if found.is_empty() {
             break;
         }
-        for (region, _) in found {
-            weak[region] = true;
+        for region in found {
+            standing[region] = Standing::Fragment;
         }
-        lay = layout(mesh, nb, &face, &segs, &weak, set);
+        lay = layout(mesh, nb, &face, &segs, &standing, set);
     }
+    assemble(mesh, normals, segs, &standing, &lay, set)
+}
+
+/// The regions that remain and the region of every organic area, each triangle going by its own
+/// piece (a region on both sides of a crease is split there; nothing is left empty).
+fn assemble(
+    mesh: &Mesh,
+    normals: &[Vec3],
+    segs: Vec<Segment>,
+    standing: &[Standing],
+    lay: &Layout,
+    set: &Settings,
+) -> Vec<Segment> {
     let mut areas: Vec<Vec<u32>> = vec![Vec::new(); lay.organic.len()];
-    for t in 0..lay.owner.len() {
-        let piece = lay.piece_of(t);
+    for (t, &piece) in lay.label.iter().enumerate().filter(|(_, p)| **p != NONE) {
         if lay.is_organic(piece) {
             areas[piece as usize].push(t as u32);
         }
     }
-    let mut out: Vec<Segment> =
-        segs.into_iter().zip(&lay.region_piece).filter(|(_, piece)| !lay.is_organic(**piece)).map(|(s, _)| s).collect();
+    let mut out: Vec<Segment> = segs
+        .into_iter()
+        .zip(standing)
+        .filter_map(|(mut s, st)| {
+            if st.in_mask() {
+                s.triangles.retain(|&t| !lay.label.get(t as usize).is_some_and(|&l| lay.is_organic(l)));
+            }
+            (!s.triangles.is_empty()).then_some(s)
+        })
+        .collect();
     out.extend(areas.into_iter().filter(|a| !a.is_empty()).map(|tris| area_segment(mesh, normals, tris, set)));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use surfacecraft_geom::synth;
+
+    fn fragment(tris: Vec<u32>) -> Segment {
+        Segment {
+            triangles: tris,
+            primitive: Primitive::Plane { point: [0.0; 3], normal: [0.0, 0.0, 1.0] },
+            rms: 0.1,
+            freeform: false,
+        }
+    }
+
+    /// A floor (x 0 to 10, z = 0) and a wall (x = 10, z 0 to 10) that meet at a 90 degree crease.
+    fn folded_sheet() -> Mesh {
+        let mut m = synth::plane(Point3::origin(), Vec3::x(), Vec3::y(), 10.0, 10.0, 10, 10);
+        m.append(&synth::plane(Point3::new(10.0, 0.0, 0.0), Vec3::z(), Vec3::y(), 10.0, 10.0, 10, 10));
+        m.weld(1e-9);
+        m
+    }
+
+    /// A weak region that straddles a sharp crease is split there: the part on the floor, where
+    /// five more fragments make an organic area, joins it, the part on the wall (a piece with no
+    /// fragment of its own) stays a region; no triangle is in two regions and none is empty.
+    #[test]
+    fn a_weak_region_across_a_crease_is_split_at_it() {
+        let m = folded_sheet();
+        let centroid = |t: usize| m.face_centroid(t).unwrap_or_else(Point3::origin);
+        let floor: Vec<u32> = (0..m.triangle_count() as u32).filter(|&t| centroid(t as usize).z < 1e-6).collect();
+        let strip: Vec<u32> = (0..m.triangle_count() as u32)
+            .filter(|&t| {
+                let c = centroid(t as usize);
+                (c.z < 1e-6 && c.x > 7.0) || (c.x > 10.0 - 1e-6 && c.z < 3.0)
+            })
+            .collect();
+        let rest: Vec<u32> = floor.iter().copied().filter(|t| !strip.contains(t)).collect();
+        let mut segs = vec![fragment(strip.clone())];
+        segs.extend(rest.chunks(rest.len().div_ceil(5)).map(|c| fragment(c.to_vec())));
+        let set = Settings {
+            strong_tris: 1000,
+            dominant_tris: 1000,
+            min_cluster: 5,
+            min_triangles: 10,
+            tolerance: 0.2,
+            cos_crease: 40f64.to_radians().cos(),
+        };
+        let normals = m.vertex_normals();
+        let nb = m.triangle_neighbours();
+        let out = consolidate(&m, &normals, &nb, segs, &set);
+        let mut seen = std::collections::HashSet::new();
+        assert!(out.iter().all(|s| !s.triangles.is_empty()));
+        assert!(out.iter().flat_map(|s| s.triangles.iter()).all(|t| seen.insert(*t)), "a triangle is in two regions");
+        let on_wall = |t: &u32| centroid(*t as usize).x > 10.0 - 1e-6;
+        for s in &out {
+            let (wall, flat) =
+                (s.triangles.iter().filter(|t| on_wall(t)).count(), s.triangles.iter().filter(|t| !on_wall(t)).count());
+            assert!(wall == 0 || flat == 0, "a region across the crease: {wall} wall, {flat} floor triangles");
+        }
+        let wall_part: Vec<u32> = strip.iter().copied().filter(on_wall).collect();
+        assert!(out.iter().any(|s| s.triangles == wall_part), "the wall part of the strip stays one region");
+        assert!(out.iter().any(|s| floor.iter().all(|t| s.triangles.contains(t))), "the floor is one area");
+    }
 }

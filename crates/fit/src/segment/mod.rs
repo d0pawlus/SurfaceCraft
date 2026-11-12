@@ -34,13 +34,14 @@ pub struct SegmentOptions {
     /// Size of the seed patch (triangles).
     pub seed_size: usize,
     /// Merge the fragments of an organic surface into a few large freeform regions (default
-    /// true): regions that hold less than `freeform_min_share` of the scan, in groups of at
+    /// true): small regions whose fit is not at the noise level of the scan, in groups of at
     /// least five that touch without a sharp crease, are replaced together with the triangles
-    /// between them by one region flagged `freeform` per smooth area. `false` keeps every
-    /// fragment as a primitive region.
+    /// between them by one region flagged `freeform` per smooth area. Large or well fitted
+    /// primitives stay. `false` keeps every fragment as a primitive region.
     pub freeform: bool,
-    /// Share of the scan's triangles (0 to 1) a primitive region needs to stay a primitive amid
-    /// fragments (default 0.005; never fewer than 10 seed patches).
+    /// Share of the scan's triangles (0 to 1) below which a region is small, and a fragment of
+    /// an organic surface unless its fit is at the noise level (default 0.005; never fewer than
+    /// 10 seed patches).
     pub freeform_min_share: f64,
     /// Sharpest crease a freeform region crosses (degrees, default 40): neighbouring triangles
     /// whose face normals differ more are in different areas.
@@ -67,6 +68,8 @@ const DEFAULT_FREEFORM_SHARE: f64 = 0.005;
 const DEFAULT_FREEFORM_CREASE_DEG: f64 = 40.0;
 /// A primitive region of fewer seed patches than this is weak evidence, whatever the scan size.
 const WEAK_SEED_PATCHES: usize = 10;
+/// Share of the scan that makes a region a major part of it.
+const DOMINANT_SHARE: f64 = 0.2;
 /// Fewest weak regions in one smooth area for it to be freeform.
 const MIN_FREEFORM_CLUSTER: usize = 5;
 
@@ -305,6 +308,7 @@ fn freeform_settings(opts: &SegmentOptions, nt: usize, seed_tris: usize, tol: f6
     };
     freeform::Settings {
         strong_tris: ((share * nt as f64).ceil() as usize).max(WEAK_SEED_PATCHES * seed_tris),
+        dominant_tris: (DOMINANT_SHARE * nt as f64).ceil() as usize,
         min_cluster: MIN_FREEFORM_CLUSTER,
         min_triangles: opts.min_triangles,
         tolerance: tol,

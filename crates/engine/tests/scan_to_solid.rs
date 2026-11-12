@@ -65,6 +65,9 @@ fn gate_scan_to_solid_rebuilds_a_chamfered_pin_in_one_call() {
     // Assert
     eprintln!("scan.to_solid: {}", serde_json::to_string_pretty(&out).unwrap());
     assert_eq!(out["verdict"], "pass", "{out}");
+    // `auto` (the default) keeps a prismatic scan on the primitives method: genuine primitives
+    // lost to freeform regions would push the primitive share below half and flip it to the wrap
+    assert_eq!(out["method"], "primitives", "{out}");
     assert!(out["issues"].as_array().unwrap().is_empty(), "{out}");
     assert_eq!(out["body"]["faces"], cad.faces.len(), "{out}");
     let volume = out["body"]["volume"].as_f64().unwrap();

@@ -123,6 +123,8 @@ pub(crate) fn fit_cmd(s: &mut Session, i: FitIn) -> CmdResult<FitOut> {
     {
         r.kind = Some(best.primitive.kind());
         r.rms = Some(best.rms);
+        // a region a primitive was fitted to is a primitive region, whatever segmentation said
+        r.freeform = false;
     }
     Ok(FitOut {
         id,
