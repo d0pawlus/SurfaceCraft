@@ -25,6 +25,11 @@ use surfacecraft_geom::Mesh;
 const DEBOUNCE: f64 = 0.25;
 /// Opacity of the previewed geometry.
 const PREVIEW_ALPHA: f32 = 0.45;
+/// Height of the footer before it was measured. A normal footer (buttons, mode switch, messages)
+/// is about 100 px; the layout is redone in the same frame once the real height is known.
+pub const FOOTER_HEIGHT_GUESS: f32 = 104.0;
+/// A footer height change below this (points) is not worth another layout pass.
+const FOOTER_HEIGHT_TOLERANCE: f32 = 0.5;
 
 /// Why a command has no live preview.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,6 +95,8 @@ pub struct CommandPanel {
     log_len: usize,
     /// Parameters the form marked as needing attention last frame.
     issues: usize,
+    /// Height the footer took last frame (0 before it was drawn).
+    footer_height: f32,
 }
 
 impl CommandPanel {
@@ -283,17 +290,54 @@ fn body(app: &mut SurfaceCraftApp, panel: &mut CommandPanel, ui: &mut egui::Ui, 
         // another command: a preview of the old one makes no sense
         panel.cancel_preview();
         panel.last_command = Some(id);
+        // the footer of the old tool is not this tool's footer
+        panel.footer_height = 0.0;
     }
     if app.field_pick.as_ref().is_some_and(|f| f.command != id) {
         // picking for another command's form
         app.field_pick = None;
     }
-    // the footer is laid out first so it keeps its place under the scrolling form: OK and Cancel
-    // stay in reach however long the form is
-    egui::Panel::bottom("tool-footer")
-        .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(0, 6)))
-        .show_separator_line(true)
-        .show(ui, |ui| footer(app, panel, ui, id));
+    // The form is drawn before the footer, so Tab reaches the fields and then OK and Cancel. The
+    // footer keeps its place at the bottom, in the height it took last frame, and OK and Cancel
+    // stay in reach however long the form is.
+    let area = ui.max_rect();
+    let footer_top = (area.bottom() - footer_reserve(panel)).max(area.top());
+    let form_area = egui::Rect::from_min_max(area.min, egui::pos2(area.right(), footer_top));
+    let footer_area = egui::Rect::from_min_max(egui::pos2(area.left(), footer_top), area.max);
+    ui.scope_builder(egui::UiBuilder::new().max_rect(form_area), |ui| form_scroll(app, panel, ui, id));
+    let footer_used = ui.scope_builder(egui::UiBuilder::new().max_rect(footer_area), |ui| {
+        egui::Frame::NONE
+            .inner_margin(egui::Margin::symmetric(0, 6))
+            .show(ui, |ui| {
+                ui.separator();
+                footer(app, panel, ui, id);
+            })
+            .response
+            .rect
+    });
+    remember_footer_height(ui, panel, footer_used.inner.height());
+    app.tool_panel_rect = Some(area);
+    app.tool_footer_rect = Some(footer_used.inner);
+}
+
+/// Keeps the measured footer height for the next layout. When it changed, the frame is laid out
+/// again at once, so a message that appears or goes away never leaves the footer clipped.
+fn remember_footer_height(ui: &egui::Ui, panel: &mut CommandPanel, measured: f32) {
+    if (measured - panel.footer_height).abs() <= FOOTER_HEIGHT_TOLERANCE {
+        return;
+    }
+    panel.footer_height = measured;
+    ui.ctx().request_discard("the tool footer changed height");
+    ui.ctx().request_repaint();
+}
+
+/// The space the footer takes: what it took last frame, or a guess before it was drawn once.
+fn footer_reserve(panel: &CommandPanel) -> f32 {
+    if panel.footer_height > 0.0 { panel.footer_height } else { FOOTER_HEIGHT_GUESS }
+}
+
+/// The scrolling part of the tool: its head, the form (or the JSON text) and the preview's result.
+fn form_scroll(app: &mut SurfaceCraftApp, panel: &mut CommandPanel, ui: &mut egui::Ui, id: &'static str) {
     egui::ScrollArea::vertical().id_salt("dock-properties").auto_shrink([false, false]).show(ui, |ui| {
         header(app, ui, id);
         ui.separator();

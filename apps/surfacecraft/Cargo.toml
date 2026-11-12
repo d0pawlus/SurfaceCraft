@@ -10,7 +10,9 @@ publish.workspace = true
 
 [dependencies]
 surfacecraft-ui-egui.workspace = true
-eframe.workspace = true
+# The AccessKit tree: without this feature the window exposes nothing to a screen reader. eframe's
+# defaults include it, but the workspace turns the defaults off (docs/STATUS.md, accessibility).
+eframe = { workspace = true, features = ["accesskit"] }
 craft-window.workspace = true
 egui.workspace = true
 
