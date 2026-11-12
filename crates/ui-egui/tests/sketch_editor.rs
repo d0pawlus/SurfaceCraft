@@ -755,3 +755,47 @@ fn new_sketch_on_xy(app: &mut SurfaceCraftApp) -> ObjectId {
     app.new_sketch_on([0.0, 0.0, 1.0]);
     app.sketch_editor.target.expect("editing")
 }
+
+#[test]
+fn sketch_drawings_are_tessellated_once_and_again_only_when_the_sketch_changes() {
+    let mut app = SurfaceCraftApp::headless();
+    let a = new_sketch_on_xy(&mut app);
+    app.run_command(
+        "sketch.add",
+        json!({"sketch": a.0, "entities": [{"line": {"from": [0.0, 0.0], "to": [10.0, 0.0]}}]}),
+    )
+    .unwrap();
+    let other = new_sketch_on_xy(&mut app);
+    app.run_command(
+        "sketch.add",
+        json!({"sketch": other.0, "entities": [{"line": {"from": [0.0, 0.0], "to": [4.0, 4.0]}}]}),
+    )
+    .unwrap();
+    app.begin_sketch_edit(a);
+    let mut h = harness(app);
+    h.run();
+    let first = h.state().sketch_cache.tessellations;
+    assert_eq!(first, 2, "the edited sketch and the reference sketch, once each");
+    for _ in 0..5 {
+        h.run();
+    }
+    assert_eq!(h.state().sketch_cache.tessellations, first, "no document change, no tessellation");
+    h.state_mut()
+        .run_command(
+            "sketch.add",
+            json!({"sketch": other.0, "entities": [{"line": {"from": [1.0, 1.0], "to": [2.0, 3.0]}}]}),
+        )
+        .unwrap();
+    h.run();
+    assert_eq!(h.state().sketch_cache.tessellations, first + 1, "the changed sketch once");
+    h.run();
+    assert_eq!(h.state().sketch_cache.tessellations, first + 1);
+    h.state_mut()
+        .run_command(
+            "sketch.add",
+            json!({"sketch": a.0, "entities": [{"line": {"from": [0.0, 5.0], "to": [3.0, 5.0]}}]}),
+        )
+        .unwrap();
+    h.run();
+    assert_eq!(h.state().sketch_cache.tessellations, first + 2, "only the edited sketch this time");
+}

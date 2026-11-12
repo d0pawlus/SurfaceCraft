@@ -201,9 +201,11 @@ impl SurfaceCraftApp {
     /// sketch with its constraints and dimensions, the rubber band, the snap marker and the
     /// editor's controls.
     pub(crate) fn sketch_overlay(&mut self, ui: &mut egui::Ui, rect: Rect) {
-        let Some((_, name, sk, report)) = self.current_sketch() else { return };
+        let Some((sketch_id, name, sk, report)) = self.current_sketch() else { return };
         // while a point is dragged the sketch is drawn as the solver leaves it
         let sk = self.sketch_editor.drag.as_ref().map_or(sk, |d| d.preview.clone());
+        let doc = &self.session.doc;
+        self.sketch_cache.retain(|id| doc.sketch(id).is_some());
         let view = PlaneView::new(&self.camera, &sk.plane, rect.width(), rect.height());
         let tk = self.tokens.clone();
         let metrics = self.settings.theme.density.metrics();
@@ -251,11 +253,9 @@ impl SurfaceCraftApp {
             if Some(o.id) == self.sketch_editor.target || !o.visible {
                 continue;
             }
-            for e in 0..o.sketch.entities.len() {
-                let pts: Vec<Pos2> = snap::entity_polyline(&o.sketch, e, 48)
-                    .iter()
-                    .filter_map(|p| view.project(&o.sketch.plane.to_3d(*p)).map(at))
-                    .collect();
+            for line_pts in self.sketch_cache.lines(o.id, &o.sketch, 48) {
+                let pts: Vec<Pos2> =
+                    line_pts.iter().filter_map(|p| view.project(&o.sketch.plane.to_3d(*p)).map(at)).collect();
                 line(&painter, &pts, 1.0, Token::TextMuted);
             }
         }
@@ -277,8 +277,9 @@ impl SurfaceCraftApp {
         });
 
         // the sketch
-        for e in 0..sk.entities.len() {
-            let pts: Vec<Pos2> = snap::entity_polyline(&sk, e, 64).iter().filter_map(|p| sp(*p)).collect();
+        let lines = self.sketch_cache.lines(sketch_id, &sk, 64).to_vec();
+        for (e, line_pts) in lines.iter().enumerate() {
+            let pts: Vec<Pos2> = line_pts.iter().filter_map(|p| sp(*p)).collect();
             let token = if bad.contains(&e) {
                 Token::StatusError
             } else if ed.picks.contains(&Hit::Entity(e)) || hover_hit == Some(Hit::Entity(e)) {

@@ -13,6 +13,11 @@ suppressed and replayed.
   (`points`). Shared end points are joined.
 - `sketch.constrain` with `sketch` and `constraints` (their shape is in `describe_command`).
   It solves and reports the degrees of freedom and any over-definition.
+- `sketch.move_point` with `sketch`, `point` (index) and `to` (sketch coordinates) moves one point
+  and solves: the constraints move the rest of the sketch with it, and a point they fix stays
+  where they put it. It is what a mouse drag issues. In the editor, press on a point in the
+  select tool and drag it; Esc during the drag cancels it; a release where nothing moves issues
+  nothing; one drag is one undo step. Alt+drag still orbits the camera.
 - `sketch.edit_constraint` replaces (or removes, when `constraint` is omitted) constraint
   `index`. `sketch.solve` solves again and replays the features that depend on the sketch.
 - `sketch.from_section` cuts a `mesh` with a plane (`origin`, `normal`, `tolerance`) and fits
@@ -41,6 +46,13 @@ suppressed and replayed.
 - `feature.edit` with `feature` and `set`, for example `{"distance": 12}`, changes parameters
   and replays the history.
 - `feature.suppress` with `feature` and `suppressed` turns a feature off, or on again.
+- `feature.rollback` with `to` moves the roll-back marker. `to` is `"end"`, `{"index": n}` (the
+  first rolled-back feature is at position `n`) or `{"feature": ref}`. The features from the
+  marker on are parked: not replayed, so the body is as it was at that step. A feature added now
+  goes in front of the parked ones, and `"end"` brings every parked feature back. `feature.tree`
+  reports `marker` (the number of active features) and `rolled_back` on each node. In the history
+  panel, click the marker to restore everything, drag it in front of a feature, or use "Roll back
+  here" on a row. Parked features cannot be edited or suppressed until the marker moves past them.
 - `feature.replay` rebuilds every body made by features.
 
 ## Redesign helpers
