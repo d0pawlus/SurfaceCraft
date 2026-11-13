@@ -212,6 +212,7 @@ pub fn find(id: &str) -> Option<&'static CommandSpec> {
 const HEAVY: &[&str] = &[
     "align.auto",
     "align.icp",
+    "align.pair_coarse",
     "body.compare",
     "body.from_regions",
     "body.plan_regions",

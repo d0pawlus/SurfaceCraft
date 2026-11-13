@@ -134,10 +134,26 @@ Normals, colours and per-vertex data go with the coordinates.
   `options` takes `max_iterations` and `tolerance` (mm per iteration). The result says whether
   it `converged` and how many `pairs` it used.
 
+## Two scans of one part
+
+- `align.pair_coarse`: brings the scan `object` onto the overlapping scan `target` (mesh or body)
+  with no picked points, then refines with ICP. It tries the 24 signed permutations of the two
+  principal frames (whole parts) and poses from local shape descriptors (FPFH) with RANSAC (partial
+  overlap, down to about half shared), scores them on a subsample, refines the best few and reports
+  the pose, `overlap_moving` and `overlap_fixed` (shares of each scan's area that lie on the other
+  within `tolerance`), a `verdict` and a `confidence`.
+- `verdict`: `unique` (one pose clearly fits better than any other), `ambiguous` (a symmetric part,
+  or an overlap with too little shape: the near-tied poses are in `alternatives`) or `no_match`
+  (too little overlap, or different parts). It proposes by default (`apply` false); a pose that is
+  not `unique` is applied only when `choose` names it (0 the best, 1 and up the alternatives).
+- Limits: the triangles of both scans must be consistently oriented (the descriptors use the
+  normals); surface that ends at the border of the other scan is no conflict, but a part whose
+  shared region is only flat or a cylinder-like surface is reported `ambiguous`.
+
 ## Parameters common to all align commands
 
 - `object`: the mesh to move.
-- `apply` (default true; false for `align.auto` and `align.symmetry`, which propose first):
+- `apply` (default true; false for `align.auto`, `align.symmetry` and `align.pair_coarse`, which propose first):
   false computes the motion without moving the mesh.
 - `also`: other meshes moved by the same motion.
 

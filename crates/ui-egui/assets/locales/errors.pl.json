@@ -615,5 +615,16 @@
   "the offset folds at {} vertices that cannot be relaxed to more than a tenth of the thickness (sharp creases on the side of the offset): use a smaller thickness": "przesunięcie załamuje się w {} wierzchołkach, których nie da się złagodzić do więcej niż jednej dziesiątej grubości (ostre załamania po stronie przesunięcia): użyj mniejszej grubości",
   "thickness {} mm is below what the coordinates of this mesh resolve ({} mm is the least): the two sides would coincide": "grubość {} mm jest poniżej rozdzielczości współrzędnych tej siatki (najmniej {} mm): obie strony by się pokryły",
   "thickness models the scan as one open shell: `components` and `part_share` do not apply (run `scan.split` first and thicken a part)": "grubość modeluje skan jako jedną otwartą skorupę: „components” i „part_share” nie mają zastosowania (najpierw uruchom „scan.split” i pogrub jedną część)",
-  "the scan has {} co-equal parts and thickness models one open shell: run `scan.split` first and thicken a part (`rebuild` does not apply to a thickened scan)": "skan ma {} równorzędnych części, a grubość modeluje jedną otwartą skorupę: najpierw uruchom „scan.split” i pogrub jedną część („rebuild” nie dotyczy pogrubionego skanu)"
+  "the scan has {} co-equal parts and thickness models one open shell: run `scan.split` first and thicken a part (`rebuild` does not apply to a thickened scan)": "skan ma {} równorzędnych części, a grubość modeluje jedną otwartą skorupę: najpierw uruchom „scan.split” i pogrub jedną część („rebuild” nie dotyczy pogrubionego skanu)",
+  "the {} scan has {} triangles; at least {} are needed": "skan „{}” ma {} trójkątów, potrzeba co najmniej {}",
+  "the {} scan is invalid: {}": "skan „{}” jest niepoprawny: {}",
+  "the {} scan has no finite surface area": "skan „{}” nie ma skończonego pola powierzchni",
+  "the fixed scan has no extent": "nieruchomy skan nie ma rozmiaru",
+  "a scan has too few usable triangles to sample": "skan ma za mało użytecznych trójkątów do pobrania próbek",
+  "the tolerance must be between {} and {} mm (a billionth to half of the target's diagonal)": "tolerancja musi mieścić się między {} a {} mm (od miliardowej do połowy przekątnej celu)",
+  "no candidate pose could be refined": "żadnego z kandydatów nie dało się dopracować",
+  "no candidate pose survived": "żaden kandydat nie przetrwał",
+  "the pose is not finite": "ułożenie nie jest skończone",
+  "`choose` picks among alternatives, and this verdict is unique (use 0)": "„choose” wybiera spośród alternatyw, a ten wynik jest jednoznaczny (użyj 0)",
+  "`choose` is {} but there are {} alternatives": "„choose” wynosi {}, a alternatyw jest {}"
 }
