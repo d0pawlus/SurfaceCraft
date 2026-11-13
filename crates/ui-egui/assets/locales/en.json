@@ -992,5 +992,8 @@
   "param.exclude_triangles": "Exclude triangles",
   "param.exclude_spheres": "Exclude spheres",
   "param.exclude_boxes": "Exclude boxes",
-  "param.conform_boundary": "Conform to outline (experimental)"
+  "param.conform_boundary": "Conform to outline (experimental)",
+  "cmd.mesh.thicken": "Thicken mesh",
+  "cmd.mesh.thicken.hint": "Makes a closed shell of constant thickness from an open scan, as a new mesh.",
+  "param.keep_thickened": "Keep thickened mesh"
 }

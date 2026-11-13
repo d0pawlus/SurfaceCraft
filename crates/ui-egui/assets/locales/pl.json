@@ -992,5 +992,8 @@
   "param.exclude_triangles": "Wyklucz trójkąty",
   "param.exclude_spheres": "Wyklucz kule",
   "param.exclude_boxes": "Wyklucz prostopadłościany",
-  "param.conform_boundary": "Dopasuj do konturu (eksperymentalne)"
+  "param.conform_boundary": "Dopasuj do konturu (eksperymentalne)",
+  "cmd.mesh.thicken": "Pogrub siatkę",
+  "cmd.mesh.thicken.hint": "Z otwartego skanu robi zamkniętą skorupę o stałej grubości jako nową siatkę.",
+  "param.keep_thickened": "Zostaw pogrubioną siatkę"
 }

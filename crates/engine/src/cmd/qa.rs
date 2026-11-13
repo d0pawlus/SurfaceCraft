@@ -344,14 +344,27 @@ fn face_of(topo: &TopoMesh, t: Option<usize>) -> Option<usize> {
 }
 
 pub(crate) fn compare(s: &Session, i: CompareIn) -> CmdResult<CompareOut> {
+    let body_id = i.body.resolve(s, ObjectKind::Body)?;
+    let scan_id = i.scan.resolve(s, ObjectKind::Mesh)?;
+    let scan =
+        s.doc.mesh(scan_id).map(|m| m.mesh.clone()).ok_or_else(|| CmdError::Params(format!("no mesh {scan_id}")))?;
+    compare_points(s, body_id, scan_id, &scan, &i)
+}
+
+/// [`compare`] with the scan points (and, with `facing`, their normals) taken from `scan`, which
+/// need not be an object of the document: `scan.to_solid` with a thickness measures a shell against
+/// the face the scan lies on. `scan_id` is only reported. `i.body` and `i.scan` are not read.
+pub(crate) fn compare_points(
+    s: &Session,
+    body_id: ObjectId,
+    scan_id: ObjectId,
+    scan: &Mesh,
+    i: &CompareIn,
+) -> CmdResult<CompareOut> {
     let tol = positive(i.tolerance.unwrap_or(TOLERANCE), "tolerance")?;
     let maxd = positive(i.max_distance.unwrap_or(REACH), "max_distance")?;
     let chord = chord_of(i.chord, tol)?;
-    let body_id = i.body.resolve(s, ObjectKind::Body)?;
-    let scan_id = i.scan.resolve(s, ObjectKind::Mesh)?;
     let b = s.doc.body(body_id).ok_or_else(|| CmdError::Params(format!("no body {body_id}")))?;
-    let scan =
-        s.doc.mesh(scan_id).map(|m| m.mesh.clone()).ok_or_else(|| CmdError::Params(format!("no mesh {scan_id}")))?;
     let topo = tessellate_topo(&b.brep, Some(chord))?;
     // the face count only: `body_out` would integrate the volume of every patch (0.7 ms each)
     let faces = surfacecraft_kernel::solid::counts(&b.brep).faces;

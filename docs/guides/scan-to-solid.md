@@ -48,6 +48,40 @@ Primitives:
 - Builds the solid (`body.from_regions`) and compares it with the scan (`body.compare`).
 - The whole run is one undo step.
 
+## An open scan: a shell of constant thickness
+
+A panel, a body or a casting scanned from one side has no back: the scan is open by nature, and the
+patch network over it is a sheet (`open_surface`), not a solid. `surface.thicken` cannot help, the
+kernel refuses sheets of many faces. Give the wall thickness instead:
+
+- `scan.to_solid` with `thickness` (mm, no default, not 0, at most half the size of the scan). When
+  the cleaned scan is open, the scan is thickened into a closed shell on the mesh side
+  (`mesh.thicken`) and the shell is wrapped in patches (method `freeform`; `thickness` has no meaning
+  with `primitives` or `reuse_regions`). The thickened mesh is removed afterwards unless
+  `keep_thickened` is true; the scan stays; the whole call is one undo step.
+- The sign says where the material is: positive puts it behind the scanned face (against the normals
+  of the scan, the usual case for a scan whose normals point to the scanner), negative in front of
+  it, `symmetric` half on each side. If the scan's normals point away from the scanner, use the
+  negative sign (or flip the normals).
+- The deviation, `coverage` and the verdict are measured against the scan, never against the
+  thickened mesh. The back face has no scan points and is not counted. With `symmetric` the scan lies
+  in the middle of the wall; it is measured against the face moved half the thickness along the
+  scan's normals, so a symmetric result is judged on the shape of the face, not on the half wall.
+- The cleaning keeps the largest boundary loop of the scan (its rim) open: holes are filled only up
+  to one edge less than it. Windows smaller than `fill_holes_max_edges` (default 400) are filled like
+  any other hole; pass `fill_holes_max_edges: 0` to keep them as windows (both loops are stitched).
+- `thickened` in the result: `thickness`, `symmetric`, `clamped_vertices`, `largest_reduction`,
+  `boundary_loops` and the thickened mesh when kept. A closed scan with `thickness` is an error:
+  there is nothing to thicken.
+- Where the surface curves more tightly than the wall is thick (a bead, a tight corner on the side
+  of the offset), the offset is reduced locally and the wall is thinner there: `clamped_vertices` and
+  `largest_reduction` say where, and more than 1 % of the vertices is the issue `thickness_reduced`.
+  A thickness that folds more than 15 % of the surface is refused (verdict `fail`, issue `no_solid`)
+  with a thickness the surface can carry as the next step. Thin gaps between two sheets of the scan
+  that are narrower than the wall are not detected.
+- `mesh.thicken` does the first half alone: a new mesh, closed and outward, from `object`,
+  `thickness`, `symmetric` and `name`.
+
 ## Reading the result
 
 - `verdict` is `pass` (closed solid, nothing skipped, the points within tolerance), `review` (a
@@ -82,9 +116,12 @@ Primitives:
 - `unassigned_triangles`: `region.grow` from a seed, or `region.resegment` with a looser tolerance.
 - `mostly_freeform` (only with `method: primitives`): less than half of the scan lies in regions
   a primitive fits. Run again with `method: freeform`.
-- `open_surface` (freeform): the network is a sheet because the scan has open boundaries. Fill
-  the holes (`mesh.fill_holes`) and run again, or `surface.thicken` the sheet when the part is a
-  shell.
+- `open_surface` (freeform): the network is a sheet because the scan has open boundaries. The
+  first next step is `scan.to_solid` with a `thickness` (2 mm is a placeholder: measure the wall)
+  for a part that is a shell scanned from one side; for holes in a scan of a solid, fill them
+  (`mesh.fill_holes`) and run again.
+- `thickness_reduced` (with `thickness`): the wall is thinner than asked at more than 1 % of the
+  vertices because the surface curves more tightly than the thickness there.
 - `out_of_tolerance` (freeform): the part needs more patches than the limit. When `max_patches` was
   not given, the first network stopped at the default limit (12000) with at least 25 % of the scan
   within the tolerance, the scan has at most 1.5 million triangles and `allow_retry` is not false,

@@ -25,6 +25,8 @@ use surfacecraft_fit::PrimitiveKind;
 mod freeform;
 #[path = "pipeline_regions.rs"]
 mod regions;
+#[path = "pipeline_shell.rs"]
+mod shell;
 use regions::{candidates, fit_regions, primitive_share};
 
 /// Default tolerance the solid is held to against the scan (mm).
@@ -114,6 +116,15 @@ pub struct ToSolidIn {
     /// `max_patches` is given).
     #[serde(default = "yes")]
     pub allow_retry: bool,
+    /// Wall thickness in mm of the solid made from an open scan (no default; not 0, at most half the scan's size): the cleaned scan is thickened and the shell wrapped (method `freeform`); deviation and verdict are measured against the scan. Positive puts the material behind the scanned face, negative in front of it; an error when the scan is closed.
+    #[serde(default)]
+    pub thickness: Option<f64>,
+    /// Put half of `thickness` on each side of the scan (default false; needs `thickness`); the scan is then measured against the face moved half the thickness.
+    #[serde(default)]
+    pub symmetric: bool,
+    /// Keep the thickened mesh in the document (default false: it is removed; needs `thickness`).
+    #[serde(default)]
+    pub keep_thickened: bool,
     /// Name of the solid (default "solid").
     #[serde(default)]
     pub name: Option<String>,
@@ -249,6 +260,9 @@ pub struct ToSolidOut {
     /// The network was built a second time with a larger patch limit (method `freeform`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry: Option<freeform::CapRetry>,
+    /// What the thickening of an open scan did (`thickness` given).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thickened: Option<shell::ThickenedInfo>,
     /// Tolerance used (mm).
     pub tolerance: f64,
     /// The solid against the scan, when a solid was built.
@@ -665,8 +679,13 @@ fn relate(s: &mut Session, modelled: &[Modelled], sigma: Option<f64>) -> usize {
 }
 
 pub(super) fn to_solid(s: &mut Session, i: ToSolidIn) -> CmdResult<ToSolidOut> {
+    shell::check(&i)?;
     let set = settings(s, &i)?;
+    let i = shell::keep_rim_open(s, i, set.scan)?;
     let scan_report = prepare(s, &i, set.scan)?;
+    if i.thickness.is_some() {
+        return shell::shell_solid(s, &set, &i, scan_report);
+    }
     if i.method == Method::Freeform {
         return freeform::freeform_solid(s, &set, scan_report);
     }
@@ -714,6 +733,7 @@ pub(super) fn to_solid(s: &mut Session, i: ToSolidIn) -> CmdResult<ToSolidOut> {
         body: o.body,
         patches: None,
         retry: None,
+        thickened: None,
         tolerance: set.tolerance,
         deviation: o.deviation,
         worst_faces: o.worst_faces,
@@ -742,51 +762,5 @@ pub static COMMANDS: &[CommandSpec] = &[command!(
 )];
 
 #[cfg(test)]
-mod coverage_tests {
-    use super::*;
-
-    fn summary_of(coverage: f64, not_facing: f64) -> DeviationSummary {
-        DeviationSummary { count: 100, coverage, not_facing, within: 1.0, rms: 0.0, max_abs: 0.0, mean: 0.0 }
-    }
-
-    #[test]
-    fn a_solid_that_covers_the_scan_has_no_coverage_issue() {
-        assert!(coverage_issue(&summary_of(0.95, 0.0), "the solid").is_none());
-    }
-
-    fn code(coverage: f64, not_facing: f64) -> String {
-        coverage_issue(&summary_of(coverage, not_facing), "the solid").expect("an issue").code
-    }
-
-    #[test]
-    fn points_that_lie_on_the_solid_but_face_away_are_an_orientation_issue_not_missing_scan() {
-        assert_eq!(code(0.71, 0.29), "inconsistent_orientation");
-    }
-
-    #[test]
-    fn a_few_percent_facing_away_beside_a_real_gap_is_low_coverage_with_both_figures() {
-        // 85 % cover, 6 % face away, 9 % are far: the gap is the problem
-        let issue = coverage_issue(&summary_of(0.85, 0.06), "the solid").expect("an issue");
-        assert_eq!(issue.code, "low_coverage");
-        assert!(issue.message.contains("85.0 %") && issue.message.contains("6.0 %") && issue.message.contains("9.0 %"));
-    }
-
-    #[test]
-    fn the_orientation_issue_starts_at_half_of_the_missing_share() {
-        // missing 0.20: 0.10 facing away is the boundary
-        assert_eq!(code(0.80, 0.10), "inconsistent_orientation");
-        assert_eq!(code(0.80, 0.0999), "low_coverage");
-    }
-
-    #[test]
-    fn a_scan_whose_points_nearly_all_face_away_is_inside_out() {
-        assert_eq!(code(0.05, 0.95), "scan_inside_out");
-        assert_eq!(code(0.10, 0.90), "scan_inside_out");
-        assert_eq!(code(0.20, 0.80), "inconsistent_orientation");
-    }
-
-    #[test]
-    fn points_far_from_the_solid_are_low_coverage() {
-        assert_eq!(code(0.5, 0.05), "low_coverage");
-    }
-}
+#[path = "pipeline_coverage_tests.rs"]
+mod coverage_tests;

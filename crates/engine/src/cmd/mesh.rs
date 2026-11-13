@@ -12,6 +12,7 @@ mod deps;
 mod scale;
 pub(crate) mod scan_size;
 pub(crate) mod size_check;
+pub(crate) mod thicken;
 pub(crate) mod units;
 
 /// Facts about a mesh.
@@ -665,6 +666,16 @@ pub static COMMANDS: &[CommandSpec] = &[
         SynthIn,
         MeshInfo,
         synth_cmd
+    ),
+    command!(
+        "mesh.thicken",
+        "Thicken mesh",
+        "Mesh",
+        true,
+        "Makes a closed shell of constant `thickness` (mm) from the open mesh `object` (a scan taken from one side): every vertex is offset along a smoothed normal, the offset copy is turned around and the rims (outer edge, windows) are stitched, as a NEW mesh; the scan is kept. Positive `thickness` puts the material behind the scanned face, negative in front of it, `symmetric` half on each side. Where the surface curves more tightly than the thickness the offset is reduced locally (reported); a thickness that folds most of the surface is refused. Reports triangles, boundary loops stitched, clamped vertices, the largest reduction and `closed`.",
+        thicken::ThickenMeshIn,
+        thicken::ThickenMeshOut,
+        thicken::thicken_cmd
     ),
     command!(
         "mesh.scale_from_length",
