@@ -155,4 +155,7 @@ pub struct ToSolidOut {
     /// Preparation: what was done to the scan before modelling it, one result per part when it was split.
     #[serde(flatten)]
     pub prep: PrepOut,
+    /// What the thickening of an open scan did (`thickness` given).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thickened: Option<super::shell::ThickenedInfo>,
 }

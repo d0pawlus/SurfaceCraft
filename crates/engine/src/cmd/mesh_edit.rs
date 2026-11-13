@@ -265,7 +265,7 @@ pub struct FillIn {
     pub smooth: Option<bool>,
 }
 
-fn fill(s: &mut Session, i: FillIn) -> CmdResult<EditOut> {
+pub(crate) fn fill(s: &mut Session, i: FillIn) -> CmdResult<EditOut> {
     edit_mesh(s, &i.object, |m, o| {
         let before = m.triangle_count();
         let r = edit::fill_holes(m, i.max_edges.unwrap_or(300), i.smooth.unwrap_or(true));

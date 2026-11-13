@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use surfacecraft_doc::ObjectId;
 
+/// The thickness the next step offers for an open scan (a placeholder the reason explains).
+const PLACEHOLDER_THICKNESS_MM: f64 = 2.0;
 /// Smallest `max_patches` (the one of `surface.wrap`).
 pub(super) const MIN_PATCHES: usize = 12;
 /// The first attempt must have put at least this share of the scan within the tolerance for a retry:
@@ -93,7 +95,7 @@ pub(super) fn judge(first: Attempt, second: Attempt) -> RetryReason {
 }
 
 /// What keeps a wrapped scan from a pass.
-fn issues_of(w: &WrapOut, d: &DeviationSummary, set: &Settings, report: &ScanSummary) -> Vec<super::Issue> {
+pub(super) fn issues_of(w: &WrapOut, d: &DeviationSummary, set: &Settings, report: &ScanSummary) -> Vec<super::Issue> {
     let mut list = Vec::new();
     if !w.closed {
         let msg = "the patch network is not closed (the scan has open boundaries): the result is a sheet, not a solid";
@@ -123,7 +125,7 @@ fn issues_of(w: &WrapOut, d: &DeviationSummary, set: &Settings, report: &ScanSum
     list
 }
 
-fn next_steps(w: &WrapOut, issues: &[super::Issue], set: &Settings, retried: bool) -> Vec<NextStep> {
+pub(super) fn next_steps(w: &WrapOut, issues: &[super::Issue], set: &Settings, retried: bool) -> Vec<NextStep> {
     let has = |code: &str| issues.iter().any(|i| i.code == code);
     if issues.is_empty() {
         let why = "the solid passed: export it (pass `path` when files are allowed, else read `data`)";
@@ -142,9 +144,10 @@ fn next_steps(w: &WrapOut, issues: &[super::Issue], set: &Settings, retried: boo
         let params = json!({"mesh": set.scan, "tolerance": set.tolerance, "max_patches": PATCH_LIMIT});
         steps.push(step("surface.wrap", params, why));
     }
-    if has("open_surface") && !has("scan_defects") {
-        let why = "turns the sheet into a solid of constant thickness when the part is a shell (give `thickness`)";
-        steps.push(step("guide.read", json!({"topic": "fit-surfaces"}), why));
+    if has("open_surface") {
+        let why = "the scan is open, a sheet: if the part is a panel or a shell scanned from one side, give the wall `thickness` in mm (2 is only a placeholder: measure the part; negative puts the material in front of the scanned face, `symmetric` half on each side) and the scan is thickened into a closed solid";
+        let params = json!({"scan": set.scan, "thickness": PLACEHOLDER_THICKNESS_MM, "tolerance": set.tolerance});
+        steps.insert(0, step("scan.to_solid", params, why));
     }
     steps.push(step(
         "guide.read",
@@ -165,7 +168,7 @@ fn failed(set: &Settings, report: ScanSummary, why: &str) -> ToSolidOut {
     out(set, None, report, Verdict::Fail, None, None, issues, next)
 }
 
-fn out(
+pub(super) fn out(
     set: &Settings,
     retry: Option<CapRetry>,
     report: ScanSummary,
@@ -195,6 +198,7 @@ fn out(
         issues,
         next_steps,
         prep: super::PrepOut::default(),
+        thickened: None,
     }
 }
 
@@ -212,7 +216,7 @@ fn remove_bodies_added_since(s: &mut Session, before: &[ObjectId]) {
     }
 }
 
-fn retry_larger_on(
+pub(super) fn retry_larger_on(
     s: &mut Session,
     set: &Settings,
     wrapped: ObjectId,

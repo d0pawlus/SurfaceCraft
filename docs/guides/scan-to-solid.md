@@ -48,6 +48,59 @@ Primitives:
 - Builds the solid (`body.from_regions`) and compares it with the scan (`body.compare`).
 - The whole run is one undo step.
 
+## An open scan: a shell of constant thickness
+
+A panel, a body or a casting scanned from one side has no back: the scan is open by nature, and the
+patch network over it is a sheet (`open_surface`), not a solid. `surface.thicken` cannot help, the
+kernel refuses sheets of many faces. Give the wall thickness instead:
+
+- `scan.to_solid` with `thickness` (mm, no default, not 0, at most half the size of the scan). When
+  the cleaned scan is open, the scan is thickened into a closed shell on the mesh side
+  (`mesh.thicken`) and the shell is wrapped in patches (method `freeform`; `thickness` has no meaning
+  with `primitives` or `reuse_regions`; it models one open shell: with several co-equal parts, or `components` / `part_share`, it is an error: `scan.split` first and thicken a part; `rebuild` does not apply). The thickened mesh is removed afterwards unless
+  `keep_thickened` is true; the scan stays; the whole call is one undo step.
+- The sign says where the material is: positive puts it behind the scanned face (against the normals
+  of the scan, the usual case for a scan whose normals point to the scanner), negative in front of
+  it, `symmetric` half on each side. If the scan's normals point away from the scanner, use the
+  negative sign (or flip the normals).
+- The deviation, `coverage` and the verdict are measured against the scan, never against the
+  thickened mesh. The back face has no scan points and is not counted. With `symmetric` the scan lies
+  in the middle of the wall; it is measured against the face moved half the thickness along the
+  scan's normals, so a symmetric result is judged on the shape of the face, not on the half wall.
+- The rim is the largest boundary loop of the CLEANED scan (debris and spikes are gone by then) and
+  stays open: holes are filled only up to one edge less than it, and up to `fill_holes_max_edges`
+  (default 400). Every other loop that is left (a hole above the limit, or a window of the part) is
+  stitched through the wall as a window: `thickened.windows` counts them, `rim_edges` is the rim, and
+  the issue `windows_stitched` (verdict at most `review`) tells, with a next step that fills every
+  hole but the rim.
+- `thickened` in the result: `thickness`, `symmetric`, `clamped_vertices`, `largest_reduction`,
+  `boundary_loops` and the thickened mesh when kept. A closed scan with `thickness` is an error:
+  there is nothing to thicken.
+- Where the surface curves more tightly than the wall is thick (a bead, a tight corner on the side
+  of the offset), the offset is reduced locally (never below a tenth of the thickness) and the wall
+  is thinner there: `clamped_vertices`, `folded_vertices` (the others were only tapered),
+  `largest_reduction`, `median_reduction` and the sampled wall `min_wall` / `median_wall` say where
+  and how much; more than 1 % of the vertices is the issue `thickness_reduced`. A sharp crease on the
+  side of the offset cannot carry any wall: up to 0.1 % of the vertices may stay folded at the floor
+  (`unresolved_vertices`), more is refused. The next step offers a thinner wall.
+  A thickness whose offset folds triangles at more than 15 % of the vertices is refused (verdict `fail`, issue `no_solid`)
+  with a thickness the surface can carry as the next step. An even sample of the thickened
+  mesh is tested for triangles that cross one they share no vertex with (`self_intersections` of
+  `thickened`, `self_intersection_samples` tested); a channel or gap narrower than the wall shows
+  there, as the issue `self_intersection` (verdict at most `review`), with the sampled count and an extrapolation to the whole mesh. Only a sample is tested. Crossings near a relaxed vertex (the two flanks of a crease within two thicknesses along the surface) are not reported: they are tested exactly during the relaxation and the offset is reduced there until they are gone; the strip along the rim is not part of that test.
+- Before the offset the mesh is repaired: duplicate triangles are dropped; of the triangles on an
+  edge shared by three or more the two that continue the surface best are kept and the others (fins)
+  removed (`removed_non_manifold`); the orientation is made consistent per piece
+  (`flipped_triangles`); places where boundary loops touch are split. The normals are averaged over a
+  ball of half the wall (at least one edge), so noise finer than that does not fold it; at the rim
+  the average is one-sided. The strip along the rim has rows of about one edge, at most 64 and at
+  most 4 million triangles, so a wall much thicker than the rim edges has needle triangles there.
+- The thickened mesh has about twice the triangles of the scan, so the automatic larger-cap retry
+  (never above 1.5 million triangles of the mesh that is wrapped) stops at about 750 000 scan
+  triangles; above that, the next step offers `scan.to_solid` with an explicit `max_patches`.
+- `mesh.thicken` does the first half alone: a new mesh, closed and outward, from `object`,
+  `thickness`, `symmetric` and `name`.
+
 ## Reading the result
 
 - `verdict` is `pass` (closed solid, nothing skipped, the points within tolerance), `review` (a
@@ -82,9 +135,12 @@ Primitives:
 - `unassigned_triangles`: `region.grow` from a seed, or `region.resegment` with a looser tolerance.
 - `mostly_freeform` (only with `method: primitives`): less than half of the scan lies in regions
   a primitive fits. Run again with `method: freeform`.
-- `open_surface` (freeform): the network is a sheet because the scan has open boundaries. Fill
-  the holes (`mesh.fill_holes`) and run again, or `surface.thicken` the sheet when the part is a
-  shell.
+- `open_surface` (freeform): the network is a sheet because the scan has open boundaries. The
+  first next step is `scan.to_solid` with a `thickness` (2 mm is a placeholder: measure the wall)
+  for a part that is a shell scanned from one side; for holes in a scan of a solid, fill them
+  (`mesh.fill_holes`) and run again.
+- `thickness_reduced` (with `thickness`): the wall is thinner than asked at more than 1 % of the
+  vertices because the surface curves more tightly than the thickness there.
 - `out_of_tolerance` (freeform): the part needs more patches than the limit. When `max_patches` was
   not given, the first network stopped at the default limit (12000) with at least 25 % of the scan
   within the tolerance, the scan has at most 1.5 million triangles and `allow_retry` is not false,

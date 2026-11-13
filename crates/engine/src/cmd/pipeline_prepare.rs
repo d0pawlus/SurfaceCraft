@@ -188,6 +188,12 @@ fn tally_of(a: &Analysis, plan: &Plan, ms: u64) -> Tally {
     }
 }
 
+/// Number of co-equal parts of `mesh` (those a split run would model; 1 for a single piece).
+pub(super) fn coequal_parts(mesh: &surfacecraft_geom::Mesh) -> usize {
+    let a = scan_split::analyse(mesh, MIN_SHARE, true);
+    if a.parts.len() < 2 { a.parts.len() } else { plan_of(&a, PART_SHARE, None).chosen.len() }
+}
+
 /// Splits a scan with several parts and models each co-equal one. `None` for a scan with one piece
 /// that counts (the usual case: nothing changes).
 pub(super) fn split_parts(
@@ -377,6 +383,7 @@ fn failure(set: &Settings, id: ObjectId, why: &str) -> ToSolidOut {
         issues: vec![issue("no_solid", format!("the part could not be modelled: {why}"))],
         next_steps: Vec::new(),
         prep: PrepOut::default(),
+        thickened: None,
     }
 }
 
