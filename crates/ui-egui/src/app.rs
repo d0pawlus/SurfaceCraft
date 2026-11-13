@@ -303,6 +303,11 @@ impl SurfaceCraftApp {
         let params = template(&schema, &self.pick_context());
         let params = crate::import_units::prefilled(id, params, self.settings.import_units);
         self.palette_params = serde_json::to_string_pretty(&params).unwrap_or_else(|_| "{}".into());
+        if let Some(note) =
+            crate::import_units::form_note(self.settings.import_units).filter(|_| id == crate::import_units::IMPORT)
+        {
+            self.status = note;
+        }
     }
 
     /// Closes the open tool without running it: the tool panel shows the guide again.

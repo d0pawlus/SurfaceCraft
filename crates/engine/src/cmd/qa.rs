@@ -302,7 +302,7 @@ pub(crate) fn scan_qa(s: &Session, i: QaIn) -> CmdResult<QaOut> {
         degenerate,
         duplicates,
         noise,
-        scale: size_check::scale_finding(&mesh),
+        scale: size_check::scale_finding(&s.doc, id),
     };
     let (bbox_min, bbox_max) = bbox_corners(&mesh);
     let area = mesh.area();

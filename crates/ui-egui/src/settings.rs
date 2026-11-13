@@ -23,7 +23,9 @@ pub struct UiSettings {
     pub workspace: Option<Workspace>,
     /// The [`LAYOUT_VERSION`] the layout was saved under.
     pub layout_version: u32,
-    /// The unit the last scan import chose (the import form starts with it).
+    /// The unit of the last scan import form, for this session only: it is never saved, so every
+    /// start begins in millimetres.
+    #[serde(skip)]
     pub import_units: surfacecraft_doc::LengthUnit,
 }
 

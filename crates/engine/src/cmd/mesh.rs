@@ -76,7 +76,7 @@ pub(crate) fn mesh_info(s: &Session, id: ObjectId) -> CmdResult<MeshInfo> {
         area: m.mesh.area(),
         working,
         source_units: m.source_units,
-        scale_warning: size_check::scale_warning(&m.mesh),
+        scale_warning: size_check::warning_of(&s.doc, id),
     })
 }
 
@@ -126,7 +126,7 @@ pub struct ImportIn {
     /// `stl`, `obj`, `ply` or `xyz` (default: from the extension, else sniffed).
     #[serde(default)]
     pub format: Option<MeshFormat>,
-    /// Scale applied on import (e.g. 25.4 for inches to mm). Default 1.
+    /// Factor on import, times `units`. Default 1.
     #[serde(default)]
     pub scale: Option<f64>,
     /// Object name (default: the file name).
@@ -136,7 +136,7 @@ pub struct ImportIn {
     /// reconstructed into a mesh on import.
     #[serde(default)]
     pub reconstruct: Option<ReconstructOpts>,
-    /// Unit of the file's coordinates, converted to millimetres.
+    /// Unit of the coordinates, converted to mm (default mm).
     #[serde(default)]
     pub units: Option<LengthUnit>,
 }
@@ -177,6 +177,26 @@ pub struct ImportOut {
     pub point_cloud: Option<CloudInfo>,
     /// Factor every coordinate was multiplied by on import (`scale` times the unit; 1 when none).
     pub scale_factor: f64,
+    /// In words, what the unit did, when it did something.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub units_note: Option<String>,
+}
+
+/// Adds an imported mesh: its unit is recorded, and stated when the caller gave one.
+fn add_imported(
+    s: &mut Session,
+    name: &str,
+    mesh: Mesh,
+    units: Option<LengthUnit>,
+    scale_factor: f64,
+    cloud: Option<CloudInfo>,
+) -> CmdResult<ImportOut> {
+    let id = s.doc.add_mesh(name, mesh);
+    let obj = s.doc.mesh_mut(id).ok_or_else(|| CmdError::Failed(format!("mesh {id} vanished on import")))?;
+    obj.source_units = units.unwrap_or_default();
+    obj.units_stated = units.is_some();
+    let units_note = units::import_note(units, scale_factor);
+    Ok(ImportOut { mesh: mesh_info(s, id)?, point_cloud: cloud, scale_factor, units_note })
 }
 
 type Loaded = (Vec<u8>, String, MeshFormat);
@@ -208,23 +228,37 @@ fn read_limits() -> Limits {
     }
 }
 
+/// The error of a scaling that leaves a coordinate that is not a number (a file with values near
+/// the largest floating-point numbers, times a large unit).
+fn overflow() -> CmdError {
+    CmdError::Params(
+        "a coordinate is not finite after scaling: the scale or the units are too large for these values".into(),
+    )
+}
+
+fn check_factor(sc: f64) -> CmdResult<()> {
+    if sc.is_finite() && sc > 0.0 { Ok(()) } else { Err(CmdError::Params("scale must be positive".into())) }
+}
+
 fn scaled(mut mesh: Mesh, scale: Option<f64>) -> CmdResult<Mesh> {
     if let Some(sc) = scale {
-        if !(sc.is_finite() && sc > 0.0) {
-            return Err(CmdError::Params("scale must be positive".into()));
-        }
+        check_factor(sc)?;
         mesh.scale(sc);
+        if !mesh.positions.iter().all(surfacecraft_geom::finite) {
+            return Err(overflow());
+        }
     }
     Ok(mesh)
 }
 
 fn from_cloud(mut cloud: PointCloud, scale: Option<f64>, opts: &ReconstructOpts) -> CmdResult<(Mesh, CloudInfo)> {
     if let Some(sc) = scale {
-        if !(sc.is_finite() && sc > 0.0) {
-            return Err(CmdError::Params("scale must be positive".into()));
-        }
+        check_factor(sc)?;
         for p in &mut cloud.positions {
             *p = Point3::from(p.coords * sc);
+        }
+        if !cloud.positions.iter().all(surfacecraft_geom::finite) {
+            return Err(overflow());
         }
     }
     let (mesh, r) = reconstruct(&cloud, &opts.params()).map_err(|e| CmdError::Failed(format!("point cloud: {e}")))?;
@@ -247,7 +281,6 @@ fn import(s: &mut Session, i: ImportIn) -> CmdResult<ImportOut> {
     let (bytes, default_name, fmt) = load(s, &i.path, &i.data, i.format)?;
     let name = i.name.clone().unwrap_or(default_name);
     let scale = units::import_scale(i.scale, i.units);
-    let scale_factor = scale.unwrap_or(1.0);
     let (mesh, cloud) = match read_scan(&bytes, fmt, &read_limits())? {
         Scan::Mesh(m) => (scaled(m, scale)?, None),
         Scan::Points(c) => {
@@ -255,10 +288,7 @@ fn import(s: &mut Session, i: ImportIn) -> CmdResult<ImportOut> {
             (m, Some(info))
         }
     };
-    let id = s.doc.add_mesh(&name, mesh);
-    let obj = s.doc.mesh_mut(id).ok_or_else(|| CmdError::Failed(format!("mesh {id} vanished on import")))?;
-    obj.source_units = i.units.unwrap_or_default();
-    Ok(ImportOut { mesh: mesh_info(s, id)?, point_cloud: cloud, scale_factor })
+    add_imported(s, &name, mesh, i.units, scale.unwrap_or(1.0), cloud)
 }
 
 /// Reconstruction parameters: a file as for `mesh.import`, whose points (vertices, when it has
@@ -275,9 +305,12 @@ pub struct ReconstructIn {
     /// `stl`, `obj`, `ply` or `xyz` (default: from the extension, else sniffed).
     #[serde(default)]
     pub format: Option<MeshFormat>,
-    /// Scale applied to the points. Default 1.
+    /// Factor on the points, multiplied with `units` (2 doubles the size). Default 1.
     #[serde(default)]
     pub scale: Option<f64>,
+    /// Unit of the coordinates, converted to mm (default mm).
+    #[serde(default)]
+    pub units: Option<LengthUnit>,
     /// Object name (default: the file name).
     #[serde(default)]
     pub name: Option<String>,
@@ -304,9 +337,10 @@ fn reconstruct_cmd(s: &mut Session, i: ReconstructIn) -> CmdResult<ImportOut> {
         passes: i.passes,
         fill_holes_max_edges: i.fill_holes_max_edges,
     };
-    let (mesh, info) = from_cloud(cloud, i.scale, &opts)?;
-    let id = s.doc.add_mesh(i.name.as_deref().unwrap_or(&default_name), mesh);
-    Ok(ImportOut { mesh: mesh_info(s, id)?, point_cloud: Some(info), scale_factor: i.scale.unwrap_or(1.0) })
+    let scale = units::import_scale(i.scale, i.units);
+    let (mesh, info) = from_cloud(cloud, scale, &opts)?;
+    let name = i.name.as_deref().unwrap_or(&default_name);
+    add_imported(s, name, mesh, i.units, scale.unwrap_or(1.0), Some(info))
 }
 
 /// Export parameters.
@@ -566,7 +600,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         "Import mesh…",
         "Mesh",
         true,
-        "Imports STL/OBJ/PLY/XYZ from `path` or base64 `data` (+`format`), optional `scale`, `name`, `units`; a point cloud (no faces) is reconstructed into a mesh (`reconstruct` settings).",
+        "Imports STL/OBJ/PLY/XYZ from `path` or base64 `data` (+`format`), optional `scale`, `name`, `units`; point clouds (no faces) are reconstructed (`reconstruct`).",
         ImportIn,
         ImportOut,
         import
@@ -576,7 +610,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         "Set units...",
         "Mesh",
         true,
-        "Rescales a mesh imported in the wrong unit: `from` is its real unit.",
+        "Sets the real unit (`from`) of a mesh imported wrongly.",
         units::SetUnitsIn,
         units::SetUnitsOut,
         units::set_units

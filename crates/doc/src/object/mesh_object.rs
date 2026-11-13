@@ -25,9 +25,17 @@ pub struct MeshObject {
     /// The unit the file was in when it was imported. The geometry is millimetres whatever it is.
     #[serde(default)]
     pub source_units: LengthUnit,
+    /// The unit was stated by the caller (an explicit `units`, or `mesh.set_units`), so the size is
+    /// taken as it is and no `suspicious_scale` warning is raised for it.
+    #[serde(default)]
+    pub units_stated: bool,
+    /// The size was set from a known length (`mesh.scale_from_length`): its unit is not a unit any
+    /// more, so `mesh.set_units` refuses it.
+    #[serde(default)]
+    pub rescaled: bool,
 }
 
-/// Length unit of a scan file.
+// Length unit of a scan file (STL, OBJ, PLY and XYZ carry none).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum LengthUnit {

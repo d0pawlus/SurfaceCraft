@@ -1,24 +1,32 @@
-//! The size check (P9-U1): is a scan plausibly a mechanical part in millimetres? A scan file has no
-//! unit, so a file in metres or inches read as millimetres is far too small, and one in
-//! micrometres is far too large. The check only reports it; it never rescales anything.
+//! The size check: is a scan plausibly a mechanical part in millimetres? A scan file has no unit,
+//! so a file in metres or inches read as millimetres is far too small, and one in micrometres is
+//! far too large. The check only reports it; it never rescales anything, and a unit the caller
+//! stated (or a size set from a known length) is taken as it is.
 //!
-//! The rule. The robust extent is the largest of the three axis extents of the vertices, each
-//! measured between the extreme vertices left once the most extreme ones at each end are cut: one
-//! vertex from every 100 (at least one from eight vertices up), so that a far-off vertex does not
-//! decide it. Below 1.0 mm the size looks like metres (or inches). Below 0.02 mm it is definitely not
-//! millimetres. Above 20 000 mm it looks like micrometres or another unit. Anything in between is
-//! fine and gives no warning.
+//! The rule. The robust extent is the largest of the three axis extents of the vertices. A mesh of
+//! at least [`MIN_TRIMMED_VERTICES`] vertices has its most extreme vertices cut at each end of every
+//! axis (one per hundred, at least one), so that a far-off vertex does not decide it; a smaller mesh
+//! is measured as it is, so a small part keeps its apex. A larger mesh is measured on at most
+//! [`SAMPLE_VERTICES`] vertices, taken evenly through the vertex list, so the work and the memory do
+//! not grow with the size of the file. Below 1.0 mm the size looks like metres (or inches). Below
+//! 0.02 mm it is definitely not millimetres. Above 20 000 mm it looks like micrometres or another
+//! unit. Anything in between is fine and gives no warning.
+use crate::cmd::mesh::units::left_alone;
 use crate::cmd::qa::{Finding, Severity};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use surfacecraft_geom::Mesh;
+use surfacecraft_doc::{Document, ObjectId};
+use surfacecraft_geom::{Mesh, Point3};
 
-/// The code of the warning, in `mesh.import`, `mesh.info`, `scan.qa` and `scan.to_solid`.
+/// The code of the warning, in `mesh.import`, `mesh.info`, `scan.qa`, `scan.to_solid` and stores.
 pub(crate) const SUSPICIOUS_SCALE: &str = "suspicious_scale";
-/// Share of the vertices cut from each end of an axis before its extent is taken.
+/// Share of the measured vertices cut from each end of an axis.
 const TRIM: f64 = 0.01;
-/// Meshes with fewer vertices are measured as they are (cutting would drop real corners).
-const MIN_TRIMMED_VERTICES: usize = 8;
+/// Meshes with fewer vertices are measured as they are (cutting would drop the corners of a small
+/// part).
+const MIN_TRIMMED_VERTICES: usize = 100;
+/// Larger meshes are measured on this many vertices, taken evenly through the vertex list.
+pub(crate) const SAMPLE_VERTICES: usize = 100_000;
 /// Extents below this (mm) look like metres or inches.
 const METRES_BELOW_MM: f64 = 1.0;
 /// Extents below this (mm) are definitely not millimetres.
@@ -49,13 +57,21 @@ pub struct ScaleWarning {
     pub extent: f64,
     /// What was found.
     pub message: String,
-    /// The calls that fix it: a re-import with `units`, or `mesh.set_units` for this mesh.
+    /// Calls that fix it, and that work for this mesh.
     pub suggestion: String,
 }
 
-/// How many of the most extreme vertices are cut at each end of an axis, for `n` vertices.
-fn cut_per_end(n: usize) -> usize {
-    if n < MIN_TRIMMED_VERTICES { 0 } else { ((n as f64 * TRIM).floor() as usize).max(1) }
+/// The vertices the extent is measured on: all of them up to [`SAMPLE_VERTICES`], else that many
+/// taken evenly through the list.
+fn sampled(mesh: &Mesh) -> Vec<Point3> {
+    let n = mesh.positions.len();
+    let count = n.min(SAMPLE_VERTICES);
+    (0..count).map(|i| mesh.positions[i * n / count]).collect()
+}
+
+/// How many of the most extreme measured vertices are cut at each end of an axis.
+fn cut_per_end(measured: usize) -> usize {
+    if measured < MIN_TRIMMED_VERTICES { 0 } else { ((measured as f64 * TRIM).floor() as usize).max(1) }
 }
 
 /// The value of rank `rank` (0 = smallest) of `values`, which it reorders.
@@ -64,22 +80,23 @@ fn order_statistic(values: &mut [f64], rank: usize) -> f64 {
     *value
 }
 
-/// The largest of the trimmed axis extents of the vertices (mm); `None` for a mesh without
+/// The largest of the (trimmed) axis extents of the vertices (mm); `None` for a mesh without
 /// vertices or with a coordinate that is not a number.
 #[must_use]
 pub fn robust_extent(mesh: &Mesh) -> Option<f64> {
     if mesh.positions.is_empty() || !mesh.positions.iter().all(surfacecraft_geom::finite) {
         return None;
     }
-    let n = mesh.positions.len();
-    let cut = cut_per_end(n);
-    let mut axis: Vec<f64> = Vec::with_capacity(n);
+    let sample = sampled(mesh);
+    let m = sample.len();
+    let cut = cut_per_end(m);
+    let mut axis: Vec<f64> = Vec::with_capacity(m);
     let mut largest = 0.0_f64;
     for k in 0..3 {
         axis.clear();
-        axis.extend(mesh.positions.iter().map(|p| p[k]));
+        axis.extend(sample.iter().map(|p| p[k]));
         let low = order_statistic(&mut axis, cut);
-        let high = order_statistic(&mut axis, n - 1 - cut);
+        let high = order_statistic(&mut axis, m - 1 - cut);
         largest = largest.max(high - low);
     }
     Some(largest)
@@ -120,38 +137,86 @@ fn message_of(problem: ScaleProblem, extent: f64) -> String {
     }
 }
 
-fn suggestion_of(problem: ScaleProblem) -> String {
+/// The fixes that work for the mesh: a re-import, or `mesh.set_units` (which needs `force` while
+/// bodies or sketches made from the document stay at the old size).
+fn suggestion_of(problem: ScaleProblem, derived: bool) -> String {
     let unit = unit_to_try(problem);
-    let extra = match problem {
+    let inches = match problem {
         ScaleProblem::MetresOrInches => " (\"in\" if the file is in inches)",
         ScaleProblem::NotMillimetres | ScaleProblem::Micrometres => "",
     };
+    let force = if derived { ", \"force\": true (the bodies and sketches keep their old size)" } else { "" };
     format!(
-        "import it again with mesh.import and \"units\": \"{unit}\"{extra}, or convert this mesh with mesh.set_units and \"from\": \"{unit}\""
+        "import it again with mesh.import and \"units\": \"{unit}\"{inches}, or convert this mesh with mesh.set_units and \"from\": \"{unit}\"{force}"
     )
 }
 
-/// The warning for `mesh`, when its size looks like a unit mistake.
+/// The warning for a robust extent (mm), when it looks like a unit mistake. `derived`: the document
+/// holds bodies or sketches that a unit change would leave at the old size.
 #[must_use]
-pub fn scale_warning(mesh: &Mesh) -> Option<ScaleWarning> {
-    let extent = robust_extent(mesh)?;
+pub(crate) fn warning_for_extent(extent: f64, derived: bool) -> Option<ScaleWarning> {
     let problem = problem_of(extent)?;
     Some(ScaleWarning {
         code: SUSPICIOUS_SCALE.to_string(),
         problem,
         extent,
         message: message_of(problem, extent),
-        suggestion: suggestion_of(problem),
+        suggestion: suggestion_of(problem, derived),
     })
+}
+
+/// The warning of mesh `id`: none when its unit was stated or its size set from a length.
+#[must_use]
+pub fn warning_of(doc: &Document, id: ObjectId) -> Option<ScaleWarning> {
+    let obj = doc.mesh(id)?;
+    if obj.units_stated || obj.rescaled {
+        return None;
+    }
+    let derived = !left_alone(doc).is_empty();
+    warning_for_extent(robust_extent(&obj.mesh)?, derived)
 }
 
 /// The warning as a finding of the quality report (a warning to clean before modelling).
 #[must_use]
-pub fn scale_finding(mesh: &Mesh) -> Option<Finding> {
-    let w = scale_warning(mesh)?;
+pub fn scale_finding(doc: &Document, id: ObjectId) -> Option<Finding> {
+    let w = warning_of(doc, id)?;
     Some(Finding {
         severity: Severity::Warning,
         code: w.code.clone(),
         message: format!("{}. {}", w.message, w.suggestion),
     })
+}
+
+/// Keeps the sample and the rule in one place for the tests of the module.
+#[cfg(test)]
+pub(crate) fn sample_len(mesh: &Mesh) -> usize {
+    sampled(mesh).len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mesh_of(points: Vec<[f64; 3]>) -> Mesh {
+        Mesh { positions: points.into_iter().map(Point3::from).collect(), triangles: Vec::new() }
+    }
+
+    #[test]
+    fn a_pin_of_one_point_two_millimetres_keeps_its_apex_and_is_not_read_as_metres() {
+        // A small mesh: its apex is a real corner, not an outlier.
+        let pin = mesh_of(vec![[0.0, 0.0, 0.0], [0.6, 0.0, 0.0], [-0.6, 0.0, 0.0], [0.0, 0.0, 1.2]]);
+        assert!(warning_of_extent_for(&pin).is_none(), "1.2 mm is plausible");
+    }
+
+    #[test]
+    fn a_large_mesh_is_measured_on_a_bounded_sample() {
+        let big = mesh_of((0..2_000_000).map(|i| [i as f64 * 1e-5, 0.0, 0.0]).collect());
+        assert_eq!(sample_len(&big), SAMPLE_VERTICES);
+        let ext = robust_extent(&big).unwrap();
+        assert!((ext - 20.0).abs() < 0.5, "the extent of the sample: {ext}");
+    }
+
+    fn warning_of_extent_for(mesh: &Mesh) -> Option<ScaleWarning> {
+        warning_for_extent(robust_extent(mesh)?, false)
+    }
 }

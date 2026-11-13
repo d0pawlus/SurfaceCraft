@@ -6,6 +6,7 @@ use surfacecraft_doc::{LengthUnit, base64};
 use surfacecraft_ui_egui::SurfaceCraftApp;
 use surfacecraft_ui_egui::forms::{self, Kind};
 use surfacecraft_ui_egui::i18n::{self, Lang};
+use surfacecraft_ui_egui::settings::UiSettings;
 
 /// A triangle 40 mm × 30 mm (as numbers: 0.04 × 0.03), as an OBJ file encoded for the form (`data`).
 fn triangle_data() -> String {
@@ -57,4 +58,48 @@ fn a_metre_file_imported_without_units_says_so_in_the_status_line() {
     }));
     i18n::set_lang(Lang::En);
     assert!(polish.is_some_and(|t| t.starts_with("Najdłuższy wymiar to 0.0400 mm")));
+}
+
+#[test]
+fn a_form_import_in_metres_is_announced_in_the_status_line() {
+    let mut app = SurfaceCraftApp::headless();
+    app.choose_command("mesh.import");
+    app.palette_params = json!({"data": triangle_data(), "format": "obj", "name": "m", "units": "m"}).to_string();
+    app.run_palette();
+    assert!(app.status.contains("Metres") && app.status.contains("1000"), "{}", app.status);
+}
+
+#[test]
+fn the_unit_is_not_kept_across_a_restart() {
+    let mut app = SurfaceCraftApp::headless();
+    app.choose_command("mesh.import");
+    app.palette_params = json!({"data": triangle_data(), "format": "obj", "name": "m", "units": "m"}).to_string();
+    app.run_palette();
+    let saved = UiSettings::from_json(&app.settings.to_json());
+    assert_eq!(saved.import_units, LengthUnit::Mm, "a non-mm unit is never persisted");
+}
+
+#[test]
+fn a_fresh_app_starts_with_millimetres_even_when_saved_settings_say_metres() {
+    let saved = UiSettings::from_json(r#"{"import_units":"m"}"#);
+    let app = SurfaceCraftApp::with_settings(saved);
+    assert_eq!(app.settings.import_units, LengthUnit::Mm);
+}
+
+#[test]
+fn the_form_preselects_the_session_unit_and_says_so() {
+    let mut app = SurfaceCraftApp::headless();
+    app.choose_command("mesh.import");
+    app.palette_params = json!({"data": triangle_data(), "format": "obj", "name": "m", "units": "cm"}).to_string();
+    app.run_palette();
+    app.status.clear();
+    app.choose_command("mesh.import");
+    assert_eq!(serde_json::from_str::<Value>(&app.palette_params).unwrap()["units"], "cm");
+    assert!(app.status.contains("Centimetres"), "the preselected unit is shown: {}", app.status);
+}
+
+#[test]
+fn menu_and_inbox_imports_always_use_millimetres_unless_the_user_picks() {
+    let params = surfacecraft_ui_egui::import_units::file_import_params(json!({"path": "scan.stl"}));
+    assert_eq!(params["units"], "mm");
 }

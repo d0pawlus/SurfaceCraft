@@ -377,8 +377,8 @@ impl SurfaceCraftApp {
                     let _ = self.run_command("doc.save", json!({"path": p}));
                 }
                 DialogThen::ImportMesh => {
-                    let units = self.settings.import_units;
-                    self.launch("mesh.import", json!({"path": p, "units": units}), After::Fit);
+                    let params = crate::import_units::file_import_params(json!({"path": p}));
+                    self.launch("mesh.import", params, After::Fit);
                 }
                 DialogThen::ImportStep => {
                     self.launch("import.step", json!({"path": p}), After::Fit);

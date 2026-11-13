@@ -11,6 +11,8 @@ use surfacecraft_doc::LengthUnit;
 use surfacecraft_geom::chunked::{StoreParams, StoreSummary};
 use surfacecraft_io::MeshFormat;
 
+use super::mesh::size_check;
+
 /// Parameters of `mesh.import_stream`.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -22,7 +24,7 @@ pub struct ImportStreamIn {
     /// `stl` or `ply` (default: from the extension, else sniffed).
     #[serde(default)]
     pub format: Option<MeshFormat>,
-    /// Scale applied on import (e.g. 25.4 for inches to mm). Default 1.
+    /// Factor on import, times `units`. Default 1.
     #[serde(default)]
     pub scale: Option<f64>,
     /// Unit of the file's coordinates, as for `mesh.import`: the store is written in millimetres.
@@ -122,6 +124,61 @@ pub struct StoreOut {
     /// Present after an import.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build: Option<BuildOut>,
+    /// The unit the store was built in (none for a store that did not record one).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub units: Option<LengthUnit>,
+    /// The size check on the bounds, when the unit was not stated and the size looks wrong.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scale_warning: Option<size_check::ScaleWarning>,
+}
+
+/// The unit a store was built in, kept beside its files.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct UnitsRecord {
+    units: LengthUnit,
+    stated: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+const UNITS_FILE: &str = "units.json";
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_units(dir: &std::path::Path, record: UnitsRecord) -> CmdResult<()> {
+    let text = serde_json::to_string(&record).map_err(|e| CmdError::Failed(e.to_string()))?;
+    std::fs::write(dir.join(UNITS_FILE), text).map_err(|e| CmdError::Failed(format!("cannot record the units: {e}")))
+}
+
+/// Removes the units record before a store is replaced (the store's own check refuses other files).
+#[cfg(not(target_arch = "wasm32"))]
+fn forget_units(dir: &std::path::Path) -> CmdResult<()> {
+    match std::fs::remove_file(dir.join(UNITS_FILE)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(CmdError::Failed(format!("cannot replace the units record of the store: {e}"))),
+    }
+}
+
+/// The units record of a store; `None` for a store that has none (made before units existed).
+#[cfg(not(target_arch = "wasm32"))]
+fn read_units(dir: &std::path::Path) -> CmdResult<Option<UnitsRecord>> {
+    match std::fs::read_to_string(dir.join(UNITS_FILE)) {
+        Ok(text) => serde_json::from_str(&text)
+            .map(Some)
+            .map_err(|e| CmdError::Failed(format!("the units record of the store is damaged: {e}"))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(CmdError::Failed(format!("cannot read the units record of the store: {e}"))),
+    }
+}
+
+/// The size check on the bounds of a store (its largest side), unless its unit was stated.
+#[cfg(not(target_arch = "wasm32"))]
+fn store_warning(out: &StoreOut, stated: bool) -> Option<size_check::ScaleWarning> {
+    if stated || out.triangles == 0 {
+        return None;
+    }
+    let extent = out.bbox_max.iter().zip(&out.bbox_min).map(|(hi, lo)| hi - lo).fold(0.0, f64::max);
+    size_check::warning_for_extent(extent, false)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -155,6 +212,8 @@ fn store_out(dir: &str, s: &StoreSummary) -> StoreOut {
         bytes_on_disk: None,
         verified: false,
         build: None,
+        units: None,
+        scale_warning: None,
     }
 }
 
@@ -191,9 +250,17 @@ fn import_stream(s: &mut Session, i: ImportStreamIn) -> CmdResult<StoreOut> {
         overwrite: i.overwrite.unwrap_or(false),
         ..StreamImportOptions::default()
     };
+    if i.overwrite.unwrap_or(false) {
+        forget_units(Path::new(&i.store_dir))?;
+    }
     let report = import_to_store(Path::new(&i.path), Path::new(&i.store_dir), &opts)?;
+    let stated = i.units.is_some();
+    let units = i.units.unwrap_or_default();
+    write_units(Path::new(&i.store_dir), UnitsRecord { units, stated })?;
     let mut out = store_out(&i.store_dir, &report.summary);
     out.bytes_on_disk = Some(report.stats.bytes_on_disk);
+    out.units = Some(units);
+    out.scale_warning = store_warning(&out, stated);
     out.build = Some(BuildOut {
         peak_buffered_triangles: report.stats.peak_buffered_triangles,
         max_chunk_triangles: report.stats.max_chunk_triangles,
@@ -223,6 +290,9 @@ fn store_info(s: &mut Session, i: StoreInfoIn) -> CmdResult<StoreOut> {
     let mut out = store_out(&i.store_dir, &store.summary());
     out.bytes_on_disk = Some(surfacecraft_geom::chunked::disk::store_bytes(&store, std::path::Path::new(&i.store_dir)));
     out.verified = verified;
+    let record = read_units(std::path::Path::new(&i.store_dir))?;
+    out.units = record.map(|r| r.units);
+    out.scale_warning = store_warning(&out, record.is_some_and(|r| r.stated));
     Ok(out)
 }
 

@@ -16,22 +16,36 @@ tool `align_icp`), or call `execute` with `command` and `params`.
 ### Units
 
 STL, OBJ, PLY and XYZ files carry no length unit, and SurfaceCraft works in millimetres. Say which
-unit the file is in with `units`: `mm` (default), `cm`, `m`, `in`, `ft` or `um`. The mesh is
-converted to millimetres on import (exact factors: cm 10, m 1000, in 25.4, ft 304.8, um 0.001), and
-the object remembers the unit in `source_units`. Normals, colours and per-vertex data go with it.
+unit the file is in with `units`: `mm`, `cm`, `m`, `in`, `ft` or `um`. Without `units` the file is
+taken as millimetres, as before. The mesh is converted to millimetres on import (exact factors: cm
+10, m 1000, in 25.4, ft 304.8, um 0.001), `scale` multiplies on top of it, and the object keeps the
+unit in `source_units`. The import result carries `scale_factor` and, in words, `units_note`.
+Normals, colours and per-vertex data go with the coordinates.
 
-- `mesh.import` with `"units": "m"` for a scan saved in metres. `mesh.import_stream` takes `units`
-  too: the store is written in millimetres, bounds and error bounds included.
-- A file read in the wrong unit is not rescaled silently. A size that looks like a unit mistake
-  (largest side below 1 mm, or above 20 000 mm) comes back as `scale_warning` with code
-  `suspicious_scale`, with the call that fixes it. The same warning is in `mesh.info`, `scan.qa`
-  and `scan.to_solid`. The rule uses the largest axis extent of the vertices, ignoring the
-  extreme vertices at each end; below 1 mm it looks like metres or inches, below 0.02 mm it is
-  definitely not millimetres, above 20 000 mm it looks like micrometres or another unit.
-- `mesh.set_units` converts a mesh imported already, with `from`: the unit its coordinates really
-  are in. Regions, primitives and quad layouts over it are rescaled with it; a fitted surface
-  refuses the conversion. One undo step. A mesh converted once cannot be converted again.
-- `mesh.export` and the STEP and IGES exports write millimetres, as before.
+- `mesh.import` with `"units": "m"` for a scan saved in metres. `mesh.reconstruct` and
+  `mesh.import_stream` take `units` too; the store records its unit (`mesh.store_info` shows
+  `units`) and is written in millimetres.
+- A size that looks like a unit mistake (largest side below 1 mm, or above 20 000 mm) comes back as
+  `scale_warning` (code `suspicious_scale`) with the calls that fix it. It is raised only when the
+  unit was NOT stated: an explicit `units`, including `mm`, and a size set by `mesh.scale_from_length`
+  are taken as they are. The same warning is in `mesh.info`, `scan.qa` and `scan.to_solid`; in
+  `scan.to_solid` it is one issue and a `pass` becomes `review`. The rule: the largest axis extent
+  of the vertices; a mesh of 100 vertices or more has its most extreme vertices cut at each end
+  (one per hundred), and a larger mesh is measured on 100 000 vertices taken evenly through the
+  list. Below 1 mm: metres or inches; below 0.02 mm: definitely not millimetres; above 20 000 mm:
+  micrometres or another unit.
+- `mesh.set_units` states the unit of a mesh imported in the wrong one: `from` is the unit its
+  coordinates really are in. The factor is taken from the unit the mesh has now, so `cm` can be
+  corrected to `m` (factor 100), `m` to `mm` (factor 1/1000), and so on. `from` equal to the unit
+  it has now only acknowledges it and rescales nothing; this also clears the warning. Regions,
+  primitives and quad layouts over the mesh are rescaled with it, a fitted surface refuses the
+  conversion, and a mesh sized by `mesh.scale_from_length` refuses it. One undo step.
+- Run `mesh.set_units` straight after the import: it scales the mesh about the origin, so an
+  alignment or a `mesh.transform` made before it is scaled too. While the document holds bodies,
+  sketches or features (they are not rescaled, and they are not linked to a mesh, so every one of
+  them counts) `mesh.set_units` refuses unless `force` is true; the result's `left_alone` counts
+  what was left at the old size. `mesh.scale_from_length` reports `left_alone` the same way.
+- Export (`mesh.export`, STEP, IGES) writes millimetres, as before.
 
 ## Scale (photogrammetry)
 

@@ -725,9 +725,11 @@ fn relate(s: &mut Session, modelled: &[Modelled], sigma: Option<f64>) -> usize {
 /// `scan.to_solid`: the run, and a size that looks like a unit mistake (P9-U1) is one of its issues.
 fn to_solid(s: &mut Session, i: ToSolidIn) -> CmdResult<ToSolidOut> {
     let scan = i.scan.resolve(s, ObjectKind::Mesh)?;
-    let size = s.doc.mesh(scan).and_then(|m| size_check::scale_warning(&m.mesh));
+    let size = size_check::warning_of(&s.doc, scan);
     let mut out = run_to_solid(s, i)?;
     if let Some(w) = size {
+        // one place: the issue (the scan report's copy of the same finding goes)
+        out.scan_report.findings.retain(|f| f.code != w.code);
         out.issues.push(Issue { code: w.code.clone(), message: format!("{}. {}", w.message, w.suggestion) });
         if matches!(out.verdict, Verdict::Pass) {
             out.verdict = Verdict::Review;

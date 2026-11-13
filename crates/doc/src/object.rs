@@ -543,6 +543,8 @@ impl Document {
             visible: true,
             working: None,
             source_units: LengthUnit::Mm,
+            units_stated: false,
+            rescaled: false,
         });
         id
     }
