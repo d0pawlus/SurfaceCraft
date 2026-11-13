@@ -17,6 +17,7 @@
 //! the final ICP. It stays usable on scans of a million triangles.
 mod candidates;
 mod fpfh;
+mod probe;
 mod ransac;
 mod sample;
 mod score;
@@ -24,7 +25,7 @@ mod verdict;
 
 use crate::{AlignError, IcpOptions, icp_cancellable};
 use sample::Samples;
-use score::{Fit, Target, clearance, corners, fit_of, median, pose_gap, stability};
+use score::{Fit, Target, clearance, corners, fit_of, median, pose_gap};
 use surfacecraft_geom::{Cancel, Mesh, Point3, Transform};
 
 pub use verdict::{AMBIGUITY_MARGIN, CONFIDENCE_THRESHOLD, CoarseMethod, MIN_OVERLAP, PairCandidate, PairVerdict};
@@ -92,6 +93,15 @@ pub struct PairResult {
     pub refined: usize,
     /// How firmly the matched part pins the pose, 0 (it can slide or turn freely) and up.
     pub stability: f64,
+    /// Displaced starts tried for a weakly pinned pose (0 for a pinned or a free one).
+    pub probed: usize,
+    /// Of those, the ones that ended in a different pose that fits as well (they are alternatives).
+    pub slides: usize,
+    /// Smallest clearance of the pose over the displaced starts that ended elsewhere; the
+    /// ambiguity margin is the bound (`None`: all came back).
+    pub probe_margin: Option<f64>,
+    /// Largest distance (mm) a displaced start ended from the pose, among those that came back.
+    pub probe_return_gap: f64,
     /// Iterations of the final ICP (0 when it did not run).
     pub icp_iterations: usize,
     /// Did the final ICP converge?
@@ -271,21 +281,26 @@ impl<'a> Scene<'a> {
     /// poorly constrained direction ends in the same pose as the best one and merges with it.
     fn settle(&self, ranked: Vec<Ranked>, tau: f64, cancel: &Cancel) -> Result<Vec<Ranked>, AlignError> {
         let Some(top) = ranked.first().map(|r| r.fit) else { return Ok(ranked) };
-        let opts =
-            IcpOptions { max_iterations: 100, tolerance: 1e-4, max_distance: Some(3.0 * tau), max_samples: SAMPLE_CAP };
         let mut again = Vec::with_capacity(ranked.len());
         for r in ranked {
             let mut cand = r.cand;
             if clearance(&top, &r.fit) < AMBIGUITY_MARGIN {
-                match icp_cancellable(&self.mov_cloud, &self.fixed.bvh, &cand.t, &opts, cancel) {
-                    Ok(rep) => cand.t = rep.transform,
-                    Err(AlignError::Cancelled) => return Err(AlignError::Cancelled),
-                    Err(_) => {}
-                }
+                cand.t = self.converge(&cand.t, tau, cancel)?;
             }
             again.push(cand);
         }
         Ok(self.rank(again, tau))
+    }
+
+    /// `t` run to convergence by ICP on the moving samples (unchanged when ICP cannot run).
+    fn converge(&self, t: &Transform, tau: f64, cancel: &Cancel) -> Result<Transform, AlignError> {
+        let opts =
+            IcpOptions { max_iterations: 100, tolerance: 1e-4, max_distance: Some(3.0 * tau), max_samples: SAMPLE_CAP };
+        match icp_cancellable(&self.mov_cloud, &self.fixed.bvh, t, &opts, cancel) {
+            Ok(rep) => Ok(rep.transform),
+            Err(AlignError::Cancelled) => Err(AlignError::Cancelled),
+            Err(_) => Ok(*t),
+        }
     }
 
     /// The best pose polished by an ICP on the whole moving scan (kept only when it scores no
@@ -363,10 +378,20 @@ fn solve(scene: &Scene, hyps: Vec<Cand>, opts: &PairOptions, cancel: &Cancel) ->
     }
     let first = ranked.remove(0);
     let (best, icp_iterations, icp_converged) = scene.polish(&first, tau, cancel)?;
+    let probe = scene.probe(&best, tau, cancel)?;
+    let probes = corners(&scene.mov.pts);
+    for r in probe.slides.iter() {
+        if ranked.iter().all(|k| pose_gap(&k.cand.t, &r.cand.t, &probes) > SAME_POSE_AFTER * scene.diag) {
+            ranked.push(Ranked { cand: r.cand, fit: r.fit });
+        }
+    }
     let poses: Vec<Transform> = std::iter::once(best.cand.t).chain(ranked.iter().map(|r| r.cand.t)).collect();
     let shares = scene.overlaps_fixed(&poses, tau);
-    let stable = stability(&scene.fixed, &scene.fix, &scene.mov.pts, &best.cand.t, tau);
-    let mut result = conclude(&best, &ranked, tau, &shares, refined_count, stable)?;
+    let mut result = conclude(&best, &ranked, tau, &shares, refined_count, probe.stability)?;
+    result.probed = probe.tested;
+    result.slides = probe.slides.len();
+    result.probe_margin = probe.margin;
+    result.probe_return_gap = probe.returned_gap;
     result.candidates = candidates;
     result.icp_iterations = icp_iterations;
     result.icp_converged = icp_converged;
@@ -413,6 +438,10 @@ fn conclude(
         candidates: 0,
         refined,
         stability: stable,
+        probed: 0,
+        slides: 0,
+        probe_margin: None,
+        probe_return_gap: 0.0,
         icp_iterations: 0,
         icp_converged: false,
     })

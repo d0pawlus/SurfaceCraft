@@ -262,57 +262,200 @@ fn p9_pair_malformed_meshes_and_choices_give_specific_answers() {
     assert!(pair_err(&mut s, json!({"apply": true, "choose": n + 1})).contains(&format!("there are {n} alternatives")));
 }
 
-/// Gate (a) of review round 2: the stability does not depend on the density of the mesh (a raw face
-/// normal of a fine noisy mesh tilts by noise over edge length; the smoothed normals do not), so
-/// sliding patches stay `ambiguous` and pinned ones `unique` on meshes of 0.3 to 0.5 mm edges as on
-/// coarse ones. Prints the table.
-#[test]
-fn gate_m2_stability_does_not_move_with_the_density_of_the_mesh() {
-    let cyl =
-        |nu: usize, nv: usize, seed: u64| noisy(synth::cylinder(Point3::origin(), Vec3::z(), 10.0, 30.0, nu, nv), seed);
+/// Mirrors `STABILITY_FLOOR` of the library (below it a pose is called free without a test).
+const FLOOR: f64 = 0.001;
+/// Mirrors `AMBIGUITY_MARGIN`.
+const MARGIN: f64 = 0.03;
+
+/// How a case is built: (fixed, moving before its motion) on a coarse or a fine mesh.
+type Build = Box<dyn Fn(bool) -> (Mesh, Mesh)>;
+
+/// What a case must give: ambiguous, or unique within a pose bound (degrees, mm).
+#[derive(Clone, Copy)]
+enum Expect {
+    /// Never unique; `no_match` is accepted where ICP, steered by the raw normals of a fine noisy
+    /// face, drifts off a patch that has nothing to hold it.
+    NotUnique,
+    Ambiguous,
+    Unique(f64, f64),
+}
+
+fn cyl_at(h: f64, nu: usize, nv: usize, seed: u64) -> Mesh {
+    noisy(synth::cylinder(Point3::origin(), Vec3::z(), 10.0, h, nu, nv), seed)
+}
+
+fn cubic_at(n: usize) -> Mesh {
+    let mut m = synth::cuboid(Point3::origin(), Vec3::new(30.0, 30.0, 30.0), n);
+    m.append(&synth::sphere(Point3::new(8.0, 9.0, 30.0), 5.0, 32, 16));
+    m
+}
+
+/// Refined to edges of `h` mm (the bar would have 7 million triangles at 0.35).
+fn fine_at(m: &Mesh, h: f64, seed: u64) -> Mesh {
+    noisy(synth::refine(m, |_| h), seed)
+}
+
+fn duo(fixed: Mesh, moving: Mesh) -> (Mesh, Mesh) {
+    (fixed, moving)
+}
+
+fn cases() -> Vec<(&'static str, Expect, Build)> {
     let sector = |c: &Point3| c.y > 0.0 && c.x > 0.0 && c.x * c.x < 0.5 * (c.x * c.x + c.y * c.y);
-    let flat = |c: &Point3| (19.9..20.1).contains(&c.z) && c.x > 21.0 && c.y > 19.0;
+    let sliver = |c: &Point3| (19.9..20.1).contains(&c.z) && c.x > 21.0 && c.y > 19.0;
+    let interior = |c: &Point3| c.z > 3.9 && c.x > 15.0 && c.x < 40.0 && c.y > 10.0 && c.y < 30.0;
     let blob_patch = |c: &Point3| c.x > 15.0 && c.z > -4.0;
-    // (name, must be unique, coarse (fixed, patch), fine (fixed, patch))
-    let cases: Vec<(&str, bool, (Mesh, Mesh), (Mesh, Mesh))> = vec![
+    let bumps = |c: &Point3| c.z > 3.0 && c.x > 18.0 && c.x < 47.0;
+    let plain_plate = |n: usize| synth::cuboid(Point3::origin(), Vec3::new(60.0, 40.0, 4.0), n);
+    vec![
         (
-            "cylinder sector",
-            false,
-            (cyl(48, 12, 1), cut(&cyl(64, 14, 5), sector)),
-            (cyl(210, 100, 1), cut(&cyl(250, 120, 5), sector)),
+            "strictly flat patch",
+            Expect::NotUnique,
+            Box::new(move |f| {
+                if f {
+                    duo(fine(&plain_plate(10), 1), cut(&fine(&plain_plate(14), 5), interior))
+                } else {
+                    duo(noisy(plain_plate(10), 1), cut(&noisy(plain_plate(14), 5), interior))
+                }
+            }),
         ),
         (
-            "flat patch",
-            false,
-            (noisy(bracket_at(12, 48, 16), 1), cut(&noisy(bracket_at(17, 64, 20), 5), flat)),
-            (fine(&bracket_at(12, 48, 16), 1), cut(&fine(&bracket_at(17, 64, 20), 5), flat)),
+            "patch held by slivers",
+            Expect::Ambiguous,
+            Box::new(move |f| {
+                if f {
+                    duo(fine(&bracket_at(12, 48, 16), 1), cut(&fine(&bracket_at(17, 64, 20), 5), sliver))
+                } else {
+                    duo(noisy(bracket_at(12, 48, 16), 1), cut(&noisy(bracket_at(17, 64, 20), 5), sliver))
+                }
+            }),
+        ),
+        (
+            "cylinder sector",
+            Expect::Ambiguous,
+            Box::new(move |f| {
+                if f {
+                    duo(cyl_at(30.0, 210, 100, 1), cut(&cyl_at(30.0, 250, 120, 5), sector))
+                } else {
+                    duo(cyl_at(30.0, 48, 12, 1), cut(&cyl_at(30.0, 64, 14, 5), sector))
+                }
+            }),
+        ),
+        (
+            "repeated bumps",
+            Expect::Ambiguous,
+            Box::new(move |f| {
+                if f {
+                    duo(fine(&ribbed_plate(14, 8), 1), cut(&fine(&ribbed_plate(19, 10), 5), bumps))
+                } else {
+                    duo(noisy(ribbed_plate(14, 8), 1), cut(&noisy(ribbed_plate(19, 10), 5), bumps))
+                }
+            }),
         ),
         (
             "blob patch",
-            true,
-            (noisy(blob_at(48), 1), cut(&noisy(blob_at(62), 5), blob_patch)),
-            (noisy(blob_at(420), 1), cut(&noisy(blob_at(480), 5), blob_patch)),
+            Expect::Unique(0.5, 0.3),
+            Box::new(move |f| {
+                if f {
+                    duo(noisy(blob_at(420), 1), cut(&noisy(blob_at(480), 5), blob_patch))
+                } else {
+                    duo(noisy(blob_at(48), 1), cut(&noisy(blob_at(62), 5), blob_patch))
+                }
+            }),
         ),
         (
             "plate, 5 % bump",
-            true,
-            (noisy(plate_at(10, 16), 1), noisy(plate_at(14, 20), 5)),
-            (fine(&plate_at(10, 16), 1), fine(&plate_at(14, 20), 5)),
+            Expect::Unique(MAX_ANGLE_DEG, MAX_DISPLACEMENT_MM),
+            Box::new(move |f| {
+                if f {
+                    duo(fine(&plate_at(10, 16), 1), fine(&plate_at(14, 20), 5))
+                } else {
+                    duo(noisy(plate_at(10, 16), 1), noisy(plate_at(14, 20), 5))
+                }
+            }),
         ),
-    ];
-    for (name, pinned, (cf, cm), (ff, fm)) in cases {
-        let (vc, sc) = patch_case(&cf, &cm, 1);
-        let (vf, sf) = patch_case(&ff, &fm, 1);
-        eprintln!(
-            "STABILITY {name}: coarse {sc:.5} ({vc}, {} tris), fine {sf:.5} ({vf}, {} tris)",
-            cf.triangle_count(),
-            ff.triangle_count()
-        );
-        for (v, label) in [(&vc, "coarse"), (&vf, "fine")] {
-            assert_eq!(v == "unique", pinned, "{name} on the {label} mesh: {v}");
+        (
+            "near-cubic with a bump",
+            Expect::Unique(MAX_ANGLE_DEG, MAX_DISPLACEMENT_MM),
+            Box::new(move |f| {
+                if f {
+                    duo(fine(&cubic_at(8), 1), fine(&cubic_at(11), 5))
+                } else {
+                    duo(noisy(cubic_at(8), 1), noisy(cubic_at(11), 5))
+                }
+            }),
+        ),
+        (
+            "slender bar with a block",
+            Expect::Unique(MAX_ANGLE_DEG, MAX_DISPLACEMENT_MM),
+            Box::new(move |f| {
+                if f {
+                    duo(fine_at(&bar_at(30), 1.0, 1), fine_at(&bar_at(41), 1.0, 5))
+                } else {
+                    duo(noisy(bar_at(30), 1), noisy(bar_at(41), 5))
+                }
+            }),
+        ),
+        (
+            "long cylinder",
+            Expect::Ambiguous,
+            Box::new(move |f| {
+                if f {
+                    duo(cyl_at(400.0, 180, 1150, 1), cyl_at(400.0, 210, 1300, 5))
+                } else {
+                    duo(cyl_at(400.0, 48, 60, 1), cyl_at(400.0, 64, 80, 5))
+                }
+            }),
+        ),
+    ]
+}
+
+/// Review round 3: a pose is decided by pushing it, not by a threshold on how loose it is. Every
+/// case on a coarse and a fine mesh (0.3 to 0.5 mm edges, 1 mm for the 400 mm bar; sigma 0.05). Prints the table: stability,
+/// displaced starts tried, slides found, the smallest clearance of the pose over the displaced
+/// starts that ended elsewhere (the bound is the margin 0.03), the largest distance a displaced
+/// start came back from.
+#[test]
+fn gate_m2_loose_poses_are_decided_by_pushing_them() {
+    for (name, expect, build) in cases() {
+        for fine_mesh in [false, true] {
+            let label = if fine_mesh { "fine" } else { "coarse" };
+            let (fixed, moving) = build(fine_mesh);
+            let pose = random_motion(1);
+            let mut s = session(&fixed, &moving, &pose);
+            let out = pair(&mut s, json!({}));
+            let (angle, disp) = pose_error(&matrix_of(&out), &pose, &moving);
+            let (stability, probed, slides) =
+                (stab(&out), out["probed"].as_u64().unwrap(), out["slides"].as_u64().unwrap());
+            let margin = out["probe_margin"].as_f64();
+            let gap = out["probe_return_gap"].as_f64().unwrap();
+            eprintln!(
+                "PUSH {name} [{label}, {} tris]: {} stability {stability:.5}, probed {probed}, slides {slides}, margin {margin:?}, return gap {gap:.3} mm, pose {angle:.3} deg {disp:.3} mm, {} alternatives",
+                fixed.triangle_count(),
+                out["verdict"],
+                out["alternatives"].as_array().unwrap().len()
+            );
+            match expect {
+                Expect::NotUnique => {
+                    assert_ne!(out["verdict"], "unique", "{name} [{label}]: {out}");
+                    assert!(stability < 0.04 || out["verdict"] == "no_match", "{name} [{label}]: {stability}");
+                }
+                Expect::Ambiguous => {
+                    assert_eq!(out["verdict"], "ambiguous", "{name} [{label}]: {out}");
+                    // free (below the floor) or found sliding by the probe, or ambiguous by the clearance
+                    // of other candidates: never unique
+                }
+                Expect::Unique(max_angle, max_disp) => {
+                    assert_eq!(out["verdict"], "unique", "{name} [{label}]: {out}");
+                    assert!(angle <= max_angle && disp <= max_disp, "{name} [{label}]: {angle} deg {disp} mm");
+                    assert!(stability > 3.0 * FLOOR, "{name} [{label}]: the floor must not catch it ({stability})");
+                    assert_eq!(slides, 0);
+                    // every displaced start that ended elsewhere fit clearly worse (twice the margin or more)
+                    assert!(margin.is_none_or(|m| m >= 2.0 * MARGIN), "{name} [{label}]: margin {margin:?}");
+                    // and those that came back did so within a quarter of the pose tolerance (2 % of the diagonal)
+                    assert!(gap <= 0.25 * 0.02 * fixed.bbox().diagonal(), "{name} [{label}]: returned {gap} mm off");
+                }
+            }
         }
-        let ratio = sf.max(1e-9) / sc.max(1e-9);
-        assert!((0.33..=3.0).contains(&ratio), "{name}: the stability moved with the density: {sc} -> {sf}");
     }
 }
 

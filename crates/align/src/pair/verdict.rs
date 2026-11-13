@@ -14,14 +14,18 @@ pub const AMBIGUITY_MARGIN: f64 = 0.03;
 pub const CONFIDENCE_THRESHOLD: f64 = 0.5;
 /// Largest share of the moving scan that may lie where the fixed scan is but off it.
 pub(super) const MAX_CONFLICT: f64 = 0.25;
-/// Smallest stability ([`super::score::stability`]) of a pose that counts as pinned. Measured on
-/// the tests (coarse and fine meshes agree within a factor of 3): parts that slide or turn freely
-/// 0.0002 to 0.0004 (cylinder sector, 400 mm cylinder), a flat patch pinned only by the border of
-/// its face 0.006 to 0.0076, and from above, the least pinned part that must be found, a 15 % blob
-/// patch, 0.011 to 0.017, a plate with a 5 % bump 0.06 to 0.09, a 20:1 bar 0.03, a bracket 0.18, and the 13 real scans (a moved decimated copy) 0.012 to 0.24.
-/// The threshold sits in the gap between 0.0076 and 0.011 (a factor 1.2 either way, a thin gap): a
-/// small patch on its edge is reported `ambiguous` rather than `unique`, which is the safe side.
-pub(super) const MIN_STABILITY: f64 = 0.009;
+/// Stability ([`super::score::stability`]) below which the matched part can slide or turn freely
+/// and nothing is tried: `ambiguous`. Measured: such parts read 0.00001 to 0.0004 (cylinder
+/// sector, long cylinder, a patch strictly inside a flat face, on Linux, macOS and Windows), and
+/// the least pinned part that must be found 0.0116 (a real scan): a factor 2.5 above the highest
+/// free one, which does not matter (a free part between the two would be probed and found
+/// ambiguous anyway), and 11 below the lowest legitimate one, which does (it must not be caught).
+pub(super) const STABILITY_FLOOR: f64 = 0.001;
+/// Poses with a stability up to this are probed for slides (see `probe`); above it they are pinned
+/// as far as can matter. Measured legitimate poses: 0.0116 and up, of which only the weakest few
+/// fall below (3.4 times the lowest); every pose above is taken as pinned, the weakest of those
+/// measured being a plate with a bump and partial scans at 0.05.
+pub(super) const WEAK_BELOW: f64 = 0.04;
 /// Largest RMS of the matched part as a fraction of the tolerance.
 pub(super) const MAX_RMS_FRACTION: f64 = 0.5;
 /// Clearance (shares of the moving scan's area) that gives full confidence.
@@ -75,7 +79,7 @@ pub struct PairCandidate {
 /// shares, `tau` is in mm, `clearance` is the smallest [`super::score::clearance`] to any other
 /// distinct pose (`None` when all others are the same pose), `refined` the number of candidates
 /// that could be refined: with fewer than two, nothing was compared and the answer is never certain;
-/// `stable` below [`MIN_STABILITY`] means the part leaves the pose free to slide: ambiguous.
+/// `stable` below [`STABILITY_FLOOR`] means the part leaves the pose free to slide: ambiguous.
 pub(super) fn judge(
     best: &Fit,
     overlap: f64,
@@ -92,7 +96,7 @@ pub(super) fn judge(
     }
     let gap = clearance.unwrap_or(1.0);
     let confidence = (gap / FULL_CONFIDENCE_GAP).clamp(0.0, 1.0);
-    if !(stable >= MIN_STABILITY) {
+    if !(stable >= STABILITY_FLOOR) {
         return (PairVerdict::Ambiguous, confidence.min(0.25));
     }
     let verdict = if confidence >= CONFIDENCE_THRESHOLD { PairVerdict::Unique } else { PairVerdict::Ambiguous };

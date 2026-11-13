@@ -142,16 +142,59 @@ pub(super) fn fit_of(target: &Target, pts: &[Point3], t: &Transform, tau: f64, c
     }
 }
 
+/// A direction in which the matched part may be loose: a small rigid motion (rotation vector
+/// `omega` and shift, about `centre`) scaled so that its largest displacement of a matched point
+/// is the step asked for.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Twist {
+    centre: Point3,
+    omega: Vec3,
+    shift: Vec3,
+}
+
+impl Twist {
+    /// `t` followed by this motion (`sign` +1 or -1 picks the sense).
+    pub(super) fn displace(&self, t: &Transform, sign: f64) -> Transform {
+        let w = self.omega * sign;
+        let angle = w.norm();
+        let rot =
+            if angle > 1e-300 { Transform::rotation_axis_angle(&(w / angle), angle) } else { Transform::identity() };
+        Transform::translation(self.centre.coords + self.shift * sign)
+            .then_after(&rot)
+            .then_after(&Transform::translation(-self.centre.coords))
+            .then_after(t)
+    }
+}
+
+/// How firmly the matched part pins a pose.
+#[derive(Clone, Debug)]
+pub(super) struct Stability {
+    /// Smallest eigenvalue of the normalised point-to-plane system (see [`stability`]).
+    pub min: f64,
+    /// The directions of the eigenvalues below the bound asked for, weakest first (at most six).
+    pub weak: Vec<Twist>,
+}
+
 /// How firmly the matched part pins the pose (geometric stability, after Gelfand et al. 2003):
-/// the smallest eigenvalue of the point-to-plane normal equations of the matched points at `t`
-/// (0 when the part can slide or turn freely, as a flat or cylindrical patch can).
+/// the eigenvalues of the point-to-plane normal equations of the matched points at `t`. The
+/// smallest is 0 when the part can slide or turn freely; the eigenvectors of those below
+/// `weak_below` are returned as motions of largest displacement `step` mm, to be tried.
 ///
-/// Two things keep it comparable between scans: the surface normals are the plane-fitted ones of the
-/// nearest fixed sample (a raw face normal of a fine noisy mesh tilts by about noise over edge
+/// Two things keep it comparable between scans: the surface normals are the plane-fitted ones of
+/// the nearest fixed sample (a raw face normal of a fine noisy mesh tilts by about noise over edge
 /// length, which would pin a sliding patch by tilt squared), and the rotation about each principal
 /// axis of the matched points is scaled by that axis's own lever arm, so a pinned direction reads
 /// alike for a compact part and a 20:1 bar.
-pub(super) fn stability(target: &Target, fixed: &Samples, pts: &[Point3], t: &Transform, tau: f64) -> f64 {
+pub(super) fn stability(
+    target: &Target,
+    fixed: &Samples,
+    pts: &[Point3],
+    t: &Transform,
+    tau: f64,
+    weak_below: f64,
+    step: f64,
+) -> Stability {
+    let none = Stability { min: 0.0, weak: Vec::new() };
     let hits: Vec<Option<(Point3, Vec3)>> = surfacecraft_geom::par::map_slice(pts, |p| {
         let q = t.apply(p);
         let h = target.bvh.closest(&q, tau)?;
@@ -160,19 +203,19 @@ pub(super) fn stability(target: &Target, fixed: &Samples, pts: &[Point3], t: &Tr
     });
     let used: Vec<&(Point3, Vec3)> = hits.iter().flatten().collect();
     if used.len() < 6 {
-        return 0.0;
+        return none;
     }
     let n = used.len() as f64;
     let c = used.iter().map(|h| h.0.coords).sum::<Vec3>() / n;
     let cov = used.iter().fold(Mat3::zeros(), |m, h| m + (h.0.coords - c) * (h.0.coords - c).transpose()) / n;
     if cov.iter().any(|v| !v.is_finite()) {
-        return 0.0;
+        return none;
     }
     let frame = cov.symmetric_eigen();
     let trace = cov.trace();
     let lever: Vec<f64> = (0..3).map(|i| (trace - frame.eigenvalues[i]).max(0.0).sqrt()).collect();
     if lever.iter().any(|l| !(*l > 0.0)) {
-        return 0.0;
+        return none;
     }
     let mut a = nalgebra::Matrix6::<f64>::zeros();
     for (q, nrm) in used.iter().map(|h| (&h.0, &h.1)) {
@@ -185,17 +228,40 @@ pub(super) fn stability(target: &Target, fixed: &Samples, pts: &[Point3], t: &Tr
         }
         a += row * row.transpose();
     }
-    min_eigenvalue(&(a / n))
+    let Some((eig, order)) = weakest_first(&(a / n)) else { return none };
+    let min = eig.eigenvalues[order[0]].max(0.0);
+    let centre = Point3::from(c);
+    let mut weak = Vec::new();
+    for &k in order.iter().filter(|&&k| eig.eigenvalues[k] < weak_below).take(6) {
+        let v = eig.eigenvectors.column(k);
+        let (mut omega, mut shift) = (Vec3::zeros(), Vec3::zeros());
+        for i in 0..3 {
+            let e: Vec3 = frame.eigenvectors.column(i).into_owned();
+            omega += e * (v[i] / lever[i]);
+            shift += e * v[3 + i];
+        }
+        let reach = used.iter().map(|h| (omega.cross(&(h.0.coords - c)) + shift).norm()).fold(0.0, f64::max);
+        if reach > 0.0 && reach.is_finite() {
+            let scale = step / reach;
+            weak.push(Twist { centre, omega: omega * scale, shift: shift * scale });
+        }
+    }
+    Stability { min: if min.is_finite() { min } else { 0.0 }, weak }
 }
 
-/// Smallest eigenvalue of a symmetric matrix; 0 when it is not finite (the iteration of the
-/// decomposition does not end on such input).
-pub(super) fn min_eigenvalue(a: &nalgebra::Matrix6<f64>) -> f64 {
+/// The eigen decomposition of a symmetric matrix with the indices of its eigenvalues, smallest
+/// first (ties by index, so the order never depends on the platform's rounding). `None` when the
+/// matrix is not finite: the iteration of the decomposition does not end on such input.
+fn weakest_first(
+    a: &nalgebra::Matrix6<f64>,
+) -> Option<(nalgebra::linalg::SymmetricEigen<f64, nalgebra::U6>, Vec<usize>)> {
     if a.iter().any(|v| !v.is_finite()) {
-        return 0.0;
+        return None;
     }
-    let min = a.symmetric_eigen().eigenvalues.min();
-    if min.is_finite() { min.max(0.0) } else { 0.0 }
+    let eig = a.symmetric_eigen();
+    let mut order: Vec<usize> = (0..6).collect();
+    order.sort_by(|&i, &j| eig.eigenvalues[i].total_cmp(&eig.eigenvalues[j]).then(i.cmp(&j)));
+    Some((eig, order))
 }
 
 /// The eight corners of the bounding box of `pts`: probes for comparing two poses.
@@ -268,13 +334,13 @@ mod tests {
     /// Finding 4: a matrix that is not finite has no eigenvalue to report (and must not be handed to
     /// the iteration).
     #[test]
-    fn a_non_finite_system_has_zero_stability() {
+    fn a_non_finite_system_is_not_decomposed() {
         let mut a = nalgebra::Matrix6::<f64>::identity();
-        assert_eq!(min_eigenvalue(&a), 1.0);
+        assert!(weakest_first(&a).is_some());
         a[(2, 3)] = f64::NAN;
-        assert_eq!(min_eigenvalue(&a), 0.0);
+        assert!(weakest_first(&a).is_none());
         a[(2, 3)] = f64::INFINITY;
-        assert_eq!(min_eigenvalue(&a), 0.0);
+        assert!(weakest_first(&a).is_none());
     }
 
     #[test]

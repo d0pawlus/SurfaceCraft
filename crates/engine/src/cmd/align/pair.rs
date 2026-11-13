@@ -64,8 +64,17 @@ pub struct PairOut {
     pub icp_iterations: usize,
     /// Did the final ICP converge?
     pub icp_converged: bool,
-    /// How firmly the matched part pins the pose: 0 means it can slide or turn freely (a flat or cylindrical patch; the verdict is then `ambiguous`), pinned parts measure above 0.011.
+    /// How firmly the matched part pins the pose: below 0.001 it can slide or turn freely (a flat or cylindrical patch; the verdict is then `ambiguous`); up to 0.04 the pose is pushed along its loose directions and refined again, and a different pose that fits as well makes it `ambiguous`.
     pub stability: f64,
+    /// Displaced starts tried for a weakly pinned pose (a pinned pose, or one that slides freely, is not tried).
+    pub probed: usize,
+    /// Of those, the starts that ended in a different pose that fits as well: slides, listed as alternatives.
+    pub slides: usize,
+    /// Smallest clearance of the pose over the displaced starts that ended elsewhere (the ambiguity margin 0.03 is the bound); absent when all came back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe_margin: Option<f64>,
+    /// Largest distance in mm a displaced start ended from the pose, among those that came back.
+    pub probe_return_gap: f64,
     /// A sentence about the outcome.
     pub note: String,
 }
@@ -185,6 +194,10 @@ pub(super) fn pair(s: &mut Session, i: PairIn) -> CmdResult<PairOut> {
         candidates: r.candidates,
         refined: r.refined,
         stability: r.stability,
+        probed: r.probed,
+        slides: r.slides,
+        probe_margin: r.probe_margin,
+        probe_return_gap: r.probe_return_gap,
         icp_iterations: shown.icp_iterations,
         icp_converged: shown.icp_converged,
     })
