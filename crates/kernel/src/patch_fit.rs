@@ -184,6 +184,11 @@ struct Round {
     ignored: usize,
 }
 
+/// One direction's size after growing by 1.5×, capped.
+fn grown(n: usize, max: usize) -> usize {
+    (n * 3).div_ceil(2).max(n + 1).min(max)
+}
+
 /// The net after a round that missed: the direction(s) with the larger miss grow by 1.5×, capped.
 fn grow(net: [usize; 2], miss: [f64; 2], max: usize) -> [usize; 2] {
     let both = (miss[0] - miss[1]).abs() <= 0.05 * miss[0].max(miss[1]);
@@ -194,10 +199,22 @@ fn grow(net: [usize; 2], miss: [f64; 2], max: usize) -> [usize; 2] {
     let mut out = net;
     for d in order {
         if out[d] < max {
-            out[d] = (out[d] * 3).div_ceil(2).clamp(out[d] + 1, max);
+            out[d] = grown(out[d], max);
             if !both {
                 break;
             }
+        }
+    }
+    out
+}
+
+/// The net after a round whose growth (`from` to `net`) did not help: the directions that did
+/// not grow in that step grow now. Unchanged when every direction grew or is at `max`.
+fn grow_other(net: [usize; 2], from: [usize; 2], max: usize) -> [usize; 2] {
+    let mut out = net;
+    for d in 0..2 {
+        if out[d] == from[d] && out[d] < max {
+            out[d] = grown(out[d], max);
         }
     }
     out
@@ -262,6 +279,9 @@ pub fn fit_patch(req: &Request) -> Result<Patch> {
     let mut cache: Option<(Layout, Vec<SideSamples>)> = None;
     let mut prev: Option<Surface> = None;
     let mut prev_worst = f64::INFINITY;
+    // the net before the last growth, and whether the last round already was a retry
+    let mut from = start_net;
+    let mut retried = false;
     let mut rounds = 0u32;
     for round in 1..=MAX_ROUNDS {
         rounds = round;
@@ -296,12 +316,26 @@ pub fn fit_patch(req: &Request) -> Result<Patch> {
                 ignored: built.ignored,
             });
         }
-        if done || !improved || round == MAX_ROUNDS {
+        if done || round == MAX_ROUNDS {
             break;
         }
-        prev_worst = worst;
+        // a round that did not help gets one retry in the direction(s) not grown last time
+        let next = if improved {
+            retried = false;
+            grow(net, miss, max)
+        } else if retried {
+            break;
+        } else {
+            retried = true;
+            grow_other(net, from, max)
+        };
+        if next == net {
+            break;
+        }
+        prev_worst = prev_worst.min(worst);
         prev = Some(solution.surface);
-        net = grow(net, miss, max);
+        from = net;
+        net = next;
     }
     let Some(best) = best else {
         return Err(KernelError::Argument("the patch could not be fitted".into()));

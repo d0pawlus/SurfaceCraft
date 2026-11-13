@@ -167,6 +167,17 @@ fn wave_with_data() {
 }
 
 #[test]
+fn g0_to_cylinder() {
+    let req = cylinder_hole(Continuity::G0);
+    let patch = fit_patch(&req).unwrap();
+    assert!(patch.report.within_targets, "{:?}", patch.report);
+    for s in &patch.report.sides {
+        assert!(s.gap_max <= G0_TARGET, "{:?}", patch.report);
+    }
+    assert!(patch.report.control.iter().all(|&n| n <= req.max_control), "{:?}", patch.report);
+}
+
+#[test]
 fn g1_to_cylinder() {
     let patch = fit_patch(&cylinder_hole(Continuity::G1)).unwrap();
     for s in &patch.report.sides {
