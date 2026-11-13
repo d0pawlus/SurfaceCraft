@@ -211,6 +211,7 @@ pub fn find(id: &str) -> Option<&'static CommandSpec> {
 /// Commands too slow to run on every parameter change (a front end skips their live preview).
 const HEAVY: &[&str] = &[
     "align.auto",
+    "align.global",
     "align.icp",
     "align.pair_coarse",
     "body.compare",

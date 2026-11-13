@@ -1010,5 +1010,7 @@
   "cmd.mesh.thicken.hint": "Z otwartego skanu robi zamkniętą skorupę o stałej grubości jako nową siatkę.",
   "param.keep_thickened": "Zostaw pogrubioną siatkę",
   "cmd.align.pair_coarse": "Wyrównanie dwóch skanów",
-  "cmd.align.pair_coarse.hint": "Układa drugi skan tej samej części na pierwszym bez wskazywania punktów: próbuje osi głównych i dopasowania lokalnych kształtów, także gdy skany zachodzą na siebie tylko częściowo. Mówi, kiedy ułożenie jest niejednoznaczne albo skany do siebie nie pasują."
+  "cmd.align.pair_coarse.hint": "Układa drugi skan tej samej części na pierwszym bez wskazywania punktów: próbuje osi głównych i dopasowania lokalnych kształtów, także gdy skany zachodzą na siebie tylko częściowo. Mówi, kiedy ułożenie jest niejednoznaczne albo skany do siebie nie pasują.",
+  "cmd.align.global": "Wyrównanie wielu skanów",
+  "cmd.align.global.hint": "Układa kilka skanów tej samej części we wspólnym położeniu bez wskazywania punktów: wyrównuje pary, ocenia, którym parom można ufać, i poprawia wszystkie położenia razem, tak by błąd wzdłuż pętli się rozłożył. Skany, których nie da się połączyć, zostają na miejscu."
 }

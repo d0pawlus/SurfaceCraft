@@ -9,6 +9,7 @@ use surfacecraft_doc::{ObjectId, ObjectKind};
 use surfacecraft_geom::{Bvh, Mesh, Point3, Transform, Vec3};
 
 mod auto;
+mod global;
 mod pair;
 mod settle;
 
@@ -447,5 +448,15 @@ pub static COMMANDS: &[CommandSpec] = &[
         pair::PairIn,
         pair::PairOut,
         pair::pair
+    ),
+    command!(
+        "align.global",
+        "Align many scans",
+        "Align",
+        true,
+        "Brings 2 to 24 scans of one part into one common pose with no picked points: pair poses (as `align.pair_coarse`; only `unique` pairs with enough overlap count, `ambiguous` and `no_match` ones are no edge), a spanning tree from the fixed scan, then a relaxation of all poses together that spreads the error around loops. Reports per scan its pose and whether it was placed, per pair the verdict, overlap and residual, the loop closure error before and after, and a verdict (`aligned`, `partial`, `failed`) with issue codes. Scans that cannot be connected to the fixed one are listed as unplaced and are not moved. `apply` false (default) only proposes; `apply` moves every placed scan in one undo step.",
+        global::GlobalIn,
+        global::GlobalOut,
+        global::global
     ),
 ];

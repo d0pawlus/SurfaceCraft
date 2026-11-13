@@ -1010,5 +1010,7 @@
   "cmd.mesh.thicken.hint": "Makes a closed shell of constant thickness from an open scan, as a new mesh.",
   "param.keep_thickened": "Keep thickened mesh",
   "cmd.align.pair_coarse": "Align two scans",
-  "cmd.align.pair_coarse.hint": "Brings a second scan of the same part onto the first without picking points: it tries the main axes and local shape matches, also when the scans overlap only partly. Says when the pose is ambiguous or there is no match."
+  "cmd.align.pair_coarse.hint": "Brings a second scan of the same part onto the first without picking points: it tries the main axes and local shape matches, also when the scans overlap only partly. Says when the pose is ambiguous or there is no match.",
+  "cmd.align.global": "Align many scans",
+  "cmd.align.global.hint": "Brings several scans of the same part into one common pose without picking points: it aligns the pairs, tells which pairs are trustworthy, and relaxes all poses together so that the error around a loop is spread. Scans that cannot be connected stay where they are."
 }
