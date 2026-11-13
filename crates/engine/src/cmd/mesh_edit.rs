@@ -1,5 +1,6 @@
 //! `mesh.*` edits of a triangle mesh: clean-up, decimation, smoothing and hole filling. Each edit
 //! acts on the working copy while the mesh has one (see `mesh.working_*`), else on the original.
+use super::mesh_folds::FoldsOut;
 use super::{CmdError, CmdResult, CommandSpec, ObjRef};
 use crate::{Session, command};
 use schemars::JsonSchema;
@@ -7,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use surfacecraft_doc::{ObjectId, ObjectKind};
 use surfacecraft_geom::reduce::{self, DeviationStats, ToleranceOptions, ToleranceReport};
-use surfacecraft_geom::{Mesh, edit};
+use surfacecraft_geom::{Mesh, edit, folds};
 
 /// Result of a mesh edit.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -28,6 +29,9 @@ pub struct EditOut {
     /// Holes left open (above the size limit, not triangulable, or whose fill would put three triangles on one edge).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub holes_left: Option<usize>,
+    /// Folds removed by `mesh.clean` (see `remove_folds`); absent when the step did not run.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub folds: Option<FoldsOut>,
     /// Largest vertex displacement (smoothing), mm.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_displacement: Option<f64>,
@@ -123,6 +127,7 @@ fn edit_mesh(
         added_triangles: 0,
         holes_filled: None,
         holes_left: None,
+        folds: None,
         max_displacement: None,
         regions_dropped: 0,
         tolerance_report: None,
@@ -182,6 +187,9 @@ pub struct CleanIn {
     /// Also fill holes up to this many edges (default: leave holes).
     #[serde(default)]
     pub fill_holes_max_edges: Option<usize>,
+    /// Remove folds (default false; `scan.to_solid` with `thickness` turns it on): small groups of triangles that face against the surface around them, where the scan passes through itself; the hole is filled. Larger groups are left and reported in `folds`.
+    #[serde(default)]
+    pub remove_folds: Option<bool>,
 }
 
 pub(crate) fn clean(s: &mut Session, i: CleanIn) -> CmdResult<EditOut> {
@@ -200,11 +208,32 @@ pub(crate) fn clean(s: &mut Session, i: CleanIn) -> CmdResult<EditOut> {
         if let Some(n) = i.fill_holes_max_edges {
             let before = m.triangle_count();
             let r = edit::fill_holes(m, n, true);
-            o.added_triangles = m.triangle_count() - before;
+            o.added_triangles += m.triangle_count() - before;
             o.holes_filled = Some(r.filled);
             o.holes_left = Some(r.skipped);
         }
+        // after the holes are filled: a patch can cross the sheet around it
+        if i.remove_folds.unwrap_or(false) {
+            fold_step(m, o);
+        }
         edit::compact(m);
+        Ok(())
+    })
+}
+
+/// Removes the folds of `m` (see `surfacecraft_geom::folds`) and reports them in `o`.
+fn fold_step(m: &mut Mesh, o: &mut EditOut) {
+    let before = m.triangle_count();
+    let report = folds::remove_folds(m);
+    o.removed_triangles += report.removed_triangles;
+    o.added_triangles += (m.triangle_count() + report.removed_triangles).saturating_sub(before);
+    o.folds = Some(FoldsOut::from(&report));
+}
+
+/// The fold removal of `mesh.clean` on its own, for a pipeline that fills the holes itself.
+pub(crate) fn remove_folds(s: &mut Session, object: &ObjRef) -> CmdResult<EditOut> {
+    edit_mesh(s, object, |m, o| {
+        fold_step(m, o);
         Ok(())
     })
 }

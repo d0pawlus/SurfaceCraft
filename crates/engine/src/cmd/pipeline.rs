@@ -311,6 +311,7 @@ fn prepare(s: &mut Session, i: &ToSolidIn, scan: ObjectId) -> CmdResult<ScanSumm
                 min_component_triangles: None,
                 outlier_ratio: None,
                 fill_holes_max_edges: Some(i.fill_holes_max_edges.unwrap_or(FILL_HOLES_MAX_EDGES)),
+                remove_folds: None,
             },
         )?;
         filled = edit.holes_filled.unwrap_or(0);

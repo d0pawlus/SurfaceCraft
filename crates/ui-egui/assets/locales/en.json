@@ -867,6 +867,7 @@
   "param.min_component_fraction": "Smallest piece (share)",
   "param.min_component_triangles": "Smallest piece (triangles)",
   "param.outlier_ratio": "Spike limit",
+  "param.remove_folds": "Remove folds of the scan",
   "param.max_error": "Max error",
   "param.preserve_boundary": "Keep the border",
   "param.share": "Share within tolerance",
