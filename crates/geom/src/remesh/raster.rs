@@ -16,6 +16,8 @@ use crate::{Mesh, Point3, par};
 const JITTER: (f64, f64) = (0.071_283_9, 0.029_745_3);
 /// Triangles rasterised per parallel task.
 const CHUNK: usize = 2048;
+/// Chunks per batch between limit checks (fixed, so the refusal does not depend on the threads).
+const BATCH_CHUNKS: usize = 16;
 
 /// What the scan conversion found.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -93,7 +95,7 @@ fn rasterise(g: &Grid, t: [[f64; 3]; 3], flip: bool, out: &mut Vec<u64>) {
 fn crossings(mesh: &Mesh, g: &Grid, flip: bool, limit: usize) -> Result<Vec<u64>, RemeshError> {
     let chunks = mesh.triangle_count().div_ceil(CHUNK);
     let mut all: Vec<u64> = Vec::new();
-    let batch = (par::threads() * 4).max(1);
+    let batch = BATCH_CHUNKS;
     for first in (0..chunks).step_by(batch) {
         let part: Vec<Vec<u64>> = par::map(batch.min(chunks - first), |b| {
             let mut out = Vec::new();

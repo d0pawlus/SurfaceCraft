@@ -19,6 +19,9 @@ fn gate_m6_web_subset_runs_without_files() {
         ("export.step", json!({"objects": ["box"]})),
         ("export.iges", json!({"objects": ["box"]})),
         ("mesh.export", json!({"object": "scan", "format": "stl"})),
+        ("mesh.synth", json!({"shape": "sphere", "name": "ball", "resolution": 40})),
+        ("scan.split", json!({"object": "ball"})),
+        ("mesh.remesh", json!({"object": "ball", "voxel": 1.0})),
     ];
     for (cmd, p) in steps {
         let r = s.execute(cmd, p);

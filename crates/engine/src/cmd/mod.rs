@@ -23,6 +23,7 @@ pub mod feature;
 pub mod hybrid;
 pub mod mesh;
 pub mod mesh_edit;
+pub mod mesh_remesh;
 pub mod param;
 pub mod pipeline;
 pub mod plan;
@@ -31,6 +32,7 @@ pub mod qa;
 pub mod quad;
 pub mod refit;
 pub mod region;
+pub mod scan_split;
 pub mod section;
 pub mod sketch;
 pub mod stream;
@@ -173,10 +175,12 @@ static REGISTRY: LazyLock<Vec<CommandSpec>> = LazyLock::new(|| {
     v.extend_from_slice(deviation::COMMANDS);
     v.extend_from_slice(mesh::COMMANDS);
     v.extend_from_slice(mesh_edit::COMMANDS);
+    v.extend_from_slice(mesh_remesh::COMMANDS);
     v.extend_from_slice(param::COMMANDS);
     v.extend_from_slice(pipeline::COMMANDS);
     v.extend_from_slice(primitive::COMMANDS);
     v.extend_from_slice(qa::COMMANDS);
+    v.extend_from_slice(scan_split::COMMANDS);
     v.extend_from_slice(quad::COMMANDS);
     v.extend_from_slice(wrap::COMMANDS);
     v.extend_from_slice(refit::COMMANDS);
@@ -229,6 +233,7 @@ const HEAVY: &[&str] = &[
     "mesh.import",
     "mesh.import_stream",
     "mesh.reconstruct",
+    "mesh.remesh",
     "mesh.remove_outliers",
     "mesh.smooth",
     "mesh.store_info",
@@ -236,6 +241,7 @@ const HEAVY: &[&str] = &[
     "primitive.fit",
     "primitive.symmetry",
     "scan.qa",
+    "scan.split",
     "scan.to_solid",
     "quad.retopo",
     "region.auto_segment",

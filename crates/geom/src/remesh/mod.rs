@@ -41,6 +41,8 @@ const PROBE_SAMPLES: usize = 2000;
 const THIN_EXTRA_VOXELS: f64 = 2.0;
 /// Share of the probes allowed to find a thinner wall (those are detail, not the wall).
 const THIN_PERCENTILE: usize = 2;
+/// The voxel is never made finer than the default divided by this.
+const MAX_REFINE: f64 = 8.0;
 /// Closing rounds that remove checkerboard voxel blocks.
 const DIAGONAL_ROUNDS: usize = 12;
 /// Samples of each surface in the deviation report.
@@ -117,7 +119,7 @@ pub enum RemeshError {
     Empty,
     /// The scan has an open boundary after the small holes were filled.
     #[error(
-        "the scan is open: {loops} boundary loops remain after filling holes of up to {max_hole_edges} edges and {max_hole} mm, the largest with {largest_edges} edges ({length:.1} mm long); remeshing builds a closed solid and does not close large openings"
+        "the scan is open: {loops} boundary loops wider than {max_hole} mm remain after filling holes of up to {max_hole_edges} edges, the largest with {largest_edges} edges ({length:.1} mm long); remeshing builds a closed solid and does not close large openings"
     )]
     Open {
         /// Loops left.
@@ -321,21 +323,19 @@ fn signed_volume(mesh: &Mesh) -> f64 {
         .sum()
 }
 
-/// A thickness of the walls: the low percentile of the distances from sampled vertices, along the
-/// inward normal, to the surface on the other side.
-fn thickness(mesh: &Mesh, bvh: &Bvh, h: f64) -> Option<f64> {
-    let normals = mesh.vertex_normals();
-    let n = mesh.positions.len();
-    let count = PROBE_SAMPLES.min(n);
+/// A thickness of the walls: the low percentile of the distances from area-weighted sample points,
+/// along the inward normal, to the surface on the other side. Distances up to `ignore` (features the
+/// closing removes anyway: handles, fins) do not count.
+fn thickness(mesh: &Mesh, bvh: &Bvh, h: f64, ignore: f64) -> Option<f64> {
     let probe = 0.5 * h;
-    let mut found: Vec<f64> = par::map(count, |k| {
-        let i = k * n / count.max(1);
-        let (p, nv) = (mesh.positions.get(i)?, normals.get(i)?);
-        let dir = -crate::normalize(*nv)?;
+    let samples = mesh.sample_points(PROBE_SAMPLES, &mut crate::Rng::new(7));
+    let mut found: Vec<f64> = par::map_slice(&samples, |(p, n)| {
+        let dir = -crate::normalize(*n)?;
         bvh.ray_cast(&(p + dir * probe), &dir).map(|(_, t)| t + probe)
     })
     .into_iter()
     .flatten()
+    .filter(|t| *t > ignore)
     .collect();
     if found.is_empty() {
         return None;
@@ -391,8 +391,10 @@ fn prepare(mesh: &Mesh, p: &Params) -> Result<Prepared, RemeshError> {
     let holes_filled = edit::fill_holes_where(&mut work, p.max_hole_edges, &accept).filled;
     let debris_triangles = edit::remove_small_components(&mut work, p.min_component_fraction, 8);
     let ps = pieces::pieces(&work);
-    let loops: Vec<_> = ps.iter().flat_map(|q| q.loops.iter()).collect();
-    if let Some(biggest) = loops.iter().max_by(|a, b| a.edges.cmp(&b.edges)) {
+    // tiny loops are flaps and slivers (a fin of two edges is not a hole): the columns tolerate them
+    let wide = p.max_hole * std::f64::consts::PI;
+    let loops: Vec<_> = ps.iter().flat_map(|q| q.loops.iter()).filter(|l| l.length > wide).collect();
+    if let Some(biggest) = loops.iter().max_by(|a, b| a.length.total_cmp(&b.length)) {
         let (largest_edges, length) = (biggest.edges, biggest.length);
         return Err(RemeshError::Open {
             loops: loops.len(),
@@ -412,20 +414,27 @@ fn prepare(mesh: &Mesh, p: &Params) -> Result<Prepared, RemeshError> {
     })
 }
 
-/// Voxel and cube size for a scan with walls of `thickness`.
-fn resolution(p: &Params, thickness: Option<f64>) -> Result<(f64, u32, bool), RemeshError> {
+/// Voxel and cube size for a scan with walls of `wall` mm. The width of what is removed stays fixed
+/// in mm: a finer voxel gets a larger cube, so a wall is resolved without keeping the handles.
+fn resolution(p: &Params, wall: Option<f64>) -> Result<(f64, u32, bool), RemeshError> {
     let h0 = p.voxel.unwrap_or(1.5 * p.tolerance);
-    let k = match p.min_feature {
+    let k0 = match p.min_feature {
         None => 1,
         Some(w) => ((w / (2.0 * h0)).round() as u32).min(MAX_K),
     };
-    let steps = 2.0 * f64::from(k) + THIN_EXTRA_VOXELS;
-    let Some(t) = thickness.filter(|t| *t < steps * h0) else { return Ok((h0, k, false)) };
-    let suggested = t / (steps + 0.5);
+    let removed = 2.0 * f64::from(k0) * h0;
+    let need = |k: u32, h: f64| (2.0 * f64::from(k) + THIN_EXTRA_VOXELS) * h;
+    let Some(t) = wall.filter(|t| *t < need(k0, h0)) else { return Ok((h0, k0, false)) };
     if p.voxel.is_some() {
-        return Err(RemeshError::ThinWall { thickness: t, required: steps * h0, voxel: h0, suggested });
+        let suggested = t / (2.0 * f64::from(k0) + THIN_EXTRA_VOXELS + 0.5);
+        return Err(RemeshError::ThinWall { thickness: t, required: need(k0, h0), voxel: h0, suggested });
     }
-    Ok((suggested, k, true))
+    let (mut h, mut k) = (h0, k0);
+    for _ in 0..8 {
+        k = ((removed / (2.0 * h)).ceil() as u32).clamp(1, MAX_K);
+        h = h.min(t / (2.0 * f64::from(k) + THIN_EXTRA_VOXELS + 0.5)).max(h0 / MAX_REFINE);
+    }
+    Ok((h, k, true))
 }
 
 /// The surface of the solid as a mesh with consistent triangles, and the facts about it.
@@ -436,41 +445,56 @@ fn build_surface(occ: &Occupancy, grid: &Grid, limits: &Limits) -> Result<(Mesh,
     Ok((mesh, pinches))
 }
 
-/// Rebuilds a closed, manifold surface from `mesh`; see the module documentation.
-pub fn remesh(mesh: &Mesh, p: &Params) -> Result<(Mesh, RemeshReport), RemeshError> {
-    check(p)?;
-    let prep = prepare(mesh, p)?;
-    let bvh = Bvh::build(&prep.work);
-    let h_probe = p.voxel.unwrap_or(1.5 * p.tolerance);
-    let wall = thickness(&prep.work, &bvh, h_probe);
-    let (h, k, refined) = resolution(p, wall)?;
-    let grid = Grid::new(&prep.work.bbox(), h, MIN_BORDER + 2 * k as usize)?;
-    if grid.nx * grid.ny > p.limits.max_columns {
+/// The solid of the prepared scan after closing and opening, with the grid it lives on.
+struct Solid {
+    occ: Occupancy,
+    grid: Grid,
+    raster: raster::RasterStats,
+    raw_bytes: usize,
+    diagonal_voxels: u64,
+    flipped: bool,
+}
+
+fn solid_of(work: &Mesh, h: f64, k: u32, limits: &Limits) -> Result<Solid, RemeshError> {
+    let grid = Grid::new(&work.bbox(), h, MIN_BORDER + 2 * k as usize)?;
+    if grid.nx * grid.ny > limits.max_columns {
         let advice = "use a larger voxel".to_string();
         return Err(RemeshError::TooMuchWork {
             what: "grid columns".into(),
             needed: grid.nx * grid.ny,
-            limit: p.limits.max_columns,
+            limit: limits.max_columns,
             advice,
         });
     }
-    let flipped = signed_volume(&prep.work) < 0.0;
-    let (raw, stats) = raster::solid(&prep.work, &grid, flipped, p.limits.max_crossings)?;
+    let flipped = signed_volume(work) < 0.0;
+    let (raw, stats) = raster::solid(work, &grid, flipped, limits.max_crossings)?;
     if stats.columns > 0 && stats.irregular_columns as f64 > MAX_IRREGULAR_SHARE * stats.columns as f64 {
         return Err(RemeshError::Irregular { share: 100.0 * stats.irregular_columns as f64 / stats.columns as f64 });
     }
     if raw.voxel_count() == 0 {
         return Err(RemeshError::NoSolid);
     }
-    let closed = raw.close_open(k);
-    let (occ, diagonal_voxels, settled) = closed.fill_diagonals(DIAGONAL_ROUNDS);
+    let (occ, diagonal_voxels, settled) = raw.close_open(k).fill_diagonals(DIAGONAL_ROUNDS);
     if !settled {
         return Err(RemeshError::NotManifold("checkerboard contacts between voxels did not settle".into()));
     }
     if occ.voxel_count() == 0 {
         return Err(RemeshError::Lost { share: 100.0, distance: h, width: 2.0 * f64::from(k) * h });
     }
-    let (mut net, pinches_split) = build_surface(&occ, &grid, &p.limits)?;
+    Ok(Solid { occ, grid, raster: stats, raw_bytes: raw.bytes(), diagonal_voxels, flipped })
+}
+
+/// Rebuilds a closed, manifold surface from `mesh`; see the module documentation.
+pub fn remesh(mesh: &Mesh, p: &Params) -> Result<(Mesh, RemeshReport), RemeshError> {
+    check(p)?;
+    let prep = prepare(mesh, p)?;
+    let bvh = Bvh::build(&prep.work);
+    let h_probe = p.voxel.unwrap_or(1.5 * p.tolerance);
+    let ignore = p.min_feature.unwrap_or(2.0 * h_probe) + 0.5 * h_probe;
+    let wall = thickness(&prep.work, &bvh, h_probe, ignore);
+    let (h, k, refined) = resolution(p, wall)?;
+    let solid = solid_of(&prep.work, h, k, &p.limits)?;
+    let (mut net, pinches_split) = build_surface(&solid.occ, &solid.grid, &p.limits)?;
     let islands_removed = edit::remove_small_components(&mut net, p.min_component_fraction, 8);
     let mut report = RemeshReport {
         voxel: h,
@@ -480,19 +504,19 @@ pub fn remesh(mesh: &Mesh, p: &Params) -> Result<(Mesh, RemeshReport), RemeshErr
         thickness: wall,
         holes_filled: prep.holes_filled,
         debris_triangles: prep.debris_triangles,
-        flipped,
-        grid: [grid.nx, grid.ny, grid.nz],
-        columns: stats.columns,
-        crossings: stats.crossings,
-        irregular_columns: stats.irregular_columns,
-        runs: occ.run_count(),
-        voxels: occ.voxel_count(),
-        diagonal_voxels,
+        flipped: solid.flipped,
+        grid: [solid.grid.nx, solid.grid.ny, solid.grid.nz],
+        columns: solid.raster.columns,
+        crossings: solid.raster.crossings,
+        irregular_columns: solid.raster.irregular_columns,
+        runs: solid.occ.run_count(),
+        voxels: solid.occ.voxel_count(),
+        diagonal_voxels: solid.diagonal_voxels,
         pinches_split,
         islands_removed,
         genus_before: prep.genus,
         non_manifold_before: prep.non_manifold,
-        peak_bytes: 8 * stats.crossings + raw.bytes() + 60 * net.triangle_count() / 2,
+        peak_bytes: 8 * solid.raster.crossings + solid.raw_bytes + 60 * net.triangle_count() / 2,
         ..Default::default()
     };
     let out = fit_to_scan(net, &prep.work, h, p, &mut report);
