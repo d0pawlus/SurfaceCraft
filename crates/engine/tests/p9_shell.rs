@@ -114,6 +114,8 @@ fn gate_a_noisy_open_cap_becomes_a_solid_of_the_exact_shell_volume() {
     // Assert
     assert_solid_of(&out, shell_volume(RADIUS - THICKNESS, RADIUS));
     assert_eq!(out["thickened"]["self_intersections"], 0, "{out}");
+    assert_eq!(out["thickened"]["self_intersections_local"], 0, "{out}");
+    assert_eq!(out["thickened"]["unresolved_vertices"], 0, "{out}");
     assert_eq!(out["thickened"]["thickness"], THICKNESS, "{out}");
     assert_eq!(out["thickened"]["clamped_vertices"], 0, "{out}");
     assert!(out["thickened"]["boundary_loops"].as_u64().unwrap() >= 1, "{out}");
@@ -520,6 +522,7 @@ fn a_channel_narrower_than_the_wall_is_reported_as_crossing_itself_and_caps_the_
     // Assert
     assert_eq!(thick["self_intersection_checked"], true, "{thick}");
     assert!(thick["self_intersections"].as_u64().unwrap() > 0, "{thick}");
+    assert_eq!(thick["self_intersections_local"], 0, "a channel is real geometry, not a fold: {thick}");
     assert_eq!(out["thickened"]["self_intersection_checked"], true);
     let codes: Vec<&str> = out["issues"].as_array().unwrap().iter().map(|i| i["code"].as_str().unwrap()).collect();
     assert!(codes.contains(&"self_intersection") && out["verdict"] != "pass", "{out}");

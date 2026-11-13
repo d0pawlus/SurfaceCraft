@@ -223,12 +223,24 @@ impl Bvh {
     /// First triangle hit by the ray `origin + t·dir`: `(triangle, t)`.
     #[must_use]
     pub fn ray_cast(&self, origin: &Point3, dir: &Vec3) -> Option<(usize, f64)> {
+        self.ray_cast_where(origin, dir, f64::INFINITY, &|_| true)
+    }
+
+    /// First hit of the ray `origin + t·dir` with `t <= max_t` among the triangles `keep` accepts.
+    #[must_use]
+    pub fn ray_cast_where(
+        &self,
+        origin: &Point3,
+        dir: &Vec3,
+        max_t: f64,
+        keep: &dyn Fn(usize) -> bool,
+    ) -> Option<(usize, f64)> {
         if self.nodes.is_empty() || !crate::finite(origin) || !crate::finite_vec(dir) {
             return None;
         }
         let inv = Vec3::new(1.0 / dir.x, 1.0 / dir.y, 1.0 / dir.z);
         let mut best: Option<(usize, f64)> = None;
-        let mut best_t = f64::INFINITY;
+        let mut best_t = if max_t.is_nan() { f64::INFINITY } else { max_t };
         let mut stack: Vec<u32> = vec![0];
         while let Some(ni) = stack.pop() {
             let Some(node) = self.nodes.get(ni as usize) else { continue };
@@ -240,6 +252,7 @@ impl Bvh {
                     if let Some([a, b, c]) = self.tris.get(ti as usize)
                         && let Some(t) = tri::ray_hit(origin, dir, a, b, c)
                         && t < best_t
+                        && keep(ti as usize)
                     {
                         best_t = t;
                         best = Some((ti as usize, t));

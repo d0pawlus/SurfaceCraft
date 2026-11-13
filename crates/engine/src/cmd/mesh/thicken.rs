@@ -41,13 +41,15 @@ pub struct ThickenMeshOut {
     pub boundary_loops: usize,
     /// Vertices whose offset was reduced because the surface curves more tightly than the thickness.
     pub clamped_vertices: usize,
+    /// Vertices whose offset was bounded up front by the distance to another part of the scan close to them along the surface (a bead, a crease: the local feature size), so the offset sheet stays on its side of the scanned sheet.
+    pub limited_vertices: usize,
     /// Largest reduction of the thickness at a vertex (mm; 0 when nothing was reduced).
     pub largest_reduction: f64,
     /// Triangles removed from the mesh before the offset (fins on edges of three or more triangles, duplicates).
     pub removed_non_manifold: usize,
     /// Triangles turned around to make the orientation consistent.
     pub flipped_triangles: usize,
-    /// Vertices that stay folded at the floor of the offset (a tenth of the thickness): sharp creases.
+    /// Vertices on a local crossing (neighbouring offset triangles, the flanks of a crease, the two sheets of a wall, the strip along the rim) that the relaxation could not remove even at the floor of the offset (a tenth of the thickness): sharp creases. More than 0.1 % of the vertices is refused.
     pub unresolved_vertices: usize,
     /// Thinnest wall found (mm), sampled as the distance between the two sheets.
     pub min_wall: f64,
@@ -57,7 +59,9 @@ pub struct ThickenMeshOut {
     pub self_intersection_checked: bool,
     /// Triangles of the sample tested.
     pub self_intersection_samples: usize,
-    /// Of them, triangles that cross another one (the offset sheet meets another part of the shell, e.g. in a channel narrower than the wall).
+    /// Of them, triangles that cross only triangles close to them along the scan (a fold of the offset). The relaxation removes these, so the count is 0 unless `unresolved_vertices` is not.
+    pub self_intersections_local: usize,
+    /// Of them, triangles that cross a triangle far from them along the scan: the offset sheet meets another part of the shell, e.g. in a channel narrower than the wall (real geometry, not relaxed).
     pub self_intersections: usize,
     /// Is the new mesh closed (every edge shared by two triangles)? Always true when the command succeeds.
     pub closed: bool,
@@ -92,6 +96,7 @@ pub(super) fn thicken_cmd(s: &mut Session, i: ThickenMeshIn) -> CmdResult<Thicke
         vertices,
         boundary_loops: shell.report.boundary_loops,
         clamped_vertices: shell.report.clamped_vertices,
+        limited_vertices: shell.report.limited_vertices,
         largest_reduction: shell.report.largest_reduction,
         removed_non_manifold: shell.report.removed_non_manifold,
         flipped_triangles: shell.report.flipped_triangles,
@@ -100,6 +105,7 @@ pub(super) fn thicken_cmd(s: &mut Session, i: ThickenMeshIn) -> CmdResult<Thicke
         median_wall: shell.report.median_wall,
         self_intersection_checked: true,
         self_intersection_samples: shell.report.crossing_samples,
+        self_intersections_local: shell.report.crossing_local,
         self_intersections: shell.report.crossing_triangles,
         closed: census.boundary == 0 && census.non_manifold == 0,
     })

@@ -37,6 +37,8 @@ pub struct ThickenedInfo {
     pub symmetric: bool,
     /// Vertices whose offset was reduced because the surface curves more tightly than the thickness.
     pub clamped_vertices: usize,
+    /// Vertices whose offset was bounded up front by the distance to another part of the scan close to them along the surface (a bead, a crease): the offset sheet then stays on its side of the scanned sheet.
+    pub limited_vertices: usize,
     /// Largest reduction of the thickness at a vertex (mm).
     pub largest_reduction: f64,
     /// Median reduction of the thickness over the reduced vertices (mm).
@@ -53,7 +55,7 @@ pub struct ThickenedInfo {
     pub min_wall: f64,
     /// Median wall found (mm).
     pub median_wall: f64,
-    /// Vertices that stay folded at the floor of the offset (a tenth of the thickness): sharp creases.
+    /// Vertices on a local crossing (neighbouring offset triangles, the flanks of a crease, the two sheets of a wall, the strip along the rim) that the relaxation could not remove even at the floor of the offset (a tenth of the thickness): sharp creases. More than 0.1 % of the vertices is refused.
     pub unresolved_vertices: usize,
     /// Triangles removed from the scan before the offset (fins on edges of three or more triangles, duplicates).
     pub removed_non_manifold: usize,
@@ -63,7 +65,9 @@ pub struct ThickenedInfo {
     pub self_intersection_checked: bool,
     /// Triangles of the sample tested.
     pub self_intersection_samples: usize,
-    /// Of them, triangles that cross another one: the offset sheet meets another part of the shell (a channel or gap narrower than the wall).
+    /// Of them, triangles that cross only triangles close to them along the scan (a fold of the offset; the relaxation removes these, so 0 unless `unresolved_vertices` is not).
+    pub self_intersections_local: usize,
+    /// Of them, triangles that cross a triangle far from them along the scan: the offset sheet meets another part of the shell (a channel or gap narrower than the wall). Only these raise the issue `self_intersection`.
     pub self_intersections: usize,
     /// Triangles of the thickened mesh.
     pub triangles: usize,
@@ -132,6 +136,7 @@ fn info(shell: &Thickened, i: &ToSolidIn, kept: Option<ObjectId>) -> ThickenedIn
         thickness: i.thickness.unwrap_or(0.0),
         symmetric: i.symmetric,
         clamped_vertices: shell.report.clamped_vertices,
+        limited_vertices: shell.report.limited_vertices,
         largest_reduction: shell.report.largest_reduction,
         median_reduction: shell.report.median_reduction,
         folded_vertices: shell.report.folded_vertices,
@@ -145,6 +150,7 @@ fn info(shell: &Thickened, i: &ToSolidIn, kept: Option<ObjectId>) -> ThickenedIn
         flipped_triangles: shell.report.flipped_triangles,
         self_intersection_checked: true,
         self_intersection_samples: shell.report.crossing_samples,
+        self_intersections_local: shell.report.crossing_local,
         self_intersections: shell.report.crossing_triangles,
         triangles: shell.mesh.triangle_count(),
         mesh: kept,
@@ -230,7 +236,7 @@ fn issues_of(
     if t.self_intersections > 0 {
         let whole = t.self_intersections as f64 * t.triangles as f64 / t.self_intersection_samples.max(1) as f64;
         let msg = format!(
-            "the thickened mesh crosses itself away from the places the offset was relaxed: {} of {} sampled triangles cut another one (about {:.0} of {} in all): the wall is thicker than a channel or gap of the part; a thinner wall, or splitting the part (`scan.split`), is the way out",
+            "the thickened mesh crosses itself between parts of the scan that are far apart along the surface: {} of {} sampled triangles cut another one (about {:.0} of {} in all): the wall is thicker than a channel or gap of the part; a thinner wall, or splitting the part (`scan.split`), is the way out",
             t.self_intersections, t.self_intersection_samples, whole, t.triangles
         );
         list.push(issue("self_intersection", msg));
