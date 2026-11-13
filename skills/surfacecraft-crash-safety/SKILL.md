@@ -9,7 +9,7 @@ description: How non-test SurfaceCraft code avoids panics and treats input as ho
   `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]`
   and the workspace forbids `unsafe_code`. Tests may unwrap (`clippy.toml`).
 - Use `get()` / `get_mut()` instead of indexing with values that come from input. Check every
-  count against the bytes actually present before allocating (see `crates/io/src/mesh.rs`).
+  count against the bytes actually present before allocating (see `crates/io/src/mesh/stl.rs`).
 - Readers have hard limits (`surfacecraft_io::Limits`); recursion is bounded.
 - Errors are `Result`s with a message a user can act on. Commands return `CmdError`, the engine
   maps them to `EngineError` and rolls the document back.
