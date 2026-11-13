@@ -187,3 +187,15 @@ fn side_far_from_reference_is_refused() {
     let err = fit_patch(&req).unwrap_err();
     assert!(err.to_string().contains("off its reference face"), "{err}");
 }
+
+#[test]
+fn soft_sides_off_the_data_still_give_a_sheet() {
+    // the traced sides lie 0.3 mm above the noisy data: the closest points of the side samples on the
+    // patch would crowd at the border of what the patch reaches, the samples' own parameters do not
+    let mut r = rng(41);
+    let mut req = request(pentagon_sides(true, |_| 0.3));
+    req.data = data_inside(&mut r, 1500, 0.5, |_| 0.0);
+    let patch = fit_patch(&req).unwrap();
+    assert_eq!(patch.sheet.faces.len(), 1);
+    assert!(patch.report.sides.iter().all(|s| s.soft), "{:?}", patch.report);
+}

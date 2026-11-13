@@ -228,6 +228,9 @@ pub struct PatchOut {
     pub sides: Vec<SideOut>,
     /// Corners where the tangent conditions were relaxed.
     pub corners: Vec<CornerOut>,
+    /// Largest distance of a weighted interior point (a soft `points` entry) from the patch (mm); absent without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_points_max_mm: Option<f64>,
     /// Hard conditions found dependent and dropped.
     pub dropped: usize,
     /// Things the caller should know.
@@ -377,6 +380,7 @@ fn patch_cmd(s: &mut Session, i: PatchIn) -> CmdResult<PatchOut> {
             .iter()
             .map(|c| CornerOut { at: c.at, mismatch_deg: c.mismatch_deg, relaxed_length_mm: c.relaxed_length })
             .collect(),
+        soft_points_max_mm: report.soft_points_max,
         dropped: report.dropped,
         warnings,
     })

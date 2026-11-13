@@ -79,6 +79,25 @@ fn patch_flat_pentagon_from_polylines() {
     assert!(mesh.positions.iter().all(|p| p.z.abs() <= 1e-9));
 }
 
+#[test]
+fn weighted_interior_point_is_followed_and_reported() {
+    let c = pentagon(15.0);
+    let sides: Vec<Value> = (0..5).map(|k| json!({"points": [c[k], c[(k + 1) % 5]]})).collect();
+    let mut s = Session::new();
+    // a heavy point 1 mm above the centre of a flat pentagon: the patch comes close to it
+    let points = json!([{"at": [0.0, 0.0, 1.0], "weight": 100.0}]);
+    let r = s.execute("surface.patch", json!({"sides": sides, "points": points, "smoothing": 1e-5})).unwrap();
+    let miss = r["soft_points_max_mm"].as_f64().unwrap();
+    assert!(miss < 0.2, "{r}");
+    // no weighted point, nothing to report
+    let r = s.execute("surface.patch", json!({"sides": sides})).unwrap();
+    assert!(r.get("soft_points_max_mm").is_none(), "{r}");
+    // a weighted point outside the outline is an error that names it
+    let points = json!([{"at": [40.0, 0.0, 0.0]}]);
+    let e = s.execute("surface.patch", json!({"sides": sides, "points": points})).unwrap_err().to_string();
+    assert!(e.contains("soft point 0"), "{e}");
+}
+
 /// A wavy sheet (fitted by `surface.fit`) with a five-sided hole, added as a body. Returns the body
 /// and the indices of the edges of the hole.
 fn wavy_sheet_with_hole(s: &mut Session) -> (ObjectId, Vec<usize>) {

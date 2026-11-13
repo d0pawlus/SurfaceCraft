@@ -192,3 +192,17 @@ fn print_rounds_of_the_wave_cases() {
         );
     }
 }
+
+#[test]
+fn smoothing_does_not_grow_a_side_beyond_its_limit() {
+    // a staircase of 10 000 points turning 90° at every point: every point is a corner, and the
+    // pieces together would be far beyond the limit of one side
+    let stairs: Vec<[f64; 3]> = (0..10_000).map(|i| [(i / 2 + i % 2) as f64, (i / 2) as f64, 0.0]).collect();
+    let mut pts = vec![stairs.clone()];
+    let mut uvs = vec![Vec::new()];
+    let notes = curve::smooth_sides(&mut pts, &mut uvs, false, &[false], 100.0);
+    assert!(pts[0].len() <= curve::MAX_OUT || !notes.is_empty(), "{} points, {notes:?}", pts[0].len());
+    // the limit is hit: the given points are kept and the warning names the side
+    assert_eq!(pts[0], stairs);
+    assert_eq!(notes, vec!["side 0: could not be smoothed, its points are used as a polyline".to_string()]);
+}

@@ -29,8 +29,15 @@ pub struct TrimmedPatchOut {
     pub rms: f64,
     /// Largest distance of a shared feature curve from the patch (mm).
     pub side_gap_max_mm: f64,
-    /// Is `max` within the target tolerance?
+    /// Is `max` within the target tolerance? Never for a patch that measured no vertex.
     pub within_tolerance: bool,
+    /// Vertices of the region measured against the patch.
+    pub points: usize,
+    /// Vertices of the region that lay outside the patch's outline and were ignored.
+    pub outside: usize,
+    /// What the fit reported about this patch (corners, data, the control net).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// What fitting all n-sided regions produced.
@@ -40,6 +47,8 @@ pub(super) struct NgonFit {
     pub patches: Vec<TrimmedPatchOut>,
     /// Regions that could not be fitted, with the reason.
     pub skipped: Vec<String>,
+    /// Patches that measured no vertex of their region (their `within_tolerance` is false).
+    pub unmeasured: Vec<String>,
     /// Sum of the squared deviations of the data of all patches.
     pub sq: f64,
     /// Largest deviation of the data of all patches.
@@ -116,7 +125,17 @@ pub(super) fn fit_regions(s: &mut Session, regions: &[NgonRegion], target: &Targ
             out.max = out.max.max(report.max);
             out.count += report.points;
         }
-        let (control, rms, max, within_tolerance) = (report.control, report.rms, report.max, report.within_tolerance);
+        // a patch that measured nothing has not met the tolerance, whatever its (empty) maximum says
+        let within_tolerance = report.within_tolerance && report.points > 0;
+        if report.points == 0 {
+            out.unmeasured.push(format!(
+                "region of {} triangles with {} corners: no vertex was measured against its patch",
+                rg.triangles.len(),
+                rg.corners.len()
+            ));
+        }
+        let (control, rms, max) = (report.control, report.rms, report.max);
+        let (points, outside, warnings) = (report.points, report.outside, report.warnings.clone());
         let surface = s.doc.add_surface(SurfaceObject {
             id: ObjectId(0),
             name: format!("{}_patch_{}", target.name, out.patches.len()),
@@ -138,6 +157,9 @@ pub(super) fn fit_regions(s: &mut Session, regions: &[NgonRegion], target: &Targ
             rms,
             side_gap_max_mm,
             within_tolerance,
+            points,
+            outside,
+            warnings,
         });
     }
     out

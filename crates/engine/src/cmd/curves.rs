@@ -246,7 +246,7 @@ fn from_curves(s: &mut Session, i: FromCurvesIn) -> CmdResult<FromCurvesOut> {
         };
         Some(bezier_part(s, &m, &net, &target)?)
     };
-    let NgonFit { patches: trimmed, skipped: ngon_skipped, sq: ngon_sq, max: ngon_max, count: ngon_count } =
+    let NgonFit { patches: trimmed, skipped: ngon_skipped, unmeasured, sq: ngon_sq, max: ngon_max, count: ngon_count } =
         fit_regions(s, &net.ngons, &Target { name: &name, region, tolerance: tol });
     let Some(surface) = bezier.as_ref().map(|b| b.surface).or_else(|| trimmed.first().map(|p| p.surface)) else {
         let reasons: Vec<&str> = net.skipped.iter().chain(ngon_skipped.iter()).map(String::as_str).collect();
@@ -267,6 +267,13 @@ fn from_curves(s: &mut Session, i: FromCurvesIn) -> CmdResult<FromCurvesOut> {
     } else {
         None
     };
+    if !unmeasured.is_empty() {
+        let note = format!("not within tolerance, nothing was measured: {}", unmeasured.join("; "));
+        warning = Some(match warning {
+            Some(w) => format!("{w}; {note}"),
+            None => note,
+        });
+    }
     if !trimmed.is_empty() {
         let note = separate_sheets_note(trimmed.len());
         warning = Some(match warning {

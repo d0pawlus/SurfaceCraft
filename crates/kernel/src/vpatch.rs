@@ -107,7 +107,10 @@ pub struct Problem {
     pub control: [usize; 2],
     /// Conditions met exactly (up to dependent rows, which are dropped).
     pub hard: Vec<Row>,
-    /// Conditions met in the least-squares sense with the given weight (> 0).
+    /// Conditions met in the least-squares sense with the given weight (> 0). A tangent or curvature
+    /// row is scaled to unit Euclidean length (its right-hand side with it) before the weight applies,
+    /// so the weight does not depend on the units of the parameters; a position row is a squared
+    /// distance in the problem's unit box.
     pub soft: Vec<(Row, f64)>,
     /// Scan samples.
     pub data: Vec<DataPoint>,
@@ -520,9 +523,11 @@ fn energy_matrix(g: &Grid, outline: &[[f64; 2]]) -> Result<(DMatrix<f64>, Vec<bo
                     let guv: [f64; 16] = std::array::from_fn(|i| lu.d[1][i / 4] * lv.d[1][i % 4]);
                     let gvv: [f64; 16] = std::array::from_fn(|i| lu.d[0][i / 4] * lv.d[2][i % 4]);
                     let idx: [usize; 16] = std::array::from_fn(|i| (lu.first + i / 4) * m + lv.first + i % 4);
-                    for p in 0..16 {
-                        for q in 0..16 {
-                            k[(idx[p], idx[q])] += w * (guu[p] * guu[q] + 2.0 * guv[p] * guv[q] + gvv[p] * gvv[q]);
+                    for (p, &ip) in idx.iter().enumerate() {
+                        for (q, &iq) in idx.iter().enumerate() {
+                            if let Some(slot) = k.get_mut((ip, iq)) {
+                                *slot += w * (guu[p] * guu[q] + 2.0 * guv[p] * guv[q] + gvv[p] * gvv[q]);
+                            }
                         }
                     }
                 }
@@ -572,8 +577,19 @@ pub fn solve(p: &Problem) -> Result<Solution> {
         match row {
             Row::Position { uv, at } => tr_soft += add_position(*uv, *at, *w)?,
             _ => {
-                for lr in build_rows(&g, &scale, row, true)? {
-                    tr_soft += w * lr.cols.iter().map(|(_, a)| a * a).sum::<f64>();
+                // like the hard rows, a soft tangent or curvature row has unit Euclidean length before
+                // its weight applies: its coefficients scale with 1/cell and 1/cell², and its weight
+                // against the positions must not depend on the units of the parameters
+                for mut lr in build_rows(&g, &scale, row, true)? {
+                    let len = lr.cols.iter().map(|(_, a)| a * a).sum::<f64>().sqrt();
+                    if !(len.is_finite() && len > TINY) {
+                        continue;
+                    }
+                    for c in lr.cols.iter_mut() {
+                        c.1 /= len;
+                    }
+                    lr.rhs[0] /= len;
+                    tr_soft += *w;
                     soft_coupled.push((lr, *w));
                 }
             }

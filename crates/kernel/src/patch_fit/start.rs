@@ -18,6 +18,7 @@ const MAX_SIDE_POINTS: usize = 10_000;
 /// Most data points used (more are thinned deterministically by stride).
 pub(super) const MAX_DATA: usize = 50_000;
 const MAX_HARD_POINTS: usize = 2_000;
+const MAX_SOFT_POINTS: usize = 2_000;
 const MAX_CURVES: usize = 64;
 const MAX_CURVE_POINTS: usize = 10_000;
 /// Points of the loop checked for self-intersection (the sweep is quadratic in the worst case).
@@ -239,9 +240,12 @@ pub(super) struct Pt {
     pub out: bool,
 }
 
-/// Points of the interior: scan data (soft), hard points and hard curves.
+/// Points of the interior: scan data (soft), soft points, hard points and hard curves.
 pub(super) struct Interior {
     pub data: Vec<Pt>,
+    /// Points the patch should pass near (`w` is their weight against a data point's 1). They are
+    /// not data: they never count toward the minimum number of data points and are never thinned.
+    pub soft: Vec<Pt>,
     pub hard: Vec<Pt>,
     pub curves: Vec<Vec<Pt>>,
 }
@@ -317,8 +321,12 @@ fn validate(req: &Request) -> Result<()> {
     if req.hard_points.len() > MAX_HARD_POINTS || req.hard_points.iter().any(|p| !finite3(p)) {
         return Err(arg(format!("at most {MAX_HARD_POINTS} finite hard points are accepted")));
     }
-    if req.soft_points.iter().any(|(p, w)| !finite3(p) || !(w.is_finite() && *w > 0.0 && *w <= 1e6)) {
-        return Err(arg("a soft point is not finite or its weight is not positive"));
+    if req.soft_points.len() > MAX_SOFT_POINTS
+        || req.soft_points.iter().any(|(p, w)| !finite3(p) || !(w.is_finite() && *w > 0.0 && *w <= 1e6))
+    {
+        return Err(arg(format!(
+            "at most {MAX_SOFT_POINTS} soft points are accepted, finite, with a positive weight of at most 1e6"
+        )));
     }
     if req.curves.len() > MAX_CURVES
         || req.curves.iter().any(|c| c.len() < 2 || c.len() > MAX_CURVE_POINTS || !c.iter().all(finite3))
@@ -630,14 +638,22 @@ fn resample(points: &[V3], n: usize, tol: f64) -> Result<Vec<V3>> {
 fn interior(req: &Request, lp: &Loop) -> Result<Interior> {
     let pt = |p: V3, w: f64| Pt { xyz: p, uv: lp.affine.uv(p), w, out: false };
     let datum = |xyz: V3, uv: V2, w: f64| Pt { xyz, uv, w, out: !lp.contains(uv) };
-    let mut data: Vec<Pt> = Vec::with_capacity(req.data.len() + req.soft_points.len());
+    let mut data: Vec<Pt> = Vec::with_capacity(req.data.len());
     for (i, p) in req.data.iter().enumerate() {
         let uv = req.data_uv.as_ref().and_then(|u| u.get(i)).copied().unwrap_or_else(|| lp.affine.uv(*p));
         data.push(datum(*p, uv, 1.0));
     }
-    data.extend(req.soft_points.iter().map(|(p, w)| datum(*p, lp.affine.uv(*p), *w)));
     let data: Vec<Pt> = thin_indices(data.len(), MAX_DATA).into_iter().filter_map(|i| data.get(i).copied()).collect();
     let hard: Vec<Pt> = req.hard_points.iter().map(|p| pt(*p, 1.0)).collect();
+    // a soft point outside the outline cannot be followed (like a hard point it is an error, not ignored)
+    let mut soft: Vec<Pt> = Vec::with_capacity(req.soft_points.len());
+    for (k, (p, w)) in req.soft_points.iter().enumerate() {
+        let q = pt(*p, *w);
+        if !lp.contains(q.uv) {
+            return Err(arg(format!("soft point {k} lies outside the outline")));
+        }
+        soft.push(q);
+    }
 
     // curves: points enough for the finest net, equally spaced
     let cells = (req.max_control - 3) as f64;
@@ -652,7 +668,7 @@ fn interior(req: &Request, lp: &Loop) -> Result<Interior> {
         let pts = resample(c, n, 1e-9 * span)?;
         curves.push(pts.into_iter().map(|p| pt(p, 1.0)).collect());
     }
-    Ok(Interior { data, hard, curves })
+    Ok(Interior { data, soft, hard, curves })
 }
 
 /// Angle between the tangent planes (or a tangent and a plane) of the two sides at each corner.

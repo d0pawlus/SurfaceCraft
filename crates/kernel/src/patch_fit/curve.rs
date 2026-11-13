@@ -23,8 +23,8 @@ const DENSE_SHARE: f64 = 1.0 / 200.0;
 const SAG_TARGET: f64 = 0.05 * G0_TARGET;
 /// Most pieces one given chord is cut into.
 const MAX_SPLIT: usize = 64;
-/// Most points of a densified side.
-const MAX_OUT: usize = 10_000;
+/// Most points of a densified side, and of each smooth stretch of it.
+pub(super) const MAX_OUT: usize = 4_096;
 /// A point where the polyline turns by more than 45° is a corner of the side.
 const CORNER_COS: f64 = std::f64::consts::FRAC_1_SQRT_2;
 
@@ -88,6 +88,7 @@ fn smooth_piece(piece: &[V3], uv: Option<&[V2]>) -> Option<(Vec<V3>, Vec<V2>)> {
             *s = (*s * MAX_OUT / total).max(1);
         }
     }
+    let total: usize = splits.iter().sum();
 
     let mut out: Vec<V3> = Vec::with_capacity(total + 1);
     let mut out_uv: Vec<V2> = Vec::new();
@@ -149,6 +150,10 @@ fn smooth_side(points: &[V3], uv: Option<&[V2]>) -> Option<(Vec<V3>, Vec<V2>)> {
         let (p, q) = smooth_piece(piece, piece_uv)?;
         // the corner between two stretches belongs to both: keep it once
         let skip = usize::from(!out.is_empty());
+        // the stretches together stay within the limit too: a side that would grow beyond it is not smoothed
+        if out.len() + p.len().saturating_sub(skip) > MAX_OUT {
+            return None;
+        }
         out.extend(p.into_iter().skip(skip));
         out_uv.extend(q.into_iter().skip(skip));
     }

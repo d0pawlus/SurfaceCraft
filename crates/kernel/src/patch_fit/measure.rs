@@ -26,6 +26,8 @@ pub(super) struct Measure {
     pub sides: Vec<SideReport>,
     /// Parameters of the closest points of every dense side sample.
     pub feet: Vec<Vec<V2>>,
+    /// The samples' own (fixed) parameters, from the flattening of the sides.
+    pub starts: Vec<Vec<V2>>,
     pub rms: f64,
     pub p99: f64,
     pub max: f64,
@@ -36,6 +38,8 @@ pub(super) struct Measure {
     pub hard_max: f64,
     /// Hard points and curves on the patch.
     pub hard_ok: bool,
+    /// Largest distance of a soft point from the patch, mm (`None` without soft points).
+    pub soft_max: Option<f64>,
     /// Per side: its angle, curvature and fold targets are met (true for a soft side).
     pub rest_ok: Vec<bool>,
     /// Per side: the gap and the larger of the other misses, in units of their targets (a fold
@@ -67,8 +71,25 @@ impl Measure {
         w
     }
 
-    /// Every side within its targets and the interior on the patch. The gap of a `frozen` side may
-    /// be up to ten times the target.
+    /// Largest relative normal curvature error of the hard G2 sides (0 without one).
+    pub fn curvature_miss(&self) -> f64 {
+        self.sides.iter().filter(|s| !s.soft).filter_map(|s| s.curvature_error_max).fold(0.0, f64::max)
+    }
+
+    /// Every hard side meets every target (gap, angle, curvature, no fold) and the interior points
+    /// and curves lie on the patch: no allowance for sides whose gap stopped improving.
+    pub fn targets_met(&self) -> bool {
+        self.hard_ok
+            && self
+                .sides
+                .iter()
+                .zip(&self.rest_ok)
+                .all(|(s, rest)| s.soft || (*rest && !s.folded && s.gap_max <= G0_TARGET))
+    }
+
+    /// Whether the rounds can stop: every side within its targets and the interior on the patch,
+    /// where the gap of a `frozen` side (as close as its own accuracy allows) may be up to ten times
+    /// the target. This steers the stopping only; [`Measure::targets_met`] is what is reported.
     pub fn sides_ok(&self, frozen: &[bool]) -> bool {
         self.hard_ok
             && self.sides.iter().zip(&self.rest_ok).enumerate().all(|(k, (s, rest))| {
@@ -76,6 +97,18 @@ impl Measure {
                 s.soft || (*rest && (s.gap_max <= G0_TARGET || lenient))
             })
     }
+}
+
+/// Per side, the parameter direction (0 for u, 1 for v) it mostly runs along: the net is refined
+/// along it to follow the side more closely.
+pub(super) fn main_directions(lp: &Loop) -> Vec<usize> {
+    lp.sides
+        .iter()
+        .map(|s| {
+            let extent = |d: usize| s.uv.windows(2).map(|w| (w[1][d] - w[0][d]).abs()).sum::<f64>();
+            usize::from(extent(1) > extent(0))
+        })
+        .collect()
 }
 
 /// Misses (in units of their targets) collected in slabs of the parameter domain.
@@ -188,6 +221,7 @@ pub(super) fn measure(
     let floor = 1.0 / (4.0 * lp.diag.max(1e-9));
     let mut reports = Vec::with_capacity(sides.len());
     let mut all_feet = Vec::with_capacity(sides.len());
+    let mut all_starts = Vec::with_capacity(sides.len());
     let mut rest_ok_all = Vec::with_capacity(sides.len());
     let mut side_terms = Vec::with_capacity(sides.len());
 
@@ -256,6 +290,7 @@ pub(super) fn measure(
             snap_max: sd.snap,
         });
         all_feet.push(feet);
+        all_starts.push(ss.samples.iter().map(|smp| smp.uv).collect());
     }
 
     let mut hard_max = 0.0_f64;
@@ -266,6 +301,13 @@ pub(super) fn measure(
         hard_max = d.iter().fold(hard_max, |m, x| m.max(*x));
     }
     let hard_term = hard_max / G0_TARGET;
+    // soft points: re-projected for the next round and reported, they steer no growth
+    let mut soft_max: Option<f64> = None;
+    for p in interior.soft.iter_mut() {
+        let (d, _, f) = probe.closest_uv(p.xyz)?;
+        p.uv = f;
+        soft_max = Some(soft_max.map_or(d, |m| m.max(d)));
+    }
 
     let (mut dists, outside) = reproject_data(probe, lp, &mut interior.data, &mut slabs, tolerance)?;
     if dists.len() < MIN_DATA {
@@ -284,6 +326,7 @@ pub(super) fn measure(
     Ok(Measure {
         sides: reports,
         feet: all_feet,
+        starts: all_starts,
         rms,
         p99,
         max,
@@ -291,6 +334,7 @@ pub(super) fn measure(
         outside,
         hard_max,
         hard_ok: hard_max <= G0_TARGET,
+        soft_max,
         rest_ok: rest_ok_all,
         side_terms,
         hard_term,

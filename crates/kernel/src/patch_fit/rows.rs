@@ -208,6 +208,20 @@ fn rows_per_sample(c: Continuity) -> usize {
     }
 }
 
+/// Keeps at most `budget` of the rows, evenly spread (first and last kept).
+fn thin_rows(rows: &mut Vec<(Row, f64)>, budget: usize) {
+    if rows.len() <= budget {
+        return;
+    }
+    if budget < 2 {
+        rows.truncate(budget);
+        return;
+    }
+    let kept: Vec<(Row, f64)> =
+        thin_indices(rows.len(), budget).into_iter().filter_map(|i| rows.get(i).cloned()).collect();
+    *rows = kept;
+}
+
 /// States the round's problem: hard rows at the collocation points, soft rows at the other dense
 /// samples (thinned to a budget), data, outline. A soft side puts only soft rows, at its collocation
 /// points (at every thinned sample when there is no data to follow), weighted like a mean data point;
@@ -293,10 +307,20 @@ pub(super) fn build_problem(inp: &Inputs) -> Result<Problem> {
             }
         }
     }
-    if hard.len() > MAX_ROWS {
-        return Err(KernelError::Argument(format!("the conditions need {} hard rows; at most {MAX_ROWS}", hard.len())));
+    let soft_points = inp.interior.soft.iter().filter(|p| inp.layout.inside(p.uv)).count();
+    if hard.len() + soft_points > MAX_ROWS {
+        return Err(KernelError::Argument(format!(
+            "the conditions need {} hard rows and {soft_points} soft points; at most {MAX_ROWS} rows",
+            hard.len()
+        )));
     }
-    soft.truncate(MAX_ROWS - hard.len());
+    // over the budget, the soft rows are thinned evenly (not cut off at the last sides)
+    thin_rows(&mut soft, MAX_ROWS - hard.len() - soft_points);
+    // the soft points: soft position rows, weighted against a mean data point (1 without data); they
+    // are not data, so they neither count toward the minimum number of data points nor are thinned
+    for p in inp.interior.soft.iter().filter(|p| inp.layout.inside(p.uv)) {
+        soft.push((Row::Position { uv: p.uv, at: p.xyz }, p.w * mean_w));
+    }
 
     let mut outline: Vec<V2> = Vec::new();
     for ss in inp.sides {

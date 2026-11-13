@@ -197,6 +197,10 @@ fn from_curves_ngon_patch_fills_triangle_and_pentagon() {
     for p in patches {
         assert!(p["max"].as_f64().unwrap() <= 0.2, "{p}");
         assert!(p["side_gap_max_mm"].as_f64().unwrap().is_finite(), "{p}");
+        // the fit measured the region's vertices (a patch that measured none is not within tolerance)
+        assert!(p["points"].as_u64().unwrap() > 50, "{p}");
+        assert!(p["outside"].as_u64().is_some(), "{p}");
+        assert_eq!(p["within_tolerance"], true, "{p}");
     }
     assert!(r["side_gap_max_mm"].as_f64().is_some(), "{r}");
     assert!(r["max"].as_f64().unwrap() <= 0.2, "{r}");

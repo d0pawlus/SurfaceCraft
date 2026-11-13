@@ -24,9 +24,15 @@ mod start;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_g2;
+#[cfg(test)]
+mod tests_points;
+#[cfg(test)]
 mod tests_rounds;
 #[cfg(test)]
 mod tests_soft;
+#[cfg(test)]
+mod tests_strict;
 
 pub use reference::face_normal_curvature;
 
@@ -77,7 +83,9 @@ pub struct Request {
     pub data_uv: Option<Vec<[f64; 2]>>,
     /// Points the patch must pass through.
     pub hard_points: Vec<[f64; 3]>,
-    /// Points the patch should pass near, with a weight relative to a data point's 1.
+    /// Points the patch should pass near, with a weight relative to a data point's 1 (at most 2000).
+    /// They are soft position conditions, not scan data: they never count toward the minimum number
+    /// of data points, are never thinned, and a point outside the outline is an error.
     pub soft_points: Vec<([f64; 3], f64)>,
     /// Interior curves the patch must contain (hard G0).
     pub curves: Vec<Vec<[f64; 3]>>,
@@ -144,12 +152,16 @@ pub struct Report {
     pub outside: usize,
     /// The data's largest distance is within the request's tolerance.
     pub within_tolerance: bool,
-    /// Every side within its targets, nothing folded, no corner relaxed.
+    /// Every hard side meets every target (gap, angle, curvature, not folded), the interior points
+    /// and curves lie on the patch, the data are within the tolerance and no corner was relaxed. A
+    /// side whose gap stopped improving is not excused: it is reported with a warning instead.
     pub within_targets: bool,
     /// One entry per side.
     pub sides: Vec<SideReport>,
     /// Corners that were relaxed.
     pub corners: Vec<CornerReport>,
+    /// Largest distance of a soft point from the patch, mm (`None` without soft points).
+    pub soft_points_max: Option<f64>,
     /// Hard scalar rows found dependent and dropped by the last solve.
     pub dropped: usize,
     /// Things the caller should know.
@@ -191,6 +203,7 @@ const MAX_TRIM_CORNERS: usize = 6_000;
 const WARN_NO_DATA: &str = "no data: the interior is shaped by the boundary and the bending energy";
 const WARN_MAX_CONTROL: &str = "the control net reached max_control";
 const WARN_FEW_DATA: &str = "too few data points for the control net";
+const WARN_TRIM_START: &str = "the trim outline uses the start parameters of the sides";
 
 /// What decides which round is kept.
 #[derive(Clone, Copy, Debug)]
@@ -279,6 +292,21 @@ fn grow_other(net: [usize; 2], from: [usize; 2], max: usize) -> [usize; 2] {
     out
 }
 
+/// The trimming outline: corners from the dense side samples, thinned. A hard side takes the closest
+/// points of its samples on the patch (`own` false), a soft side (or every side, `own` true) the
+/// samples' own parameters, which come from the flattening and cannot cross.
+fn trim_outline(lp: &start::Loop, m: &measure::Measure, own: bool) -> Vec<V2> {
+    let mut outer: Vec<V2> = Vec::new();
+    let cap = (MAX_TRIM_CORNERS / lp.sides.len().max(1)).max(8);
+    for (k, side) in lp.sides.iter().enumerate() {
+        let source = if own || side.soft { m.starts.get(k) } else { m.feet.get(k) };
+        let Some(pts) = source else { continue };
+        let body = pts.get(..pts.len().saturating_sub(1)).unwrap_or_default();
+        outer.extend(thin_indices(body.len(), cap).into_iter().filter_map(|i| body.get(i).copied()));
+    }
+    outer
+}
+
 fn conflict_list(corners: &[start::Corner]) -> String {
     corners
         .iter()
@@ -298,8 +326,13 @@ fn conflict_list(corners: &[start::Corner]) -> String {
 /// ([`Side::soft`]) are followed as far as the data allow and do not steer the fit's targets.
 /// The points of a hard side of three or more points are samples of a smooth curve: its dense
 /// samples follow a cubic interpolant through them, not the chords (a warning names a side that
-/// could not be interpolated). A round is kept by `prefer`; a side whose gap the growth no
-/// longer lowers is reported as being as close as its own accuracy allows.
+/// could not be interpolated). A round is kept by `prefer`; a side whose gap a growth step along it
+/// no longer lowers is reported (with a warning) as being as close as its own accuracy allows, but
+/// is not excused from `within_targets`. G2 rows are linearised about the previous round, so with
+/// a G2 side a net that cannot grow still gets a second round, and more while the curvature error
+/// falls by 5 %. Soft points are soft position rows that need an outline to lie inside (`Err`
+/// otherwise); the largest distance of one from the patch is reported. When the trimmer refuses
+/// the outline of closest points, it is tried with the start parameters of the sides (a warning).
 pub fn fit_patch(req: &Request) -> Result<Patch> {
     fit(
         req,
@@ -363,12 +396,20 @@ fn fit(req: &Request, #[cfg(test)] trace: &mut Vec<RoundTrace>) -> Result<Patch>
     // sides whose gap the growth no longer lowers, and every side's gap in the round before
     let mut frozen = vec![false; lp.sides.len()];
     let mut prev_gaps: Vec<f64> = Vec::new();
-    // the net before the last growth, and whether the last round already was a retry
+    let main = measure::main_directions(&lp);
+    // the net before the last growth, whether the last step grew the net, and whether the last
+    // round already was a retry
     let mut from = start_net;
+    let mut grew = false;
     let mut retried = false;
+    // G2 rows are linearised about the previous round's surface: the curvature error of the last
+    // round that had them
+    let has_g2 = lp.sides.iter().any(|s| s.continuity == Continuity::G2);
+    let mut prev_curv: Option<f64> = None;
     let mut rounds = 0u32;
     for round in 1..=MAX_ROUNDS {
         rounds = round;
+        let had_rows = prev.is_some();
         let layout = Layout::new(domain, net);
         if cache.as_ref().is_none_or(|(l, _)| l.net != net) {
             cache = Some((layout, rows::sample_sides(&lp, &layout)?));
@@ -395,9 +436,12 @@ fn fit(req: &Request, #[cfg(test)] trace: &mut Vec<RoundTrace>) -> Result<Patch>
             gap_max: m.sides.iter().filter(|s| !s.soft).map(|s| s.gap_max).fold(0.0, f64::max),
         });
 
-        // a side whose gap the growth lowered by less than MIN_IMPROVEMENT is as close as it gets
+        // a side whose gap a growth step along it lowered by less than MIN_IMPROVEMENT is as close as
+        // it gets (a step that grew only the other direction says nothing about the side)
         for (k, (s, before)) in m.sides.iter().zip(&prev_gaps).enumerate() {
-            if !s.soft
+            let along = grew && main.get(k).is_some_and(|&d| net.get(d) > from.get(d));
+            if along
+                && !s.soft
                 && s.gap_max > G0_TARGET
                 && before - s.gap_max < MIN_IMPROVEMENT * before
                 && let Some(f) = frozen.get_mut(k)
@@ -413,6 +457,13 @@ fn fit(req: &Request, #[cfg(test)] trace: &mut Vec<RoundTrace>) -> Result<Patch>
         let miss = m.miss;
         let improved = round == 1 || prev_worst - worst >= MIN_IMPROVEMENT * prev_worst;
         let summary = Summary { data_ok, data_max: m.max, side_miss: m.side_miss() };
+        // G2 on a net that cannot grow: the first round has no curvature rows, so another round at the
+        // same net states them; then rounds repeat while the curvature error still falls by 5 %
+        let curv = m.curvature_miss();
+        let refine = has_g2
+            && !done
+            && (!had_rows || (curv > G2_TARGET_REL && prev_curv.is_none_or(|p| p - curv >= MIN_IMPROVEMENT * p)));
+        prev_curv = had_rows.then_some(curv);
         if best.as_ref().is_none_or(|b| prefer(&summary, &b.summary)) {
             best =
                 Some(Round { surface: solution.surface.clone(), measure: m, net, dropped: solution.dropped, summary });
@@ -421,40 +472,52 @@ fn fit(req: &Request, #[cfg(test)] trace: &mut Vec<RoundTrace>) -> Result<Patch>
             break;
         }
         // a round that did not help gets one retry in the direction(s) not grown last time
-        let next = if improved {
+        let wanted = if improved {
             retried = false;
-            grow(net, miss, max)
+            Some(grow(net, miss, max))
         } else if retried {
-            break;
+            None
         } else {
             retried = true;
-            grow_other(net, from, max)
+            Some(grow_other(net, from, max))
         };
-        if next == net {
-            break;
-        }
+        let next = match wanted {
+            Some(n) if n != net => n,
+            _ if refine => net,
+            _ => break,
+        };
         prev_worst = prev_worst.min(worst);
         prev = Some(solution.surface);
-        from = net;
+        grew = next != net;
+        if grew {
+            from = net;
+        }
         net = next;
     }
     let Some(best) = best else {
         return Err(KernelError::Argument("the patch could not be fitted".into()));
     };
 
-    // trimming outline: the closest points of the dense side samples on the final patch
-    let mut outer: Vec<V2> = Vec::new();
-    let cap = (MAX_TRIM_CORNERS / lp.sides.len().max(1)).max(8);
-    for feet in &best.measure.feet {
-        let body = &feet[..feet.len().saturating_sub(1)];
-        outer.extend(thin_indices(body.len(), cap).into_iter().filter_map(|i| body.get(i).copied()));
-    }
-    let sheet = trimmed_sheet(&best.surface, &outer, &[])?;
-
+    // trimming outline: the closest points of the dense samples of the hard sides on the final patch,
+    // the samples' own parameters for soft sides (which may lie off the patch, where the feet clamp
+    // or cross); when the trimmer refuses it, once more with the own parameters of every side
     let m = &best.measure;
+    let mut trim_fallback = false;
+    let sheet = match trimmed_sheet(&best.surface, &trim_outline(&lp, m, false), &[]) {
+        Ok(sheet) => sheet,
+        Err(first) if lp.sides.iter().any(|s| !s.soft) => {
+            trim_fallback = true;
+            trimmed_sheet(&best.surface, &trim_outline(&lp, m, true), &[]).map_err(|_| first)?
+        }
+        Err(first) => return Err(first),
+    };
+
     let within_tolerance = m.points == 0 || m.max <= req.tolerance;
-    let within_targets = m.sides_ok(&frozen) && corner_reports.is_empty();
+    let within_targets = m.targets_met() && within_tolerance && corner_reports.is_empty();
     let mut warnings = notes;
+    if trim_fallback {
+        warnings.push(WARN_TRIM_START.to_string());
+    }
     if m.points == 0 {
         warnings.push(WARN_NO_DATA.to_string());
     } else if m.points < 3 * best.net[0] * best.net[1] {
@@ -486,6 +549,7 @@ fn fit(req: &Request, #[cfg(test)] trace: &mut Vec<RoundTrace>) -> Result<Patch>
         within_targets,
         sides: m.sides.clone(),
         corners: corner_reports,
+        soft_points_max: m.soft_max,
         dropped: best.dropped,
         warnings,
     };

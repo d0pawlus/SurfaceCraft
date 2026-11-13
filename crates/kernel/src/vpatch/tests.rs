@@ -381,3 +381,54 @@ fn hostile_input_is_refused() {
     let known = known_surface();
     assert!(derivatives(&known, [f64::NAN, 0.5]).is_err());
 }
+
+/// The wave problem with soft tangent and curvature rows, in the units of `k` (1 or 10 times larger):
+/// positions and parameters scale with `k`, a curvature value with `1 / k`, nothing else changes.
+fn scaled_problem(k: f64) -> Problem {
+    let place = |uv: [f64; 2]| [k * 60.0 * uv[0], k * 40.0 * uv[1], k * wave(60.0 * uv[0], 40.0 * uv[1])];
+    let scaled = |uv: [f64; 2]| [k * uv[0], k * uv[1]];
+    let mut hard = Vec::new();
+    for e in 0..5 {
+        for j in 0..8 {
+            let uv = edge_point(e, j as f64 / 8.0);
+            hard.push(Row::Position { uv: scaled(uv), at: place(uv) });
+        }
+    }
+    let mut soft = Vec::new();
+    for j in 1..=12 {
+        let uv = edge_point(0, j as f64 / 14.0);
+        soft.push((Row::Tangent { uv: scaled(uv), dir: [0.0, 1.0], normal: [0.0, 0.6, 0.8] }, 5.0));
+    }
+    soft.push((
+        Row::Curvature { uv: scaled([0.5, 0.5]), dir: [1.0, 0.0], normal: [0.0, 0.0, 1.0], value: 10.0 / k },
+        3.0,
+    ));
+    let mut data = Vec::new();
+    for i in 0..12 {
+        for j in 0..12 {
+            let uv = [0.3 + 0.4 * i as f64 / 11.0, 0.3 + 0.4 * j as f64 / 11.0];
+            data.push(DataPoint { uv: scaled(uv), at: place(uv), weight: 1.0 });
+        }
+    }
+    Problem { domain: [[0.0, k], [0.0, k]], control: [8, 8], hard, soft, data, outline: Vec::new(), smoothing: 1e-3 }
+}
+
+#[test]
+fn soft_tangent_and_curvature_rows_do_not_depend_on_the_units() {
+    let a = net(&solve(&scaled_problem(1.0)).unwrap().surface);
+    let b = net(&solve(&scaled_problem(10.0)).unwrap().surface);
+    let size = a.iter().flatten().flat_map(|c| c.iter()).fold(0.0_f64, |m, v| m.max(v.abs()));
+    for i in 0..8 {
+        for j in 0..8 {
+            for c in 0..3 {
+                let d = (a[i][j][c] - b[i][j][c] / 10.0).abs();
+                assert!(
+                    d <= 1e-6 * size,
+                    "control point {i},{j},{c}: {} against {} (size {size})",
+                    a[i][j][c],
+                    b[i][j][c] / 10.0
+                );
+            }
+        }
+    }
+}

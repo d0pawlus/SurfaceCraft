@@ -182,19 +182,23 @@ fn g0_to_cylinder() {
 fn g1_to_cylinder() {
     let patch = fit_patch(&cylinder_hole(Continuity::G1)).unwrap();
     for s in &patch.report.sides {
+        assert!(s.gap_max <= G0_TARGET, "{:?}", patch.report);
         assert!(s.angle_max_deg.unwrap() <= G1_TARGET_DEG, "{:?}", patch.report);
         assert!(!s.folded);
     }
+    assert!(patch.report.within_targets, "{:?}", patch.report);
 }
 
 #[test]
 fn g2_to_cylinder() {
     let patch = fit_patch(&cylinder_hole(Continuity::G2)).unwrap();
     for s in &patch.report.sides {
+        assert!(s.gap_max <= G0_TARGET, "{:?}", patch.report);
         assert!(s.angle_max_deg.unwrap() <= G1_TARGET_DEG, "{:?}", patch.report);
         assert!(s.curvature_error_max.unwrap() <= 0.05, "{:?}", patch.report);
         assert!(!s.folded);
     }
+    assert!(patch.report.within_targets, "{:?}", patch.report);
 }
 
 /// A loop of four sides whose first two continue planes 30° apart at their corner; the others are
