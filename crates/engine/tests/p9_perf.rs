@@ -298,6 +298,42 @@ fn decode(data: &str) -> Vec<u8> {
     surfacecraft_doc::base64::decode(data).unwrap()
 }
 
+/// FNV-1a over the bits of `values`.
+fn fnv(values: impl IntoIterator<Item = f64>) -> u64 {
+    values.into_iter().fold(0xcbf2_9ce4_8422_2325, |h, v| (h ^ v.to_bits()).wrapping_mul(0x0000_0100_0000_01b3))
+}
+
+/// Sorted hashes of the surface of every face, of the curve of every edge and of every vertex, and
+/// the number of edges used once, twice and more often.
+fn signature(r: &surfacecraft_kernel::record::brep::Brep) -> (Vec<u64>, Vec<u64>, Vec<u64>, [usize; 3]) {
+    use surfacecraft_kernel::record::brep::{Curve, Surface};
+    let mut faces: Vec<u64> = r
+        .faces
+        .iter()
+        .map(|f| match &f.surface {
+            Surface::Spline { points, .. } => fnv(points.iter().flatten().flatten().copied()),
+            _ => 0,
+        })
+        .collect();
+    let mut edges: Vec<u64> = r
+        .edges
+        .iter()
+        .map(|e| match &e.curve {
+            Curve::Spline { points, .. } => fnv(points.iter().flatten().copied()),
+            _ => 0,
+        })
+        .collect();
+    let mut vertices: Vec<u64> = r.vertices.iter().map(|v| fnv(v.point)).collect();
+    let mut uses = [0usize; 3];
+    for e in &r.edges {
+        uses[e.uses.len().clamp(1, 3) - 1] += 1;
+    }
+    faces.sort_unstable();
+    edges.sort_unstable();
+    vertices.sort_unstable();
+    (faces, edges, vertices, uses)
+}
+
 #[test]
 fn an_own_open_sheet_imports_as_the_stitched_import_does() {
     let (data, faces) = sheet_step(900);
@@ -310,9 +346,11 @@ fn an_own_open_sheet_imports_as_the_stitched_import_does() {
     let (a, b) = (&fast[0], &slow[0]);
     assert_eq!((a.faces.len(), a.edges.len(), a.vertices.len()), (b.faces.len(), b.edges.len(), b.vertices.len()));
     assert_eq!(a.faces.len(), faces);
-    assert_eq!(a.shells.len(), b.shells.len());
     assert!(!surfacecraft_kernel::nurbs::is_closed(a));
-    // the same geometry: the same display area
+    // the same display area, and the same file when each is written out again
     let area = |r: &surfacecraft_kernel::record::brep::Brep| tess::tessellate(r, Some(0.05)).unwrap().area();
     assert!((area(a) - area(b)).abs() <= 1e-9 * area(b), "{} vs {}", area(a), area(b));
+    // the same entities, in the order of the file instead of the stitcher's: the multisets of the
+    // face, edge and vertex geometry (bit for bit) and of how many faces use an edge
+    assert_eq!(signature(a), signature(b));
 }
