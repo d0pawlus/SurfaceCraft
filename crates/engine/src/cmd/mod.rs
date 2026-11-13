@@ -42,6 +42,8 @@ mod surface_pieces;
 mod surface_report;
 pub mod working;
 pub mod wrap;
+mod wrap_cap;
+mod wrap_cluster;
 mod wrap_rounds;
 
 /// An error from a command's `run`.

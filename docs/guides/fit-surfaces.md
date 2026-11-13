@@ -13,6 +13,18 @@ patch network over a whole scan.
   miss, so smooth areas keep large patches; `uniform` halves the budget of the whole scan each
   round (more patches for the same tolerance). `levels` lists the patches and the share within
   the tolerance of every round, `refine` the layout used.
+- `max_patches` is a hard bound of every round, the first included (`cap_used` echoes it): no
+  network has more patches. A round that would exceed it is not dropped: the largest refinement
+  that fits is built (adaptive: the most deviating scan points first; uniform: the budget between
+  the two rounds), within 90 % to 100 % of the cap when the search lands there (at most 4
+  reductions of the scan, `probes` in `levels`), and `levels[].partial` says why a round was cut.
+  The best round is the result. A larger `max_patches` usually raises the share of points within the
+  tolerance (the `within` field of the result's deviation), but that is not guaranteed.
+  `capped` is true when the cap cut a round and the tolerance is still missed. A scan whose
+  surface carries thousands of tiny handles cannot be reduced by edge collapse; its coarse mesh
+  is then clustered on a grid, which keeps the cap at the price of a coarser network (`clustered` is
+  true in the result). When the clustering would lose more than half of the surface, or leave fewer
+  than a tenth of the cap, the command fails and asks for a larger `max_patches`.
 - The scan tells creases from smooth edges: an edge is a crease when the scan normals on its two
   sides differ by more than `crease_deg` (default 35, at most 60; a thin wall's two faces are two
   sides, never averaged). With `continuity: g0` (the default) the patches meet in position only.
