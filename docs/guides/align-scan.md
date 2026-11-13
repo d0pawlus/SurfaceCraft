@@ -145,7 +145,8 @@ Normals, colours and per-vertex data go with the coordinates.
 - `verdict`: `unique` (one pose clearly fits better than any other: every other pose has at least
   3 % of the moving scan's area more in conflict or less on the target), `ambiguous` (a symmetric
   part: the near-tied poses are in `alternatives`; or a matched part that can slide or turn freely,
-  such as a flat or cylindrical patch: `stability` near 0, no alternatives) or `no_match` (too
+  such as a flat or cylindrical patch: `stability` near 0, or a displaced start that settles in a
+  different pose that fits as well, see `probed` and `slides`) or `no_match` (too
   little overlap, or different parts). It proposes by default (`apply` false); a pose that is
   not `unique` is applied only when `choose` names it (0 the best, 1 and up the alternatives; `choose`
   needs `apply`). The result then carries the numbers of the pose chosen. When `apply` was given

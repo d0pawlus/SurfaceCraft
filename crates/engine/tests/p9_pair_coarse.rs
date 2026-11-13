@@ -349,12 +349,14 @@ fn local_corpus_pair() {
     let out = pair(&mut s, json!({}));
     let (angle, disp) = pose_error(&matrix_of(&out), &pose, &other);
     eprintln!(
-        "scan {number}: {:.2} s, angle {angle:.4} deg, displacement {disp:.4} mm, verdict {}, overlap {}, stability {:.5}, {} refined",
+        "scan {number}: {:.2} s, angle {angle:.4} deg, displacement {disp:.4} mm, verdict {}, overlap {}, stability {:.5}, {} refined, probed {} slides {}",
         t.elapsed().as_secs_f64(),
         out["verdict"],
         out["overlap_moving"],
         stab(&out),
-        out["refined"]
+        out["refined"],
+        out["probed"],
+        out["slides"]
     );
 }
 
