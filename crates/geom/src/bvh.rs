@@ -4,6 +4,51 @@ use crate::{Aabb, Mesh, Point3, Vec3, tri};
 
 const LEAF: usize = 8;
 
+/// The corners of the triangles a [`Bvh`] holds: copied out of the mesh (72 bytes a triangle,
+/// contiguous, which queries read fastest) or kept as the mesh's own vertex and index lists (24
+/// bytes a triangle, [`Bvh::build_owned`]: the mesh moves into the tree, nothing is copied).
+#[derive(Clone, Debug)]
+enum Store {
+    Copied(Vec<[Point3; 3]>),
+    Indexed { positions: Vec<Point3>, triangles: Vec<[u32; 3]> },
+}
+
+impl Default for Store {
+    fn default() -> Self {
+        Store::Copied(Vec::new())
+    }
+}
+
+impl Store {
+    fn len(&self) -> usize {
+        match self {
+            Store::Copied(t) => t.len(),
+            Store::Indexed { triangles, .. } => triangles.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Triangle `i`; a triangle that names a missing vertex has all corners at the origin (as
+    /// [`Bvh::build`] takes it from a mesh).
+    #[inline]
+    fn get(&self, i: usize) -> Option<[Point3; 3]> {
+        match self {
+            Store::Copied(t) => t.get(i).copied(),
+            Store::Indexed { positions, triangles } => {
+                let t = triangles.get(i)?;
+                let corner = |k: usize| positions.get(t[k] as usize).copied();
+                Some(match (corner(0), corner(1), corner(2)) {
+                    (Some(a), Some(b), Some(c)) => [a, b, c],
+                    _ => [Point3::origin(); 3],
+                })
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Node {
     bbox: Aabb,
@@ -18,16 +63,16 @@ struct Node {
 /// Ranges at least this large are split into two parallel tasks.
 const PAR_MIN: usize = 32_768;
 
-fn tri_axis_sum(tris: &[[Point3; 3]], ti: u32, axis: usize) -> f64 {
+fn tri_axis_sum(tris: &Store, ti: u32, axis: usize) -> f64 {
     tris.get(ti as usize).map_or(0.0, |t| t[0][axis] + t[1][axis] + t[2][axis])
 }
 
-fn bounds(tris: &[[Point3; 3]], order: &[u32]) -> (Aabb, Aabb) {
+fn bounds(tris: &Store, order: &[u32]) -> (Aabb, Aabb) {
     let mut bbox = Aabb::empty();
     let mut cb = Aabb::empty();
     for &ti in order {
         let Some(t) = tris.get(ti as usize) else { continue };
-        for p in t {
+        for p in &t {
             bbox.grow(p);
         }
         cb.grow(&Point3::from((t[0].coords + t[1].coords + t[2].coords) / 3.0));
@@ -36,12 +81,7 @@ fn bounds(tris: &[[Point3; 3]], order: &[u32]) -> (Aabb, Aabb) {
 }
 
 /// Splits `order` at its median along the longest axis of the centroid box; `None` for a leaf.
-fn split<'a>(
-    tris: &[[Point3; 3]],
-    order: &'a mut [u32],
-    cb: &Aabb,
-    depth: usize,
-) -> Option<(&'a mut [u32], &'a mut [u32])> {
+fn split<'a>(tris: &Store, order: &'a mut [u32], cb: &Aabb, depth: usize) -> Option<(&'a mut [u32], &'a mut [u32])> {
     let n = order.len();
     if n <= LEAF || depth > 60 {
         return None;
@@ -60,7 +100,7 @@ fn split<'a>(
 }
 
 /// Sequential subtree: nodes pushed pre-order into `nodes`; returns the id of the subtree root.
-fn build_seq(tris: &[[Point3; 3]], order: &mut [u32], offset: usize, depth: usize, nodes: &mut Vec<Node>) -> u32 {
+fn build_seq(tris: &Store, order: &mut [u32], offset: usize, depth: usize, nodes: &mut Vec<Node>) -> u32 {
     let n = order.len();
     let (bbox, cb) = bounds(tris, order);
     let id = nodes.len() as u32;
@@ -81,7 +121,7 @@ fn build_seq(tris: &[[Point3; 3]], order: &mut [u32], offset: usize, depth: usiz
 /// Nodes of the subtree over `order` (a slice starting at global position `offset`), pre-order,
 /// child ids relative to the returned vector. Subtrees of at least [`PAR_MIN`] triangles are built
 /// as two parallel tasks and stitched; smaller ones sequentially.
-fn build_range(tris: &[[Point3; 3]], order: &mut [u32], offset: usize, depth: usize) -> Vec<Node> {
+fn build_range(tris: &Store, order: &mut [u32], offset: usize, depth: usize) -> Vec<Node> {
     let n = order.len();
     if n < PAR_MIN {
         let mut v = Vec::with_capacity(2 * n / LEAF + 2);
@@ -136,10 +176,11 @@ pub enum RayCast {
     Exhausted,
 }
 
-/// Triangle BVH. Holds a copy of the triangle corners so it outlives edits to the mesh.
+/// Triangle BVH. [`Bvh::build`] holds a copy of the triangle corners so it outlives edits to the
+/// mesh; [`Bvh::build_owned`] takes the mesh itself and keeps its vertex and index lists.
 #[derive(Clone, Debug, Default)]
 pub struct Bvh {
-    tris: Vec<[Point3; 3]>,
+    tris: Store,
     order: Vec<u32>,
     nodes: Vec<Node>,
 }
@@ -151,6 +192,19 @@ impl Bvh {
     pub fn build(mesh: &Mesh) -> Self {
         let tris: Vec<[Point3; 3]> =
             crate::par::map(mesh.triangle_count(), |i| mesh.triangle(i).unwrap_or([Point3::origin(); 3]));
+        Self::over(Store::Copied(tris))
+    }
+
+    /// [`Bvh::build`] over `mesh`, which moves into the tree: the tree keeps the mesh's vertex
+    /// and index lists instead of a copy of every triangle's corners (24 bytes a triangle instead
+    /// of 72). The tree and every answer are those of [`Bvh::build`]; queries read the corners
+    /// through the index list, which is a little slower.
+    #[must_use]
+    pub fn build_owned(mesh: Mesh) -> Self {
+        Self::over(Store::Indexed { positions: mesh.positions, triangles: mesh.triangles })
+    }
+
+    fn over(tris: Store) -> Self {
         let mut order: Vec<u32> = (0..tris.len() as u32).collect();
         let nodes = if order.is_empty() { Vec::new() } else { build_range(&tris, &mut order, 0, 0) };
         Bvh { tris, order, nodes }
@@ -172,7 +226,7 @@ impl Bvh {
     #[must_use]
     pub fn triangle_normal(&self, i: usize) -> Option<Vec3> {
         let [a, b, c] = self.tris.get(i)?;
-        tri::normal(a, b, c)
+        tri::normal(&a, &b, &c)
     }
 
     /// Closest point on the surface to `q` within `max_dist` (∞ for unbounded).
@@ -207,7 +261,7 @@ impl Bvh {
             if node.leaf {
                 for &ti in self.order.get(node.start as usize..node.end as usize).unwrap_or(&[]) {
                     if let Some([a, b, c]) = self.tris.get(ti as usize) {
-                        let p = tri::closest_point(q, a, b, c);
+                        let p = tri::closest_point(q, &a, &b, &c);
                         let d2 = (p - q).norm_squared();
                         if d2 < best_d2 && keep(ti as usize) {
                             best_d2 = d2;
@@ -282,7 +336,7 @@ impl Bvh {
                         return RayCast::Exhausted;
                     }
                     if let Some([a, b, c]) = self.tris.get(ti as usize)
-                        && let Some(t) = tri::ray_hit(origin, dir, a, b, c)
+                        && let Some(t) = tri::ray_hit(origin, dir, &a, &b, &c)
                         && t < best_t
                         && keep(ti as usize)
                     {
@@ -393,6 +447,33 @@ mod tests {
             let got = bvh.closest(&q, f64::INFINITY).unwrap();
             assert!((got.distance - brute).abs() < 1e-12);
         }
+    }
+
+    /// `build_owned` keeps the mesh's own lists instead of a copy of the corners; every answer is
+    /// that of `build`, bit for bit, including a triangle that names a missing vertex.
+    #[test]
+    fn an_owned_tree_answers_exactly_as_a_copying_one() {
+        let mut m = synth::sphere(Point3::new(1.0, 2.0, 3.0), 5.0, 60, 30);
+        let mut rng = Rng::new(3);
+        for p in &mut m.positions {
+            p.coords *= 1.0 + 0.05 * rng.gauss();
+        }
+        m.triangles.push([0, 1, m.positions.len() as u32 + 7]);
+        let copied = Bvh::build(&m);
+        let owned = Bvh::build_owned(m.clone());
+        assert_eq!((copied.len(), owned.len()), (m.triangle_count(), m.triangle_count()));
+        for _ in 0..500 {
+            let q = Point3::new(rng.range(-9.0, 9.0), rng.range(-9.0, 9.0), rng.range(-9.0, 9.0));
+            assert_eq!(copied.closest(&q, f64::INFINITY), owned.closest(&q, f64::INFINITY));
+            assert_eq!(copied.closest(&q, 1.5), owned.closest(&q, 1.5));
+            let d = rng.unit_vector();
+            assert_eq!(copied.ray_cast(&q, &d), owned.ray_cast(&q, &d));
+        }
+        for i in 0..m.triangle_count() {
+            assert_eq!(copied.triangle_normal(i), owned.triangle_normal(i));
+        }
+        let keep = |b: &Aabb| b.dist2(&Point3::origin()) < 30.0;
+        assert_eq!(copied.candidates(&keep), owned.candidates(&keep));
     }
 
     #[test]

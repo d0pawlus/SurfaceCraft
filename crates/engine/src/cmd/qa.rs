@@ -338,9 +338,10 @@ fn chord_of(chord: Option<f64>, tol: f64) -> CmdResult<f64> {
     Ok(c.clamp(CHORD_BOUNDS.0, CHORD_BOUNDS.1))
 }
 
-/// The B-rep face of the triangle `t` of the tessellation, when the tessellation has a face map.
-fn face_of(topo: &TopoMesh, t: Option<usize>) -> Option<usize> {
-    t.and_then(|t| topo.tri_face.get(t)).map(|&f| f as usize)
+/// The B-rep face of the triangle `t` of the tessellation, when the tessellation has a face map
+/// (`tri_face`, one entry per triangle).
+fn face_of(tri_face: &[u32], t: Option<usize>) -> Option<usize> {
+    t.and_then(|t| tri_face.get(t)).map(|&f| f as usize)
 }
 
 pub(crate) fn compare(s: &Session, i: CompareIn) -> CmdResult<CompareOut> {
@@ -365,14 +366,15 @@ pub(crate) fn compare_points(
     let maxd = positive(i.max_distance.unwrap_or(REACH), "max_distance")?;
     let chord = chord_of(i.chord, tol)?;
     let b = s.doc.body(body_id).ok_or_else(|| CmdError::Params(format!("no body {body_id}")))?;
-    let topo = tessellate_topo(&b.brep, Some(chord))?;
+    let TopoMesh { mesh, tri_face, .. } = tessellate_topo(&b.brep, Some(chord))?;
     // the face count only: `body_out` would integrate the volume of every patch (0.7 ms each)
     let faces = surfacecraft_kernel::solid::counts(&b.brep).faces;
     let normals = if i.facing { scan.vertex_normals() } else { Vec::new() };
-    let bvh = Bvh::build(&topo.mesh);
+    // the tree takes the tessellation over (a copy of every triangle would triple its memory)
+    let bvh = Bvh::build_owned(mesh);
     let tagged: Vec<(Sample, Option<usize>)> = samples_mesh_tagged(&scan.positions, &normals, &bvh, maxd)
         .into_iter()
-        .map(|(sample, tri)| (sample, face_of(&topo, tri)))
+        .map(|(sample, tri)| (sample, face_of(&tri_face, tri)))
         .collect();
     let samples: Vec<Sample> = tagged.iter().map(|(sample, _)| *sample).collect();
     let mut rows = per_face(&tagged, faces, tol);
