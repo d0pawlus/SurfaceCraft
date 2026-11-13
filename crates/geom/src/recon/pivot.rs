@@ -75,6 +75,26 @@ fn ball_center(p0: &Point3, p1: &Point3, p2: &Point3, rho: f64) -> Option<(Point
     Some((cc + nhat * h2.sqrt(), nhat))
 }
 
+/// Tolerance of the pivot angle below zero, 1e-7 rad (near zero the pseudo angle equals the angle).
+const PSEUDO_EPS: f64 = 1e-7;
+
+/// A monotone stand-in for `atan2(y, x) / (π/2)`, in `(-2, 2]` (a quarter turn is 1), from
+/// `+ - * /` only: those are exactly rounded everywhere, while `atan2` differs in the last bit
+/// between the C libraries of macOS, Linux and Windows, and the pivot picks among candidates
+/// (often exactly tied ones, on regular clouds) by this value.
+pub(super) fn pseudo_angle(y: f64, x: f64) -> f64 {
+    let sum = x.abs() + y.abs();
+    if !(sum > 0.0) {
+        return 0.0;
+    }
+    let p = y / sum;
+    match (x < 0.0, y < 0.0) {
+        (false, _) => p,
+        (true, false) => 2.0 - p,
+        (true, true) => -2.0 - p,
+    }
+}
+
 impl<'a> Bpa<'a> {
     pub(super) fn new(pts: &'a [Point3], nrm: &'a [Vec3]) -> Self {
         Self {
@@ -239,11 +259,11 @@ impl<'a> Bpa<'a> {
                 return false;
             }
             let v1 = cen - m;
-            let mut ang = u.dot(&v0.cross(&v1)).atan2(v0.dot(&v1));
-            if ang < -1e-7 {
-                ang += TAU;
+            let mut ang = pseudo_angle(u.dot(&v0.cross(&v1)), v0.dot(&v1));
+            if ang < -PSEUDO_EPS {
+                ang += 4.0;
             }
-            if ang <= PI {
+            if ang <= 2.0 {
                 cands.push((ang.max(0.0), d, cen));
             }
             false
