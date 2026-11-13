@@ -177,14 +177,19 @@ pub(crate) fn analyse(mesh: &Mesh, share: f64, with_nesting: bool) -> Analysis {
 pub(crate) fn split(s: &mut Session, i: SplitIn) -> CmdResult<SplitOut> {
     let id = i.object.resolve(s, ObjectKind::Mesh)?;
     let share = i.min_share.unwrap_or(MIN_SHARE);
-    if !(share.is_finite() && (0.0..=1.0).contains(&share)) {
-        return Err(CmdError::Params("min_share must be within 0..=1".into()));
+    if !(share.is_finite() && share > 0.0 && share <= 1.0) {
+        return Err(CmdError::Params("min_share must be above 0 and at most 1".into()));
     }
     let obj = s.doc.mesh(id).ok_or_else(|| CmdError::Params(format!("no mesh {id}")))?;
     let (mesh, base): (Arc<Mesh>, String) = (obj.mesh.clone(), obj.name.clone());
     let Analysis { parts: listed, beyond, rest, nests } = analyse(&mesh, share, true);
     if listed.is_empty() {
-        return Err(CmdError::Failed("the mesh is empty or invalid".into()));
+        let msg = if rest.is_empty() {
+            "the mesh is empty or invalid".to_string()
+        } else {
+            format!("no piece reaches min_share {share}: the largest of the {} pieces holds less", rest.len())
+        };
+        return Err(CmdError::Failed(msg));
     }
     let total = mesh.triangle_count() as f64;
     let mut out: Vec<PartOut> =

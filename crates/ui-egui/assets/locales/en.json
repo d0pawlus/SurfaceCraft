@@ -899,6 +899,7 @@
   "param.align_frame": "Straighten the sketch",
   "param.angle_tolerance_degrees": "Angle tolerance",
   "param.max_patches": "Max patches",
+  "param.allow_retry": "Retry with a larger limit",
   "param.refine": "Refinement",
   "param.crease_deg": "Crease angle",
   "param.continuity": "Continuity",

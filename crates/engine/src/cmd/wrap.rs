@@ -132,8 +132,14 @@ pub struct WrapOut {
     pub refine: String,
     /// Patches and fit of every round, in order (the result is the best of them).
     pub levels: Vec<WrapLevel>,
-    /// True when `max_patches` stopped the refinement.
+    /// True when `max_patches` cut or stopped the refinement and the tolerance was still missed.
     pub capped: bool,
+    /// `max_patches` in force (the bound of every round; see `levels[].partial` for the rounds it cut).
+    pub cap_used: usize,
+    /// True when edge collapse could not reach the cap and the coarse mesh was made by grid clustering
+    /// (a coarser network).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clustered: bool,
     /// Tolerance used (mm).
     pub tolerance: f64,
     /// The patches against the scan.
@@ -304,6 +310,8 @@ pub(crate) fn wrap(s: &mut Session, i: WrapIn) -> CmdResult<WrapOut> {
         refine: set.refine.name().to_string(),
         levels: wrapped.levels,
         capped: round.capped,
+        cap_used: set.max_patches,
+        clustered: round.clustered,
         tolerance: set.tolerance,
         deviation: round.deviation,
         within_tolerance,

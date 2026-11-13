@@ -39,6 +39,8 @@ pub struct RemeshIn {
 pub struct DeviationFigures {
     /// Points measured.
     pub samples: usize,
+    /// Every vertex was measured (else an even sample, whose maximum can miss one removed fin).
+    pub exact: bool,
     /// Median.
     pub p50: f64,
     /// 95th percentile.
@@ -51,7 +53,7 @@ pub struct DeviationFigures {
 
 impl From<Deviation> for DeviationFigures {
     fn from(d: Deviation) -> Self {
-        Self { samples: d.samples, p50: d.p50, p95: d.p95, p99: d.p99, max: d.max }
+        Self { samples: d.samples, exact: d.exact, p50: d.p50, p95: d.p95, p99: d.p99, max: d.max }
     }
 }
 
@@ -92,10 +94,20 @@ pub struct RemeshOut {
     pub non_manifold_before: usize,
     /// Bytes of the voxel stage (not the whole process).
     pub peak_bytes: usize,
-    /// Scan vertices to the new surface.
+    /// Scan vertices to the new surface: the error of the result and, in its tail, what was removed.
     pub original_to_result: DeviationFigures,
     /// New vertices to the scan surface.
     pub result_to_original: DeviationFigures,
+    /// Share of the scan vertices farther from the result than the tolerance: fins and bridges removed on purpose (or lost), not error.
+    pub removed_share: f64,
+    /// Duplicate triangles dropped before the remesh.
+    pub duplicate_triangles: usize,
+    /// Triangles of the result that cross another (of an even sample of the result).
+    pub self_intersections: usize,
+    /// Triangles tested for that.
+    pub self_intersection_samples: usize,
+    /// What the caller should know (thin features removed).
+    pub warnings: Vec<String>,
 }
 
 impl RemeshOut {
@@ -120,6 +132,11 @@ impl RemeshOut {
             peak_bytes: r.peak_bytes,
             original_to_result: r.original_to_result.into(),
             result_to_original: r.result_to_original.into(),
+            removed_share: r.removed_share,
+            duplicate_triangles: r.duplicate_triangles,
+            self_intersections: r.self_intersections,
+            self_intersection_samples: r.self_intersection_samples,
+            warnings: r.warnings,
         }
     }
 }

@@ -85,8 +85,16 @@ Primitives:
 - `open_surface` (freeform): the network is a sheet because the scan has open boundaries. Fill
   the holes (`mesh.fill_holes`) and run again, or `surface.thicken` the sheet when the part is a
   shell.
-- `out_of_tolerance` (freeform): the part needs more patches than the limit. `surface.wrap` with
-  a larger `max_patches` (up to 60000); the STEP file grows with the patch count.
+- `out_of_tolerance` (freeform): the part needs more patches than the limit. When `max_patches` was
+  not given, the first network stopped at the default limit (12000) with at least 25 % of the scan
+  within the tolerance, the scan has at most 1.5 million triangles and `allow_retry` is not false,
+  the command wraps once more with five times the limit (at most 60000). The second network
+  replaces the first only if it is not open where the first is closed and puts at least 0.5
+  percentage points more of the scan within the tolerance (or closes an open network at no loss).
+  `retry` reports both limits, patches and shares, `kept`, a `reason` (`better`, `not_better`,
+  `open_result`, `failed`) and the `error` of a failed second wrap. A `max_patches` you give is
+  never exceeded. Beyond that, `surface.wrap` with a larger `max_patches` (up to 60000); the STEP
+  file grows with the patch count.
 - `non_manifold_edges`: edges shared by three or more triangles are left after cleaning; the
   regions and holes next to them are unreliable. `mesh.reconstruct` builds a new mesh from the
   points of the file.
@@ -96,29 +104,48 @@ Primitives:
 ## Messy scans: parts, handles, shells
 
 `scan.to_solid` looks at the cleaned scan before it models it and reports what it did in
-`preparation` (`[{step, reason, numbers}]`; empty when the scan was modelled as it is).
+`preparation` (`[{step, reason, numbers}]`, `numbers.ms` the time spent; empty when the scan was
+modelled as it is).
 
-- **Several parts in one file** (`split`). A piece of the scan that holds at least 1 % of the
-  triangles or of the area is a part; the rest is debris. With two or more parts every part is
-  modelled on its own (one solid each, at most the largest 24; `components` takes `all`,
-  `largest` or a number of parts), and `components[]` gives a verdict per part. The overall
-  `verdict` and `issues` are those of the worst part; the figures at the top level are the
-  largest part's. A part inside another closed part is not a part of its own when it is the inner
-  skin of a hollow part (`nested_shell_skipped`). `scan.split` does the separation alone: it makes
-  one mesh per part, reports triangles, area, box, closedness and genus, the debris, and which
-  parts are nested (`cavity`, a hollow part's inner skin, or `inclusion`, a separate part inside another).
+- **Several parts in one file** (`split`). Pieces of the scan are sorted three ways. A piece with at
+  least 1 % of the triangles or of the area is a *part*; a part with at least `part_share` (default
+  10 %) of the area of the largest piece is *co-equal* and gets a solid of its own (the largest 24
+  at most; `components` takes `all`, `largest` or a number). Parts below that are *minor* and
+  pieces below 1 % are *debris*: they are not modelled. Exactly one co-equal part: that part is
+  modelled by the usual path. Several: `components[]` has a verdict per part, `bodies` lists every
+  solid, the top-level `body` and `patches` are the largest part's, `deviation` is the aggregate
+  over the modelled parts (area-weighted share within tolerance, largest maximum) and `verdict`
+  the worst co-equal part's.
+- **What was not modelled is reported.** More than 2 % of the surface in minor pieces and debris:
+  issue `unmodelled_pieces` (count and area share) and the verdict is at most `review`. The inner
+  skin of a hollow part is not modelled either: `nested_shell_skipped`, at most `review`. Co-equal
+  parts past the 24 cap: `parts_beyond_limit` (count and area share), at most `review`. Parts you
+  did not ask for with `components: largest` or a number are no issue and do not lower a pass;
+  `preparation[0].numbers.not_requested` counts them. After a split with every part passed, one
+  `export.step` names all the solids; otherwise each next step says which part it is for.
+  `scan.split` does the separation alone (`min_share` above 0 and at most 1) and reports nesting
+  (`cavity`, a hollow part's inner skin, or `inclusion`, a separate part inside another).
 - **Topological noise** (`remesh`). A closed scan with many handles (genus 64 or more) or non-manifold
-  edges (20 or more) is rebuilt with `mesh.remesh` before it is wrapped; a closed scan that
-  wrapping does not pass on is rebuilt and wrapped again, and the better result is kept.
+  edges (20 or more) is rebuilt with `mesh.remesh` before it is wrapped; a closed scan that wrapping
+  does not pass on is rebuilt and wrapped again, and the result that is clearly better is kept (the
+  rule of the larger-cap retry: a closed result is never replaced by an open one, the share within
+  tolerance must gain more than 0.5 points; a tie keeps the plain result). `rebuild: false` turns it
+  off. The rebuild-and-wrap-again runs at most once per part and for at most the 4 largest parts;
+  the worst case is 24 first wraps and 4 second wraps per call (28), plus one freeform wrap for each
+  part the primitives could not close.
   `mesh.remesh` makes a closed, manifold, outward oriented surface at a voxel of 1.5 x tolerance
   (finer for a thin wall, coarser for a very large area): tunnels, bridges, fins, coincident second
   shells and self-intersections up to two voxels wide are removed, genuine handles and walls of at
   least two voxels beyond that are kept, and the vertices are projected back onto the scan. It
-  reports the deviation from the scan both ways. It refuses an open scan (an opening wider than
-  `max_hole`, default 5 mm, is not closed over), a resolution that would exceed its memory limits
-  (16 million grid columns, 40 million ray crossings, 6 million quads), and a wall the voxel cannot
-  resolve when `voxel` is given.
-- A scan that already works is not touched: no preparation step, the same result as before.
+  reports the deviation from the scan both ways (exact up to 100 000 vertices, else an even sample)
+  and `removed_share`, the share of the scan farther from the result than the tolerance, which is
+  what was removed (or lost), not error. It refuses an open scan (a hole wider than `max_hole`,
+  default 5 mm, or a loop of more than three edges that was not filled), a resolution beyond its
+  limits (16 million grid columns, 40 million ray crossings, 6 million quads; fewer on 32-bit
+  targets), and a wall the voxel cannot resolve when `voxel` is given.
+- A scan that already works is not touched: no preparation step, the same result as before. The
+  piece analysis that decides this is O(n log n) on the cleaned scan (see the PR for the time on a
+  million triangles).
 
 ## Second run
 

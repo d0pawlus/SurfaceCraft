@@ -31,18 +31,37 @@ fn speck(at: Point3, size: f64) -> Mesh {
     }
 }
 
+/// A closed organic part: a sphere of radius `r` at `c` with a wavy skin, noise 0.02.
+fn wavy(c: Point3, r: f64, k: f64, res: usize) -> Mesh {
+    let mut m = weld(synth::sphere(Point3::origin(), 1.0, res, res / 2));
+    for p in &mut m.positions {
+        let d = p.coords;
+        p.coords = c.coords + d * r * (1.0 + 0.08 * (k * d.x).sin() * (k * 0.7 * d.y).cos());
+    }
+    synth::add_noise(&mut m, 0.02, &mut Rng::new(c.x as u64 + 3));
+    m
+}
+
+/// `parts` placed 60 mm apart along x, plus `specks` closed specks of debris far away.
+fn assembly(parts: &[Mesh], specks: usize) -> Mesh {
+    let mut all = Mesh::default();
+    for (n, p) in parts.iter().enumerate() {
+        let mut q = p.clone();
+        q.positions.iter_mut().for_each(|v| v.x += 60.0 * n as f64);
+        all.append(&q);
+    }
+    let mut rng = Rng::new(9);
+    for _ in 0..specks {
+        let at =
+            Point3::new(rng.range(-20.0, 60.0 * parts.len() as f64), rng.range(60.0, 140.0), rng.range(-10.0, 30.0));
+        all.append(&weld(synth::sphere(at, 1.5, 16, 8)));
+    }
+    all
+}
+
 fn three_parts_and_debris() -> (Mesh, [Mesh; 3]) {
-    let wavy = |c: Point3, r: f64, k: f64| {
-        let mut m = weld(synth::sphere(Point3::origin(), 1.0, 120, 60));
-        for p in &mut m.positions {
-            let d = p.coords;
-            p.coords = c.coords + d * r * (1.0 + 0.08 * (k * d.x).sin() * (k * 0.7 * d.y).cos());
-        }
-        synth::add_noise(&mut m, 0.02, &mut Rng::new(c.x as u64 + 3));
-        m
-    };
-    let a = wavy(Point3::new(0.0, 0.0, 0.0), 14.0, 3.0);
-    let b = wavy(Point3::new(45.0, 0.0, 0.0), 10.0, 4.0);
+    let a = wavy(Point3::new(0.0, 0.0, 0.0), 14.0, 3.0, 120);
+    let b = wavy(Point3::new(45.0, 0.0, 0.0), 10.0, 4.0, 120);
     let mut c = weld(synth::torus(Point3::origin(), Vec3::z(), 9.0, 3.5, 120, 60));
     c.positions.iter_mut().for_each(|p| *p += Vec3::new(0.0, 45.0, 0.0));
     synth::add_noise(&mut c, 0.02, &mut Rng::new(8));
@@ -109,10 +128,24 @@ fn gate_split_reports_a_hollow_part_as_nested_not_as_two_parts() {
     let mut s2 = session_with("scan", included);
     let r2 = s2.execute("scan.split", json!({"object": "scan"})).unwrap();
     assert_eq!(r2["parts"][1]["relation"], "inclusion", "{r2}");
-    // a hollow scan is one part for scan.to_solid: nothing is split, no preparation
+}
+
+/// A hollow casting: the outer skin is modelled, the cavity shell is reported, and the verdict says so.
+#[test]
+fn gate_a_hollow_casting_models_the_outer_shell_and_says_what_it_left_out() {
+    let outer = wavy(Point3::origin(), 15.0, 3.0, 120);
+    let mut inner = wavy(Point3::origin(), 9.0, 3.0, 96);
+    inner.triangles.iter_mut().for_each(|t| t.swap(1, 2));
+    let mut hollow = outer;
+    hollow.append(&inner);
+    let mut s = session_with("scan", hollow);
     let out = s.execute("scan.to_solid", json!({"scan": "scan", "method": "freeform"})).unwrap();
-    assert!(out["components"].is_null() || out["components"].as_array().is_some_and(Vec::is_empty), "{out}");
-    assert_eq!(out["preparation"], json!([]));
+    assert_eq!(out["components"].as_array().map(Vec::len), Some(1), "{out}");
+    assert_eq!(out["bodies"].as_array().map(Vec::len), Some(1));
+    let codes: Vec<&str> = out["issues"].as_array().unwrap().iter().filter_map(|i| i["code"].as_str()).collect();
+    assert!(codes.contains(&"nested_shell_skipped"), "{codes:?}");
+    assert_eq!(out["verdict"], "review", "{out}");
+    assert_eq!(out["preparation"][0]["numbers"]["cavity_shells"], 1);
 }
 
 #[test]
@@ -134,6 +167,13 @@ fn gate_to_solid_models_every_part_and_components_largest_models_one() {
     }
     assert_eq!(out["verdict"], "pass");
     assert_eq!(out["preparation"][0]["step"], "split");
+    // every part passed: one export of all the bodies, and the bodies are listed
+    let ids: Vec<u64> = comps.iter().map(|c| c["body"]["id"].as_u64().unwrap()).collect();
+    assert_eq!(out["bodies"].as_array().map(Vec::len), Some(3));
+    assert_eq!(out["next_steps"].as_array().map(Vec::len), Some(1), "{}", out["next_steps"]);
+    assert_eq!(out["next_steps"][0]["command"], "export.step");
+    assert_eq!(out["next_steps"][0]["params"]["objects"], json!(ids));
+    assert!(out["deviation"]["within"].as_f64().unwrap() >= MIN_WITHIN, "the aggregate over the parts");
     let mut s1 = session_with("scan", all.clone());
     let one =
         s1.execute("scan.to_solid", json!({"scan": "scan", "method": "freeform", "components": "largest"})).unwrap();
@@ -141,6 +181,10 @@ fn gate_to_solid_models_every_part_and_components_largest_models_one() {
     let mut s2 = session_with("scan", all);
     let two = s2.execute("scan.to_solid", json!({"scan": "scan", "method": "freeform", "components": 2})).unwrap();
     assert_eq!(two["components"].as_array().unwrap().len(), 2);
+    // parts that were not asked for are not an issue and do not lower a pass; the numbers say how many
+    assert_eq!(one["verdict"], "pass", "{one}");
+    assert_eq!(one["issues"], json!([]), "{one}");
+    assert_eq!(one["preparation"][0]["numbers"]["not_requested"], 2);
     let bad = s2.execute("scan.to_solid", json!({"scan": "scan", "components": "none"}));
     assert!(bad.is_err());
 }
@@ -303,6 +347,11 @@ fn gate_topological_noise_is_removed_and_the_blob_is_modelled() {
     assert!(made >= 190, "handles injected: {made}");
     let before = wrap_summary(&scan);
     eprintln!("surface.wrap on the messy scan, as it is (200 handles): {before}");
+    // recorded, not hoped for: with 200 handles today's wrap still reaches the tolerance (so this gate
+    // is not RED at 200; the thousand-handle gate is)
+    assert!(before["error"].is_null(), "{before}");
+    assert_eq!(before["closed"], json!(true), "{before}");
+    assert!(before["within"].as_f64().unwrap() >= MIN_WITHIN, "{before}");
     let mut s = session_with("scan", scan.clone());
     let r = s.execute("mesh.remesh", json!({"object": "scan"})).unwrap();
     eprintln!("remesh: {r}");
@@ -322,6 +371,9 @@ fn gate_topological_noise_is_removed_and_the_blob_is_modelled() {
     assert_eq!(t["verdict"], "pass", "{t}");
     assert!(t["deviation"]["within"].as_f64().unwrap() >= MIN_WITHIN);
     assert_eq!(t["preparation"][0]["step"], "remesh");
+    assert!(t["preparation"][0]["numbers"]["ms"].is_u64(), "{t}");
+    assert_eq!(s.doc.bodies.len(), 1, "the other attempt leaves nothing behind");
+    assert_eq!(s.doc.bodies[0].name, "solid", "the winner has the requested name");
     let v = t["body"]["volume"].as_f64().unwrap();
     assert!((v - blob_volume()).abs() / blob_volume() < 0.005, "volume {v} vs {}", blob_volume());
 }
@@ -425,12 +477,18 @@ fn gate_a_thousand_handles_stall_the_wrap_and_the_rebuild_cures_it() {
     let (scan, made) = noisy_blob(1000, 77);
     let before = wrap_summary(&scan);
     eprintln!("RED ({made} handles): surface.wrap as it is: {before}");
+    assert!(before["error"].is_null(), "{before}");
     assert!(
         before["closed"] == json!(false)
             || before["within"].as_f64().unwrap_or(0.0) < MIN_WITHIN
             || before["capped"] == json!(true),
         "{before}"
     );
+    let mut s = session_with("scan", scan.clone());
+    let plain = s.execute("scan.to_solid", json!({"scan": "scan", "method": "freeform", "rebuild": false})).unwrap();
+    eprintln!("rebuild off: verdict {} preparation {}", plain["verdict"], plain["preparation"]);
+    assert_ne!(plain["verdict"], "pass", "{plain}");
+    assert_eq!(plain["preparation"], json!([]));
     let mut s = session_with("scan", scan);
     let t = s.execute("scan.to_solid", json!({"scan": "scan", "method": "freeform"})).unwrap();
     eprintln!(
@@ -439,8 +497,111 @@ fn gate_a_thousand_handles_stall_the_wrap_and_the_rebuild_cures_it() {
     );
     assert_eq!(t["verdict"], "pass", "{t}");
     assert_eq!(t["preparation"][0]["step"], "remesh");
+    assert_eq!(s.doc.bodies.len(), 1);
+    assert_eq!(s.doc.bodies[0].name, "solid");
     let v = t["body"]["volume"].as_f64().unwrap();
     assert!((v - blob_volume()).abs() / blob_volume() < 0.005, "volume {v}");
+}
+
+// ---- which parts count ---------------------------------------------------------------------------
+
+/// One part with 98 % of the surface and a small fragment (above the share of a part, below that of a
+/// co-equal one): one body, the verdict of the main part, no issue for a fragment of 1.5 %.
+#[test]
+fn gate_a_small_fragment_is_not_a_part_and_does_not_hide_the_main_pass() {
+    let main = wavy(Point3::origin(), 20.0, 3.0, 160);
+    let fragment = wavy(Point3::origin(), 2.5, 5.0, 60);
+    let mut s = session_with("scan", assembly(&[main, fragment], 0));
+    let out = s.execute("scan.to_solid", json!({"scan": "scan", "method": "freeform"})).unwrap();
+    assert_eq!(out["components"].as_array().map(Vec::len), Some(1), "{out}");
+    assert_eq!(out["bodies"].as_array().map(Vec::len), Some(1));
+    assert_eq!(out["verdict"], "pass", "{out}");
+    assert_eq!(out["issues"], json!([]), "{out}");
+    assert_eq!(out["preparation"][0]["numbers"]["minor_and_debris_pieces"], 1);
+    assert_eq!(out["body"]["id"], out["components"][0]["body"]["id"]);
+}
+
+#[test]
+fn gate_two_parts_of_70_and_30_percent_are_two_bodies() {
+    let big = wavy(Point3::origin(), 15.0, 3.0, 120);
+    let small = wavy(Point3::origin(), 9.8, 4.0, 100);
+    let mut s = session_with("scan", assembly(&[big, small], 0));
+    let out = s.execute("scan.to_solid", json!({"scan": "scan", "method": "freeform"})).unwrap();
+    assert_eq!(out["components"].as_array().map(Vec::len), Some(2), "{out}");
+    assert_eq!(out["bodies"].as_array().map(Vec::len), Some(2));
+    assert_eq!(out["verdict"], "pass", "{out}");
+}
+
+/// Two parts and fifty small pieces that are no part: the pieces are reported and the verdict is not a pass.
+#[test]
+fn gate_unmodelled_pieces_are_an_issue_and_cap_the_verdict() {
+    let a = wavy(Point3::origin(), 14.0, 3.0, 120);
+    let b = wavy(Point3::origin(), 12.0, 4.0, 110);
+    let mut s = session_with("scan", assembly(&[a, b], 50));
+    let out = s.execute("scan.to_solid", json!({"scan": "scan", "method": "freeform"})).unwrap();
+    assert_eq!(out["components"].as_array().map(Vec::len), Some(2), "{out}");
+    let codes: Vec<&str> = out["issues"].as_array().unwrap().iter().filter_map(|i| i["code"].as_str()).collect();
+    assert!(codes.contains(&"unmodelled_pieces"), "{codes:?}");
+    assert_ne!(out["verdict"], "pass", "{out}");
+    assert!(
+        out["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["message"].as_str().is_some_and(|m| m.contains("50 pieces")))
+    );
+}
+
+#[test]
+fn a_cancelled_run_is_a_cancelled_error_not_a_failed_part() {
+    let (all, _) = three_parts_and_debris();
+    let mut s = session_with("scan", all);
+    s.cancel.cancel();
+    let r = s.execute("scan.to_solid", json!({"scan": "scan", "method": "freeform"}));
+    let e = r.expect_err("a cancelled run is an error").to_string();
+    assert!(e.contains("cancelled"), "{e}");
+}
+
+#[test]
+fn scan_split_says_when_no_piece_reaches_the_share_and_wants_a_positive_share() {
+    let (all, _) = three_parts_and_debris();
+    let mut s = session_with("scan", all);
+    let e = s.execute("scan.split", json!({"object": "scan", "min_share": 1.0})).unwrap_err().to_string();
+    assert!(e.contains("no piece reaches"), "{e}");
+    assert!(s.execute("scan.split", json!({"object": "scan", "min_share": 0.0})).is_err());
+}
+
+/// A single shell that does not close (the old meaning of the three-shell test of `scan_to_solid`).
+#[test]
+fn gate_a_single_open_shell_gets_a_verdict_and_next_steps_not_an_error() {
+    let tube = weld(synth::cylinder(Point3::origin(), Vec3::z(), 8.0, 30.0, 96, 24));
+    let mut s = session_with("scan", tube);
+    // the ends of the tube are two holes of 96 edges: left open, they keep the scan from closing
+    let out =
+        s.execute("scan.to_solid", json!({"scan": "scan", "method": "freeform", "fill_holes_max_edges": 10})).unwrap();
+    assert_ne!(out["verdict"], "pass", "{out}");
+    assert!(out["components"].is_null(), "one shell is not split: {out}");
+    assert_eq!(out["preparation"], json!([]));
+    assert!(!out["issues"].as_array().unwrap().is_empty());
+    assert!(!out["next_steps"].as_array().unwrap().is_empty());
+}
+
+/// Timing of the piece analysis `scan.to_solid` runs on every cleaned scan, on about a million triangles.
+#[test]
+#[ignore = "measurement"]
+fn measure_piece_analysis_of_a_million_triangles() {
+    let m = weld(synth::sphere(Point3::origin(), 150.0, 1000, 500));
+    let started = std::time::Instant::now();
+    let ps = pieces(&m);
+    eprintln!("pieces of {} triangles: {} in {:.2} s", m.triangle_count(), ps.len(), started.elapsed().as_secs_f64());
+    let started = std::time::Instant::now();
+    let mut s = session_with("scan", m);
+    let r = s.execute("scan.split", json!({"object": "scan"})).unwrap();
+    eprintln!(
+        "scan.split (analysis with nesting, parts made): {} parts in {:.2} s",
+        r["parts"].as_array().unwrap().len(),
+        started.elapsed().as_secs_f64()
+    );
 }
 
 /// Footprint of `mesh.remesh` on a scan of about a million triangles and 300 mm at the default voxel:

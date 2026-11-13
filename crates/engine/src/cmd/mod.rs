@@ -44,6 +44,8 @@ mod surface_pieces;
 mod surface_report;
 pub mod working;
 pub mod wrap;
+mod wrap_cap;
+mod wrap_cluster;
 mod wrap_rounds;
 
 /// An error from a command's `run`.
@@ -268,6 +270,11 @@ pub const CANCELLED: &str = "cancelled";
 /// The error of a command that was cancelled while it ran.
 pub(crate) fn cancelled() -> CmdError {
     CmdError::Failed(CANCELLED.into())
+}
+
+/// Is `e` the error of a command that was cancelled?
+pub(crate) fn is_cancelled(e: &CmdError) -> bool {
+    matches!(e, CmdError::Failed(m) if m == CANCELLED)
 }
 
 /// No parameters.

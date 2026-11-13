@@ -1,7 +1,8 @@
 //! The result types of `scan.to_solid`: issues, next steps, the scan summary, what was modelled and
 //! how it compares with the scan.
-use super::body::BodyOut;
-use super::{ComponentOut, Method, PrepStep, Verdict};
+use super::{Method, PrepOut, Verdict};
+use crate::cmd::body::BodyOut;
+use crate::cmd::qa::Finding;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -124,6 +125,9 @@ pub struct ToSolidOut {
     /// Patches of the network (method `freeform`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub patches: Option<usize>,
+    /// The network was built a second time with a larger patch limit (method `freeform`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<super::freeform::CapRetry>,
     /// Tolerance used (mm).
     pub tolerance: f64,
     /// The solid against the scan, when a solid was built.
@@ -148,11 +152,7 @@ pub struct ToSolidOut {
     pub issues: Vec<Issue>,
     /// Commands worth running next, most useful first.
     pub next_steps: Vec<NextStep>,
-    /// What was done to the scan before modelling it (`split`, `remesh`) and why; empty when the scan was modelled as it is.
-    #[serde(default)]
-    pub preparation: Vec<PrepStep>,
-    /// One result per part when the scan held several significant parts (the fields above then
-    /// describe the largest part, `verdict` and `issues` the worst of all); empty otherwise.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub components: Vec<ComponentOut>,
+    /// Preparation: what was done to the scan before modelling it, one result per part when it was split.
+    #[serde(flatten)]
+    pub prep: PrepOut,
 }

@@ -7,9 +7,10 @@ use super::body::BodyOut;
 use super::deviation::{NOISE_PRIMITIVE_MM, positive, yes};
 use super::hybrid::{FaceOf, FromRegionsIn, from_regions};
 use super::mesh_edit::{CleanIn, clean};
-use super::primitive::{AutoConstrainIn, FitIn, KindChoice, auto_constrain, fit_cmd};
-use super::qa::{CompareIn, CompareOut, Finding, QaIn, compare, scan_qa};
+use super::primitive::{AutoConstrainIn, auto_constrain};
+use super::qa::{CompareIn, CompareOut, QaIn, compare, scan_qa};
 use super::region::{AutoIn, auto_segment};
+use super::wrap::PATCH_LIMIT;
 use super::{CmdError, CmdResult, CommandSpec, ObjRef};
 use crate::{Session, command};
 use schemars::JsonSchema;
@@ -18,16 +19,20 @@ use serde_json::{Value, json};
 use surfacecraft_deviation::faces::FaceDeviation;
 use surfacecraft_deviation::noise_estimate;
 use surfacecraft_doc::{ObjectId, ObjectKind};
-use surfacecraft_fit::PrimitiveKind;
 
 #[path = "pipeline_freeform.rs"]
 mod freeform;
 #[path = "pipeline_prepare.rs"]
 mod prepare;
-pub use prepare::{ComponentOut, PrepStep};
+pub use prepare::{ComponentOut, PrepOut, PrepStep};
+#[path = "pipeline_rebuild.rs"]
+mod rebuild;
 #[path = "pipeline_types.rs"]
 mod types;
 pub use types::{DeviationSummary, Issue, LeftOut, Modelled, NextStep, ScanSummary, ToSolidOut};
+#[path = "pipeline_regions.rs"]
+mod regions;
+use regions::{candidates, fit_regions, primitive_share};
 
 /// Default tolerance the solid is held to against the scan (mm).
 const TOLERANCE: f64 = 0.2;
@@ -105,6 +110,23 @@ pub struct ToSolidIn {
     /// coaxial, equal radii (default true).
     #[serde(default = "yes")]
     pub constrain: bool,
+    /// Most patches of the network of method `freeform` (default 12000, at most 60000). An explicit
+    /// value is a promise and is never exceeded; without it, a network that stops at the default limit
+    /// short of the tolerance is built once more with a larger limit when that is likely to help
+    /// (`allow_retry`, `retry` of the result).
+    #[serde(default)]
+    pub max_patches: Option<usize>,
+    /// Let method `freeform` build the network once more with a larger patch limit when the first
+    /// one stopped at the default limit short of the tolerance (default true; never done when
+    /// `max_patches` is given).
+    #[serde(default = "yes")]
+    pub allow_retry: bool,
+    /// Rebuild a closed scan with many handles or non-manifold edges, or that wrapping did not pass on, with `mesh.remesh` and wrap it (again) (default true; at most one extra wrap per part and for at most the 4 largest parts). `false`: the scan is wrapped as it is.
+    #[serde(default = "yes")]
+    pub rebuild: bool,
+    /// A part of a scan with several pieces is co-equal, and modelled, when its area is at least this share of the largest piece's (0..1, default 0.1). Smaller pieces and debris are reported, not modelled.
+    #[serde(default)]
+    pub part_share: Option<f64>,
     /// Name of the solid (default "solid").
     #[serde(default)]
     pub name: Option<String>,
@@ -131,15 +153,10 @@ struct Settings {
     tolerance: f64,
     min_within: f64,
     min_triangles: Option<usize>,
+    max_patches: Option<usize>,
+    allow_retry: bool,
+    rebuild: bool,
     name: String,
-}
-
-/// A region as the selection sees it.
-struct Candidate {
-    id: ObjectId,
-    triangles: usize,
-    kind: Option<PrimitiveKind>,
-    rms: Option<f64>,
 }
 
 /// `inconsistent_orientation` needs at least this share of the missing coverage to lie on the solid
@@ -204,93 +221,25 @@ fn settings(s: &Session, i: &ToSolidIn) -> CmdResult<Settings> {
     if i.reuse_regions && s.doc.regions_of(scan).next().is_none() {
         return Err(CmdError::Params("reuse_regions: the scan has no regions (run without it to segment)".into()));
     }
+    if let Some(m) = i.max_patches
+        && !(freeform::MIN_PATCHES..=PATCH_LIMIT).contains(&m)
+    {
+        return Err(CmdError::Params(format!("max_patches must be {}..={PATCH_LIMIT}", freeform::MIN_PATCHES)));
+    }
     Ok(Settings {
         scan,
         tolerance,
         min_within,
         min_triangles: i.min_region_triangles,
+        max_patches: i.max_patches,
+        allow_retry: i.allow_retry,
+        rebuild: i.rebuild,
         name: i.name.clone().unwrap_or_else(|| "solid".to_string()),
     })
 }
 
 fn triangle_count(s: &Session, scan: ObjectId) -> usize {
     s.doc.mesh(scan).map_or(0, |m| m.mesh.triangle_count())
-}
-
-/// The regions of the scan, largest first, and the triangles in none of them.
-fn candidates(s: &Session, scan: ObjectId) -> (Vec<Candidate>, usize) {
-    let mut list: Vec<Candidate> = s
-        .doc
-        .regions_of(scan)
-        .map(|r| Candidate { id: r.id, triangles: r.triangles.len(), kind: r.kind, rms: r.rms })
-        .collect();
-    list.sort_by(|a, b| b.triangles.cmp(&a.triangles).then(a.id.cmp(&b.id)));
-    let assigned: usize = list.iter().map(|c| c.triangles).sum();
-    (list, triangle_count(s, scan).saturating_sub(assigned))
-}
-
-/// Why a region is not modelled; `None` when it is.
-fn refusal(c: &Candidate, min_triangles: usize, rms_limit: f64, taken: usize) -> Option<String> {
-    if c.triangles < min_triangles {
-        return Some(format!("fewer than {min_triangles} triangles"));
-    }
-    if c.kind.is_none() {
-        return Some("no primitive kind fits it".to_string());
-    }
-    match c.rms {
-        Some(rms) if rms > rms_limit => {
-            Some(format!("RMS {rms:.3} mm is above {rms_limit:.3} mm: not a primitive at this noise"))
-        }
-        _ if taken >= MAX_INPUTS => Some(format!("over the limit of {MAX_INPUTS} inputs of one solid")),
-        _ => None,
-    }
-}
-
-fn left_out(c: &Candidate, reason: String) -> LeftOut {
-    LeftOut { region: c.id, triangles: c.triangles, kind: c.kind, rms: c.rms, reason }
-}
-
-/// Share of the scan's triangles in the regions a primitive would be fitted to.
-fn primitive_share(list: &[Candidate], min_triangles: usize, rms_limit: f64, total: usize) -> f64 {
-    if total == 0 {
-        return 0.0;
-    }
-    let fit: usize =
-        list.iter().filter(|c| refusal(c, min_triangles, rms_limit, 0).is_none()).map(|c| c.triangles).sum();
-    fit as f64 / total as f64
-}
-
-/// Fits a primitive to every region that qualifies. Returns the modelled regions and the others.
-fn fit_regions(
-    s: &mut Session,
-    list: &[Candidate],
-    min_triangles: usize,
-    rms_limit: f64,
-) -> (Vec<Modelled>, Vec<LeftOut>) {
-    let mut modelled: Vec<Modelled> = Vec::new();
-    let mut out: Vec<LeftOut> = Vec::new();
-    for c in list {
-        if let Some(reason) = refusal(c, min_triangles, rms_limit, modelled.len()) {
-            out.push(left_out(c, reason));
-            continue;
-        }
-        let params =
-            FitIn { region: Some(ObjRef::Id(c.id.0)), mesh: None, triangles: None, kind: KindChoice::Auto, name: None };
-        match fit_cmd(s, params) {
-            Ok(f) => modelled.push(Modelled {
-                region: c.id,
-                primitive: f.id,
-                kind: f.primitive.kind(),
-                triangles: c.triangles,
-                rms: f.rms,
-                role: String::new(),
-                faces: Vec::new(),
-                skipped: None,
-            }),
-            Err(e) => out.push(left_out(c, format!("no primitive: {}", message_of(&e)))),
-        }
-    }
-    (modelled, out)
 }
 
 fn message_of(e: &CmdError) -> &str {
@@ -646,6 +595,7 @@ fn solve(s: &mut Session, i: &ToSolidIn, set: Settings, scan_report: ScanSummary
         scan: set.scan,
         body: o.body,
         patches: None,
+        retry: None,
         tolerance: set.tolerance,
         deviation: o.deviation,
         worst_faces: o.worst_faces,
@@ -658,8 +608,7 @@ fn solve(s: &mut Session, i: &ToSolidIn, set: Settings, scan_report: ScanSummary
         relations,
         issues,
         next_steps: next,
-        preparation: Vec::new(),
-        components: Vec::new(),
+        prep: PrepOut::default(),
     })
 }
 
