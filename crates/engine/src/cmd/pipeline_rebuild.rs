@@ -3,6 +3,7 @@
 //! rebuilt and wrapped again, the better result kept by the rule of the larger-cap retry (`judge`).
 //! `rebuild: false` turns all of it off. At most one rebuild-and-wrap-again per part, and per call
 //! only for the largest [`super::prepare`] parts.
+use super::budget::CallBudget;
 use super::freeform::{Attempt, RetryReason, freeform_on, judge};
 use super::prepare::check_cancel;
 use super::{CmdResult, PrepStep, ScanSummary, Settings, ToSolidOut, Verdict, message_of};
@@ -185,7 +186,7 @@ pub(super) fn freeform_prepared(s: &mut Session, set: &Settings, report: ScanSum
     let found = if set.rebuild { mesh_of(s, set.scan).and_then(|m| evidence(&m)) } else { None };
     let Some((strong, soft, figures)) = found else { return freeform_on(s, set, set.scan, report) };
     // the larger-cap retry belongs to the first attempt only: a second attempt never makes a third wrap
-    let second = Settings { allow_retry: false, name: set.name.clone(), ..*set };
+    let second = Settings { allow_retry: false, name: set.name.clone(), budget: set.budget.clone(), ..*set };
     let mut refusal = None;
     if strong {
         let reason = "the scan has many handles or non-manifold edges that stall the reduction";
@@ -195,6 +196,14 @@ pub(super) fn freeform_prepared(s: &mut Session, set: &Settings, report: ScanSum
                 let rebuilt = freeform_on(s, set, id, report.clone())?;
                 if rebuilt.verdict == Verdict::Pass {
                     return Ok(finish_rebuilt(s, set, rebuilt, step));
+                }
+                // wrapping the scan as it is as well is an extra attempt of the call's budget
+                if !set.budget.draw() {
+                    let mut kept = finish_rebuilt(s, set, rebuilt, step);
+                    kept.prep
+                        .preparation
+                        .push(budget_spent("the rebuilt scan did not pass; wrapping the scan as it is as well"));
+                    return Ok(kept);
                 }
                 check_cancel(s)?;
                 let base = freeform_on(s, &second, set.scan, report)?;
@@ -208,8 +217,12 @@ pub(super) fn freeform_prepared(s: &mut Session, set: &Settings, report: ScanSum
         base.prep.preparation.extend(refusal);
         return Ok(base);
     }
-    check_cancel(s)?;
     let reason = "wrapping the scan as it is did not pass; the scan is closed and is rebuilt as a clean surface";
+    if !set.budget.draw() {
+        base.prep.preparation.push(budget_spent(reason));
+        return Ok(base);
+    }
+    check_cancel(s)?;
     match remesh_scan(s, set, reason, figures)? {
         Ok((id, step)) => {
             check_cancel(s)?;
@@ -220,6 +233,16 @@ pub(super) fn freeform_prepared(s: &mut Session, set: &Settings, report: ScanSum
             base.prep.preparation.push(step);
             Ok(base)
         }
+    }
+}
+
+/// The step that says a rebuild-and-wrap-again was withheld because the call had used its extra attempts.
+fn budget_spent(reason: &str) -> PrepStep {
+    let why = CallBudget::default().refusal();
+    PrepStep {
+        step: "remesh".into(),
+        reason: format!("{reason}; not done: {why}"),
+        numbers: json!({"refused": "budget_spent"}),
     }
 }
 
@@ -251,6 +274,7 @@ mod tests {
             min_triangles: None,
             max_patches: None,
             allow_retry: true,
+            budget: super::super::budget::CallBudget::default(),
             rebuild: true,
             name: "solid".into(),
         };
@@ -279,6 +303,7 @@ mod tests {
             min_triangles: None,
             max_patches: None,
             allow_retry: true,
+            budget: super::super::budget::CallBudget::default(),
             rebuild: true,
             name: "solid".into(),
         }
@@ -377,5 +402,17 @@ mod tests {
         let mut none = closed_short;
         none.body = None;
         assert!(rebuild_can_help(&none, false), "no solid at all");
+    }
+
+    /// A rebuild-and-wrap-again withheld by the spent budget is a visible `remesh` step that says so.
+    #[test]
+    fn a_rebuild_withheld_by_the_spent_budget_is_a_visible_step() {
+        // Arrange / Act
+        let step = budget_spent("wrapping the scan as it is did not pass");
+
+        // Assert
+        assert_eq!(step.step, "remesh");
+        assert!(step.reason.contains("not done") && step.reason.contains("extra attempts"), "{}", step.reason);
+        assert_eq!(step.numbers["refused"], "budget_spent");
     }
 }

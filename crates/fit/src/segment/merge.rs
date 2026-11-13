@@ -121,7 +121,7 @@ pub(super) fn merge_adjacent(
                 continue;
             }
             tris.sort_unstable();
-            segs[a] = Segment { triangles: tris, primitive: f.primitive, rms: f.rms };
+            segs[a] = Segment { triangles: tris, primitive: f.primitive, rms: f.rms, freeform: false };
             segs[b].triangles.clear();
             // one merge per region and pass; the merged region meets its other neighbours next pass
             busy[a] = true;

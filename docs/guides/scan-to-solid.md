@@ -20,8 +20,25 @@ Use the step-by-step guides when you need a feature history.
 
 ## What it does
 
-`auto` segments the scan; when less than half of its triangles lie in regions a primitive fits,
-the freeform method runs. Pass `method` to choose yourself.
+`auto` segments the scan (at your `tolerance`) and starts with the method the scan suggests: the
+primitives when at least half of its triangles lie in regions a primitive fits, else freeform. When
+that attempt does not end in `pass`, the other method runs too (the primitives after a freeform
+attempt only if at least a quarter of the scan lies in primitive regions) and the better result is
+returned: pass, then review, then fail; at the same verdict the larger share of all scan points
+within the tolerance, then a closed solid over a sheet. `attempts` lists what was tried (method,
+verdict, issue codes, seconds, `returned`); the attempt that lost leaves nothing in the document and
+one `edit.undo` takes the whole run back. A winner that is no pass carries `other_method_tried`.
+Pass `method` to choose yourself (one attempt), or `retry: false` to forbid the second one. It is
+skipped on its own, by counts and never by a clock, when the cleaned mesh of the call (or of the
+part) has more than 600 000 triangles or the first result has 30 000 patches or more: `attempts`
+then holds an entry with `skipped.reason` and `skipped.call`, the call that runs that method. A
+second method that is freeform is also an extra attempt of the call's budget (see "Extra attempts
+of one call"); the primitives method makes no wrap and costs none.
+
+The scan noise (`scan_report.noise_used`, `noise_source`, `noise_spread`) is what the segmentation
+judges fits by. When it is above the tolerance, nothing is merged into freeform regions and a
+result that is not a pass carries `noise_above_tolerance`: the first next step repeats the call with
+a tolerance of three times the noise.
 
 Freeform (`surface.wrap` inside):
 
@@ -59,6 +76,7 @@ kernel refuses sheets of many faces. Give the wall thickness instead:
   (`mesh.thicken`) and the shell is wrapped in patches (method `freeform`; `thickness` has no meaning
   with `primitives` or `reuse_regions`; it models one open shell: with several co-equal parts, or `components` / `part_share`, it is an error: `scan.split` first and thicken a part; `rebuild` does not apply). The thickened mesh is removed afterwards unless
   `keep_thickened` is true; the scan stays; the whole call is one undo step.
+  A call with `thickness` is one open shell and one method: `method: auto` does not try a second method for it (`attempts` is empty), and its larger-cap retry draws from the call's budget of extra attempts like every other path (`retry.reason: budget_spent` when the call had spent it; with one shell the budget is always whole, so in practice the retry runs when it qualifies).
 - The sign says where the material is: positive puts it behind the scanned face (against the normals
   of the scan, the usual case for a scan whose normals point to the scanner), negative in front of
   it, `symmetric` half on each side. If the scan's normals point away from the scanner, use the
@@ -153,6 +171,9 @@ kernel refuses sheets of many faces. Give the wall thickness instead:
 - `left_out_regions` with an RMS reason: the region is freeform. `surface.fit` it and build with
   `body.from_regions`, passing the primitives of `modelled` and the surface in `surfaces`.
 - `unassigned_triangles`: `region.grow` from a seed, or `region.resegment` with a looser tolerance.
+- `noise_above_tolerance`: the scan is rougher than the tolerance; use the tolerance of the first
+  next step (about 3 times the noise) or a smoother scan.
+- `other_method_tried`: `auto` ran the other method as well and it did not do better; see `attempts`.
 - `mostly_freeform` (only with `method: primitives`): less than half of the scan lies in regions
   a primitive fits. Run again with `method: freeform`.
 - `open_surface` (freeform): the network is a sheet because the scan has open boundaries. The
@@ -171,7 +192,7 @@ kernel refuses sheets of many faces. Give the wall thickness instead:
   replaces the first only if it is not open where the first is closed and puts at least 0.5
   percentage points more of the scan within the tolerance (or closes an open network at no loss).
   `retry` reports both limits, patches and shares, `kept`, a `reason` (`better`, `not_better`,
-  `open_result`, `failed`) and the `error` of a failed second wrap. A `max_patches` you give is
+  `open_result`, `failed`, `budget_spent`) and the `error` of a failed second wrap. `budget_spent`: the retry was due but the call had used its extra attempts, so no second network was made (a call that needed no retry has no `retry`). A `max_patches` you give is
   never exceeded. Beyond that, `surface.wrap` with a larger `max_patches` (up to 60000); the STEP
   file grows with the patch count.
 - `non_manifold_edges`: edges shared by three or more triangles are left after cleaning; the
@@ -213,10 +234,20 @@ modelled as it is).
   tolerance must gain more than 0.5 points; a tie keeps the plain result). `rebuild: false` turns it
   off. A rebuild repairs topology, so it is not tried for a closed result whose only issue is
   `out_of_tolerance` (that is the patch budget) unless the scan shows some topology evidence (genus
-  16 or more, or 5 or more non-manifold edges). The rebuild-and-wrap-again runs at most once per part and for at most the 4 largest parts. The
-  larger-cap retry (`allow_retry`) is made once per call: for the first part, in area order, whose first
-  result is capped by the patch limit and short of the tolerance, and only in that part's first attempt. The true worst case is 29 wraps per call: 24 parts (a part the primitives
-  could not close is wrapped as freeform once, as its one wrap), 4 rebuilds and 1 retry.
+  16 or more, or 5 or more non-manifold edges). The rebuild is made for at most the 4 largest parts.
+- **Extra attempts of one call** are counted in one place, a budget of 2 per call (a count of
+  attempts, no clock, so the result does not depend on the machine's speed): the rebuild-and-wrap-again,
+  the larger-cap retry (`allow_retry`: for the first part, in area order, whose first result is capped by
+  the patch limit and short of the tolerance, and only in that part's first attempt) and the other method of
+  `auto` all draw from it, whichever part asks first; when it is spent they are not run (an `auto` attempt
+  that was not run is listed with its reason). A part's own wrap is not an extra attempt (a part the
+  primitives could not close is wrapped as freeform once, as its one wrap; a scan with strong topology
+  evidence is rebuilt and that wrap is made on the rebuilt scan). The worst case is therefore 26 wraps
+  per call: one for each of the 24 parts and the 2 extra attempts, and at most 4 rebuilds. A part that
+  was refused shows it: `components[].retry` with reason `budget_spent`, a `remesh` step in
+  `components[].preparation` saying "not done: the call has used its 2 extra attempts", or the
+  skipped entry in `components[].attempts`. For a split scan the top-level `attempts` and `retry`
+  are those of the largest part; every part's own are in `components[]`.
   `mesh.remesh` makes a closed, manifold, outward oriented surface at a voxel of 1.5 x tolerance
   (finer for a thin wall, coarser for a very large area): tunnels, bridges, fins, coincident second
   shells and self-intersections up to two voxels wide are removed, genuine handles and walls of at

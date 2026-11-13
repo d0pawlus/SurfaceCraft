@@ -30,9 +30,11 @@ pub enum Phase {
     Merge,
     /// Moving boundary triangles between regions.
     Relax,
+    /// Merging fragments into freeform regions.
+    Freeform,
 }
 
-const PHASES: [(&str, Phase); 8] = [
+const PHASES: [(&str, Phase); 9] = [
     ("prep", Phase::Prep),
     ("regions", Phase::Regions),
     ("seed", Phase::Seed),
@@ -41,9 +43,11 @@ const PHASES: [(&str, Phase); 8] = [
     ("final", Phase::Final),
     ("merge", Phase::Merge),
     ("relax", Phase::Relax),
+    ("freeform", Phase::Freeform),
 ];
 
-static PHASE_NS: [AtomicU64; 8] = [
+static PHASE_NS: [AtomicU64; 9] = [
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),

@@ -312,7 +312,8 @@ fn wrap_and_judge(
     // the rim stays open on purpose and the shell is closed over it: holes left are not a defect of the solid
     let judged = super::ScanSummary { holes_left: 0, ..report.clone() };
     let issues = issues_of(&w, &d, set, &judged, &t, face.vertex_count());
-    let next = next_steps(&w, &issues, set, retry.is_some(), i, &t);
+    let tried = retry.as_ref().is_some_and(|r| r.reason != freeform::RetryReason::BudgetSpent);
+    let next = next_steps(&w, &issues, set, tried, i, &t);
     let verdict = if issues.is_empty() {
         Verdict::Pass
     } else if d.coverage >= MIN_COVERAGE {

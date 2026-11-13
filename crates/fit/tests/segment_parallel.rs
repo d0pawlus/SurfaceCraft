@@ -72,7 +72,9 @@ fn digest(segs: &[Segment]) -> u64 {
 #[test]
 fn organic_segmentation_is_identical_on_one_thread_and_many() {
     let mesh = organic_scan(25_000, MEDIUM);
-    let opts = SegmentOptions::default();
+    // the fragments of the surface are kept (the freeform consolidation has its own test in
+    // `segment_freeform`): this one needs the hundreds of regions to exercise speculation
+    let opts = SegmentOptions { freeform: false, ..SegmentOptions::default() };
     let many = std::thread::available_parallelism().map_or(4, usize::from).max(4);
     let (one, one_stats) = segment_stats_on(1, &mesh, &opts);
     let (par, par_stats) = segment_stats_on(many, &mesh, &opts);

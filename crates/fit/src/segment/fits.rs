@@ -57,3 +57,14 @@ fn fit_kind_points(p: &[Point3], n: &[Vec3], kind: PrimitiveKind) -> Option<Prim
     let ns: Vec<Vec3> = n.iter().step_by(stride).copied().collect();
     crate::primitive::fit(kind, &ps, &ns)
 }
+
+/// The kind with the lowest RMS among the candidates of the automatic fit of a set of triangles
+/// (on the same subsample as [`fit_tris`]): `fit_auto` prefers a simpler kind within 20 % of it.
+pub(super) fn best_rms_kind(mesh: &Mesh, normals: &[Vec3], tris: &[u32]) -> Option<PrimitiveKind> {
+    let (p, n) = region_points(mesh, normals, tris);
+    let stride = p.len().div_ceil(FIT_POINTS).max(1);
+    let ps: Vec<Point3> = p.iter().step_by(stride).copied().collect();
+    let ns: Vec<Vec3> = n.iter().step_by(stride).copied().collect();
+    let candidates = fit_auto(&ps, &ns)?.candidates;
+    candidates.into_iter().min_by(|a, b| a.1.total_cmp(&b.1)).map(|(kind, _)| kind)
+}
