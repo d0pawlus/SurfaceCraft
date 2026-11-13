@@ -1,5 +1,6 @@
 //! `mesh.scale_from_length`: a scan of unknown scale brought to true size from one known length.
 use super::deps::{Dependents, scaled_mesh};
+use super::units::{LeftAlone, left_alone};
 use crate::Session;
 use crate::cmd::{CmdError, CmdResult, ObjRef};
 use schemars::JsonSchema;
@@ -47,6 +48,8 @@ pub struct ScaleOut {
     pub primitives: usize,
     /// Quad layouts over the mesh, scaled with it.
     pub quads: usize,
+    /// What was NOT rescaled: bodies, sketches and features stay at the old size.
+    pub left_alone: LeftAlone,
 }
 
 fn finite3(v: [f64; 3]) -> CmdResult<Vec3> {
@@ -89,9 +92,11 @@ pub(super) fn scale_from_length(s: &mut Session, i: ScaleIn) -> CmdResult<ScaleO
     let done = deps.rescale(&mut s.doc, &origin, factor)?;
     let obj = s.doc.mesh_mut(id).ok_or_else(|| CmdError::Params(format!("no mesh {id}")))?;
     obj.mesh = Arc::new(scaled);
+    obj.rescaled = true;
     if let (Some(w), Some(m)) = (obj.working.as_mut(), working) {
         w.mesh = Arc::new(m);
     }
+    let left = left_alone(&s.doc);
     Ok(ScaleOut {
         id,
         factor,
@@ -100,5 +105,6 @@ pub(super) fn scale_from_length(s: &mut Session, i: ScaleIn) -> CmdResult<ScaleO
         regions: done.regions,
         primitives: done.primitives,
         quads: done.quads,
+        left_alone: left,
     })
 }

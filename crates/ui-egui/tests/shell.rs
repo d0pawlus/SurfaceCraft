@@ -209,6 +209,7 @@ fn the_viewport_is_protected_and_the_layout_survives_a_round_trip() {
         lang: Lang::Pl,
         workspace: Some(ws.clone()),
         layout_version: surfacecraft_ui_egui::settings::LAYOUT_VERSION,
+        ..UiSettings::default()
     };
     let back = UiSettings::from_json(&settings.to_json());
     assert_eq!(back, settings);

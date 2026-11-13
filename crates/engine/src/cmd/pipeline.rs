@@ -721,7 +721,7 @@ fn relate(s: &mut Session, modelled: &[Modelled], sigma: Option<f64>) -> usize {
     auto_constrain(s, params).map_or(0, |r| if r.applied { r.relations.len() } else { 0 })
 }
 
-fn to_solid(s: &mut Session, i: ToSolidIn) -> CmdResult<ToSolidOut> {
+pub(super) fn to_solid(s: &mut Session, i: ToSolidIn) -> CmdResult<ToSolidOut> {
     let set = settings(s, &i)?;
     let scan_report = prepare(s, &i, set.scan)?;
     if i.method == Method::Freeform {
@@ -794,7 +794,7 @@ pub static COMMANDS: &[CommandSpec] = &[command!(
     "From raw scan `scan` to a closed solid in one step, measured against the scan. Prismatic parts (`method` primitives): cleans the scan, segments it, fits a primitive to each sizeable region, relates the primitives and builds the solid. Organic parts, castings and body panels (`method` freeform): wraps the whole scan in a watertight network of patches. `method` auto (default) chooses by how much of the scan primitives fit. Returns `verdict` (pass, review or fail), the deviation, `issues`, and `next_steps` with ready parameters. A poor model is a verdict, not an error; regions and primitives stay for manual work. `reuse_regions` models corrected regions again (without cleaning).",
     ToSolidIn,
     ToSolidOut,
-    to_solid
+    super::mesh::scan_size::to_solid_checked
 )];
 
 #[cfg(test)]

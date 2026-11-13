@@ -25,8 +25,8 @@ pub mod working;
 pub use feature::{BoolOp, FeatureObject, FeatureOp, Mode, Side, SketchObject};
 pub use history::History;
 pub use object::{
-    BodyObject, Document, MeshObject, Object, ObjectId, ObjectKind, ObjectSummary, PrimitiveObject, QuadObject,
-    RegionObject, SurfaceObject,
+    BodyObject, Document, LengthUnit, MeshObject, Object, ObjectId, ObjectKind, ObjectSummary, PrimitiveObject,
+    QuadObject, RegionObject, SurfaceObject,
 };
 pub use params::{Param, ParamError, ParamTable, ParamUser};
 pub use working::WorkingCopy;
