@@ -268,7 +268,11 @@ fn rpc<B: Backend + Send + 'static>(s: &mut Server<B>, method: &str, params: Val
 }
 
 /// Largest default `tools/list` reply an agent should have to read (bytes).
-const MAX_DEFAULT_LISTING: usize = 48_000;
+const MAX_DEFAULT_LISTING: usize = 40_000;
+/// Bytes the default listing must stay below its limit, so a new parameter never forces a hand trim.
+const MIN_HEADROOM: usize = 2_000;
+/// Length and FNV-1a hash of the full listing (`--tools full`), which the shortening must not touch.
+const FULL_LISTING_PIN: (usize, u64) = (478_118, 0x5af6_fdf8_b8cc_cf6c);
 
 #[test]
 fn the_default_listing_is_small_and_carries_the_workflow_tools_in_full() {
@@ -395,5 +399,275 @@ fn hostile_prompt_and_resource_requests_never_panic() {
     ] {
         let r = rpc(&mut s, method, params);
         assert!(r.get("result").is_some() || r.get("error").is_some(), "{method}: {r}");
+    }
+}
+
+mod shortening {
+    use super::*;
+    use crate::shorten::{MAX_DESCRIPTION_CHARS, first_sentence, shorten_description, shorten_schema};
+
+    /// FNV-1a, enough to pin a listing byte for byte.
+    fn fnv(text: &str) -> u64 {
+        text.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+    }
+
+    fn listing_text(s: &mut Server<LocalBackend>) -> String {
+        rpc(s, "tools/list", Value::Null).to_string()
+    }
+
+    fn listed_tools(s: &mut Server<LocalBackend>) -> Vec<Value> {
+        rpc(s, "tools/list", Value::Null)["result"]["tools"].as_array().cloned().unwrap_or_default()
+    }
+
+    /// Descriptions of every schema of `v` that sits in a `properties` map.
+    fn property_descriptions(v: &Value, out: &mut Vec<String>) {
+        match v {
+            Value::Object(map) => {
+                if let Some(Value::Object(props)) = map.get("properties") {
+                    for p in props.values() {
+                        if let Some(d) = p.get("description").and_then(Value::as_str) {
+                            out.push(d.to_string());
+                        }
+                    }
+                }
+                map.values().for_each(|x| property_descriptions(x, out));
+            }
+            Value::Array(list) => list.iter().for_each(|x| property_descriptions(x, out)),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn first_sentence_of_a_plain_description() {
+        assert_eq!(first_sentence("Tolerance in mm. Larger values merge more."), "Tolerance in mm.");
+        assert_eq!(first_sentence("No period at all"), "No period at all");
+        assert_eq!(first_sentence("Ends here."), "Ends here.");
+        assert_eq!(first_sentence(""), "");
+        assert_eq!(first_sentence("  padded.  Next"), "padded.");
+    }
+
+    #[test]
+    fn first_sentence_ignores_abbreviations_decimals_and_code() {
+        assert_eq!(
+            first_sentence("Scale factor, e.g. 25.4 for inches. Default 1."),
+            "Scale factor, e.g. 25.4 for inches."
+        );
+        assert_eq!(first_sentence("Ratio of 0.2 to 0.5 of the size. More."), "Ratio of 0.2 to 0.5 of the size.");
+        assert_eq!(first_sentence("Use `a. b` for both. Then more."), "Use `a. b` for both.");
+        assert_eq!(first_sentence("Units, i.e. mm or cm. Rest."), "Units, i.e. mm or cm.");
+    }
+
+    #[test]
+    fn a_long_description_is_cut_on_a_word_with_an_ellipsis() {
+        let long = "word ".repeat(60);
+        let cut = shorten_description(&long, MAX_DESCRIPTION_CHARS);
+        assert!(cut.chars().count() <= MAX_DESCRIPTION_CHARS, "{cut}");
+        assert!(cut.ends_with("word…"), "{cut}");
+        let short = "Short enough.";
+        assert_eq!(shorten_description(short, MAX_DESCRIPTION_CHARS), short, "nothing cut, no ellipsis");
+    }
+
+    #[test]
+    fn a_cut_never_lands_inside_code_or_a_number() {
+        let text = format!("{} `some_long_identifier_name` end", "x".repeat(100));
+        let cut = shorten_description(&text, MAX_DESCRIPTION_CHARS);
+        assert_eq!(cut.matches('`').count() % 2, 0, "{cut}");
+        let text = format!("{} 0.25 tail", "y".repeat(112));
+        let cut = shorten_description(&text, MAX_DESCRIPTION_CHARS);
+        assert!(!cut.contains("0.") || cut.contains("0.25"), "{cut}");
+    }
+
+    #[test]
+    fn cutting_multi_byte_text_is_valid_utf8_at_every_cap() {
+        let text = "zażółć gęślą jaźń ".repeat(20) + "日本語のテキスト ".repeat(20).as_str();
+        for cap in 0..200 {
+            let cut = shorten_description(&text, cap);
+            assert!(cut.chars().count() <= cap.max(1) + 1, "cap {cap}: {cut}");
+        }
+        let no_space = "ę".repeat(500);
+        assert!(shorten_description(&no_space, 120).chars().count() <= 120);
+    }
+
+    fn sample_schema() -> Value {
+        json!({
+            "type": "object",
+            "description": "Top-level text. Kept as is.",
+            "properties": {
+                "unit": {
+                    "type": "string",
+                    "enum": ["mm", "cm", "m", "in", "ft", "um"],
+                    "default": "mm",
+                    "description": "Length unit of the file. One of the listed values. More detail follows here."
+                },
+                "nested": {
+                    "type": "object",
+                    "properties": {"mode": {"type": "string", "enum": ["adaptive", "uniform"], "description": "How to grid. Second."}},
+                    "required": ["mode"]
+                }
+            },
+            "required": ["unit"]
+        })
+    }
+
+    #[test]
+    fn shortening_keeps_enums_defaults_required_and_names() {
+        let (short, cuts) = shorten_schema(&sample_schema());
+        assert_eq!(cuts, 2);
+        assert_eq!(short["properties"]["unit"]["enum"], json!(["mm", "cm", "m", "in", "ft", "um"]));
+        assert_eq!(short["properties"]["unit"]["default"], "mm");
+        assert_eq!(short["properties"]["unit"]["description"], "Length unit of the file.");
+        assert_eq!(short["properties"]["nested"]["properties"]["mode"]["enum"], json!(["adaptive", "uniform"]));
+        assert_eq!(short["properties"]["nested"]["properties"]["mode"]["description"], "How to grid.");
+        assert_eq!(short["required"], json!(["unit"]));
+        assert_eq!(short["properties"]["nested"]["required"], json!(["mode"]));
+        assert_eq!(short["description"], "Top-level text. Kept as is.");
+    }
+
+    #[test]
+    fn the_default_listing_keeps_enums_required_and_says_where_the_docs_are() {
+        let mut s = default_server();
+        let compact = listed_tools(&mut s);
+        let mut full = server();
+        let full = listed_tools(&mut full);
+        for id in FEATURED {
+            let name = tool_name(id);
+            let (c, f) = (
+                compact.iter().find(|t| t["name"] == name.as_str()).expect("compact tool"),
+                full.iter().find(|t| t["name"] == name.as_str()).expect("full tool"),
+            );
+            assert_eq!(c["inputSchema"]["required"], f["inputSchema"]["required"], "{id}");
+            let keys = |t: &Value| -> Vec<String> {
+                t["inputSchema"]["properties"].as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default()
+            };
+            assert_eq!(keys(c), keys(f), "{id}");
+            for (prop, spec) in f["inputSchema"]["properties"].as_object().into_iter().flatten() {
+                assert_eq!(c["inputSchema"]["properties"][prop]["enum"], spec["enum"], "{id}.{prop}");
+                assert_eq!(c["inputSchema"]["properties"][prop]["default"], spec["default"], "{id}.{prop}");
+            }
+            let without_queued = |t: &Value| {
+                let mut schema = t["inputSchema"].clone();
+                if let Some(props) = schema["properties"].as_object_mut() {
+                    props.remove("queued");
+                }
+                schema
+            };
+            let cut = without_queued(c) != without_queued(f);
+            let description = c["description"].as_str().unwrap_or_default();
+            if cut {
+                assert!(
+                    description.contains("describe_command"),
+                    "{id} is shortened but does not say where the docs are"
+                );
+                assert!(description.contains(*id), "{id}: the note names the command id");
+            }
+        }
+        assert!(compact.iter().any(|t| t["description"].as_str().is_some_and(|d| d.contains("describe_command"))));
+    }
+
+    #[test]
+    fn describe_command_and_parameter_errors_stay_unshortened() {
+        let mut s = default_server();
+        let full_schema = (find("scan.to_solid").expect("command").input)();
+        let mut long = Vec::new();
+        property_descriptions(&full_schema, &mut long);
+        let longest = long.iter().max_by_key(|d| d.chars().count()).cloned().unwrap_or_default();
+        assert!(longest.chars().count() > MAX_DESCRIPTION_CHARS, "scan.to_solid has a long description to protect");
+
+        let listed = listed_tools(&mut s);
+        let tool = listed.iter().find(|t| t["name"] == "scan_to_solid").expect("listed");
+        let mut shortened = Vec::new();
+        property_descriptions(&tool["inputSchema"], &mut shortened);
+        assert!(!shortened.contains(&longest), "the listing carries the long description");
+
+        let described = call(&mut s, "describe_command", json!({"id": "scan.to_solid"}));
+        assert!(
+            structured(&described).to_string().contains(&serde_json::to_string(&longest).unwrap_or_default()[1..20])
+        );
+        let mut in_described = Vec::new();
+        property_descriptions(&structured(&described)["input_schema"], &mut in_described);
+        assert!(in_described.contains(&longest), "{described}");
+
+        let err = call(&mut s, "scan_to_solid", json!({"nonsense": 1}));
+        let mut in_error = Vec::new();
+        property_descriptions(&structured(&err)["input_schema"], &mut in_error);
+        assert!(in_error.contains(&longest), "the parameter error carries the full schema: {err}");
+    }
+
+    #[test]
+    fn area_verb_lines_are_first_sentences_and_the_full_summary_is_one_call_away() {
+        let mut s = default_server();
+        let tools = listed_tools(&mut s);
+        let area = tools.iter().find(|t| t["name"] == "scan").expect("scan area");
+        let text = area["description"].as_str().unwrap_or_default();
+        let spec = find("scan.qa").expect("command");
+        let line = text.lines().find(|l| l.starts_with("- qa:")).expect("verb line");
+        assert!(line.chars().count() <= "- qa: ".len() + crate::shorten::MAX_SUMMARY_CHARS, "{line}");
+        assert!(text.contains("describe_command"), "{text}");
+        let described = call(&mut s, "describe_command", json!({"id": "scan.qa"}));
+        assert_eq!(structured(&described)["command"]["summary"], spec.summary, "{described}");
+        assert!(tools.iter().all(|t| {
+            t["inputSchema"]["properties"]["queued"]
+                .get("description")
+                .is_none_or(|d| d.as_str().is_some_and(|d| d.chars().count() < 80))
+        }));
+    }
+
+    #[test]
+    fn the_default_listing_has_headroom_and_is_deterministic() {
+        let mut s = default_server();
+        let first = listing_text(&mut s);
+        assert_eq!(first, listing_text(&mut s), "same server, same bytes");
+        assert_eq!(first, listing_text(&mut default_server()), "new server, same bytes");
+        let size = first.len();
+        assert!(size <= MAX_DEFAULT_LISTING, "the default listing is {size} bytes");
+        assert!(
+            MAX_DEFAULT_LISTING - size >= MIN_HEADROOM,
+            "only {} bytes of headroom left (limit {MAX_DEFAULT_LISTING}, listing {size}): shorten descriptions \
+             structurally in crates/mcp, do not hand-trim command docs",
+            MAX_DEFAULT_LISTING - size
+        );
+    }
+
+    #[test]
+    fn the_full_listing_is_byte_identical_to_before_the_shortening() {
+        let text = listing_text(&mut server());
+        assert_eq!((text.len(), fnv(&text)), FULL_LISTING_PIN, "the full listing changed");
+    }
+
+    #[test]
+    #[ignore = "prints the size table for the pull request"]
+    fn print_the_size_table() {
+        let mut full = server();
+        let mut compact = default_server();
+        let (f, c) = (listing_text(&mut full), listing_text(&mut compact));
+        println!("TOTAL default={} full={} full_fnv={:#x}", c.len(), f.len(), fnv(&f));
+        for t in listed_tools(&mut compact) {
+            println!(
+                "TOOL {} {} bytes, description {} bytes, schema {} bytes",
+                t["name"],
+                t.to_string().len(),
+                t["description"].to_string().len(),
+                t["inputSchema"].to_string().len()
+            );
+        }
+        for id in FEATURED {
+            let spec = find(id).expect("featured");
+            let before = crate::listing::command_tool_unshortened(spec).to_string().len();
+            let tools = listed_tools(&mut compact);
+            let tool = tools.iter().find(|t| t["name"] == tool_name(id).as_str()).expect("listed");
+            let mut after = Vec::new();
+            property_descriptions(&tool["inputSchema"], &mut after);
+            let mut original = Vec::new();
+            property_descriptions(&(spec.input)(), &mut original);
+            let cut = original.iter().filter(|d| !after.contains(d)).count();
+            let longest = after.iter().map(|d| d.chars().count()).max().unwrap_or(0);
+            let longest_before = original.iter().map(|d| d.chars().count()).max().unwrap_or(0);
+            println!(
+                "{id}: {before} -> {} bytes, {} properties, {cut} cut, longest {longest_before} -> {longest}, description {} chars",
+                tool.to_string().len(),
+                original.len(),
+                tool["description"].as_str().map_or(0, |d| d.chars().count()),
+            );
+        }
     }
 }

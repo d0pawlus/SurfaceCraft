@@ -19,6 +19,10 @@ description: Driving SurfaceCraft from an agent — MCP server, bridged mode, CL
   (`crates/mcp/src/lib.rs`) with their input schema. `--tools full` (or `SURFACECRAFT_MCP_TOOLS=full`) lists one
   tool per command with output schemas (about 380 KB). A command that an agent needs on the short path
   belongs in `FEATURED`; keep the default listing under the size the test `the_default_listing_is_small…` holds.
+  The compact listing shortens prose structurally (`crates/mcp/src/shorten.rs`): property descriptions of the
+  featured schemas and the verb lines of the area tools shrink to their first sentence (capped), enums,
+  names and `required` stay, and `describe_command` / parameter errors carry the full text. Never hand-trim
+  command docs to fit the budget; when the headroom test fails, shorten structurally in `crates/mcp`.
 - Results are lean (`crates/mcp/src/lean.rs`): compact JSON text, floats rounded to 6 decimals. A parameter
   error carries the command's `input_schema`; an unknown command, verb or tool carries `did_you_mean`.
 - Prompt `scan_to_solid` (`prompts/get`), resources `surfacecraft://design`, `surfacecraft://commands` and

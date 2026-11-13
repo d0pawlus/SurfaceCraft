@@ -1,4 +1,5 @@
 //! `tools/list`: the entries of the general tools, of one command and of one area.
+use crate::shorten::{MAX_SUMMARY_CHARS, shorten_description, shorten_schema};
 use crate::{OWN, area_commands, tool_name, verb_of, verbs};
 use serde_json::{Value, json};
 use surfacecraft_engine::CommandSpec;
@@ -101,16 +102,56 @@ pub(crate) fn command_tool(c: &CommandSpec, output: bool) -> Value {
     tool
 }
 
+/// A command's entry as the full listing carries it, without the output schema (the baseline the
+/// compact listing is measured against).
+#[cfg(test)]
+pub(crate) fn command_tool_unshortened(c: &CommandSpec) -> Value {
+    command_tool(c, false)
+}
+
+/// A featured command's entry in the compact listing: the input schema keeps its structure and
+/// loses prose beyond the first sentence of each description. The tool says where the full
+/// parameter documentation is (`describe_command`; a parameter error returns it too).
+pub(crate) fn featured_tool(c: &CommandSpec) -> Value {
+    let mut tool = command_tool(c, false);
+    let Some(obj) = tool.as_object_mut() else { return tool };
+    let (schema, cuts) = shorten_schema(&queueable((c.input)()));
+    obj.insert("inputSchema".into(), schema);
+    if cuts > 0 {
+        let description = obj.get("description").and_then(Value::as_str).unwrap_or_default();
+        let note = format!("{description} Parameter notes shortened; full: describe_command id=\"{}\".", c.id);
+        obj.insert("description".into(), Value::String(note));
+    }
+    tool
+}
+
+/// Description of the `queued` flag in the compact listing (full mode keeps the long text; the
+/// queue is explained by `job_status` and `job_wait`).
+const QUEUED_NOTE: &str = "true: queue the call, return a job id (see job_wait).";
+
+/// `tool` with the short description of its `queued` flag, for the compact listing, where the flag
+/// appears on every tool.
+pub(crate) fn with_short_queued(tool: Value) -> Value {
+    let mut tool = tool;
+    let queued = tool.pointer_mut("/inputSchema/properties/queued");
+    if let Some(obj) = queued.and_then(Value::as_object_mut) {
+        obj.insert("description".into(), json!(QUEUED_NOTE));
+    }
+    tool
+}
+
 /// One area's listing entry (compact mode): `verb` and `params`.
 pub(crate) fn area_tool_spec(area: &str) -> Value {
     let commands = area_commands(area);
-    let lines: Vec<String> = commands.iter().map(|c| format!("- {}: {}", verb_of(c.id), c.summary)).collect();
+    let lines: Vec<String> = commands
+        .iter()
+        .map(|c| format!("- {}: {}", verb_of(c.id), shorten_description(c.summary, MAX_SUMMARY_CHARS)))
+        .collect();
     let verb_names = verbs(area);
     json!({
         "name": area,
-        "title": format!("{area} commands"),
         "description": format!(
-            "Commands of the `{area}` area. `verb` picks one, `params` are its parameters (describe_command gives the schema; a wrong parameter returns it too).\n{}",
+            "Commands of the `{area}` area. `verb` picks one, `params` are its parameters (describe_command `id` `{area}.<verb>`: full summary and schema; a wrong parameter returns the schema).\n{}",
             lines.join("\n")
         ),
         "inputSchema": queueable(json!({
