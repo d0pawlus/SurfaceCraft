@@ -3,113 +3,14 @@
 //! already imported (with everything that depends on it), and a size that looks like a unit
 //! mistake is reported as `suspicious_scale` by `mesh.import`, `mesh.info`, `scan.qa` and
 //! `scan.to_solid`.
+#[path = "p9_units/support.rs"]
+mod support;
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use support::*;
 use surfacecraft_doc::{LengthUnit, format};
 use surfacecraft_engine::Session;
 use surfacecraft_fit::primitive::Primitive;
 use surfacecraft_geom::{Mesh, Point3};
-
-/// Removes its directory when dropped.
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(tag: &str) -> Self {
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-        let dir = std::env::temp_dir().join(format!("surfacecraft-p9-units-{tag}-{}-{nanos}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        Self(dir)
-    }
-
-    fn file(&self, name: &str) -> String {
-        self.0.join(name).to_string_lossy().to_string()
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// The mesh object `name` of `s`, copied out.
-fn mesh_of(s: &Session, name: &str) -> Mesh {
-    let (id, _) = s.doc.find_by_name(name).unwrap();
-    s.doc.mesh(id).unwrap().mesh.as_ref().clone()
-}
-
-/// Largest distance between corresponding vertices, relative to the diagonal of `reference`.
-fn worst_gap(a: &Mesh, reference: &Mesh) -> f64 {
-    assert_eq!(a.positions.len(), reference.positions.len(), "vertex counts differ");
-    let diag = reference.bbox().diagonal();
-    a.positions.iter().zip(&reference.positions).map(|(p, q)| (p - q).norm() / diag).fold(0.0, f64::max)
-}
-
-/// Largest distance between the corners of corresponding triangles, relative to the largest
-/// coordinate of `reference`. STL re-indexes the vertices by first use, so the triangles are
-/// compared, not the vertex lists. Single precision is judged against the size of the coordinates.
-fn worst_corner_gap(a: &Mesh, reference: &Mesh) -> f64 {
-    assert_eq!(a.triangles.len(), reference.triangles.len(), "triangle counts differ");
-    let magnitude = reference.positions.iter().map(|p| p.coords.amax()).fold(0.0, f64::max);
-    let corners = |m: &Mesh, t: &[u32; 3]| t.map(|v| m.positions[v as usize]);
-    a.triangles
-        .iter()
-        .zip(&reference.triangles)
-        .flat_map(|(ta, tb)| corners(a, ta).into_iter().zip(corners(reference, tb)))
-        .map(|(p, q)| (p - q).norm() / magnitude)
-        .fold(0.0, f64::max)
-}
-
-/// A bracket as the test reference (millimetres), in a session of its own.
-fn bracket_session() -> Session {
-    let mut s = Session::new();
-    s.execute("mesh.synth", json!({"shape": "bracket", "name": "part"})).unwrap();
-    s
-}
-
-/// The bracket written to `dir` with every length multiplied by `factor` (the file in another unit).
-fn scaled_file(dir: &TempDir, name: &str, factor: f64) -> String {
-    let mut s = bracket_session();
-    s.execute(
-        "mesh.scale_from_length",
-        json!({"object": "part", "from": [0, 0, 0], "to": [1, 0, 0], "length": factor, "origin": [0, 0, 0]}),
-    )
-    .unwrap();
-    let path = dir.file(name);
-    s.execute("mesh.export", json!({"object": "part", "path": path})).unwrap();
-    path
-}
-
-/// Coordinates per millimetre of each unit: a file in `unit` holds this many units per mm.
-fn units_per_mm(unit: &str) -> f64 {
-    match unit {
-        "m" => 0.001,
-        "cm" => 0.1,
-        "in" => 1.0 / 25.4,
-        "ft" => 1.0 / 304.8,
-        "um" => 1000.0,
-        _ => 1.0,
-    }
-}
-
-fn import_as(s: &mut Session, path: &str, units: Option<&str>, name: &str) -> Value {
-    let mut params = json!({"path": path, "name": name});
-    if let Some(u) = units {
-        params["units"] = json!(u);
-    }
-    s.execute("mesh.import", params).unwrap()
-}
-
-/// A plain box of eight corners as an OBJ file (no outlier: a few vertices are measured exactly).
-fn plain_box(dir: &TempDir, name: &str, size: f64) -> String {
-    let h = size / 2.0;
-    let corners = [[-h, -h, -h], [h, -h, -h], [h, h, -h], [-h, h, -h], [-h, -h, h], [h, -h, h], [h, h, h], [-h, h, h]];
-    let mut text: String = corners.iter().map(|c| format!("v {} {} {}\n", c[0], c[1], c[2])).collect();
-    text.push_str("f 1 2 3\nf 1 3 4\nf 5 6 7\nf 5 7 8\n");
-    let path = dir.file(name);
-    std::fs::write(&path, text).unwrap();
-    path
-}
 
 // --- units of the import ---------------------------------------------------------------------
 
@@ -193,10 +94,6 @@ fn mesh_info_shows_the_source_unit() {
 }
 
 // --- the size check --------------------------------------------------------------------------
-
-fn warning_code(v: &Value) -> Option<&str> {
-    v["scale_warning"]["code"].as_str()
-}
 
 #[test]
 fn metre_file_read_as_millimetres_gives_suspicious_scale_with_a_fix() {
@@ -326,20 +223,6 @@ fn a_small_pin_keeps_its_apex_and_is_not_read_as_metres() {
     assert!(out.get("scale_warning").is_none(), "1.2 mm pin: {out}");
 }
 
-/// A flat grid of 12 × 12 vertices (over 100) of `x` × `y` millimetres, with one far outlier.
-fn plane_with_outlier(dir: &TempDir, name: &str, x: f64, y: f64) -> String {
-    let mut text = String::new();
-    for i in 0..12 {
-        for j in 0..12 {
-            text.push_str(&format!("v {} {} 0\n", x * i as f64 / 11.0, y * j as f64 / 11.0));
-        }
-    }
-    text.push_str("v 1000000 0 0\n");
-    let path = dir.file(name);
-    std::fs::write(&path, text).unwrap();
-    path
-}
-
 #[test]
 fn scan_qa_reports_suspicious_scale_on_the_metre_scan_only() {
     let dir = TempDir::new("qa");
@@ -405,20 +288,6 @@ fn set_units_rescales_regions_and_a_fitted_cylinder_made_before_the_fix() {
         other => panic!("expected a cylinder, got {other:?}"),
     };
     assert!((radius - 10.0).abs() <= 1e-6, "radius {radius}");
-}
-
-/// The file at `src` with every coordinate multiplied by `factor`, written to `name` in `dir`.
-fn scaled_file_of(dir: &TempDir, name: &str, src: &str, factor: f64) -> String {
-    let mut s = Session::new();
-    s.execute("mesh.import", json!({"path": src, "name": "src"})).unwrap();
-    s.execute(
-        "mesh.scale_from_length",
-        json!({"object": "src", "from": [0, 0, 0], "to": [1, 0, 0], "length": factor, "origin": [0, 0, 0]}),
-    )
-    .unwrap();
-    let path = dir.file(name);
-    s.execute("mesh.export", json!({"object": "src", "path": path})).unwrap();
-    path
 }
 
 #[test]
@@ -544,10 +413,6 @@ fn streamed_store_in_metres_matches_the_millimetre_store() {
 }
 
 // --- review round 1: corrections, acknowledgement, overflow, what is left alone ----------------
-
-fn info_of(s: &mut Session, name: &str) -> Value {
-    s.execute("mesh.info", json!({"object": name})).unwrap()
-}
 
 #[test]
 fn set_units_corrects_a_cm_choice_to_m_and_equals_a_direct_m_import() {

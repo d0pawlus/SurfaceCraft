@@ -8,6 +8,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use surfacecraft_doc::LengthUnit;
 #[cfg(not(target_arch = "wasm32"))]
+use surfacecraft_geom::Aabb;
+#[cfg(not(target_arch = "wasm32"))]
+use surfacecraft_geom::chunked::disk::ChunkStore;
+#[cfg(not(target_arch = "wasm32"))]
 use surfacecraft_geom::chunked::{StoreParams, StoreSummary};
 use surfacecraft_io::MeshFormat;
 
@@ -194,14 +198,54 @@ fn read_units(dir: &std::path::Path) -> Option<UnitsRecord> {
     serde_json::from_str(&text).ok()
 }
 
-/// The size check on the bounds of a store (its largest side), unless its unit was stated.
+/// The size check of a store, unless its unit was stated. It takes the robust extent of the chunk
+/// boxes, which the index holds: no block is read, so the cost is the number of chunks, and a stray
+/// vertex is trimmed like an outlier vertex of a mesh once there are a hundred chunks or more.
 #[cfg(not(target_arch = "wasm32"))]
-fn store_warning(out: &StoreOut, stated: bool) -> Option<size_check::ScaleWarning> {
-    if stated || out.triangles == 0 {
+fn store_warning(store: &ChunkStore, triangles: u64, stated: bool) -> Option<size_check::ScaleWarning> {
+    if stated || triangles == 0 {
         return None;
     }
-    let extent = out.bbox_max.iter().zip(&out.bbox_min).map(|(hi, lo)| hi - lo).fold(0.0, f64::max);
-    size_check::warning_for_extent(extent, false)
+    let boxes: Vec<Aabb> = (0..store.chunk_count()).filter_map(|c| store.chunk_bbox(c)).collect();
+    size_check::warning_for_extent(size_check::box_extent(&boxes)?, false)
+}
+
+/// Whether the store in `dir` is still the store it was: its index opens and every block checks.
+#[cfg(not(target_arch = "wasm32"))]
+fn store_is_intact(dir: &std::path::Path) -> bool {
+    surfacecraft_geom::chunked::disk::open(dir).and_then(|store| store.verify()).is_ok()
+}
+
+/// The error of a rejected overwrite. The import's own error comes first; the units record goes back
+/// only over an intact store, since otherwise it would describe a store that is no longer there, and
+/// a failure to put it back is appended to the import's error.
+#[cfg(not(target_arch = "wasm32"))]
+fn rejected_overwrite(dir: &std::path::Path, previous: Option<Vec<u8>>, error: CmdError) -> CmdError {
+    if previous.is_none() || !store_is_intact(dir) {
+        return error;
+    }
+    match put_back_units_record(dir, previous) {
+        Ok(()) => error,
+        Err(restore) => appended(error, &restore),
+    }
+}
+
+/// `error` with the text of `extra` appended to its message, keeping its kind.
+#[cfg(not(target_arch = "wasm32"))]
+fn appended(error: CmdError, extra: &CmdError) -> CmdError {
+    let note = |m: &str| {
+        format!(
+            "{m}; {}",
+            match extra {
+                CmdError::Params(t) | CmdError::Failed(t) | CmdError::Unavailable(t) => t,
+            }
+        )
+    };
+    match error {
+        CmdError::Params(m) => CmdError::Params(note(&m)),
+        CmdError::Failed(m) => CmdError::Failed(note(&m)),
+        CmdError::Unavailable(m) => CmdError::Unavailable(note(&m)),
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -277,18 +321,16 @@ fn import_stream(s: &mut Session, i: ImportStreamIn) -> CmdResult<StoreOut> {
     let previous = if i.overwrite.unwrap_or(false) { take_units_record(dir)? } else { None };
     let report = match import_to_store(Path::new(&i.path), dir, &opts) {
         Ok(report) => report,
-        Err(e) => {
-            put_back_units_record(dir, previous)?;
-            return Err(e.into());
-        }
+        Err(e) => return Err(rejected_overwrite(dir, previous, e.into())),
     };
     let stated = i.units.is_some();
     let units = i.units.unwrap_or_default();
-    write_units(Path::new(&i.store_dir), UnitsRecord { units, stated })?;
+    write_units(dir, UnitsRecord { units, stated })?;
     let mut out = store_out(&i.store_dir, &report.summary);
     out.bytes_on_disk = Some(report.stats.bytes_on_disk);
     out.units = Some(units);
-    out.scale_warning = store_warning(&out, stated);
+    let built = surfacecraft_geom::chunked::disk::open(dir).map_err(|e| CmdError::Failed(e.to_string()))?;
+    out.scale_warning = store_warning(&built, out.triangles, stated);
     out.build = Some(BuildOut {
         peak_buffered_triangles: report.stats.peak_buffered_triangles,
         max_chunk_triangles: report.stats.max_chunk_triangles,
@@ -320,7 +362,7 @@ fn store_info(s: &mut Session, i: StoreInfoIn) -> CmdResult<StoreOut> {
     out.verified = verified;
     let record = read_units(std::path::Path::new(&i.store_dir));
     out.units = record.map(|r| r.units);
-    out.scale_warning = store_warning(&out, record.is_some_and(|r| r.stated));
+    out.scale_warning = store_warning(&store, out.triangles, record.is_some_and(|r| r.stated));
     Ok(out)
 }
 

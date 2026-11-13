@@ -332,13 +332,11 @@ impl SurfaceCraftApp {
             let ext = lower.rsplit('.').next().unwrap_or("").to_string();
             let stem = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s).to_string();
             let data = surfacecraft_doc::base64::encode(&bytes);
-            let (id, params) = if ext == "step" || ext == "stp" {
-                ("import.step", json!({"data": data, "name": stem}))
+            if ext == "step" || ext == "stp" {
+                self.launch("import.step", json!({"data": data, "name": stem}), After::Fit);
             } else {
-                let params = json!({"data": data, "format": ext, "name": stem});
-                ("mesh.import", crate::import_units::file_import_params(params))
-            };
-            self.launch(id, params, After::Fit);
+                self.import_mesh_file(json!({"data": data, "format": ext, "name": stem}));
+            }
         }
     }
 

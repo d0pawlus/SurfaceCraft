@@ -63,8 +63,8 @@ pub(crate) fn left_alone(doc: &Document) -> LeftAlone {
 pub struct SetUnitsIn {
     /// Mesh id or name.
     pub object: ObjRef,
-    /// The unit the coordinates really are in; the unit the mesh has now acknowledges it. Refused
-    /// after mesh.scale_from_length.
+    /// The unit the coordinates really are in; the unit the mesh has now acknowledges it.
+    /// A conversion is refused after mesh.scale_from_length.
     pub from: LengthUnit,
     /// Convert although bodies, sketches or features would stay at the old size.
     #[serde(default)]

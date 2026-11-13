@@ -89,6 +89,21 @@ impl LengthUnit {
 }
 
 impl MeshObject {
+    /// A visible mesh in millimetres, with no working copy and no stated unit.
+    #[must_use]
+    pub fn new(id: ObjectId, name: String, mesh: Mesh) -> Self {
+        Self {
+            id,
+            name,
+            mesh: Arc::new(mesh),
+            visible: true,
+            working: None,
+            source_units: LengthUnit::Mm,
+            units_stated: false,
+            rescaled: false,
+        }
+    }
+
     fn describe(&self) -> String {
         let copy = if self.working.is_some() { ", working copy" } else { "" };
         format!("{} triangles, {} vertices{copy}", self.mesh.triangle_count(), self.mesh.vertex_count())

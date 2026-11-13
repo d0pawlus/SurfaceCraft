@@ -15,8 +15,8 @@ use crate::cmd::mesh::units::left_alone;
 use crate::cmd::qa::{Finding, Severity};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use surfacecraft_doc::{Document, ObjectId};
-use surfacecraft_geom::{Mesh, Point3};
+use surfacecraft_doc::{Document, LengthUnit, ObjectId};
+use surfacecraft_geom::{Aabb, Mesh, Point3};
 
 /// The code of the warning, in `mesh.import`, `mesh.info`, `scan.qa`, `scan.to_solid` and stores.
 pub(crate) const SUSPICIOUS_SCALE: &str = "suspicious_scale";
@@ -31,6 +31,8 @@ pub(crate) const SAMPLE_VERTICES: usize = 100_000;
 const METRES_BELOW_MM: f64 = 1.0;
 /// Extents below this (mm) are definitely not millimetres.
 const NOT_MILLIMETRES_BELOW_MM: f64 = 0.02;
+/// Extents at or below this (mm) are a degenerate mesh (a point, or coincident vertices): no size to judge.
+const DEGENERATE_EXTENT_MM: f64 = 1e-9;
 /// Extents above this (mm) look like micrometres or another unit.
 const MICROMETRES_ABOVE_MM: f64 = 20_000.0;
 
@@ -44,6 +46,9 @@ pub enum ScaleProblem {
     NotMillimetres,
     /// Above 20 000 mm: micrometres, or another unit.
     Micrometres,
+    /// A unit was stated, and the size it gives is implausible, while read as millimetres it is
+    /// plausible: the file may already be in millimetres.
+    StatedUnitImplausible,
 }
 
 /// The `suspicious_scale` warning.
@@ -126,7 +131,7 @@ fn problem_of(extent: f64) -> Option<ScaleProblem> {
 fn unit_to_try(problem: ScaleProblem) -> &'static str {
     match problem {
         ScaleProblem::MetresOrInches | ScaleProblem::NotMillimetres => "m",
-        ScaleProblem::Micrometres => "um",
+        ScaleProblem::Micrometres | ScaleProblem::StatedUnitImplausible => "um",
     }
 }
 
@@ -141,20 +146,30 @@ fn message_of(problem: ScaleProblem, extent: f64) -> String {
         ScaleProblem::Micrometres => {
             format!("the largest extent is {extent:.0} mm: this looks like micrometres or another unit")
         }
+        ScaleProblem::StatedUnitImplausible => format!(
+            "the largest extent is {extent:.0} mm after the stated unit, but read as millimetres it would be plausible: the file may already be in millimetres"
+        ),
     }
 }
 
-/// The fixes that work for the mesh: a re-import, or `mesh.set_units` (which needs `force` while
-/// bodies or sketches made from the document stay at the old size).
+/// The fixes that work for the mesh, and always the millimetre confirmation: a re-import, or
+/// `mesh.set_units` (which needs `force` while bodies, sketches or features stay at the old size).
 fn suggestion_of(problem: ScaleProblem, derived: bool) -> String {
-    let unit = unit_to_try(problem);
+    let unit = match problem {
+        ScaleProblem::StatedUnitImplausible => "mm",
+        other => unit_to_try(other),
+    };
     let inches = match problem {
         ScaleProblem::MetresOrInches => " (\"in\" if the file is in inches)",
-        ScaleProblem::NotMillimetres | ScaleProblem::Micrometres => "",
+        _ => "",
     };
     let force = if derived { ", \"force\": true (the bodies and sketches keep their old size)" } else { "" };
+    let fix = match problem {
+        ScaleProblem::StatedUnitImplausible => "import it again without \"units\"".to_string(),
+        _ => format!("import it again with mesh.import and \"units\": \"{unit}\"{inches}"),
+    };
     format!(
-        "import it again with mesh.import and \"units\": \"{unit}\"{inches}, or convert this mesh with mesh.set_units and \"from\": \"{unit}\"{force}"
+        "{fix}, or convert this mesh with mesh.set_units and \"from\": \"{unit}\"{force}, or confirm millimetres with mesh.set_units from mm"
     )
 }
 
@@ -162,6 +177,9 @@ fn suggestion_of(problem: ScaleProblem, derived: bool) -> String {
 /// holds bodies or sketches that a unit change would leave at the old size.
 #[must_use]
 pub(crate) fn warning_for_extent(extent: f64, derived: bool) -> Option<ScaleWarning> {
+    if !(extent > DEGENERATE_EXTENT_MM) {
+        return None;
+    }
     let problem = problem_of(extent)?;
     Some(ScaleWarning {
         code: SUSPICIOUS_SCALE.to_string(),
@@ -176,11 +194,59 @@ pub(crate) fn warning_for_extent(extent: f64, derived: bool) -> Option<ScaleWarn
 #[must_use]
 pub fn warning_of(doc: &Document, id: ObjectId) -> Option<ScaleWarning> {
     let obj = doc.mesh(id)?;
-    if obj.units_stated || obj.rescaled {
+    if obj.rescaled {
         return None;
     }
     let derived = !left_alone(doc).is_empty();
-    warning_for_extent(robust_extent(&obj.mesh)?, derived)
+    let extent = robust_extent(&obj.mesh)?;
+    if obj.units_stated {
+        return stated_warning(extent, obj.source_units, derived);
+    }
+    warning_for_extent(extent, derived)
+}
+
+/// The warning of a mesh whose unit was stated: when the size after the stated conversion is
+/// implausible but the same numbers read as millimetres are plausible, the file may already be in
+/// millimetres. A stated millimetre unit is taken as it is.
+fn stated_warning(extent: f64, source: LengthUnit, derived: bool) -> Option<ScaleWarning> {
+    if source.is_mm() || !(extent > DEGENERATE_EXTENT_MM) || problem_of(extent).is_none() {
+        return None;
+    }
+    if problem_of(extent / source.mm_per_unit()).is_some() {
+        return None;
+    }
+    let problem = ScaleProblem::StatedUnitImplausible;
+    Some(ScaleWarning {
+        code: SUSPICIOUS_SCALE.to_string(),
+        problem,
+        extent,
+        message: message_of(problem, extent),
+        suggestion: suggestion_of(problem, derived),
+    })
+}
+
+/// The robust extent (mm) of boxes, such as the chunks of a store: the same trimming as for the
+/// vertices, applied to the box faces. `None` when there are no boxes.
+#[must_use]
+pub(crate) fn box_extent(boxes: &[Aabb]) -> Option<f64> {
+    let boxes: Vec<&Aabb> = boxes.iter().filter(|b| !b.is_empty()).collect();
+    let n = boxes.len();
+    if n == 0 {
+        return None;
+    }
+    let cut = cut_per_end(n);
+    let mut values: Vec<f64> = Vec::with_capacity(n);
+    let mut largest = 0.0_f64;
+    for k in 0..3 {
+        values.clear();
+        values.extend(boxes.iter().map(|b| b.min[k]));
+        let low = order_statistic(&mut values, cut);
+        values.clear();
+        values.extend(boxes.iter().map(|b| b.max[k]));
+        let high = order_statistic(&mut values, n - 1 - cut);
+        largest = largest.max(high - low);
+    }
+    largest.is_finite().then_some(largest)
 }
 
 /// The warning as a finding of the quality report (a warning to clean before modelling).

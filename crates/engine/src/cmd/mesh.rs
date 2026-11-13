@@ -10,6 +10,7 @@ use surfacecraft_io::{Limits, MeshFormat, Scan, read_points, read_scan, write_me
 
 mod deps;
 mod scale;
+pub(crate) mod scan_size;
 pub(crate) mod size_check;
 pub(crate) mod units;
 

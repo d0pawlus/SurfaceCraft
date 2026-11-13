@@ -6,7 +6,6 @@
 use super::body::BodyOut;
 use super::deviation::{NOISE_PRIMITIVE_MM, positive, yes};
 use super::hybrid::{FaceOf, FromRegionsIn, from_regions};
-use super::mesh::size_check;
 use super::mesh_edit::{CleanIn, clean};
 use super::primitive::{AutoConstrainIn, FitIn, KindChoice, auto_constrain, fit_cmd};
 use super::qa::{CompareIn, CompareOut, Finding, QaIn, compare, scan_qa};
@@ -722,23 +721,7 @@ fn relate(s: &mut Session, modelled: &[Modelled], sigma: Option<f64>) -> usize {
     auto_constrain(s, params).map_or(0, |r| if r.applied { r.relations.len() } else { 0 })
 }
 
-/// `scan.to_solid`: the run, and a size that looks like a unit mistake (P9-U1) is one of its issues.
-fn to_solid(s: &mut Session, i: ToSolidIn) -> CmdResult<ToSolidOut> {
-    let scan = i.scan.resolve(s, ObjectKind::Mesh)?;
-    let size = size_check::warning_of(&s.doc, scan);
-    let mut out = run_to_solid(s, i)?;
-    if let Some(w) = size {
-        // one place: the issue (the scan report's copy of the same finding goes)
-        out.scan_report.findings.retain(|f| f.code != w.code);
-        out.issues.push(Issue { code: w.code.clone(), message: format!("{}. {}", w.message, w.suggestion) });
-        if matches!(out.verdict, Verdict::Pass) {
-            out.verdict = Verdict::Review;
-        }
-    }
-    Ok(out)
-}
-
-fn run_to_solid(s: &mut Session, i: ToSolidIn) -> CmdResult<ToSolidOut> {
+pub(super) fn to_solid(s: &mut Session, i: ToSolidIn) -> CmdResult<ToSolidOut> {
     let set = settings(s, &i)?;
     let scan_report = prepare(s, &i, set.scan)?;
     if i.method == Method::Freeform {
@@ -811,7 +794,7 @@ pub static COMMANDS: &[CommandSpec] = &[command!(
     "From raw scan `scan` to a closed solid in one step, measured against the scan. Prismatic parts (`method` primitives): cleans the scan, segments it, fits a primitive to each sizeable region, relates the primitives and builds the solid. Organic parts, castings and body panels (`method` freeform): wraps the whole scan in a watertight network of patches. `method` auto (default) chooses by how much of the scan primitives fit. Returns `verdict` (pass, review or fail), the deviation, `issues`, and `next_steps` with ready parameters. A poor model is a verdict, not an error; regions and primitives stay for manual work. `reuse_regions` models corrected regions again (without cleaning).",
     ToSolidIn,
     ToSolidOut,
-    to_solid
+    super::mesh::scan_size::to_solid_checked
 )];
 
 #[cfg(test)]

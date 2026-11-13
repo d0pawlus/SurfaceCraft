@@ -3,7 +3,9 @@
 //! file picker) send no `units`, which keeps the size check on. The import form starts with the unit
 //! chosen last in this session (never kept across a restart) and sends it only when it is not
 //! millimetres. What an import or a conversion did is said in words in the interface language.
+use crate::SurfaceCraftApp;
 use crate::i18n::{t, tf};
+use crate::jobs::After;
 use serde_json::{Value, json};
 use surfacecraft_doc::LengthUnit;
 
@@ -37,6 +39,15 @@ pub fn file_import_params(params: Value) -> Value {
             Value::Object(map)
         }
         other => other,
+    }
+}
+
+impl SurfaceCraftApp {
+    /// Imports a mesh file the way the menu, the welcome card and the browser's file picker do: no unit
+    /// is stated, so the size check applies. The one entry point of those imports, so that no caller
+    /// can state a unit by accident.
+    pub fn import_mesh_file(&mut self, params: Value) -> bool {
+        self.launch(IMPORT, file_import_params(params), After::Fit)
     }
 }
 
@@ -89,6 +100,7 @@ pub fn warning_text(result: &Value) -> Option<String> {
         "metres_or_inches" => "units.warning.metres",
         "not_millimetres" => "units.warning.tiny",
         "micrometres" => "units.warning.micro",
+        "stated_unit_implausible" => "units.warning.stated",
         _ => return None,
     };
     let extent = format!("{:.4}", warning.get("extent")?.as_f64()?);

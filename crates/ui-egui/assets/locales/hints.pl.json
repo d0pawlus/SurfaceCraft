@@ -530,7 +530,7 @@
   "The steps, in order.": "Kroki, po kolei.",
   "The true distance between the two points, in mm.": "Prawdziwa odległość między tymi dwoma punktami, w mm.",
   "The unit the coordinates really are in (not millimetres).": "Jednostka, w jakiej naprawdę są współrzędne (nie milimetry).",
-  "The unit the coordinates really are in; the unit the mesh has now acknowledges it. Refused\nafter mesh.scale_from_length.": "Jednostka, w jakiej naprawdę są współrzędne; obecna jednostka siatki ją potwierdza. Odrzucane po mesh.scale_from_length.",
+  "The unit the coordinates really are in; the unit the mesh has now acknowledges it.\nA conversion is refused after mesh.scale_from_length.": "Jednostka, w jakiej naprawdę są współrzędne; obecna jednostka siatki ją potwierdza.\nKonwersja jest odrzucana po mesh.scale_from_length.",
   "The world plane the mirror plane is put on.": "Płaszczyzna układu, na którą trafia płaszczyzna lustra.",
   "Thicken parameters.": "Ustawienia pogrubiania.",
   "Tolerance (mm, 0.001 to 10, default 0.1) of the trim outline: no boundary vertex of the\nregion is farther than this from the trim edge. Holes smaller than five tolerances across\nare ignored.": "Tolerancja konturu przycięcia (mm, 0,001 do 10, domyślnie 0,1): żaden wierzchołek brzegu regionu nie leży dalej od krawędzi przycięcia. Otwory mniejsze niż pięć tolerancji są pomijane.",

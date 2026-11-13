@@ -536,16 +536,7 @@ impl Document {
     pub fn add_mesh(&mut self, name: &str, mesh: Mesh) -> ObjectId {
         let id = self.fresh_id();
         let name = self.unique_name(name);
-        self.meshes.push(MeshObject {
-            id,
-            name,
-            mesh: Arc::new(mesh),
-            visible: true,
-            working: None,
-            source_units: LengthUnit::Mm,
-            units_stated: false,
-            rescaled: false,
-        });
+        self.meshes.push(MeshObject::new(id, name, mesh));
         id
     }
 

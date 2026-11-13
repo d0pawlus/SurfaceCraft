@@ -113,11 +113,9 @@ fn metre_box_data() -> String {
 
 #[test]
 fn a_metre_looking_file_warns_from_the_menu_path_and_from_the_form_alike() {
-    use surfacecraft_ui_egui::import_units;
     let mut app = SurfaceCraftApp::headless();
-    let menu = import_units::file_import_params(json!({"data": metre_box_data(), "format": "obj", "name": "menu"}));
-    let result = app.run_command("mesh.import", menu).unwrap();
-    assert_eq!(result["scale_warning"]["problem"], "metres_or_inches", "the menu path warns: {result}");
+    app.import_mesh_file(json!({"data": metre_box_data(), "format": "obj", "name": "menu"}));
+    assert!(app.status.starts_with("The largest side is 0.0900 mm"), "the menu path warns: {}", app.status);
 
     let mut form = SurfaceCraftApp::headless();
     form.choose_command("mesh.import");
@@ -128,6 +126,36 @@ fn a_metre_looking_file_warns_from_the_menu_path_and_from_the_form_alike() {
     form.palette_params = p.to_string();
     form.run_palette();
     assert!(form.status.starts_with("The largest side is 0.0900 mm"), "the form path warns: {}", form.status);
+}
+
+#[test]
+fn the_menu_entry_point_never_states_a_unit() {
+    let mut app = SurfaceCraftApp::headless();
+    app.import_mesh_file(json!({"data": metre_box_data(), "format": "obj", "name": "m", "units": "m"}));
+    assert!(app.status.starts_with("The largest side is 0.0900 mm"), "a caller cannot state a unit: {}", app.status);
+}
+
+#[test]
+fn a_session_unit_that_does_not_fit_the_next_file_warns() {
+    // file A is metres, chosen in the form; file B is a 45 mm part in a millimetre file, and the
+    // form for B still offers the session's metres
+    let mut app = SurfaceCraftApp::headless();
+    app.choose_command("mesh.import");
+    let mut p = params(&app);
+    p["data"] = json!(metre_box_data());
+    p["format"] = json!("obj");
+    p["name"] = json!("a");
+    p["units"] = json!("m");
+    app.palette_params = p.to_string();
+    app.run_palette();
+    app.choose_command("mesh.import");
+    let mut b = params(&app);
+    b["data"] = json!(base64::encode(b"v 0 0 0\nv 45 0 0\nv 0 45 0\nf 1 2 3\n"));
+    b["format"] = json!("obj");
+    b["name"] = json!("b");
+    app.palette_params = b.to_string();
+    app.run_palette();
+    assert!(app.status.contains("after the stated unit"), "the stated metres do not fit: {}", app.status);
 }
 
 #[test]
