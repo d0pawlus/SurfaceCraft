@@ -59,8 +59,18 @@ fn big_network_costs() {
     let id = surfacecraft_doc::ObjectId(body.as_u64().unwrap());
     let brep = s.doc.body(id).unwrap().brep.clone();
     let t = Instant::now();
+    let info = surfacecraft_kernel::solid::info(&brep);
+    eprintln!("SCALE   solid::info {:.1} s: volume {:?}", seconds(t), info.volume);
+    let t = Instant::now();
     let topo = tessellate_topo(&brep, Some(0.01)).unwrap();
     eprintln!("SCALE   tessellate (chord 0.01) {:.1} s: {} triangles", seconds(t), topo.mesh.triangle_count());
+    let t = Instant::now();
+    let bvh = surfacecraft_geom::Bvh::build(&topo.mesh);
+    eprintln!("SCALE   bvh over the tessellation {:.1} s ({} triangles)", seconds(t), bvh.len());
+    let scan = s.doc.mesh(s.doc.find_by_name("scan").unwrap().0).unwrap().mesh.clone();
+    let t = Instant::now();
+    let near = scan.positions.iter().filter(|p| bvh.closest(p, 5.0).is_some()).count();
+    eprintln!("SCALE   {} closest-point queries {:.1} s ({near} hit)", scan.positions.len(), seconds(t));
     let t = Instant::now();
     let c = s.execute("body.compare", json!({"body": body, "scan": "scan", "tolerance": COMPARE_TOLERANCE})).unwrap();
     eprintln!("SCALE   compare {:.1} s within {} chord {}", seconds(t), c["totals"]["within"], c["chord"]);
@@ -70,6 +80,10 @@ fn big_network_costs() {
     eprintln!("SCALE   export.step {:.1} s: {} bytes", seconds(t), x["bytes"]);
     let t = Instant::now();
     let r = s.execute("import.step", json!({"path": file.to_string_lossy(), "name": "back"}));
-    eprintln!("SCALE   import.step {:.1} s: {}", seconds(t), r.map_or_else(|e| format!("error {e}"), |v| v["faces"].to_string()));
+    eprintln!(
+        "SCALE   import.step {:.1} s: {}",
+        seconds(t),
+        r.map_or_else(|e| format!("error {e}"), |v| v["faces"].to_string())
+    );
     let _ = std::fs::remove_file(&file);
 }

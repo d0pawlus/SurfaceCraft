@@ -71,8 +71,10 @@ fn cluster(mesh: &Mesh, origin: &Point3, cell: f64) -> Mesh {
             *s = (s.0 + p.x, s.1 + p.y, s.2 + p.z, s.3 + 1);
         }
     }
-    let positions =
-        sum.iter().map(|s| Point3::new(s.0 / s.3.max(1) as f64, s.1 / s.3.max(1) as f64, s.2 / s.3.max(1) as f64)).collect();
+    let positions = sum
+        .iter()
+        .map(|s| Point3::new(s.0 / s.3.max(1) as f64, s.1 / s.3.max(1) as f64, s.2 / s.3.max(1) as f64))
+        .collect();
     let cell_id = |v: u32| keys.get(v as usize).and_then(|k| index.get(k)).map(|&c| c as u32);
     let mut seen = std::collections::HashSet::new();
     let mut triangles = Vec::new();
@@ -86,7 +88,61 @@ fn cluster(mesh: &Mesh, origin: &Point3, cell: f64) -> Mesh {
     }
     let mut out = Mesh { positions, triangles };
     remove_non_manifold(&mut out);
+    orient_consistently(&mut out);
     out
+}
+
+/// The three directed edges of a triangle, as stored.
+fn directed(t: &[u32; 3]) -> [(u32, u32); 3] {
+    [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])]
+}
+
+/// Makes triangles that share an edge traverse it in opposite directions: every connected piece is
+/// flipped as a whole from its first triangle, and a triangle that cannot be made consistent (a twist
+/// or a pinch the clustering made) is dropped. The patch network of the mesh must be orientable;
+/// merging the vertices of a grid cell can reverse the sense of a neighbouring triangle.
+fn orient_consistently(mesh: &mut Mesh) {
+    let mut by_edge: std::collections::HashMap<(u32, u32), Vec<usize>> = std::collections::HashMap::new();
+    for (i, t) in mesh.triangles.iter().enumerate() {
+        for (a, b) in directed(t) {
+            by_edge.entry((a.min(b), a.max(b))).or_default().push(i);
+        }
+    }
+    let n = mesh.triangles.len();
+    let (mut flip, mut seen, mut bad) = (vec![false; n], vec![false; n], vec![false; n]);
+    for seed in 0..n {
+        if seen[seed] {
+            continue;
+        }
+        seen[seed] = true;
+        let mut stack = vec![seed];
+        while let Some(t) = stack.pop() {
+            let Some(tri) = mesh.triangles.get(t) else { continue };
+            for (a, b) in directed(tri) {
+                let (from, to) = if flip[t] { (b, a) } else { (a, b) };
+                for &o in by_edge.get(&(a.min(b), a.max(b))).map_or(&[][..], Vec::as_slice) {
+                    let Some(other) = mesh.triangles.get(o).filter(|_| o != t) else { continue };
+                    // `o` must run to -> from; flipped when it is stored from -> to
+                    let want = directed(other).contains(&(from, to));
+                    if !seen[o] {
+                        seen[o] = true;
+                        flip[o] = want;
+                        stack.push(o);
+                    } else if flip[o] != want {
+                        bad[o] = true;
+                    }
+                }
+            }
+        }
+    }
+    let kept: Vec<[u32; 3]> = mesh
+        .triangles
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !bad[*i])
+        .map(|(i, t)| if flip[i] { [t[0], t[2], t[1]] } else { *t })
+        .collect();
+    mesh.triangles = kept;
 }
 
 /// The clustering of `mesh` with the finest cell that leaves at most `cap` triangles (bisection of
@@ -213,6 +269,29 @@ mod tests {
         assert!(out.triangle_count() >= 150, "{}", out.triangle_count());
         assert!(out.validate().is_ok());
         assert_eq!(out, cluster_to_cap(&mesh, 300).unwrap());
+    }
+
+    #[test]
+    fn a_clustered_mesh_is_consistently_oriented() {
+        // Arrange: a sphere with every third triangle turned around
+        let mut mesh = sphere(60);
+        for (i, t) in mesh.triangles.iter_mut().enumerate() {
+            if i % 3 == 0 {
+                t.swap(1, 2);
+            }
+        }
+
+        // Act
+        let out = cluster_to_cap(&mesh, 400).unwrap();
+
+        // Assert: no directed edge is used twice
+        let mut used = std::collections::HashSet::new();
+        for t in &out.triangles {
+            for e in directed(t) {
+                assert!(used.insert(e), "edge {e:?} is used in the same direction twice");
+            }
+        }
+        assert!(out.triangle_count() > 50);
     }
 
     #[test]

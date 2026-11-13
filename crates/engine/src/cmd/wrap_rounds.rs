@@ -323,7 +323,8 @@ fn trimmed(t: &Target, raw: Mesh, budget: f64, refined_vertices: usize) -> Optio
 /// tolerance the budget between the last round and this one that just fits is searched for (the
 /// better of the two is kept). Returns that second round, or `None` when there is none to build.
 fn uniform_over(t: &Target, run: &mut Run, raw: Mesh, budget: f64, last: usize) -> Option<Laid> {
-    let ends = (End { x: -(2.0 * budget).ln(), triangles: last }, End { x: -budget.ln(), triangles: raw.triangle_count() });
+    let ends =
+        (End { x: -(2.0 * budget).ln(), triangles: last }, End { x: -budget.ln(), triangles: raw.triangle_count() });
     if let Some(cut) = trimmed(t, raw, budget, 0)
         && run.add(t, cut).1
     {
@@ -331,7 +332,13 @@ fn uniform_over(t: &Target, run: &mut Run, raw: Mesh, budget: f64, last: usize) 
     }
     let (found, probes) = search_cap(t.max_triangles, ends, UNIFORM_STEP, |x| reduce_scan(t.scan, (-x).exp(), &[]));
     let f = found?;
-    Some(Laid { mesh: f.mesh, budget: (-f.x).exp(), partial: Some(PartialReason::NextRoundOverCap), probes, refined_vertices: 0 })
+    Some(Laid {
+        mesh: f.mesh,
+        budget: (-f.x).exp(),
+        partial: Some(PartialReason::NextRoundOverCap),
+        probes,
+        refined_vertices: 0,
+    })
 }
 
 /// The uniform layout: the budget of the whole scan is halved each round. A round that would not

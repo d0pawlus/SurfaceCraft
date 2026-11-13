@@ -1,7 +1,6 @@
 //! `scan.qa` and `body.compare`, the two reports read before modelling. `scan.qa` says what to clean
 //! in a scan (holes, debris, bad triangles, noise); `body.compare` says where a body departs from the
 //! scan, face by face.
-use super::body::body_out;
 use super::deviation::{CHORD_BOUNDS, NOISE_PRIMITIVE_MM, NOISE_WARNING_MM, REACH, TOLERANCE, positive, yes};
 use super::{CmdError, CmdResult, CommandSpec, ObjRef};
 use crate::{Session, command};
@@ -350,7 +349,8 @@ pub(crate) fn compare(s: &Session, i: CompareIn) -> CmdResult<CompareOut> {
     let scan =
         s.doc.mesh(scan_id).map(|m| m.mesh.clone()).ok_or_else(|| CmdError::Params(format!("no mesh {scan_id}")))?;
     let topo = tessellate_topo(&b.brep, Some(chord))?;
-    let faces = body_out(s, body_id)?.faces;
+    // the face count only: `body_out` would integrate the volume of every patch (0.7 ms each)
+    let faces = surfacecraft_kernel::solid::counts(&b.brep).faces;
     let normals = if i.facing { scan.vertex_normals() } else { Vec::new() };
     let bvh = Bvh::build(&topo.mesh);
     let tagged: Vec<(Sample, Option<usize>)> = samples_mesh_tagged(&scan.positions, &normals, &bvh, maxd)
