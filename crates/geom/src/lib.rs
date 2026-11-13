@@ -34,6 +34,7 @@ pub mod pieces;
 pub mod quality;
 pub mod recon;
 pub mod reduce;
+pub mod remesh;
 pub mod rng;
 pub mod section;
 pub mod synth;

@@ -92,10 +92,26 @@ pub fn fill_holes(mesh: &mut Mesh, max_edges: usize, smooth: bool) -> FillReport
 /// [`fill_holes`], with the keeping of sharp edges (`sharpen`, only with `smooth`) on its own
 /// switch.
 pub(crate) fn fill_holes_with(mesh: &mut Mesh, max_edges: usize, smooth: bool, sharpen: bool) -> FillReport {
+    fill_holes_filtered(mesh, max_edges, smooth, sharpen, &|_, _| true)
+}
+
+/// Fills the holes of at most `max_edges` edges whose loop (vertex indices) `accept` approves, flat
+/// (no fairing): the edge count alone says nothing about the size of a hole on a fine or coarse mesh.
+pub fn fill_holes_where(mesh: &mut Mesh, max_edges: usize, accept: &dyn Fn(&Mesh, &[u32]) -> bool) -> FillReport {
+    fill_holes_filtered(mesh, max_edges, false, false, accept)
+}
+
+fn fill_holes_filtered(
+    mesh: &mut Mesh,
+    max_edges: usize,
+    smooth: bool,
+    sharpen: bool,
+    accept: &dyn Fn(&Mesh, &[u32]) -> bool,
+) -> FillReport {
     let mut rep = FillReport::default();
     let max_edges = max_edges.clamp(3, MAX_FILL_EDGES);
     let (todo, long): (Vec<Vec<u32>>, Vec<Vec<u32>>) =
-        boundary_loops(mesh).into_iter().partition(|lp| lp.len() <= max_edges);
+        boundary_loops(mesh).into_iter().partition(|lp| lp.len() <= max_edges && accept(mesh, lp));
     rep.skipped = long.len();
     drop(long);
     if todo.is_empty() {
