@@ -234,6 +234,10 @@ fn retry_larger(
         reason: RetryReason::Failed,
         error: None,
     };
+    // a call cancelled meanwhile does not start the second wrap (the caller's next check ends it)
+    if s.cancel.is_cancelled() {
+        return (first, None);
+    }
     let before: Vec<ObjectId> = s.doc.bodies.iter().map(|b| b.id).collect();
     let second = match wrap_with(s, cap_to) {
         Ok(w) => w,
@@ -535,6 +539,25 @@ mod tests {
             noise_above_tolerance: false,
             findings: Vec::new(),
         }
+    }
+
+    /// A call cancelled after the first network does not build the second one.
+    #[test]
+    fn a_cancelled_call_does_not_build_the_second_network() {
+        let (mut s, set) = session();
+        let mut calls = 0;
+        let out = freeform_with(&mut s, &set, scan_summary(), |s, cap| {
+            calls += 1;
+            let mut w = wrap_with(s, &set, Some(cap.unwrap_or(300)))?;
+            if cap.is_none() {
+                w.capped = true;
+                s.cancel.cancel();
+            }
+            Ok(w)
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert!(out.retry.is_none());
     }
 
     /// The assembled output of `freeform_with` when the first wrap is forced to be capped and the

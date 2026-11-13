@@ -465,9 +465,10 @@ fn wavy_top_case(seed: u64) -> TopCase {
     TopCase { problems, share: in_freeform as f64 / top.max(1) as f64, others }
 }
 
-/// Noise seeds of the wavy top gate: those of part A and the worst ones of a sweep of 1..=40
-/// (before the islands were joined again after each absorption, the freeform region held only
-/// 86 to 93 % of the top for these, and on Linux's different tessellation under half).
+/// Noise seeds of the wavy top gate: those of part A, the worst ones of a sweep of 1..=40 (before the
+/// islands were joined again after each absorption, the freeform region held only 86 to 93 % of the
+/// top for these, and on Linux's different tessellation under half) and seed 77, the worst of the
+/// sweep of 1..=80 (0.861). The gate asks for 85 % of the top on every one of them.
 const WAVY_TOP_SEEDS: [u64; 12] = [21, 8, 11, 12, 18, 17, 22, 26, 19, 16, 14, 77];
 
 /// P9-O7, part A: the walls and the bottom come out as the same primitives as without the

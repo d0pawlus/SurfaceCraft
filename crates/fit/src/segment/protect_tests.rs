@@ -92,3 +92,98 @@ fn the_plane_extent_limit_scales_with_the_scan() {
     // 50 x 1.0 mm = 50 mm is more than the face; 0.2 x its diagonal (8.5 mm) is not
     assert!(protected_by_tolerance(&m, &seg, 1.0, 0.003));
 }
+
+// --- regions that wrap a cylinder or a sphere, and the tiers of the slope limit ---------------------
+
+use crate::primitive::Primitive;
+
+/// A region of all the triangles of `m` with the given primitive and its measured RMS.
+fn with_primitive(m: &Mesh, primitive: Primitive) -> Segment {
+    let rms =
+        (m.positions.iter().map(|p| primitive.distance(p).powi(2)).sum::<f64>() / m.positions.len() as f64).sqrt();
+    Segment { triangles: (0..m.triangle_count() as u32).collect(), primitive, rms, freeform: false }
+}
+
+/// 200 degrees of a cylinder (R = 30 mm, 20 mm long, cells of about 1.2 mm) with a smooth radial
+/// deviation of amplitude `amp` (two waves around the arc), noise 0.003.
+fn wrapped_cylinder(amp: f64, seed: u64) -> Mesh {
+    let span = 200f64.to_radians();
+    let mut m = sheet(1.0, 1.0, 90, |a, b| {
+        let th = (a - 0.5) * span;
+        let r = 30.0 + amp * (4.0 * std::f64::consts::PI * a).sin() * (std::f64::consts::PI * b).sin();
+        Point3::new(r * th.cos(), r * th.sin(), 20.0 * b)
+    });
+    synth::add_noise(&mut m, 0.003, &mut Rng::new(seed));
+    m
+}
+
+fn cylinder() -> Primitive {
+    Primitive::Cylinder { point: [0.0; 3], axis: [0.0, 0.0, 1.0], radius: 30.0 }
+}
+
+/// A cap of a sphere (R = 30 mm) out to 110 degrees from its pole (more than a hemisphere), with a
+/// smooth radial deviation of amplitude `amp`, noise 0.003.
+fn big_cap(amp: f64, seed: u64) -> Mesh {
+    let reach = 110f64.to_radians();
+    let mut m = sheet(1.0, 1.0, 100, |a, b| {
+        let (psi, phi) = (0.03 + a * (reach - 0.03), b * std::f64::consts::TAU * 0.98);
+        let r = 30.0 + amp * (3.0 * std::f64::consts::PI * a).sin() * (2.0 * phi).cos();
+        Point3::new(r * psi.sin() * phi.cos(), r * psi.sin() * phi.sin(), r * psi.cos())
+    });
+    synth::add_noise(&mut m, 0.003, &mut Rng::new(seed));
+    m
+}
+
+fn sphere() -> Primitive {
+    Primitive::Sphere { center: [0.0; 3], radius: 30.0 }
+}
+
+/// The tolerance of these tests is 1.0 mm: the bow limit of the largest tier is 2e-3 of the extent
+/// (100 mm of arc: 0.2 mm), well inside 0.5 x the tolerance; the form-error limit is 0.08 mm.
+const COARSE: f64 = 1.0;
+
+/// A region that wraps 200 degrees of a cylinder: a real bow (0.3 mm RMS, above the slope limit) is
+/// not protected, form error under the limit (0.085 mm, over the form-error limit so the bow decides)
+/// is. The height field is fitted in the cylinder's own chart: over a best-fit plane the arc folds,
+/// the quadric fits worse than the primitive and the bow used to read zero.
+#[test]
+fn a_cylinder_wrapped_200_degrees_is_judged_by_its_bow_in_its_own_chart() {
+    let (bowed, tidy) = (wrapped_cylinder(0.42, 1), wrapped_cylinder(0.12, 2));
+    assert!(
+        !protected_by_tolerance(&bowed, &with_primitive(&bowed, cylinder()), COARSE, 0.003),
+        "a bowed wrap is protected"
+    );
+    assert!(protected_by_tolerance(&tidy, &with_primitive(&tidy, cylinder()), COARSE, 0.003), "a tidy wrap is lost");
+}
+
+/// The same for a cap of a sphere beyond a hemisphere.
+#[test]
+fn a_sphere_cap_beyond_a_hemisphere_is_judged_by_its_bow_in_its_own_chart() {
+    let (bowed, tidy) = (big_cap(0.42, 3), big_cap(0.12, 4));
+    assert!(
+        !protected_by_tolerance(&bowed, &with_primitive(&bowed, sphere()), COARSE, 0.003),
+        "a bowed cap is protected"
+    );
+    assert!(protected_by_tolerance(&tidy, &with_primitive(&tidy, sphere()), COARSE, 0.003), "a tidy cap is lost");
+}
+
+/// A region of 2.7 % of a larger scan is judged by the 5e-4 tier: a plane patch that bows 4e-4 of
+/// its size is protected, one that bows 6e-4 is not (the plate that makes the scan large is flat).
+#[test]
+fn a_region_under_five_percent_of_the_scan_is_judged_by_the_tight_slope() {
+    let case = |amp: f64| {
+        let k = std::f64::consts::TAU / 50.0;
+        let mut patch = sheet(50.0, 50.0, 50, |x, y| Point3::new(x, y, amp * (k * x).sin() * (k * y + 0.7).sin()));
+        let triangles = patch.triangle_count() as u32;
+        patch.append(&sheet(300.0, 300.0, 100, |x, y| Point3::new(x + 100.0, y, 0.0)));
+        synth::add_noise(&mut patch, 0.003, &mut Rng::new(6));
+        let plane = Primitive::Plane { point: [0.0; 3], normal: [0.0, 0.0, 1.0] };
+        let rms = (patch.positions.iter().take(51 * 51).map(|p| plane.distance(p).powi(2)).sum::<f64>()
+            / (51.0 * 51.0))
+            .sqrt();
+        let seg = Segment { triangles: (0..triangles).collect(), primitive: plane, rms, freeform: false };
+        protected_by_tolerance(&patch, &seg, TOLERANCE, 0.003)
+    };
+    assert!(case(0.05), "slope 5e-4 x 0.8: the patch should be protected");
+    assert!(!case(0.14), "slope well over 5e-4: the patch should not be protected");
+}

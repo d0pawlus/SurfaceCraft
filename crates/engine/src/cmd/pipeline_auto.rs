@@ -22,8 +22,11 @@ const PLAUSIBLE_SHARE: f64 = MIN_MODELLED_SHARE / 2.0;
 /// minutes occur at a million triangles and more, and a second full run doubles that. A caller can
 /// force it with the call the skipped entry lists.
 const SECOND_ATTEMPT_MAX_TRIANGLES: usize = 600_000;
-/// ... nor after a first attempt that took longer than this (s).
-const SECOND_ATTEMPT_MAX_SECONDS: f64 = 120.0;
+/// ... nor after a first result of this many patches or more (half the patch limit): such a network
+/// took minutes on the real scans (a 60 000-patch one 450 s). The bounds are functions of the input
+/// and of the first result, never of the clock: a time limit would skip the second method on a slow
+/// or loaded machine and run it on a fast one.
+const SECOND_ATTEMPT_MAX_PATCHES: usize = 30_000;
 /// Two results explain the scan equally well when their shares differ by no more than this (a
 /// sheet at 0.995 does not beat a closed solid at 0.990).
 const EXPLAINED_BAND: f64 = 0.005;
@@ -34,12 +37,12 @@ const ERROR_TEXT_LIMIT: usize = 200;
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Limits {
     pub max_triangles: usize,
-    pub max_seconds: f64,
+    pub max_patches: usize,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { max_triangles: SECOND_ATTEMPT_MAX_TRIANGLES, max_seconds: SECOND_ATTEMPT_MAX_SECONDS }
+        Self { max_triangles: SECOND_ATTEMPT_MAX_TRIANGLES, max_patches: SECOND_ATTEMPT_MAX_PATCHES }
     }
 }
 
@@ -178,7 +181,7 @@ fn method_name(m: Method) -> &'static str {
 }
 
 /// The reason not to run a second attempt, with the call that forces it.
-fn skip_reason(plan: &Plan, first_seconds: f64) -> Option<String> {
+fn skip_reason(plan: &Plan, first: &ToSolidOut) -> Option<String> {
     if !plan.retry {
         return Some("`retry` is false".to_string());
     }
@@ -188,11 +191,8 @@ fn skip_reason(plan: &Plan, first_seconds: f64) -> Option<String> {
             plan.triangles, plan.limits.max_triangles
         ));
     }
-    (first_seconds > plan.limits.max_seconds).then(|| {
-        format!(
-            "the first attempt took {first_seconds:.0} s, more than the {:.0} s a second attempt is worth",
-            plan.limits.max_seconds
-        )
+    first.patches.filter(|&p| p >= plan.limits.max_patches).map(|p| {
+        format!("the first result has {p} patches, at least the {} a second attempt is worth", plan.limits.max_patches)
     })
 }
 
@@ -263,8 +263,7 @@ pub(super) fn orchestrate(
     if s.cancel.is_cancelled() {
         return Err(cancelled());
     }
-    plan.budget.set_first(first_seconds);
-    let refusal = skip_reason(plan, first_seconds).or_else(|| (!plan.budget.draw()).then(|| plan.budget.refusal()));
+    let refusal = skip_reason(plan, &first_result).or_else(|| (!plan.budget.draw()).then(|| plan.budget.refusal()));
     if let Some(reason) = refusal {
         let skipped = skipped_attempt(plan, second, reason);
         return Ok(ToSolidReport { result: first_result, attempts: vec![first_record, skipped] });
@@ -272,7 +271,6 @@ pub(super) fn orchestrate(
     let after_first = std::mem::replace(&mut s.doc, base);
     let timer = Timer::start();
     let second_outcome = exec(s, second);
-    plan.budget.spend(timer.seconds());
     // a call cancelled while the second attempt ran ends in the cancellation, whatever it returned
     if s.cancel.is_cancelled() {
         return Err(cancelled());
@@ -319,6 +317,9 @@ fn alone(
 ) -> CmdResult<ToSolidReport> {
     let timer = Timer::start();
     let result = exec(s, method)?;
+    if s.cancel.is_cancelled() {
+        return Err(cancelled());
+    }
     Ok(single(result, method, timer.seconds()))
 }
 
@@ -628,19 +629,21 @@ mod tests {
         assert_eq!(report.expect("a report").attempts.len(), 1);
     }
 
-    /// `retry: false`, a scan over the triangle limit and a first attempt over the time limit skip the
-    /// second attempt, and say how to force it. No sleeping: the limits are set low.
+    /// `retry: false`, a scan over the triangle limit and a first result with many patches skip the
+    /// second attempt, and say how to force it. The decision is a function of the input and the first
+    /// result: nothing here depends on time.
     #[test]
     fn the_second_attempt_is_bounded_and_the_skip_names_the_call_that_forces_it() {
-        let slow = || Limits { max_triangles: 600_000, max_seconds: -1.0 };
-        let few = || Limits { max_triangles: 10, max_seconds: 120.0 };
-        for (reason, p) in [
-            ("`retry` is false", Plan { retry: false, ..plan(0.9) }),
-            ("triangles", Plan { limits: few(), ..plan(0.9) }),
-            ("took", Plan { limits: slow(), ..plan(0.9) }),
+        let few = || Limits { max_triangles: 10, max_patches: 30_000 };
+        let heavy = || Limits { max_triangles: 600_000, max_patches: 100 };
+        for (reason, p, patches) in [
+            ("`retry` is false", Plan { retry: false, ..plan(0.9) }, None),
+            ("triangles", Plan { limits: few(), ..plan(0.9) }, None),
+            ("patches", Plan { limits: heavy(), ..plan(0.9) }, Some(500)),
         ] {
-            let (_, report, called) =
-                run_fake(&p, outcomes(result(Verdict::Fail, SOLID, 1.0, 0.5), result(Verdict::Pass, SOLID, 1.0, 1.0)));
+            let mut first = result(Verdict::Fail, SOLID, 1.0, 0.5);
+            first.patches = patches;
+            let (_, report, called) = run_fake(&p, outcomes(first, result(Verdict::Pass, SOLID, 1.0, 1.0)));
             let report = report.expect("a report");
             assert_eq!(called, ["primitives"], "{reason}");
             let skipped = report.attempts[1].skipped.as_ref().expect("a skipped entry");

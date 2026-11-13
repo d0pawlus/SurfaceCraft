@@ -12,6 +12,17 @@
 //!   patches explains (see `bow`) is within [`BOW_TOLERANCE_SHARE`] of the tolerance, and small
 //!   against the region's own size: at most [`BOW_SLOPE`] of its extent, or at most
 //!   [`DOMINANT_BOW_SLOPE`] when the region is [`DOMINANT_SHARE`] of the scan or more.
+//!
+//! The constants are a calibrated heuristic, not a separator: the two populations overlap. Bow
+//! over extent of genuine large faces on three real scans ran 2e-4 to 1.2e-3 (the large sphere of
+//! one: 1.2e-3); that of the large fragments of a synthetic wavy surface had minimum 6.8e-4, 5th
+//! percentile 1.0 to 1.5e-3, median 2e-3. So by construction (a) a genuine face under 5 % of the
+//! scan with a bow over 5e-4 of its extent is lost to freeform; (b) a freeform fragment of 5 % of the
+//! scan or more with a bow under 2e-3 of its extent is protected; (c) the 5 % tier rests on three
+//! real scans and one synthetic family (no fragment there reached 3.2 %). The scan-wide `tolerance`
+//! moves the bow limit; there is no per-region override: a region wrongly merged can be recreated
+//! with `region.create` and fitted with `primitive.fit`, or the whole step skipped with
+//! `options.freeform: false`.
 use super::Segment;
 use super::bow::region_bow;
 use super::freeform::{curvature_support, extent, residual_spread, sample_corners};
@@ -37,8 +48,8 @@ const RMS_CAP_SHARE: f64 = 0.5;
 /// The bow of a protected region is at most this share of the tolerance ...
 const BOW_TOLERANCE_SHARE: f64 = 0.5;
 /// ... and at most this fraction of its extent. Calibrated (`print_bow_table` and the real scans,
-/// numbers in the pull request): large genuine faces read 2e-4 to 8e-4; the large fragments of a
-/// wavy surface 1e-3 at the 5th percentile (median 2e-3, smallest 7e-4).
+/// numbers in the pull request): genuine large faces read 2e-4 to 1.2e-3; the large fragments of a
+/// wavy surface 1.0 to 1.5e-3 at the 5th percentile (median 2e-3, smallest 6.8e-4).
 const BOW_SLOPE: f64 = 5e-4;
 /// From this share of the scan's area (no organic fragment reached it) a curved region needs no
 /// span of a radius and the bow may be this large.
