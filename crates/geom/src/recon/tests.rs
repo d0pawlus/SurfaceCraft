@@ -108,7 +108,8 @@ fn units_do_not_change_the_reconstruction_of_a_regular_cloud() {
     // Arrange
     let original = synth::bracket().positions;
     let (want, _) = reconstruct(&PointCloud::from_points(original.clone()), &ReconParams::default()).unwrap();
-    for (per_mm, mm_per_unit) in [(0.001, 1000.0), (0.1, 10.0), (1.0 / 25.4, 25.4), (1.0 / 304.8, 304.8), (1000.0, 0.001)]
+    for (per_mm, mm_per_unit) in
+        [(0.001, 1000.0), (0.1, 10.0), (1.0 / 25.4, 25.4), (1.0 / 304.8, 304.8), (1000.0, 0.001)]
     {
         // Act
         let converted = through_a_unit_file(&original, per_mm, mm_per_unit);
