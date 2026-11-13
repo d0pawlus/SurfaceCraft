@@ -134,10 +134,41 @@ Normals, colours and per-vertex data go with the coordinates.
   `options` takes `max_iterations` and `tolerance` (mm per iteration). The result says whether
   it `converged` and how many `pairs` it used.
 
+## Two scans of one part
+
+- `align.pair_coarse`: brings the scan `object` onto the overlapping scan `target` (mesh or body)
+  with no picked points, then refines with ICP. It tries the 24 signed permutations of the two
+  principal frames (whole parts) and poses from local shape descriptors (FPFH) with RANSAC (partial
+  overlap, down to about half shared), scores them on a subsample, refines the best few and reports
+  the pose, `overlap_moving` and `overlap_fixed` (shares of each scan's area that lie on the other
+  within `tolerance`), a `verdict` and a `confidence`.
+- `verdict`: `unique` (one pose clearly fits better than any other: every other pose has at least
+  3 % of the moving scan's area more in conflict or less on the target, and the pose survives being
+  pushed), `ambiguous` (a symmetric part: the near-tied poses are in `alternatives`; or a part that
+  can slide or turn freely, such as a flat or cylindrical patch) or `no_match` (too little overlap,
+  or different parts).
+- The push: every pose is displaced by 0.2 of the moving scan's extent along each of its three
+  weakest directions (the eigenvectors of its point-to-plane system), in both senses, and refined
+  again: 6 extra ICP runs, about 0.7 s on a scan of a million triangles. A start that settles in a
+  different pose (more than 2 % of the diagonal away) that does not clash with the target by at
+  least 2 % of the moving scan's area (`probe_threshold`; running off the end of a cylinder is no
+  clash) is a slide (`slides`) and is listed as an alternative; a start that flew off (lost 30 %
+  of the matches) or whose ICP found no pairs (`probes_failed`) says nothing: with any failed start,
+  or none tried, the pose is never `unique`; if all come back the pose is held. No verdict depends on how loose
+  the pose reads (`stability`: 0.2 for a bracket, 0.01 and up for real scans; below 0.001 the part
+  is free and always `ambiguous`).
+- It proposes by default (`apply` false); a pose that is not `unique` is applied only when
+  `choose` names it (0 the best, 1 and up the alternatives; `choose` needs `apply`). The result then
+  carries the numbers of the pose chosen. When `apply` was given and nothing moved, `refused` is true.
+- Limits: the triangles of both scans must be consistently oriented (the descriptors use the
+  normals); surface that ends at the border of the other scan is no conflict, but a part whose
+  shared region is only flat or a cylinder-like surface is reported `ambiguous`; a scan that
+  repeats its vertices per triangle gets the borders of the welded mesh (found by position).
+
 ## Parameters common to all align commands
 
 - `object`: the mesh to move.
-- `apply` (default true; false for `align.auto` and `align.symmetry`, which propose first):
+- `apply` (default true; false for `align.auto`, `align.symmetry` and `align.pair_coarse`, which propose first):
   false computes the motion without moving the mesh.
 - `also`: other meshes moved by the same motion.
 

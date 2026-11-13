@@ -3378,6 +3378,7 @@ name = "surfacecraft-align"
 version = "0.2.0"
 dependencies = [
  "nalgebra",
+ "rayon",
  "schemars",
  "serde",
  "surfacecraft-fit",
