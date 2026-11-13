@@ -9,6 +9,7 @@
   "A fitted primitive: plane, sphere, cylinder, cone or torus.": "Dopasowany kształt: płaszczyzna, kula, walec, stożek lub torus.",
   "A least-squares compromise over all near-axis-aligned faces, weighted by area: the base may tilt a little.": "Kompromis najmniejszych kwadratów po wszystkich ścianach zbliżonych do osi, ważony polem: podstawa może się lekko przechylić.",
   "A line through `point` along `direction`.": "Prosta przez „Punkt” w kierunku „Kierunek”.",
+  "A network of patches over the whole scan in which the patches that lie on a primitive are merged\ninto exact analytic faces (parts that are partly machined and partly organic).": "Siatka płatów na całym skanie, w której płaty leżące na prymitywie są scalone w dokładne ściany analityczne (części częściowo obrabiane, częściowo organiczne).",
   "A network of patches over the whole scan (castings, body panels, organic shapes).": "Siatka płatów na całym skanie (odlewy, karoseria, kształty organiczne).",
   "A new body.": "Nowa bryła.",
   "A part of a scan with several pieces is co-equal, and modelled, when its area is at least this share of the largest piece's (0..1, default 0.1). Smaller pieces and debris are reported, not modelled.": "Część skanu z kilkoma fragmentami jest równorzędna i modelowana, gdy jej powierzchnia to co najmniej taki udział powierzchni największego fragmentu (0..1, domyślnie 0,1). Mniejsze fragmenty i okruchy są zgłaszane, nie modelowane.",

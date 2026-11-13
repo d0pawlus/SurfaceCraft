@@ -85,8 +85,8 @@ pub enum Method {
     Primitives,
     /// A network of patches over the whole scan (castings, body panels, organic shapes).
     Freeform,
-    /// One closed body: the regions a primitive fits are exact analytic faces, the rest of the scan
-    /// is covered by patches (parts that are partly machined and partly organic).
+    /// A network of patches over the whole scan in which the patches that lie on a primitive are merged
+    /// into exact analytic faces (parts that are partly machined and partly organic).
     Hybrid,
 }
 
