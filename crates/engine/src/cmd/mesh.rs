@@ -672,7 +672,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         "Thicken mesh",
         "Mesh",
         true,
-        "Makes a closed shell of constant `thickness` (mm) from the open mesh `object` (a scan taken from one side): every vertex is offset along a smoothed normal, the offset copy is turned around and the rims (outer edge, windows) are stitched, as a NEW mesh; the scan is kept. Positive `thickness` puts the material behind the scanned face, negative in front of it, `symmetric` half on each side. Where the surface curves more tightly than the thickness the offset is reduced locally (reported); a thickness that folds most of the surface is refused. Only local folds are detected, not a part of the offset sheet meeting another part of the shell (a channel narrower than the wall). Reports triangles, boundary loops stitched, clamped vertices, the largest reduction and `closed`.",
+        "Makes a closed shell of constant `thickness` (mm) from the open mesh `object` (a scan taken from one side): every vertex is offset along a smoothed normal, the offset copy is turned around and the rims (outer edge, windows) are stitched, as a NEW mesh; the scan is kept. Positive `thickness` puts the material behind the scanned face, negative in front of it, `symmetric` half on each side. Where the surface curves more tightly than the thickness the offset is reduced locally (reported); a thickness that folds most of the surface is refused. A sample of the result is tested for self-intersection (`self_intersections`). Reports triangles, boundary loops stitched, clamped vertices, the largest reduction and `closed`.",
         thicken::ThickenMeshIn,
         thicken::ThickenMeshOut,
         thicken::thicken_cmd

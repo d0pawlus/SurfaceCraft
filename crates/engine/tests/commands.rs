@@ -124,6 +124,26 @@ fn hostile_params_never_panic() {
     }
 }
 
+/// Coarse voxels, huge tolerances and absurd limits of the remesh are refusals or results, never a panic.
+#[test]
+fn remesh_with_coarse_or_absurd_resolutions_never_panics() {
+    for params in [
+        json!({"object": "scan", "voxel": 5.0}),
+        json!({"object": "scan", "voxel": 50.0}),
+        json!({"object": "scan", "tolerance": 3.0}),
+        json!({"object": "scan", "tolerance": 1e300}),
+        json!({"object": "scan", "voxel": 1e-300}),
+        json!({"object": "scan", "voxel": 1e300, "min_feature": 1e300}),
+        json!({"object": "scan", "min_feature": 1e300}),
+        json!({"object": "scan", "max_hole": 1e300}),
+    ] {
+        let mut s = Session::new();
+        s.execute("mesh.synth", json!({"shape": "sphere", "size": [150.0], "resolution": 40, "name": "scan"})).unwrap();
+        let r = s.execute("mesh.remesh", params.clone());
+        assert!(!matches!(r, Err(EngineError::Internal(_))), "{params} panicked");
+    }
+}
+
 #[test]
 fn unknown_command_is_an_error() {
     let mut s = Session::new();

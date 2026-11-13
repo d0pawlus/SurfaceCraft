@@ -61,6 +61,7 @@ fn gate_scan_to_solid_rebuilds_a_chamfered_pin_in_one_call() {
 
     // Act
     let out = s.execute("scan.to_solid", json!({"scan": "scan", "name": "pin solid"})).unwrap();
+    assert_eq!(out["preparation"], json!([]), "a scan that works takes the unchanged path");
 
     // Assert
     eprintln!("scan.to_solid: {}", serde_json::to_string_pretty(&out).unwrap());
@@ -90,9 +91,23 @@ fn a_scan_that_does_not_close_gets_a_verdict_and_next_steps_not_an_error() {
     s.execute("mesh.synth", json!({"shape": "bracket", "noise": 0.03, "name": "scan"})).unwrap();
 
     // Act
-    let out = s.execute("scan.to_solid", json!({"scan": "scan"})).unwrap();
+    let out = s.execute("scan.to_solid", json!({"scan": "scan", "part_share": 0.05})).unwrap();
 
-    // Assert
+    // Assert: the three shells are three parts; each is modelled on its own and the verdict is the worst of the three
+    assert_eq!(out["preparation"][0]["step"], "split", "{out}");
+    let parts = out["components"].as_array().unwrap();
+    // measured areas: the box 8 803 mm2, the boss 895 mm2 (10.2 % of the box), the ball about 3 % of
+    // the surface. The boss sits just above the default `part_share` of 10 %, so the test asks for 5 %:
+    // the boss is clearly co-equal (twice the share) and the ball clearly minor
+    assert_eq!(parts.len(), 2, "{out}");
+    let verdicts: Vec<&str> = parts.iter().map(|c| c["verdict"].as_str().unwrap()).collect();
+    assert_eq!(verdicts.iter().filter(|v| **v == "pass").count(), 1, "{verdicts:?}");
+    assert_eq!(verdicts.iter().filter(|v| **v == "fail").count(), 1, "{verdicts:?}");
+    let failed = parts.iter().find(|c| c["verdict"] == "fail").unwrap();
+    assert!(codes(&failed["issues"]).contains(&"no_solid".to_string()), "{failed}");
+    let passed = parts.iter().find(|c| c["verdict"] == "pass").unwrap();
+    assert!(passed["deviation"]["within"].as_f64().unwrap() >= 0.99, "{passed}");
+    assert_eq!(out["preparation"][0]["numbers"]["minor_and_debris_pieces"], 1, "{out}");
     eprintln!("verdict {} issues {}", out["verdict"], out["issues"]);
     assert_ne!(out["verdict"], "pass", "{out}");
     assert!(!codes(&out["issues"]).is_empty(), "{out}");
@@ -123,6 +138,7 @@ fn reuse_regions_models_the_regions_the_scan_already_has() {
 
     // Act
     let out = s.execute("scan.to_solid", json!({"scan": "scan", "reuse_regions": true})).unwrap();
+    assert_eq!(out["preparation"], json!([]), "a scan that works takes the unchanged path");
 
     // Assert
     assert_eq!(out["verdict"], "pass", "{out}");
@@ -175,6 +191,7 @@ fn gate_scan_to_solid_wraps_an_organic_scan_in_patches() {
 
     // Act
     let out = s.execute("scan.to_solid", json!({"scan": "scan"})).unwrap();
+    assert_eq!(out["preparation"], json!([]), "a scan that works takes the unchanged path");
 
     // Assert: auto chose the freeform method and the solid passed
     eprintln!("organic: {}", serde_json::to_string(&json!({"verdict": out["verdict"], "method": out["method"], "patches": out["patches"], "body": out["body"], "deviation": out["deviation"], "issues": out["issues"]})).unwrap());
@@ -201,6 +218,7 @@ fn method_primitives_on_an_organic_scan_says_it_is_freeform() {
 
     // Act
     let out = s.execute("scan.to_solid", json!({"scan": "scan", "method": "primitives"})).unwrap();
+    assert_eq!(out["preparation"], json!([]), "a scan that works takes the unchanged path");
 
     // Assert
     assert_eq!(out["method"], "primitives", "{out}");
@@ -258,6 +276,7 @@ fn a_scan_with_non_manifold_edges_gets_a_verdict_not_an_error() {
 
     // Act
     let out = s.execute("scan.to_solid", json!({"scan": "scan", "clean": false})).unwrap();
+    assert_eq!(out["preparation"], json!([]), "a scan that works takes the unchanged path");
 
     // Assert
     assert!(out["scan_report"]["non_manifold_edges"].as_u64().unwrap() > 0, "{out}");

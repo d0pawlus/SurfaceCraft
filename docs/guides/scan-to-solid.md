@@ -57,7 +57,7 @@ kernel refuses sheets of many faces. Give the wall thickness instead:
 - `scan.to_solid` with `thickness` (mm, no default, not 0, at most half the size of the scan). When
   the cleaned scan is open, the scan is thickened into a closed shell on the mesh side
   (`mesh.thicken`) and the shell is wrapped in patches (method `freeform`; `thickness` has no meaning
-  with `primitives` or `reuse_regions`). The thickened mesh is removed afterwards unless
+  with `primitives` or `reuse_regions`; it models one open shell: with several co-equal parts, or `components` / `part_share`, it is an error: `scan.split` first and thicken a part; `rebuild` does not apply). The thickened mesh is removed afterwards unless
   `keep_thickened` is true; the scan stays; the whole call is one undo step.
 - The sign says where the material is: positive puts it behind the scanned face (against the normals
   of the scan, the usual case for a scan whose normals point to the scanner), negative in front of
@@ -84,9 +84,10 @@ kernel refuses sheets of many faces. Give the wall thickness instead:
   side of the offset cannot carry any wall: up to 0.1 % of the vertices may stay folded at the floor
   (`unresolved_vertices`), more is refused. The next step offers a thinner wall.
   A thickness whose offset folds triangles at more than 15 % of the vertices is refused (verdict `fail`, issue `no_solid`)
-  with a thickness the surface can carry as the next step. Only local folds are detected
-  (`self_intersection_checked` is always false): a part of the offset sheet that meets another part
-  of the shell, such as a channel narrower than the wall or two sheets closer than the wall, is not.
+  with a thickness the surface can carry as the next step. An even sample of the thickened
+  mesh is tested for triangles that cross one they share no vertex with (`self_intersections` of
+  `thickened`, `self_intersection_samples` tested); a channel or gap narrower than the wall shows
+  there, as the issue `self_intersection` (verdict at most `review`). Only a sample is tested.
 - Before the offset the mesh is repaired: duplicate triangles are dropped; of the triangles on an
   edge shared by three or more the two that continue the surface best are kept and the others (fins)
   removed (`removed_non_manifold`); the orientation is made consistent per piece
@@ -152,6 +153,57 @@ kernel refuses sheets of many faces. Give the wall thickness instead:
   points of the file.
 - `scan_defects`: holes too large to fill; `mesh.fill_holes` with a larger `max_edges` (it drops
   the regions), then `scan.to_solid` again without `reuse_regions`.
+
+## Messy scans: parts, handles, shells
+
+`scan.to_solid` looks at the cleaned scan before it models it and reports what it did in
+`preparation` (`[{step, reason, numbers}]`, `numbers.ms` the time spent; empty when the scan was
+modelled as it is).
+
+- **Several parts in one file** (`split`). Pieces of the scan are sorted three ways. A piece with at
+  least 1 % of the triangles or of the area is a *part*; a part with at least `part_share` (default
+  10 %) of the area of the largest piece is *co-equal* and gets a solid of its own (the largest 24
+  at most; `components` takes `all`, `largest` or a number). Parts below that are *minor* and
+  pieces below 1 % are *debris*: they are not modelled. Exactly one co-equal part: that part is
+  modelled by the usual path. Several: `components[]` has a verdict per part, `bodies` lists every
+  solid, the top-level `body` and `patches` are the largest part's, `deviation` is the aggregate
+  over the modelled parts (area-weighted share within tolerance, largest maximum) and `verdict`
+  the worst co-equal part's.
+- **What was not modelled is reported** (each issue says what to do: `part_share`, `scan.split`, `components`; the next steps include the split). More than 2 % of the surface in minor pieces and debris:
+  issue `unmodelled_pieces` (count and area share) and the verdict is at most `review`. The inner
+  skin of a hollow part is not modelled either: `nested_shell_skipped`, at most `review`. Co-equal
+  parts past the 24 cap: `parts_beyond_limit` (count and area share), at most `review`. Parts you
+  did not ask for with `components: largest` or a number are no issue and do not lower a pass;
+  `preparation[0].numbers.not_requested` counts them. After a split with every part passed, one
+  `export.step` names all the solids; otherwise each next step says which part it is for.
+  `scan.split` does the separation alone (`min_share` above 0 and at most 1) and reports nesting
+  (`cavity`, a hollow part's inner skin, or `inclusion`, a separate part inside another). It lists at
+  most 64 parts; the significant pieces past that are not made into meshes but are counted in
+  `parts_beyond_limit` with their `beyond_limit_triangles` and `beyond_limit_area`.
+- **Topological noise** (`remesh`). A closed scan with many handles (genus 64 or more) or non-manifold
+  edges (20 or more) is rebuilt with `mesh.remesh` before it is wrapped; a closed scan that wrapping
+  does not pass on is rebuilt and wrapped again, and the result that is clearly better is kept (the
+  rule of the larger-cap retry: a closed result is never replaced by an open one, the share within
+  tolerance must gain more than 0.5 points; a tie keeps the plain result). `rebuild: false` turns it
+  off. A rebuild repairs topology, so it is not tried for a closed result whose only issue is
+  `out_of_tolerance` (that is the patch budget) unless the scan shows some topology evidence (genus
+  16 or more, or 5 or more non-manifold edges). The rebuild-and-wrap-again runs at most once per part and for at most the 4 largest parts. The
+  larger-cap retry (`allow_retry`) is made once per call: for the first part, in area order, whose first
+  result is capped by the patch limit and short of the tolerance, and only in that part's first attempt. The true worst case is 29 wraps per call: 24 parts (a part the primitives
+  could not close is wrapped as freeform once, as its one wrap), 4 rebuilds and 1 retry.
+  `mesh.remesh` makes a closed, manifold, outward oriented surface at a voxel of 1.5 x tolerance
+  (finer for a thin wall, coarser for a very large area): tunnels, bridges, fins, coincident second
+  shells and self-intersections up to two voxels wide are removed, genuine handles and walls of at
+  least two voxels beyond that are kept, and the vertices are projected back onto the scan. It
+  reports the deviation from the scan both ways (exact up to 100 000 vertices, else an even sample)
+  and `removed_share`, the share of the scan farther from the result than the tolerance, which is
+  what was removed (or lost), not error. It refuses an open scan (a hole wider than `max_hole`,
+  default 5 mm, or a loop of more than two edges that was not filled (a missing triangle is one)), a resolution beyond its
+  limits (16 million grid columns, 40 million ray crossings, 6 million quads; fewer on 32-bit
+  targets), and a wall the voxel cannot resolve when `voxel` is given.
+- A scan that already works is not touched: no preparation step, the same result as before. The
+  piece analysis that decides this is O(n log n) on the cleaned scan (see the PR for the time on a
+  million triangles).
 
 ## Second run
 

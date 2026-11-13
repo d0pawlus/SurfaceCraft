@@ -113,6 +113,7 @@ fn gate_a_noisy_open_cap_becomes_a_solid_of_the_exact_shell_volume() {
 
     // Assert
     assert_solid_of(&out, shell_volume(RADIUS - THICKNESS, RADIUS));
+    assert_eq!(out["thickened"]["self_intersections"], 0, "{out}");
     assert_eq!(out["thickened"]["thickness"], THICKNESS, "{out}");
     assert_eq!(out["thickened"]["clamped_vertices"], 0, "{out}");
     assert!(out["thickened"]["boundary_loops"].as_u64().unwrap() >= 1, "{out}");
@@ -441,4 +442,85 @@ fn a_spike_on_the_rim_does_not_make_a_window_or_close_the_scan() {
     // Assert
     assert!(out["thickened"].is_object(), "{out}");
     assert_eq!(out["thickened"]["windows"], 0, "{out}");
+}
+
+#[test]
+fn thickness_with_parts_or_several_co_equal_pieces_is_refused_and_one_piece_is_unchanged() {
+    // Arrange: two co-equal panels
+    let mut two = synth::plane(Point3::origin(), Vec3::x(), Vec3::y(), 20.0, 20.0, 20, 20);
+    let second = synth::plane(Point3::new(100.0, 0.0, 0.0), Vec3::x(), Vec3::y(), 20.0, 20.0, 20, 20);
+    two.append(&second);
+    let mut s = session_with(two);
+
+    // Act and assert: explicit parameters of the split and several co-equal pieces are refused
+    for p in [
+        json!({"scan": "scan", "thickness": 1.0, "components": "largest"}),
+        json!({"scan": "scan", "thickness": 1.0, "part_share": 0.5}),
+        json!({"scan": "scan", "thickness": 1.0}),
+    ] {
+        let r = s.execute("scan.to_solid", p.clone());
+        let Err(EngineError::Failed(m) | EngineError::InvalidParams(m)) = r else { panic!("{p}: {r:?}") };
+        assert!(m.contains("scan.split"), "{m}");
+    }
+    assert!(s.doc.bodies.is_empty() && s.doc.meshes.len() == 1);
+
+    // a single open piece goes through the preparation stage unchanged: one thickened solid, no parts
+    let mut one = session_with(panel_with_window());
+    let out = one.execute("scan.to_solid", json!({"scan": "scan", "thickness": 1.0, "rebuild": false})).unwrap();
+    assert!(out["thickened"].is_object() && out["prep"]["components"].as_array().is_none_or(Vec::is_empty), "{out}");
+}
+
+/// A U-shaped channel 1 mm wide and 6 mm deep as an open sheet whose normals point out of it.
+fn narrow_channel() -> Mesh {
+    let path = [(-0.5, 6.0), (-0.5, 0.0), (0.5, 0.0), (0.5, 6.0)];
+    let (steps, rows) = (20usize, 67usize);
+    let mut positions = Vec::new();
+    for j in 0..=rows {
+        let y = 20.0 * j as f64 / rows as f64;
+        for k in 0..(path.len() - 1) {
+            let ((x0, z0), (x1, z1)) = (path[k], path[k + 1]);
+            let n = if k == 1 { 3 } else { steps };
+            for i in 0..=n {
+                if k > 0 && i == 0 {
+                    continue;
+                }
+                let f = i as f64 / n as f64;
+                positions.push(Point3::new(x0 + (x1 - x0) * f, y, z0 + (z1 - z0) * f));
+            }
+        }
+    }
+    let per_row = positions.len() / (rows + 1);
+    let mut triangles = Vec::new();
+    for j in 0..rows {
+        for i in 0..per_row - 1 {
+            let (a, b) = ((j * per_row + i) as u32, (j * per_row + i + 1) as u32);
+            let (c, d) = (((j + 1) * per_row + i + 1) as u32, ((j + 1) * per_row + i) as u32);
+            triangles.push([a, b, c]);
+            triangles.push([a, c, d]);
+        }
+    }
+    let mut m = Mesh { positions, triangles };
+    if m.vertex_normals()[per_row / 6].x > 0.0 {
+        for t in &mut m.triangles {
+            t.swap(1, 2);
+        }
+    }
+    m
+}
+
+#[test]
+fn a_channel_narrower_than_the_wall_is_reported_as_crossing_itself_and_caps_the_verdict() {
+    // Arrange
+    let mut s = session_with(narrow_channel());
+
+    // Act
+    let thick = s.execute("mesh.thicken", json!({"object": "scan", "thickness": 2.0})).unwrap();
+    let out = s.execute("scan.to_solid", json!({"scan": "scan", "thickness": 2.0})).unwrap();
+
+    // Assert
+    assert_eq!(thick["self_intersection_checked"], true, "{thick}");
+    assert!(thick["self_intersections"].as_u64().unwrap() > 0, "{thick}");
+    assert_eq!(out["thickened"]["self_intersection_checked"], true);
+    let codes: Vec<&str> = out["issues"].as_array().unwrap().iter().map(|i| i["code"].as_str().unwrap()).collect();
+    assert!(codes.contains(&"self_intersection") && out["verdict"] != "pass", "{out}");
 }

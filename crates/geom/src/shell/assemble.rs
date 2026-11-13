@@ -1,12 +1,14 @@
 //! The shell from the offsets: the two layers and the strip along the rim.
 use super::topology::Work;
 use super::{ScanLayer, ThickenError, ThickenParams, ThickenReport, Thickened, topology};
-use crate::{Bvh, Mesh, MeshError, Point3, Vec3};
+use crate::{Bvh, Mesh, MeshError, Point3, Vec3, nesting};
 
 /// Rows of the strip along the rim at most.
 const MAX_STRIP_ROWS: usize = 64;
 /// Triangles of the strip at most (the rows are cut back for a long rim).
 const MAX_STRIP_TRIANGLES: usize = 4_000_000;
+/// Triangles of the shell tested for crossing another triangle at most.
+const MAX_CROSSING_SAMPLES: usize = 20_000;
 /// Vertices at which the wall is measured at most.
 const MAX_WALL_SAMPLES: usize = 20_000;
 
@@ -133,6 +135,10 @@ pub(super) fn assemble(
     }
     let mesh = Mesh { positions, triangles: shell_triangles(work, &rim, boundary) };
     check_closed(&mesh)?;
+    let crossings = {
+        let bvh = Bvh::build(&mesh);
+        nesting::sampled_self_intersections(&mesh, &bvh, MAX_CROSSING_SAMPLES)
+    };
     let (min_wall, median_wall) = measured_wall(&outer, &inner, &work.triangles, params.thickness);
     let loops = topology::loop_lengths(n, boundary);
     let thickness = params.thickness.abs();
@@ -154,6 +160,8 @@ pub(super) fn assemble(
         unresolved_vertices: work.unresolved,
         min_wall,
         median_wall,
+        crossing_samples: crossings.tested,
+        crossing_triangles: crossings.crossing,
     };
     let scan_layer = if !params.symmetric && params.thickness < 0.0 { ScanLayer::Inner } else { ScanLayer::Outer };
     Ok(Thickened {

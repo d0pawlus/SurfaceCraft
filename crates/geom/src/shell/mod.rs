@@ -90,6 +90,10 @@ pub struct ThickenReport {
     pub min_wall: f64,
     /// Median wall found (mm).
     pub median_wall: f64,
+    /// Triangles of the shell tested for crossing a triangle they share no vertex with (an even sample).
+    pub crossing_samples: usize,
+    /// Of them, triangles that cross another: the offset sheet meets another part of the shell.
+    pub crossing_triangles: usize,
 }
 
 /// A closed shell.

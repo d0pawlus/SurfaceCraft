@@ -59,8 +59,12 @@ pub struct ThickenedInfo {
     pub removed_non_manifold: usize,
     /// Triangles of the scan turned around to make the orientation consistent.
     pub flipped_triangles: usize,
-    /// Always false: only local folds are detected; a part of the offset sheet meeting another part of the shell (a channel narrower than the wall) is not.
+    /// Always true: an even sample of the thickened mesh was tested for triangles that cross one they share no vertex with (`self_intersection_samples` tested).
     pub self_intersection_checked: bool,
+    /// Triangles of the sample tested.
+    pub self_intersection_samples: usize,
+    /// Of them, triangles that cross another one: the offset sheet meets another part of the shell (a channel or gap narrower than the wall).
+    pub self_intersections: usize,
     /// Triangles of the thickened mesh.
     pub triangles: usize,
     /// The thickened mesh, when `keep_thickened` kept it in the document.
@@ -89,6 +93,11 @@ pub(super) fn check(i: &ToSolidIn) -> CmdResult<()> {
             "thickness has no meaning with `reuse_regions` (the scan is not segmented)".into(),
         ));
     }
+    if i.components.is_some() || i.part_share.is_some() {
+        return Err(CmdError::Params(
+            "thickness models the scan as one open shell: `components` and `part_share` do not apply (run `scan.split` first and thicken a part)".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -98,6 +107,12 @@ pub(super) fn run(s: &mut Session, set: &Settings, i: &ToSolidIn) -> CmdResult<T
     let limit = i.fill_holes_max_edges.unwrap_or(super::FILL_HOLES_MAX_EDGES);
     let cleaned_only = ToSolidIn { fill_holes_max_edges: Some(0), ..i.clone() };
     let mut report = super::prepare(s, &cleaned_only, set.scan)?;
+    let parts = s.doc.mesh(set.scan).map_or(1, |m| super::prepare::coequal_parts(&m.mesh));
+    if parts > 1 {
+        return Err(CmdError::Params(format!(
+            "the scan has {parts} co-equal parts and thickness models one open shell: run `scan.split` first and thicken a part (`rebuild` does not apply to a thickened scan)"
+        )));
+    }
     let rim = s
         .doc
         .mesh(set.scan)
@@ -128,7 +143,9 @@ fn info(shell: &Thickened, i: &ToSolidIn, kept: Option<ObjectId>) -> ThickenedIn
         unresolved_vertices: shell.report.unresolved_vertices,
         removed_non_manifold: shell.report.removed_non_manifold,
         flipped_triangles: shell.report.flipped_triangles,
-        self_intersection_checked: false,
+        self_intersection_checked: true,
+        self_intersection_samples: shell.report.crossing_samples,
+        self_intersections: shell.report.crossing_triangles,
         triangles: shell.mesh.triangle_count(),
         mesh: kept,
     }
@@ -210,6 +227,13 @@ fn issues_of(
         );
         list.push(issue("thickness_reduced", msg));
     }
+    if t.self_intersections > 0 {
+        let msg = format!(
+            "the thickened mesh crosses itself: {} of {} sampled triangles cut another one (a channel or gap narrower than the wall): use a thinner wall or model the parts separately",
+            t.self_intersections, t.self_intersection_samples
+        );
+        list.push(issue("self_intersection", msg));
+    }
     if t.windows > 0 {
         let msg = format!(
             "{} boundary loops besides the rim ({} edges) were stitched through the wall as windows: a real hole of the scan shows as a window; fill it with a larger `fill_holes_max_edges` unless the part has the window",
@@ -274,7 +298,7 @@ fn wrap_and_judge(
         }
     };
     let (w, retry): (WrapOut, Option<CapRetry>) =
-        freeform::retry_larger(s, set, first, |s, cap| wrap_shell(s, set, thick_id, Some(cap)));
+        freeform::retry_larger_on(s, set, thick_id, first, |s, cap| wrap_shell(s, set, thick_id, Some(cap)))?;
     let face = shell.scan_face();
     let d = measure(s, set, &face, &w)?;
     let t = info(shell, i, None);

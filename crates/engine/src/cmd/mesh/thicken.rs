@@ -53,8 +53,12 @@ pub struct ThickenMeshOut {
     pub min_wall: f64,
     /// Median wall found (mm).
     pub median_wall: f64,
-    /// Always false: only local folds are detected, not a part of the offset sheet meeting another part of the shell (a channel narrower than the wall).
+    /// Always true: an even sample of the new mesh was tested for crossing triangles.
     pub self_intersection_checked: bool,
+    /// Triangles of the sample tested.
+    pub self_intersection_samples: usize,
+    /// Of them, triangles that cross another one (the offset sheet meets another part of the shell, e.g. in a channel narrower than the wall).
+    pub self_intersections: usize,
     /// Is the new mesh closed (every edge shared by two triangles)? Always true when the command succeeds.
     pub closed: bool,
 }
@@ -94,7 +98,9 @@ pub(super) fn thicken_cmd(s: &mut Session, i: ThickenMeshIn) -> CmdResult<Thicke
         unresolved_vertices: shell.report.unresolved_vertices,
         min_wall: shell.report.min_wall,
         median_wall: shell.report.median_wall,
-        self_intersection_checked: false,
+        self_intersection_checked: true,
+        self_intersection_samples: shell.report.crossing_samples,
+        self_intersections: shell.report.crossing_triangles,
         closed: census.boundary == 0 && census.non_manifold == 0,
     })
 }

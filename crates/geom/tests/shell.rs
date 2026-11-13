@@ -525,3 +525,70 @@ fn the_wall_is_measured_and_the_folded_vertices_are_told_from_the_tapered_ones()
     assert!(report.median_wall > 1.9 && report.median_wall <= 2.01, "{report:?}");
     assert!(report.folded_vertices > 0 && report.folded_vertices <= report.clamped_vertices);
 }
+
+/// A U-shaped channel 1 mm wide and 6 mm deep, 20 mm long, as an open sheet whose normals point out
+/// of the channel; offset against them (positive thickness) the walls run into each other.
+fn narrow_channel() -> Mesh {
+    let path = [(-0.5, 6.0), (-0.5, 0.0), (0.5, 0.0), (0.5, 6.0)];
+    let (steps, rows) = (20usize, 67usize);
+    let mut positions = Vec::new();
+    for j in 0..=rows {
+        let y = 20.0 * j as f64 / rows as f64;
+        for k in 0..(path.len() - 1) {
+            let ((x0, z0), (x1, z1)) = (path[k], path[k + 1]);
+            let n = if k == 1 { 3 } else { steps };
+            for i in 0..=n {
+                if k > 0 && i == 0 {
+                    continue;
+                }
+                let f = i as f64 / n as f64;
+                positions.push(Point3::new(x0 + (x1 - x0) * f, y, z0 + (z1 - z0) * f));
+            }
+        }
+    }
+    let per_row = positions.len() / (rows + 1);
+    let mut triangles = Vec::new();
+    for j in 0..rows {
+        for i in 0..per_row - 1 {
+            let (a, b) = ((j * per_row + i) as u32, (j * per_row + i + 1) as u32);
+            let (c, d) = (((j + 1) * per_row + i + 1) as u32, ((j + 1) * per_row + i) as u32);
+            triangles.push([a, b, c]);
+            triangles.push([a, c, d]);
+        }
+    }
+    let mut m = Mesh { positions, triangles };
+    // the normals must point out of the channel: at the left wall that is towards -x
+    let n = m.vertex_normals();
+    if n[per_row / 6].x > 0.0 {
+        for t in &mut m.triangles {
+            t.swap(1, 2);
+        }
+    }
+    m
+}
+
+#[test]
+fn a_channel_narrower_than_the_wall_is_reported_as_crossing_itself() {
+    // Arrange
+    let channel = narrow_channel();
+
+    // Act
+    let r = thicken(&channel, &params(2.0)).expect("relaxed, not refused");
+
+    // Assert: the sampled check finds what the local fold test cannot
+    assert!(r.report.crossing_samples > 0 && r.report.crossing_triangles > 0, "{:?}", r.report);
+    assert!(self_intersections(&r.mesh) > 0);
+}
+
+#[test]
+fn shells_that_do_not_meet_themselves_report_no_crossing() {
+    // Arrange
+    let (cap, _) = noisy_cap(0.03, 3);
+
+    // Act
+    let r = thicken(&cap, &params(2.0)).expect("thickens");
+
+    // Assert
+    assert!(r.report.crossing_samples > 0);
+    assert_eq!(r.report.crossing_triangles, 0, "{:?}", r.report);
+}
