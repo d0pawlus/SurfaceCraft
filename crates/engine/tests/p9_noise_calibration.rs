@@ -381,13 +381,9 @@ fn print_bow_table() {
         ("plane noise only 0.03".into(), wavy_plane(0.0, 0.03, 1)),
     ];
     for (name, m) in &patches {
-        if let Some(seg) = whole_patch(m) {
-            if let Some(r) = bow_row(m, &seg.triangles, &seg.primitive) {
-                println!(
-                    "  {name}: r_p {:.4} r_q {:.4} bow {:.4} extent {:.1} slope {:.2e}",
-                    r[0], r[1], r[2], r[3], r[4]
-                );
-            }
+        let row = whole_patch(m).and_then(|seg| bow_row(m, &seg.triangles, &seg.primitive));
+        if let Some(r) = row {
+            println!("  {name}: r_p {:.4} r_q {:.4} bow {:.4} extent {:.1} slope {:.2e}", r[0], r[1], r[2], r[3], r[4]);
         }
     }
     println!("large fragments of a wavy surface (>= 1 % of the scan, 300 triangles): slope bow / extent");

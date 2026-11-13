@@ -7,7 +7,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use surfacecraft_fit::{Primitive, PrimitiveKind};
+use surfacecraft_fit::Primitive;
 use surfacecraft_geom::{Aabb, Mesh, Point3};
 use surfacecraft_kernel::record::brep::Brep;
 
@@ -92,6 +92,8 @@ macro_rules! object_common {
 
 mod mesh_object;
 pub use mesh_object::{LengthUnit, MeshObject};
+mod region;
+pub use region::RegionObject;
 
 /// A B-rep body, held as the kernel's neutral record.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -146,41 +148,6 @@ impl Object for BodyObject {
     }
 }
 
-/// A persistent region: triangles of one mesh, optionally classified by a fitted primitive.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RegionObject {
-    /// Id.
-    pub id: ObjectId,
-    /// Display name.
-    pub name: String,
-    /// The mesh the triangles belong to.
-    pub mesh: ObjectId,
-    /// Triangle indices, sorted and unique.
-    pub triangles: Arc<Vec<u32>>,
-    /// Geometry type after classification.
-    #[serde(default)]
-    pub kind: Option<PrimitiveKind>,
-    /// RMS of the classification fit (mm).
-    #[serde(default)]
-    pub rms: Option<f64>,
-    /// An organic area found by segmentation: no primitive describes it (`kind` is `None`).
-    #[serde(default)]
-    pub freeform: bool,
-    /// Shown in the viewport (as a colour on its mesh).
-    #[serde(default = "yes")]
-    pub visible: bool,
-}
-
-impl RegionObject {
-    fn describe(&self) -> String {
-        let k = if self.freeform {
-            "freeform".to_string()
-        } else {
-            self.kind.map_or_else(|| "unclassified".to_string(), |k| format!("{k:?}").to_lowercase())
-        };
-        format!("{} triangles of {}, {k}", self.triangles.len(), self.mesh)
-    }
-}
 object_common!(RegionObject, ObjectKind::Region);
 
 /// A fitted primitive.
