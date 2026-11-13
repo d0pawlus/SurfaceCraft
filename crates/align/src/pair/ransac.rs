@@ -30,6 +30,8 @@ const INLIER_SPACINGS: f64 = 2.5;
 const MIN_EDGE_SPACINGS: f64 = 8.0;
 /// Sides may differ by this fraction between the scans (on top of the inlier distance).
 const EDGE_TOLERANCE: f64 = 0.03;
+/// ... or this fraction of the extent of the moving scan, when that is shorter.
+const MIN_EDGE_EXTENT: f64 = 0.25;
 /// Rotated normals of an inlier match agree to at least this cosine.
 const NORMAL_COS: f64 = 0.8;
 /// Poses closer than this many spacings (largest probe displacement) are one pose.
@@ -171,7 +173,9 @@ pub(super) fn descriptor_poses(
     if ms.len() < 3 {
         return Ok(Vec::new());
     }
-    let (tau, min_edge) = (INLIER_SPACINGS * spacing, MIN_EDGE_SPACINGS * spacing);
+    // sides of a trial triple: long enough to fix a rotation, but short enough to fit in a small patch
+    let extent = surfacecraft_geom::Aabb::from_points(&mov.pts).diagonal();
+    let (tau, min_edge) = (INLIER_SPACINGS * spacing, (MIN_EDGE_SPACINGS * spacing).min(MIN_EDGE_EXTENT * extent));
     let mut hits = run_trials(&ms, tau, min_edge, cancel)?;
     hits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     let probes = corners(&mov.pts);

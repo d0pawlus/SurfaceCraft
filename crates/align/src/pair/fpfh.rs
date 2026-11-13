@@ -11,6 +11,9 @@ use surfacecraft_geom::{Point3, Vec3};
 const BINS: usize = 11;
 /// Descriptor length.
 pub(super) const DIM: usize = 3 * BINS;
+/// Most neighbours of a point that take part (the nearest ones): bounds the memory when many
+/// samples crowd together.
+const MAX_NEIGHBOURS: usize = 160;
 /// Fewer neighbours than this and a point has no usable descriptor.
 const MIN_NEIGHBOURS: usize = 8;
 
@@ -73,7 +76,8 @@ pub(super) fn describe(s: &Samples, radius: f64) -> Vec<Option<Desc>> {
     let n = s.pts.len();
     let nbrs: Vec<Vec<usize>> = surfacecraft_geom::par::map(n, |i| {
         let Some(p) = s.pts.get(i) else { return Vec::new() };
-        s.tree.within(p, radius).into_iter().filter(|&j| j != i).collect()
+        let r2 = radius * radius;
+        s.tree.knn(p, MAX_NEIGHBOURS + 1).into_iter().filter(|&(j, d2)| j != i && d2 <= r2).map(|(j, _)| j).collect()
     });
     let simple: Vec<Desc> = surfacecraft_geom::par::map(n, |i| spfh(s, i, nbrs.get(i).map_or(&[][..], |v| v)));
     surfacecraft_geom::par::map(n, |i| {
@@ -122,5 +126,16 @@ mod tests {
             }
         }
         assert!(worst < 1e-3, "descriptor changed by {worst}");
+    }
+
+    /// Finding 8: crowded samples keep only their nearest neighbours (bounded memory and time).
+    #[test]
+    fn coincident_samples_do_not_blow_up_the_neighbour_lists() {
+        use surfacecraft_geom::KdTree;
+        let pts = vec![Point3::new(1.0, 2.0, 3.0); 3000];
+        let s = Samples { tree: KdTree::build(&pts), nrm: vec![Vec3::z(); 3000], pts };
+        let d = describe(&s, 1.0);
+        assert_eq!(d.len(), 3000);
+        assert!(d.iter().all(Option::is_some), "every point has neighbours and a descriptor");
     }
 }

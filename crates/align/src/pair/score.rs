@@ -1,12 +1,48 @@
 //! Robust scoring of a pose: how much of the moving scan lies on the fixed surface, and how
 //! tightly. Truncated, so surface that has no counterpart (partial overlap) costs a fixed amount
 //! and does not drag a good pose down the way a mean or a median distance would.
-use surfacecraft_geom::{Bvh, Mesh, Point3, Transform};
+use surfacecraft_geom::{Bvh, Mesh, Point3, Transform, Vec3};
 
 /// Weight of a conflict against a match in [`Fit::score`].
 pub(super) const CONFLICT_WEIGHT: f64 = 3.0;
 /// A point is in conflict beyond this many tolerances from a surface that is there to be hit.
 const CONFLICT_TAUS: f64 = 2.0;
+
+/// Per triangle, bit `k` set when edge `k` (corner `k` to `k + 1`) is shared by no other triangle
+/// (a border) or by more than one (non-manifold). Vertices are matched by position, so a mesh that
+/// repeats its vertices per triangle (unwelded) has the borders of the welded one.
+fn open_edges(mesh: &Mesh, diag: f64) -> Vec<u8> {
+    let q = 1.0 / (1e-6 * diag).max(1e-300);
+    let cell = |p: &Point3| [(p.x * q).round() as i64, (p.y * q).round() as i64, (p.z * q).round() as i64];
+    let mut half: Vec<([i64; 3], [i64; 3], u32)> = Vec::with_capacity(mesh.triangle_count() * 3);
+    for i in 0..mesh.triangle_count() {
+        let Some(c) = mesh.triangle(i) else { continue };
+        for k in 0..3 {
+            let (a, b) = (cell(&c[k]), cell(&c[(k + 1) % 3]));
+            if a != b {
+                half.push((a.min(b), a.max(b), (i * 3 + k) as u32));
+            }
+        }
+    }
+    surfacecraft_geom::par::sort_unstable(&mut half);
+    let mut open = vec![0u8; mesh.triangle_count()];
+    let mut i = 0;
+    while i < half.len() {
+        let mut j = i + 1;
+        while j < half.len() && half.get(j).map(|h| (h.0, h.1)) == half.get(i).map(|h| (h.0, h.1)) {
+            j += 1;
+        }
+        if j - i != 2 {
+            for h in half.get(i..j).unwrap_or(&[]) {
+                if let Some(m) = open.get_mut((h.2 / 3) as usize) {
+                    *m |= 1 << (h.2 % 3);
+                }
+            }
+        }
+        i = j;
+    }
+    open
+}
 
 /// The fixed scan as a target: its BVH and which triangle edges are open (the scan ends there).
 pub(super) struct Target<'a> {
@@ -25,11 +61,7 @@ impl<'a> Target<'a> {
     }
 
     pub(super) fn new(mesh: &'a Mesh, diag: f64) -> Self {
-        let open = mesh
-            .triangle_neighbours()
-            .iter()
-            .map(|n| n.iter().enumerate().fold(0u8, |m, (k, &x)| if x == u32::MAX { m | (1 << k) } else { m }))
-            .collect();
+        let open = open_edges(mesh, diag);
         Target { mesh, bvh: Bvh::build(mesh), open, border: 1e-7 * diag }
     }
 
@@ -73,6 +105,13 @@ impl Fit {
     }
 }
 
+/// How far `best` stands clear of `other`, in shares of the moving scan's area: the larger of the
+/// matches `other` lacks and the conflicts `other` has more. Negative when `other` is better in
+/// both. This is the quantity [`super::AMBIGUITY_MARGIN`] bounds.
+pub(super) fn clearance(best: &Fit, other: &Fit) -> f64 {
+    (best.share - other.share).max(other.conflict - best.conflict)
+}
+
 /// Scores `pts` moved by `t` against `target`; conflicts are only counted when `conflicts`.
 pub(super) fn fit_of(target: &Target, pts: &[Point3], t: &Transform, tau: f64, conflicts: bool) -> Fit {
     let reach = if conflicts { f64::INFINITY } else { tau };
@@ -100,6 +139,37 @@ pub(super) fn fit_of(target: &Target, pts: &[Point3], t: &Transform, tau: f64, c
         rms: if inliers > 0 { (sq / inliers as f64).sqrt() } else { f64::INFINITY },
         msac: (sq + outliers * tau * tau) / n as f64,
     }
+}
+
+/// How firmly the matched part pins the pose (geometric stability, after Gelfand et al. 2003):
+/// the smallest eigenvalue of the point-to-plane normal equations of the matched points at `t`,
+/// with positions centred and scaled by their RMS radius so that rotations and shifts weigh alike
+/// (0 when the part can slide or turn freely, as a flat or cylindrical patch can; a bracket or a
+/// lumpy blob is orders of magnitude above).
+pub(super) fn stability(target: &Target, pts: &[Point3], t: &Transform, tau: f64) -> f64 {
+    let hits: Vec<Option<(Point3, Vec3)>> = surfacecraft_geom::par::map_slice(pts, |p| {
+        let q = t.apply(p);
+        let h = target.bvh.closest(&q, tau)?;
+        Some((q, target.bvh.triangle_normal(h.triangle)?))
+    });
+    let used: Vec<&(Point3, Vec3)> = hits.iter().flatten().collect();
+    if used.len() < 6 {
+        return 0.0;
+    }
+    let n = used.len() as f64;
+    let c = used.iter().map(|h| h.0.coords).sum::<Vec3>() / n;
+    let radius = (used.iter().map(|h| (h.0.coords - c).norm_squared()).sum::<f64>() / n).sqrt();
+    if !(radius > 0.0) {
+        return 0.0;
+    }
+    let mut a = nalgebra::Matrix6::<f64>::zeros();
+    for (q, nrm) in used.iter().map(|h| (&h.0, &h.1)) {
+        let r = ((q.coords - c) / radius).cross(nrm);
+        let row = nalgebra::Vector6::new(r.x, r.y, r.z, nrm.x, nrm.y, nrm.z);
+        a += row * row.transpose();
+    }
+    let min = (a / n).symmetric_eigen().eigenvalues.min();
+    if min.is_finite() { min.max(0.0) } else { 0.0 }
 }
 
 /// The eight corners of the bounding box of `pts`: probes for comparing two poses.

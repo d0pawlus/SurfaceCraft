@@ -142,13 +142,18 @@ Normals, colours and per-vertex data go with the coordinates.
   overlap, down to about half shared), scores them on a subsample, refines the best few and reports
   the pose, `overlap_moving` and `overlap_fixed` (shares of each scan's area that lie on the other
   within `tolerance`), a `verdict` and a `confidence`.
-- `verdict`: `unique` (one pose clearly fits better than any other), `ambiguous` (a symmetric part,
-  or an overlap with too little shape: the near-tied poses are in `alternatives`) or `no_match`
-  (too little overlap, or different parts). It proposes by default (`apply` false); a pose that is
-  not `unique` is applied only when `choose` names it (0 the best, 1 and up the alternatives).
+- `verdict`: `unique` (one pose clearly fits better than any other: every other pose has at least
+  3 % of the moving scan's area more in conflict or less on the target), `ambiguous` (a symmetric
+  part: the near-tied poses are in `alternatives`; or a matched part that can slide or turn freely,
+  such as a flat or cylindrical patch: `stability` near 0, no alternatives) or `no_match` (too
+  little overlap, or different parts). It proposes by default (`apply` false); a pose that is
+  not `unique` is applied only when `choose` names it (0 the best, 1 and up the alternatives; `choose`
+  needs `apply`). The result then carries the numbers of the pose chosen. When `apply` was given
+  and nothing moved, `refused` is true.
 - Limits: the triangles of both scans must be consistently oriented (the descriptors use the
   normals); surface that ends at the border of the other scan is no conflict, but a part whose
-  shared region is only flat or a cylinder-like surface is reported `ambiguous`.
+  shared region is only flat or a cylinder-like surface is reported `ambiguous`; a scan that
+  repeats its vertices per triangle gets the borders of the welded mesh (found by position).
 
 ## Parameters common to all align commands
 

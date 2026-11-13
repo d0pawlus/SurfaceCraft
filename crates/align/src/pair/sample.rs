@@ -28,9 +28,11 @@ pub(super) fn count_for(area: f64, spacing: f64, cap: usize) -> usize {
     if n.is_finite() { (n as usize).clamp(64, cap.max(64)) } else { cap.max(64) }
 }
 
-/// `count` samples of `mesh` with smoothed normals.
-pub(super) fn sample(mesh: &Mesh, count: usize, spacing: f64, salt: u64, cancel: &Cancel) -> Option<Samples> {
-    let mut rng = Rng::new(SEED ^ salt);
+/// `count` samples of `mesh` with smoothed normals. `stream` is the index of the deterministic
+/// sample stream (the fixed scan and the moving scan draw from different ones); it is a plain
+/// sequence number, not a secret and not cryptographic.
+pub(super) fn sample(mesh: &Mesh, count: usize, spacing: f64, stream: u64, cancel: &Cancel) -> Option<Samples> {
+    let mut rng = Rng::new(SEED ^ stream);
     let raw = mesh.sample_points(count, &mut rng);
     if raw.len() < 16 || cancel.is_cancelled() {
         return None;

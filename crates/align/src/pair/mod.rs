@@ -24,7 +24,7 @@ mod verdict;
 
 use crate::{AlignError, IcpOptions, icp_cancellable};
 use sample::Samples;
-use score::{Fit, Target, corners, fit_of, median, pose_gap};
+use score::{Fit, Target, clearance, corners, fit_of, median, pose_gap, stability};
 use surfacecraft_geom::{Cancel, Mesh, Point3, Transform};
 
 pub use verdict::{AMBIGUITY_MARGIN, CONFIDENCE_THRESHOLD, CoarseMethod, MIN_OVERLAP, PairCandidate, PairVerdict};
@@ -35,8 +35,11 @@ const MIN_TRIANGLES: usize = 4;
 const SAMPLE_CAP: usize = 3000;
 /// Moving samples used to score the unrefined candidates.
 const SHORTLIST_SAMPLES: usize = 1500;
-/// Candidates refined by ICP.
+/// Candidates refined by ICP: the best 8 distinct ones, and up to 16 when more score within
+/// `SHORTLIST_SLACK` of the eighth (a near-tie must not be cut by the order of a sort).
 const SHORTLIST: usize = 8;
+const SHORTLIST_MAX: usize = 16;
+const SHORTLIST_SLACK: f64 = 1.25;
 /// Alternatives listed.
 const MAX_ALTERNATIVES: usize = 7;
 /// Tolerance of the shortlist score, as a fraction of the diagonal of the fixed scan.
@@ -85,6 +88,10 @@ pub struct PairResult {
     pub alternatives: Vec<PairCandidate>,
     /// Candidate poses scored.
     pub candidates: usize,
+    /// Candidates that ICP could refine and that were compared (fewer than two: never certain).
+    pub refined: usize,
+    /// How firmly the matched part pins the pose, 0 (it can slide or turn freely) and up.
+    pub stability: f64,
     /// Iterations of the final ICP (0 when it did not run).
     pub icp_iterations: usize,
     /// Did the final ICP converge?
@@ -173,11 +180,14 @@ impl<'a> Scene<'a> {
         scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
         let probes = corners(&self.mov.pts);
         let mut kept: Vec<Cand> = Vec::new();
-        for (_, _, c) in scored {
-            if kept.len() < SHORTLIST
-                && kept.iter().all(|k| pose_gap(&k.t, &c.t, &probes) > SAME_POSE_BEFORE * self.diag)
-            {
+        let mut cut = f64::INFINITY;
+        for (msac, _, c) in scored {
+            let room = kept.len() < SHORTLIST || (kept.len() < SHORTLIST_MAX && msac <= cut);
+            if room && kept.iter().all(|k| pose_gap(&k.t, &c.t, &probes) > SAME_POSE_BEFORE * self.diag) {
                 kept.push(c);
+                if kept.len() == SHORTLIST {
+                    cut = msac * SHORTLIST_SLACK + 1e-12;
+                }
             }
         }
         kept
@@ -260,13 +270,13 @@ impl<'a> Scene<'a> {
     /// to convergence and ranks again: a slide that only looked as good because ICP crawls along a
     /// poorly constrained direction ends in the same pose as the best one and merges with it.
     fn settle(&self, ranked: Vec<Ranked>, tau: f64, cancel: &Cancel) -> Result<Vec<Ranked>, AlignError> {
-        let Some(top) = ranked.first().map(|r| r.fit.score()) else { return Ok(ranked) };
+        let Some(top) = ranked.first().map(|r| r.fit) else { return Ok(ranked) };
         let opts =
             IcpOptions { max_iterations: 100, tolerance: 1e-4, max_distance: Some(3.0 * tau), max_samples: SAMPLE_CAP };
         let mut again = Vec::with_capacity(ranked.len());
         for r in ranked {
             let mut cand = r.cand;
-            if r.fit.score() >= top - AMBIGUITY_MARGIN {
+            if clearance(&top, &r.fit) < AMBIGUITY_MARGIN {
                 match icp_cancellable(&self.mov_cloud, &self.fixed.bvh, &cand.t, &opts, cancel) {
                     Ok(rep) => cand.t = rep.transform,
                     Err(AlignError::Cancelled) => return Err(AlignError::Cancelled),
@@ -299,9 +309,10 @@ impl<'a> Scene<'a> {
         }
     }
 
-    /// Share of the fixed scan's samples within `tau` of the moving scan placed by `t`.
-    fn overlap_fixed(&self, t: &Transform, tau: f64) -> f64 {
-        fit_of(&Target::plain(self.moving), &self.fix.pts, &t.inverse(), tau, false).share
+    /// Per pose, the share of the fixed scan's samples within `tau` of the moving scan placed there.
+    fn overlaps_fixed(&self, poses: &[Transform], tau: f64) -> Vec<f64> {
+        let moving = Target::plain(self.moving);
+        poses.iter().map(|t| fit_of(&moving, &self.fix.pts, &t.inverse(), tau, false).share).collect()
     }
 }
 
@@ -309,10 +320,12 @@ fn finite_or_zero(x: f64) -> f64 {
     if x.is_finite() { x } else { 0.0 }
 }
 
-fn alternative(r: &Ranked) -> PairCandidate {
+fn alternative(r: &Ranked, overlap_fixed: f64) -> PairCandidate {
     PairCandidate {
         transform: r.cand.t,
         overlap_moving: r.fit.share,
+        overlap_fixed,
+        confidence: 0.0,
         rms: finite_or_zero(r.fit.rms),
         score: r.fit.score(),
         method: r.cand.method,
@@ -335,6 +348,7 @@ pub fn pair_coarse(moving: &Mesh, fixed: &Mesh, opts: &PairOptions, cancel: &Can
     if refined.is_empty() {
         return Err(AlignError::Degenerate("no candidate pose could be refined".into()));
     }
+    let refined_count = refined.len();
     let tau = scene.tolerance(&refined, opts.tolerance);
     let ranked = scene.rank(refined, tau);
     let mut ranked = scene.settle(ranked, tau, cancel)?;
@@ -343,28 +357,42 @@ pub fn pair_coarse(moving: &Mesh, fixed: &Mesh, opts: &PairOptions, cancel: &Can
     }
     let first = ranked.remove(0);
     let (best, icp_iterations, icp_converged) = scene.polish(&first, tau, cancel)?;
-    let overlap_fixed = scene.overlap_fixed(&best.cand.t, tau);
-    let mut result = conclude(&best, &ranked, tau, overlap_fixed)?;
+    let poses: Vec<Transform> = std::iter::once(best.cand.t).chain(ranked.iter().map(|r| r.cand.t)).collect();
+    let shares = scene.overlaps_fixed(&poses, tau);
+    let stable = stability(&scene.fixed, &scene.mov.pts, &best.cand.t, tau);
+    let mut result = conclude(&best, &ranked, tau, &shares, refined_count, stable)?;
     result.candidates = candidates;
     result.icp_iterations = icp_iterations;
     result.icp_converged = icp_converged;
     Ok(result)
 }
 
-/// The verdict and the result from the best pose and the other distinct ones.
-fn conclude(best: &Ranked, others: &[Ranked], tau: f64, overlap_fixed: f64) -> Result<PairResult, AlignError> {
+/// The verdict and the result from the best pose and the other distinct ones; `shares[0]` is the
+/// best pose's share of the fixed scan on the moving one, `shares[k]` that of `others[k - 1]`.
+fn conclude(
+    best: &Ranked,
+    others: &[Ranked],
+    tau: f64,
+    shares: &[f64],
+    refined: usize,
+    stable: f64,
+) -> Result<PairResult, AlignError> {
     if !best.cand.t.to_rows().iter().flatten().all(|v| v.is_finite()) {
         return Err(AlignError::Degenerate("the pose is not finite".into()));
     }
+    let overlap_fixed = shares.first().copied().unwrap_or(0.0);
     let overlap = best.fit.share.max(overlap_fixed);
-    let runner_up =
-        others.iter().map(|r| r.fit.score()).fold(None, |m: Option<f64>, s| Some(m.map_or(s, |x| x.max(s))));
-    let (verdict, confidence) = verdict::judge(&best.fit, overlap, tau, runner_up);
+    let nearest = others
+        .iter()
+        .map(|r| clearance(&best.fit, &r.fit))
+        .fold(None, |m: Option<f64>, c| Some(m.map_or(c, |x| x.min(c))));
+    let (verdict, confidence) = verdict::judge(&best.fit, overlap, tau, nearest, refined, stable);
     let alternatives: Vec<PairCandidate> = others
         .iter()
-        .filter(|r| verdict == PairVerdict::Ambiguous && r.fit.score() >= best.fit.score() - AMBIGUITY_MARGIN)
+        .zip(shares.iter().skip(1))
+        .filter(|(r, _)| verdict == PairVerdict::Ambiguous && clearance(&best.fit, &r.fit) < AMBIGUITY_MARGIN)
         .take(MAX_ALTERNATIVES)
-        .map(alternative)
+        .map(|(r, s)| alternative(r, *s))
         .collect();
     Ok(PairResult {
         transform: best.cand.t,
@@ -377,6 +405,8 @@ fn conclude(best: &Ranked, others: &[Ranked], tau: f64, overlap_fixed: f64) -> R
         method: best.cand.method,
         alternatives,
         candidates: 0,
+        refined,
+        stability: stable,
         icp_iterations: 0,
         icp_converged: false,
     })

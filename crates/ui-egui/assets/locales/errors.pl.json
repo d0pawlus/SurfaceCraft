@@ -626,5 +626,6 @@
   "no candidate pose survived": "żaden kandydat nie przetrwał",
   "the pose is not finite": "ułożenie nie jest skończone",
   "`choose` picks among alternatives, and this verdict is unique (use 0)": "„choose” wybiera spośród alternatyw, a ten wynik jest jednoznaczny (użyj 0)",
-  "`choose` is {} but there are {} alternatives": "„choose” wynosi {}, a alternatyw jest {}"
+  "`choose` is {} but there are {} alternatives": "„choose” wynosi {}, a alternatyw jest {}",
+  "`choose` names the pose to apply: give `apply` too": "„choose” wskazuje ułożenie do zastosowania: podaj też „apply”"
 }
