@@ -25,10 +25,12 @@ use surfacecraft_geom::{Aabb, Mesh};
 const MIN_SHARE: f64 = 0.01;
 const MIN_TRIANGLES: usize = 500;
 /// The form error of a protected region is at most this share of the tolerance. Calibrated
-/// (`p9_noise_calibration`, `print_tolerance_table`): planes with form error (waviness up to
-/// 0.05 mm, ovality up to 0.05 mm, noise up to 0.01 mm) read 0.02 to 0.135 of a tolerance of
-/// 0.2 mm, the large organic fragments of a wavy surface 0.13 (plane) and above.
-pub const FORM_ERROR_SHARE: f64 = 0.12;
+/// (`p9_noise_calibration`, `print_tolerance_table`, and the wavy-top scenes): planes with form
+/// error read 0.02 to 0.135 of a tolerance of 0.2 mm and cylinders 0.02 to 0.05, but the large
+/// organic fragments read 0.13 and above before the scanner noise is taken out, and as little as
+/// 0.096 after it (a cone fragment of the wavy-top scene at noise 0.03). A plane with more form
+/// error than this share is protected by its bow instead (see below).
+pub const FORM_ERROR_SHARE: f64 = 0.08;
 /// The RMS of a protected region is at most this share of the tolerance (a shoulder where it grew
 /// into a tangent neighbour inflates the RMS, not the spread).
 const RMS_CAP_SHARE: f64 = 0.5;
