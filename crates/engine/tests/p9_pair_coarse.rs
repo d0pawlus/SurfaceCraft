@@ -37,12 +37,17 @@ fn noisy(mut m: Mesh, seed: u64) -> Mesh {
     m
 }
 
-/// The two tessellations of a part: (fixed scan, moving scan before its motion).
-fn pair_of(part: &str) -> (Mesh, Mesh) {
+/// The two tessellations of a part: (fixed scan, moving scan before its motion), with the noise of
+/// trial `k` (independent for every trial).
+fn pair_of_trial(part: &str, k: u64) -> (Mesh, Mesh) {
     match part {
-        "bracket" => (noisy(bracket_at(12, 48, 16), 1), noisy(bracket_at(17, 64, 20), 2)),
-        _ => (noisy(blob_at(48), 3), noisy(blob_at(62), 4)),
+        "bracket" => (noisy(bracket_at(12, 48, 16), 1 + 10 * k), noisy(bracket_at(17, 64, 20), 2 + 10 * k)),
+        _ => (noisy(blob_at(48), 3 + 10 * k), noisy(blob_at(62), 4 + 10 * k)),
     }
+}
+
+fn pair_of(part: &str) -> (Mesh, Mesh) {
+    pair_of_trial(part, 0)
 }
 
 /// A random rotation up to 180 degrees with a translation up to twice the part size (75 mm).
@@ -80,8 +85,9 @@ fn pose_error(found: &Transform, pose: &Transform, moving: &Mesh) -> (f64, f64) 
     (angle.to_degrees(), found.max_displacement(&pose.inverse(), &on_scan.positions))
 }
 
-fn assert_recovers(part: &str, seed: u64) {
-    let (fixed, moving) = pair_of(part);
+/// Checks trial `seed` and returns (angle in degrees, displacement in mm).
+fn assert_recovers(part: &str, seed: u64) -> (f64, f64) {
+    let (fixed, moving) = pair_of_trial(part, seed);
     let pose = random_motion(seed);
     let mut s = session(&fixed, &moving, &pose);
     let out = pair(&mut s, json!({}));
@@ -101,18 +107,26 @@ fn assert_recovers(part: &str, seed: u64) {
     assert!(disp <= MAX_DISPLACEMENT_MM, "{part} seed {seed}: displacement {disp} mm, {out}");
     assert_eq!(out["verdict"], "unique", "{part} seed {seed}: {out}");
     assert_eq!(out["confident"], true);
+    (angle, disp)
+}
+
+/// Runs the ten trials (each its own motion and its own noise) and prints the worst case.
+fn ten_trials(part: &str) {
+    let worst =
+        (0..10).map(|seed| assert_recovers(part, seed)).fold((0.0_f64, 0.0_f64), |w, e| (w.0.max(e.0), w.1.max(e.1)));
+    eprintln!("{part}: worst of ten trials: angle {:.4} deg, displacement {:.4} mm", worst.0, worst.1);
 }
 
 /// Gate 1: ten random motions, rotations up to 180 degrees, bracket then blob, every one a unique
 /// and correct pose.
 #[test]
 fn gate_m2_pair_recovers_ten_random_motions_on_the_bracket() {
-    (0..10).for_each(|seed| assert_recovers("bracket", seed));
+    ten_trials("bracket");
 }
 
 #[test]
 fn gate_m2_pair_recovers_ten_random_motions_on_the_blob() {
-    (0..10).for_each(|seed| assert_recovers("blob", seed));
+    ten_trials("blob");
 }
 
 /// The triangles of `m` whose centroid satisfies `keep`.
@@ -133,8 +147,8 @@ fn true_share(of: &Mesh, on: &Mesh, tau: f64) -> f64 {
 }
 
 /// Two partial scans of a part, each from its own tessellation: (fixed, moving before its motion).
-fn partial_pair(part: &str) -> (Mesh, Mesh) {
-    let (full_f, full_m) = pair_of(part);
+fn partial_pair(part: &str, trial: u64) -> (Mesh, Mesh) {
+    let (full_f, full_m) = pair_of_trial(part, trial);
     if part == "bracket" {
         (cut(&full_f, |c| c.z > 1.0 && c.x <= 54.0), cut(&full_m, |c| c.z > 1.0 && c.x >= 6.0))
     } else {
@@ -143,7 +157,7 @@ fn partial_pair(part: &str) -> (Mesh, Mesh) {
 }
 
 fn assert_partial(part: &str, seed: u64) {
-    let (fixed, moving) = partial_pair(part);
+    let (fixed, moving) = partial_pair(part, seed);
     let whole = if part == "bracket" { synth::bracket() } else { blob_at(96) };
     let (cover_f, cover_m) = (fixed.area() / whole.area(), moving.area() / whole.area());
     let truth_m = true_share(&moving, &fixed, 0.3);
@@ -439,7 +453,7 @@ fn local_corpus_pair() {
     let mut s = Session::new();
     s.execute("mesh.import", json!({"path": path.to_string_lossy(), "name": "fixed"})).unwrap();
     s.execute("mesh.import", json!({"path": path.to_string_lossy(), "name": "other"})).unwrap();
-    // two different decimations of the scan: no vertex of one is a vertex of the other
+    // two different decimations of the scan (interior vertices differ; the boundary is kept in place)
     s.execute("mesh.decimate", json!({"object": "fixed", "ratio": 0.5})).unwrap();
     s.execute("mesh.decimate", json!({"object": "other", "ratio": 0.4})).unwrap();
     let (fid, _) = s.doc.find_by_name("fixed").unwrap();
@@ -458,4 +472,16 @@ fn local_corpus_pair() {
         out["verdict"],
         out["overlap_moving"]
     );
+}
+
+/// A cancelled run is the cancel error of the engine, not a data error, and leaves no trace.
+#[test]
+fn p9_pair_cancelled_before_it_starts_is_the_cancel_error() {
+    let (fixed, moving) = pair_of("bracket");
+    let mut s = session(&fixed, &moving, &random_motion(8));
+    let depth = s.history.undo_labels().len();
+    s.cancel.cancel();
+    let r = s.execute("align.pair_coarse", json!({"object": "moving", "target": "fixed", "apply": true}));
+    assert_eq!(r, Err(surfacecraft_engine::EngineError::Failed(surfacecraft_engine::cmd::CANCELLED.into())));
+    assert_eq!(s.history.undo_labels().len(), depth);
 }

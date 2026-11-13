@@ -136,7 +136,13 @@ impl<'a> Scene<'a> {
             return Err(AlignError::Degenerate("the fixed scan has no extent".into()));
         }
         let spacing = (am.max(af) / SAMPLE_CAP as f64).sqrt();
-        let few = || AlignError::NotEnough("a scan has too few usable triangles to sample".into());
+        let few = || {
+            if cancel.is_cancelled() {
+                AlignError::Cancelled
+            } else {
+                AlignError::NotEnough("a scan has too few usable triangles to sample".into())
+            }
+        };
         let mov =
             sample::sample(moving, sample::count_for(am, spacing, SAMPLE_CAP), spacing, 1, cancel).ok_or_else(few)?;
         let fix =
