@@ -133,3 +133,41 @@ fn diagnose_messy_scans() {
         report("cleaned", &cleaned);
     }
 }
+
+/// `scan.to_solid` on the listed scans: verdicts (one per part when the scan was split), bodies,
+/// patches, share within the tolerance, time. Run one scan per process to read its peak memory
+/// (`/usr/bin/time -l`). Numbers only.
+#[test]
+#[ignore = "needs SURFACECRAFT_LOCAL_CORPUS (third-party scans, never committed)"]
+fn measure_to_solid_on_messy_scans() {
+    let files = corpus();
+    assert!(!files.is_empty(), "set SURFACECRAFT_LOCAL_CORPUS");
+    for n in numbers() {
+        let Some(path) = files.get(n - 1) else { continue };
+        let mut s = Session::new();
+        s.execute("mesh.import", json!({"path": path.to_string_lossy(), "name": "scan"})).unwrap();
+        let started = std::time::Instant::now();
+        let out = s.execute("scan.to_solid", json!({"scan": "scan"}));
+        let seconds = started.elapsed().as_secs_f64();
+        let Ok(out) = out else {
+            eprintln!("C{n:02}: ERROR {out:?} in {seconds:.1} s");
+            continue;
+        };
+        let parts: Vec<serde_json::Value> = out["components"].as_array().cloned().unwrap_or_default();
+        let verdicts: Vec<&str> = parts.iter().filter_map(|c| c["verdict"].as_str()).collect();
+        let bodies = if parts.is_empty() { usize::from(!out["body"].is_null()) } else { parts.iter().filter(|c| !c["body"].is_null()).count() };
+        let patches: Vec<String> = if parts.is_empty() { vec![out["patches"].to_string()] } else { parts.iter().map(|c| c["patches"].to_string()).collect() };
+        let within: Vec<String> = if parts.is_empty() { vec![out["deviation"]["within"].to_string()] } else { parts.iter().map(|c| format!("{:.3}", c["deviation"]["within"].as_f64().unwrap_or(0.0))).collect() };
+        let prep: Vec<&str> = out["preparation"].as_array().into_iter().flatten().filter_map(|p| p["step"].as_str()).collect();
+        let codes: Vec<&str> = out["issues"].as_array().into_iter().flatten().filter_map(|i| i["code"].as_str()).collect();
+        eprintln!(
+            "C{n:02}: verdict {} parts {} part verdicts {verdicts:?} bodies {bodies} method {} patches {patches:?} within {within:?} time {seconds:.1} s preparation {prep:?} issues {codes:?}",
+            out["verdict"],
+            parts.len(),
+            out["method"]
+        );
+        if let Some(p) = out["preparation"].as_array().and_then(|a| a.first()) {
+            eprintln!("    preparation numbers: {}", p["numbers"]);
+        }
+    }
+}
