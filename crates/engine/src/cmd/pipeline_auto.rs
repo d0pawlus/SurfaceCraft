@@ -76,13 +76,9 @@ pub struct Attempt {
     pub skipped: Option<Skipped>,
 }
 
-/// Result of `scan.to_solid`: the result of the method returned, and the attempts.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-pub struct ToSolidReport {
-    /// The returned attempt's result.
-    #[serde(flatten)]
+/// The result of the method returned, and the attempts (merged into `ToSolidOut` by `solve`).
+pub(super) struct ToSolidReport {
     pub result: ToSolidOut,
-    /// Every method tried, in order; one when the first passed or the method was given.
     pub attempts: Vec<Attempt>,
 }
 
@@ -444,6 +440,8 @@ mod tests {
             relations: 0,
             issues: Vec::new(),
             next_steps: Vec::new(),
+            attempts: Vec::new(),
+            prep: super::super::PrepOut::default(),
         }
     }
 

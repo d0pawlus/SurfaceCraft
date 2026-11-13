@@ -995,5 +995,15 @@
   "param.exclude_triangles": "Exclude triangles",
   "param.exclude_spheres": "Exclude spheres",
   "param.exclude_boxes": "Exclude boxes",
-  "param.conform_boundary": "Conform to outline (experimental)"
+  "param.conform_boundary": "Conform to outline (experimental)",
+  "cmd.mesh.remesh": "Remesh scan",
+  "cmd.mesh.remesh.hint": "Rebuilds a clean, closed surface from a messy closed scan: removes tiny handles, fins and self-intersections, keeps real holes and thin walls.",
+  "cmd.scan.split": "Split scan into parts",
+  "cmd.scan.split.hint": "Separates a file with several parts into one mesh per part and reports the debris and hollow parts.",
+  "param.voxel": "Voxel size",
+  "param.min_feature": "Smallest feature kept",
+  "param.max_hole": "Largest hole filled",
+  "param.min_share": "Smallest part share",
+  "param.keep_debris": "Keep debris",
+  "param.components": "Parts to model"
 }

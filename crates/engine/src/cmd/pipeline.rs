@@ -3,23 +3,20 @@
 //! `primitive.fit`, `primitive.auto_constrain`, `body.from_regions` and `body.compare` in order
 //! and adds no geometry of its own; what it adds is the choice of regions, the verdict and the
 //! next steps, so that an agent needs one call instead of a dozen and cannot miss a poor result.
-use super::body::BodyOut;
 use super::deviation::{NOISE_PRIMITIVE_MM, positive, yes};
 use super::hybrid::{FaceOf, FromRegionsIn, from_regions};
 use super::mesh_edit::{CleanIn, clean};
 use super::primitive::{AutoConstrainIn, auto_constrain};
-use super::qa::{CompareIn, CompareOut, Finding, QaIn, compare, scan_qa};
-use super::region::{AutoIn, NoiseSource, NoiseSpread, RegionsOut, auto_segment};
+use super::qa::{CompareIn, CompareOut, QaIn, compare, scan_qa};
+use super::region::{AutoIn, RegionsOut, auto_segment};
 use super::wrap::PATCH_LIMIT;
 use super::{CmdError, CmdResult, CommandSpec, ObjRef};
 use crate::{Session, command};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use surfacecraft_deviation::faces::FaceDeviation;
 use surfacecraft_deviation::noise_estimate;
 use surfacecraft_doc::{ObjectId, ObjectKind};
-use surfacecraft_fit::PrimitiveKind;
 use surfacecraft_fit::segment::SegmentOptions;
 
 #[path = "pipeline_auto.rs"]
@@ -30,9 +27,16 @@ mod budget;
 mod freeform;
 #[path = "pipeline_judge.rs"]
 mod judge;
+#[path = "pipeline_prepare.rs"]
+mod prepare;
+pub use prepare::{ComponentOut, PrepOut, PrepStep};
+#[path = "pipeline_rebuild.rs"]
+mod rebuild;
+#[path = "pipeline_types.rs"]
+mod types;
+pub use types::{DeviationSummary, Issue, LeftOut, Modelled, NextStep, ScanSummary, ToSolidOut};
 #[path = "pipeline_regions.rs"]
 mod regions;
-pub(crate) use auto::ToSolidReport;
 use judge::{Outcome, issues_of, next_steps, verdict_of};
 use regions::{candidates, fit_regions, primitive_share};
 
@@ -126,9 +130,18 @@ pub struct ToSolidIn {
     /// `max_patches` is given).
     #[serde(default = "yes")]
     pub allow_retry: bool,
+    /// Rebuild a closed scan with many handles or non-manifold edges, or that wrapping did not pass on, with `mesh.remesh` and wrap it (again) (default true; for at most the 4 largest parts). The wrap again, the larger-cap retry (`allow_retry`, for the first part in area order that qualifies for it) and the other method of `auto` are extra attempts: one budget of 2 per call (a count, no clock). At most 26 wraps per call in all (a wrap for each of 24 parts, and the 2 extra attempts). `false`: the scan is wrapped as it is.
+    #[serde(default = "yes")]
+    pub rebuild: bool,
+    /// A part of a scan with several pieces is co-equal, and modelled, when its area is at least this share of the largest piece's (0..1, default 0.1). Smaller pieces and debris are reported, not modelled.
+    #[serde(default)]
+    pub part_share: Option<f64>,
     /// Name of the solid (default "solid").
     #[serde(default)]
     pub name: Option<String>,
+    /// Which co-equal parts of a scan with several parts are modelled: `all` (default, the largest 24, one solid each), `largest`, or a number of the largest parts.
+    #[serde(default)]
+    pub components: Option<prepare::Components>,
 }
 
 /// How the run ended.
@@ -143,162 +156,6 @@ pub enum Verdict {
     Fail,
 }
 
-/// One thing that kept the run from a pass.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-pub struct Issue {
-    /// Short identifier, stable across versions.
-    pub code: String,
-    /// What was found.
-    pub message: String,
-}
-
-/// A command worth running next, with its parameters.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-pub struct NextStep {
-    /// Command id.
-    pub command: String,
-    /// Parameters to call it with.
-    pub params: Value,
-    /// Why.
-    pub why: String,
-}
-
-/// What the cleaning did to the scan.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-pub struct ScanSummary {
-    /// Triangles when the command started.
-    pub triangles_before: usize,
-    /// Triangles after cleaning.
-    pub triangles: usize,
-    /// Holes found before cleaning.
-    pub holes_before: usize,
-    /// Holes filled.
-    pub holes_filled: usize,
-    /// Holes left open (above the size limit, not triangulable, or whose fill would put three triangles on one edge).
-    pub holes_left: usize,
-    /// Edges shared by three or more triangles, after cleaning.
-    pub non_manifold_edges: usize,
-    /// Estimated scanner noise sigma after cleaning (mm); null when it cannot be estimated.
-    pub noise_sigma: Option<f64>,
-    /// The noise the segmentation judged the fits by (sigma, mm; see `region.auto_segment`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub noise_used: Option<f64>,
-    /// Where it came from: `estimated`, `estimated_mesh`, `given` or `fallback`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub noise_source: Option<NoiseSource>,
-    /// Smallest and largest noise measured on blocks of the scan, when two or more were measured.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub noise_spread: Option<NoiseSpread>,
-    /// The noise is above the tolerance: nothing was merged into freeform regions.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub noise_above_tolerance: bool,
-    /// Findings of the quality check before cleaning.
-    pub findings: Vec<Finding>,
-}
-
-/// A region that became a primitive of the solid.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-pub struct Modelled {
-    /// Region.
-    pub region: ObjectId,
-    /// Primitive fitted to it.
-    pub primitive: ObjectId,
-    /// Kind of the primitive.
-    pub kind: PrimitiveKind,
-    /// Triangles of the region.
-    pub triangles: usize,
-    /// RMS of the fit (mm).
-    pub rms: f64,
-    /// Role in the solid, as `body.from_regions` reports it (`global`, `local-subtract`,
-    /// `local-add`, `blend`, `skipped`); empty when no solid was built.
-    pub role: String,
-    /// Faces of the solid on this primitive.
-    pub faces: Vec<usize>,
-    /// Why it was skipped, when it was.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub skipped: Option<String>,
-}
-
-/// A region that was not modelled.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-pub struct LeftOut {
-    /// Region.
-    pub region: ObjectId,
-    /// Triangles.
-    pub triangles: usize,
-    /// Classified kind.
-    pub kind: Option<PrimitiveKind>,
-    /// RMS of the classification (mm).
-    pub rms: Option<f64>,
-    /// Why it was left out.
-    pub reason: String,
-}
-
-/// The solid against the scan.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-pub struct DeviationSummary {
-    /// Scan points measured.
-    pub count: usize,
-    /// Share of the scan's points that were measured (0..1): the rest lie farther than 5 mm from
-    /// the solid or face away from it.
-    pub coverage: f64,
-    /// Share of the scan's points (0..1) that lie on the solid but face away from it, and so are
-    /// not in `count`: a solid that is inside out, or has faces turned the wrong way, shows here.
-    #[serde(default)]
-    pub not_facing: f64,
-    /// Share of the measured points within the tolerance (0..1).
-    pub within: f64,
-    /// RMS deviation (mm).
-    pub rms: f64,
-    /// Largest |deviation| (mm).
-    pub max_abs: f64,
-    /// Mean signed deviation (mm); positive when the scan lies outside the solid.
-    pub mean: f64,
-}
-
-/// Result of `scan.to_solid`.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-pub struct ToSolidOut {
-    /// How the run ended: `pass`, `review` or `fail`.
-    pub verdict: Verdict,
-    /// The method used: `primitives` or `freeform`.
-    pub method: Method,
-    /// The scan.
-    pub scan: ObjectId,
-    /// The solid, when one was built.
-    pub body: Option<BodyOut>,
-    /// Patches of the network (method `freeform`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub patches: Option<usize>,
-    /// The network was built a second time with a larger patch limit (method `freeform`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retry: Option<freeform::CapRetry>,
-    /// Tolerance used (mm).
-    pub tolerance: f64,
-    /// The solid against the scan, when a solid was built.
-    pub deviation: Option<DeviationSummary>,
-    /// Faces with points outside the tolerance, worst first (at most 5).
-    pub worst_faces: Vec<FaceDeviation>,
-    /// The scan before and after cleaning.
-    pub scan_report: ScanSummary,
-    /// Regions modelled, largest first.
-    pub modelled: Vec<Modelled>,
-    /// Regions not modelled, largest first (at most 20).
-    pub left_out: Vec<LeftOut>,
-    /// Regions not modelled, all of them.
-    pub left_out_regions: usize,
-    /// Triangles of the regions not modelled.
-    pub left_out_triangles: usize,
-    /// Triangles of the scan in no region.
-    pub unassigned_triangles: usize,
-    /// Relations imposed between the primitives.
-    pub relations: usize,
-    /// What kept the run from a pass; empty on a pass.
-    pub issues: Vec<Issue>,
-    /// Commands worth running next, most useful first.
-    pub next_steps: Vec<NextStep>,
-}
-
 /// The parameters after validation.
 struct Settings {
     /// Extra attempts of this call draw from it (see `pipeline_budget`).
@@ -309,6 +166,7 @@ struct Settings {
     min_triangles: Option<usize>,
     max_patches: Option<usize>,
     allow_retry: bool,
+    rebuild: bool,
     name: String,
 }
 
@@ -387,6 +245,7 @@ fn settings(s: &Session, i: &ToSolidIn) -> CmdResult<Settings> {
         min_triangles: i.min_region_triangles,
         max_patches: i.max_patches,
         allow_retry: i.allow_retry,
+        rebuild: i.rebuild,
         name: i.name.clone().unwrap_or_else(|| "solid".to_string()),
     })
 }
@@ -524,10 +383,20 @@ fn relate(s: &mut Session, modelled: &[Modelled], sigma: Option<f64>) -> usize {
     auto_constrain(s, params).map_or(0, |r| if r.applied { r.relations.len() } else { 0 })
 }
 
-pub(super) fn to_solid(s: &mut Session, i: ToSolidIn) -> CmdResult<auto::ToSolidReport> {
+pub(super) fn to_solid(s: &mut Session, i: ToSolidIn) -> CmdResult<ToSolidOut> {
     let set = settings(s, &i)?;
     let scan_report = prepare(s, &i, set.scan)?;
-    auto::run(s, &i, &set, scan_report)
+    if let Some(done) = prepare::split_parts(s, &i, &set, &scan_report)? {
+        return Ok(done);
+    }
+    solve(s, &i, set, scan_report)
+}
+
+/// Models one scan (a part, or the whole scan) once it is cleaned: the given method, or `auto`'s
+/// ordered attempts (see `pipeline_auto`); the attempts are listed in the result.
+fn solve(s: &mut Session, i: &ToSolidIn, set: Settings, scan_report: ScanSummary) -> CmdResult<ToSolidOut> {
+    let report = auto::run(s, i, &set, scan_report)?;
+    Ok(ToSolidOut { attempts: report.attempts, ..report.result })
 }
 
 /// Segments the scan into regions at the caller's tolerance (unless the regions are reused) and
@@ -603,6 +472,8 @@ fn primitives_solid(s: &mut Session, i: &ToSolidIn, set: &Settings, scan_report:
         relations,
         issues,
         next_steps: next,
+        attempts: Vec::new(),
+        prep: PrepOut::default(),
     })
 }
 
@@ -614,7 +485,7 @@ pub static COMMANDS: &[CommandSpec] = &[command!(
     true,
     "From raw scan `scan` to a closed solid in one step, measured against the scan. Prismatic parts (`method` primitives): cleans the scan, segments it, fits a primitive to each sizeable region, relates the primitives and builds the solid. Organic parts, castings and body panels (`method` freeform): wraps the whole scan in a watertight network of patches. `method` auto (default) tries the suggested method, then the other if it fails, and returns the better (`attempts`). Returns `verdict` (pass, review or fail), the deviation, `issues`, and `next_steps` with ready parameters. A poor model is a verdict, not an error; regions stay for manual work. `reuse_regions` models corrected regions again (without cleaning).",
     ToSolidIn,
-    auto::ToSolidReport,
+    ToSolidOut,
     super::mesh::scan_size::to_solid_checked
 )];
 

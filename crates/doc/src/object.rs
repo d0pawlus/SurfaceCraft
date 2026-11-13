@@ -465,6 +465,7 @@ macro_rules! stores {
         }
     }};
 }
+pub(crate) use stores;
 
 impl Document {
     /// An empty document.
@@ -479,16 +480,6 @@ impl Document {
         ObjectId(self.next_id)
     }
 
-    /// A name not used by any object, built from `base`.
-    #[must_use]
-    pub fn unique_name(&self, base: &str) -> String {
-        let base = if base.trim().is_empty() { "object" } else { base.trim() };
-        if !self.name_taken(base) {
-            return base.to_string();
-        }
-        (2..).map(|i| format!("{base} {i}")).find(|n| !self.name_taken(n)).unwrap_or_else(|| base.to_string())
-    }
-
     /// Every object id in use: the active stores, the parked features and the dormant bodies.
     #[must_use]
     pub fn all_ids(&self) -> Vec<u64> {
@@ -497,13 +488,6 @@ impl Document {
         ids.extend(self.rolled_back.iter().map(|f| f.id.0));
         ids.extend(self.dormant_bodies.iter().map(|b| b.id.0));
         ids
-    }
-
-    fn name_taken(&self, n: &str) -> bool {
-        let mut taken = false;
-        stores!(self, s => taken |= s.iter().any(|o| o.name() == n));
-        // parked features and bodies are inactive but keep their names
-        taken || self.rolled_back.iter().any(|f| f.name == n) || self.dormant_bodies.iter().any(|b| b.name == n)
     }
 
     /// Adds a mesh and returns its id.
@@ -748,14 +732,6 @@ impl Document {
             }
         }
         Some(gone.len())
-    }
-
-    /// Renames an object; false when it does not exist.
-    pub fn rename(&mut self, id: ObjectId, name: &str) -> bool {
-        let name = self.unique_name(name);
-        let mut done = false;
-        stores!(mut self, s => if let Some(o) = s.iter_mut().find(|o| o.id() == id) { *o.name_mut() = name.clone(); done = true; });
-        done
     }
 
     /// Shows or hides an object.

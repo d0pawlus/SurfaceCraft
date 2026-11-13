@@ -98,10 +98,26 @@ pub fn fill_holes(mesh: &mut Mesh, max_edges: usize, smooth: bool) -> FillReport
 /// [`fill_holes`], with the keeping of sharp edges (`sharpen`, only with `smooth`) on its own
 /// switch.
 pub(crate) fn fill_holes_with(mesh: &mut Mesh, max_edges: usize, smooth: bool, sharpen: bool) -> FillReport {
+    fill_holes_filtered(mesh, max_edges, smooth, sharpen, &|_, _| true)
+}
+
+/// Fills the holes of at most `max_edges` edges whose loop (vertex indices) `accept` approves, flat
+/// (no fairing): the edge count alone says nothing about the size of a hole on a fine or coarse mesh.
+pub fn fill_holes_where(mesh: &mut Mesh, max_edges: usize, accept: &dyn Fn(&Mesh, &[u32]) -> bool) -> FillReport {
+    fill_holes_filtered(mesh, max_edges, false, false, accept)
+}
+
+fn fill_holes_filtered(
+    mesh: &mut Mesh,
+    max_edges: usize,
+    smooth: bool,
+    sharpen: bool,
+    accept: &dyn Fn(&Mesh, &[u32]) -> bool,
+) -> FillReport {
     let mut rep = FillReport::default();
     let max_edges = max_edges.clamp(3, MAX_FILL_EDGES);
     let (todo, long): (Vec<Vec<u32>>, Vec<Vec<u32>>) =
-        simple_loops(boundary_loops(mesh)).into_iter().partition(|lp| lp.len() <= max_edges);
+        simple_loops(boundary_loops(mesh)).into_iter().partition(|lp| lp.len() <= max_edges && accept(mesh, lp));
     rep.skipped = long.len();
     drop(long);
     if todo.is_empty() {
@@ -652,6 +668,19 @@ mod tests {
 
     fn in_pool<T: Send>(threads: usize, f: impl FnOnce() -> T + Send) -> T {
         rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap().install(f)
+    }
+
+    #[test]
+    fn fill_holes_where_fills_only_the_holes_the_predicate_accepts() {
+        let mut m = punched(3);
+        let loops = boundary_loops(&m);
+        assert!(loops.len() >= 2, "{}", loops.len());
+        let first = loops[0].clone();
+        let only_first = move |_: &Mesh, lp: &[u32]| lp == first.as_slice();
+        let rep = fill_holes_where(&mut m, 400, &only_first);
+        assert_eq!(rep.filled, 1);
+        assert_eq!(rep.skipped, loops.len() - 1);
+        assert_eq!(boundary_loops(&m).len(), loops.len() - 1);
     }
 
     /// A sphere with holes punched around `count` well-spread vertices.
