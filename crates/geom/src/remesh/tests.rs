@@ -268,3 +268,15 @@ fn more_columns_than_the_index_can_hold_are_refused_whatever_the_limit() {
         other => panic!("{other:?}"),
     }
 }
+
+#[test]
+fn a_few_crossing_triangles_are_a_warning_and_many_are_a_refusal() {
+    use crate::nesting::IntersectionSample as S;
+    let mut warnings = Vec::new();
+    assert!(self_intersection_note(S { tested: 3000, crossing: 0 }, &mut warnings).is_ok() && warnings.is_empty());
+    assert!(self_intersection_note(S { tested: 3000, crossing: 3 }, &mut warnings).is_ok());
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("3 of 3000"));
+    let refused = self_intersection_note(S { tested: 3000, crossing: 31 }, &mut warnings);
+    assert!(matches!(refused, Err(RemeshError::SelfIntersecting { share }) if share > 1.0));
+}

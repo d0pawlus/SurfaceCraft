@@ -9,7 +9,7 @@ const WELD_MM: f64 = 1e-6;
 /// A boundary loop of this many edges or fewer is a flap (the two free edges of a fin are not a hole):
 /// rays through it lose nothing worth a refusal. Any longer loop that is left, a missing triangle
 /// included, is refused.
-const MAX_FLAP_EDGES: usize = 2;
+pub const MAX_FLAP_EDGES: usize = 2;
 
 /// The scan prepared for the solid.
 pub(super) struct Prepared {
@@ -67,6 +67,11 @@ pub(super) fn prepare(mesh: &Mesh, p: &Params) -> Result<Prepared, RemeshError> 
         return Err(RemeshError::Open {
             loops: loops.len(),
             largest_edges: biggest.edges,
+            note: if biggest.edges == MAX_FLAP_EDGES + 1 {
+                " (three edges: a missing triangle)".into()
+            } else {
+                String::new()
+            },
             length: biggest.length,
             max_hole_edges: p.max_hole_edges,
             max_hole: p.max_hole,

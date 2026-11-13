@@ -137,7 +137,17 @@ pub(super) fn triangulate(positions: &[Point3], quads: &[[u32; 4]]) -> Vec<[u32;
 /// of vertices added.
 #[must_use]
 pub fn split_pinched_vertices(mesh: &Mesh) -> (Mesh, usize) {
+    let (out, added, _) = split_pinched_vertices_with_origin(mesh);
+    (out, added)
+}
+
+/// [`split_pinched_vertices`], also giving for every vertex of the result the vertex of `mesh` it is
+/// (a clone of a pinched vertex has the origin of the vertex it was cloned from): the relation that
+/// stays true when the positions move apart afterwards.
+#[must_use]
+pub fn split_pinched_vertices_with_origin(mesh: &Mesh) -> (Mesh, usize, Vec<u32>) {
     let n = mesh.positions.len();
+    let mut origin: Vec<u32> = (0..n as u32).collect();
     let mut incident: Vec<Vec<u32>> = vec![Vec::new(); n];
     for (ti, t) in mesh.triangles.iter().enumerate() {
         for &v in t {
@@ -154,6 +164,7 @@ pub fn split_pinched_vertices(mesh: &Mesh) -> (Mesh, usize) {
         for fan in fans.iter().skip(1) {
             let new = positions.len() as u32;
             positions.push(mesh.positions.get(v).copied().unwrap_or_else(Point3::origin));
+            origin.push(v as u32);
             added += 1;
             for &t in fan {
                 if let Some(tri) = triangles.get_mut(t as usize) {
@@ -162,7 +173,7 @@ pub fn split_pinched_vertices(mesh: &Mesh) -> (Mesh, usize) {
             }
         }
     }
-    (Mesh { positions, triangles }, added)
+    (Mesh { positions, triangles }, added, origin)
 }
 
 /// The triangles around `v` grouped into fans, in order of their lowest triangle index.
@@ -240,6 +251,41 @@ mod tests {
         let (occ, grid) = cube(8, 0, 3);
         let (positions, quads) = quads(&occ, &grid, usize::MAX).unwrap();
         assert!(!positions.is_empty() && !quads.is_empty());
+    }
+
+    /// After the clones of a pinched vertex have moved apart (smoothing, projection) their triangles may
+    /// pass through each other's: the origin tells that this is the pinch, not a crossing of the surface.
+    #[test]
+    fn clones_of_a_pinched_vertex_are_not_crossings_whatever_their_positions() {
+        let n = 12;
+        let mut cols = Vec::new();
+        for j in 2..5usize {
+            for i in 2..5usize {
+                cols.push(((j * n + i) as u32, vec![[2u32, 5u32]]));
+            }
+        }
+        for j in 5..8usize {
+            for i in 5..8usize {
+                cols.push(((j * n + i) as u32, vec![[5u32, 8u32]]));
+            }
+        }
+        cols.sort_by_key(|c| c.0);
+        let occ = Occupancy::from_columns(n, n, n as u32, cols);
+        let grid = Grid { origin: Point3::origin(), h: 1.0, nx: n, ny: n, nz: n };
+        let (mut split, added, origin) = split_pinched_vertices_with_origin(&mesh_of(&occ, &grid));
+        assert!(added > 0 && origin.len() == split.positions.len());
+        // the clones move into each other's cube
+        for v in origin.len() - added..origin.len() {
+            let from = origin[v] as usize;
+            split.positions[v] = Point3::from(
+                split.positions[from].coords + crate::Vec3::new(0.6, 0.6, 0.6) * (v as f64 % 2.0 * 2.0 - 1.0),
+            );
+        }
+        let bvh = crate::Bvh::build(&split);
+        let with = crate::nesting::sampled_self_intersections_with_origin(&split, &bvh, 10_000, &origin);
+        let without = crate::nesting::sampled_self_intersections(&split, &bvh, 10_000);
+        assert_eq!(with.crossing, 0, "the origin tells the pinch");
+        assert!(without.crossing >= with.crossing);
     }
 
     #[test]

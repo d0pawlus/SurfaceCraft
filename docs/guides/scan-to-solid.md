@@ -124,7 +124,9 @@ modelled as it is).
   `preparation[0].numbers.not_requested` counts them. After a split with every part passed, one
   `export.step` names all the solids; otherwise each next step says which part it is for.
   `scan.split` does the separation alone (`min_share` above 0 and at most 1) and reports nesting
-  (`cavity`, a hollow part's inner skin, or `inclusion`, a separate part inside another).
+  (`cavity`, a hollow part's inner skin, or `inclusion`, a separate part inside another). It lists at
+  most 64 parts; the significant pieces past that are not made into meshes but are counted in
+  `parts_beyond_limit` with their `beyond_limit_triangles` and `beyond_limit_area`.
 - **Topological noise** (`remesh`). A closed scan with many handles (genus 64 or more) or non-manifold
   edges (20 or more) is rebuilt with `mesh.remesh` before it is wrapped; a closed scan that wrapping
   does not pass on is rebuilt and wrapped again, and the result that is clearly better is kept (the
@@ -133,8 +135,8 @@ modelled as it is).
   off. A rebuild repairs topology, so it is not tried for a closed result whose only issue is
   `out_of_tolerance` (that is the patch budget) unless the scan shows some topology evidence (genus
   16 or more, or 5 or more non-manifold edges). The rebuild-and-wrap-again runs at most once per part and for at most the 4 largest parts. The
-  larger-cap retry (`allow_retry`) is made for the largest part only and only in its first attempt, so
-  at most once per call. The true worst case is 29 wraps per call: 24 parts (a part the primitives
+  larger-cap retry (`allow_retry`) is made once per call: for the first part, in area order, whose first
+  result is capped by the patch limit and short of the tolerance, and only in that part's first attempt. The true worst case is 29 wraps per call: 24 parts (a part the primitives
   could not close is wrapped as freeform once, as its one wrap), 4 rebuilds and 1 retry.
   `mesh.remesh` makes a closed, manifold, outward oriented surface at a voxel of 1.5 x tolerance
   (finer for a thin wall, coarser for a very large area): tunnels, bridges, fins, coincident second
@@ -143,7 +145,7 @@ modelled as it is).
   reports the deviation from the scan both ways (exact up to 100 000 vertices, else an even sample)
   and `removed_share`, the share of the scan farther from the result than the tolerance, which is
   what was removed (or lost), not error. It refuses an open scan (a hole wider than `max_hole`,
-  default 5 mm, or a loop of more than three edges that was not filled), a resolution beyond its
+  default 5 mm, or a loop of more than two edges that was not filled (a missing triangle is one)), a resolution beyond its
   limits (16 million grid columns, 40 million ray crossings, 6 million quads; fewer on 32-bit
   targets), and a wall the voxel cannot resolve when `voxel` is given.
 - A scan that already works is not touched: no preparation step, the same result as before. The

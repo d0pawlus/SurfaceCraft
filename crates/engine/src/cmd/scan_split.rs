@@ -210,7 +210,7 @@ pub(crate) fn split(s: &mut Session, i: SplitIn) -> CmdResult<SplitOut> {
         distinct_parts: distinct,
         parts_beyond_limit: extra.len(),
         beyond_limit_triangles: extra.iter().map(|p| p.triangles.len()).sum(),
-        beyond_limit_area: extra.iter().map(|p| p.area).sum(),
+        beyond_limit_area: extra.iter().map(|p| p.area).sum::<f64>() + 0.0,
         debris: DebrisOut { pieces: rest.len(), triangles: tris.len(), id: debris_id },
     })
 }

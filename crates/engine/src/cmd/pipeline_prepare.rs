@@ -149,7 +149,7 @@ struct Plan {
 }
 
 fn plan_of(a: &Analysis, part_share: f64, requested: Option<usize>) -> Plan {
-    let area = |k: &usize| a.parts[*k].area;
+    let area = |k: &usize| a.parts.get(*k).map_or(0.0, |p| p.area);
     let distinct = a.distinct();
     // the yardstick is the largest piece that is not the inner skin of another: a cavity skin may have
     // far more area than the shell around it and must not turn that shell into a "minor" piece
@@ -171,12 +171,13 @@ fn plan_of(a: &Analysis, part_share: f64, requested: Option<usize>) -> Plan {
 }
 
 /// What was left out, from the plan: pieces and share of the surface of the scan.
-fn account_of(a: &Analysis, plan: &Plan, ms: u64) -> Account {
+fn tally_of(a: &Analysis, plan: &Plan, ms: u64) -> Tally {
     let all_area: f64 = a.parts.iter().chain(&a.extra).chain(&a.rest).map(|p| p.area).sum::<f64>().max(1e-12);
-    let area_of = |ks: &[usize]| ks.iter().map(|k| a.parts[*k].area).sum::<f64>() / all_area;
+    let area_of =
+        |ks: &[usize]| ks.iter().filter_map(|k| a.parts.get(*k)).map(|p| p.area).sum::<f64>() / all_area + 0.0;
     let (rest_area, extra_area) =
         (a.rest.iter().map(|p| p.area).sum::<f64>() / all_area, a.extra.iter().map(|p| p.area).sum::<f64>() / all_area);
-    Account {
+    Tally {
         minor: (plan.minor.len() + a.rest.len(), area_of(&plan.minor) + rest_area),
         cavities: (plan.cavities.len(), area_of(&plan.cavities)),
         beyond_cap: (plan.beyond_cap.len() + a.extra.len(), area_of(&plan.beyond_cap) + extra_area),
@@ -212,17 +213,34 @@ pub(super) fn split_parts(
     let mut done: Vec<(ComponentOut, ToSolidOut)> = Vec::new();
     for (n, &k) in plan.chosen.iter().enumerate() {
         check_cancel(s)?;
-        let part = scan_split::add_part(s, &base, k, &a.parts[k], &mesh, total_tris);
-        let allow = i.rebuild && n < REBUILD_PARTS;
-        done.push(run_part(s, i, set, (&part.name, part.id, a.parts[k].area), n + 1, allow)?);
+        let Some(piece) = a.parts.get(k) else { continue };
+        let part = scan_split::add_part(s, &base, k, piece, &mesh, total_tris);
+        let allow = (i.rebuild && n < REBUILD_PARTS, retry_allowed(i.allow_retry, &done));
+        done.push(run_part(s, i, set, (&part.name, part.id, piece.area), n + 1, allow)?);
+        #[cfg(test)]
+        after_part_hook(n);
     }
     check_cancel(s)?;
-    let account = account_of(&a, &plan, watch.ms());
-    Ok(Some(combine(set, report.clone(), done, &account)))
+    let tally = tally_of(&a, &plan, watch.ms());
+    Ok(Some(combine(set, report.clone(), done, &tally)))
+}
+
+/// Test hook: called after each part of a split run (index from 0), so that a test can cancel at a
+/// chosen moment without relying on time.
+#[cfg(test)]
+static AFTER_PART: std::sync::Mutex<Option<Box<dyn Fn(usize) + Send>>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn after_part_hook(n: usize) {
+    if let Ok(g) = AFTER_PART.lock()
+        && let Some(f) = g.as_ref()
+    {
+        f(n);
+    }
 }
 
 /// What was left unmodelled, as `(pieces, share of the area)`.
-struct Account {
+struct Tally {
     minor: (usize, f64),
     cavities: (usize, f64),
     beyond_cap: (usize, f64),
@@ -232,6 +250,13 @@ struct Account {
     ms: u64,
 }
 
+/// The larger-cap retry is made once per call: for the first part, in area order, whose first result
+/// qualifies for it (capped by the patch limit and short of the tolerance, which is the retry's own test).
+/// The parts after it do not get it; a part that does not qualify leaves it for the next.
+pub(super) fn retry_allowed(allow: bool, done: &[(ComponentOut, ToSolidOut)]) -> bool {
+    allow && done.iter().all(|(_, o)| o.retry.is_none())
+}
+
 /// Models one part on its own (`(name, mesh, area)`); a cancelled run is an error, any other failure a failed part.
 fn run_part(
     s: &mut Session,
@@ -239,7 +264,7 @@ fn run_part(
     set: &Settings,
     part: (&str, ObjectId, f64),
     n: usize,
-    allow_rebuild: bool,
+    (allow_rebuild, allow_retry): (bool, bool),
 ) -> CmdResult<(ComponentOut, ToSolidOut)> {
     let (name, id, area) = part;
     let part_in = ToSolidIn {
@@ -248,8 +273,7 @@ fn run_part(
         name: Some(format!("{}-{n}", set.name)),
         components: None,
         rebuild: allow_rebuild,
-        // the larger-cap retry is for the largest part only: one more wrap per call at most
-        allow_retry: i.allow_retry && n == 1,
+        allow_retry,
         ..i.clone()
     };
     let triangles = s.doc.mesh(id).map_or(0, |m| m.mesh.triangle_count());
@@ -297,6 +321,23 @@ fn model_part(s: &mut Session, part_in: &ToSolidIn, set: &Settings, id: ObjectId
         Err(e) if is_cancelled(&e) => Err(e),
         Err(e) => Ok(failure(set, id, message_of(&e))),
         Ok(o) => Ok(o),
+    }
+}
+
+#[cfg(test)]
+pub(super) fn component_for_tests(out: &ToSolidOut) -> ComponentOut {
+    ComponentOut {
+        mesh: out.scan,
+        name: String::new(),
+        triangles: 0,
+        area: 0.0,
+        verdict: out.verdict,
+        method: out.method,
+        body: out.body.clone(),
+        patches: out.patches,
+        deviation: out.deviation.clone(),
+        issues: out.issues.clone(),
+        preparation: Vec::new(),
     }
 }
 
@@ -361,7 +402,7 @@ fn aggregate(parts: &[(ComponentOut, ToSolidOut)]) -> Option<DeviationSummary> {
 
 /// The issues of the parts (named by part when there are several) and of what was left unmodelled;
 /// whether the verdict must come down to `review` for them.
-fn collect_issues(parts: &[(ComponentOut, ToSolidOut)], acct: &Account) -> (Vec<Issue>, bool) {
+fn collect_issues(parts: &[(ComponentOut, ToSolidOut)], tally: &Tally) -> (Vec<Issue>, bool) {
     let mut issues: Vec<Issue> = Vec::new();
     let several = parts.len() > 1;
     for (n, (c, _)) in parts.iter().enumerate() {
@@ -373,30 +414,30 @@ fn collect_issues(parts: &[(ComponentOut, ToSolidOut)], acct: &Account) -> (Vec<
     }
     let pct = |share: f64| 100.0 * share;
     let mut cap = false;
-    if acct.minor.1 > UNMODELLED_REVIEW_SHARE {
+    if tally.minor.1 > UNMODELLED_REVIEW_SHARE {
         let msg = format!(
             "{} pieces ({} of them debris), {:.1} % of the surface of the scan, were not modelled (each is below `part_share` of the largest part); lower `part_share` to model them with the rest, or run `scan.split` and model a piece on its own with `scan.to_solid`",
-            acct.minor.0,
-            acct.debris_pieces,
-            pct(acct.minor.1)
+            tally.minor.0,
+            tally.debris_pieces,
+            pct(tally.minor.1)
         );
         issues.push(issue("unmodelled_pieces", msg));
         cap = true;
     }
-    if acct.cavities.1 > UNMODELLED_REVIEW_SHARE {
+    if tally.cavities.1 > UNMODELLED_REVIEW_SHARE {
         let msg = format!(
             "{} inner shells (cavity skins of hollow parts, {:.1} % of the surface) were not modelled: the solids are the outer shells; `scan.split` makes a mesh of each shell if a cavity has to be modelled on its own",
-            acct.cavities.0,
-            pct(acct.cavities.1)
+            tally.cavities.0,
+            pct(tally.cavities.1)
         );
         issues.push(issue("nested_shell_skipped", msg));
         cap = true;
     }
-    if acct.beyond_cap.0 > 0 {
+    if tally.beyond_cap.0 > 0 {
         let msg = format!(
             "{} more parts ({:.1} % of the surface) were not modelled: at most {MAX_COMPONENTS} are per call, the largest first; run `scan.split` and model the others on their own (`scan.to_solid` on each mesh), or raise `part_share` to leave the small ones out",
-            acct.beyond_cap.0,
-            pct(acct.beyond_cap.1)
+            tally.beyond_cap.0,
+            pct(tally.beyond_cap.1)
         );
         issues.push(issue("parts_beyond_limit", msg));
         cap = true;
@@ -450,8 +491,8 @@ fn next_steps_of(parts: &[(ComponentOut, ToSolidOut)], scan: ObjectId, left_out:
 
 /// One result for the whole scan: the worst co-equal part's verdict (at most `review` with unmodelled
 /// surface), the largest part's body, the aggregate deviation, every body in `bodies`.
-fn combine(set: &Settings, report: ScanSummary, parts: Vec<(ComponentOut, ToSolidOut)>, acct: &Account) -> ToSolidOut {
-    let (issues, capped) = collect_issues(&parts, acct);
+fn combine(set: &Settings, report: ScanSummary, parts: Vec<(ComponentOut, ToSolidOut)>, tally: &Tally) -> ToSolidOut {
+    let (issues, capped) = collect_issues(&parts, tally);
     let mut verdict = parts.iter().fold(Verdict::Pass, |v, c| worst(v, c.0.verdict));
     if capped && verdict == Verdict::Pass {
         verdict = Verdict::Review;
@@ -462,13 +503,13 @@ fn combine(set: &Settings, report: ScanSummary, parts: Vec<(ComponentOut, ToSoli
     let bodies: Vec<BodyOut> = parts.iter().filter_map(|(c, _)| c.body.clone()).collect();
     let step = PrepStep {
         step: "split".into(),
-        reason: format!("the scan holds {} co-equal parts, modelled one by one", acct.modelled),
+        reason: format!("the scan holds {} co-equal parts, modelled one by one", tally.modelled),
         numbers: json!({
-            "modelled": acct.modelled, "minor_and_debris_pieces": acct.minor.0, "minor_and_debris_area_share": acct.minor.1,
-            "debris_pieces": acct.debris_pieces, "cavity_shells": acct.cavities.0, "cavity_area_share": acct.cavities.1,
-            "beyond_limit": acct.beyond_cap.0, "beyond_limit_area_share": acct.beyond_cap.1,
-            "not_requested": acct.not_requested.0, "not_requested_area_share": acct.not_requested.1,
-            "limit": MAX_COMPONENTS, "ms": acct.ms,
+            "modelled": tally.modelled, "minor_and_debris_pieces": tally.minor.0, "minor_and_debris_area_share": tally.minor.1,
+            "debris_pieces": tally.debris_pieces, "cavity_shells": tally.cavities.0, "cavity_area_share": tally.cavities.1,
+            "beyond_limit": tally.beyond_cap.0, "beyond_limit_area_share": tally.beyond_cap.1,
+            "not_requested": tally.not_requested.0, "not_requested_area_share": tally.not_requested.1,
+            "limit": MAX_COMPONENTS, "ms": tally.ms,
         }),
     };
     let comps: Vec<ComponentOut> = parts.iter().map(|p| p.0.clone()).collect();
@@ -486,6 +527,7 @@ fn combine(set: &Settings, report: ScanSummary, parts: Vec<(ComponentOut, ToSoli
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use surfacecraft_geom::{Mesh, Point3, synth};
 
     /// `n` equal closed balls far apart.
@@ -506,7 +548,7 @@ mod tests {
         assert_eq!((capped.chosen.len(), capped.beyond_cap.len(), capped.not_requested.len()), (24, 2, 0));
         let asked = plan_of(&a, PART_SHARE, Some(1));
         assert_eq!((asked.chosen.len(), asked.beyond_cap.len(), asked.not_requested.len()), (1, 0, 25));
-        let acct = Account {
+        let tally = Tally {
             minor: (0, 0.0),
             cavities: (0, 0.0),
             beyond_cap: (0, 0.0),
@@ -515,9 +557,9 @@ mod tests {
             debris_pieces: 0,
             ms: 0,
         };
-        let (issues, capped_verdict) = collect_issues(&[], &acct);
+        let (issues, capped_verdict) = collect_issues(&[], &tally);
         assert!(issues.is_empty() && !capped_verdict, "a requested subset is no issue");
-        let over = Account { beyond_cap: (2, 0.07), ..acct };
+        let over = Tally { beyond_cap: (2, 0.07), ..tally };
         let (issues, capped_verdict) = collect_issues(&[], &over);
         assert!(
             issues.iter().any(|i| i.code == "parts_beyond_limit" && i.message.contains("2 more parts"))
@@ -575,20 +617,20 @@ mod tests {
     }
 
     #[test]
-    fn pieces_beyond_the_listed_parts_stay_in_the_account() {
+    fn pieces_beyond_the_listed_parts_stay_in_the_tally() {
         let a = scan_split::analyse(&balls(80), MIN_SHARE, false);
         assert_eq!((a.parts.len(), a.extra.len()), (scan_split::MAX_PARTS, 16));
         let plan = plan_of(&a, PART_SHARE, None);
-        let acct = account_of(&a, &plan, 0);
-        assert_eq!(acct.beyond_cap.0, 56, "40 past the cap of 24, 16 past the listed parts");
-        assert!((acct.beyond_cap.1 - 56.0 / 80.0).abs() < 1e-9, "{}", acct.beyond_cap.1);
-        let (issues, capped) = collect_issues(&[], &acct);
+        let tally = tally_of(&a, &plan, 0);
+        assert_eq!(tally.beyond_cap.0, 56, "40 past the cap of 24, 16 past the listed parts");
+        assert!((tally.beyond_cap.1 - 56.0 / 80.0).abs() < 1e-9, "{}", tally.beyond_cap.1);
+        let (issues, capped) = collect_issues(&[], &tally);
         assert!(capped && issues.iter().any(|i| i.code == "parts_beyond_limit" && i.message.contains("56 more parts")));
     }
 
     #[test]
     fn two_percent_of_unmodelled_surface_is_the_boundary_of_the_review_cap() {
-        let acct = |share: f64| Account {
+        let tally = |share: f64| Tally {
             minor: (3, share),
             cavities: (0, 0.0),
             beyond_cap: (0, 0.0),
@@ -597,11 +639,11 @@ mod tests {
             debris_pieces: 3,
             ms: 0,
         };
-        let (issues, capped) = collect_issues(&[], &acct(UNMODELLED_REVIEW_SHARE));
+        let (issues, capped) = collect_issues(&[], &tally(UNMODELLED_REVIEW_SHARE));
         assert!(issues.is_empty() && !capped, "exactly 2 % is not above 2 %");
-        let (issues, capped) = collect_issues(&[], &acct(UNMODELLED_REVIEW_SHARE + 1e-4));
+        let (issues, capped) = collect_issues(&[], &tally(UNMODELLED_REVIEW_SHARE + 1e-4));
         assert!(capped && issues[0].code == "unmodelled_pieces" && issues[0].message.contains("part_share"));
-        let (issues, capped) = collect_issues(&[], &acct(UNMODELLED_REVIEW_SHARE - 1e-4));
+        let (issues, capped) = collect_issues(&[], &tally(UNMODELLED_REVIEW_SHARE - 1e-4));
         assert!(issues.is_empty() && !capped);
     }
 
@@ -623,5 +665,49 @@ mod tests {
         assert!(needs_freeform(Method::Auto, &out));
         assert!(!needs_freeform(Method::Freeform, &out));
         assert!(!needs_freeform(Method::Primitives, &out));
+    }
+
+    /// A cancellation between two parts (set by the hook after the first part has been modelled, so no
+    /// timing is involved) is a cancelled error and leaves neither the bodies nor the meshes of the parts.
+    #[test]
+    fn a_cancel_between_parts_leaves_no_body_and_no_part_mesh() {
+        let mut s = Session::new();
+        let mut all = Mesh::default();
+        for k in 0..3 {
+            let mut m = synth::sphere(Point3::new(40.0 * f64::from(k), 0.0, 0.0), 8.0, 40, 20);
+            m.weld(1e-9);
+            all.append(&m);
+        }
+        s.doc.add_mesh("scan", all);
+        let flag = s.cancel.clone();
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = seen.clone();
+        *AFTER_PART.lock().unwrap() = Some(Box::new(move |n| {
+            count.store(n + 1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                flag.cancel();
+            }
+        }));
+        let r = s.execute("scan.to_solid", json!({"scan": "scan", "method": "freeform", "part_share": 0.5}));
+        *AFTER_PART.lock().unwrap() = None;
+        let e = r.expect_err("cancelled between parts").to_string();
+        assert!(e.contains("cancelled"), "{e}");
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1, "the second part was never started");
+        assert!(s.doc.bodies.is_empty() && s.doc.meshes.len() == 1);
+    }
+
+    /// Exactly a tenth of the largest piece is co-equal; a hair less is a minor piece.
+    #[test]
+    fn the_co_equal_boundary_is_exactly_a_tenth_of_the_largest_area() {
+        let at = |small: f64| Analysis {
+            parts: vec![piece(1000.0), piece(small)],
+            extra: Vec::new(),
+            rest: Vec::new(),
+            nests: vec![None, None],
+        };
+        let on = plan_of(&at(100.0), PART_SHARE, None);
+        assert_eq!((on.chosen.len(), on.minor.len()), (2, 0), "exactly 0.1 x the largest is co-equal");
+        let below = plan_of(&at(99.99), PART_SHARE, None);
+        assert_eq!((below.chosen.len(), below.minor.len()), (1, 1), "just below is minor");
     }
 }

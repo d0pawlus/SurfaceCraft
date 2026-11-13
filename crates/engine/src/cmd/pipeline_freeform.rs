@@ -204,6 +204,14 @@ fn out(
 /// `max_patches` (an explicit cap is a promise) or switched `allow_retry` off. One retry at most; a
 /// failed one leaves the first attempt as it is and says why in the result. `wrap_with` makes the
 /// second wrap (the command's own, or a test's).
+/// A failed retry never leaves a second body behind.
+fn remove_bodies_added_since(s: &mut Session, before: &[ObjectId]) {
+    let added: Vec<ObjectId> = s.doc.bodies.iter().map(|b| b.id).filter(|id| !before.contains(id)).collect();
+    for id in added {
+        s.doc.remove(id);
+    }
+}
+
 fn retry_larger_on(
     s: &mut Session,
     set: &Settings,
@@ -239,11 +247,7 @@ fn retry_larger_on(
     let second = match wrap_with(s, cap_to) {
         Ok(w) => w,
         Err(e) => {
-            // a failed retry never leaves a second body behind
-            let added: Vec<ObjectId> = s.doc.bodies.iter().map(|b| b.id).filter(|id| !before.contains(id)).collect();
-            for id in added {
-                s.doc.remove(id);
-            }
+            remove_bodies_added_since(s, &before);
             if crate::cmd::is_cancelled(&e) {
                 return Err(e);
             }
@@ -685,5 +689,31 @@ mod tests {
             assert!(out.is_ok());
             assert_eq!(calls, expected, "allow_retry {allow}");
         }
+    }
+
+    /// Two parts in turn, the first fine and the second capped, then a third that is capped too: the one
+    /// retry of the call goes to the second and is made once; the third makes one wrap.
+    #[test]
+    fn the_one_retry_of_a_call_goes_to_the_first_part_that_qualifies() {
+        let (mut s, set) = session();
+        let mut done: Vec<(super::super::ComponentOut, ToSolidOut)> = Vec::new();
+        let mut calls = Vec::new();
+        for capped in [false, true, true] {
+            let allow = super::super::prepare::retry_allowed(true, &done);
+            let set = Settings { allow_retry: allow, name: set.name.clone(), ..set };
+            let mut n = 0usize;
+            let out = freeform_with(&mut s, &set, empty_report(), |s, cap| {
+                n += 1;
+                let mut w = wrap_with(s, &set, Some(cap.unwrap_or(300)))?;
+                w.capped = capped;
+                w.deviation.within = if capped { 0.5 } else { 1.0 };
+                Ok(w)
+            })
+            .unwrap();
+            calls.push(n);
+            let comp = super::super::prepare::component_for_tests(&out);
+            done.push((comp, out));
+        }
+        assert_eq!(calls, vec![1, 2, 1], "wraps per part: the retry is made for the second only");
     }
 }

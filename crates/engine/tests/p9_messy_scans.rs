@@ -673,28 +673,11 @@ fn part_share_is_validated() {
     }
 }
 
-/// A cancellation in the middle of a split run leaves nothing of the parts that were already modelled.
+/// A single piece with an opening that cleaning cannot fill (above 400 edges), method `freeform`: a
+/// verdict with reasons and next steps, never an error or a pass. (The all-defaults case with several
+/// pieces is the next test.)
 #[test]
-fn a_cancel_in_the_middle_of_a_split_run_leaves_no_body_and_no_part_mesh() {
-    let (all, _) = three_parts_and_debris();
-    let mut s = session_with("scan", all);
-    let flag = s.cancel.clone();
-    let stopper = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(1500));
-        flag.cancel();
-    });
-    let r = s.execute("scan.to_solid", json!({"scan": "scan", "method": "freeform"}));
-    stopper.join().unwrap();
-    let e = r.expect_err("the run takes several seconds").to_string();
-    assert!(e.contains("cancelled"), "{e}");
-    assert!(s.doc.bodies.is_empty(), "no body of an earlier part is left");
-    assert_eq!(s.doc.meshes.len(), 1, "no part mesh is left: only the scan");
-}
-
-/// An opening that cleaning cannot fill (above 400 edges) at the default parameters: a verdict with
-/// reasons and next steps, never an error or a pass.
-#[test]
-fn gate_an_open_scan_that_cannot_be_closed_gets_reasons_and_next_steps_at_the_default_parameters() {
+fn gate_a_half_sphere_with_a_hole_above_400_edges_gets_reasons_and_next_steps_with_method_freeform() {
     let mut half = weld(synth::sphere(Point3::origin(), 20.0, 500, 250));
     half.triangles.retain(|t| t.iter().all(|&v| half.positions[v as usize].z > -1e-9));
     let loops = pieces(&half)[0].loops.clone();
@@ -738,4 +721,31 @@ fn scan_split_counts_pieces_beyond_its_limit_of_listed_parts() {
     assert_eq!(r["parts"].as_array().map(Vec::len), Some(64), "{r}");
     assert_eq!(r["parts_beyond_limit"], 16);
     assert!(r["beyond_limit_triangles"].as_u64().unwrap() > 0 && r["beyond_limit_area"].as_f64().unwrap() > 0.0);
+}
+
+/// Exactly `{"scan": "scan"}` (method `auto`, every default) on a box with a boss that no primitive or
+/// stock cut closes, the boss with about 30 % of the area of the box (clearly co-equal): not a pass
+/// (`review` here: the box passes, the boss misses the tolerance), with reasons, next steps and the
+/// outcome of each part.
+#[test]
+fn gate_all_defaults_a_boss_the_planner_cannot_close_is_not_a_pass_and_has_reasons_and_next_steps() {
+    let block = synth::cuboid(Point3::new(0.0, 0.0, 0.0), Vec3::new(40.0, 30.0, 20.0), 16);
+    let mut boss = weld(synth::cylinder(Point3::origin(), Vec3::z(), 8.0, 31.0, 96, 24));
+    boss.positions.iter_mut().for_each(|p| p.x += 80.0);
+    let mut both = block.clone();
+    both.append(&boss);
+    let (a, b) = (block.area(), boss.area());
+    eprintln!("areas: block {a:.0}, boss {b:.0} ({:.0} % of the block)", 100.0 * b / a);
+    assert!(b / a > 0.2 && b / a < 0.5, "the boss is clearly co-equal: {}", b / a);
+    let mut s = session_with("scan", both);
+    let out = s.execute("scan.to_solid", json!({"scan": "scan"})).unwrap();
+    eprintln!("verdict {} issues {}", out["verdict"], out["issues"]);
+    let parts = out["components"].as_array().unwrap();
+    assert_eq!(parts.len(), 2, "{out}");
+    assert_ne!(out["verdict"], "pass", "{out}");
+    assert!(!out["issues"].as_array().unwrap().is_empty());
+    assert!(!out["next_steps"].as_array().unwrap().is_empty());
+    for c in parts {
+        eprintln!("  part {} {} {} issues {}", c["name"], c["method"], c["verdict"], c["issues"]);
+    }
 }

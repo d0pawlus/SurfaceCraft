@@ -209,7 +209,9 @@ mod tests {
         let tree = KdTree::build(&line);
         let fit = Fit { radius: 1.0, height: 0.1, max_move: 0.5 };
         let out = project(&[Point3::new(1.0, 0.01, 0.05)], &[Vec3::z()], &tree, &fit, 0.3);
-        assert!(out[0].coords.iter().all(|x| x.is_finite()) && (out[0] - Point3::new(1.0, 0.01, 0.05)).norm() <= 0.5);
+        // the quadric is singular (every point has y = 0): the fallback is the weighted mean height of
+        // the scan points, which is 0, so the vertex lands on the line's plane and nowhere else
+        assert!((out[0] - Point3::new(1.0, 0.01, 0.0)).norm() < 1e-9, "{:?}", out[0]);
     }
 
     #[test]

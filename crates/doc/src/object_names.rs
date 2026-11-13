@@ -5,16 +5,22 @@ impl Document {
     /// A name not used by any object, built from `base`.
     #[must_use]
     pub fn unique_name(&self, base: &str) -> String {
-        let base = if base.trim().is_empty() { "object" } else { base.trim() };
-        if !self.name_taken(base) {
-            return base.to_string();
-        }
-        (2..).map(|i| format!("{base} {i}")).find(|n| !self.name_taken(n)).unwrap_or_else(|| base.to_string())
+        self.unique_name_skipping(base, None)
     }
 
-    fn name_taken(&self, n: &str) -> bool {
+    /// [`Document::unique_name`] where the object `skip` does not count: the name it holds now is free
+    /// for it (a second `solid 2` renamed to `solid` stays `solid 2`, not `solid 3`).
+    fn unique_name_skipping(&self, base: &str, skip: Option<ObjectId>) -> String {
+        let base = if base.trim().is_empty() { "object" } else { base.trim() };
+        if !self.name_taken(base, skip) {
+            return base.to_string();
+        }
+        (2..).map(|i| format!("{base} {i}")).find(|n| !self.name_taken(n, skip)).unwrap_or_else(|| base.to_string())
+    }
+
+    fn name_taken(&self, n: &str, skip: Option<ObjectId>) -> bool {
         let mut taken = false;
-        stores!(self, s => taken |= s.iter().any(|o| o.name() == n));
+        stores!(self, s => taken |= s.iter().any(|o| Some(o.id()) != skip && o.name() == n));
         // parked features and bodies are inactive but keep their names
         taken || self.rolled_back.iter().any(|f| f.name == n) || self.dormant_bodies.iter().any(|b| b.name == n)
     }
@@ -23,11 +29,11 @@ impl Document {
     /// changes nothing; another object's name gets the next free suffix.
     pub fn rename(&mut self, id: ObjectId, name: &str) -> bool {
         let (mut exists, mut own) = (false, false);
-        stores!(self, s => if let Some(o) = s.iter().find(|o| o.id() == id) { exists = true; own = o.name() == name; });
+        stores!(self, s => if let Some(o) = s.iter().find(|o| o.id() == id) { exists = true; own = o.name() == name.trim(); });
         if !exists || own {
             return exists;
         }
-        let name = self.unique_name(name);
+        let name = self.unique_name_skipping(name, Some(id));
         stores!(mut self, s => if let Some(o) = s.iter_mut().find(|o| o.id() == id) { *o.name_mut() = name.clone(); });
         true
     }
@@ -49,5 +55,10 @@ mod tests {
         assert!(d.rename(b, "solid 2"), "its own name again");
         assert_eq!(d.mesh(b).unwrap().name, "solid 2");
         assert!(!d.rename(ObjectId(999), "x"));
+        // a second run: `solid` exists, the kept body is `solid 2`; asking for `solid` keeps `solid 2`
+        assert!(d.rename(b, "solid"));
+        assert_eq!(d.mesh(b).unwrap().name, "solid 2", "not solid 3");
+        assert!(d.rename(b, " solid 2 "), "trimmed names compare equal");
+        assert_eq!(d.mesh(b).unwrap().name, "solid 2");
     }
 }

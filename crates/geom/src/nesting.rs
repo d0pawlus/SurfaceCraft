@@ -77,11 +77,6 @@ fn crosses(x: &[Point3; 3], y: &[Point3; 3]) -> bool {
     hit(x, y) || hit(y, x)
 }
 
-/// Do the triangles have a corner at the same place (vertices split apart at a pinch share a position)?
-fn shares_position(x: &[Point3; 3], y: &[Point3; 3]) -> bool {
-    x.iter().any(|p| y.contains(p))
-}
-
 /// Result of [`sampled_self_intersections`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct IntersectionSample {
@@ -95,6 +90,24 @@ pub struct IntersectionSample {
 /// `bvh`, built over the same mesh). Triangles that share a vertex are not tested against each other.
 #[must_use]
 pub fn sampled_self_intersections(mesh: &Mesh, bvh: &Bvh, max_samples: usize) -> IntersectionSample {
+    sampled(mesh, bvh, max_samples, None)
+}
+
+/// [`sampled_self_intersections`] for a mesh whose vertices were split apart at pinch points:
+/// `origin[v]` is the vertex that `v` was cloned from, and triangles that share an origin do not count
+/// as crossing (their positions may have moved apart since).
+#[must_use]
+pub fn sampled_self_intersections_with_origin(
+    mesh: &Mesh,
+    bvh: &Bvh,
+    max_samples: usize,
+    origin: &[u32],
+) -> IntersectionSample {
+    sampled(mesh, bvh, max_samples, Some(origin))
+}
+
+fn sampled(mesh: &Mesh, bvh: &Bvh, max_samples: usize, origin: Option<&[u32]>) -> IntersectionSample {
+    let root = |v: u32| origin.and_then(|o| o.get(v as usize)).copied().unwrap_or(v);
     let n = mesh.triangle_count();
     let count = max_samples.min(n);
     let mut out = IntersectionSample::default();
@@ -106,7 +119,7 @@ pub fn sampled_self_intersections(mesh: &Mesh, bvh: &Bvh, max_samples: usize) ->
         let near = bvh.candidates(&|b| overlap(b, &bx));
         let found = near.iter().any(|&o| {
             let (Some(y), Some(oi)) = (mesh.triangle(o as usize), mesh.triangles.get(o as usize)) else { return false };
-            o as usize != ti && !idx.iter().any(|v| oi.contains(v)) && !shares_position(&x, &y) && crosses(&x, &y)
+            o as usize != ti && !idx.iter().any(|v| oi.iter().any(|w| root(*v) == root(*w))) && crosses(&x, &y)
         });
         out.crossing += usize::from(found);
     }
@@ -131,24 +144,23 @@ mod tests {
     }
 
     #[test]
-    fn triangles_that_share_a_position_are_not_counted_as_crossing() {
-        let corner = Point3::new(0.0, 0.0, 0.0);
-        let base = |c: Point3| Mesh {
+    fn triangles_with_a_common_origin_are_not_counted_as_crossing() {
+        let m = Mesh {
             positions: vec![
-                corner,
+                Point3::new(0.0, 0.0, 0.0),
                 Point3::new(2.0, 0.0, 0.0),
                 Point3::new(0.0, 2.0, 0.0),
-                c,
+                Point3::new(0.0, 0.0, -0.5),
                 Point3::new(1.0, 1.0, -1.0),
                 Point3::new(1.0, 0.2, 1.0),
             ],
             triangles: vec![[0, 1, 2], [3, 4, 5]],
         };
-        let apart = base(Point3::new(0.0, 0.0, -0.5));
-        let touching = base(corner);
-        let n = |m: &Mesh| sampled_self_intersections(m, &Bvh::build(m), 10).crossing;
-        assert!(n(&apart) > 0, "the triangles cross");
-        assert_eq!(n(&touching), 0, "a shared position is a pinch, not a crossing");
+        let bvh = Bvh::build(&m);
+        assert!(sampled_self_intersections(&m, &bvh, 10).crossing > 0, "the triangles cross");
+        // vertex 3 is a clone of vertex 0: the pinch, not a crossing
+        let origin = [0u32, 1, 2, 0, 4, 5];
+        assert_eq!(sampled_self_intersections_with_origin(&m, &bvh, 10, &origin).crossing, 0);
     }
 
     #[test]

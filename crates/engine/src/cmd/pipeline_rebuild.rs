@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use surfacecraft_doc::ObjectId;
 use surfacecraft_geom::Mesh;
 use surfacecraft_geom::pieces::pieces;
+use surfacecraft_geom::remesh::MAX_FLAP_EDGES;
 
 /// A closed scan with at least this genus is rebuilt before it is wrapped: thousands of handles stall
 /// the mesh reduction, and the remesh keeps the genuine ones.
@@ -26,8 +27,6 @@ const SOFT_HANDLES: usize = 16;
 const SOFT_NON_MANIFOLD: usize = 5;
 /// The surface of a rebuilt scan has about this many quads at most: the voxel grows with the area.
 const REMESH_QUAD_BUDGET: f64 = 1_500_000.0;
-/// A boundary loop of this many edges or fewer is a flap or a sliver, not an opening.
-const MAX_FLAP_EDGES: usize = 3;
 
 /// Wall-clock time of a step; zero where the clock is not available (the browser build).
 pub(super) struct Stopwatch(#[cfg(not(target_arch = "wasm32"))] std::time::Instant);

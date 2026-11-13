@@ -102,6 +102,12 @@ impl Flat {
     pub fn bytes(&self) -> usize {
         self.cols.len() * 8 + self.runs.len() * 8
     }
+
+    /// Runs held.
+    #[must_use]
+    pub fn run_count(&self) -> usize {
+        self.runs.len()
+    }
 }
 
 impl Occupancy {
@@ -175,10 +181,17 @@ impl Occupancy {
 
     /// A new set whose column `(i, j)` is what `f` writes for it, given this set. Rows run in
     /// parallel; the result does not depend on the thread count.
-    fn transform<F>(&self, budget: usize, f: F) -> Result<Self, usize>
+    ///
+    /// `bound` is an upper bound of the runs of the result, known before anything is built (a grow
+    /// along x or y writes at most `2k + 1` times the runs it reads, along z at most as many): when it
+    /// passes `budget` nothing is built and the bound is the error, the same for any thread count.
+    fn transform<F>(&self, budget: usize, bound: usize, f: F) -> Result<Self, usize>
     where
         F: Fn(&Occupancy, usize, usize, &mut Vec<Run>) + Sync + Send,
     {
+        if bound > budget {
+            return Err(bound);
+        }
         let rows: Vec<Flat> = par::map(self.ny, |j| {
             let mut row = Flat::default();
             let mut list = Vec::new();
@@ -201,12 +214,12 @@ impl Occupancy {
 
     /// Erosion (`grow = false`) or dilation (`grow = true`) by a cube of half-size `k` along z.
     fn along_z(&self, k: u32, grow: bool, budget: usize) -> Result<Self, usize> {
-        self.transform(budget, |o, i, j, out| {
+        self.transform(budget, self.runs.len(), |o, i, j, out| {
             for r in o.column(i, j) {
                 if grow {
                     out.push([r[0].saturating_sub(k), r[1].saturating_add(k)]);
-                } else if r[1] - r[0] > 2 * k {
-                    out.push([r[0] + k, r[1] - k]);
+                } else if r[1] - r[0] > k.saturating_mul(2) {
+                    out.push([r[0].saturating_add(k), r[1] - k]);
                 }
             }
         })
@@ -214,7 +227,8 @@ impl Occupancy {
 
     /// Erosion or dilation along x (`axis = 0`) or y (`axis = 1`).
     fn along_xy(&self, k: usize, axis: usize, grow: bool, budget: usize) -> Result<Self, usize> {
-        self.transform(budget, |o, i, j, out| {
+        let bound = self.runs.len().saturating_mul(k.saturating_mul(2).saturating_add(1));
+        self.transform(budget, bound, |o, i, j, out| {
             let at = |d: isize| -> Option<(usize, usize)> {
                 let (a, b) = if axis == 0 { (i as isize + d, j as isize) } else { (i as isize, j as isize + d) };
                 (a >= 0 && b >= 0).then_some((a as usize, b as usize))
@@ -269,7 +283,8 @@ impl Occupancy {
     /// block of voxels in a checkerboard): the surface of such a set is not a manifold. Returns the
     /// new set and the number of voxels added.
     fn fill_diagonals_once(&self, budget: usize) -> Result<(Self, u64), usize> {
-        let grown = self.transform(budget, |o, i, j, out| {
+        // additions are few: the bound is the runs of the set (checked again once built)
+        let grown = self.transform(budget, self.runs.len(), |o, i, j, out| {
             out.extend_from_slice(o.column(i, j));
             let own = o.column(i, j).to_vec();
             // along z: a neighbour column's run ends where an own run starts
@@ -378,6 +393,26 @@ mod tests {
         assert!(need >= 16 * 16, "{need}");
         let r = o.close_open(1, 100);
         assert!(matches!(r, Err(n) if n > 100), "{r:?}");
+    }
+
+    #[test]
+    fn a_grow_whose_bound_passes_the_budget_is_refused_with_the_bound_before_any_row_is_built() {
+        // eight layers per column, three voxels apart: dilation by one keeps them apart
+        let cols: Vec<(u32, Vec<Run>)> = (4..20usize)
+            .flat_map(|j| {
+                (4..20usize).map(move |i| ((j * 24 + i) as u32, (0..4u32).map(|l| [4 * l + 1, 4 * l + 2]).collect()))
+            })
+            .collect();
+        let o = Occupancy::from_columns(24, 24, 24, cols);
+        let runs = o.run_count();
+        assert_eq!(runs, 16 * 16 * 4);
+        // the real result of the x-dilation has as many runs as the input (neighbours are identical and
+        // merge), so building it would pass a budget of 1.5 x; the bound is 3 x and refuses first
+        let budget = runs + runs / 2;
+        // the built result: the layers of the neighbours coincide and merge, two columns are added at the ends
+        assert_eq!(o.along_xy(1, 0, true, BIG).unwrap().run_count(), runs + 2 * 16 * 4);
+        assert_eq!(o.along_xy(1, 0, true, budget).err(), Some(3 * runs));
+        assert_eq!(o.along_z(1, true, runs - 1).err(), Some(runs));
     }
 
     #[test]

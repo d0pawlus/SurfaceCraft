@@ -121,7 +121,7 @@ pub struct ToSolidIn {
     /// `max_patches` is given).
     #[serde(default = "yes")]
     pub allow_retry: bool,
-    /// Rebuild a closed scan with many handles or non-manifold edges, or that wrapping did not pass on, with `mesh.remesh` and wrap it (again) (default true; at most one extra wrap per part and for at most the 4 largest parts; the larger-cap retry is made for the largest part only, once per call). At most 29 wraps per call in all (24 parts, 4 rebuilds, 1 retry). `false`: the scan is wrapped as it is.
+    /// Rebuild a closed scan with many handles or non-manifold edges, or that wrapping did not pass on, with `mesh.remesh` and wrap it (again) (default true; at most one extra wrap per part and for at most the 4 largest parts; the larger-cap retry is made once per call, for the first part in area order that qualifies for it). At most 29 wraps per call in all (24 parts, 4 rebuilds, 1 retry). `false`: the scan is wrapped as it is.
     #[serde(default = "yes")]
     pub rebuild: bool,
     /// A part of a scan with several pieces is co-equal, and modelled, when its area is at least this share of the largest piece's (0..1, default 0.1). Smaller pieces and debris are reported, not modelled.

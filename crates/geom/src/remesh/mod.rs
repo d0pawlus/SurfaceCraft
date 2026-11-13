@@ -36,6 +36,7 @@ use crate::{Bvh, KdTree, Mesh, Point3, edit, nesting, par, pieces};
 use grid::Grid;
 pub use grid::{MAX_AXIS, cell_product};
 pub use occupancy::Occupancy;
+pub use prepare::MAX_FLAP_EDGES;
 use prepare::prepare;
 pub use surface::split_pinched_vertices;
 
@@ -129,13 +130,15 @@ pub enum RemeshError {
     Empty,
     /// The scan has an open boundary after the small holes were filled.
     #[error(
-        "the scan is open: {loops} boundary loops remain after filling holes of up to {max_hole_edges} edges and {max_hole} mm (a loop of more than three edges is not a flap), the largest with {largest_edges} edges ({length:.1} mm long); remeshing builds a closed solid and does not close large openings"
+        "the scan is open: {loops} boundary loops remain after filling holes of up to {max_hole_edges} edges and {max_hole} mm (a loop of more than two edges is not a flap: a missing triangle is one), the largest with {largest_edges} edges{note} ({length:.1} mm long); remeshing builds a closed solid and does not close large openings"
     )]
     Open {
         /// Loops left.
         loops: usize,
         /// Edges of the largest.
         largest_edges: usize,
+        /// What the largest is, when it is a missing triangle.
+        note: String,
         /// Length of the largest (mm).
         length: f64,
         /// The hole limit used (edges).
@@ -374,11 +377,10 @@ fn deviation<'a>(points: impl Iterator<Item = &'a Point3>, bvh: &Bvh) -> (Deviat
 }
 
 /// The surface of the solid as a mesh with consistent triangles, and the facts about it.
-fn build_surface(occ: &Occupancy, grid: &Grid, limits: &Limits) -> Result<(Mesh, usize), RemeshError> {
+fn build_surface(occ: &Occupancy, grid: &Grid, limits: &Limits) -> Result<Mesh, RemeshError> {
     let (positions, quads) = surface::quads(occ, grid, limits.max_quads)?;
     let triangles = surface::triangulate(&positions, &quads);
-    let (mesh, pinches) = split_pinched_vertices(&Mesh { positions, triangles });
-    Ok((mesh, pinches))
+    Ok(Mesh { positions, triangles })
 }
 
 /// The solid of the prepared scan after closing and opening, with the grid it lives on.
@@ -415,14 +417,14 @@ fn solid_of(work: &Mesh, h: f64, k: u32, limits: &Limits) -> Result<Solid, Remes
         return Err(RemeshError::TooMuchWork { what, needed, limit: limits.max_quads, advice });
     }
     let flipped = signed_volume(work) < 0.0;
-    let (raw, stats) = raster::solid(work, &grid, flipped, limits.max_crossings)?;
+    let budget = limits.max_crossings.saturating_mul(4).min(RUN_BUDGET_MAX);
+    let (raw, stats) = raster::solid(work, &grid, flipped, limits.max_crossings, budget)?;
     if stats.columns > 0 && stats.irregular_columns as f64 > MAX_IRREGULAR_SHARE * stats.columns as f64 {
         return Err(RemeshError::Irregular { share: 100.0 * stats.irregular_columns as f64 / stats.columns as f64 });
     }
     if raw.voxel_count() == 0 {
         return Err(RemeshError::NoSolid);
     }
-    let budget = (4 * limits.max_crossings).min(RUN_BUDGET_MAX);
     let runs = |n: usize| RemeshError::TooMuchWork {
         what: "runs of the solid after dilation or erosion".into(),
         needed: n,
@@ -452,8 +454,10 @@ pub fn remesh(mesh: &Mesh, p: &Params) -> Result<(Mesh, RemeshReport), RemeshErr
     let (h, k, refined) = (res.h, res.k, res.refined);
     let wall = walls.wall;
     let solid = solid_of(&prep.work, h, k, &p.limits)?;
-    let (mut net, pinches_split) = build_surface(&solid.occ, &solid.grid, &p.limits)?;
+    let mut net = build_surface(&solid.occ, &solid.grid, &p.limits)?;
     let islands_removed = edit::remove_small_components(&mut net, p.min_component_fraction, 8);
+    // split after the islands are gone (that reindexes the vertices), so that the origin stays valid
+    let (net, pinches_split, origin) = surface::split_pinched_vertices_with_origin(&net);
     let mut report = RemeshReport {
         voxel: h,
         voxel_refined: refined,
@@ -482,7 +486,7 @@ pub fn remesh(mesh: &Mesh, p: &Params) -> Result<(Mesh, RemeshReport), RemeshErr
     let clock = Clock::start();
     let out = fit_to_scan(net, &prep.work, h, p, &mut report);
     report.fit_ms = clock.ms();
-    finish(out, &prep.work, &bvh, h, k, p.tolerance, &mut report)
+    finish(out, &origin, &prep.work, &bvh, (h, k, p.tolerance), &mut report)
 }
 
 /// Smooths and projects the surface onto the scan's vertices and triangle centroids.
@@ -502,14 +506,26 @@ fn fit_to_scan(net: Mesh, scan: &Mesh, h: f64, p: &Params, report: &mut RemeshRe
     Mesh { positions: moved, triangles: smooth.triangles }
 }
 
+/// A warning when some sampled triangles cross another one, a refusal when more than
+/// [`MAX_SELF_INTERSECTION_SHARE`] of them do.
+fn self_intersection_note(c: nesting::IntersectionSample, warnings: &mut Vec<String>) -> Result<(), RemeshError> {
+    let share = c.crossing as f64 / c.tested.max(1) as f64;
+    if share > MAX_SELF_INTERSECTION_SHARE {
+        return Err(RemeshError::SelfIntersecting { share: 100.0 * share });
+    }
+    if c.crossing > 0 {
+        warnings.push(format!("{} of {} sampled triangles of the result cross another one", c.crossing, c.tested));
+    }
+    Ok(())
+}
+
 /// Checks the result against the scan, fills in the report.
 fn finish(
     out: Mesh,
+    origin: &[u32],
     scan: &Mesh,
     scan_bvh: &Bvh,
-    h: f64,
-    k: u32,
-    tolerance: f64,
+    (h, k, tolerance): (f64, u32, f64),
     report: &mut RemeshReport,
 ) -> Result<(Mesh, RemeshReport), RemeshError> {
     let result_bvh = Bvh::build(&out);
@@ -526,18 +542,11 @@ fn finish(
         return Err(RemeshError::NotManifold("the surface has boundary or non-manifold edges".into()));
     }
     report.genus_after = ps.iter().map(pieces::Piece::genus).collect();
-    let crossing = nesting::sampled_self_intersections(&out, &result_bvh, SELF_INTERSECTION_SAMPLES);
+    let crossing =
+        nesting::sampled_self_intersections_with_origin(&out, &result_bvh, SELF_INTERSECTION_SAMPLES, origin);
     report.self_intersections = crossing.crossing;
     report.self_intersection_samples = crossing.tested;
-    let share = crossing.crossing as f64 / crossing.tested.max(1) as f64;
-    if share > MAX_SELF_INTERSECTION_SHARE {
-        return Err(RemeshError::SelfIntersecting { share: 100.0 * share });
-    }
-    if crossing.crossing > 0 {
-        let msg =
-            format!("{} of {} sampled triangles of the result cross another one", crossing.crossing, crossing.tested);
-        report.warnings.push(msg);
-    }
+    self_intersection_note(crossing, &mut report.warnings)?;
     report.triangles = out.triangle_count();
     Ok((out, report.clone()))
 }

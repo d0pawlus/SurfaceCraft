@@ -10,7 +10,7 @@
 use super::occupancy::{Flat, Occupancy, Run};
 use super::{Grid, RemeshError};
 use crate::{Mesh, Point3, par};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Sub-voxel offset of every ray inside its column (grid units): a fixed pair of irrational-looking
 /// numbers, so that rays do not run along the edges of axis-aligned meshes.
@@ -24,6 +24,8 @@ const BATCH_CHUNKS: usize = 16;
 const WORK_FACTOR: u64 = 4;
 /// Two crossings this close (voxels) are the same surface seen twice (a coincident shell).
 const COINCIDENT: f32 = 0.05;
+/// Margin (grid units) added to both ends of the exact span of a triangle on a row.
+const SPAN_MARGIN: f64 = 1e-9;
 
 /// What the scan conversion found.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -90,14 +92,32 @@ fn row_columns(g: &Grid, t: &[[f64; 3]; 3], j: usize) -> Option<(usize, usize)> 
             hi = hi.max(x);
         }
     }
-    let (first, last) = ((lo - JITTER.0).ceil().max(0.0), (hi - JITTER.0).floor().min(g.nx as f64 - 1.0));
+    // a small margin so that a sample on an edge shared by two triangles is never dropped from both
+    let (first, last) =
+        ((lo - JITTER.0 - SPAN_MARGIN).ceil().max(0.0), (hi - JITTER.0 + SPAN_MARGIN).floor().min(g.nx as f64 - 1.0));
     (first <= last).then_some((first as usize, last as usize))
 }
 
-/// Columns the rays of the rows reach under the triangle: an upper bound of its crossings.
-fn span_cells(g: &Grid, t: &[[f64; 3]; 3]) -> u64 {
-    let Some((j0, j1)) = row_range(g, t) else { return 0 };
-    (j0..=j1).filter_map(|j| row_columns(g, t, j)).fold(0u64, |acc, (i0, i1)| acc.saturating_add((i1 - i0 + 1) as u64))
+/// Is the projection of the triangle on the xy plane a real area? (`rasterise` skips the others.)
+fn has_area(t: &[[f64; 3]; 3]) -> bool {
+    let det = (t[1][0] - t[0][0]) * (t[2][1] - t[0][1]) - (t[1][1] - t[0][1]) * (t[2][0] - t[0][0]);
+    det.is_finite() && det != 0.0
+}
+
+/// Columns the rays of the rows reach under the triangle: an upper bound of its crossings. Stops, with
+/// what it has, once that alone passes `cap`; `0` for a triangle that `rasterise` skips.
+fn span_cells(g: &Grid, t: &[[f64; 3]; 3], cap: u64) -> u64 {
+    let Some((j0, j1)) = row_range(g, t).filter(|_| has_area(t)) else { return 0 };
+    let mut sum = 0u64;
+    for j in j0..=j1 {
+        if let Some((i0, i1)) = row_columns(g, t, j) {
+            sum = sum.saturating_add((i1 - i0 + 1) as u64);
+        }
+        if sum > cap {
+            break;
+        }
+    }
+    sum
 }
 
 /// Appends the crossings of the columns under triangle `t`, row by row; stops when `made` (crossings
@@ -136,17 +156,31 @@ fn triangle_of(mesh: &Mesh, g: &Grid, ti: usize) -> Option<[[f64; 3]; 3]> {
     mesh.triangle(ti).map(|[p, q, r]| [to_grid(g, &p), to_grid(g, &q), to_grid(g, &r)])
 }
 
-/// Upper bound of the crossings: the columns under the exact row spans of all triangles.
-fn crossing_bound(mesh: &Mesh, g: &Grid) -> u64 {
+/// Upper bound of the crossings: the columns under the exact row spans of all triangles. Stops as soon
+/// as the running sum passes `cap` (every chunk and every triangle looks at it) and then answers
+/// `u64::MAX`, so that a scan that is going to be refused is refused after its first few triangles;
+/// below `cap` nothing stops early and the sum is exact, the same for any thread count.
+fn crossing_bound(mesh: &Mesh, g: &Grid, cap: u64) -> u64 {
     let chunks = mesh.triangle_count().div_ceil(CHUNK);
+    let total = AtomicU64::new(0);
     par::map(chunks, |c| {
         let lo = c * CHUNK;
-        (lo..(lo + CHUNK).min(mesh.triangle_count()))
-            .filter_map(|ti| triangle_of(mesh, g, ti))
-            .fold(0u64, |acc, t| acc.saturating_add(span_cells(g, &t)))
-    })
-    .into_iter()
-    .fold(0u64, u64::saturating_add)
+        let mut local = 0u64;
+        for ti in lo..(lo + CHUNK).min(mesh.triangle_count()) {
+            if total.load(Ordering::Relaxed) > cap {
+                break;
+            }
+            if let Some(t) = triangle_of(mesh, g, ti) {
+                local = local.saturating_add(span_cells(g, &t, cap));
+                if local > cap {
+                    break;
+                }
+            }
+        }
+        total.fetch_add(local, Ordering::Relaxed);
+    });
+    let sum = total.load(Ordering::Relaxed);
+    if sum > cap { u64::MAX } else { sum }
 }
 
 /// The crossings of all triangles, sorted by column, then z, then kind. Refused before anything is
@@ -154,14 +188,15 @@ fn crossing_bound(mesh: &Mesh, g: &Grid) -> u64 {
 /// stopped within a row of the moment `limit` is passed, so memory stays bounded for any input. The
 /// refusals report the bound, which does not depend on the thread count.
 fn crossings(mesh: &Mesh, g: &Grid, flip: bool, limit: usize) -> Result<Vec<u64>, RemeshError> {
-    let bound = crossing_bound(mesh, g);
+    let cap = (limit as u64).saturating_mul(WORK_FACTOR);
+    let bound = crossing_bound(mesh, g, cap);
     let refuse = |what: &str| RemeshError::TooMuchWork {
         what: what.into(),
         needed: usize::try_from(bound).unwrap_or(usize::MAX),
         limit,
         advice: "use a larger voxel".into(),
     };
-    if bound > (limit as u64).saturating_mul(WORK_FACTOR) {
+    if bound > cap {
         return Err(refuse("ray crossings (at most, counted from the rows of the triangles, before any is made)"));
     }
     let chunks = mesh.triangle_count().div_ceil(CHUNK);
@@ -221,6 +256,7 @@ pub(super) fn solid(
     grid: &Grid,
     flip: bool,
     limit: usize,
+    run_budget: usize,
 ) -> Result<(Occupancy, RasterStats), RemeshError> {
     let sorted = crossings(mesh, grid, flip, limit)?;
     let mut stats = RasterStats { crossings: sorted.len(), ..Default::default() };
@@ -236,6 +272,11 @@ pub(super) fn solid(
         start += len;
     }
     drop(sorted);
+    if flat.run_count() > run_budget {
+        let (what, advice) =
+            ("runs of the solid after the scan conversion".to_string(), "use a larger voxel".to_string());
+        return Err(RemeshError::TooMuchWork { what, needed: flat.run_count(), limit: run_budget, advice });
+    }
     Ok((Occupancy::from_flat(grid.nx, grid.ny, grid.nz as u32, flat), stats))
 }
 
@@ -260,7 +301,7 @@ mod tests {
         let mut m = synth::sphere(Point3::origin(), 10.0, 64, 32);
         m.weld(1e-9);
         let g = grid_for(&m, 0.5);
-        let (occ, stats) = solid(&m, &g, false, 10_000_000).unwrap();
+        let (occ, stats) = solid(&m, &g, false, 10_000_000, usize::MAX).unwrap();
         let exact = 4.0 / 3.0 * std::f64::consts::PI * 1000.0;
         let volume = occ.voxel_count() as f64 * 0.125;
         assert!((volume - exact).abs() / exact < 0.02, "{volume} vs {exact}");
@@ -272,10 +313,10 @@ mod tests {
         let mut m = synth::sphere(Point3::origin(), 10.0, 64, 32);
         m.weld(1e-9);
         let g = grid_for(&m, 0.5);
-        let (reference, _) = solid(&m, &g, false, 10_000_000).unwrap();
+        let (reference, _) = solid(&m, &g, false, 10_000_000, usize::MAX).unwrap();
         let mut flipped = m.clone();
         flipped.triangles.iter_mut().for_each(|t| t.swap(1, 2));
-        let (back, _) = solid(&flipped, &g, true, 10_000_000).unwrap();
+        let (back, _) = solid(&flipped, &g, true, 10_000_000, usize::MAX).unwrap();
         assert_eq!(back.voxel_count(), reference.voxel_count());
         let mut finned = m.clone();
         let n = finned.positions.len() as u32;
@@ -285,7 +326,7 @@ mod tests {
             Point3::new(0.0, 3.0, 13.0),
         ]);
         finned.triangles.push([n, n + 1, n + 2]);
-        let (with_fin, stats) = solid(&finned, &g, false, 10_000_000).unwrap();
+        let (with_fin, stats) = solid(&finned, &g, false, 10_000_000, usize::MAX).unwrap();
         assert!(stats.irregular_columns > 0);
         let diff = with_fin.voxel_count().abs_diff(reference.voxel_count());
         assert!(diff < 40, "{diff}");
@@ -301,7 +342,7 @@ mod tests {
             m.triangles.push([base, base + 1, base + 2]);
         }
         let g = Grid::new(&m.bbox(), 0.1, 3).unwrap();
-        match solid(&m, &g, false, 1000) {
+        match solid(&m, &g, false, 1000, usize::MAX) {
             Err(RemeshError::TooMuchWork { what, needed, .. }) => {
                 assert!(what.contains("before any is made"), "{what}");
                 assert!(needed > 4000 * 1000, "{needed}");
@@ -323,13 +364,13 @@ mod tests {
             m.triangles.push([0, k + 1, k + 2]);
         }
         let g = Grid::new(&m.bbox(), 0.3, 3).unwrap();
-        assert!(crossing_bound(&m, &g) < 3_000_000, "{}", crossing_bound(&m, &g));
-        let (_, stats) = solid(&m, &g, false, 40_000_000).unwrap();
+        assert!(crossing_bound(&m, &g, u64::MAX - 1) < 3_000_000, "{}", crossing_bound(&m, &g, u64::MAX - 1));
+        let (_, stats) = solid(&m, &g, false, 40_000_000, usize::MAX).unwrap();
         assert!(stats.crossings > 400_000 && stats.crossings < 1_200_000, "{}", stats.crossings);
         let dense = synth::sphere(Point3::origin(), 150.0, 1000, 500);
         let g = Grid::new(&dense.bbox(), 0.3, 3).unwrap();
         assert!(dense.triangle_count() >= 998_000);
-        assert!(crossing_bound(&dense, &g) <= 4 * 40_000_000);
+        assert!(crossing_bound(&dense, &g, 4 * 40_000_000) <= 4 * 40_000_000);
     }
 
     #[test]
@@ -337,12 +378,12 @@ mod tests {
         let mut m = synth::sphere(Point3::origin(), 10.0, 64, 32);
         m.weld(1e-9);
         let g = grid_for(&m, 0.5);
-        let (_, stats) = solid(&m, &g, false, usize::MAX / 8).unwrap();
-        let bound = crossing_bound(&m, &g);
+        let (_, stats) = solid(&m, &g, false, usize::MAX / 8, usize::MAX).unwrap();
+        let bound = crossing_bound(&m, &g, u64::MAX - 1);
         assert!(bound >= stats.crossings as u64);
         let limit = stats.crossings - 1;
         assert!(bound <= 4 * limit as u64, "the pre-check must pass for the runtime stop to be reached");
-        match solid(&m, &g, false, limit) {
+        match solid(&m, &g, false, limit, usize::MAX) {
             Err(RemeshError::TooMuchWork { what, needed, .. }) => {
                 assert!(what.contains("stopped while they were made"), "{what}");
                 assert_eq!(needed as u64, bound);
@@ -351,10 +392,93 @@ mod tests {
         }
     }
 
+    /// Slivers that run the whole height of a very long grid: the bound pass stops after the first few
+    /// triangles (without the early exit it would walk every row of every sliver).
+    #[test]
+    fn the_bound_pass_stops_early_on_slivers_that_run_the_whole_height_of_a_long_grid() {
+        let mut m = Mesh::default();
+        for k in 0..2000u32 {
+            let base = m.positions.len() as u32;
+            let x = f64::from(k) * 0.05;
+            m.positions.extend([
+                Point3::new(x, 0.0, 0.0),
+                Point3::new(x + 0.04, 0.0, 0.0),
+                Point3::new(x, 200_000.0, 0.0),
+            ]);
+            m.triangles.push([base, base + 1, base + 2]);
+        }
+        let g = Grid::new(&m.bbox(), 0.1, 3).unwrap();
+        assert!(g.ny > 1_900_000, "{}", g.ny);
+        let started = std::time::Instant::now();
+        assert_eq!(crossing_bound(&m, &g, 4_000), u64::MAX);
+        assert!(started.elapsed().as_secs_f64() < 2.0, "{:?}", started.elapsed());
+        assert!(matches!(
+            solid(&m, &g, false, 1000, usize::MAX),
+            Err(RemeshError::TooMuchWork { needed: usize::MAX, .. })
+        ));
+    }
+
+    #[test]
+    fn zero_area_triangles_are_not_counted_in_the_bound() {
+        let mut m = Mesh::default();
+        for k in 0..2000u32 {
+            let base = m.positions.len() as u32;
+            let y = f64::from(k % 7);
+            m.positions.extend([Point3::new(0.0, y, 0.0), Point3::new(150.0, y, 0.0), Point3::new(300.0, y, 0.0)]);
+            m.triangles.push([base, base + 1, base + 2]);
+        }
+        let g = Grid::new(&m.bbox(), 0.3, 3).unwrap();
+        assert_eq!(crossing_bound(&m, &g, u64::MAX - 1), 0, "collinear triangles have no crossings");
+        let (_, stats) = solid(&m, &g, false, 10, usize::MAX).unwrap();
+        assert_eq!(stats.crossings, 0);
+    }
+
+    /// Every sample that the edge functions put inside a triangle lies in the span of its row, for random
+    /// triangles with horizontal edges, a vertex on a row and clipping at the edge of the grid.
+    #[test]
+    fn the_row_span_holds_every_sample_the_box_loop_would_have_tested() {
+        let g = Grid { origin: Point3::origin(), h: 1.0, nx: 40, ny: 40, nz: 10 };
+        let mut rng = crate::Rng::new(11);
+        let mut checked = 0;
+        for k in 0..4000 {
+            let mut v = |_: usize| [rng.range(-5.0, 45.0), rng.range(-5.0, 45.0), rng.range(0.0, 9.0)];
+            let mut t = [v(0), v(1), v(2)];
+            match k % 4 {
+                1 => t[1][1] = t[0][1],
+                2 => t[2][1] = (t[2][1] - JITTER.1).round() + JITTER.1,
+                3 => t[0] = [t[0][0].round(), t[0][1].round(), t[0][2]],
+                _ => {}
+            }
+            let xy = |p: &[f64; 3]| (p[0], p[1]);
+            let (a, b, c) = (xy(&t[0]), xy(&t[1]), xy(&t[2]));
+            let det = (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
+            if det == 0.0 {
+                continue;
+            }
+            for j in 0..g.ny {
+                for i in 0..g.nx {
+                    let p = (i as f64 + JITTER.0, j as f64 + JITTER.1);
+                    let (e0, e1, e2) = (edge(a, b, p), edge(b, c, p), edge(c, a, p));
+                    let inside =
+                        if det > 0.0 { e0 > 0.0 && e1 > 0.0 && e2 > 0.0 } else { e0 < 0.0 && e1 < 0.0 && e2 < 0.0 };
+                    if inside {
+                        let span = row_columns(&g, &t, j);
+                        assert!(
+                            span.is_some_and(|(i0, i1)| i0 <= i && i <= i1),
+                            "triangle {t:?} sample ({i}, {j}) span {span:?}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 10_000, "{checked}");
+    }
+
     #[test]
     fn the_crossing_limit_refuses() {
         let m = synth::sphere(Point3::origin(), 10.0, 64, 32);
         let g = grid_for(&m, 0.5);
-        assert!(matches!(solid(&m, &g, false, 100), Err(RemeshError::TooMuchWork { .. })));
+        assert!(matches!(solid(&m, &g, false, 100, usize::MAX), Err(RemeshError::TooMuchWork { .. })));
     }
 }
