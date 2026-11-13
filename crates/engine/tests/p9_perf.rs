@@ -303,11 +303,24 @@ fn fnv(values: impl IntoIterator<Item = f64>) -> u64 {
     values.into_iter().fold(0xcbf2_9ce4_8422_2325, |h, v| (h ^ v.to_bits()).wrapping_mul(0x0000_0100_0000_01b3))
 }
 
-/// Sorted hashes of the surface of every face, of the curve of every edge and of every vertex, and
-/// the number of edges used once, twice and more often.
-fn signature(r: &surfacecraft_kernel::record::brep::Brep) -> (Vec<u64>, Vec<u64>, Vec<u64>, [usize; 3]) {
-    use surfacecraft_kernel::record::brep::{Curve, Surface};
-    let mut faces: Vec<u64> = r
+/// What an import is, orientation included: sorted hashes of the surface of every face, of the
+/// curve of every edge and of every vertex; the number of edges used once, twice and more often;
+/// the sorted (face, edge, direction) incidences, where the direction joins the sense of the face
+/// and the direction of the loop edge; the sorted face senses; the number of loops.
+#[derive(Debug, PartialEq)]
+struct Signature {
+    faces: Vec<u64>,
+    edges: Vec<u64>,
+    vertices: Vec<u64>,
+    uses: [usize; 3],
+    incidences: Vec<(u64, u64, bool)>,
+    senses: Vec<(u64, bool)>,
+    loops: usize,
+}
+
+fn signature(r: &surfacecraft_kernel::record::brep::Brep) -> Signature {
+    use surfacecraft_kernel::record::brep::{Curve, Loop, Shell, Surface};
+    let face_hash: Vec<u64> = r
         .faces
         .iter()
         .map(|f| match &f.surface {
@@ -315,7 +328,7 @@ fn signature(r: &surfacecraft_kernel::record::brep::Brep) -> (Vec<u64>, Vec<u64>
             _ => 0,
         })
         .collect();
-    let mut edges: Vec<u64> = r
+    let edge_hash: Vec<u64> = r
         .edges
         .iter()
         .map(|e| match &e.curve {
@@ -323,15 +336,36 @@ fn signature(r: &surfacecraft_kernel::record::brep::Brep) -> (Vec<u64>, Vec<u64>
             _ => 0,
         })
         .collect();
-    let mut vertices: Vec<u64> = r.vertices.iter().map(|v| fnv(v.point)).collect();
+    let (mut incidences, mut senses, mut loops) = (Vec::new(), Vec::new(), 0);
+    for shell in &r.shells {
+        let Shell::Faces { faces, .. } = shell else { continue };
+        for of in faces {
+            let fh = face_hash.get(of.face as usize).copied().unwrap_or(0);
+            senses.push((fh, of.forward));
+            for lp in r.faces.get(of.face as usize).map(|f| f.loops.as_slice()).unwrap_or_default() {
+                loops += 1;
+                if let Loop::Edges { edges } = lp {
+                    for oe in edges {
+                        let eh = edge_hash.get(oe.edge as usize).copied().unwrap_or(0);
+                        incidences.push((fh, eh, oe.forward == of.forward));
+                    }
+                }
+            }
+        }
+    }
     let mut uses = [0usize; 3];
     for e in &r.edges {
         uses[e.uses.len().clamp(1, 3) - 1] += 1;
     }
+    let mut faces = face_hash;
+    let mut edges = edge_hash;
+    let mut vertices: Vec<u64> = r.vertices.iter().map(|v| fnv(v.point)).collect();
     faces.sort_unstable();
     edges.sort_unstable();
     vertices.sort_unstable();
-    (faces, edges, vertices, uses)
+    incidences.sort_unstable();
+    senses.sort_unstable();
+    Signature { faces, edges, vertices, uses, incidences, senses, loops }
 }
 
 #[test]
@@ -353,4 +387,103 @@ fn an_own_open_sheet_imports_as_the_stitched_import_does() {
     // the same entities, in the order of the file instead of the stitcher's: the multisets of the
     // face, edge and vertex geometry (bit for bit) and of how many faces use an edge
     assert_eq!(signature(a), signature(b));
+}
+
+/// Writes the STEP text of an open sheet of about `SURFACECRAFT_PERF_PATCHES` patches to
+/// `SURFACECRAFT_PERF_DUMP` (for measuring the importer's memory in its own process).
+#[test]
+#[ignore = "writes a file"]
+fn dump_sheet_step() {
+    let n: usize = std::env::var("SURFACECRAFT_PERF_PATCHES").ok().and_then(|v| v.parse().ok()).unwrap_or(16_000);
+    let (data, _) = sheet_step(n);
+    std::fs::write(std::env::var("SURFACECRAFT_PERF_DUMP").unwrap(), decode(&data)).unwrap();
+}
+
+/// Edges both of whose uses run the same way: a sheet that is not consistently oriented.
+fn same_direction_edges(sig: &Signature) -> usize {
+    let mut by_edge: std::collections::BTreeMap<u64, Vec<bool>> = Default::default();
+    for (_, e, d) in &sig.incidences {
+        by_edge.entry(*e).or_default().push(*d);
+    }
+    by_edge.values().filter(|d| d.len() == 2 && d[0] == d[1]).count()
+}
+
+/// The own sheet's text with one change; the change must hit (the text differs).
+fn mutated(text: &str, from: &str, to: &str) -> Vec<u8> {
+    assert!(text.contains(from), "nothing to change: {from}");
+    text.replacen(from, to, 1).into_bytes()
+}
+
+/// A file the fast path may try (the mark, 300 faces or more) with a defect: the answer must be
+/// `Ok` or `Err` without a panic, and the same sheet as the stitched import gives (or an error
+/// from both).
+fn assert_agrees_with_stitched(file: &[u8], what: &str) {
+    let fast = surfacecraft_kernel::step::import(file);
+    let slow = surfacecraft_kernel::step::import_stitched(file);
+    match (fast, slow) {
+        (Ok(a), Ok(b)) => {
+            assert_eq!(a.len(), b.len(), "{what}");
+            for (x, y) in a.iter().zip(&b) {
+                assert_eq!(x.faces.len(), y.faces.len(), "{what}: face count");
+                assert_eq!(x.edges.len(), y.edges.len(), "{what}: edge count");
+                let (sx, sy) = (signature(x), signature(y));
+                assert_eq!(sx.uses, sy.uses, "{what}: edge-use histogram");
+                assert_eq!(same_direction_edges(&sx), same_direction_edges(&sy), "{what}: orientation of shared edges");
+                assert_eq!(sx, sy, "{what}: the sheet");
+            }
+        }
+        (Err(_), Err(_)) => {}
+        (a, b) => panic!("{what}: fast {:?}, stitched {:?}", a.map(|v| v.len()), b.map(|v| v.len())),
+    }
+}
+
+#[test]
+fn defective_own_sheets_of_300_faces_import_as_the_stitched_import_does() {
+    let (data, faces) = sheet_step(400);
+    assert!(faces >= 300);
+    let text = String::from_utf8(decode(&data)).unwrap();
+    // a face of reversed sense
+    let face_line = text.lines().find(|l| l.contains("ADVANCED_FACE(")).unwrap().to_string();
+    assert_agrees_with_stitched(
+        &mutated(&text, &face_line, &face_line.replace(".T.);", ".F.);")),
+        "face of reversed sense",
+    );
+    // a face without its loop
+    let bound = face_line.split("(#").nth(1).and_then(|r| r.split(')').next()).unwrap().to_string();
+    assert_agrees_with_stitched(
+        &mutated(&text, &face_line, &face_line.replace(&format!("(#{bound})"), "()")),
+        "face without a loop",
+    );
+    // an edge used by three faces: the first loop edge points at the edge of the second one
+    let oriented: Vec<&str> = text.lines().filter(|l| l.contains("ORIENTED_EDGE(")).collect();
+    let edge_of = |l: &str| l.split(",*,*,").nth(1).and_then(|r| r.split(',').next()).unwrap().to_string();
+    let (e0, e1) = (edge_of(oriented[0]), edge_of(oriented[7]));
+    assert_ne!(e0, e1);
+    assert_agrees_with_stitched(
+        &mutated(&text, oriented[0], &oriented[0].replace(&format!(",*,*,{e0},"), &format!(",*,*,{e1},"))),
+        "edge of three faces",
+    );
+    // a dangling vertex reference
+    let curve = text.lines().find(|l| l.contains("EDGE_CURVE(")).unwrap().to_string();
+    let v = curve.split(',').nth(1).unwrap().to_string();
+    assert_agrees_with_stitched(&mutated(&text, &curve, &curve.replacen(&v, "#99999999", 1)), "dangling vertex");
+    // the mark in the description of a file that names another writer
+    let foreign = text.replacen("'SurfaceCraft','SurfaceCraft'", "'Other','Other'", 1).replacen(
+        "FILE_DESCRIPTION((''),",
+        "FILE_DESCRIPTION(('SurfaceCraft','SurfaceCraft'),",
+        1,
+    );
+    assert!(foreign.contains("FILE_DESCRIPTION(('SurfaceCraft','SurfaceCraft')"));
+    assert_agrees_with_stitched(foreign.as_bytes(), "mark in a description");
+}
+
+#[test]
+fn a_marked_file_over_the_entity_limit_is_refused_not_parsed() {
+    let (data, _) = sheet_step(400);
+    let mut text = String::from_utf8(decode(&data)).unwrap();
+    // pad the data section with 4.1 million tiny entities
+    let at = text.find("ENDSEC;\nEND-ISO").unwrap();
+    let pad: String = (1_000_000..5_100_000).map(|i| format!("#{i}=B();\n")).collect();
+    text.insert_str(at, &pad);
+    assert!(surfacecraft_kernel::step::import(text.as_bytes()).is_err());
 }

@@ -165,7 +165,8 @@ pub struct SurfaceHit {
     pub distance: f64,
 }
 
-/// Triangle BVH. Holds a copy of the triangle corners so it outlives edits to the mesh.
+/// Triangle BVH. [`Bvh::build`] holds a copy of the triangle corners so it outlives edits to the
+/// mesh; [`Bvh::build_owned`] takes the mesh itself and keeps its vertex and index lists.
 #[derive(Clone, Debug, Default)]
 pub struct Bvh {
     tris: Store,

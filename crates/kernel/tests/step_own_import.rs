@@ -28,3 +28,13 @@ fn a_header_alone_and_a_truncated_header_do_not_panic() {
         let _ = step::import(HEADER.as_bytes().get(..n).unwrap_or_default());
     }
 }
+
+/// Reads the file named by `SURFACECRAFT_PERF_DUMP` and imports it (run under `/usr/bin/time -l`).
+#[test]
+#[ignore = "measurement"]
+fn import_dumped_file() {
+    let bytes = std::fs::read(std::env::var("SURFACECRAFT_PERF_DUMP").unwrap()).unwrap();
+    let t = std::time::Instant::now();
+    let r = step::import(&bytes).unwrap();
+    eprintln!("IMPORT {} bytes, {} faces, {:.1} s", bytes.len(), r[0].faces.len(), t.elapsed().as_secs_f64());
+}
