@@ -16,7 +16,7 @@ use crate::{Mesh, Point3, Vec3};
 use nalgebra::Matrix3;
 use std::collections::HashMap;
 
-pub use crate::decimate::{DecimateOptions, decimate};
+pub use crate::decimate::{DecimateOptions, DecimateReport, decimate, decimate_with_report};
 pub(crate) use crate::decimate::{Guard, decimate_guarded};
 #[cfg(test)]
 pub(crate) use crate::holes::fill_holes_with;

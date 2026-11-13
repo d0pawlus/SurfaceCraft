@@ -2,7 +2,7 @@
 //! feature-edge constraint planes, link-condition and normal-flip checks, optionally guarded by
 //! a measured deviation from the original surface. The collapse loop is in [`crate::collapse`];
 //! with a guard a large mesh is first reduced in independent parts (see [`crate::partition`]).
-use crate::collapse::{Collapser, Quadric, plane_quadric};
+use crate::collapse::{Collapser, Quadric, plane_quadric, vertex_origins};
 use crate::edit::compact;
 use crate::{Bvh, Mesh, Point3, Vec3, tri};
 use std::collections::HashMap;
@@ -28,6 +28,22 @@ impl Default for DecimateOptions {
 
 /// Quadric edge-collapse decimation; returns the number of triangles removed.
 pub fn decimate(mesh: &mut Mesh, opts: &DecimateOptions) -> usize {
+    decimate_guarded(mesh, opts, None).removed
+}
+
+/// What a decimation did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DecimateReport {
+    /// Triangles removed.
+    pub removed: usize,
+    /// Collapses refused because they would have turned a triangle against the surface it came
+    /// from (attempts; an edge tried again counts again). A reduction that stops above its target
+    /// because of them is what keeps thin walls and sharp ridges from being folded over.
+    pub turns_refused: usize,
+}
+
+/// [`decimate`] with a report of what stood in the way of the target.
+pub fn decimate_with_report(mesh: &mut Mesh, opts: &DecimateOptions) -> DecimateReport {
     decimate_guarded(mesh, opts, None)
 }
 
@@ -47,32 +63,39 @@ pub(crate) struct Guard<'a> {
 const PARTS_FROM_TRIANGLES: usize = 100_000;
 
 /// [`decimate`] with an optional measured [`Guard`]; without one it is [`decimate`].
-pub(crate) fn decimate_guarded(mesh: &mut Mesh, opts: &DecimateOptions, mut guard: Option<Guard<'_>>) -> usize {
+pub(crate) fn decimate_guarded(
+    mesh: &mut Mesh,
+    opts: &DecimateOptions,
+    mut guard: Option<Guard<'_>>,
+) -> DecimateReport {
     if guard.as_ref().is_some_and(|g| g.budget.len() != mesh.positions.len()) {
-        return 0;
+        return DecimateReport::default();
     }
     if mesh.validate().is_err() || mesh.triangles.len() <= opts.target_triangles.max(4) {
-        return 0;
+        return DecimateReport::default();
     }
     let before = mesh.triangles.len();
     let mut tris = std::mem::take(&mut mesh.triangles);
     let mut pos = std::mem::take(&mut mesh.positions);
     let (mut q, mut locked) = setup(&tris, &pos, opts);
+    let mut origin = vertex_origins(&tris, &pos);
+    let mut refused = 0;
     let max_cost = opts.max_error.filter(|e| e.is_finite() && *e > 0.0).map(|e| e * e);
     if let Some(g) = guard.as_mut()
         && tris.len() >= PARTS_FROM_TRIANGLES
     {
-        let whole = crate::partition::Whole { tris, pos, q, locked };
+        let whole = crate::partition::Whole { tris, pos, q, origin, locked, refused: 0 };
         let done = crate::partition::reduce_in_parts(whole, g, opts, max_cost);
-        (tris, pos, q, locked) = (done.tris, done.pos, done.q, done.locked);
+        (tris, pos, q, origin, locked, refused) = (done.tris, done.pos, done.q, done.origin, done.locked, done.refused);
     }
-    let mut c = Collapser::new(tris, pos, q, locked, guard, true);
+    let mut c = Collapser::new(tris, pos, q, origin, locked, guard, true);
     c.run(opts.target_triangles, max_cost);
-    let (tris, pos, _) = c.finish();
+    refused += c.turns_refused();
+    let (tris, pos, ..) = c.finish();
     mesh.positions = pos;
     mesh.triangles = tris;
     compact(mesh);
-    before - mesh.triangles.len()
+    DecimateReport { removed: before - mesh.triangles.len(), turns_refused: refused }
 }
 
 /// The vertex quadrics (face planes, plus constraint planes along boundary and feature edges) and
@@ -123,4 +146,127 @@ fn setup(tris: &[[u32; 3]], pos: &[Point3], opts: &DecimateOptions) -> (Vec<Quad
         }
     }
     (q, locked)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Rng, synth};
+
+    const SEEDS: u64 = 20;
+    /// A guarded reduction may stop above its target, but not by more than this factor.
+    const MAX_OVERSHOOT: usize = 2;
+
+    /// What a collapse loop left of a mesh.
+    struct Run {
+        /// Triangles left.
+        reached: usize,
+        /// Of those, how many face away from the original orientation of their corners.
+        turned: usize,
+        /// Collapses refused for turning a triangle against the surface.
+        refused: usize,
+    }
+
+    /// Collapses `m` with the loop down to `target` triangles (and within `max_error`, if given).
+    fn collapse(m: &Mesh, target: usize, max_error: Option<f64>, guard: bool) -> Run {
+        let opts = DecimateOptions { target_triangles: target, feature_angle_deg: 181.0, ..DecimateOptions::default() };
+        let (q, locked) = setup(&m.triangles, &m.positions, &opts);
+        let origin = vertex_origins(&m.triangles, &m.positions);
+        let mut c = Collapser::new(m.triangles.clone(), m.positions.clone(), q, origin, locked, None, true);
+        c.orient_guard = guard;
+        c.run(target, max_error.map(|e| e * e));
+        let refused = c.turns_refused();
+        let (tris, pos, _, origin) = c.finish();
+        let turned = tris
+            .iter()
+            .filter(|t| {
+                let n = tri::cross(&pos[t[0] as usize], &pos[t[1] as usize], &pos[t[2] as usize]);
+                let r: Vec3 = t.iter().map(|&v| origin[v as usize]).sum();
+                n.dot(&r) <= 0.0
+            })
+            .count();
+        Run { reached: tris.len(), turned, refused }
+    }
+
+    /// A noisy plate, much thinner than it is wide: two faces 1 mm apart.
+    fn plate(seed: u64, noise: f64) -> Mesh {
+        let mut m = synth::rounded_cuboid(Point3::origin(), Vec3::new(40.0, 40.0, 1.0), 0.4, 30);
+        synth::add_noise(&mut m, noise, &mut Rng::new(seed));
+        m
+    }
+
+    #[test]
+    fn a_reduction_never_returns_a_triangle_turned_against_the_surface() {
+        for target in [4, 12, 60] {
+            let turned: usize = (1..=SEEDS).map(|seed| collapse(&plate(seed, 0.05), target, None, true).turned).sum();
+            assert_eq!(turned, 0, "{SEEDS} seeds reduced to {target} triangles");
+        }
+    }
+
+    /// The guard must not be a way of refusing everything: the plate still gets (nearly) down to its
+    /// target. Measured: the target exactly at 12 and 60 triangles for all 20 seeds, and at most 12
+    /// triangles when asked for 4.
+    #[test]
+    fn the_guard_still_lets_the_reduction_reach_its_target() {
+        for target in [12, 60] {
+            for seed in 1..=SEEDS {
+                let run = collapse(&plate(seed, 0.05), target, None, true);
+                assert!(
+                    run.reached <= MAX_OVERSHOOT * target,
+                    "seed {seed}: {} triangles for a target of {target}",
+                    run.reached
+                );
+            }
+        }
+    }
+
+    /// The test above is only worth something if the guard does refuse collapses, and the plain
+    /// reductions do turn triangles without it.
+    #[test]
+    fn without_the_guard_the_same_reductions_do_turn_triangles_and_with_it_collapses_are_refused() {
+        let (mut turned, mut refused_with, mut refused_without) = (0, 0, 0);
+        for target in [4, 12, 60] {
+            for seed in 1..=SEEDS {
+                let m = plate(seed, 0.05);
+                let off = collapse(&m, target, None, false);
+                turned += off.turned;
+                refused_without += off.refused;
+                refused_with += collapse(&m, target, None, true).refused;
+            }
+        }
+        assert!(turned > 0, "the plates never needed the guard");
+        assert!(refused_with > 0, "the guard never refused a collapse");
+        assert_eq!(refused_without, 0);
+    }
+
+    /// The price of the guard on thin and sharp shapes: triangles left for the same error budget,
+    /// guarded against unguarded. Measured over the seeds and printed; asserted within a factor.
+    fn cost_of_the_guard(shape: impl Fn(u64) -> Mesh, max_error: f64) -> f64 {
+        let (mut with, mut without) = (0, 0);
+        for seed in 1..=SEEDS {
+            let m = shape(seed);
+            with += collapse(&m, 0, Some(max_error), true).reached;
+            without += collapse(&m, 0, Some(max_error), false).reached;
+        }
+        let factor = with as f64 / without as f64;
+        eprintln!("guarded {with} against unguarded {without} triangles over {SEEDS} seeds: factor {factor:.2}");
+        factor
+    }
+
+    #[test]
+    fn on_a_thin_closed_plate_the_guard_costs_less_than_a_factor_of_two_in_triangles() {
+        let factor = cost_of_the_guard(|seed| plate(seed, 0.03), 0.3);
+        assert!(factor <= MAX_OVERSHOOT as f64, "factor {factor}");
+    }
+
+    #[test]
+    fn on_a_sharp_ridge_the_guard_costs_less_than_a_factor_of_two_in_triangles() {
+        let ridge = |seed: u64| {
+            let mut m = synth::cuboid(Point3::origin(), Vec3::new(40.0, 30.0, 20.0), 20);
+            synth::add_noise(&mut m, 0.03, &mut Rng::new(seed));
+            m
+        };
+        let factor = cost_of_the_guard(ridge, 0.3);
+        assert!(factor <= MAX_OVERSHOOT as f64, "factor {factor}");
+    }
 }

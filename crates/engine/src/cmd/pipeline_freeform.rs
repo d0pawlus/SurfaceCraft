@@ -2,11 +2,11 @@
 //! (`surface.wrap`) and measured against the scan, for parts no set of primitives describes.
 use super::{
     DeviationSummary, MAX_FILL_EDGES, MIN_COVERAGE, Method, NextStep, ScanSummary, Settings, ToSolidOut, Verdict,
-    issue, message_of, step, summary,
+    coverage_issue, issue, message_of, step, summary,
 };
 use crate::Session;
 use crate::cmd::qa::{CompareIn, compare};
-use crate::cmd::wrap::{PATCH_LIMIT, WrapIn, WrapOut, wrap};
+use crate::cmd::wrap::{PATCH_LIMIT, WrapIn, WrapOut, robust_diagonal, scale_warning, wrap};
 use crate::cmd::{CmdResult, ObjRef};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -49,14 +49,7 @@ fn issues_of(w: &WrapOut, d: &DeviationSummary, set: &Settings, report: &ScanSum
         let msg = "the patch network is not closed (the scan has open boundaries): the result is a sheet, not a solid";
         list.push(issue("open_surface", msg.to_string()));
     }
-    if d.coverage < MIN_COVERAGE {
-        let msg = format!(
-            "only {:.1} % of the scan points lie on the patches (at least {:.0} % expected)",
-            100.0 * d.coverage,
-            100.0 * MIN_COVERAGE
-        );
-        list.push(issue("low_coverage", msg));
-    }
+    list.extend(coverage_issue(d, "the patches"));
     if d.count > 0 && d.within < set.min_within {
         let msg = format!(
             "{:.2} % of the measured points are within {} mm ({:.0} % required); max {:.3} mm, RMS {:.3} mm; {} patches{}",
@@ -220,7 +213,11 @@ pub(super) fn freeform_solid(s: &mut Session, set: &Settings, report: ScanSummar
     )?;
     let vertices = s.doc.mesh(set.scan).map_or(0, |m| m.mesh.vertex_count());
     let d = summary(&cmp, vertices);
-    let issues = issues_of(&w, &d, set, &report);
+    let mut issues = issues_of(&w, &d, set, &report);
+    let diagonal = s.doc.mesh(set.scan).map_or(f64::NAN, |m| robust_diagonal(&m.mesh));
+    if let Some(msg) = scale_warning(set.tolerance, diagonal) {
+        issues.insert(0, issue("tolerance_exceeds_part", msg));
+    }
     let next = next_steps(&w, &issues, set);
     let verdict = if issues.is_empty() {
         Verdict::Pass

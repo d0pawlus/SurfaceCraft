@@ -222,6 +222,52 @@ fn advice(round: &Round, tolerance: f64) -> String {
     format!("{:.1} % of the scan is within {tolerance} mm (p99 {:.3} mm); {why}", 100.0 * d.within, d.p99)
 }
 
+/// The tolerance is a larger share of the part than this: the reduction has nothing to hold on to.
+pub(crate) const MAX_TOLERANCE_SHARE: f64 = 0.05;
+
+/// Share of the vertices left out at each end of an axis when the size of the part is measured, so
+/// that stray points do not make it larger.
+const EXTENT_TRIM: f64 = 0.01;
+
+/// The size of the part: the diagonal of the box that holds all but [`EXTENT_TRIM`] of the
+/// vertices at each end of every axis (debris and spikes do not count). 0 for an empty mesh.
+pub(crate) fn robust_diagonal(mesh: &surfacecraft_geom::Mesh) -> f64 {
+    let n = mesh.positions.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let cut = ((n as f64 * EXTENT_TRIM) as usize).min((n - 1) / 2);
+    let span = |axis: usize| -> f64 {
+        let mut v: Vec<f64> = mesh.positions.iter().map(|p| p[axis]).filter(|x| x.is_finite()).collect();
+        if v.len() < 2 {
+            return 0.0;
+        }
+        let (lo, hi) = (cut.min(v.len() - 1), v.len() - 1 - cut.min(v.len() - 1));
+        let low = *v.select_nth_unstable_by(lo, f64::total_cmp).1;
+        let high = *v.select_nth_unstable_by(hi, f64::total_cmp).1;
+        high - low
+    };
+    (span(0).powi(2) + span(1).powi(2) + span(2).powi(2)).sqrt()
+}
+
+/// Advice when the tolerance is not small against the part (a scan in metres, a tolerance in mm).
+/// Nothing for a part with no size.
+pub(crate) fn scale_warning(tolerance: f64, diagonal: f64) -> Option<String> {
+    (diagonal.is_finite() && diagonal > 0.0 && tolerance > MAX_TOLERANCE_SHARE * diagonal).then(|| {
+        format!(
+            "the tolerance {tolerance} is {:.0} % of the size of the part (diagonal {diagonal:.4}): check the units of the scan; the coarse mesh is reduced within a budget of several tolerances, so a part this small is not resolved",
+            100.0 * tolerance / diagonal
+        )
+    })
+}
+
+/// Advice when a closed network has no positive volume: its faces are not consistently oriented.
+fn orientation_warning(closed: bool, volume: Option<f64>) -> Option<String> {
+    (closed && !volume.is_some_and(|v| v.is_finite() && v > 0.0)).then(|| {
+        "the network is closed but the body has no positive volume: its faces are not consistently oriented".into()
+    })
+}
+
 pub(crate) fn wrap(s: &mut Session, i: WrapIn) -> CmdResult<WrapOut> {
     let id = i.mesh.resolve(s, ObjectKind::Mesh)?;
     let set = settings(&i)?;
@@ -240,9 +286,18 @@ pub(crate) fn wrap(s: &mut Session, i: WrapIn) -> CmdResult<WrapOut> {
     let jump_mean = (jumps.iter().sum::<f64>() / jumps.len().max(1) as f64).to_degrees();
     let (smooth, sharp) = jump_stats(&round.set, &round.creases);
     let body = s.doc.add_body(i.name.as_deref().unwrap_or("wrap"), sheet);
+    let body_info = body_out(s, body)?;
+    let warnings: Vec<String> = [
+        (round.deviation.within < set.min_within).then(|| advice(&round, set.tolerance)),
+        scale_warning(set.tolerance, robust_diagonal(&scan)),
+        orientation_warning(closed, body_info.volume),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     let within_tolerance = round.deviation.within >= set.min_within;
     Ok(WrapOut {
-        body: body_out(s, body)?,
+        body: body_info,
         closed,
         patches: round.set.nets.len(),
         coarse_triangles: round.coarse_triangles,
@@ -263,7 +318,7 @@ pub(crate) fn wrap(s: &mut Session, i: WrapIn) -> CmdResult<WrapOut> {
         g0_patches: round.g0_patches,
         smooth_jump: smooth.into(),
         crease_angle_mean_deg: (sharp.count > 0).then_some(sharp.mean_deg),
-        warning: (!within_tolerance).then(|| advice(&round, set.tolerance)),
+        warning: (!warnings.is_empty()).then(|| warnings.join("; ")),
     })
 }
 
@@ -278,3 +333,30 @@ pub static COMMANDS: &[CommandSpec] = &[command!(
     WrapOut,
     wrap
 )];
+
+#[cfg(test)]
+mod scale_tests {
+    use super::*;
+    use surfacecraft_geom::{Mesh, Point3, synth};
+
+    #[test]
+    fn a_stray_point_does_not_hide_a_tolerance_that_is_too_large() {
+        // a ball of radius 0.01 (a scan in metres) and one speck of debris 5 units away
+        let mut ball = synth::sphere(Point3::origin(), 0.01, 40, 20);
+        let clean = robust_diagonal(&ball);
+        ball.positions.push(Point3::new(5.0, 5.0, 5.0));
+        let with_speck = robust_diagonal(&ball);
+        assert!((with_speck - clean).abs() < 0.1 * clean, "{clean} vs {with_speck}");
+        assert!(scale_warning(0.2, with_speck).is_some());
+        assert!(scale_warning(0.2, 100.0).is_none());
+    }
+
+    #[test]
+    fn a_part_with_no_size_gets_no_warning_and_no_infinite_share() {
+        let point = Mesh { positions: vec![Point3::origin(); 3], triangles: vec![[0, 1, 2]] };
+        assert_eq!(robust_diagonal(&point), 0.0);
+        assert!(scale_warning(0.2, 0.0).is_none());
+        assert_eq!(robust_diagonal(&Mesh::default()), 0.0);
+        assert!(scale_warning(0.2, f64::NAN).is_none());
+    }
+}
