@@ -147,6 +147,23 @@ fn snapping_leaves_degenerate_extents_alone() {
 }
 
 #[test]
+fn snapping_never_gives_a_negative_zero_so_duplicates_on_zero_are_dropped() {
+    // a coordinate a hair below zero and one a hair above land on the same lattice point; with a
+    // negative zero the total order of the duplicate sort would part them and the duplicate stay
+    let pts = vec![
+        Point3::new(-1e-12, 1.0, 0.0),
+        Point3::new(-1e-12, 5.0, 0.0),
+        Point3::new(1e-12, 1.0, 0.0),
+        Point3::new(10.0, 10.0, 10.0),
+    ];
+    let snapped = snap::snapped(&pts);
+    let negative_zero = |v: f64| v == 0.0 && v.is_sign_negative();
+    assert!(!snapped.iter().any(|p| negative_zero(p.x) || negative_zero(p.y) || negative_zero(p.z)), "{snapped:?}");
+    let (kept, _) = normals::dedupe(&PointCloud { positions: pts, normals: None });
+    assert_eq!(kept.len(), 3, "{kept:?}");
+}
+
+#[test]
 fn pseudo_angle_orders_like_the_angle() {
     let mut last = f64::NEG_INFINITY;
     for step in -199..=200 {

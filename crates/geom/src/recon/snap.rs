@@ -15,6 +15,10 @@
 //! coordinate, around 2^-22 for a conversion through a decimal factor and back, larger for clouds
 //! far from the origin). That is the best a rounding can do: exact equality of two clouds that
 //! differ in their bits cannot be promised in general.
+//!
+//! The reconstructed mesh takes the rounded positions as its vertices: a vertex lies at most half a
+//! lattice step (about 5e-10 of the extent, at most 2^-21 mm) from the point that was read, and
+//! points closer than a step are one point.
 
 use super::*;
 
@@ -59,7 +63,15 @@ pub(super) fn snapped(pts: &[Point3]) -> Vec<Point3> {
     let inv = 1.0 / step; // a power of two: exact
     let round = |v: f64| {
         let r = (v * inv).round() * step;
-        if r.is_finite() { r } else { v }
+        // a coordinate just below zero rounds to -0.0: the duplicate sort orders -0.0 before 0.0,
+        // so the two zeros must be one value
+        if !r.is_finite() {
+            v
+        } else if r == 0.0 {
+            0.0
+        } else {
+            r
+        }
     };
     pts.iter().map(|p| Point3::new(round(p.x), round(p.y), round(p.z))).collect()
 }
