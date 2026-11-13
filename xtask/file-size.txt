@@ -1,12 +1,5 @@
 # Rust files over 800 lines that cannot be split in this change (other open pull requests are changing them).
 # Each line is `<path> <lines>` with the file's current line count. This list only shrinks:
 # a listed file may not grow, and a listed file that is 800 lines or fewer must be removed.
-crates/ui-egui/src/forms.rs 1383
 crates/engine/src/cmd/primitive.rs 1045
-crates/ui-egui/src/viewtools.rs 1008
-crates/ui-egui/tests/sketch_editor.rs 952
-crates/ui-egui/src/viewport.rs 942
-crates/ui-egui/src/sketch_editor/mod.rs 919
-crates/io/src/mesh.rs 917
 crates/doc/src/object.rs 809
-crates/engine/src/cmd/quad/unstructured.rs 824
