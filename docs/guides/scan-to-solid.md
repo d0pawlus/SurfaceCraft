@@ -1,12 +1,16 @@
 # Scan to solid in one call
 
 `scan.to_solid` takes a raw scan to a closed solid and measures the solid against the scan. It
-has two methods and chooses between them itself (`method: auto`):
+has three methods and chooses between them itself (`method: auto`):
 
 - `primitives`: planes, cylinders, cones, spheres and tori fitted to regions; for machined and
   prismatic parts. A few analytic faces, exact dimensions.
 - `freeform`: a watertight network of bicubic patches over the whole scan; for castings, body
   panels and organic shapes. Thousands of small faces that follow the scan.
+- `hybrid`: one closed body in which the regions a primitive fits are exact analytic faces (plane,
+  cylinder, cone, sphere, torus) and the rest of the scan is a network of patches; for parts that
+  are partly machined and partly organic. The result reports `analytic` (faces on analytic
+  surfaces, all faces, and their share of the surface area).
 
 Use the step-by-step guides when you need a feature history.
 
@@ -28,12 +32,19 @@ returned: pass, then review, then fail; at the same verdict the larger share of 
 within the tolerance, then a closed solid over a sheet. `attempts` lists what was tried (method,
 verdict, issue codes, seconds, `returned`); the attempt that lost leaves nothing in the document and
 one `edit.undo` takes the whole run back. A winner that is no pass carries `other_method_tried`.
+When the primitives cover at least a quarter of the scan (the same share as for the primitives
+attempt after a freeform one), `auto` also tries the hybrid method as a further attempt, after a
+freeform pass as well (not after a passing primitives solid, which is analytic all over). The hybrid
+body is returned when it is not worse: the verdict and the share of the scan within the tolerance
+(shares within 0.5 percentage points are equal) decide first, then a closed solid over a sheet,
+and only at a tie the larger share of the area on analytic faces; a hybrid body that explains the
+scan less well is listed in `attempts` and not returned.
 Pass `method` to choose yourself (one attempt), or `retry: false` to forbid the second one. It is
 skipped on its own, by counts and never by a clock, when the cleaned mesh of the call (or of the
 part) has more than 600 000 triangles or the first result has 30 000 patches or more: `attempts`
 then holds an entry with `skipped.reason` and `skipped.call`, the call that runs that method. A
-second method that is freeform is also an extra attempt of the call's budget (see "Extra attempts
-of one call"); the primitives method makes no wrap and costs none.
+second method that is freeform, and the hybrid attempt, are also extra attempts of the call's
+budget (see "Extra attempts of one call"); the primitives method makes no wrap and costs none.
 
 The scan noise (`scan_report.noise_used`, `noise_source`, `noise_spread`) is what the segmentation
 judges fits by. When it is above the tolerance, nothing is merged into freeform regions and a
@@ -53,6 +64,24 @@ Freeform (`surface.wrap` inside):
 - Patches meet in position (`continuity: g0`, what `scan.to_solid` uses). Tangent patches
   (`surface.wrap` with `continuity: g1`) are experimental: on 13 real scans they reached the
   tolerance on 7 where `g0` did on 9, and needed 56 % more patches and 2 to 3 times the time.
+
+Hybrid (trim a stock; `surface.wrap`, `mesh.remesh` and the kernel inside):
+
+- Fits a primitive to every region that qualifies, as the primitives method does, and plans them as
+  `body.from_regions` does: which are global cuts (planes, full revolutions), which local tools
+  (blind holes, pockets, slots), which additions (bosses, domes), which fillets.
+- Makes a copy of the scan whose primitive regions lie a little (0.4 of the tolerance) beyond their
+  primitive on the side the cut removes, or short of it for an addition; rebuilds that copy as a
+  clean closed surface (`mesh.remesh`, voxel 0.75 of the tolerance) and wraps it in patches. This
+  is the stock. At most 4000 patches (`max_patches` can only lower that): the kernel's booleans on
+  a network are slow and fragile beyond it.
+- The kernel trims the stock with the primitives (`hybrid::cut_stock`): the faces on the primitives
+  are exactly the primitives, bounded by their intersections with the patches; the rest stays
+  patches. A cut the kernel refuses, a partial cylinder, cone, sphere or torus (a fillet needs the
+  sharp edge of two planes, which a network of patches has not) and anything else that is not
+  applied stays patches at most 0.4 of the tolerance from the scan; `modelled[].skipped` says why.
+- Needs a scan that is closed after cleaning (the rebuild refuses an open one). It is judged
+  against the scan by the same rules as the freeform method.
 
 Primitives:
 
@@ -154,6 +183,15 @@ kernel refuses sheets of many faces. Give the wall thickness instead:
 - `noise_above_tolerance`: the scan is rougher than the tolerance; use the tolerance of the first
   next step (about 3 times the noise) or a smoother scan.
 - `other_method_tried`: `auto` ran the other method as well and it did not do better; see `attempts`.
+- Hybrid method, no body (verdict `fail`; `auto` then returns the other result, and the document is
+  as it was before the attempt): `hybrid_no_primitives` (no region could be modelled as a
+  primitive; use `freeform`), `hybrid_not_closed` (the scan cannot be rebuilt as a closed surface:
+  an open scan or one with a thin wall; fill the holes with `mesh.fill_holes`, or use `freeform`),
+  `hybrid_stock_failed` (the wrap over the rebuilt scan failed), `hybrid_stock_open` (the patch
+  network is not closed), `hybrid_cut_failed` (the kernel could not apply any primitive to the
+  stock, or the result was not one closed solid), `hybrid_no_analytic_faces` (no face of the body
+  is on a primitive: nothing is gained over `freeform`), `hybrid_failed` (anything else, with the
+  reason). `thickness` has no meaning with `method: hybrid`.
 - `mostly_freeform` (only with `method: primitives`): less than half of the scan lies in regions
   a primitive fits. Run again with `method: freeform`.
 - `open_surface` (freeform): the network is a sheet because the scan has open boundaries. The

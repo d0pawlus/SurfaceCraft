@@ -74,11 +74,13 @@ fn methods_of(out: &Value) -> Vec<(String, String)> {
 }
 
 /// The share rule picks the primitives (the sides are 70 % of the block), the planner cannot close
-/// a solid over the wavy top and ends in `fail`; `auto` then runs the freeform wrap too and returns
-/// it, with both attempts listed. The primitives attempt leaves nothing behind; one undo removes
-/// the whole run.
+/// a solid over the wavy top and ends in `fail`; `auto` then runs the freeform wrap too, and, as the
+/// primitives cover enough of the scan, the hybrid method (the planes of the block as exact faces, the
+/// wavy top as patches). All three attempts are listed; the hybrid body is returned: it explains the
+/// scan as well as the wrap and has analytic faces. The attempts that lost leave nothing behind; one
+/// undo removes the whole run.
 #[test]
-fn auto_falls_back_to_the_freeform_wrap_when_the_primitives_do_not_close() {
+fn auto_falls_back_to_the_freeform_wrap_and_hybrid_when_the_primitives_do_not_close() {
     let mut s = block_with_wavy_top(21);
     let before = (s.doc.meshes.len(), s.doc.meshes[0].mesh.triangle_count());
 
@@ -86,22 +88,41 @@ fn auto_falls_back_to_the_freeform_wrap_when_the_primitives_do_not_close() {
 
     eprintln!("verdict {} method {} attempts {}", out["verdict"], out["method"], out["attempts"]);
     assert!(["pass", "review"].contains(&out["verdict"].as_str().unwrap()), "{out}");
-    assert_eq!(out["method"], "freeform", "{out}");
+    assert_eq!(out["method"], "hybrid", "{out}");
+    let verdict = out["verdict"].as_str().unwrap().to_string();
+    let wrap_verdict = out["attempts"][1]["verdict"].as_str().unwrap().to_string();
     assert_eq!(
         methods_of(&out),
         vec![
             ("primitives".to_string(), "fail".to_string()),
-            ("freeform".to_string(), out["verdict"].as_str().unwrap().to_string())
+            ("freeform".to_string(), wrap_verdict),
+            ("hybrid".to_string(), verdict)
         ]
     );
     let returned: Vec<bool> = out["attempts"].as_array().unwrap().iter().map(|a| a["returned"] == true).collect();
-    assert_eq!(returned, vec![false, true]);
+    assert_eq!(returned, vec![false, false, true]);
+    assert!(out["analytic"]["faces"].as_u64().unwrap() >= 5, "the block's planes are analytic faces: {out}");
     assert!(!out["attempts"][0]["issues"].as_array().unwrap().is_empty() && out["attempts"][0]["seconds"].is_number());
-    assert!(s.doc.primitives.is_empty(), "the losing attempt left primitives behind");
+    assert!(!s.doc.primitives.is_empty(), "the hybrid body keeps its primitives");
     assert_eq!(s.doc.bodies.len(), 1, "exactly the returned solid");
     s.execute("edit.undo", Value::Null).unwrap();
     assert!(s.doc.bodies.is_empty() && s.doc.primitives.is_empty() && s.doc.regions.is_empty());
     assert_eq!((s.doc.meshes.len(), s.doc.meshes[0].mesh.triangle_count()), before);
+}
+
+/// With `retry: false` the same scan is the primitives attempt alone: no second method, no hybrid.
+#[test]
+fn retry_false_stops_auto_after_the_first_attempt_whatever_the_primitives_cover() {
+    let mut s = block_with_wavy_top(21);
+    let out = s.execute("scan.to_solid", json!({"scan": "scan", "retry": false})).unwrap();
+    let attempts = out["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 3, "the primitives attempt, and the two that were skipped: {attempts:?}");
+    assert!(attempts[0]["verdict"].is_string());
+    for skipped in &attempts[1..] {
+        assert!(skipped["skipped"]["reason"].as_str().unwrap().contains("`retry` is false"), "{skipped}");
+    }
+    let methods: Vec<&str> = attempts.iter().map(|a| a["method"].as_str().unwrap()).collect();
+    assert_eq!(methods, ["primitives", "freeform", "hybrid"]);
 }
 
 /// With `method: primitives` the same scan is judged as before: one attempt, a fail.

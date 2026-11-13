@@ -12,7 +12,6 @@
 //! offset from the scan. Anything else that goes wrong ends the attempt with an issue code and no
 //! body; the document is as it was.
 use super::freeform::{self, NetworkFacts, issues_for, verdict_of, wrap_mesh};
-use super::rebuild::remesh_scan;
 use super::regions::{candidates, fit_regions};
 use super::{
     DeviationSummary, Issue, LeftOut, MAX_LISTED_FACES, MAX_LISTED_LEFT_OUT, Method, Modelled, NextStep, ScanSummary,
@@ -21,12 +20,13 @@ use super::{
 };
 use crate::Session;
 use crate::cmd::hybrid::{FaceOf, collect_items, item_faces, snap_axes, square_deg};
+use crate::cmd::mesh_remesh::{RemeshIn, remesh_cmd};
 use crate::cmd::plan::{self, Item, RoleKind};
 use crate::cmd::qa::{CompareIn, compare};
 use crate::cmd::{CmdError, ObjRef, cancelled, is_cancelled};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use surfacecraft_doc::ObjectId;
@@ -43,6 +43,12 @@ use snap::{SnapRegion, primitive_of, snapped};
 /// to clear the fit error of the stock; a cut the kernel refuses leaves the region this far from the
 /// scan, which stays inside the tolerance.
 const OFFSET_SHARE_OF_TOLERANCE: f64 = 0.4;
+/// The voxel of the rebuild, as a share of the tolerance (the default of `mesh.remesh` is 1.5): finer,
+/// because the hybrid body is judged against the scan like a plain wrap, and a coarse voxel rounds
+/// the sharp edges the patches next to the primitives follow.
+const REMESH_VOXEL_SHARE: f64 = 0.75;
+/// The surface of the rebuilt scan has about this many quads at most: the voxel grows with the area.
+const REMESH_QUAD_BUDGET: f64 = 1_500_000.0;
 /// The most patches the stock may have. The kernel's booleans on a network are slow and fragile as
 /// it grows (measured: a few seconds at 400 patches, 15 s at 2 000, refusals above); a network that
 /// would be larger is not cut.
@@ -153,6 +159,30 @@ struct Stock {
     capped: bool,
 }
 
+/// Rebuilds the prepared scan as a clean closed surface (`mesh.remesh`); a scan the remesh refuses
+/// ends the attempt.
+fn remesh_prepared(s: &mut Session, set: &Settings, prepared: ObjectId) -> Step<ObjectId> {
+    let area = s.doc.mesh(prepared).map_or(0.0, |m| m.mesh.area());
+    let voxel = (REMESH_VOXEL_SHARE * set.tolerance).max((area / REMESH_QUAD_BUDGET).sqrt());
+    let input = RemeshIn {
+        object: ObjRef::Id(prepared.0),
+        tolerance: Some(set.tolerance),
+        voxel: Some(voxel),
+        min_feature: None,
+        max_hole: None,
+        min_component_fraction: None,
+        name: Some(format!("{}-remesh", set.name)),
+    };
+    match remesh_cmd(s, input) {
+        Ok(r) => Ok(r.id),
+        Err(e) if is_cancelled(&e) => Err(Halt::Cancelled(e)),
+        Err(e) => Err(halt(
+            "hybrid_not_closed",
+            format!("the scan cannot be rebuilt as a closed surface: {}", message_of(&e)),
+        )),
+    }
+}
+
 /// Prepares the scan, rebuilds it as a clean surface and wraps it. The two meshes made on the way
 /// are removed again.
 fn make_stock(s: &mut Session, set: &Settings, planned: &Planned) -> Step<Stock> {
@@ -160,15 +190,7 @@ fn make_stock(s: &mut Session, set: &Settings, planned: &Planned) -> Step<Stock>
     let delta = OFFSET_SHARE_OF_TOLERANCE * set.tolerance;
     let prepared = snapped(&scan, &snap_regions(s, planned), delta);
     let prepared_id = s.doc.add_mesh(&format!("{}-prepared", set.name), prepared);
-    let on_prepared = Settings { scan: prepared_id, name: set.name.clone(), budget: set.budget.clone(), ..*set };
-    let reason = "the hybrid stock is wrapped over a rebuilt, denoised copy of the scan";
-    let remeshed = match remesh_scan(s, &on_prepared, reason, Value::Null).map_err(failed_at("hybrid_failed"))? {
-        Ok((id, _)) => id,
-        Err(refused) => {
-            let why = refused.numbers.get("refused").and_then(Value::as_str).unwrap_or("refused").to_string();
-            return Err(halt("hybrid_not_closed", format!("the scan cannot be rebuilt as a closed surface: {why}")));
-        }
-    };
+    let remeshed = remesh_prepared(s, set, prepared_id)?;
     check_cancel(s)?;
     let cap = set.max_patches.unwrap_or(STOCK_MAX_PATCHES).min(STOCK_MAX_PATCHES);
     let wrapped = wrap_mesh(s, set, remeshed, Some(cap)).map_err(failed_at("hybrid_stock_failed"));
