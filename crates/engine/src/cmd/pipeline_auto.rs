@@ -721,4 +721,18 @@ mod tests {
             assert!(tolerance <= 3.0 * sigma && tolerance > 3.0 * sigma - 0.001, "{tolerance} for {sigma}");
         }
     }
+
+    /// Extra attempts already run inside the call (the freeform fit's retry) use up the budget the
+    /// second method draws from: with two drawn there is no third, and the skip says so.
+    #[test]
+    fn a_spent_call_budget_skips_the_second_method() {
+        let p = plan(0.9);
+        assert!(p.budget.draw() && p.budget.draw(), "two extra attempts drawn by others");
+        let (_, report, called) =
+            run_fake(&p, outcomes(result(Verdict::Fail, SOLID, 1.0, 0.5), result(Verdict::Pass, SOLID, 1.0, 1.0)));
+        let report = report.expect("a report");
+        assert_eq!(called, ["primitives"]);
+        let skipped = report.attempts[1].skipped.as_ref().expect("a skipped entry");
+        assert!(skipped.reason.contains("extra attempts"), "{}", skipped.reason);
+    }
 }
