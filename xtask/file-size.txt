@@ -9,5 +9,5 @@ crates/ui-egui/src/viewport.rs 942
 crates/ui-egui/src/sketch_editor/mod.rs 919
 crates/io/src/mesh.rs 917
 crates/engine/src/cmd/region.rs 867
-crates/doc/src/object.rs 858
+crates/doc/src/object.rs 834
 crates/engine/src/cmd/quad/unstructured.rs 824

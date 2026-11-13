@@ -142,6 +142,9 @@ impl RemeshOut {
 }
 
 pub(crate) fn remesh_cmd(s: &mut Session, i: RemeshIn) -> CmdResult<RemeshOut> {
+    if s.cancel.is_cancelled() {
+        return Err(super::cancelled());
+    }
     let id = i.object.resolve(s, ObjectKind::Mesh)?;
     let scan = s.doc.mesh(id).map(|m| m.mesh.clone()).ok_or_else(|| CmdError::Params(format!("no mesh {id}")))?;
     let d = Params::default();
@@ -154,6 +157,9 @@ pub(crate) fn remesh_cmd(s: &mut Session, i: RemeshIn) -> CmdResult<RemeshOut> {
         ..d
     };
     let (mesh, report) = remesh::remesh(&scan, &params)?;
+    if s.cancel.is_cancelled() {
+        return Err(super::cancelled());
+    }
     let new = s.doc.add_mesh(i.name.as_deref().unwrap_or("remesh"), mesh);
     Ok(RemeshOut::new(new, report))
 }

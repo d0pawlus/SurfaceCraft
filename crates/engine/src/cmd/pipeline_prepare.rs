@@ -150,16 +150,41 @@ struct Plan {
 
 fn plan_of(a: &Analysis, part_share: f64, requested: Option<usize>) -> Plan {
     let area = |k: &usize| a.parts[*k].area;
-    let largest = a.parts.iter().map(|p| p.area).fold(0.0, f64::max);
     let distinct = a.distinct();
+    // the yardstick is the largest piece that is not the inner skin of another: a cavity skin may have
+    // far more area than the shell around it and must not turn that shell into a "minor" piece
+    let largest = distinct.iter().map(area).fold(0.0, f64::max);
     let cavities: Vec<usize> = (0..a.parts.len()).filter(|k| !distinct.contains(k)).collect();
     let (mut equal, minor): (Vec<usize>, Vec<usize>) =
-        distinct.into_iter().partition(|k| area(k) >= part_share * largest);
+        distinct.iter().copied().partition(|k| area(k) >= part_share * largest);
     equal.sort_by(|x, y| area(y).total_cmp(&area(x)).then(x.cmp(y)));
+    if equal.is_empty() {
+        // never a result without a body: fall back to the largest outer piece (or the largest piece)
+        let pool = if distinct.is_empty() { (0..a.parts.len()).collect() } else { distinct };
+        equal.extend(pool.into_iter().max_by(|x, y| area(x).total_cmp(&area(y))));
+    }
     let take = requested.unwrap_or(MAX_COMPONENTS).min(MAX_COMPONENTS);
     let rest = equal.split_off(take.min(equal.len()));
     let (not_requested, beyond_cap) = if requested.is_some() { (rest, Vec::new()) } else { (Vec::new(), rest) };
+    let minor = minor.into_iter().filter(|k| !equal.contains(k)).collect();
     Plan { chosen: equal, not_requested, beyond_cap, minor, cavities }
+}
+
+/// What was left out, from the plan: pieces and share of the surface of the scan.
+fn account_of(a: &Analysis, plan: &Plan, ms: u64) -> Account {
+    let all_area: f64 = a.parts.iter().chain(&a.extra).chain(&a.rest).map(|p| p.area).sum::<f64>().max(1e-12);
+    let area_of = |ks: &[usize]| ks.iter().map(|k| a.parts[*k].area).sum::<f64>() / all_area;
+    let (rest_area, extra_area) =
+        (a.rest.iter().map(|p| p.area).sum::<f64>() / all_area, a.extra.iter().map(|p| p.area).sum::<f64>() / all_area);
+    Account {
+        minor: (plan.minor.len() + a.rest.len(), area_of(&plan.minor) + rest_area),
+        cavities: (plan.cavities.len(), area_of(&plan.cavities)),
+        beyond_cap: (plan.beyond_cap.len() + a.extra.len(), area_of(&plan.beyond_cap) + extra_area),
+        not_requested: (plan.not_requested.len(), area_of(&plan.not_requested)),
+        modelled: plan.chosen.len(),
+        debris_pieces: a.rest.len(),
+        ms,
+    }
 }
 
 /// Splits a scan with several parts and models each co-equal one. `None` for a scan with one piece
@@ -191,18 +216,8 @@ pub(super) fn split_parts(
         let allow = i.rebuild && n < REBUILD_PARTS;
         done.push(run_part(s, i, set, (&part.name, part.id, a.parts[k].area), n + 1, allow)?);
     }
-    let all_area: f64 = a.parts.iter().chain(&a.rest).map(|p| p.area).sum();
-    let area_of = |ks: &[usize]| ks.iter().map(|k| a.parts[*k].area).sum::<f64>() / all_area.max(1e-12);
-    let rest_area = a.rest.iter().map(|p| p.area).sum::<f64>() / all_area.max(1e-12);
-    let account = Account {
-        minor: (plan.minor.len() + a.rest.len(), area_of(&plan.minor) + rest_area),
-        cavities: (plan.cavities.len(), area_of(&plan.cavities)),
-        beyond_cap: (plan.beyond_cap.len(), area_of(&plan.beyond_cap)),
-        not_requested: (plan.not_requested.len(), area_of(&plan.not_requested)),
-        modelled: plan.chosen.len(),
-        debris_pieces: a.rest.len(),
-        ms: watch.ms(),
-    };
+    check_cancel(s)?;
+    let account = account_of(&a, &plan, watch.ms());
     Ok(Some(combine(set, report.clone(), done, &account)))
 }
 
@@ -233,11 +248,13 @@ fn run_part(
         name: Some(format!("{}-{n}", set.name)),
         components: None,
         rebuild: allow_rebuild,
+        // the larger-cap retry is for the largest part only: one more wrap per call at most
+        allow_retry: i.allow_retry && n == 1,
         ..i.clone()
     };
     let triangles = s.doc.mesh(id).map_or(0, |m| m.mesh.triangle_count());
     let mut out = model_part(s, &part_in, set, id)?;
-    if i.method == Method::Auto && out.verdict == Verdict::Fail && out.body.is_none() {
+    if needs_freeform(i.method, &out) {
         // the primitives found no closed solid in this part: model it as freeform instead
         let watch = Stopwatch::start();
         let again = model_part(s, &ToSolidIn { method: Method::Freeform, ..part_in.clone() }, set, id)?;
@@ -265,6 +282,11 @@ fn run_part(
         preparation: out.prep.preparation.clone(),
     };
     Ok((comp, out))
+}
+
+/// Did the primitives (not a freeform wrap) leave this part without a solid?
+fn needs_freeform(method: Method, out: &ToSolidOut) -> bool {
+    method == Method::Auto && out.verdict == Verdict::Fail && out.body.is_none() && out.method != Method::Freeform
 }
 
 /// One run of the single-scan pipeline on a part; an error other than a cancellation becomes a failed result.
@@ -353,7 +375,7 @@ fn collect_issues(parts: &[(ComponentOut, ToSolidOut)], acct: &Account) -> (Vec<
     let mut cap = false;
     if acct.minor.1 > UNMODELLED_REVIEW_SHARE {
         let msg = format!(
-            "{} pieces ({} of them debris), {:.1} % of the surface of the scan, were not modelled (each is below the share of the largest part that counts as a part)",
+            "{} pieces ({} of them debris), {:.1} % of the surface of the scan, were not modelled (each is below `part_share` of the largest part); lower `part_share` to model them with the rest, or run `scan.split` and model a piece on its own with `scan.to_solid`",
             acct.minor.0,
             acct.debris_pieces,
             pct(acct.minor.1)
@@ -363,7 +385,7 @@ fn collect_issues(parts: &[(ComponentOut, ToSolidOut)], acct: &Account) -> (Vec<
     }
     if acct.cavities.1 > UNMODELLED_REVIEW_SHARE {
         let msg = format!(
-            "{} inner shells (cavity skins of hollow parts, {:.1} % of the surface) were not modelled: the solids are the outer shells",
+            "{} inner shells (cavity skins of hollow parts, {:.1} % of the surface) were not modelled: the solids are the outer shells; `scan.split` makes a mesh of each shell if a cavity has to be modelled on its own",
             acct.cavities.0,
             pct(acct.cavities.1)
         );
@@ -372,7 +394,7 @@ fn collect_issues(parts: &[(ComponentOut, ToSolidOut)], acct: &Account) -> (Vec<
     }
     if acct.beyond_cap.0 > 0 {
         let msg = format!(
-            "{} more parts ({:.1} % of the surface) were not modelled: at most {MAX_COMPONENTS} are, the largest first; run `scan.split` and model them by hand",
+            "{} more parts ({:.1} % of the surface) were not modelled: at most {MAX_COMPONENTS} are per call, the largest first; run `scan.split` and model the others on their own (`scan.to_solid` on each mesh), or raise `part_share` to leave the small ones out",
             acct.beyond_cap.0,
             pct(acct.beyond_cap.1)
         );
@@ -382,20 +404,46 @@ fn collect_issues(parts: &[(ComponentOut, ToSolidOut)], acct: &Account) -> (Vec<
     (issues, cap)
 }
 
-/// The next steps of a split result: when every part passed, one export of all the solids; else the
-/// steps of each part, each labelled with its part.
-fn next_steps_of(parts: &[(ComponentOut, ToSolidOut)]) -> Vec<NextStep> {
-    if parts.iter().all(|(c, _)| c.verdict == Verdict::Pass) {
-        let ids: Vec<u64> = parts.iter().filter_map(|(c, _)| c.body.as_ref().map(|b| b.id.0)).collect();
-        let why = "every part passed: export all the solids";
-        return vec![NextStep { command: "export.step".into(), params: json!({"objects": ids}), why: why.into() }];
-    }
+/// The next steps of a split result: every part passed and nothing left out: one export of all the
+/// solids; else the steps of each part that did not pass, each labelled with its part, an export of
+/// the solids that did, and (when pieces were left out) the split that makes them meshes of their own.
+fn next_steps_of(parts: &[(ComponentOut, ToSolidOut)], scan: ObjectId, left_out: bool) -> Vec<NextStep> {
+    let passed: Vec<u64> = parts
+        .iter()
+        .filter(|(c, _)| c.verdict == Verdict::Pass)
+        .filter_map(|(c, _)| c.body.as_ref().map(|b| b.id.0))
+        .collect();
     let mut next = Vec::new();
-    for (n, (c, o)) in parts.iter().enumerate() {
-        for st in o.next_steps.iter().filter(|_| c.verdict != Verdict::Pass).take(3) {
-            let why = format!("part {} ({}): {}", n + 1, c.name, st.why);
-            next.push(NextStep { why, ..st.clone() });
+    let export =
+        |ids: &[u64], why: String| NextStep { command: "export.step".into(), params: json!({"objects": ids}), why };
+    if passed.len() == parts.len() {
+        let why = if left_out {
+            format!(
+                "the {} solids that were modelled passed (see the issues for what was left out): export them",
+                passed.len()
+            )
+        } else {
+            "every part passed: export all the solids".to_string()
+        };
+        next.push(export(&passed, why));
+    } else {
+        for (n, (c, o)) in parts.iter().enumerate().filter(|(_, (c, _))| c.verdict != Verdict::Pass) {
+            for st in o.next_steps.iter().take(3) {
+                let why = format!("part {} ({}): {}", n + 1, c.name, st.why);
+                next.push(NextStep { why, ..st.clone() });
+            }
         }
+        if !passed.is_empty() {
+            next.push(export(&passed, format!("export the {} parts that passed", passed.len())));
+        }
+    }
+    if left_out {
+        let why = "makes a mesh of every piece, so that what was left out can be modelled on its own";
+        next.push(NextStep {
+            command: "scan.split".into(),
+            params: json!({"object": scan.0, "keep_debris": true}),
+            why: why.into(),
+        });
     }
     next
 }
@@ -409,7 +457,7 @@ fn combine(set: &Settings, report: ScanSummary, parts: Vec<(ComponentOut, ToSoli
         verdict = Verdict::Review;
     }
     let deviation = aggregate(&parts);
-    let next = next_steps_of(&parts);
+    let next = next_steps_of(&parts, set.scan, capped);
     let largest = parts.iter().enumerate().max_by(|a, b| a.1.0.area.total_cmp(&b.1.0.area)).map_or(0, |(k, _)| k);
     let bodies: Vec<BodyOut> = parts.iter().filter_map(|(c, _)| c.body.clone()).collect();
     let step = PrepStep {
@@ -490,5 +538,90 @@ mod tests {
         assert_eq!(Components::requested(&None).unwrap(), None);
         assert!(Components::requested(&Some(Components::Word("some".into()))).is_err());
         assert!(Components::requested(&Some(Components::Count(0))).is_err());
+    }
+
+    fn piece(area: f64) -> surfacecraft_geom::pieces::Piece {
+        surfacecraft_geom::pieces::Piece {
+            triangles: vec![0],
+            vertices: 3,
+            area,
+            bbox: surfacecraft_geom::Aabb::default(),
+            boundary_edges: 0,
+            loops: Vec::new(),
+            non_manifold_edges: 0,
+            edges: 3,
+            euler: 2,
+            pinched_vertices: 0,
+            unoriented_edges: 0,
+        }
+    }
+
+    /// An outer shell of 1 000 mm2 around a cavity skin of 12 000 mm2: the shell is the part, whatever
+    /// the area of what is inside it.
+    #[test]
+    fn a_cavity_skin_larger_than_its_shell_does_not_turn_the_shell_into_a_minor_piece() {
+        let a = Analysis {
+            parts: vec![piece(1000.0), piece(12_000.0)],
+            extra: Vec::new(),
+            rest: Vec::new(),
+            nests: vec![None, Some((0, true))],
+        };
+        let p = plan_of(&a, PART_SHARE, None);
+        assert_eq!(p.chosen, vec![0], "the shell is modelled");
+        assert_eq!(p.cavities, vec![1]);
+        assert!(p.minor.is_empty());
+        let none = Analysis { nests: vec![Some((1, true)), Some((0, true))], ..a };
+        assert_eq!(plan_of(&none, PART_SHARE, None).chosen.len(), 1, "never an empty choice");
+    }
+
+    #[test]
+    fn pieces_beyond_the_listed_parts_stay_in_the_account() {
+        let a = scan_split::analyse(&balls(80), MIN_SHARE, false);
+        assert_eq!((a.parts.len(), a.extra.len()), (scan_split::MAX_PARTS, 16));
+        let plan = plan_of(&a, PART_SHARE, None);
+        let acct = account_of(&a, &plan, 0);
+        assert_eq!(acct.beyond_cap.0, 56, "40 past the cap of 24, 16 past the listed parts");
+        assert!((acct.beyond_cap.1 - 56.0 / 80.0).abs() < 1e-9, "{}", acct.beyond_cap.1);
+        let (issues, capped) = collect_issues(&[], &acct);
+        assert!(capped && issues.iter().any(|i| i.code == "parts_beyond_limit" && i.message.contains("56 more parts")));
+    }
+
+    #[test]
+    fn two_percent_of_unmodelled_surface_is_the_boundary_of_the_review_cap() {
+        let acct = |share: f64| Account {
+            minor: (3, share),
+            cavities: (0, 0.0),
+            beyond_cap: (0, 0.0),
+            not_requested: (0, 0.0),
+            modelled: 1,
+            debris_pieces: 3,
+            ms: 0,
+        };
+        let (issues, capped) = collect_issues(&[], &acct(UNMODELLED_REVIEW_SHARE));
+        assert!(issues.is_empty() && !capped, "exactly 2 % is not above 2 %");
+        let (issues, capped) = collect_issues(&[], &acct(UNMODELLED_REVIEW_SHARE + 1e-4));
+        assert!(capped && issues[0].code == "unmodelled_pieces" && issues[0].message.contains("part_share"));
+        let (issues, capped) = collect_issues(&[], &acct(UNMODELLED_REVIEW_SHARE - 1e-4));
+        assert!(issues.is_empty() && !capped);
+    }
+
+    #[test]
+    fn only_a_primitives_failure_without_a_body_is_wrapped_as_freeform() {
+        let set = Settings {
+            scan: ObjectId(0),
+            tolerance: 0.2,
+            min_within: 0.99,
+            min_triangles: None,
+            max_patches: None,
+            allow_retry: true,
+            rebuild: true,
+            name: "solid".into(),
+        };
+        let mut out = failure(&set, ObjectId(1), "x");
+        assert!(!needs_freeform(Method::Auto, &out), "a freeform failure is not repeated");
+        out.method = Method::Primitives;
+        assert!(needs_freeform(Method::Auto, &out));
+        assert!(!needs_freeform(Method::Freeform, &out));
+        assert!(!needs_freeform(Method::Primitives, &out));
     }
 }

@@ -197,3 +197,74 @@ fn even_indices_do_not_wrap_in_32_bits() {
     assert_eq!(crate::even_index(65_535, 100_000, 65_536), 99_998);
     assert_eq!(crate::even_index(0, 0, 0), 0);
 }
+
+#[test]
+fn a_coarse_voxel_or_a_huge_tolerance_never_panics() {
+    let mut big = synth::sphere(Point3::origin(), 150.0, 80, 40);
+    big.weld(1e-9);
+    for p in [
+        Params { voxel: Some(5.0), ..Params::default() },
+        Params { tolerance: 3.0, ..Params::default() },
+        Params { voxel: Some(50.0), ..Params::default() },
+        Params { tolerance: 1e300, ..Params::default() },
+        Params { voxel: Some(1e300), ..Params::default() },
+    ] {
+        let r = std::panic::catch_unwind(|| remesh(&big, &p));
+        assert!(r.is_ok(), "{p:?} panicked");
+    }
+    let (out, rep) = remesh(&big, &Params { voxel: Some(5.0), ..Params::default() }).unwrap();
+    assert!(pieces::pieces(&out)[0].closed(), "{rep:?}");
+}
+
+#[test]
+fn a_missing_triangle_wider_than_the_hole_limit_is_refused_not_drilled() {
+    let mut m = synth::sphere(Point3::origin(), 40.0, 30, 15);
+    m.weld(1e-9);
+    m.triangles.remove(m.triangle_count() / 2);
+    let loops = pieces::pieces(&m)[0].loops.clone();
+    assert_eq!(loops.len(), 1);
+    assert_eq!(loops[0].edges, 3);
+    assert!(loops[0].length / std::f64::consts::PI > 5.0, "{loops:?}");
+    assert!(matches!(remesh(&m, &Params::default()), Err(RemeshError::Open { .. })));
+}
+
+#[test]
+fn the_quad_estimate_refuses_only_far_beyond_the_limit_and_the_real_count_decides_after() {
+    let mut m = synth::sphere(Point3::origin(), 15.0, 80, 40);
+    m.weld(1e-9);
+    // area / h² is about 31 000 here: above this limit, below four times it
+    let p = Params { limits: Limits { max_quads: 20_000, ..Limits::default() }, ..Params::default() };
+    match remesh(&m, &p) {
+        Err(RemeshError::TooMuchWork { what, .. }) => assert!(!what.contains("estimated"), "{what}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_double_faced_fin_is_kept_as_a_closed_sheet_and_removed_by_the_closing() {
+    let mut m = synth::sphere(Point3::origin(), 15.0, 80, 40);
+    m.weld(1e-9);
+    let pole = m.positions.iter().position(|p| p.z > 14.99).unwrap() as u32;
+    let n = m.positions.len() as u32;
+    m.positions.extend([Point3::new(1.0, 0.0, 16.5), Point3::new(0.0, 1.0, 16.5)]);
+    m.triangles.extend([[pole, n, n + 1], [pole, n + 1, n]]);
+    assert!(pieces::pieces(&m)[0].loops.is_empty(), "both faces kept: no boundary");
+    let (out, rep) = remesh(&m, &Params::default()).unwrap();
+    assert_eq!(rep.duplicate_triangles, 0);
+    assert_eq!(pieces::pieces(&out)[0].genus(), Some(0));
+}
+
+#[test]
+fn more_columns_than_the_index_can_hold_are_refused_whatever_the_limit() {
+    let mut m = synth::sphere(Point3::origin(), 7000.0, 40, 20);
+    m.weld(1e-9);
+    let p = Params {
+        voxel: Some(0.3),
+        limits: Limits { max_columns: usize::MAX, ..Limits::default() },
+        ..Params::default()
+    };
+    match remesh(&m, &p) {
+        Err(RemeshError::TooMuchWork { what, .. }) => assert!(what.contains("grid columns"), "{what}"),
+        other => panic!("{other:?}"),
+    }
+}

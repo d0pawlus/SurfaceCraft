@@ -204,15 +204,17 @@ fn out(
 /// `max_patches` (an explicit cap is a promise) or switched `allow_retry` off. One retry at most; a
 /// failed one leaves the first attempt as it is and says why in the result. `wrap_with` makes the
 /// second wrap (the command's own, or a test's).
-fn retry_larger(
+fn retry_larger_on(
     s: &mut Session,
     set: &Settings,
+    wrapped: ObjectId,
     first: WrapOut,
     wrap_with: impl FnOnce(&mut Session, usize) -> CmdResult<WrapOut>,
-) -> (WrapOut, Option<CapRetry>) {
+) -> CmdResult<(WrapOut, Option<CapRetry>)> {
     let cap_from = first.cap_used;
     let cap_to = cap_from.saturating_mul(RETRY_FACTOR).min(PATCH_LIMIT);
-    let triangles = s.doc.mesh(set.scan).map_or(usize::MAX, |m| m.mesh.triangle_count());
+    // the size that counts is that of the mesh actually wrapped (a rebuilt scan can be much larger)
+    let triangles = s.doc.mesh(wrapped).map_or(usize::MAX, |m| m.mesh.triangle_count());
     let worth = set.allow_retry
         && set.max_patches.is_none()
         && first.capped
@@ -220,7 +222,7 @@ fn retry_larger(
         && first.deviation.within >= RETRY_MIN_WITHIN
         && triangles <= RETRY_MAX_TRIANGLES;
     if !worth {
-        return (first, None);
+        return Ok((first, None));
     }
     let base = CapRetry {
         cap_from,
@@ -242,7 +244,10 @@ fn retry_larger(
             for id in added {
                 s.doc.remove(id);
             }
-            return (first, Some(CapRetry { error: Some(message_of(&e).to_string()), ..base }));
+            if crate::cmd::is_cancelled(&e) {
+                return Err(e);
+            }
+            return Ok((first, Some(CapRetry { error: Some(message_of(&e).to_string()), ..base })));
         }
     };
     let reason = judge(Attempt::of(&first), Attempt::of(&second));
@@ -255,7 +260,18 @@ fn retry_larger(
         // the second wrap ran while the first body still held the name: the result gets it back
         s.doc.rename(keep.body.id, &set.name);
     }
-    (keep, Some(info))
+    Ok((keep, Some(info)))
+}
+
+/// [`retry_larger_on`] for the scan itself.
+#[cfg(test)]
+fn retry_larger(
+    s: &mut Session,
+    set: &Settings,
+    first: WrapOut,
+    wrap_with: impl FnOnce(&mut Session, usize) -> CmdResult<WrapOut>,
+) -> (WrapOut, Option<CapRetry>) {
+    retry_larger_on(s, set, set.scan, first, wrap_with).unwrap_or_else(|e| panic!("{e:?}"))
 }
 
 #[cfg(test)]
@@ -291,14 +307,26 @@ pub(super) fn freeform_on(
     mesh: ObjectId,
     report: ScanSummary,
 ) -> CmdResult<ToSolidOut> {
-    freeform_with(s, set, report, |s, cap| wrap_mesh(s, set, mesh, cap))
+    freeform_with_mesh(s, set, mesh, report, |s, cap| wrap_mesh(s, set, mesh, cap))
 }
 
 /// [`freeform_solid`] with the wrap made by `wrap_fn` (given the patch limit, `None` for the default):
 /// the command's own, or a test's.
+#[cfg(test)]
 fn freeform_with(
     s: &mut Session,
     set: &Settings,
+    report: ScanSummary,
+    wrap_fn: impl FnMut(&mut Session, Option<usize>) -> CmdResult<WrapOut>,
+) -> CmdResult<ToSolidOut> {
+    freeform_with_mesh(s, set, set.scan, report, wrap_fn)
+}
+
+/// [`freeform_with`] for the wrap of `wrapped` (the scan, or a rebuilt copy of it).
+fn freeform_with_mesh(
+    s: &mut Session,
+    set: &Settings,
+    wrapped: ObjectId,
     report: ScanSummary,
     mut wrap_fn: impl FnMut(&mut Session, Option<usize>) -> CmdResult<WrapOut>,
 ) -> CmdResult<ToSolidOut> {
@@ -307,7 +335,8 @@ fn freeform_with(
         Err(e) if crate::cmd::is_cancelled(&e) => return Err(e),
         Err(e) => return Ok(failed(set, report, message_of(&e))),
     };
-    let (w, retry) = retry_larger(s, set, first, |s, cap| wrap_fn(s, Some(cap)));
+    let (w, retry) = retry_larger_on(s, set, wrapped, first, |s, cap| wrap_fn(s, Some(cap)))?;
+    super::prepare::check_cancel(s)?;
     let cmp = compare(
         s,
         CompareIn {
@@ -616,6 +645,45 @@ mod tests {
             non_manifold_edges: 0,
             noise_sigma: None,
             findings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_cancelled_larger_cap_wrap_is_a_cancelled_error_and_leaves_no_second_body() {
+        let (mut s, set) = session();
+        let first = first_attempt(&mut s, &set, 300);
+        let bodies = s.doc.bodies.len();
+        let r = retry_larger_on(&mut s, &set, set.scan, first, |_, _| Err(crate::cmd::cancelled()));
+        assert!(matches!(r, Err(ref e) if crate::cmd::is_cancelled(e)));
+        assert_eq!(s.doc.bodies.len(), bodies);
+    }
+
+    #[test]
+    fn the_size_limit_of_the_retry_is_that_of_the_mesh_wrapped() {
+        let (mut s, set) = session();
+        let first = first_attempt(&mut s, &set, 300);
+        let big = surfacecraft_geom::synth::sphere(Point3::origin(), 20.0, 1300, 700);
+        assert!(big.triangle_count() > RETRY_MAX_TRIANGLES);
+        let huge = s.doc.add_mesh("rebuilt", big);
+        let r = retry_larger_on(&mut s, &set, huge, first, |_, _| panic!("no second wrap for a mesh this large"));
+        assert!(matches!(r, Ok((_, None))));
+    }
+
+    #[test]
+    fn the_wraps_of_a_call_are_one_unless_the_retry_is_allowed() {
+        for (allow, expected) in [(true, 2usize), (false, 1)] {
+            let (mut s, set) = session();
+            let set = Settings { allow_retry: allow, ..set };
+            let mut calls = 0usize;
+            let out = freeform_with(&mut s, &set, empty_report(), |s, cap| {
+                calls += 1;
+                let mut w = wrap_with(s, &set, Some(cap.unwrap_or(300)))?;
+                w.capped = true;
+                w.deviation.within = 0.5;
+                Ok(w)
+            });
+            assert!(out.is_ok());
+            assert_eq!(calls, expected, "allow_retry {allow}");
         }
     }
 }

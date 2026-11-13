@@ -130,7 +130,7 @@ pub struct ToSolidOut {
     pub retry: Option<super::freeform::CapRetry>,
     /// Tolerance used (mm).
     pub tolerance: f64,
-    /// The solid against the scan, when a solid was built.
+    /// The solid against the scan it was modelled from, when a solid was built: for a scan that was split, against the mesh of the part (one co-equal part) or the area-weighted aggregate over the modelled parts (several); never against pieces that were left out.
     pub deviation: Option<DeviationSummary>,
     /// Faces with points outside the tolerance, worst first (at most 5).
     pub worst_faces: Vec<FaceDeviation>,

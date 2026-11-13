@@ -91,13 +91,14 @@ fn a_scan_that_does_not_close_gets_a_verdict_and_next_steps_not_an_error() {
     s.execute("mesh.synth", json!({"shape": "bracket", "noise": 0.03, "name": "scan"})).unwrap();
 
     // Act
-    let out = s.execute("scan.to_solid", json!({"scan": "scan"})).unwrap();
+    let out = s.execute("scan.to_solid", json!({"scan": "scan", "part_share": 0.05})).unwrap();
 
     // Assert: the three shells are three parts; each is modelled on its own and the verdict is the worst of the three
     assert_eq!(out["preparation"][0]["step"], "split", "{out}");
     let parts = out["components"].as_array().unwrap();
-    // two parts are co-equal (the box and the boss, the boss with 10 % of the box's area); the ball
-    // is a minor piece (3 % of the surface) and is reported, not modelled
+    // measured areas: the box 8 803 mm2, the boss 895 mm2 (10.2 % of the box), the ball about 3 % of
+    // the surface. The boss sits just above the default `part_share` of 10 %, so the test asks for 5 %:
+    // the boss is clearly co-equal (twice the share) and the ball clearly minor
     assert_eq!(parts.len(), 2, "{out}");
     let verdicts: Vec<&str> = parts.iter().map(|c| c["verdict"].as_str().unwrap()).collect();
     assert_eq!(verdicts.iter().filter(|v| **v == "pass").count(), 1, "{verdicts:?}");

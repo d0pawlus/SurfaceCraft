@@ -505,14 +505,27 @@ fn gate_a_thousand_handles_stall_the_wrap_and_the_rebuild_cures_it() {
 
 // ---- which parts count ---------------------------------------------------------------------------
 
-/// One part with 98 % of the surface and a small fragment (above the share of a part, below that of a
-/// co-equal one): one body, the verdict of the main part, no issue for a fragment of 1.5 %.
+/// One part with 98 % of the surface and a small open fragment (above the share of a part, below that
+/// of a co-equal one): one body, the verdict of the main part. The fragment is shown to fail on its own
+/// first, so that the pass proves that it was left out.
 #[test]
 fn gate_a_small_fragment_is_not_a_part_and_does_not_hide_the_main_pass() {
     let main = wavy(Point3::origin(), 20.0, 3.0, 160);
-    let fragment = wavy(Point3::origin(), 2.5, 5.0, 60);
-    let mut s = session_with("scan", assembly(&[main, fragment], 0));
-    let out = s.execute("scan.to_solid", json!({"scan": "scan", "method": "freeform"})).unwrap();
+    let mut fragment = wavy(Point3::origin(), 3.2, 5.0, 60);
+    fragment.triangles.retain(|t| t.iter().all(|&v| fragment.positions[v as usize].z > -0.3));
+    let scan = assembly(&[main, fragment], 0);
+    // the hole of the fragment (about 30 edges) is left open
+    let params = |extra: Value| {
+        let mut p = json!({"scan": "scan", "method": "freeform", "fill_holes_max_edges": 10});
+        p.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        p
+    };
+    let mut s = session_with("scan", scan.clone());
+    let both = s.execute("scan.to_solid", params(json!({"part_share": 0.01}))).unwrap();
+    assert_eq!(both["components"].as_array().map(Vec::len), Some(2), "{both}");
+    assert_ne!(both["verdict"], "pass", "the fragment on its own is not a pass: {both}");
+    let mut s = session_with("scan", scan);
+    let out = s.execute("scan.to_solid", params(json!({}))).unwrap();
     assert_eq!(out["components"].as_array().map(Vec::len), Some(1), "{out}");
     assert_eq!(out["bodies"].as_array().map(Vec::len), Some(1));
     assert_eq!(out["verdict"], "pass", "{out}");
@@ -550,6 +563,18 @@ fn gate_unmodelled_pieces_are_an_issue_and_cap_the_verdict() {
             .iter()
             .any(|i| i["message"].as_str().is_some_and(|m| m.contains("50 pieces")))
     );
+    // what to do about it: the message says, and the next steps split the scan; no claim that every part passed
+    let says = |what: &[&str]| {
+        out["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["message"].as_str().is_some_and(|m| what.iter().all(|w| m.contains(w))))
+    };
+    assert!(says(&["part_share", "scan.split"]));
+    let steps = out["next_steps"].as_array().unwrap();
+    assert!(steps.iter().any(|st| st["command"] == "scan.split"), "{steps:?}");
+    assert!(steps.iter().all(|st| !st["why"].as_str().unwrap().contains("every part passed")), "{steps:?}");
 }
 
 #[test]
@@ -633,4 +658,84 @@ fn measure_remesh_footprint_of_a_million_triangles() {
         ),
         Err(e) => eprintln!("refused: {e}"),
     }
+}
+
+#[test]
+fn part_share_is_validated() {
+    let mut s = session_with("scan", wavy(Point3::origin(), 10.0, 3.0, 60));
+    for bad in [json!(-0.1), json!(1.5), json!(2)] {
+        let r = s.execute("scan.to_solid", json!({"scan": "scan", "method": "freeform", "part_share": bad}));
+        assert!(r.is_err(), "{bad}");
+    }
+    for ok in [json!(0), json!(1), json!(0.1)] {
+        let r = s.execute("scan.to_solid", json!({"scan": "scan", "method": "freeform", "part_share": ok}));
+        assert!(r.is_ok(), "{ok}: {r:?}");
+    }
+}
+
+/// A cancellation in the middle of a split run leaves nothing of the parts that were already modelled.
+#[test]
+fn a_cancel_in_the_middle_of_a_split_run_leaves_no_body_and_no_part_mesh() {
+    let (all, _) = three_parts_and_debris();
+    let mut s = session_with("scan", all);
+    let flag = s.cancel.clone();
+    let stopper = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        flag.cancel();
+    });
+    let r = s.execute("scan.to_solid", json!({"scan": "scan", "method": "freeform"}));
+    stopper.join().unwrap();
+    let e = r.expect_err("the run takes several seconds").to_string();
+    assert!(e.contains("cancelled"), "{e}");
+    assert!(s.doc.bodies.is_empty(), "no body of an earlier part is left");
+    assert_eq!(s.doc.meshes.len(), 1, "no part mesh is left: only the scan");
+}
+
+/// An opening that cleaning cannot fill (above 400 edges) at the default parameters: a verdict with
+/// reasons and next steps, never an error or a pass.
+#[test]
+fn gate_an_open_scan_that_cannot_be_closed_gets_reasons_and_next_steps_at_the_default_parameters() {
+    let mut half = weld(synth::sphere(Point3::origin(), 20.0, 500, 250));
+    half.triangles.retain(|t| t.iter().all(|&v| half.positions[v as usize].z > -1e-9));
+    let loops = pieces(&half)[0].loops.clone();
+    assert!(loops.len() == 1 && loops[0].edges > 400, "{loops:?}");
+    let mut s = session_with("scan", half);
+    let out = s.execute("scan.to_solid", json!({"scan": "scan", "method": "freeform"})).unwrap();
+    assert_ne!(out["verdict"], "pass", "{out}");
+    assert!(!out["issues"].as_array().unwrap().is_empty());
+    assert!(!out["next_steps"].as_array().unwrap().is_empty());
+    assert!(out["components"].is_null());
+}
+
+/// Strong evidence (many fins) but a remesh that is refused: the refused step is in `preparation`.
+#[test]
+fn gate_a_refused_remesh_is_recorded_in_the_preparation() {
+    let mut m = wavy(Point3::origin(), 8.0, 3.0, 80);
+    // every other triangle turned around: a closed scan whose orientation cannot be read, so that the
+    // remesh refuses; thirty fins make the evidence strong
+    m.triangles.iter_mut().step_by(2).for_each(|t| t.swap(1, 2));
+    let mut rng = Rng::new(4);
+    inject_fins(&mut m, 30, &mut rng);
+    let mut s = session_with("scan", m);
+    let out = s.execute("scan.to_solid", json!({"scan": "scan", "method": "freeform"})).unwrap();
+    let steps = out["preparation"].as_array().unwrap();
+    assert!(steps.iter().any(|p| p["step"] == "remesh" && p["numbers"]["refused"].is_string()), "{out}");
+    assert!(steps.iter().all(|p| p["numbers"]["ms"].is_u64()));
+}
+
+/// Eighty equal pieces: the debris report of the split counts all of them.
+#[test]
+fn scan_split_counts_pieces_beyond_its_limit_of_listed_parts() {
+    let ball = weld(synth::sphere(Point3::origin(), 3.0, 24, 12));
+    let mut all = Mesh::default();
+    for k in 0..80 {
+        let mut b = ball.clone();
+        b.positions.iter_mut().for_each(|p| p.x += 10.0 * f64::from(k));
+        all.append(&b);
+    }
+    let mut s = session_with("scan", all);
+    let r = s.execute("scan.split", json!({"object": "scan"})).unwrap();
+    assert_eq!(r["parts"].as_array().map(Vec::len), Some(64), "{r}");
+    assert_eq!(r["parts_beyond_limit"], 16);
+    assert!(r["beyond_limit_triangles"].as_u64().unwrap() > 0 && r["beyond_limit_area"].as_f64().unwrap() > 0.0);
 }

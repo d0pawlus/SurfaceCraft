@@ -6,9 +6,10 @@ use std::collections::HashSet;
 
 /// Vertices closer than this (mm) are one, so that a coincident second shell shares its triangles.
 const WELD_MM: f64 = 1e-6;
-/// A boundary loop of this many edges or fewer is a flap or a sliver (a fin of two edges is not a
-/// hole): rays through it lose nothing worth a refusal. Any longer loop that is left is refused.
-const MAX_FLAP_EDGES: usize = 3;
+/// A boundary loop of this many edges or fewer is a flap (the two free edges of a fin are not a hole):
+/// rays through it lose nothing worth a refusal. Any longer loop that is left, a missing triangle
+/// included, is refused.
+const MAX_FLAP_EDGES: usize = 2;
 
 /// The scan prepared for the solid.
 pub(super) struct Prepared {
@@ -34,14 +35,15 @@ fn loop_width(mesh: &Mesh, lp: &[u32]) -> f64 {
     perimeter / std::f64::consts::PI
 }
 
-/// Drops every triangle that repeats an earlier one (the same three vertices in any order).
+/// Drops every triangle that repeats an earlier one with the same winding (the same three vertices in
+/// the same cyclic order): a coincident second shell. A twin with the opposite winding is kept: with
+/// its mate it is a closed double-faced sheet, and dropping one would leave an open one.
 fn drop_duplicates(mesh: &mut Mesh) -> usize {
     let mut seen: HashSet<[u32; 3]> = HashSet::with_capacity(mesh.triangles.len());
     let before = mesh.triangles.len();
     mesh.triangles.retain(|t| {
-        let mut k = *t;
-        k.sort_unstable();
-        seen.insert(k)
+        let first = (0..3).min_by_key(|k| t[*k]).unwrap_or(0);
+        seen.insert([t[first], t[(first + 1) % 3], t[(first + 2) % 3]])
     });
     before - mesh.triangles.len()
 }

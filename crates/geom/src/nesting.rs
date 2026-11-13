@@ -77,6 +77,11 @@ fn crosses(x: &[Point3; 3], y: &[Point3; 3]) -> bool {
     hit(x, y) || hit(y, x)
 }
 
+/// Do the triangles have a corner at the same place (vertices split apart at a pinch share a position)?
+fn shares_position(x: &[Point3; 3], y: &[Point3; 3]) -> bool {
+    x.iter().any(|p| y.contains(p))
+}
+
 /// Result of [`sampled_self_intersections`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct IntersectionSample {
@@ -101,7 +106,7 @@ pub fn sampled_self_intersections(mesh: &Mesh, bvh: &Bvh, max_samples: usize) ->
         let near = bvh.candidates(&|b| overlap(b, &bx));
         let found = near.iter().any(|&o| {
             let (Some(y), Some(oi)) = (mesh.triangle(o as usize), mesh.triangles.get(o as usize)) else { return false };
-            o as usize != ti && !idx.iter().any(|v| oi.contains(v)) && crosses(&x, &y)
+            o as usize != ti && !idx.iter().any(|v| oi.contains(v)) && !shares_position(&x, &y) && crosses(&x, &y)
         });
         out.crossing += usize::from(found);
     }
@@ -123,6 +128,27 @@ mod tests {
         assert_eq!(inside_share(&far, &bvh, 1e-7), 0.0);
         assert!(contains(&big.bbox(), &inner.bbox(), 0.0));
         assert!(!contains(&big.bbox(), &far.bbox(), 0.0));
+    }
+
+    #[test]
+    fn triangles_that_share_a_position_are_not_counted_as_crossing() {
+        let corner = Point3::new(0.0, 0.0, 0.0);
+        let base = |c: Point3| Mesh {
+            positions: vec![
+                corner,
+                Point3::new(2.0, 0.0, 0.0),
+                Point3::new(0.0, 2.0, 0.0),
+                c,
+                Point3::new(1.0, 1.0, -1.0),
+                Point3::new(1.0, 0.2, 1.0),
+            ],
+            triangles: vec![[0, 1, 2], [3, 4, 5]],
+        };
+        let apart = base(Point3::new(0.0, 0.0, -0.5));
+        let touching = base(corner);
+        let n = |m: &Mesh| sampled_self_intersections(m, &Bvh::build(m), 10).crossing;
+        assert!(n(&apart) > 0, "the triangles cross");
+        assert_eq!(n(&touching), 0, "a shared position is a pinch, not a crossing");
     }
 
     #[test]

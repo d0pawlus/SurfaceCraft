@@ -81,8 +81,12 @@ pub struct SplitOut {
     pub parts: Vec<PartOut>,
     /// Parts that are not the cavity skin of another: the bodies a model needs.
     pub distinct_parts: usize,
-    /// Significant pieces past the limit of listed parts.
+    /// Significant pieces past the limit of listed parts (not made into meshes).
     pub parts_beyond_limit: usize,
+    /// Their triangles.
+    pub beyond_limit_triangles: usize,
+    /// Their surface area (mm2).
+    pub beyond_limit_area: f64,
     /// The rest of the scan.
     pub debris: DebrisOut,
 }
@@ -148,8 +152,8 @@ pub(crate) fn add_part(s: &mut Session, base: &str, k: usize, p: &Piece, mesh: &
 pub(crate) struct Analysis {
     /// Significant pieces, largest first (at most [`MAX_PARTS`]).
     pub parts: Vec<Piece>,
-    /// Significant pieces past the limit.
-    pub beyond: usize,
+    /// Significant pieces past the limit (kept, so that they can be counted and reported).
+    pub extra: Vec<Piece>,
     /// The pieces below the share.
     pub rest: Vec<Piece>,
     /// Per part: the closed part it lies inside and whether it is a cavity skin.
@@ -168,10 +172,9 @@ pub(crate) fn analyse(mesh: &Mesh, share: f64, with_nesting: bool) -> Analysis {
     let all = pieces(mesh);
     let (total, area): (f64, f64) = (mesh.triangle_count() as f64, all.iter().map(|p| p.area).sum());
     let (mut parts, rest): (Vec<Piece>, Vec<Piece>) = all.into_iter().partition(|p| is_part(p, total, area, share));
-    let beyond = parts.len().saturating_sub(MAX_PARTS);
-    parts.truncate(MAX_PARTS);
+    let extra = parts.split_off(parts.len().min(MAX_PARTS));
     let nests = if with_nesting && parts.len() > 1 { nesting_of(mesh, &parts) } else { vec![None; parts.len()] };
-    Analysis { parts, beyond, rest, nests }
+    Analysis { parts, extra, rest, nests }
 }
 
 pub(crate) fn split(s: &mut Session, i: SplitIn) -> CmdResult<SplitOut> {
@@ -182,7 +185,7 @@ pub(crate) fn split(s: &mut Session, i: SplitIn) -> CmdResult<SplitOut> {
     }
     let obj = s.doc.mesh(id).ok_or_else(|| CmdError::Params(format!("no mesh {id}")))?;
     let (mesh, base): (Arc<Mesh>, String) = (obj.mesh.clone(), obj.name.clone());
-    let Analysis { parts: listed, beyond, rest, nests } = analyse(&mesh, share, true);
+    let Analysis { parts: listed, extra, rest, nests } = analyse(&mesh, share, true);
     if listed.is_empty() {
         let msg = if rest.is_empty() {
             "the mesh is empty or invalid".to_string()
@@ -205,7 +208,9 @@ pub(crate) fn split(s: &mut Session, i: SplitIn) -> CmdResult<SplitOut> {
     Ok(SplitOut {
         parts: out,
         distinct_parts: distinct,
-        parts_beyond_limit: beyond,
+        parts_beyond_limit: extra.len(),
+        beyond_limit_triangles: extra.iter().map(|p| p.triangles.len()).sum(),
+        beyond_limit_area: extra.iter().map(|p| p.area).sum(),
         debris: DebrisOut { pieces: rest.len(), triangles: tris.len(), id: debris_id },
     })
 }

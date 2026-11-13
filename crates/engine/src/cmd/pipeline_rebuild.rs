@@ -7,8 +7,8 @@ use super::freeform::{Attempt, RetryReason, freeform_on, judge};
 use super::prepare::check_cancel;
 use super::{CmdResult, PrepStep, ScanSummary, Settings, ToSolidOut, Verdict, message_of};
 use crate::Session;
-use crate::cmd::ObjRef;
 use crate::cmd::mesh_remesh::{RemeshIn, remesh_cmd};
+use crate::cmd::{ObjRef, is_cancelled};
 use serde_json::{Value, json};
 use surfacecraft_doc::ObjectId;
 use surfacecraft_geom::Mesh;
@@ -67,15 +67,14 @@ fn evidence(mesh: &Mesh) -> Option<(bool, Value)> {
     closed.then(|| (strong, json!({"genus": genus, "non_manifold_edges": non_manifold})))
 }
 
-/// Remeshes the scan; returns the new mesh and the step, or the step that says why it was not done.
-fn remesh_scan(
-    s: &mut Session,
-    set: &Settings,
-    reason: &str,
-    figures: Value,
-) -> Result<(ObjectId, PrepStep), PrepStep> {
+/// What a remesh attempt came to: the new mesh and the step, or the step saying why it was not done.
+type Rebuilt = Result<(ObjectId, PrepStep), PrepStep>;
+
+/// Remeshes the scan. A cancellation is an error; any other refusal is the `Err` step.
+fn remesh_scan(s: &mut Session, set: &Settings, reason: &str, figures: Value) -> CmdResult<Rebuilt> {
+    check_cancel(s)?;
     let watch = Stopwatch::start();
-    let Some(mesh) = mesh_of(s, set.scan) else { return Err(refused(reason, "no mesh", figures, 0)) };
+    let Some(mesh) = mesh_of(s, set.scan) else { return Ok(Err(refused(reason, "no mesh", figures, 0))) };
     let voxel = (1.5 * set.tolerance).max((mesh.area() / REMESH_QUAD_BUDGET).sqrt());
     let input = RemeshIn {
         object: ObjRef::Id(set.scan.0),
@@ -94,9 +93,10 @@ fn remesh_scan(
                 "max_deviation_to_scan": r.original_to_result.max, "p99_deviation_to_scan": r.original_to_result.p99,
                 "removed_share": r.removed_share, "warnings": r.warnings, "evidence": figures, "ms": watch.ms(),
             });
-            Ok((r.id, PrepStep { step: "remesh".into(), reason: reason.into(), numbers }))
+            Ok(Ok((r.id, PrepStep { step: "remesh".into(), reason: reason.into(), numbers })))
         }
-        Err(e) => Err(refused(reason, message_of(&e), figures, watch.ms())),
+        Err(e) if is_cancelled(&e) => Err(e),
+        Err(e) => Ok(Err(refused(reason, message_of(&e), figures, watch.ms()))),
     }
 }
 
@@ -169,36 +169,41 @@ fn restore_name(s: &mut Session, set: &Settings, out: &ToSolidOut) {
 pub(super) fn freeform_prepared(s: &mut Session, set: &Settings, report: ScanSummary) -> CmdResult<ToSolidOut> {
     let found = if set.rebuild { mesh_of(s, set.scan).and_then(|m| evidence(&m)) } else { None };
     let Some((strong, figures)) = found else { return freeform_on(s, set, set.scan, report) };
+    // the larger-cap retry belongs to the first attempt only: a second attempt never makes a third wrap
+    let second = Settings { allow_retry: false, name: set.name.clone(), ..*set };
+    let mut refusal = None;
     if strong {
-        check_cancel(s)?;
         let reason = "the scan has many handles or non-manifold edges that stall the reduction";
-        if let Ok((id, step)) = remesh_scan(s, set, reason, figures.clone()) {
-            check_cancel(s)?;
-            let rebuilt = freeform_on(s, set, id, report.clone())?;
-            if rebuilt.verdict == Verdict::Pass {
-                return Ok(finish_rebuilt(s, set, rebuilt, step));
+        match remesh_scan(s, set, reason, figures.clone())? {
+            Ok((id, step)) => {
+                check_cancel(s)?;
+                let rebuilt = freeform_on(s, set, id, report.clone())?;
+                if rebuilt.verdict == Verdict::Pass {
+                    return Ok(finish_rebuilt(s, set, rebuilt, step));
+                }
+                check_cancel(s)?;
+                let base = freeform_on(s, &second, set.scan, report)?;
+                return Ok(choose(s, set, (base, rebuilt), step, id));
             }
-            check_cancel(s)?;
-            let base = freeform_on(s, set, set.scan, report)?;
-            return Ok(choose(s, set, (base, rebuilt), step, id));
+            Err(step) => refusal = Some(step),
         }
     }
-    let base = freeform_on(s, set, set.scan, report.clone())?;
+    let mut base = freeform_on(s, set, set.scan, report.clone())?;
     if base.verdict == Verdict::Pass || strong {
+        base.prep.preparation.extend(refusal);
         return Ok(base);
     }
     check_cancel(s)?;
     let reason = "wrapping the scan as it is did not pass; the scan is closed and is rebuilt as a clean surface";
-    match remesh_scan(s, set, reason, figures) {
+    match remesh_scan(s, set, reason, figures)? {
         Ok((id, step)) => {
             check_cancel(s)?;
-            let rebuilt = freeform_on(s, set, id, report)?;
+            let rebuilt = freeform_on(s, &second, id, report)?;
             Ok(choose(s, set, (base, rebuilt), step, id))
         }
         Err(step) => {
-            let mut out = base;
-            out.prep.preparation.push(step);
-            Ok(out)
+            base.prep.preparation.push(step);
+            Ok(base)
         }
     }
 }
@@ -313,5 +318,29 @@ mod tests {
             choose(&mut s, &setting(), (result(plain.clone(), 0.80, false), result(rebuilt, 0.99, true)), step(), mesh);
         assert_eq!(out.body.unwrap().id, plain.id);
         let _ = (ObjRef::Id(0), result as fn(BodyOut, f64, bool) -> ToSolidOut);
+    }
+
+    #[test]
+    fn a_cancelled_remesh_is_a_cancelled_error_not_a_refused_step() {
+        let mut s = Session::new();
+        let id =
+            s.doc.add_mesh("scan", surfacecraft_geom::synth::sphere(surfacecraft_geom::Point3::origin(), 5.0, 16, 8));
+        let set = Settings { scan: id, ..setting() };
+        s.cancel.cancel();
+        let r = remesh_scan(&mut s, &set, "test", json!({}));
+        assert!(matches!(r, Err(ref e) if is_cancelled(e)));
+        let c = remesh_cmd(
+            &mut s,
+            RemeshIn {
+                object: ObjRef::Id(id.0),
+                tolerance: None,
+                voxel: None,
+                min_feature: None,
+                max_hole: None,
+                min_component_fraction: None,
+                name: None,
+            },
+        );
+        assert!(matches!(c, Err(ref e) if is_cancelled(e)), "the command itself checks too");
     }
 }

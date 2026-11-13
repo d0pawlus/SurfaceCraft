@@ -116,7 +116,7 @@ modelled as it is).
   solid, the top-level `body` and `patches` are the largest part's, `deviation` is the aggregate
   over the modelled parts (area-weighted share within tolerance, largest maximum) and `verdict`
   the worst co-equal part's.
-- **What was not modelled is reported.** More than 2 % of the surface in minor pieces and debris:
+- **What was not modelled is reported** (each issue says what to do: `part_share`, `scan.split`, `components`; the next steps include the split). More than 2 % of the surface in minor pieces and debris:
   issue `unmodelled_pieces` (count and area share) and the verdict is at most `review`. The inner
   skin of a hollow part is not modelled either: `nested_shell_skipped`, at most `review`. Co-equal
   parts past the 24 cap: `parts_beyond_limit` (count and area share), at most `review`. Parts you
@@ -130,9 +130,10 @@ modelled as it is).
   does not pass on is rebuilt and wrapped again, and the result that is clearly better is kept (the
   rule of the larger-cap retry: a closed result is never replaced by an open one, the share within
   tolerance must gain more than 0.5 points; a tie keeps the plain result). `rebuild: false` turns it
-  off. The rebuild-and-wrap-again runs at most once per part and for at most the 4 largest parts;
-  the worst case is 24 first wraps and 4 second wraps per call (28), plus one freeform wrap for each
-  part the primitives could not close.
+  off. The rebuild-and-wrap-again runs at most once per part and for at most the 4 largest parts. The
+  larger-cap retry (`allow_retry`) is made for the largest part only and only in its first attempt, so
+  at most once per call. The true worst case is 29 wraps per call: 24 parts (a part the primitives
+  could not close is wrapped as freeform once, as its one wrap), 4 rebuilds and 1 retry.
   `mesh.remesh` makes a closed, manifold, outward oriented surface at a voxel of 1.5 x tolerance
   (finer for a thin wall, coarser for a very large area): tunnels, bridges, fins, coincident second
   shells and self-intersections up to two voxels wide are removed, genuine handles and walls of at

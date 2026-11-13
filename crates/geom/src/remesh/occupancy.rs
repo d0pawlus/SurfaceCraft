@@ -87,13 +87,13 @@ impl Flat {
         }
         self.runs.extend_from_slice(list);
         self.cols.push(col);
-        self.ends.push(self.runs.len() as u32);
+        self.ends.push(u32::try_from(self.runs.len()).unwrap_or(u32::MAX));
     }
 
     fn append(&mut self, other: Flat) {
-        let offset = self.runs.len() as u32;
+        let offset = u32::try_from(self.runs.len()).unwrap_or(u32::MAX);
         self.cols.extend(other.cols);
-        self.ends.extend(other.ends.into_iter().map(|e| e + offset));
+        self.ends.extend(other.ends.into_iter().map(|e| e.saturating_add(offset)));
         self.runs.extend(other.runs);
     }
 
@@ -124,12 +124,12 @@ impl Occupancy {
         let mut prev = 0u32;
         for (c, end) in flat.cols.iter().zip(&flat.ends) {
             if let Some(s) = start.get_mut(*c as usize + 1) {
-                *s = end - prev;
+                *s = end.saturating_sub(prev);
             }
             prev = *end;
         }
         for k in 0..n {
-            start[k + 1] += start[k];
+            start[k + 1] = start[k + 1].saturating_add(start[k]);
         }
         Self { nx, ny, nz, start, runs: flat.runs }
     }
@@ -175,7 +175,7 @@ impl Occupancy {
 
     /// A new set whose column `(i, j)` is what `f` writes for it, given this set. Rows run in
     /// parallel; the result does not depend on the thread count.
-    fn transform<F>(&self, f: F) -> Self
+    fn transform<F>(&self, budget: usize, f: F) -> Result<Self, usize>
     where
         F: Fn(&Occupancy, usize, usize, &mut Vec<Run>) + Sync + Send,
     {
@@ -193,12 +193,15 @@ impl Occupancy {
         for row in rows {
             all.append(row);
         }
-        Self::from_flat(self.nx, self.ny, self.nz, all)
+        if all.runs.len() > budget {
+            return Err(all.runs.len());
+        }
+        Ok(Self::from_flat(self.nx, self.ny, self.nz, all))
     }
 
     /// Erosion (`grow = false`) or dilation (`grow = true`) by a cube of half-size `k` along z.
-    fn along_z(&self, k: u32, grow: bool) -> Self {
-        self.transform(|o, i, j, out| {
+    fn along_z(&self, k: u32, grow: bool, budget: usize) -> Result<Self, usize> {
+        self.transform(budget, |o, i, j, out| {
             for r in o.column(i, j) {
                 if grow {
                     out.push([r[0].saturating_sub(k), r[1].saturating_add(k)]);
@@ -210,8 +213,8 @@ impl Occupancy {
     }
 
     /// Erosion or dilation along x (`axis = 0`) or y (`axis = 1`).
-    fn along_xy(&self, k: usize, axis: usize, grow: bool) -> Self {
-        self.transform(|o, i, j, out| {
+    fn along_xy(&self, k: usize, axis: usize, grow: bool, budget: usize) -> Result<Self, usize> {
+        self.transform(budget, |o, i, j, out| {
             let at = |d: isize| -> Option<(usize, usize)> {
                 let (a, b) = if axis == 0 { (i as isize + d, j as isize) } else { (i as isize, j as isize + d) };
                 (a >= 0 && b >= 0).then_some((a as usize, b as usize))
@@ -239,36 +242,34 @@ impl Occupancy {
         })
     }
 
-    /// Erosion by a cube of half-size `k` voxels (separable: z, x, y).
-    #[must_use]
-    pub fn erode(&self, k: u32) -> Self {
+    /// Erosion by a cube of half-size `k` voxels (separable: z, x, y). `Err(runs)` when a step would
+    /// hold more than `budget` runs.
+    pub fn erode(&self, k: u32, budget: usize) -> Result<Self, usize> {
         if k == 0 {
-            return self.clone();
+            return Ok(self.clone());
         }
-        self.along_z(k, false).along_xy(k as usize, 0, false).along_xy(k as usize, 1, false)
+        self.along_z(k, false, budget)?.along_xy(k as usize, 0, false, budget)?.along_xy(k as usize, 1, false, budget)
     }
 
-    /// Dilation by a cube of half-size `k` voxels.
-    #[must_use]
-    pub fn dilate(&self, k: u32) -> Self {
+    /// Dilation by a cube of half-size `k` voxels (see [`Occupancy::erode`] for the budget).
+    pub fn dilate(&self, k: u32, budget: usize) -> Result<Self, usize> {
         if k == 0 {
-            return self.clone();
+            return Ok(self.clone());
         }
-        self.along_z(k, true).along_xy(k as usize, 0, true).along_xy(k as usize, 1, true)
+        self.along_z(k, true, budget)?.along_xy(k as usize, 0, true, budget)?.along_xy(k as usize, 1, true, budget)
     }
 
     /// Closing then opening by a cube of half-size `k`: the solid loses every tunnel, gap, bridge
     /// and spur at most `2k` voxels wide and keeps what is at least `2k + 1` wide.
-    #[must_use]
-    pub fn close_open(&self, k: u32) -> Self {
-        self.dilate(k).erode(k).erode(k).dilate(k)
+    pub fn close_open(&self, k: u32, budget: usize) -> Result<Self, usize> {
+        self.dilate(k, budget)?.erode(k, budget)?.erode(k, budget)?.dilate(k, budget)
     }
 
     /// One pass that fills a voxel wherever two inside voxels touch only along an edge (a 2 × 2
     /// block of voxels in a checkerboard): the surface of such a set is not a manifold. Returns the
     /// new set and the number of voxels added.
-    fn fill_diagonals_once(&self) -> (Self, u64) {
-        let grown = self.transform(|o, i, j, out| {
+    fn fill_diagonals_once(&self, budget: usize) -> Result<(Self, u64), usize> {
+        let grown = self.transform(budget, |o, i, j, out| {
             out.extend_from_slice(o.column(i, j));
             let own = o.column(i, j).to_vec();
             // along z: a neighbour column's run ends where an own run starts
@@ -299,25 +300,24 @@ impl Occupancy {
                 merge_sorted(&mut outside);
                 subtract(&both, &outside, out);
             }
-        });
+        })?;
         let added = grown.voxel_count().saturating_sub(self.voxel_count());
-        (grown, added)
+        Ok((grown, added))
     }
 
     /// Repeats [`Occupancy::fill_diagonals_once`] until nothing is added (at most `rounds` times);
     /// returns the set, the voxels added and whether it settled.
-    #[must_use]
-    pub fn fill_diagonals(&self, rounds: usize) -> (Self, u64, bool) {
+    pub fn fill_diagonals(&self, rounds: usize, budget: usize) -> Result<(Self, u64, bool), usize> {
         let (mut cur, mut total) = (self.clone(), 0u64);
         for _ in 0..rounds {
-            let (next, added) = cur.fill_diagonals_once();
+            let (next, added) = cur.fill_diagonals_once(budget)?;
             total += added;
             cur = next;
             if added == 0 {
-                return (cur, total, true);
+                return Ok((cur, total, true));
             }
         }
-        (cur, total, false)
+        Ok((cur, total, false))
     }
 
     /// The runs of both columns that differ: `(from, to, upper)` voxel ranges where exactly one of
@@ -339,6 +339,8 @@ impl Occupancy {
 mod tests {
     use super::*;
 
+    const BIG: usize = usize::MAX / 2;
+
     fn block(n: usize, lo: usize, hi: usize) -> Occupancy {
         let cols =
             (lo..hi).flat_map(|j| (lo..hi).map(move |i| ((j * n + i) as u32, vec![[lo as u32, hi as u32]]))).collect();
@@ -348,18 +350,34 @@ mod tests {
     #[test]
     fn closing_and_opening_keep_a_thick_block_and_remove_a_thin_one() {
         let thick = block(24, 6, 18);
-        assert_eq!(thick.close_open(1).voxel_count(), thick.voxel_count());
+        assert_eq!(thick.close_open(1, BIG).unwrap().voxel_count(), thick.voxel_count());
         let thin = block(24, 6, 8);
-        assert_eq!(thin.close_open(1).voxel_count(), 0);
+        assert_eq!(thin.close_open(1, BIG).unwrap().voxel_count(), 0);
         let three = block(24, 6, 9);
-        assert_eq!(three.close_open(1).voxel_count(), three.voxel_count());
+        assert_eq!(three.close_open(1, BIG).unwrap().voxel_count(), three.voxel_count());
     }
 
     #[test]
     fn dilation_grows_a_cube_by_k_on_every_side() {
         let b = block(24, 8, 12);
-        assert_eq!(b.dilate(2).voxel_count(), 8 * 8 * 8);
-        assert_eq!(b.dilate(2).erode(2).voxel_count(), b.voxel_count());
+        assert_eq!(b.dilate(2, BIG).unwrap().voxel_count(), 8 * 8 * 8);
+        assert_eq!(b.dilate(2, BIG).unwrap().erode(2, BIG).unwrap().voxel_count(), b.voxel_count());
+    }
+
+    #[test]
+    fn a_run_budget_stops_a_solid_whose_runs_multiply_and_reports_the_count() {
+        // a stack of thin layers, every second voxel: runs along z in every column
+        let cols: Vec<(u32, Vec<Run>)> = (4..20usize)
+            .flat_map(|j| {
+                (4..20usize).map(move |i| ((j * 24 + i) as u32, (0..8u32).map(|l| [2 * l, 2 * l + 1]).collect()))
+            })
+            .collect();
+        let o = Occupancy::from_columns(24, 24, 24, cols);
+        assert_eq!(o.run_count(), 16 * 16 * 8);
+        let need = o.dilate(1, BIG).unwrap().run_count();
+        assert!(need >= 16 * 16, "{need}");
+        let r = o.close_open(1, 100);
+        assert!(matches!(r, Err(n) if n > 100), "{r:?}");
     }
 
     #[test]
@@ -374,14 +392,14 @@ mod tests {
         }
         let o = Occupancy::from_columns(24, 24, 24, cols);
         assert!(!o.contains(12, 12, 10));
-        assert!(o.close_open(1).contains(12, 12, 10));
+        assert!(o.close_open(1, BIG).unwrap().contains(12, 12, 10));
     }
 
     #[test]
     fn diagonal_contacts_are_filled() {
         let cols = vec![(2 * 8 + 2, vec![[2u32, 4u32]]), (3 * 8 + 3, vec![[2u32, 4u32]])];
         let o = Occupancy::from_columns(8, 8, 8, cols);
-        let (filled, added, settled) = o.fill_diagonals(4);
+        let (filled, added, settled) = o.fill_diagonals(4, BIG).unwrap();
         assert!(settled && added > 0);
         let both = filled.contains(3, 2, 2) || filled.contains(2, 3, 2);
         assert!(both);

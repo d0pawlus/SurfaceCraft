@@ -43,8 +43,12 @@ pub use surface::split_pinched_vertices;
 const MIN_BORDER: usize = 3;
 /// Largest half-size of the closing and opening cube (voxels).
 const MAX_K: u32 = 4;
+/// Runs held at once never exceed this (the offsets of the column index are 32-bit).
+const RUN_BUDGET_MAX: usize = 1 << 30;
 /// Closing rounds that remove checkerboard voxel blocks.
 const DIAGONAL_ROUNDS: usize = 12;
+/// More than this share of the tested triangles crossing another one refuses the result.
+const MAX_SELF_INTERSECTION_SHARE: f64 = 0.01;
 /// Triangles of the result tested for self-intersection.
 const SELF_INTERSECTION_SAMPLES: usize = 3000;
 /// Samples of each surface in the deviation report.
@@ -177,6 +181,14 @@ pub enum RemeshError {
     /// No solid came out.
     #[error("the scan encloses no volume at this voxel size")]
     NoSolid,
+    /// The projection left the surface crossing itself.
+    #[error(
+        "{share:.1} % of a sample of the triangles of the result cross another one: the voxel is too coarse for this scan or the scan too noisy; use a finer voxel"
+    )]
+    SelfIntersecting {
+        /// Percent of the sample.
+        share: f64,
+    },
     /// The surface could not be made manifold.
     #[error("the surface could not be made manifold: {0}")]
     NotManifold(String),
@@ -273,12 +285,41 @@ pub struct RemeshReport {
     pub removed_share: f64,
     /// Duplicate triangles dropped before the remesh.
     pub duplicate_triangles: usize,
+    /// Milliseconds the smoothing and projection took (0 where there is no clock).
+    pub fit_ms: u64,
     /// Triangles of the result that cross another one (of an even sample) after the projection.
     pub self_intersections: usize,
     /// Triangles tested for that.
     pub self_intersection_samples: usize,
     /// What the caller should know (thin features removed).
     pub warnings: Vec<String>,
+}
+
+/// Wall-clock time of a stage; zero where the clock is not available (the browser build).
+struct Clock(#[cfg(not(target_arch = "wasm32"))] std::time::Instant);
+
+impl Clock {
+    fn start() -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Self(std::time::Instant::now())
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Self()
+        }
+    }
+
+    fn ms(&self) -> u64 {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.0.elapsed().as_millis() as u64
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            0
+        }
+    }
 }
 
 fn check(p: &Params) -> Result<(), RemeshError> {
@@ -353,7 +394,8 @@ struct Solid {
 fn solid_of(work: &Mesh, h: f64, k: u32, limits: &Limits) -> Result<Solid, RemeshError> {
     let grid = Grid::new(&work.bbox(), h, MIN_BORDER + 2 * k as usize)?;
     let columns = grid::cell_product(grid.nx, grid.ny);
-    if columns > limits.max_columns as u64 {
+    // the column index has 32-bit offsets and keys: never more than 2^31 columns, whatever the limit says
+    if columns > (limits.max_columns as u64).min(1 << 31) {
         let advice = "use a larger voxel".to_string();
         let needed = usize::try_from(columns).unwrap_or(usize::MAX);
         return Err(RemeshError::TooMuchWork {
@@ -363,11 +405,13 @@ fn solid_of(work: &Mesh, h: f64, k: u32, limits: &Limits) -> Result<Solid, Remes
             advice,
         });
     }
-    // every voxel face of the boundary covers at most h² of the area: the area bounds the quads from below
+    // a rough bound before any voxel is built: a smooth surface has about area / h² quads and up to
+    // 3 times that when it is oblique (a doubled shell or noise add more), so only more than 4 times
+    // the limit is refused here; the real count is checked before the quads are allocated
     let quads = work.area() / (h * h);
-    if quads > limits.max_quads as f64 {
+    if quads > 4.0 * limits.max_quads as f64 {
         let (needed, advice) = (quads as usize, "use a larger voxel".to_string());
-        let what = "surface quads (at least, from the area and the voxel, before any voxel is built)".into();
+        let what = "surface quads (estimated from the area and the voxel, before any voxel is built)".into();
         return Err(RemeshError::TooMuchWork { what, needed, limit: limits.max_quads, advice });
     }
     let flipped = signed_volume(work) < 0.0;
@@ -378,7 +422,15 @@ fn solid_of(work: &Mesh, h: f64, k: u32, limits: &Limits) -> Result<Solid, Remes
     if raw.voxel_count() == 0 {
         return Err(RemeshError::NoSolid);
     }
-    let (occ, diagonal_voxels, settled) = raw.close_open(k).fill_diagonals(DIAGONAL_ROUNDS);
+    let budget = (4 * limits.max_crossings).min(RUN_BUDGET_MAX);
+    let runs = |n: usize| RemeshError::TooMuchWork {
+        what: "runs of the solid after dilation or erosion".into(),
+        needed: n,
+        limit: budget,
+        advice: "use a larger voxel or a smaller `min_feature`".into(),
+    };
+    let closed = raw.close_open(k, budget).map_err(runs)?;
+    let (occ, diagonal_voxels, settled) = closed.fill_diagonals(DIAGONAL_ROUNDS, budget).map_err(runs)?;
     if !settled {
         return Err(RemeshError::NotManifold("checkerboard contacts between voxels did not settle".into()));
     }
@@ -427,7 +479,9 @@ pub fn remesh(mesh: &Mesh, p: &Params) -> Result<(Mesh, RemeshReport), RemeshErr
         peak_bytes: 8 * solid.raster.crossings + solid.raw_bytes + 60 * net.triangle_count() / 2,
         ..Default::default()
     };
+    let clock = Clock::start();
     let out = fit_to_scan(net, &prep.work, h, p, &mut report);
+    report.fit_ms = clock.ms();
     finish(out, &prep.work, &bvh, h, k, p.tolerance, &mut report)
 }
 
@@ -438,7 +492,8 @@ fn fit_to_scan(net: Mesh, scan: &Mesh, h: f64, p: &Params, report: &mut RemeshRe
     let normals = smooth.vertex_normals();
     let mut samples = scan.positions.clone();
     samples.extend((0..scan.triangle_count()).filter_map(|i| scan.face_centroid(i)));
-    let radius = (FIT_RADIUS_EDGES * fit::median_edge(&scan.positions, &scan.triangles)).clamp(3.0 * h, FIT_RADIUS_MAX);
+    let radius = (FIT_RADIUS_EDGES * fit::median_edge(&scan.positions, &scan.triangles))
+        .clamp(3.0 * h, FIT_RADIUS_MAX.max(3.0 * h));
     let tree = KdTree::build(&samples);
     let fit = fit::Fit { radius, height: 0.5 * p.tolerance, max_move: 3.0 * h };
     let moved = fit::project(&smooth.positions, &normals, &tree, &fit, h);
@@ -474,6 +529,15 @@ fn finish(
     let crossing = nesting::sampled_self_intersections(&out, &result_bvh, SELF_INTERSECTION_SAMPLES);
     report.self_intersections = crossing.crossing;
     report.self_intersection_samples = crossing.tested;
+    let share = crossing.crossing as f64 / crossing.tested.max(1) as f64;
+    if share > MAX_SELF_INTERSECTION_SHARE {
+        return Err(RemeshError::SelfIntersecting { share: 100.0 * share });
+    }
+    if crossing.crossing > 0 {
+        let msg =
+            format!("{} of {} sampled triangles of the result cross another one", crossing.crossing, crossing.tested);
+        report.warnings.push(msg);
+    }
     report.triangles = out.triangle_count();
     Ok((out, report.clone()))
 }

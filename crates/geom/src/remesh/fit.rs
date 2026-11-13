@@ -20,9 +20,10 @@ const MIN_WEIGHT: f64 = 1e-3;
 const EDGE_SAMPLES: usize = 20_000;
 /// Scan vertices used per fit at most (a dense scan would otherwise cost thousands per vertex).
 const MAX_NEIGHBOURS: usize = 160;
-/// The quadric is fitted only when the smallest eigenvalue of the normal equations is at least this
-/// share of the largest: a degenerate neighbourhood (points on a line) gets the weighted mean instead.
-const MIN_CONDITION: f64 = 1e-7;
+/// The quadric is fitted only when the smallest pivot of the Cholesky factor of the normal equations is
+/// at least this share of the largest (a condition of about 1e-7): a degenerate neighbourhood (points
+/// on a line) gets the weighted mean instead.
+const MIN_PIVOT_RATIO: f64 = 3e-4;
 
 /// Neighbours of every vertex in compressed form.
 pub(super) struct Rings {
@@ -116,11 +117,9 @@ pub(super) struct Fit {
     pub max_move: f64,
 }
 
-/// Is the 6 x 6 system far enough from singular for the fit to mean something?
-fn well_conditioned(ata: &SMatrix<f64, TERMS, TERMS>) -> bool {
-    let e = ata.symmetric_eigen().eigenvalues;
-    let (lo, hi) = (e.min(), e.max());
-    hi > 0.0 && lo >= MIN_CONDITION * hi
+/// Are the pivots of the factor far enough from zero for the fit to mean something?
+fn pivots_ok(d: &SVector<f64, TERMS>) -> bool {
+    d.max() > 0.0 && d.min() >= MIN_PIVOT_RATIO * d.max()
 }
 
 /// Height of the quadric fitted around `p` (frame `n`, `t1`, `t2`), and its gradient `(c1, c2)`.
@@ -151,8 +150,9 @@ fn quadric(p: &Point3, frame: &(Vec3, Vec3, Vec3), scan: &KdTree, fit: &Fit, rob
         return None;
     }
     if used >= MIN_QUADRIC_POINTS
-        && well_conditioned(&ata)
-        && let Some(c) = ata.lu().solve(&atb)
+        && let Some(chol) = ata.cholesky()
+        && pivots_ok(&chol.l().diagonal())
+        && let c = chol.solve(&atb)
         && c.iter().all(|x| x.is_finite())
     {
         return Some((c[0] * rho, c[1], c[2]));
@@ -201,6 +201,15 @@ mod tests {
         let out = project(&start, &normals, &tree, &fit, 0.3);
         let worst = out.iter().map(|p| p.z.abs()).fold(0.0, f64::max);
         assert!(worst < 0.03, "{worst}");
+    }
+
+    #[test]
+    fn points_on_a_line_give_a_bounded_answer_not_an_arbitrary_quadric() {
+        let line: Vec<Point3> = (0..40).map(|k| Point3::new(0.05 * k as f64, 0.0, 0.0)).collect();
+        let tree = KdTree::build(&line);
+        let fit = Fit { radius: 1.0, height: 0.1, max_move: 0.5 };
+        let out = project(&[Point3::new(1.0, 0.01, 0.05)], &[Vec3::z()], &tree, &fit, 0.3);
+        assert!(out[0].coords.iter().all(|x| x.is_finite()) && (out[0] - Point3::new(1.0, 0.01, 0.05)).norm() <= 0.5);
     }
 
     #[test]

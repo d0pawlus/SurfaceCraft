@@ -62,34 +62,58 @@ fn to_grid(g: &Grid, p: &Point3) -> [f64; 3] {
     [(p.x - g.origin.x) / g.h - 0.5, (p.y - g.origin.y) / g.h - 0.5, (p.z - g.origin.z) / g.h - 0.5]
 }
 
-/// The columns under the box of a triangle: `(i0, i1, j0, j1)`, clipped to the grid.
-fn column_box(g: &Grid, t: &[[f64; 3]; 3]) -> Option<(usize, usize, usize, usize)> {
-    let range = |lo: f64, hi: f64, jit: f64, n: usize| -> Option<(usize, usize)> {
-        let (first, last) = ((lo - jit).ceil().max(0.0), (hi - jit).floor().min(n as f64 - 1.0));
-        (first <= last).then_some((first as usize, last as usize))
-    };
-    let (xs, ys) = (t.map(|v| v[0]), t.map(|v| v[1]));
-    let (i0, i1) = range(xs[0].min(xs[1]).min(xs[2]), xs[0].max(xs[1]).max(xs[2]), JITTER.0, g.nx)?;
-    let (j0, j1) = range(ys[0].min(ys[1]).min(ys[2]), ys[0].max(ys[1]).max(ys[2]), JITTER.1, g.ny)?;
-    Some((i0, i1, j0, j1))
+/// The rows (`j0..=j1`) the triangle reaches, clipped to the grid.
+fn row_range(g: &Grid, t: &[[f64; 3]; 3]) -> Option<(usize, usize)> {
+    let ys = t.map(|v| v[1]);
+    let (lo, hi) = (ys[0].min(ys[1]).min(ys[2]), ys[0].max(ys[1]).max(ys[2]));
+    let (first, last) = ((lo - JITTER.1).ceil().max(0.0), (hi - JITTER.1).floor().min(g.ny as f64 - 1.0));
+    (first <= last).then_some((first as usize, last as usize))
 }
 
-/// Cells under the box of a triangle (0 for none).
-fn box_cells(g: &Grid, t: &[[f64; 3]; 3]) -> u64 {
-    column_box(g, t).map_or(0, |(i0, i1, j0, j1)| ((i1 - i0 + 1) as u64).saturating_mul((j1 - j0 + 1) as u64))
+/// The columns `i0..=i1` the triangle covers on row `j`, from the exact x-interval of its projection
+/// on the line of the rays of that row (not from its box: a long diagonal sliver has a box of L² cells
+/// and L crossings), clipped to the grid.
+fn row_columns(g: &Grid, t: &[[f64; 3]; 3], j: usize) -> Option<(usize, usize)> {
+    let y = j as f64 + JITTER.1;
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for k in 0..3 {
+        let (p, q) = (t[k], t[(k + 1) % 3]);
+        if !((p[1] <= y && y <= q[1]) || (q[1] <= y && y <= p[1])) {
+            continue;
+        }
+        if p[1] == q[1] {
+            lo = lo.min(p[0].min(q[0]));
+            hi = hi.max(p[0].max(q[0]));
+        } else {
+            let x = p[0] + (q[0] - p[0]) * (y - p[1]) / (q[1] - p[1]);
+            lo = lo.min(x);
+            hi = hi.max(x);
+        }
+    }
+    let (first, last) = ((lo - JITTER.0).ceil().max(0.0), (hi - JITTER.0).floor().min(g.nx as f64 - 1.0));
+    (first <= last).then_some((first as usize, last as usize))
 }
 
-/// Appends the crossings of the columns under triangle `t`.
-fn rasterise(g: &Grid, t: [[f64; 3]; 3], flip: bool, out: &mut Vec<u64>) {
+/// Columns the rays of the rows reach under the triangle: an upper bound of its crossings.
+fn span_cells(g: &Grid, t: &[[f64; 3]; 3]) -> u64 {
+    let Some((j0, j1)) = row_range(g, t) else { return 0 };
+    (j0..=j1).filter_map(|j| row_columns(g, t, j)).fold(0u64, |acc, (i0, i1)| acc.saturating_add((i1 - i0 + 1) as u64))
+}
+
+/// Appends the crossings of the columns under triangle `t`, row by row; stops when `made` (crossings
+/// of all tasks so far, this one's included after each row) passes `limit`.
+fn rasterise(g: &Grid, t: [[f64; 3]; 3], flip: bool, out: &mut Vec<u64>, budget: (&AtomicUsize, usize)) {
     let xy = |v: &[f64; 3]| (v[0], v[1]);
     let (a, b, c) = (xy(&t[0]), xy(&t[1]), xy(&t[2]));
     let det = (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
     if !(det.is_finite() && det != 0.0) {
         return;
     }
-    let Some((i0, i1, j0, j1)) = column_box(g, &t) else { return };
+    let Some((j0, j1)) = row_range(g, &t) else { return };
     let enter = (det < 0.0) != flip;
     for j in j0..=j1 {
+        let Some((i0, i1)) = row_columns(g, &t, j) else { continue };
+        let before = out.len();
         for i in i0..=i1 {
             let p = (i as f64 + JITTER.0, j as f64 + JITTER.1);
             let (e0, e1, e2) = (edge(a, b, p), edge(b, c, p), edge(c, a, p));
@@ -101,6 +125,10 @@ fn rasterise(g: &Grid, t: [[f64; 3]; 3], flip: bool, out: &mut Vec<u64>) {
             let col = (j as u64) * (g.nx as u64) + i as u64;
             out.push(col << 33 | u64::from(ordered(z)) << 1 | u64::from(enter));
         }
+        let made = budget.0.fetch_add(out.len() - before, Ordering::Relaxed) + (out.len() - before);
+        if made > budget.1 {
+            return;
+        }
     }
 }
 
@@ -108,33 +136,33 @@ fn triangle_of(mesh: &Mesh, g: &Grid, ti: usize) -> Option<[[f64; 3]; 3]> {
     mesh.triangle(ti).map(|[p, q, r]| [to_grid(g, &p), to_grid(g, &q), to_grid(g, &r)])
 }
 
-/// Upper bound of the crossings: the cells under the boxes of all triangles.
+/// Upper bound of the crossings: the columns under the exact row spans of all triangles.
 fn crossing_bound(mesh: &Mesh, g: &Grid) -> u64 {
     let chunks = mesh.triangle_count().div_ceil(CHUNK);
     par::map(chunks, |c| {
         let lo = c * CHUNK;
         (lo..(lo + CHUNK).min(mesh.triangle_count()))
             .filter_map(|ti| triangle_of(mesh, g, ti))
-            .fold(0u64, |acc, t| acc.saturating_add(box_cells(g, &t)))
+            .fold(0u64, |acc, t| acc.saturating_add(span_cells(g, &t)))
     })
     .into_iter()
     .fold(0u64, u64::saturating_add)
 }
 
 /// The crossings of all triangles, sorted by column, then z, then kind. Refused before anything is
-/// allocated when the boxes of the triangles could hold more than [`WORK_FACTOR`] times `limit`, and
-/// stopped as soon as `limit` is passed, so memory stays bounded for any input. The refusal reports the
-/// bound, which does not depend on the thread count.
+/// allocated when the row spans of the triangles could hold more than [`WORK_FACTOR`] times `limit`, and
+/// stopped within a row of the moment `limit` is passed, so memory stays bounded for any input. The
+/// refusals report the bound, which does not depend on the thread count.
 fn crossings(mesh: &Mesh, g: &Grid, flip: bool, limit: usize) -> Result<Vec<u64>, RemeshError> {
     let bound = crossing_bound(mesh, g);
-    let refuse = || RemeshError::TooMuchWork {
-        what: "ray crossings (at most, counted from the boxes of the triangles)".into(),
+    let refuse = |what: &str| RemeshError::TooMuchWork {
+        what: what.into(),
         needed: usize::try_from(bound).unwrap_or(usize::MAX),
         limit,
         advice: "use a larger voxel".into(),
     };
     if bound > (limit as u64).saturating_mul(WORK_FACTOR) {
-        return Err(refuse());
+        return Err(refuse("ray crossings (at most, counted from the rows of the triangles, before any is made)"));
     }
     let chunks = mesh.triangle_count().div_ceil(CHUNK);
     let (mut all, count): (Vec<u64>, AtomicUsize) = (Vec::new(), AtomicUsize::new(0));
@@ -146,16 +174,14 @@ fn crossings(mesh: &Mesh, g: &Grid, flip: bool, limit: usize) -> Result<Vec<u64>
                 if count.load(Ordering::Relaxed) > limit {
                     break;
                 }
-                let before = out.len();
                 if let Some(t) = triangle_of(mesh, g, ti) {
-                    rasterise(g, t, flip, &mut out);
+                    rasterise(g, t, flip, &mut out, (&count, limit));
                 }
-                count.fetch_add(out.len() - before, Ordering::Relaxed);
             }
             out
         });
         if count.load(Ordering::Relaxed) > limit {
-            return Err(refuse());
+            return Err(refuse("ray crossings (stopped while they were made)"));
         }
         for p in part {
             all.extend(p);
@@ -277,8 +303,49 @@ mod tests {
         let g = Grid::new(&m.bbox(), 0.1, 3).unwrap();
         match solid(&m, &g, false, 1000) {
             Err(RemeshError::TooMuchWork { what, needed, .. }) => {
-                assert!(what.contains("boxes of the triangles"), "{what}");
+                assert!(what.contains("before any is made"), "{what}");
                 assert!(needed > 4000 * 1000, "{needed}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A flat square fanned into slivers that each run the whole width: boxes of L² cells, L crossings.
+    #[test]
+    fn a_fan_of_full_width_slivers_passes_and_a_dense_scan_passes_the_pre_check() {
+        let n = 160usize;
+        let mut m = Mesh::default();
+        m.positions.push(Point3::new(0.0, 0.0, 0.0));
+        for k in 0..=n {
+            m.positions.push(Point3::new(300.0, 300.0 * k as f64 / n as f64, 0.0));
+        }
+        for k in 0..n as u32 {
+            m.triangles.push([0, k + 1, k + 2]);
+        }
+        let g = Grid::new(&m.bbox(), 0.3, 3).unwrap();
+        assert!(crossing_bound(&m, &g) < 3_000_000, "{}", crossing_bound(&m, &g));
+        let (_, stats) = solid(&m, &g, false, 40_000_000).unwrap();
+        assert!(stats.crossings > 400_000 && stats.crossings < 1_200_000, "{}", stats.crossings);
+        let dense = synth::sphere(Point3::origin(), 150.0, 1000, 500);
+        let g = Grid::new(&dense.bbox(), 0.3, 3).unwrap();
+        assert!(dense.triangle_count() >= 998_000);
+        assert!(crossing_bound(&dense, &g) <= 4 * 40_000_000);
+    }
+
+    #[test]
+    fn a_limit_between_the_real_crossings_and_the_bound_stops_the_run_while_it_runs() {
+        let mut m = synth::sphere(Point3::origin(), 10.0, 64, 32);
+        m.weld(1e-9);
+        let g = grid_for(&m, 0.5);
+        let (_, stats) = solid(&m, &g, false, usize::MAX / 8).unwrap();
+        let bound = crossing_bound(&m, &g);
+        assert!(bound >= stats.crossings as u64);
+        let limit = stats.crossings - 1;
+        assert!(bound <= 4 * limit as u64, "the pre-check must pass for the runtime stop to be reached");
+        match solid(&m, &g, false, limit) {
+            Err(RemeshError::TooMuchWork { what, needed, .. }) => {
+                assert!(what.contains("stopped while they were made"), "{what}");
+                assert_eq!(needed as u64, bound);
             }
             other => panic!("{other:?}"),
         }

@@ -95,7 +95,8 @@ fn corner_of(mesh: &Mesh, tri: u32, vertex: u32) -> u32 {
     tri * 3 + k as u32
 }
 
-fn edge_facts(mesh: &Mesh, piece_of: &[u32], pieces: usize) -> EdgeFacts {
+/// Every directed edge with its triangle and direction bit, sorted by the undirected edge.
+fn half_edges(mesh: &Mesh) -> Vec<(u64, u32)> {
     let mut half: Vec<(u64, u32)> = Vec::with_capacity(mesh.triangles.len() * 3);
     for (ti, t) in mesh.triangles.iter().enumerate() {
         for k in 0..3 {
@@ -106,6 +107,30 @@ fn edge_facts(mesh: &Mesh, piece_of: &[u32], pieces: usize) -> EdgeFacts {
         }
     }
     par::sort_unstable(&mut half);
+    half
+}
+
+/// An edge of two triangles `(first, second)`: counts it unoriented when both run the same way and
+/// joins the corners of its two vertices.
+fn pair_edge(mesh: &Mesh, f: &mut EdgeFacts, piece: usize, (first, second): (u32, u32), (a, b): (u32, u32)) {
+    if (first & 1) == (second & 1)
+        && let Some(u) = f.unoriented.get_mut(piece)
+    {
+        *u += 1;
+    }
+    for v in [a, b] {
+        let (x, y) = (corner_of(mesh, first >> 1, v), corner_of(mesh, second >> 1, v));
+        let (rx, ry) = (find(&mut f.corners, x), find(&mut f.corners, y));
+        if rx != ry
+            && let Some(slot) = f.corners.get_mut(ry as usize)
+        {
+            *slot = rx;
+        }
+    }
+}
+
+fn edge_facts(mesh: &Mesh, piece_of: &[u32], pieces: usize) -> EdgeFacts {
+    let half = half_edges(mesh);
     let mut f = EdgeFacts {
         boundary: Vec::new(),
         non_manifold: vec![0; pieces],
@@ -116,29 +141,14 @@ fn edge_facts(mesh: &Mesh, piece_of: &[u32], pieces: usize) -> EdgeFacts {
     let mut i = 0;
     while let Some(&(key, first)) = half.get(i) {
         let run = half.get(i..).map_or(0, |r| r.iter().take_while(|h| h.0 == key).count());
-        let (a, b) = ((key >> 32) as u32, (key & 0xffff_ffff) as u32);
+        let ends = ((key >> 32) as u32, (key & 0xffff_ffff) as u32);
         let piece = piece_of.get((first >> 1) as usize).copied().unwrap_or(0) as usize;
         if let Some(e) = f.edges.get_mut(piece) {
             *e += 1;
         }
         match (run, half.get(i + 1)) {
-            (1, _) => f.boundary.push((a, b, piece as u32)),
-            (2, Some(&(_, second))) => {
-                if (first & 1) == (second & 1)
-                    && let Some(u) = f.unoriented.get_mut(piece)
-                {
-                    *u += 1;
-                }
-                for v in [a, b] {
-                    let (x, y) = (corner_of(mesh, first >> 1, v), corner_of(mesh, second >> 1, v));
-                    let (rx, ry) = (find(&mut f.corners, x), find(&mut f.corners, y));
-                    if rx != ry
-                        && let Some(slot) = f.corners.get_mut(ry as usize)
-                    {
-                        *slot = rx;
-                    }
-                }
-            }
+            (1, _) => f.boundary.push((ends.0, ends.1, piece as u32)),
+            (2, Some(&(_, second))) => pair_edge(mesh, &mut f, piece, (first, second), ends),
             _ => {
                 if let Some(n) = f.non_manifold.get_mut(piece) {
                     *n += 1;
