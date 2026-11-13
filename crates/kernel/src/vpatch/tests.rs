@@ -585,6 +585,10 @@ fn the_largest_accepted_net_solves_within_the_bound() {
     let started = std::time::Instant::now();
     let sol = solve(&p).unwrap();
     let took = started.elapsed().as_secs_f64();
-    println!("COST largest accepted: 24 x 24, {} hard rows, estimate {est:.1} s, took {took:.2} s, rank {}", p.hard_scalar_rows(), sol.rank);
+    println!(
+        "COST largest accepted: 24 x 24, {} hard rows, estimate {est:.1} s, took {took:.2} s, rank {}",
+        p.hard_scalar_rows(),
+        sol.rank
+    );
     assert!(took <= 1.5 * MAX_SOLVE_SECONDS, "took {took:.1} s against an estimate of {est:.1} s");
 }

@@ -73,7 +73,8 @@ pub(super) fn build(i: Inputs) -> Report {
     } else if m.points < 3 * best.net[0] * best.net[1] {
         warnings.push(WARN_FEW_DATA.to_string());
     }
-    if (best.net[0] >= max || best.net[1] >= max) && (best.net != i.start_net || !(within_tolerance && within_targets)) {
+    if (best.net[0] >= max || best.net[1] >= max) && (best.net != i.start_net || !(within_tolerance && within_targets))
+    {
         warnings.push(WARN_MAX_CONTROL.to_string());
     }
     if let Some(stop) = i.outcome.stop {
@@ -95,7 +96,8 @@ pub(super) fn build(i: Inputs) -> Report {
         warnings.push(format!("interior points or curves miss the patch by up to {:.4} mm", m.hard_max));
     }
     if m.interior_folded {
-        warnings.push("the patch folds over inside the outline (its normal turns past the outline's plane)".to_string());
+        warnings
+            .push("the patch folds over inside the outline (its normal turns past the outline's plane)".to_string());
     }
     if !residual_ok {
         warnings.push(format!(

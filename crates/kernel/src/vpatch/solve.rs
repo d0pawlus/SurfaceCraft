@@ -2,8 +2,8 @@
 
 use super::{LinRow, RANK_TOL};
 use crate::{Result, op_err, poll};
-use surfacecraft_geom::Cancel;
 use nalgebra::{DMatrix, SVD};
+use surfacecraft_geom::Cancel;
 
 fn all_finite(m: &DMatrix<f64>) -> bool {
     m.iter().all(|v| v.is_finite())

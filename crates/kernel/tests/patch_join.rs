@@ -182,6 +182,7 @@ fn request(v: &Variant) -> Request {
         control: None,
         max_control: 16,
         conflicts: Conflicts::Relax,
+        side_ids: Vec::new(),
     }
 }
 

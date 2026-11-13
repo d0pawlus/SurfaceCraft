@@ -184,7 +184,8 @@ fn triangles_of_a_mesh_are_the_data() {
             .collect()
     };
     let (a, b, c, d) = ([10.0, 8.0], [50.0, 8.0], [50.0, 32.0], [10.0, 32.0]);
-    let sides: Vec<Value> = [(a, b), (b, c), (c, d), (d, a)].iter().map(|&(p, q)| json!({"points": line(p, q)})).collect();
+    let sides: Vec<Value> =
+        [(a, b), (b, c), (c, d), (d, a)].iter().map(|&(p, q)| json!({"points": line(p, q)})).collect();
     let mut s = Session::new();
     s.doc.add_mesh("scan", m);
     let r = s.execute("surface.patch", json!({"sides": sides, "mesh": "scan", "triangles": ids})).unwrap();

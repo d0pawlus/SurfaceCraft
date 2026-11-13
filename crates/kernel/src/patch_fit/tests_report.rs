@@ -97,7 +97,8 @@ fn messages_name_the_callers_side() {
     req.control = Some([4, 4]);
     req.max_control = 4;
     let report = fit_patch(&req).unwrap().report;
-    let id_of = |w: &String| w.strip_prefix("side ").and_then(|r| r.split(':').next()).and_then(|n| n.parse::<usize>().ok());
+    let id_of =
+        |w: &String| w.strip_prefix("side ").and_then(|r| r.split(':').next()).and_then(|n| n.parse::<usize>().ok());
     let ids: Vec<usize> = report.warnings.iter().filter_map(id_of).collect();
     assert!(!ids.is_empty() && ids.iter().all(|i| (7..=11).contains(i)), "{:?}", report.warnings);
     // a side 3 mm off its reference face: the error names the side and hints at adjacency
@@ -111,5 +112,3 @@ fn messages_name_the_callers_side() {
     let err = fit_patch(&off).unwrap_err().to_string();
     assert!(err.contains("side 9") && err.contains("reference face"), "{err}");
 }
-
-

@@ -3,10 +3,10 @@
 use super::Continuity;
 use super::geom::{V2, V3, add, dot, scale, thin_indices, unit};
 use super::reference::RefSample;
+use super::start::named;
 use super::start::{Interior, Loop};
 use crate::record::brep::Surface;
 use crate::vpatch::{DataPoint, Problem, Row, derivatives};
-use super::start::named;
 use crate::{KernelError, Result, poll};
 use surfacecraft_geom::Cancel;
 

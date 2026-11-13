@@ -229,6 +229,7 @@ fn build(s: &Setup) -> Built {
         control: s.control,
         max_control: 16,
         conflicts: Conflicts::Relax,
+        side_ids: Vec::new(),
     };
     Built { req, eval, outline: poly }
 }

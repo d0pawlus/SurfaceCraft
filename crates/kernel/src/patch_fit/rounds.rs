@@ -5,7 +5,8 @@ use super::measure::{self, Goal, Measure};
 use super::rows::{self, Inputs, Layout, SideSamples, Zone};
 use super::start::{Interior, Loop};
 use super::{
-    Continuity, G0_TARGET, G2_TARGET_REL, MAX_ROUNDS, MIN_IMPROVEMENT, Request, Round, Summary, grow, grow_other, prefer,
+    Continuity, G0_TARGET, G2_TARGET_REL, MAX_ROUNDS, MIN_IMPROVEMENT, Request, Round, Summary, grow, grow_other,
+    prefer,
 };
 use crate::nurbs::SurfaceProbe;
 use crate::record::brep::Surface;
@@ -229,8 +230,7 @@ impl Context<'_> {
         let curv = m.curvature_miss();
         let refine = has_g2
             && !done
-            && (!had_rows
-                || (curv > G2_TARGET_REL && st.prev_curv.is_none_or(|p| p - curv >= MIN_IMPROVEMENT * p)));
+            && (!had_rows || (curv > G2_TARGET_REL && st.prev_curv.is_none_or(|p| p - curv >= MIN_IMPROVEMENT * p)));
         st.prev_curv = had_rows.then_some(curv);
         if st.best.as_ref().is_none_or(|b| prefer(&summary, &b.summary)) {
             st.best = Some(Round {

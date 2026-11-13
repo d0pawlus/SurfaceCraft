@@ -73,10 +73,10 @@ impl RefProbe {
             return Err(arg("the point must be finite"));
         }
         let size = p.iter().fold(1.0_f64, |m, v| m.max(v.abs()));
-        let uv = self
-            .eval
-            .project_with(&self.starts, v3(p), None, ACCEPT_REL * size.min(COORD_LIMIT))
-            .ok_or_else(|| arg("a point of the side does not lie on its reference face (is the face adjacent to the side?)"))?;
+        let uv =
+            self.eval.project_with(&self.starts, v3(p), None, ACCEPT_REL * size.min(COORD_LIMIT)).ok_or_else(|| {
+                arg("a point of the side does not lie on its reference face (is the face adjacent to the side?)")
+            })?;
         let d = self
             .eval
             .partials(uv[0], uv[1])

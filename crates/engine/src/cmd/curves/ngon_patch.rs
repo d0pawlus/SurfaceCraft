@@ -8,9 +8,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use surfacecraft_doc::{ObjectId, SurfaceObject};
 use surfacecraft_fit::features::NgonRegion;
-use surfacecraft_kernel::patch_fit::{Conflicts, Continuity, Patch, Request, Side, fit_patch_cancellable};
 use surfacecraft_geom::Cancel;
 use surfacecraft_kernel::KernelError;
+use surfacecraft_kernel::patch_fit::{Conflicts, Continuity, Patch, Request, Side, fit_patch_cancellable};
 use surfacecraft_kernel::tess::tessellate_all;
 use surfacecraft_kernel::vpatch::DEGREE;
 
