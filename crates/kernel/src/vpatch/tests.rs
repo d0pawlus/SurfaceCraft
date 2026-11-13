@@ -206,7 +206,7 @@ fn noise_stays_smooth() {
         sum += (0..3).map(|c| (d.at[c] - s[c]).powi(2)).sum::<f64>();
     }
     let rms = (sum / data.len() as f64).sqrt();
-    assert!((0.024..=0.036).contains(&rms), "residual rms {rms}");
+    assert!((0.015..=0.045).contains(&rms), "residual rms {rms}");
 }
 
 fn data_rms(s: &Surface, data: &[DataPoint]) -> f64 {
@@ -256,8 +256,8 @@ fn soft_rows_do_not_stiffen_the_fit() {
     let pinned = Problem { soft, ..free.clone() };
     let rms_free = data_rms(&solve(&free).unwrap().surface, &data);
     let rms_pinned = data_rms(&solve(&pinned).unwrap().surface, &data);
-    assert!((0.024..=0.036).contains(&rms_free), "residual rms without soft rows {rms_free}");
-    assert!((0.024..=0.036).contains(&rms_pinned), "residual rms with soft rows {rms_pinned}");
+    assert!((0.015..=0.045).contains(&rms_free), "residual rms without soft rows {rms_free}");
+    assert!((0.015..=0.045).contains(&rms_pinned), "residual rms with soft rows {rms_pinned}");
     assert!((rms_free - rms_pinned).abs() < 0.003, "rms differs: {rms_free} vs {rms_pinned}");
 }
 

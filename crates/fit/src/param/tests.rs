@@ -159,3 +159,28 @@ fn hostile_ids_and_topology_are_errors() {
     assert_eq!(f.flipped, 0);
     assert!(f.distortion_max <= 1e-9, "{}", f.distortion_max);
 }
+
+/// Measurement (ignored): flattening a grid disc of about 400 000 triangles, the largest region
+/// accepted, with the 20 relaxation steps `surface.patch` uses. Measured on the development laptop
+/// (aarch64, `ci` profile): see the printed time.
+#[test]
+#[ignore = "measurement"]
+fn time_of_the_largest_region() {
+    let n: usize = std::env::var("PARAM_N").ok().and_then(|s| s.parse().ok()).unwrap_or(447);
+    let mesh = grid_mesh(n, |_, _| true);
+    let ids = all_ids(&mesh);
+    let started = std::time::Instant::now();
+    let f = flatten(&mesh, &ids, 20).unwrap();
+    println!("PARAM {} triangles: {:.2} s, flipped {}", ids.len(), started.elapsed().as_secs_f64(), f.flipped);
+}
+
+#[test]
+fn a_cancelled_flattening_returns_the_cancellation() {
+    let mesh = grid_mesh(60, |_, _| true);
+    let cancel = Cancel::new();
+    cancel.cancel();
+    assert_eq!(flatten_cancellable(&mesh, &all_ids(&mesh), 20, &cancel).unwrap_err(), CANCELLED);
+    // a token that is not set changes nothing
+    let ok = flatten_cancellable(&mesh, &all_ids(&mesh), 20, &Cancel::new()).unwrap();
+    assert_eq!(ok.flipped, 0);
+}

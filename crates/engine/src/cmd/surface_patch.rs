@@ -352,7 +352,7 @@ fn patch_cmd(s: &mut Session, i: PatchIn) -> CmdResult<PatchOut> {
     let (outline, mut warnings) = sides::chain(resolved, st.gap_tolerance)?;
     warnings.extend(ignored_inputs(&i.sides));
     let scan = data::resolve_scan(s, &i)?;
-    let got = data::gather(scan.as_ref(), &outline, st.gap_tolerance, MAX_DATA, &mut warnings);
+    let got = data::gather(scan.as_ref(), &outline, st.gap_tolerance, MAX_DATA, &mut warnings, &s.cancel)?;
     let order: Vec<usize> = outline.iter().map(|r| r.index).collect();
     let parameters = if got.side_uv.is_some() { "flattened" } else { "plane" };
     let request = Request {

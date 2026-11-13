@@ -6,11 +6,14 @@ use crate::Session;
 use crate::cmd::{CmdError, CmdResult};
 use std::sync::Arc;
 use surfacecraft_doc::{ObjectId, ObjectKind};
-use surfacecraft_fit::param::flatten;
-use surfacecraft_geom::{KdTree, Mesh, Point3};
+use surfacecraft_fit::param::{CANCELLED as FLATTEN_CANCELLED, flatten_cancellable};
+use surfacecraft_geom::{Cancel, KdTree, Mesh, Point3};
 
 /// Local/global steps of the flattening.
 const ARAP_ITERATIONS: usize = 20;
+/// Most triangles of a region that is flattened: 100 000 take about 3.4 s (20 000: 0.3 s), 400 000
+/// about 47 s (aarch64, `ci` profile). A larger region is fitted on the plane of the outline.
+const MAX_FLATTEN_TRIANGLES: usize = 100_000;
 
 /// The mesh and the triangles the data come from.
 pub(super) struct Scan {
@@ -122,6 +125,7 @@ fn flattened(
     sides: &[Resolved],
     gap_tol: f64,
     warnings: &mut Vec<String>,
+    cancel: &Cancel,
 ) -> Option<(surfacecraft_fit::param::Flattening, Vec<Vec<V2>>)> {
     let boundary = boundary_vertices(scan);
     let positions: Vec<Option<Point3>> = boundary.iter().map(|&v| point(scan, v)).collect();
@@ -144,8 +148,17 @@ fn flattened(
         }
         nearest.push(ids);
     }
-    let flat = match flatten(&scan.mesh, &scan.triangles, ARAP_ITERATIONS) {
+    if scan.triangles.len() > MAX_FLATTEN_TRIANGLES {
+        warnings.push(format!(
+            "the region has {} triangles (at most {MAX_FLATTEN_TRIANGLES} are flattened): the plane of the outline is used",
+            scan.triangles.len()
+        ));
+        return None;
+    }
+    let flat = match flatten_cancellable(&scan.mesh, &scan.triangles, ARAP_ITERATIONS, cancel) {
         Ok(f) => f,
+        // a cancelled call is ended by the caller, which looks at the flag
+        Err(why) if why == FLATTEN_CANCELLED => return None,
         Err(why) => {
             warnings.push(format!("the region could not be flattened ({why}): the plane of the outline is used"));
             return None;
@@ -173,10 +186,14 @@ pub(super) fn gather(
     gap_tol: f64,
     max_data: usize,
     warnings: &mut Vec<String>,
-) -> Gathered {
-    let Some(scan) = scan else { return Gathered::none() };
+    cancel: &Cancel,
+) -> CmdResult<Gathered> {
+    let Some(scan) = scan else { return Ok(Gathered::none()) };
     let ids = vertex_ids(scan);
-    let flat = flattened(scan, sides, gap_tol, warnings);
+    let flat = flattened(scan, sides, gap_tol, warnings, cancel);
+    if cancel.is_cancelled() {
+        return Err(crate::cmd::cancelled());
+    }
     let mut data: Vec<V3> = Vec::with_capacity(ids.len());
     let mut uv: Vec<V2> = Vec::new();
     for &v in &ids {
@@ -194,8 +211,8 @@ pub(super) fn gather(
         data = keep.iter().filter_map(|&k| data.get(k).copied()).collect();
         uv = keep.iter().filter_map(|&k| uv.get(k).copied()).collect();
     }
-    match flat {
+    Ok(match flat {
         Some((_, side_uv)) => Gathered { data, data_uv: Some(uv), side_uv: Some(side_uv) },
         None => Gathered { data, data_uv: None, side_uv: None },
-    }
+    })
 }

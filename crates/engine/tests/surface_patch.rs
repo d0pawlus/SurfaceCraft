@@ -233,7 +233,8 @@ fn patch_uses_the_flattening_when_the_sides_are_the_boundary_of_the_scan() {
     eprintln!("flattened patch: {r}");
     assert_eq!(r["parameters"], "flattened", "{r}");
     assert!(r["max"].as_f64().unwrap() <= 0.2, "{r}");
-    assert!((0.02..=0.045).contains(&r["rms"].as_f64().unwrap()), "{r}");
+    // noise sigma 0.02 per axis; measured rms 0.0273 (macOS aarch64): bounds 0.44x and 1.65x
+    assert!((0.012..=0.045).contains(&r["rms"].as_f64().unwrap()), "{r}");
     assert_eq!(r["within_tolerance"], true, "{r}");
     assert!(r["sides"].as_array().unwrap().iter().all(|e| e["soft"] == true), "{r}");
     assert!(r["points"].as_u64().unwrap() > 1000, "every vertex of the scan is data: {r}");

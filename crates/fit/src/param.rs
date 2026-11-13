@@ -10,8 +10,10 @@
 //!
 //! Mesh-side computation only; no dense matrix is formed (the solves run on adjacency lists).
 use std::f64::consts::TAU;
-use surfacecraft_geom::{Mesh, Vec3};
+use surfacecraft_geom::{Cancel, Mesh, Vec3};
 
+/// Iterations of a linear solve between two looks at the cancellation flag.
+const POLL_EVERY: usize = 16;
 /// Most triangles flattened in one call.
 const MAX_TRIANGLES: usize = 400_000;
 /// Most local/global steps whatever the caller asks for.
@@ -74,9 +76,8 @@ fn find_root(parent: &mut [usize], mut x: usize) -> usize {
     x
 }
 
-/// Checks the triangles of `mesh` listed in `triangles` and builds the compact topology and the
-/// positions of its vertices.
-fn build_topology(mesh: &Mesh, triangles: &[u32]) -> Result<(Topology, Vec<Vec3>), String> {
+/// The corners of the listed triangles, the sorted ids of their vertices and those vertices' positions.
+fn collect_vertices(mesh: &Mesh, triangles: &[u32]) -> Result<(Vec<[u32; 3]>, Vec<u32>, Vec<Vec3>), String> {
     if triangles.is_empty() {
         return Err("no triangles to flatten".to_string());
     }
@@ -105,9 +106,13 @@ fn build_topology(mesh: &Mesh, triangles: &[u32]) -> Result<(Topology, Vec<Vec3>
         }
         pos.push(p.coords);
     }
-    let nv = ids.len();
+    Ok((corners, ids, pos))
+}
+
+/// The triangles on compact vertex numbers (positions in `ids`); a repeated vertex is an error.
+fn compact_triangles(corners: &[[u32; 3]], ids: &[u32]) -> Result<Vec<[usize; 3]>, String> {
     let mut tris: Vec<[usize; 3]> = Vec::with_capacity(corners.len());
-    for c in &corners {
+    for c in corners {
         let mut t = [0usize; 3];
         for (slot, v) in t.iter_mut().zip(c.iter()) {
             *slot = ids.binary_search(v).map_err(|_| "internal error: unknown vertex".to_string())?;
@@ -117,10 +122,15 @@ fn build_topology(mesh: &Mesh, triangles: &[u32]) -> Result<(Topology, Vec<Vec3>
         }
         tris.push(t);
     }
+    Ok(tris)
+}
 
+/// Undirected edges, the next vertex along the boundary (`usize::MAX` for interior vertices) and
+/// which vertices lie on the boundary. Every index comes from `tris`, so it is below `nv`.
+fn edge_structure(tris: &[[usize; 3]], nv: usize) -> Result<(Vec<(usize, usize)>, Vec<usize>, Vec<bool>), String> {
     // directed half-edges: a repeat is a non-manifold edge or two triangles of opposite orientation
     let mut half: Vec<(usize, usize)> = Vec::with_capacity(tris.len() * 3);
-    for t in &tris {
+    for t in tris {
         for k in 0..3 {
             half.push((t[k], t[(k + 1) % 3]));
         }
@@ -146,17 +156,25 @@ fn build_topology(mesh: &Mesh, triangles: &[u32]) -> Result<(Topology, Vec<Vec3>
             edges.push((a.min(b), a.max(b)));
         }
     }
+    Ok((edges, next, is_boundary))
+}
+
+/// The sorted neighbour lists of the vertices.
+fn neighbours(edges: &[(usize, usize)], nv: usize) -> Vec<Vec<usize>> {
     let mut nbr: Vec<Vec<usize>> = vec![Vec::new(); nv];
-    for &(a, b) in &edges {
+    for &(a, b) in edges {
         nbr[a].push(b);
         nbr[b].push(a);
     }
     for list in &mut nbr {
         list.sort_unstable();
     }
+    nbr
+}
 
+fn check_connected(edges: &[(usize, usize)], nv: usize) -> Result<(), String> {
     let mut parent: Vec<usize> = (0..nv).collect();
-    for &(a, b) in &edges {
+    for &(a, b) in edges {
         let (ra, rb) = (find_root(&mut parent, a), find_root(&mut parent, b));
         if ra != rb {
             parent[ra] = rb;
@@ -166,7 +184,12 @@ fn build_topology(mesh: &Mesh, triangles: &[u32]) -> Result<(Topology, Vec<Vec3>
     if components > 1 {
         return Err(format!("the region is not connected ({components} parts)"));
     }
+    Ok(())
+}
 
+/// The one boundary loop of the region (a disc has exactly one).
+fn boundary_loop(next: &[usize], is_boundary: &[bool]) -> Result<Vec<usize>, String> {
+    let nv = next.len();
     let mut loops: Vec<Vec<usize>> = Vec::new();
     let mut visited = vec![false; nv];
     for s in 0..nv {
@@ -198,11 +221,23 @@ fn build_topology(mesh: &Mesh, triangles: &[u32]) -> Result<(Topology, Vec<Vec3>
     if loops.len() > 1 {
         return Err(format!("the region has {} boundary loops (it must be a disc: one loop, no holes)", loops.len()));
     }
+    Ok(first.clone())
+}
+
+/// Checks the triangles of `mesh` listed in `triangles` and builds the compact topology and the
+/// positions of its vertices.
+fn build_topology(mesh: &Mesh, triangles: &[u32]) -> Result<(Topology, Vec<Vec3>), String> {
+    let (corners, ids, pos) = collect_vertices(mesh, triangles)?;
+    let nv = ids.len();
+    let tris = compact_triangles(&corners, &ids)?;
+    let (edges, next, is_boundary) = edge_structure(&tris, nv)?;
+    let nbr = neighbours(&edges, nv);
+    check_connected(&edges, nv)?;
+    let boundary = boundary_loop(&next, &is_boundary)?;
     let euler = nv as i64 - edges.len() as i64 + tris.len() as i64;
     if euler != 1 {
         return Err(format!("the region is not a topological disc (Euler characteristic {euler}, expected 1)"));
     }
-    let boundary = first.clone();
     Ok((Topology { ids, tris, edges, nbr, boundary, is_boundary }, pos))
 }
 
@@ -323,6 +358,7 @@ fn conjugate_gradient(
     b: &[f64],
     x: &mut [f64],
     max_iter: usize,
+    cancel: &Cancel,
 ) -> f64 {
     let n = b.len();
     let bn = norm(b);
@@ -338,7 +374,10 @@ fn conjugate_gradient(
     let mut z: Vec<f64> = r.iter().zip(inv_diag).map(|(ri, d)| ri * d).collect();
     let mut p = z.clone();
     let mut rz = dot(&r, &z);
-    for _ in 0..max_iter {
+    for k in 0..max_iter {
+        if k % POLL_EVERY == 0 && cancel.is_cancelled() {
+            return f64::NAN;
+        }
         if norm(&r) <= SOLVE_TOLERANCE * bn {
             break;
         }
@@ -368,7 +407,7 @@ fn conjugate_gradient(
 
 /// BiCGSTAB for a general sparse operator (the mean-value system is not symmetric). `x` is the
 /// start and receives the result. Returns the relative residual reached.
-fn bicgstab(apply: &dyn Fn(&[f64], &mut [f64]), b: &[f64], x: &mut [f64], max_iter: usize) -> f64 {
+fn bicgstab(apply: &dyn Fn(&[f64], &mut [f64]), b: &[f64], x: &mut [f64], max_iter: usize, cancel: &Cancel) -> f64 {
     let n = b.len();
     let bn = norm(b);
     if !bn.is_finite() {
@@ -386,7 +425,10 @@ fn bicgstab(apply: &dyn Fn(&[f64], &mut [f64]), b: &[f64], x: &mut [f64], max_it
     let mut p = vec![0.0; n];
     let mut s = vec![0.0; n];
     let mut t = vec![0.0; n];
-    for _ in 0..max_iter {
+    for k in 0..max_iter {
+        if k % POLL_EVERY == 0 && cancel.is_cancelled() {
+            return f64::NAN;
+        }
         if norm(&r) <= SOLVE_TOLERANCE * bn {
             break;
         }
@@ -522,7 +564,7 @@ fn scale_to_area(tris: &[[usize; 3]], uv: &mut [[f64; 2]], area: f64) -> Result<
 }
 
 /// Mean-value (harmonic-like) map of the interior for the given boundary positions.
-fn harmonic(topo: &Topology, geo: &Geometry, polygon: &[[f64; 2]]) -> Result<Vec<[f64; 2]>, String> {
+fn harmonic(topo: &Topology, geo: &Geometry, polygon: &[[f64; 2]], cancel: &Cancel) -> Result<Vec<[f64; 2]>, String> {
     let n = topo.nbr.len();
     let mut uv = vec![[0.0; 2]; n];
     for (&v, p) in topo.boundary.iter().zip(polygon) {
@@ -545,7 +587,7 @@ fn harmonic(topo: &Topology, geo: &Geometry, polygon: &[[f64; 2]]) -> Result<Vec
     for c in 0..2 {
         let b: Vec<f64> = (0..n).map(|i| if topo.is_boundary[i] { uv[i][c] } else { 0.0 }).collect();
         let mut x = b.clone();
-        let residual = bicgstab(&apply, &b, &mut x, max_iter);
+        let residual = bicgstab(&apply, &b, &mut x, max_iter, cancel);
         if !(residual <= HARMONIC_ACCEPT) || x.iter().any(|e| !e.is_finite()) {
             return Err(format!("the interior system did not converge (relative residual {residual:e})"));
         }
@@ -556,9 +598,44 @@ fn harmonic(topo: &Topology, geo: &Geometry, polygon: &[[f64; 2]]) -> Result<Vec
     Ok(uv)
 }
 
+/// Local step of the relaxation: the rotation closest to the Jacobian of every triangle, and the
+/// right-hand side of the global step it gives.
+fn local_step(topo: &Topology, geo: &Geometry, cur: &[[f64; 2]]) -> Vec<[f64; 2]> {
+    let mut rhs = vec![[0.0f64; 2]; cur.len()];
+    for (ti, t) in topo.tris.iter().enumerate() {
+        let x = &geo.local[ti];
+        let w = &geo.cot[ti];
+        let mut jac = [[0.0f64; 2]; 2];
+        for k in 0..3 {
+            let (ia, ib) = ((k + 1) % 3, (k + 2) % 3);
+            let du = [cur[t[ia]][0] - cur[t[ib]][0], cur[t[ia]][1] - cur[t[ib]][1]];
+            let dx = [x[ia][0] - x[ib][0], x[ia][1] - x[ib][1]];
+            for r in 0..2 {
+                for c in 0..2 {
+                    jac[r][c] += w[k] * du[r] * dx[c];
+                }
+            }
+        }
+        // maximises tr(R^T J) over rotations R = [[c, -s], [s, c]]
+        let (cx, sy) = (jac[0][0] + jac[1][1], jac[1][0] - jac[0][1]);
+        let len = cx.hypot(sy);
+        let (c, s) = if len > 1e-300 { (cx / len, sy / len) } else { (1.0, 0.0) };
+        for k in 0..3 {
+            let (ia, ib) = ((k + 1) % 3, (k + 2) % 3);
+            let dx = [x[ia][0] - x[ib][0], x[ia][1] - x[ib][1]];
+            let d = [w[k] * (c * dx[0] - s * dx[1]), w[k] * (s * dx[0] + c * dx[1])];
+            rhs[t[ia]][0] += d[0];
+            rhs[t[ia]][1] += d[1];
+            rhs[t[ib]][0] -= d[0];
+            rhs[t[ib]][1] -= d[1];
+        }
+    }
+    rhs
+}
+
 /// Up to `iterations` local/global steps of the rigid-fit relaxation of `uv`. A step is kept only
 /// when its result is finite and has no more reversed triangles than the map before it.
-fn relax_arap(topo: &Topology, geo: &Geometry, uv: &mut [[f64; 2]], iterations: usize) {
+fn relax_arap(topo: &Topology, geo: &Geometry, uv: &mut [[f64; 2]], iterations: usize, cancel: &Cancel) {
     let n = uv.len();
     let scale = geo.area.sqrt();
     let apply = |x: &[f64], y: &mut [f64]| {
@@ -575,36 +652,10 @@ fn relax_arap(topo: &Topology, geo: &Geometry, uv: &mut [[f64; 2]], iterations: 
     let mut cur: Vec<[f64; 2]> = uv.to_vec();
     let mut cur_flipped = flipped_count(&topo.tris, &cur);
     for _ in 0..iterations.min(MAX_ARAP_ITERATIONS) {
-        // local step: the rotation closest to the Jacobian of every triangle
-        let mut rhs = vec![[0.0f64; 2]; n];
-        for (ti, t) in topo.tris.iter().enumerate() {
-            let x = &geo.local[ti];
-            let w = &geo.cot[ti];
-            let mut jac = [[0.0f64; 2]; 2];
-            for k in 0..3 {
-                let (ia, ib) = ((k + 1) % 3, (k + 2) % 3);
-                let du = [cur[t[ia]][0] - cur[t[ib]][0], cur[t[ia]][1] - cur[t[ib]][1]];
-                let dx = [x[ia][0] - x[ib][0], x[ia][1] - x[ib][1]];
-                for r in 0..2 {
-                    for c in 0..2 {
-                        jac[r][c] += w[k] * du[r] * dx[c];
-                    }
-                }
-            }
-            // maximises tr(R^T J) over rotations R = [[c, -s], [s, c]]
-            let (cx, sy) = (jac[0][0] + jac[1][1], jac[1][0] - jac[0][1]);
-            let len = cx.hypot(sy);
-            let (c, s) = if len > 1e-300 { (cx / len, sy / len) } else { (1.0, 0.0) };
-            for k in 0..3 {
-                let (ia, ib) = ((k + 1) % 3, (k + 2) % 3);
-                let dx = [x[ia][0] - x[ib][0], x[ia][1] - x[ib][1]];
-                let d = [w[k] * (c * dx[0] - s * dx[1]), w[k] * (s * dx[0] + c * dx[1])];
-                rhs[t[ia]][0] += d[0];
-                rhs[t[ia]][1] += d[1];
-                rhs[t[ib]][0] -= d[0];
-                rhs[t[ib]][1] -= d[1];
-            }
+        if cancel.is_cancelled() {
+            break;
         }
+        let rhs = local_step(topo, geo, &cur);
         // global step: one Poisson-type solve per coordinate, translation left as it was
         let mut next = cur.clone();
         let mut ok = true;
@@ -615,7 +666,7 @@ fn relax_arap(topo: &Topology, geo: &Geometry, uv: &mut [[f64; 2]], iterations: 
                 *e -= mean;
             }
             let mut x: Vec<f64> = cur.iter().map(|p| p[c]).collect();
-            let residual = conjugate_gradient(&apply, &inv_diag, &b, &mut x, max_iter);
+            let residual = conjugate_gradient(&apply, &inv_diag, &b, &mut x, max_iter, cancel);
             if !(residual <= ARAP_ACCEPT) || x.iter().any(|e| !e.is_finite()) {
                 ok = false;
                 break;
@@ -700,10 +751,32 @@ fn edge_distortion(topo: &Topology, pos: &[Vec3], uv: &[[f64; 2]]) -> (f64, f64)
 /// is not connected or has no boundary (a closed surface), more than one boundary loop, a
 /// boundary touching itself, or a linear system that does not converge.
 pub fn flatten(mesh: &Mesh, triangles: &[u32], arap_iterations: usize) -> Result<Flattening, String> {
+    flatten_cancellable(mesh, triangles, arap_iterations, &Cancel::new())
+}
+
+/// The message of the error [`flatten_cancellable`] returns when `cancel` was set.
+pub const CANCELLED: &str = "cancelled";
+
+/// [`flatten`] that stops with `Err(CANCELLED)` when `cancel` is set (looked at between steps and
+/// every few iterations of the linear solves). Measured (aarch64, `ci` profile, grid discs, 20
+/// relaxation steps): 20 000 triangles 0.3 s, 100 000 triangles 3.4 s, 400 000 triangles 47 s (the
+/// cost grows faster than linearly: the solves need more iterations on a finer grid); callers that
+/// must stay interactive bound the size themselves.
+pub fn flatten_cancellable(
+    mesh: &Mesh,
+    triangles: &[u32],
+    arap_iterations: usize,
+    cancel: &Cancel,
+) -> Result<Flattening, String> {
+    let stopped = |r: Result<Flattening, String>| if cancel.is_cancelled() { Err(CANCELLED.to_string()) } else { r };
+    stopped(flatten_steps(mesh, triangles, arap_iterations, cancel))
+}
+
+fn flatten_steps(mesh: &Mesh, triangles: &[u32], arap_iterations: usize, cancel: &Cancel) -> Result<Flattening, String> {
     let (topo, pos) = build_topology(mesh, triangles)?;
     let geo = build_geometry(&topo, &pos)?;
     let polygon = boundary_polygon(&topo.boundary, &pos)?;
-    let mut uv = harmonic(&topo, &geo, &polygon)?;
+    let mut uv = harmonic(&topo, &geo, &polygon, cancel)?;
     scale_to_area(&topo.tris, &mut uv, geo.area)?;
     if !all_finite(&uv) {
         return Err("the flattening is not finite".to_string());
@@ -711,7 +784,7 @@ pub fn flatten(mesh: &Mesh, triangles: &[u32], arap_iterations: usize) -> Result
     let mut reference = uv.clone();
     center(&mut reference);
     if arap_iterations > 0 {
-        relax_arap(&topo, &geo, &mut uv, arap_iterations);
+        relax_arap(&topo, &geo, &mut uv, arap_iterations, cancel);
         center(&mut uv);
         align_rotation(&mut uv, &reference);
         scale_to_area(&topo.tris, &mut uv, geo.area)?;
