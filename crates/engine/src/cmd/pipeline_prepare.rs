@@ -7,6 +7,7 @@
 //! largest piece is *co-equal*. Pieces between the two are minor, pieces below `min_share` are
 //! debris; neither is modelled, and when their area is more than [`UNMODELLED_REVIEW_SHARE`] of the
 //! scan the verdict is at most `review` and an issue says so.
+use super::freeform::RetryReason;
 use super::rebuild::Stopwatch;
 use super::{
     CmdError, CmdResult, DeviationSummary, Issue, Method, NextStep, ScanSummary, Settings, ToSolidIn, ToSolidOut,
@@ -106,6 +107,12 @@ pub struct ComponentOut {
     pub issues: Vec<Issue>,
     /// What was done to the part first.
     pub preparation: Vec<PrepStep>,
+    /// The methods tried for this part (the top level of a split scan lists the largest part's).
+    #[serde(default)]
+    pub attempts: Vec<super::auto::Attempt>,
+    /// The larger-cap retry of this part, or the note that the call's budget was spent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<super::freeform::CapRetry>,
 }
 
 pub(super) fn rank(v: Verdict) -> u8 {
@@ -260,7 +267,7 @@ struct Tally {
 /// qualifies for it (capped by the patch limit and short of the tolerance, which is the retry's own test).
 /// The parts after it do not get it; a part that does not qualify leaves it for the next.
 pub(super) fn retry_allowed(allow: bool, done: &[(ComponentOut, ToSolidOut)]) -> bool {
-    allow && done.iter().all(|(_, o)| o.retry.is_none())
+    allow && done.iter().all(|(_, o)| o.retry.as_ref().is_none_or(|r| r.reason == RetryReason::BudgetSpent))
 }
 
 /// Models one part on its own (`(name, mesh, area)`); a cancelled run is an error, any other failure a failed part.
@@ -294,7 +301,12 @@ fn run_part(
                 reason: "the primitives built no solid for this part, so it was wrapped in patches".into(),
                 numbers: json!({"primitive_issues": out.issues.iter().map(|x| x.code.clone()).collect::<Vec<_>>(), "ms": watch.ms()}),
             };
+            // the attempts that came before stay in the list (none of them is the returned one now)
+            let mut tried = std::mem::take(&mut out.attempts);
+            tried.iter_mut().for_each(|a| a.returned = false);
             out = again;
+            tried.append(&mut out.attempts);
+            out.attempts = tried;
             out.prep.preparation.insert(0, step);
         }
     }
@@ -310,24 +322,52 @@ fn run_part(
         deviation: out.deviation.clone(),
         issues: out.issues.clone(),
         preparation: out.prep.preparation.clone(),
+        attempts: out.attempts.clone(),
+        retry: out.retry.clone(),
     };
     Ok((comp, out))
 }
 
-/// Did the primitives (not a freeform wrap) leave this part without a solid?
+/// Did the primitives (not a freeform wrap) leave this part without a solid, and has no freeform wrap
+/// been run for it yet (`auto` may have run one as its second method)? Then the part gets its one wrap.
 fn needs_freeform(method: Method, out: &ToSolidOut) -> bool {
-    method == Method::Auto && out.verdict == Verdict::Fail && out.body.is_none() && out.method != Method::Freeform
+    let wrapped_already = out.attempts.iter().any(|a| a.method == Method::Freeform && a.skipped.is_none());
+    method == Method::Auto
+        && out.verdict == Verdict::Fail
+        && out.body.is_none()
+        && out.method != Method::Freeform
+        && !wrapped_already
 }
 
-/// One run of the single-scan pipeline on a part; an error other than a cancellation becomes a failed result.
-fn model_part(s: &mut Session, part_in: &ToSolidIn, set: &Settings, id: ObjectId) -> CmdResult<ToSolidOut> {
-    let run =
-        settings(s, part_in).and_then(|pset| prepare(s, part_in, pset.scan).and_then(|r| solve(s, part_in, pset, r)));
-    match run {
+/// Runs `run` on the document; a failure other than a cancellation takes back everything the run
+/// added (a rebuilt mesh, a body, regions) and is returned as the inner `Err`; a cancellation is the
+/// outer one and leaves the document to the caller's own clean-up.
+pub(super) fn restoring_on_failure<T>(
+    s: &mut Session,
+    run: impl FnOnce(&mut Session) -> CmdResult<T>,
+) -> CmdResult<Result<T, CmdError>> {
+    let before = s.doc.clone();
+    match run(s) {
+        Ok(v) => Ok(Ok(v)),
         Err(e) if is_cancelled(&e) => Err(e),
-        Err(e) => Ok(failure(set, id, message_of(&e))),
-        Ok(o) => Ok(o),
+        Err(e) => {
+            s.doc = before;
+            Ok(Err(e))
+        }
     }
+}
+
+/// One run of the single-scan pipeline on a part; an error other than a cancellation becomes a failed
+/// result and leaves nothing of the run in the document.
+fn model_part(s: &mut Session, part_in: &ToSolidIn, set: &Settings, id: ObjectId) -> CmdResult<ToSolidOut> {
+    // the extra attempts of all parts of a call draw from one budget (the call's own)
+    let run = |s: &mut Session| {
+        let pset = Settings { budget: set.budget.clone(), ..settings(s, part_in)? };
+        let scan = pset.scan;
+        let report = prepare(s, part_in, scan)?;
+        solve(s, part_in, pset, report)
+    };
+    Ok(restoring_on_failure(s, run)?.unwrap_or_else(|e| failure(set, id, message_of(&e))))
 }
 
 #[cfg(test)]
@@ -344,6 +384,8 @@ pub(super) fn component_for_tests(out: &ToSolidOut) -> ComponentOut {
         deviation: out.deviation.clone(),
         issues: out.issues.clone(),
         preparation: Vec::new(),
+        attempts: out.attempts.clone(),
+        retry: out.retry.clone(),
     }
 }
 
@@ -361,6 +403,10 @@ fn failure(set: &Settings, id: ObjectId, why: &str) -> ToSolidOut {
         holes_left: 0,
         non_manifold_edges: 0,
         noise_sigma: None,
+        noise_used: None,
+        noise_source: None,
+        noise_spread: None,
+        noise_above_tolerance: false,
         findings: Vec::new(),
     };
     ToSolidOut {
@@ -382,6 +428,7 @@ fn failure(set: &Settings, id: ObjectId, why: &str) -> ToSolidOut {
         relations: 0,
         issues: vec![issue("no_solid", format!("the part could not be modelled: {why}"))],
         next_steps: Vec::new(),
+        attempts: Vec::new(),
         prep: PrepOut::default(),
         thickened: None,
     }
@@ -532,189 +579,5 @@ fn combine(set: &Settings, report: ScanSummary, parts: Vec<(ComponentOut, ToSoli
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-    use surfacecraft_geom::{Mesh, Point3, synth};
-
-    /// `n` equal closed balls far apart.
-    fn balls(n: usize) -> Mesh {
-        let mut all = Mesh::default();
-        for k in 0..n {
-            let mut m = synth::sphere(Point3::new(30.0 * k as f64, 0.0, 0.0), 5.0, 16, 8);
-            m.weld(1e-9);
-            all.append(&m);
-        }
-        all
-    }
-
-    #[test]
-    fn only_the_cap_leaves_co_equal_parts_beyond_the_limit_and_a_request_does_not() {
-        let a = scan_split::analyse(&balls(26), MIN_SHARE, false);
-        let capped = plan_of(&a, PART_SHARE, None);
-        assert_eq!((capped.chosen.len(), capped.beyond_cap.len(), capped.not_requested.len()), (24, 2, 0));
-        let asked = plan_of(&a, PART_SHARE, Some(1));
-        assert_eq!((asked.chosen.len(), asked.beyond_cap.len(), asked.not_requested.len()), (1, 0, 25));
-        let tally = Tally {
-            minor: (0, 0.0),
-            cavities: (0, 0.0),
-            beyond_cap: (0, 0.0),
-            not_requested: (25, 0.96),
-            modelled: 1,
-            debris_pieces: 0,
-            ms: 0,
-        };
-        let (issues, capped_verdict) = collect_issues(&[], &tally);
-        assert!(issues.is_empty() && !capped_verdict, "a requested subset is no issue");
-        let over = Tally { beyond_cap: (2, 0.07), ..tally };
-        let (issues, capped_verdict) = collect_issues(&[], &over);
-        assert!(
-            issues.iter().any(|i| i.code == "parts_beyond_limit" && i.message.contains("2 more parts"))
-                && capped_verdict
-        );
-    }
-
-    #[test]
-    fn a_piece_below_a_tenth_of_the_largest_is_minor_and_the_components_word_is_checked() {
-        let mut m = balls(1);
-        let mut small = synth::sphere(Point3::new(60.0, 0.0, 0.0), 1.2, 16, 8);
-        small.weld(1e-9);
-        m.append(&small);
-        let a = scan_split::analyse(&m, MIN_SHARE, false);
-        let p = plan_of(&a, PART_SHARE, None);
-        assert_eq!((p.chosen.len(), p.minor.len()), (1, 1));
-        assert_eq!(Components::requested(&Some(Components::Word("largest".into()))).unwrap(), Some(1));
-        assert_eq!(Components::requested(&None).unwrap(), None);
-        assert!(Components::requested(&Some(Components::Word("some".into()))).is_err());
-        assert!(Components::requested(&Some(Components::Count(0))).is_err());
-    }
-
-    fn piece(area: f64) -> surfacecraft_geom::pieces::Piece {
-        surfacecraft_geom::pieces::Piece {
-            triangles: vec![0],
-            vertices: 3,
-            area,
-            bbox: surfacecraft_geom::Aabb::default(),
-            boundary_edges: 0,
-            loops: Vec::new(),
-            non_manifold_edges: 0,
-            edges: 3,
-            euler: 2,
-            pinched_vertices: 0,
-            unoriented_edges: 0,
-        }
-    }
-
-    /// An outer shell of 1 000 mm2 around a cavity skin of 12 000 mm2: the shell is the part, whatever
-    /// the area of what is inside it.
-    #[test]
-    fn a_cavity_skin_larger_than_its_shell_does_not_turn_the_shell_into_a_minor_piece() {
-        let a = Analysis {
-            parts: vec![piece(1000.0), piece(12_000.0)],
-            extra: Vec::new(),
-            rest: Vec::new(),
-            nests: vec![None, Some((0, true))],
-        };
-        let p = plan_of(&a, PART_SHARE, None);
-        assert_eq!(p.chosen, vec![0], "the shell is modelled");
-        assert_eq!(p.cavities, vec![1]);
-        assert!(p.minor.is_empty());
-        let none = Analysis { nests: vec![Some((1, true)), Some((0, true))], ..a };
-        assert_eq!(plan_of(&none, PART_SHARE, None).chosen.len(), 1, "never an empty choice");
-    }
-
-    #[test]
-    fn pieces_beyond_the_listed_parts_stay_in_the_tally() {
-        let a = scan_split::analyse(&balls(80), MIN_SHARE, false);
-        assert_eq!((a.parts.len(), a.extra.len()), (scan_split::MAX_PARTS, 16));
-        let plan = plan_of(&a, PART_SHARE, None);
-        let tally = tally_of(&a, &plan, 0);
-        assert_eq!(tally.beyond_cap.0, 56, "40 past the cap of 24, 16 past the listed parts");
-        assert!((tally.beyond_cap.1 - 56.0 / 80.0).abs() < 1e-9, "{}", tally.beyond_cap.1);
-        let (issues, capped) = collect_issues(&[], &tally);
-        assert!(capped && issues.iter().any(|i| i.code == "parts_beyond_limit" && i.message.contains("56 more parts")));
-    }
-
-    #[test]
-    fn two_percent_of_unmodelled_surface_is_the_boundary_of_the_review_cap() {
-        let tally = |share: f64| Tally {
-            minor: (3, share),
-            cavities: (0, 0.0),
-            beyond_cap: (0, 0.0),
-            not_requested: (0, 0.0),
-            modelled: 1,
-            debris_pieces: 3,
-            ms: 0,
-        };
-        let (issues, capped) = collect_issues(&[], &tally(UNMODELLED_REVIEW_SHARE));
-        assert!(issues.is_empty() && !capped, "exactly 2 % is not above 2 %");
-        let (issues, capped) = collect_issues(&[], &tally(UNMODELLED_REVIEW_SHARE + 1e-4));
-        assert!(capped && issues[0].code == "unmodelled_pieces" && issues[0].message.contains("part_share"));
-        let (issues, capped) = collect_issues(&[], &tally(UNMODELLED_REVIEW_SHARE - 1e-4));
-        assert!(issues.is_empty() && !capped);
-    }
-
-    #[test]
-    fn only_a_primitives_failure_without_a_body_is_wrapped_as_freeform() {
-        let set = Settings {
-            scan: ObjectId(0),
-            tolerance: 0.2,
-            min_within: 0.99,
-            min_triangles: None,
-            max_patches: None,
-            allow_retry: true,
-            rebuild: true,
-            name: "solid".into(),
-        };
-        let mut out = failure(&set, ObjectId(1), "x");
-        assert!(!needs_freeform(Method::Auto, &out), "a freeform failure is not repeated");
-        out.method = Method::Primitives;
-        assert!(needs_freeform(Method::Auto, &out));
-        assert!(!needs_freeform(Method::Freeform, &out));
-        assert!(!needs_freeform(Method::Primitives, &out));
-    }
-
-    /// A cancellation between two parts (set by the hook after the first part has been modelled, so no
-    /// timing is involved) is a cancelled error and leaves neither the bodies nor the meshes of the parts.
-    #[test]
-    fn a_cancel_between_parts_leaves_no_body_and_no_part_mesh() {
-        let mut s = Session::new();
-        let mut all = Mesh::default();
-        for k in 0..3 {
-            let mut m = synth::sphere(Point3::new(40.0 * f64::from(k), 0.0, 0.0), 8.0, 40, 20);
-            m.weld(1e-9);
-            all.append(&m);
-        }
-        s.doc.add_mesh("scan", all);
-        let flag = s.cancel.clone();
-        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let count = seen.clone();
-        *AFTER_PART.lock().unwrap() = Some(Box::new(move |n| {
-            count.store(n + 1, std::sync::atomic::Ordering::SeqCst);
-            if n == 0 {
-                flag.cancel();
-            }
-        }));
-        let r = s.execute("scan.to_solid", json!({"scan": "scan", "method": "freeform", "part_share": 0.5}));
-        *AFTER_PART.lock().unwrap() = None;
-        let e = r.expect_err("cancelled between parts").to_string();
-        assert!(e.contains("cancelled"), "{e}");
-        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1, "the second part was never started");
-        assert!(s.doc.bodies.is_empty() && s.doc.meshes.len() == 1);
-    }
-
-    /// Exactly a tenth of the largest piece is co-equal; a hair less is a minor piece.
-    #[test]
-    fn the_co_equal_boundary_is_exactly_a_tenth_of_the_largest_area() {
-        let at = |small: f64| Analysis {
-            parts: vec![piece(1000.0), piece(small)],
-            extra: Vec::new(),
-            rest: Vec::new(),
-            nests: vec![None, None],
-        };
-        let on = plan_of(&at(100.0), PART_SHARE, None);
-        assert_eq!((on.chosen.len(), on.minor.len()), (2, 0), "exactly 0.1 x the largest is co-equal");
-        let below = plan_of(&at(99.99), PART_SHARE, None);
-        assert_eq!((below.chosen.len(), below.minor.len()), (1, 1), "just below is minor");
-    }
-}
+#[path = "pipeline_prepare_tests.rs"]
+mod tests;

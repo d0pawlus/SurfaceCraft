@@ -11,7 +11,7 @@
 //! skipped either way).
 use super::Segment;
 use super::grow::{Ctx, Job, Outcome, UNOWNED};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 /// Most regions kept (the rest of the mesh stays unassigned).
 const MAX_REGIONS: usize = 10_000;
@@ -30,11 +30,30 @@ const ADAPT_AFTER: usize = 16;
 /// Cached speculative jobs kept at most per unit of batch size.
 const CACHE_PER_BATCH: usize = 8;
 
+/// A fragment next to another fragment is evidence of an organic area: the seeds around it are
+/// skipped up to this many seed patches of area (they would only make more fragments).
+const HALO_PATCHES: f64 = 8.0;
+/// Smoothness of the halo: the least dot product of the normals of neighbouring triangles it
+/// crosses (it stops at the same creases as a seed patch).
+const HALO_MIN_DOT: f64 = 0.94;
+
+/// What marks organic territory to the seed loop (see `freeform`).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct FreeformHints {
+    /// Regions with fewer triangles than this are fragments.
+    pub weak_tris: usize,
+}
+
 /// The state of the seed loop.
 struct Seeder<'a, 'b> {
     ctx: &'a Ctx<'b>,
     order: &'a [(u64, u32)],
     min_triangles: usize,
+    /// Fragments (rejected seed patches and weak regions) are noted, and their surroundings
+    /// skipped, when set.
+    hints: Option<FreeformHints>,
+    /// Triangles of fragments found so far.
+    fragment: Vec<bool>,
     owner: Vec<u32>,
     tried: Vec<bool>,
     out: Vec<Segment>,
@@ -53,6 +72,7 @@ pub(super) fn grow_regions(
     ctx: &Ctx<'_>,
     order: &[(u64, u32)],
     min_triangles: usize,
+    hints: Option<FreeformHints>,
     cancel: &surfacecraft_geom::Cancel,
 ) -> (Vec<Segment>, super::SegmentStats) {
     let threads = surfacecraft_geom::par::threads();
@@ -61,6 +81,8 @@ pub(super) fn grow_regions(
         ctx,
         order,
         min_triangles,
+        hints,
+        fragment: if hints.is_some() { vec![false; ctx.nb.len()] } else { Vec::new() },
         owner: vec![UNOWNED; ctx.nb.len()],
         tried: vec![false; ctx.nb.len()],
         out: Vec::new(),
@@ -124,9 +146,19 @@ impl Seeder<'_, '_> {
 
     /// Claims the region of `job` if it is big enough.
     fn commit(&mut self, job: Job) {
-        let Outcome::Grown { mut region, fit } = job.outcome else { return };
-        if region.len() < self.min_triangles {
+        let weak = self.hints.map_or(0, |h| h.weak_tris);
+        let Outcome::Grown { mut region, fit } = job.outcome else {
+            if matches!(job.outcome, Outcome::Rejected) {
+                self.note_fragment(&job.patch);
+            }
             return;
+        };
+        if region.len() < self.min_triangles {
+            self.note_fragment(&job.patch);
+            return;
+        }
+        if region.len() < weak {
+            self.note_fragment(&region);
         }
         let id = self.out.len() as u32;
         for &t in &region {
@@ -135,7 +167,52 @@ impl Seeder<'_, '_> {
             }
         }
         region.sort_unstable();
-        self.out.push(Segment { triangles: region, primitive: fit.primitive, rms: fit.rms });
+        self.out.push(Segment { triangles: region, primitive: fit.primitive, rms: fit.rms, freeform: false });
+    }
+
+    /// Notes a fragment (`tris`): one that touches an earlier fragment sits in organic territory,
+    /// and the free triangles around it are skipped as seeds.
+    fn note_fragment(&mut self, tris: &[u32]) {
+        if self.hints.is_none() {
+            return;
+        }
+        let touches = tris.iter().any(|&t| {
+            let nb = self.ctx.nb.get(t as usize).into_iter().flatten();
+            nb.into_iter().any(|&o| o != UNOWNED && self.fragment.get(o as usize) == Some(&true))
+        });
+        for &t in tris {
+            if let Some(f) = self.fragment.get_mut(t as usize) {
+                *f = true;
+            }
+        }
+        if touches {
+            self.skip_around(tris);
+        }
+    }
+
+    /// Marks the free, smooth triangles around `tris`, breadth first up to the halo area, as tried.
+    fn skip_around(&mut self, tris: &[u32]) {
+        let limit = HALO_PATCHES * self.ctx.seed_area;
+        let mut area = 0.0;
+        let mut queue: VecDeque<u32> = tris.iter().copied().collect();
+        while let Some(t) = queue.pop_front() {
+            if area >= limit {
+                break;
+            }
+            let Some(n0) = self.ctx.fnorm.get(t as usize).copied().flatten() else { continue };
+            for &o in self.ctx.nb.get(t as usize).into_iter().flatten() {
+                let free = o != UNOWNED && self.is_free(o);
+                let smooth =
+                    self.ctx.fnorm.get(o as usize).copied().flatten().is_some_and(|m| m.dot(&n0) > HALO_MIN_DOT);
+                if free && smooth {
+                    if let Some(f) = self.tried.get_mut(o as usize) {
+                        *f = true;
+                    }
+                    area += self.ctx.areas.get(o as usize).copied().unwrap_or(0.0);
+                    queue.push_back(o);
+                }
+            }
+        }
     }
 
     /// Runs the job of `seed` now, together with speculative jobs for the next free seeds (the

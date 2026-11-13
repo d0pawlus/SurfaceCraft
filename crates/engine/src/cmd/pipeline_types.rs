@@ -3,6 +3,7 @@
 use super::{Method, PrepOut, Verdict};
 use crate::cmd::body::BodyOut;
 use crate::cmd::qa::Finding;
+use crate::cmd::region::{NoiseSource, NoiseSpread};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -47,6 +48,18 @@ pub struct ScanSummary {
     pub non_manifold_edges: usize,
     /// Estimated scanner noise sigma after cleaning (mm); null when it cannot be estimated.
     pub noise_sigma: Option<f64>,
+    /// The noise the segmentation judged the fits by (sigma, mm; see `region.auto_segment`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noise_used: Option<f64>,
+    /// Where it came from: `estimated`, `estimated_mesh`, `given` or `fallback`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noise_source: Option<NoiseSource>,
+    /// Smallest and largest noise measured on blocks of the scan, when two or more were measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noise_spread: Option<NoiseSpread>,
+    /// The noise is above the tolerance: nothing was merged into freeform regions.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub noise_above_tolerance: bool,
     /// Findings of the quality check before cleaning.
     pub findings: Vec<Finding>,
 }
@@ -152,6 +165,9 @@ pub struct ToSolidOut {
     pub issues: Vec<Issue>,
     /// Commands worth running next, most useful first.
     pub next_steps: Vec<NextStep>,
+    /// Every method tried, in order; one when the first passed or the method was given.
+    #[serde(default)]
+    pub attempts: Vec<super::auto::Attempt>,
     /// Preparation: what was done to the scan before modelling it, one result per part when it was split.
     #[serde(flatten)]
     pub prep: PrepOut,

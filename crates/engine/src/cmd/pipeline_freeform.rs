@@ -41,6 +41,8 @@ pub enum RetryReason {
     OpenResult,
     /// The second wrap failed (see `error`): the first stands.
     Failed,
+    /// The call had used its extra attempts: no second wrap was made, the first stands.
+    BudgetSpent,
 }
 
 /// The second attempt of the network with a larger patch limit.
@@ -197,17 +199,12 @@ pub(super) fn out(
         relations: 0,
         issues,
         next_steps,
+        attempts: Vec::new(),
         prep: super::PrepOut::default(),
         thickened: None,
     }
 }
 
-/// Wraps the scan a second time with a larger limit when the first attempt stopped at its limit short
-/// of the tolerance, reached at least [`RETRY_MIN_WITHIN`] and the scan is not too big, and keeps
-/// the better of the two by [`judge`] (the other body is removed). Never done when the caller gave
-/// `max_patches` (an explicit cap is a promise) or switched `allow_retry` off. One retry at most; a
-/// failed one leaves the first attempt as it is and says why in the result. `wrap_with` makes the
-/// second wrap (the command's own, or a test's).
 /// A failed retry never leaves a second body behind.
 fn remove_bodies_added_since(s: &mut Session, before: &[ObjectId]) {
     let added: Vec<ObjectId> = s.doc.bodies.iter().map(|b| b.id).filter(|id| !before.contains(id)).collect();
@@ -216,48 +213,40 @@ fn remove_bodies_added_since(s: &mut Session, before: &[ObjectId]) {
     }
 }
 
-pub(super) fn retry_larger_on(
-    s: &mut Session,
-    set: &Settings,
-    wrapped: ObjectId,
-    first: WrapOut,
-    wrap_with: impl FnOnce(&mut Session, usize) -> CmdResult<WrapOut>,
-) -> CmdResult<(WrapOut, Option<CapRetry>)> {
-    let cap_from = first.cap_used;
-    let cap_to = cap_from.saturating_mul(RETRY_FACTOR).min(PATCH_LIMIT);
+/// The cap of the larger-cap retry when one is worth making: the first attempt stopped at its limit
+/// short of the tolerance, reached at least [`RETRY_MIN_WITHIN`], the wrapped mesh is not too big,
+/// and the caller neither gave `max_patches` (an explicit cap is a promise) nor switched
+/// `allow_retry` off.
+fn retry_cap(s: &Session, set: &Settings, wrapped: ObjectId, first: &WrapOut) -> Option<usize> {
+    let cap_to = first.cap_used.saturating_mul(RETRY_FACTOR).min(PATCH_LIMIT);
     // the size that counts is that of the mesh actually wrapped (a rebuilt scan can be much larger)
     let triangles = s.doc.mesh(wrapped).map_or(usize::MAX, |m| m.mesh.triangle_count());
     let worth = set.allow_retry
         && set.max_patches.is_none()
         && first.capped
-        && cap_to > cap_from
+        && cap_to > first.cap_used
         && first.deviation.within >= RETRY_MIN_WITHIN
         && triangles <= RETRY_MAX_TRIANGLES;
-    if !worth {
-        return Ok((first, None));
-    }
-    let base = CapRetry {
-        cap_from,
+    worth.then_some(cap_to)
+}
+
+/// The record of a retry that has not run yet.
+fn retry_note(first: &WrapOut, cap_to: usize, reason: RetryReason) -> CapRetry {
+    CapRetry {
+        cap_from: first.cap_used,
         cap_to,
         patches_from: first.patches,
         patches_to: None,
         within_from: first.deviation.within,
         within_to: None,
         kept: false,
-        reason: RetryReason::Failed,
+        reason,
         error: None,
-    };
-    let before: Vec<ObjectId> = s.doc.bodies.iter().map(|b| b.id).collect();
-    let second = match wrap_with(s, cap_to) {
-        Ok(w) => w,
-        Err(e) => {
-            remove_bodies_added_since(s, &before);
-            if crate::cmd::is_cancelled(&e) {
-                return Err(e);
-            }
-            return Ok((first, Some(CapRetry { error: Some(message_of(&e).to_string()), ..base })));
-        }
-    };
+    }
+}
+
+/// Keeps the better of the two wraps by [`judge`] and removes the other body.
+fn settle(s: &mut Session, set: &Settings, first: WrapOut, second: WrapOut, base: CapRetry) -> (WrapOut, CapRetry) {
     let reason = judge(Attempt::of(&first), Attempt::of(&second));
     let kept = reason == RetryReason::Better;
     let within_to = Some(second.deviation.within).filter(|v| v.is_finite());
@@ -268,7 +257,42 @@ pub(super) fn retry_larger_on(
         // the second wrap ran while the first body still held the name: the result gets it back
         s.doc.rename(keep.body.id, &set.name);
     }
-    Ok((keep, Some(info)))
+    (keep, info)
+}
+
+/// Wraps the scan a second time with a larger limit (see [`retry_cap`]) and keeps the better of the
+/// two. The retry is an extra attempt of the call's budget; when the budget is spent the first wrap
+/// stands and the result says so (`budget_spent`). One retry at most; a failed one leaves the first
+/// attempt as it is and says why. `wrap_with` makes the second wrap (the command's own, or a test's).
+pub(super) fn retry_larger_on(
+    s: &mut Session,
+    set: &Settings,
+    wrapped: ObjectId,
+    first: WrapOut,
+    wrap_with: impl FnOnce(&mut Session, usize) -> CmdResult<WrapOut>,
+) -> CmdResult<(WrapOut, Option<CapRetry>)> {
+    // a call cancelled meanwhile does not start the second wrap (the caller's next check ends it)
+    let Some(cap_to) = retry_cap(s, set, wrapped, &first).filter(|_| !s.cancel.is_cancelled()) else {
+        return Ok((first, None));
+    };
+    let base = retry_note(&first, cap_to, RetryReason::Failed);
+    if !set.budget.draw() {
+        return Ok((first, Some(CapRetry { reason: RetryReason::BudgetSpent, ..base })));
+    }
+    let before: Vec<ObjectId> = s.doc.bodies.iter().map(|b| b.id).collect();
+    match wrap_with(s, cap_to) {
+        Ok(second) => {
+            let (kept, info) = settle(s, set, first, second, base);
+            Ok((kept, Some(info)))
+        }
+        Err(e) => {
+            remove_bodies_added_since(s, &before);
+            if crate::cmd::is_cancelled(&e) {
+                return Err(e);
+            }
+            Ok((first, Some(CapRetry { error: Some(message_of(&e).to_string()), ..base })))
+        }
+    }
 }
 
 /// [`retry_larger_on`] for the scan itself.
@@ -363,7 +387,8 @@ fn freeform_with_mesh(
     if let Some(msg) = scale_warning(set.tolerance, diagonal) {
         issues.insert(0, issue("tolerance_exceeds_part", msg));
     }
-    let next = next_steps(&w, &issues, set, retry.is_some());
+    let tried = retry.as_ref().is_some_and(|r| r.reason != RetryReason::BudgetSpent);
+    let next = next_steps(&w, &issues, set, tried);
     let verdict = if issues.is_empty() {
         Verdict::Pass
     } else if d.coverage >= MIN_COVERAGE {
@@ -375,349 +400,5 @@ fn freeform_with_mesh(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::cmd::CmdError;
-    use surfacecraft_doc::ObjectId;
-    use surfacecraft_geom::{Point3, Vec3, synth};
-
-    const TOLERANCE: f64 = 0.2;
-
-    /// A closed sphere rippled all over: needs far more patches than a cap of a few hundred.
-    fn rippled() -> surfacecraft_geom::Mesh {
-        let k = std::f64::consts::TAU * 20.0 / 5.0;
-        let mut m = synth::sphere(Point3::origin(), 1.0, 120, 60);
-        for p in &mut m.positions {
-            let d: Vec3 = p.coords;
-            p.coords = d * (20.0 + 0.7 * (k * d.x + 0.3).sin() * (k * d.y + 0.7).sin() * (0.5 * k * d.z).cos());
-        }
-        m
-    }
-
-    fn session() -> (Session, Settings) {
-        let mut s = Session::new();
-        let scan = s.doc.add_mesh("scan", rippled());
-        let set = Settings {
-            scan,
-            tolerance: TOLERANCE,
-            min_within: 0.99,
-            min_triangles: None,
-            max_patches: None,
-            allow_retry: true,
-            rebuild: true,
-            name: "w".into(),
-        };
-        (s, set)
-    }
-
-    /// A wrap with `cap` patches whose result is forced to look capped and short of the tolerance.
-    fn first_attempt(s: &mut Session, set: &Settings, cap: usize) -> WrapOut {
-        let mut w = wrap_with(s, set, Some(cap)).unwrap();
-        w.capped = true;
-        w
-    }
-
-    fn bodies(s: &Session) -> usize {
-        s.doc.bodies.len()
-    }
-
-    #[test]
-    fn a_retry_that_covers_more_but_is_open_is_rejected() {
-        let closed = Attempt { closed: true, within: 0.5 };
-        assert_eq!(judge(closed, Attempt { closed: false, within: 0.9 }), RetryReason::OpenResult);
-    }
-
-    #[test]
-    fn a_retry_that_ties_or_gains_less_than_the_margin_is_rejected() {
-        let first = Attempt { closed: true, within: 0.80 };
-        assert_eq!(judge(first, Attempt { closed: true, within: 0.80 }), RetryReason::NotBetter);
-        assert_eq!(judge(first, Attempt { closed: true, within: 0.80 + RETRY_MIN_GAIN }), RetryReason::NotBetter);
-        assert_eq!(judge(first, Attempt { closed: true, within: 0.80 + 2.0 * RETRY_MIN_GAIN }), RetryReason::Better);
-    }
-
-    #[test]
-    fn closing_an_open_network_at_no_loss_counts_as_better() {
-        let open = Attempt { closed: false, within: 0.8 };
-        assert_eq!(judge(open, Attempt { closed: true, within: 0.8 }), RetryReason::Better);
-        assert_eq!(judge(open, Attempt { closed: true, within: 0.7 }), RetryReason::NotBetter);
-    }
-
-    #[test]
-    fn a_retry_with_a_larger_cap_that_is_clearly_better_replaces_the_first_body() {
-        // Arrange
-        let (mut s, set) = session();
-        let first = first_attempt(&mut s, &set, 300);
-        assert!(first.deviation.within >= RETRY_MIN_WITHIN);
-
-        // Act
-        let (kept, retry) = retry_larger(&mut s, &set, first.clone(), |s, cap| wrap_with(s, &set, Some(cap)));
-
-        // Assert
-        let retry = retry.unwrap();
-        assert_eq!((retry.cap_from, retry.cap_to), (300, 1500));
-        assert!(retry.kept && retry.reason == RetryReason::Better, "{retry:?}");
-        assert!(kept.patches > first.patches && kept.patches <= 1500);
-        assert_eq!(bodies(&s), 1);
-        assert_eq!(s.doc.body(kept.body.id).unwrap().name, set.name, "the result keeps the requested name");
-    }
-
-    #[test]
-    fn a_retry_that_loses_leaves_the_first_body_and_says_why() {
-        // Arrange: the second wrap is the real one, forced to tie
-        let (mut s, set) = session();
-        let first = first_attempt(&mut s, &set, 300);
-        let (first_id, first_within) = (first.body.id, first.deviation.within);
-
-        // Act
-        let (kept, retry) = retry_larger(&mut s, &set, first, |s, cap| {
-            let mut w = wrap_with(s, &set, Some(cap))?;
-            w.deviation.within = first_within;
-            Ok(w)
-        });
-
-        // Assert
-        let retry = retry.unwrap();
-        assert!(!retry.kept && retry.reason == RetryReason::NotBetter, "{retry:?}");
-        assert_eq!(kept.body.id, first_id);
-        assert_eq!(bodies(&s), 1);
-        assert!(s.doc.body(ObjectId(first_id.0)).is_some());
-    }
-
-    #[test]
-    fn a_failed_retry_is_reported_with_its_error() {
-        // Arrange
-        let (mut s, set) = session();
-        let first = first_attempt(&mut s, &set, 300);
-
-        // Act
-        let (_, retry) = retry_larger(&mut s, &set, first, |_, _| Err(CmdError::Failed("boom".into())));
-
-        // Assert
-        let retry = retry.unwrap();
-        assert_eq!(retry.reason, RetryReason::Failed);
-        assert_eq!(retry.error.as_deref(), Some("boom"));
-        assert!(!retry.kept && retry.patches_to.is_none());
-        assert_eq!(bodies(&s), 1);
-    }
-
-    #[test]
-    fn an_explicit_cap_or_allow_retry_false_is_never_exceeded() {
-        for (max_patches, allow_retry) in [(Some(300), true), (None, false)] {
-            // Arrange
-            let (mut s, set) = session();
-            let set = Settings { max_patches, allow_retry, ..set };
-            let first = first_attempt(&mut s, &set, 300);
-
-            // Act
-            let (_, retry) = retry_larger(&mut s, &set, first, |_, _| panic!("no second wrap may be made"));
-
-            // Assert
-            assert!(retry.is_none());
-            assert_eq!(bodies(&s), 1);
-        }
-    }
-
-    #[test]
-    fn the_larger_cap_is_not_suggested_again_after_a_retry() {
-        // Arrange
-        let (mut s, set) = session();
-        let w = first_attempt(&mut s, &set, 300);
-        let issues = vec![issue("out_of_tolerance", "x".into())];
-
-        // Act
-        let fresh = next_steps(&w, &issues, &set, false);
-        let retried = next_steps(&w, &issues, &set, true);
-
-        // Assert
-        assert!(fresh.iter().any(|st| st.command == "surface.wrap"));
-        assert!(retried.iter().all(|st| st.command != "surface.wrap"));
-    }
-
-    #[test]
-    fn a_failed_retry_removes_any_body_it_added() {
-        // Arrange
-        let (mut s, set) = session();
-        let first = first_attempt(&mut s, &set, 300);
-        let (id, name) = (first.body.id, s.doc.body(first.body.id).unwrap().name.clone());
-
-        // Act: the wrap adds a body and then fails
-        let (kept, retry) = retry_larger(&mut s, &set, first, |s, cap| {
-            wrap_with(s, &set, Some(cap))?;
-            Err(CmdError::Failed("late failure".into()))
-        });
-
-        // Assert
-        assert_eq!(retry.unwrap().reason, RetryReason::Failed);
-        assert_eq!(bodies(&s), 1);
-        assert_eq!(kept.body.id, id);
-        assert_eq!(s.doc.body(id).unwrap().name, name);
-    }
-
-    #[test]
-    fn a_share_that_is_not_a_number_is_not_reported_as_one() {
-        // Arrange
-        let (mut s, set) = session();
-        let first = first_attempt(&mut s, &set, 300);
-
-        // Act
-        let (_, retry) = retry_larger(&mut s, &set, first, |s, cap| {
-            let mut w = wrap_with(s, &set, Some(cap))?;
-            w.deviation.within = f64::NAN;
-            Ok(w)
-        });
-
-        // Assert
-        let retry = retry.unwrap();
-        assert!(retry.within_to.is_none() && !retry.kept, "{retry:?}");
-        assert!(serde_json::to_value(&retry).unwrap().get("within_to").is_none());
-    }
-
-    fn scan_summary() -> ScanSummary {
-        ScanSummary {
-            triangles_before: 0,
-            triangles: 0,
-            holes_before: 0,
-            holes_filled: 0,
-            holes_left: 0,
-            non_manifold_edges: 0,
-            noise_sigma: None,
-            findings: Vec::new(),
-        }
-    }
-
-    /// The assembled output of `freeform_with` when the first wrap is forced to be capped and the
-    /// second is the real wrap, optionally forced to tie.
-    fn assembled(second_ties: bool) -> (Session, Settings, ToSolidOut) {
-        let (mut s, set) = session();
-        let mut first_within = 0.0;
-        let out = freeform_with(&mut s, &set, scan_summary(), |s, cap| {
-            let mut w = wrap_with(s, &set, Some(cap.unwrap_or(300)))?;
-            if cap.is_none() {
-                w.capped = true;
-                first_within = w.deviation.within;
-            } else if second_ties {
-                w.deviation.within = first_within;
-            }
-            Ok(w)
-        })
-        .unwrap();
-        (s, set, out)
-    }
-
-    #[test]
-    fn the_assembled_output_of_a_winning_retry_has_the_second_body_under_the_requested_name() {
-        // Act
-        let (s, set, out) = assembled(false);
-
-        // Assert
-        let retry = out.retry.as_ref().unwrap();
-        assert!(retry.kept && retry.reason == RetryReason::Better, "{retry:?}");
-        let id = out.body.as_ref().unwrap().id;
-        assert_eq!(s.doc.body(id).unwrap().name, set.name);
-        assert_eq!(bodies(&s), 1);
-        assert_eq!(out.patches, retry.patches_to);
-        assert!(out.next_steps.iter().all(|st| st.command != "surface.wrap"));
-    }
-
-    #[test]
-    fn the_assembled_output_of_a_losing_retry_keeps_the_first_body_and_suggests_no_larger_cap() {
-        // Act
-        let (s, set, out) = assembled(true);
-
-        // Assert
-        let retry = out.retry.as_ref().unwrap();
-        assert!(!retry.kept && retry.reason == RetryReason::NotBetter, "{retry:?}");
-        let id = out.body.as_ref().unwrap().id;
-        assert_eq!(s.doc.body(id).unwrap().name, set.name);
-        assert_eq!(bodies(&s), 1);
-        assert_eq!(out.patches, Some(retry.patches_from));
-        assert!(out.next_steps.iter().all(|st| st.command != "surface.wrap"));
-    }
-
-    #[test]
-    fn a_cancelled_wrap_is_a_cancelled_error_not_a_failed_result() {
-        let (mut s, set) = session();
-        let r = freeform_with(&mut s, &set, empty_report(), |_, _| Err(crate::cmd::cancelled()));
-        assert!(matches!(r, Err(ref e) if crate::cmd::is_cancelled(e)));
-        let other = freeform_with(&mut s, &set, empty_report(), |_, _| Err(CmdError::Failed("boom".into())));
-        assert!(other.is_ok_and(|o| o.verdict == Verdict::Fail), "any other failure is a failed result");
-    }
-
-    fn empty_report() -> ScanSummary {
-        ScanSummary {
-            triangles_before: 0,
-            triangles: 0,
-            holes_before: 0,
-            holes_filled: 0,
-            holes_left: 0,
-            non_manifold_edges: 0,
-            noise_sigma: None,
-            findings: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn a_cancelled_larger_cap_wrap_is_a_cancelled_error_and_leaves_no_second_body() {
-        let (mut s, set) = session();
-        let first = first_attempt(&mut s, &set, 300);
-        let bodies = s.doc.bodies.len();
-        let r = retry_larger_on(&mut s, &set, set.scan, first, |_, _| Err(crate::cmd::cancelled()));
-        assert!(matches!(r, Err(ref e) if crate::cmd::is_cancelled(e)));
-        assert_eq!(s.doc.bodies.len(), bodies);
-    }
-
-    #[test]
-    fn the_size_limit_of_the_retry_is_that_of_the_mesh_wrapped() {
-        let (mut s, set) = session();
-        let first = first_attempt(&mut s, &set, 300);
-        let big = surfacecraft_geom::synth::sphere(Point3::origin(), 20.0, 1300, 700);
-        assert!(big.triangle_count() > RETRY_MAX_TRIANGLES);
-        let huge = s.doc.add_mesh("rebuilt", big);
-        let r = retry_larger_on(&mut s, &set, huge, first, |_, _| panic!("no second wrap for a mesh this large"));
-        assert!(matches!(r, Ok((_, None))));
-    }
-
-    #[test]
-    fn the_wraps_of_a_call_are_one_unless_the_retry_is_allowed() {
-        for (allow, expected) in [(true, 2usize), (false, 1)] {
-            let (mut s, set) = session();
-            let set = Settings { allow_retry: allow, ..set };
-            let mut calls = 0usize;
-            let out = freeform_with(&mut s, &set, empty_report(), |s, cap| {
-                calls += 1;
-                let mut w = wrap_with(s, &set, Some(cap.unwrap_or(300)))?;
-                w.capped = true;
-                w.deviation.within = 0.5;
-                Ok(w)
-            });
-            assert!(out.is_ok());
-            assert_eq!(calls, expected, "allow_retry {allow}");
-        }
-    }
-
-    /// Two parts in turn, the first fine and the second capped, then a third that is capped too: the one
-    /// retry of the call goes to the second and is made once; the third makes one wrap.
-    #[test]
-    fn the_one_retry_of_a_call_goes_to_the_first_part_that_qualifies() {
-        let (mut s, set) = session();
-        let mut done: Vec<(super::super::ComponentOut, ToSolidOut)> = Vec::new();
-        let mut calls = Vec::new();
-        for capped in [false, true, true] {
-            let allow = super::super::prepare::retry_allowed(true, &done);
-            let set = Settings { allow_retry: allow, name: set.name.clone(), ..set };
-            let mut n = 0usize;
-            let out = freeform_with(&mut s, &set, empty_report(), |s, cap| {
-                n += 1;
-                let mut w = wrap_with(s, &set, Some(cap.unwrap_or(300)))?;
-                w.capped = capped;
-                w.deviation.within = if capped { 0.5 } else { 1.0 };
-                Ok(w)
-            })
-            .unwrap();
-            calls.push(n);
-            let comp = super::super::prepare::component_for_tests(&out);
-            done.push((comp, out));
-        }
-        assert_eq!(calls, vec![1, 2, 1], "wraps per part: the retry is made for the second only");
-    }
-}
+#[path = "pipeline_freeform_tests.rs"]
+mod tests;

@@ -66,6 +66,10 @@ fn gate_scan_to_solid_rebuilds_a_chamfered_pin_in_one_call() {
     // Assert
     eprintln!("scan.to_solid: {}", serde_json::to_string_pretty(&out).unwrap());
     assert_eq!(out["verdict"], "pass", "{out}");
+    // `auto` (the default) keeps a prismatic scan on the primitives method: genuine primitives
+    // lost to freeform regions would push the primitive share below half and flip it to the wrap
+    assert_eq!(out["method"], "primitives", "{out}");
+    assert_eq!(out["attempts"].as_array().unwrap().len(), 1, "a pass with the first method is one attempt: {out}");
     assert!(out["issues"].as_array().unwrap().is_empty(), "{out}");
     assert_eq!(out["body"]["faces"], cad.faces.len(), "{out}");
     let volume = out["body"]["volume"].as_f64().unwrap();
@@ -84,14 +88,37 @@ fn gate_scan_to_solid_rebuilds_a_chamfered_pin_in_one_call() {
     assert_eq!(s.doc.meshes[0].mesh.triangle_count(), raw_triangles);
 }
 
+/// `auto` on the three-shell bracket: the scan is split, the box is modelled with primitives and the
+/// boss, which no primitive closes, is wrapped in patches as a freeform part (P9-O7: its holes are
+/// consolidated into a freeform area). Both parts pass; the ball, about 3 % of the surface, is below
+/// `part_share` and is reported, so the verdict is a `review` whose only issue is `unmodelled_pieces`
+/// (the twin of the next test, which forces the primitives method).
+#[test]
+fn auto_on_the_three_shell_scan_models_the_box_with_primitives_and_the_boss_as_freeform() {
+    let mut s = Session::new();
+    s.execute("mesh.synth", json!({"shape": "bracket", "noise": 0.03, "name": "scan"})).unwrap();
+    let out = s.execute("scan.to_solid", json!({"scan": "scan"})).unwrap();
+    let parts = out["components"].as_array().unwrap();
+    assert!(parts.iter().any(|c| c["method"] == "primitives" && c["verdict"] == "pass"), "{out}");
+    assert!(parts.iter().any(|c| c["method"] == "freeform" && c["verdict"] == "pass"), "{out}");
+    assert_eq!(out["verdict"], "review", "{out}");
+    let issues: Vec<&str> = out["issues"].as_array().unwrap().iter().map(|i| i["code"].as_str().unwrap()).collect();
+    assert_eq!(issues, ["unmodelled_pieces"], "{out}");
+    let commands: Vec<&str> =
+        out["next_steps"].as_array().unwrap().iter().map(|n| n["command"].as_str().unwrap()).collect();
+    assert_eq!(commands, ["export.step", "scan.split"], "{out}");
+    let ids: Vec<&Value> = out["bodies"].as_array().unwrap().iter().map(|b| &b["id"]).collect();
+    assert_eq!(out["next_steps"][0]["params"]["objects"].as_array().unwrap().iter().collect::<Vec<_>>(), ids, "{out}");
+}
+
 #[test]
 fn a_scan_that_does_not_close_gets_a_verdict_and_next_steps_not_an_error() {
     // Arrange: three separate shells (a box, a boss and a ball), which no stock trimming closes
     let mut s = Session::new();
     s.execute("mesh.synth", json!({"shape": "bracket", "noise": 0.03, "name": "scan"})).unwrap();
 
-    // Act
-    let out = s.execute("scan.to_solid", json!({"scan": "scan", "part_share": 0.05})).unwrap();
+    // Act (the cleaned boss goes to freeform under `auto`, so ask for the primitives method)
+    let out = s.execute("scan.to_solid", json!({"scan": "scan", "method": "primitives", "part_share": 0.05})).unwrap();
 
     // Assert: the three shells are three parts; each is modelled on its own and the verdict is the worst of the three
     assert_eq!(out["preparation"][0]["step"], "split", "{out}");
@@ -117,7 +144,9 @@ fn a_scan_that_does_not_close_gets_a_verdict_and_next_steps_not_an_error() {
     assert!(!steps.is_empty(), "{out}");
     assert!(steps.iter().all(|st| st["command"].is_string() && st["why"].is_string()), "{out}");
     assert_eq!(out["verdict"], "fail", "{out}");
-    assert!(codes(&out["issues"]).contains(&"no_solid".to_string()), "{out}");
+    // no solid, or one that holds a part of the scan (the boss is left out as a freeform area)
+    let found = codes(&out["issues"]);
+    assert!(found.contains(&"no_solid".to_string()) || found.contains(&"low_coverage".to_string()), "{out}");
     // every suggested step has parameters its command accepts
     for st in steps {
         let command = st["command"].as_str().unwrap();
@@ -197,6 +226,7 @@ fn gate_scan_to_solid_wraps_an_organic_scan_in_patches() {
     eprintln!("organic: {}", serde_json::to_string(&json!({"verdict": out["verdict"], "method": out["method"], "patches": out["patches"], "body": out["body"], "deviation": out["deviation"], "issues": out["issues"]})).unwrap());
     assert_eq!(out["method"], "freeform", "{out}");
     assert_eq!(out["verdict"], "pass", "{out}");
+    assert_eq!(out["attempts"].as_array().unwrap().len(), 1, "an organic scan that passes is one attempt: {out}");
     assert!(out["patches"].as_u64().unwrap() > 0, "{out}");
     assert!(out["body"]["volume"].as_f64().is_some_and(|v| v > 0.0), "a closed solid: {out}");
     assert!(out["deviation"]["within"].as_f64().unwrap() >= 0.99, "{out}");

@@ -3,25 +3,30 @@
 //! `primitive.fit`, `primitive.auto_constrain`, `body.from_regions` and `body.compare` in order
 //! and adds no geometry of its own; what it adds is the choice of regions, the verdict and the
 //! next steps, so that an agent needs one call instead of a dozen and cannot miss a poor result.
-use super::body::BodyOut;
 use super::deviation::{NOISE_PRIMITIVE_MM, positive, yes};
 use super::hybrid::{FaceOf, FromRegionsIn, from_regions};
 use super::mesh_edit::{CleanIn, clean};
 use super::primitive::{AutoConstrainIn, auto_constrain};
 use super::qa::{CompareIn, CompareOut, QaIn, compare, scan_qa};
-use super::region::{AutoIn, auto_segment};
+use super::region::{AutoIn, RegionsOut, auto_segment};
 use super::wrap::PATCH_LIMIT;
 use super::{CmdError, CmdResult, CommandSpec, ObjRef};
 use crate::{Session, command};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use surfacecraft_deviation::faces::FaceDeviation;
+use serde_json::Value;
 use surfacecraft_deviation::noise_estimate;
 use surfacecraft_doc::{ObjectId, ObjectKind};
+use surfacecraft_fit::segment::SegmentOptions;
 
+#[path = "pipeline_auto.rs"]
+mod auto;
+#[path = "pipeline_budget.rs"]
+mod budget;
 #[path = "pipeline_freeform.rs"]
 mod freeform;
+#[path = "pipeline_judge.rs"]
+mod judge;
 #[path = "pipeline_prepare.rs"]
 mod prepare;
 #[path = "pipeline_shell.rs"]
@@ -34,6 +39,7 @@ mod types;
 pub use types::{DeviationSummary, Issue, LeftOut, Modelled, NextStep, ScanSummary, ToSolidOut};
 #[path = "pipeline_regions.rs"]
 mod regions;
+use judge::{Outcome, issues_of, next_steps, verdict_of};
 use regions::{candidates, fit_regions, primitive_share};
 
 /// Default tolerance the solid is held to against the scan (mm).
@@ -112,6 +118,9 @@ pub struct ToSolidIn {
     /// coaxial, equal radii (default true).
     #[serde(default = "yes")]
     pub constrain: bool,
+    /// `auto` only: also try the other method when the first does not pass (default true).
+    #[serde(default)]
+    pub retry: Option<bool>,
     /// Most patches of the network of method `freeform` (default 12000, at most 60000). An explicit
     /// value is a promise and is never exceeded; without it, a network that stops at the default limit
     /// short of the tolerance is built once more with a larger limit when that is likely to help
@@ -123,7 +132,7 @@ pub struct ToSolidIn {
     /// `max_patches` is given).
     #[serde(default = "yes")]
     pub allow_retry: bool,
-    /// Rebuild a closed scan with many handles or non-manifold edges, or that wrapping did not pass on, with `mesh.remesh` and wrap it (again) (default true; at most one extra wrap per part and for at most the 4 largest parts; the larger-cap retry is made once per call, for the first part in area order that qualifies for it). At most 29 wraps per call in all (24 parts, 4 rebuilds, 1 retry). `false`: the scan is wrapped as it is.
+    /// Rebuild a closed scan with many handles or non-manifold edges, or that wrapping did not pass on, with `mesh.remesh` and wrap it (again) (default true; for at most the 4 largest parts). The wrap again, the larger-cap retry (`allow_retry`, for the first part in area order that qualifies for it) and the other method of `auto` are extra attempts: one budget of 2 per call (a count, no clock). At most 26 wraps per call in all (a wrap for each of 24 parts, and the 2 extra attempts). `false`: the scan is wrapped as it is.
     #[serde(default = "yes")]
     pub rebuild: bool,
     /// A part of a scan with several pieces is co-equal, and modelled, when its area is at least this share of the largest piece's (0..1, default 0.1). Smaller pieces and debris are reported, not modelled.
@@ -160,6 +169,8 @@ pub enum Verdict {
 
 /// The parameters after validation.
 struct Settings {
+    /// Extra attempts of this call draw from it (see `pipeline_budget`).
+    budget: budget::CallBudget,
     scan: ObjectId,
     tolerance: f64,
     min_within: f64,
@@ -238,6 +249,7 @@ fn settings(s: &Session, i: &ToSolidIn) -> CmdResult<Settings> {
         return Err(CmdError::Params(format!("max_patches must be {}..={PATCH_LIMIT}", freeform::MIN_PATCHES)));
     }
     Ok(Settings {
+        budget: budget::CallBudget::default(),
         scan,
         tolerance,
         min_within,
@@ -283,177 +295,6 @@ fn summary(c: &CompareOut, scan_vertices: usize) -> DeviationSummary {
     }
 }
 
-/// The run so far: what the issues and the next steps are read from.
-struct Outcome {
-    scan: ObjectId,
-    body: Option<BodyOut>,
-    build_error: Option<String>,
-    deviation: Option<DeviationSummary>,
-    worst_faces: Vec<FaceDeviation>,
-    modelled: Vec<Modelled>,
-    left_out: Vec<LeftOut>,
-    unassigned: usize,
-    holes_left: usize,
-    non_manifold: usize,
-}
-
-impl Outcome {
-    fn closed(&self) -> bool {
-        self.body.as_ref().is_some_and(|b| b.volume.is_some_and(|v| v.is_finite() && v > 0.0))
-    }
-
-    fn skipped(&self) -> usize {
-        self.modelled.iter().filter(|m| m.skipped.is_some()).count()
-    }
-
-    fn covered(&self) -> bool {
-        self.deviation.as_ref().is_some_and(|d| d.coverage >= MIN_COVERAGE)
-    }
-
-    /// Share of the scan's triangles in the regions that became primitives.
-    fn modelled_share(&self, total_triangles: usize) -> f64 {
-        if total_triangles == 0 {
-            return 0.0;
-        }
-        self.modelled.iter().map(|m| m.triangles).sum::<usize>() as f64 / total_triangles as f64
-    }
-}
-
-/// What keeps the outcome from a pass; empty when nothing does.
-fn issues_of(o: &Outcome, set: &Settings, total_triangles: usize) -> Vec<Issue> {
-    let mut list = blocking_issues(o, set);
-    if !list.is_empty() {
-        list.extend(context_issues(o, total_triangles));
-    }
-    list
-}
-
-/// The issues that decide the verdict: no solid, skipped inputs, coverage, tolerance.
-fn blocking_issues(o: &Outcome, set: &Settings) -> Vec<Issue> {
-    let mut list = Vec::new();
-    if let Some(e) = &o.build_error {
-        list.push(issue("no_solid", format!("no solid was built: {e}")));
-    } else if o.modelled.is_empty() {
-        list.push(issue("no_solid", "no region of the scan could be modelled as a primitive".to_string()));
-    } else if !o.closed() {
-        list.push(issue("no_solid", "the result is not a closed solid (it has no volume)".to_string()));
-    }
-    if o.skipped() > 0 {
-        let msg = format!("{} of {} primitives could not be built into the solid", o.skipped(), o.modelled.len());
-        list.push(issue("skipped_inputs", msg));
-    }
-    if let Some(d) = &o.deviation {
-        list.extend(coverage_issue(d, "the solid"));
-        if d.count > 0 && d.within < set.min_within {
-            let msg = format!(
-                "{:.2} % of the measured points are within {} mm ({:.0} % required); max {:.3} mm, RMS {:.3} mm",
-                100.0 * d.within,
-                set.tolerance,
-                100.0 * set.min_within,
-                d.max_abs,
-                d.rms
-            );
-            list.push(issue("out_of_tolerance", msg));
-        }
-    }
-    list
-}
-
-/// Context for a run that did not pass: what the solid was not built from.
-fn context_issues(o: &Outcome, total_triangles: usize) -> Vec<Issue> {
-    let mut list = Vec::new();
-    let share = o.modelled_share(total_triangles);
-    if share < MIN_MODELLED_SHARE {
-        let msg = format!(
-            "only {:.0} % of the scan lies in regions a primitive fits: the part is mostly freeform, and this command models planes, cylinders, cones, spheres and tori",
-            100.0 * share
-        );
-        list.push(issue("mostly_freeform", msg));
-    }
-    let left: usize = o.left_out.iter().map(|l| l.triangles).sum();
-    if left > 0 {
-        let msg = format!("{} regions ({left} triangles) were not modelled", o.left_out.len());
-        list.push(issue("left_out_regions", msg));
-    }
-    if o.unassigned > 0 && total_triangles > 0 {
-        let share = 100.0 * o.unassigned as f64 / total_triangles as f64;
-        list.push(issue("unassigned_triangles", format!("{} triangles ({share:.1} %) are in no region", o.unassigned)));
-    }
-    if o.holes_left > 0 {
-        list.push(issue("scan_defects", format!("{} holes of the scan were too large to fill", o.holes_left)));
-    }
-    if o.non_manifold > 0 {
-        let msg = format!(
-            "{} edges are shared by three or more triangles; regions and holes next to them are unreliable",
-            o.non_manifold
-        );
-        list.push(issue("non_manifold_edges", msg));
-    }
-    list
-}
-
-/// Commands worth running next, most useful first.
-fn next_steps(o: &Outcome, issues: &[Issue], set: &Settings) -> Vec<NextStep> {
-    let has = |code: &str| issues.iter().any(|i| i.code == code);
-    let mut steps = Vec::new();
-    if issues.is_empty() {
-        if let Some(b) = &o.body {
-            let why = "the solid passed: export it (pass `path` when files are allowed, else read `data`)";
-            steps.push(step("export.step", json!({"objects": [b.id]}), why));
-        }
-        return steps;
-    }
-    let primitives: Vec<ObjectId> = o.modelled.iter().map(|m| m.primitive).collect();
-    if (has("skipped_inputs") || has("no_solid")) && !primitives.is_empty() {
-        let why = "reports the role of each primitive and why an input is skipped, before any cut";
-        steps.push(step("body.plan_regions", json!({"primitives": primitives}), why));
-    }
-    if has("mostly_freeform") {
-        let why = "the part is freeform: wrap the whole scan in a patch network instead";
-        steps.push(step(
-            "scan.to_solid",
-            json!({"scan": o.scan, "method": "freeform", "tolerance": set.tolerance}),
-            why,
-        ));
-    }
-    if has("out_of_tolerance")
-        && o.covered()
-        && let Some(b) = &o.body
-    {
-        let why = "moves the analytic faces of the solid onto the scan (planes shift, radii change)";
-        steps.push(step("body.refit_faces", json!({"body": b.id, "mesh": o.scan}), why));
-    }
-    let freeform = o.left_out.iter().filter(|l| l.reason.starts_with("RMS")).take(MAX_SURFACE_HINTS);
-    for l in freeform {
-        let why = "a large region that is no primitive: fit a freeform surface, then pass it in `surfaces` of body.from_regions";
-        steps.push(step("surface.fit", json!({"region": l.region, "tolerance": set.tolerance}), why));
-    }
-    if has("scan_defects") {
-        let why = "fills the holes that were too large (this drops the regions), then model the scan again";
-        steps.push(step("mesh.fill_holes", json!({"object": o.scan, "max_edges": MAX_FILL_EDGES}), why));
-        steps.push(step("scan.to_solid", json!({"scan": o.scan}), "segments and models the repaired scan"));
-    } else if !has("mostly_freeform") {
-        let why = "after correcting the regions (region.merge, region.split, region.grow, region.resegment), model them again";
-        steps.push(step("scan.to_solid", json!({"scan": o.scan, "reuse_regions": true}), why));
-    }
-    steps.push(step(
-        "guide.read",
-        json!({"topic": "scan-to-solid"}),
-        "what each verdict and issue means and how to go on by hand",
-    ));
-    steps
-}
-
-fn verdict_of(o: &Outcome, issues: &[Issue]) -> Verdict {
-    if issues.is_empty() {
-        Verdict::Pass
-    } else if o.closed() && o.covered() {
-        Verdict::Review
-    } else {
-        Verdict::Fail
-    }
-}
-
 /// Cleans the scan when asked and reports what the scan was and is.
 fn prepare(s: &mut Session, i: &ToSolidIn, scan: ObjectId) -> CmdResult<ScanSummary> {
     let qa = scan_qa(s, QaIn { object: ObjRef::Id(scan.0) })?;
@@ -488,6 +329,10 @@ fn prepare(s: &mut Session, i: &ToSolidIn, scan: ObjectId) -> CmdResult<ScanSumm
         holes_left: left,
         non_manifold_edges: non_manifold,
         noise_sigma: noise,
+        noise_used: None,
+        noise_source: None,
+        noise_spread: None,
+        noise_above_tolerance: false,
         findings: qa.findings,
     })
 }
@@ -562,26 +407,45 @@ pub(super) fn to_solid(s: &mut Session, i: ToSolidIn) -> CmdResult<ToSolidOut> {
     solve(s, &i, set, scan_report)
 }
 
-/// Models one scan (a part, or the whole scan) once it is cleaned.
+/// Models one scan (a part, or the whole scan) once it is cleaned: the given method, or `auto`'s
+/// ordered attempts (see `pipeline_auto`); the attempts are listed in the result.
 fn solve(s: &mut Session, i: &ToSolidIn, set: Settings, scan_report: ScanSummary) -> CmdResult<ToSolidOut> {
-    if i.method == Method::Freeform {
-        return freeform::freeform_solid(s, &set, scan_report);
+    let report = auto::run(s, i, &set, scan_report)?;
+    Ok(ToSolidOut { attempts: report.attempts, ..report.result })
+}
+
+/// Segments the scan into regions at the caller's tolerance (unless the regions are reused) and
+/// returns what the segmentation reports, the noise it used among it.
+fn segment_scan(s: &mut Session, i: &ToSolidIn, set: &Settings) -> CmdResult<Option<RegionsOut>> {
+    if i.reuse_regions {
+        return Ok(None);
     }
-    if !i.reuse_regions {
-        auto_segment(s, AutoIn { mesh: ObjRef::Id(set.scan.0), options: Default::default(), replace: true })?;
-    }
-    let (list, unassigned) = candidates(s, set.scan);
-    let total = triangle_count(s, set.scan);
+    let options = SegmentOptions { tolerance: set.tolerance, ..SegmentOptions::default() };
+    auto_segment(s, AutoIn { mesh: ObjRef::Id(set.scan.0), options, replace: true }).map(Some)
+}
+
+/// The smallest region the primitives method models, and the RMS above which a fit is no primitive.
+fn region_limits(set: &Settings, total: usize, scan_report: &ScanSummary) -> (usize, f64) {
     let min_triangles = set
         .min_triangles
         .unwrap_or_else(|| ((total as f64 * MIN_REGION_SHARE).ceil() as usize).max(MIN_REGION_TRIANGLES));
-    let rms_limit = NOISE_PRIMITIVE_MM.max(2.0 * scan_report.noise_sigma.unwrap_or(0.0));
-    if i.method == Method::Auto
-        && !i.reuse_regions
-        && primitive_share(&list, min_triangles, rms_limit, total) < MIN_MODELLED_SHARE
-    {
-        return freeform::freeform_solid(s, &set, scan_report);
-    }
+    (min_triangles, NOISE_PRIMITIVE_MM.max(2.0 * scan_report.noise_sigma.unwrap_or(0.0)))
+}
+
+/// Share of the scan's triangles in the regions a primitive fits (freeform regions have no kind and
+/// never count): the heuristic that orders the attempts of `method: auto`.
+fn scan_primitive_share(s: &Session, set: &Settings, scan_report: &ScanSummary) -> f64 {
+    let (list, _) = candidates(s, set.scan);
+    let total = triangle_count(s, set.scan);
+    let (min_triangles, rms_limit) = region_limits(set, total, scan_report);
+    primitive_share(&list, min_triangles, rms_limit, total)
+}
+
+/// The primitives method on the regions the scan has: fits, relates and builds.
+fn primitives_solid(s: &mut Session, i: &ToSolidIn, set: &Settings, scan_report: ScanSummary) -> CmdResult<ToSolidOut> {
+    let (list, unassigned) = candidates(s, set.scan);
+    let total = triangle_count(s, set.scan);
+    let (min_triangles, rms_limit) = region_limits(set, total, &scan_report);
     let (modelled, left) = fit_regions(s, &list, min_triangles, rms_limit);
     let relations = if i.constrain { relate(s, &modelled, scan_report.noise_sigma) } else { 0 };
     let mut o = Outcome {
@@ -596,9 +460,9 @@ fn solve(s: &mut Session, i: &ToSolidIn, set: Settings, scan_report: ScanSummary
         holes_left: scan_report.holes_left,
         non_manifold: scan_report.non_manifold_edges,
     };
-    build(s, &set, &mut o)?;
-    let issues = issues_of(&o, &set, total);
-    let next = next_steps(&o, &issues, &set);
+    build(s, set, &mut o)?;
+    let issues = issues_of(&o, set, total);
+    let next = next_steps(&o, &issues, set);
     let verdict = verdict_of(&o, &issues);
     let left_out_regions = o.left_out.len();
     let left_out_triangles = o.left_out.iter().map(|l| l.triangles).sum();
@@ -623,6 +487,7 @@ fn solve(s: &mut Session, i: &ToSolidIn, set: Settings, scan_report: ScanSummary
         relations,
         issues,
         next_steps: next,
+        attempts: Vec::new(),
         prep: PrepOut::default(),
         thickened: None,
     })
@@ -634,7 +499,7 @@ pub static COMMANDS: &[CommandSpec] = &[command!(
     "Scan to solid",
     "Solid",
     true,
-    "From raw scan `scan` to a closed solid in one step, measured against the scan. Prismatic parts (`method` primitives): cleans the scan, segments it, fits a primitive to each sizeable region, relates the primitives and builds the solid. Organic parts, castings and body panels (`method` freeform): wraps the whole scan in a watertight network of patches. `method` auto (default) chooses by how much of the scan primitives fit. Returns `verdict` (pass, review or fail), the deviation, `issues`, and `next_steps` with ready parameters. A poor model is a verdict, not an error; regions and primitives stay for manual work. `reuse_regions` models corrected regions again (without cleaning).",
+    "From raw scan `scan` to a closed solid in one step, measured against the scan. Prismatic parts (`method` primitives): cleans the scan, segments it, fits a primitive to each sizeable region, relates the primitives and builds the solid. Organic parts, castings and body panels (`method` freeform): wraps the whole scan in a watertight network of patches. `method` auto (default) tries the suggested method, then the other if it fails, and returns the better (`attempts`). Returns `verdict` (pass, review or fail), the deviation, `issues`, and `next_steps` with ready parameters. A poor model is a verdict, not an error; regions stay for manual work. `reuse_regions` models corrected regions again (without cleaning).",
     ToSolidIn,
     ToSolidOut,
     super::mesh::scan_size::to_solid_checked
