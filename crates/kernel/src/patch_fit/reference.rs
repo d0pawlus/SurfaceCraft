@@ -57,6 +57,16 @@ impl RefProbe {
         Ok(Self { eval, starts: Starts::default() })
     }
 
+    /// The point of the face's surface closest to `p`; `None` when `p` is farther than `accept` from it.
+    pub fn closest(&self, p: V3, accept: f64) -> Result<Option<V3>> {
+        if !finite3(&p) {
+            return Err(arg("the point must be finite"));
+        }
+        let Some(uv) = self.eval.project_with(&self.starts, v3(p), None, accept) else { return Ok(None) };
+        let q = self.eval.point(uv).map(|q| [q.x, q.y, q.z]).filter(finite3);
+        Ok(q)
+    }
+
     /// The face's normal and derivatives at the point of its surface closest to `p`.
     pub fn locate(&self, p: V3) -> Result<RefSample> {
         if !finite3(&p) {

@@ -5,21 +5,21 @@ use crate::vpatch::derivatives;
 
 const RADIUS: f64 = 20.0;
 
-struct Rng(u64);
+pub(super) struct Rng(pub(super) u64);
 
 impl Rng {
-    fn next(&mut self) -> f64 {
+    pub(super) fn next(&mut self) -> f64 {
         self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         (self.0 >> 11) as f64 / (1u64 << 53) as f64
     }
 
-    fn normal(&mut self) -> f64 {
+    pub(super) fn normal(&mut self) -> f64 {
         let (a, b) = (self.next().max(1e-12), self.next());
         (-2.0 * a.ln()).sqrt() * (2.0 * std::f64::consts::PI * b).cos()
     }
 }
 
-fn request(sides: Vec<Side>) -> Request {
+pub(super) fn request(sides: Vec<Side>) -> Request {
     Request {
         sides,
         data: Vec::new(),
@@ -35,11 +35,11 @@ fn request(sides: Vec<Side>) -> Request {
     }
 }
 
-fn g0(points: Vec<[f64; 3]>) -> Side {
-    Side { points, continuity: Continuity::G0, reference: None, uv: None }
+pub(super) fn g0(points: Vec<[f64; 3]>) -> Side {
+    Side { points, continuity: Continuity::G0, reference: None, uv: None, soft: false }
 }
 
-fn regular(n: usize, centre: [f64; 2], r: f64) -> Vec<[f64; 2]> {
+pub(super) fn regular(n: usize, centre: [f64; 2], r: f64) -> Vec<[f64; 2]> {
     (0..n)
         .map(|k| {
             let a = std::f64::consts::FRAC_PI_2 + 2.0 * std::f64::consts::PI * k as f64 / n as f64;
@@ -49,7 +49,7 @@ fn regular(n: usize, centre: [f64; 2], r: f64) -> Vec<[f64; 2]> {
 }
 
 /// Sides that are straight chords between `corners` in the plane, lifted by `lift`.
-fn polygon(corners: &[[f64; 2]], per_side: usize, lift: &dyn Fn(f64, f64) -> [f64; 3]) -> Vec<Side> {
+pub(super) fn polygon(corners: &[[f64; 2]], per_side: usize, lift: &dyn Fn(f64, f64) -> [f64; 3]) -> Vec<Side> {
     let n = corners.len();
     (0..n)
         .map(|k| {
@@ -68,7 +68,7 @@ fn wave(x: f64, y: f64) -> f64 {
     3.0 * (x / 12.0).sin() * (y / 9.0).cos()
 }
 
-fn cylinder_face() -> Face {
+pub(super) fn cylinder_face() -> Face {
     Face {
         surface: Surface::Cylinder {
             frame: Frame { origin: [0.0; 3], x_axis: [1.0, 0.0, 0.0], y_axis: [0.0, 1.0, 0.0] },
@@ -80,13 +80,13 @@ fn cylinder_face() -> Face {
     }
 }
 
-fn on_cylinder(s: f64, z: f64) -> [f64; 3] {
+pub(super) fn on_cylinder(s: f64, z: f64) -> [f64; 3] {
     let t = s / RADIUS;
     [RADIUS * t.cos(), RADIUS * t.sin(), z]
 }
 
 /// A five-sided hole of radius 6 in the unrolled cylinder, every side continuing the cylinder.
-fn cylinder_hole(continuity: Continuity) -> Request {
+pub(super) fn cylinder_hole(continuity: Continuity) -> Request {
     let corners = regular(5, [0.0, 0.0], 6.0);
     let sides = polygon(&corners, 40, &|s, z| on_cylinder(s, z))
         .into_iter()
@@ -164,6 +164,7 @@ fn wave_with_data() {
     assert!(patch.report.max <= 0.2, "{:?}", patch.report);
     assert!(patch.report.within_tolerance);
     assert_eq!(patch.report.points, 2000);
+    assert!((0.02..=0.04).contains(&patch.report.rms), "{:?}", patch.report);
 }
 
 #[test]
@@ -220,7 +221,7 @@ fn skewed_corner(conflicts: Conflicts) -> Request {
         domain: [[-20.0, 20.0], [-20.0, 20.0]],
         loops: Vec::new(),
     };
-    let side = |points, continuity, reference| Side { points, continuity, reference, uv: None };
+    let side = |points, continuity, reference| Side { points, continuity, reference, uv: None, soft: false };
     let mut req = request(vec![
         side(line(a, b, 30), Continuity::G1, Some(plane([1.0, 0.0, 0.0], [0.0, 1.0, 0.0]))),
         side(line(b, cc, 30), Continuity::G1, Some(plane([0.0, 1.0, 0.0], [c, 0.0, -s]))),

@@ -15,6 +15,7 @@ use crate::{KernelError, Result};
 use geom::{V2, thin_indices};
 use rows::{Inputs, Layout, SideSamples, Zone};
 
+mod curve;
 mod geom;
 mod measure;
 mod reference;
@@ -22,6 +23,10 @@ mod rows;
 mod start;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_rounds;
+#[cfg(test)]
+mod tests_soft;
 
 pub use reference::face_normal_curvature;
 
@@ -56,6 +61,9 @@ pub struct Side {
     pub reference: Option<Face>,
     /// Parameters of `points` when the caller has a flattening (same length as `points`).
     pub uv: Option<Vec<[f64; 2]>>,
+    /// The side is approximate (traced on a scan): the patch follows the data and comes as close to
+    /// the side as the data allow; its gap is reported but is not a target.
+    pub soft: bool,
 }
 
 /// What to fit.
@@ -90,6 +98,8 @@ pub struct Request {
 pub struct SideReport {
     /// The continuity asked for.
     pub continuity: Continuity,
+    /// The side was soft: its numbers are reported, not targets.
+    pub soft: bool,
     /// Largest distance from a side sample to the patch, mm.
     pub gap_max: f64,
     /// Largest angle between the reference normal and the patch normal, degrees (G1/G2).
@@ -100,6 +110,8 @@ pub struct SideReport {
     pub samples: usize,
     /// The patch folds back over the reference face.
     pub folded: bool,
+    /// Largest distance a point of the side was moved onto its reference face (G1/G2 sides), mm.
+    pub snap_max: Option<f64>,
 }
 
 /// A corner whose sides ask for tangent planes that disagree.
@@ -128,6 +140,8 @@ pub struct Report {
     pub max: f64,
     /// Data points measured.
     pub points: usize,
+    /// Data points that lie outside the outline and were ignored.
+    pub outside: usize,
     /// The data's largest distance is within the request's tolerance.
     pub within_tolerance: bool,
     /// Every side within its targets, nothing folded, no corner relaxed.
@@ -166,8 +180,11 @@ const MAX_ROUNDS: u32 = 6;
 const DEFAULT_SMOOTHING: f64 = 1e-3;
 /// Share of a side's length around a conflicting corner where its G1/G2 rows are relaxed.
 const RELAX_SPAN: f64 = 0.15;
-/// A round must lower the worst miss by this share to be followed by another.
+/// A round must lower the worst miss by this share to be followed by another; a side whose gap
+/// the growth lowered by less is as close as its own accuracy allows.
 const MIN_IMPROVEMENT: f64 = 0.05;
+/// Growth never replaces the kept round by one whose data deviation is this share larger.
+const MAX_DATA_GROWTH: f64 = 0.10;
 /// Corners of the trimming outline (the trimmer takes 8000).
 const MAX_TRIM_CORNERS: usize = 6_000;
 
@@ -175,13 +192,55 @@ const WARN_NO_DATA: &str = "no data: the interior is shaped by the boundary and 
 const WARN_MAX_CONTROL: &str = "the control net reached max_control";
 const WARN_FEW_DATA: &str = "too few data points for the control net";
 
+/// What decides which round is kept.
+#[derive(Clone, Copy, Debug)]
+struct Summary {
+    /// The data's largest distance is within the tolerance (or there are no data).
+    data_ok: bool,
+    /// The data's largest distance, mm.
+    data_max: f64,
+    /// Worst miss of the hard conditions in units of their targets (at most 1 when all are met).
+    side_miss: f64,
+}
+
 /// One solved and measured round.
 struct Round {
     surface: Surface,
     measure: measure::Measure,
     net: [usize; 2],
     dropped: usize,
-    ignored: usize,
+    summary: Summary,
+}
+
+/// Does `new` replace the kept round `kept`? A round within the data tolerance beats one outside
+/// it. Among rounds on the same side of the tolerance the smaller miss of the hard conditions wins
+/// (rounds that meet them all tie and the smaller data deviation wins), but a round whose data
+/// deviation is more than [`MAX_DATA_GROWTH`] larger never does, unless it brings the hard
+/// conditions from missed to met.
+fn prefer(new: &Summary, kept: &Summary) -> bool {
+    if new.data_ok != kept.data_ok {
+        return new.data_ok;
+    }
+    let brings_met = kept.side_miss > 1.0 && new.side_miss <= 1.0;
+    if new.data_max > (1.0 + MAX_DATA_GROWTH) * kept.data_max && !brings_met {
+        return false;
+    }
+    let (n, k) = (new.side_miss.max(1.0), kept.side_miss.max(1.0));
+    if n == k { new.data_max < kept.data_max } else { n < k }
+}
+
+/// A round as the tests see it.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct RoundTrace {
+    /// Control net of the round.
+    pub net: [usize; 2],
+    /// Root-mean-square data distance, mm.
+    pub rms: f64,
+    /// Largest data distance, mm.
+    pub max: f64,
+    /// Largest gap of a hard side, mm.
+    pub gap_max: f64,
 }
 
 /// One direction's size after growing by 1.5×, capped.
@@ -232,11 +291,33 @@ fn conflict_list(corners: &[start::Corner]) -> String {
 ///
 /// Errors (`KernelError::Argument`) name the reason: non-finite or oversized input, an open loop,
 /// G1/G2 without a reference face, an outline that is not a height field (give a flattening), a
-/// reference normal more than 75° off the outline's plane, incompatible corners with
+/// reference normal more than 75° off the outline's plane, a G1/G2 side more than 0.1 mm off its
+/// reference face (its points are first moved onto the face), incompatible corners with
 /// [`Conflicts::Fail`], hard points outside the parameter domain; and a kernel error where the
-/// solve or the trimming fails.
+/// solve or the trimming fails. Data outside the outline are ignored and counted; soft sides
+/// ([`Side::soft`]) are followed as far as the data allow and do not steer the fit's targets.
+/// The points of a hard side of three or more points are samples of a smooth curve: its dense
+/// samples follow a cubic interpolant through them, not the chords (a warning names a side that
+/// could not be interpolated). A round is kept by `prefer`; a side whose gap the growth no
+/// longer lowers is reported as being as close as its own accuracy allows.
 pub fn fit_patch(req: &Request) -> Result<Patch> {
-    let start::Prepared { lp, mut interior, corners } = start::prepare(req)?;
+    fit(
+        req,
+        #[cfg(test)]
+        &mut Vec::new(),
+    )
+}
+
+/// [`fit_patch`] with what every round measured.
+#[cfg(test)]
+pub(crate) fn fit_patch_rounds(req: &Request) -> Result<(Patch, Vec<RoundTrace>)> {
+    let mut trace = Vec::new();
+    let patch = fit(req, &mut trace)?;
+    Ok((patch, trace))
+}
+
+fn fit(req: &Request, #[cfg(test)] trace: &mut Vec<RoundTrace>) -> Result<Patch> {
+    let start::Prepared { lp, mut interior, corners, warnings: notes } = start::prepare(req)?;
 
     // corners whose tangent planes disagree: refuse, or relax the rows near them
     let conflicts: Vec<start::Corner> =
@@ -260,7 +341,7 @@ pub fn fit_patch(req: &Request) -> Result<Patch> {
 
     // start net and the fixed parameter domain: the loop's box grown by one control spacing
     let max = req.max_control;
-    let n_data = interior.data.len();
+    let n_data = interior.data.iter().filter(|p| !p.out).count();
     let start_net = req.control.unwrap_or_else(|| {
         let k = ((n_data as f64 / 12.0).sqrt().round() as usize).max(6);
         let k = std::cmp::min(max, k);
@@ -279,6 +360,9 @@ pub fn fit_patch(req: &Request) -> Result<Patch> {
     let mut cache: Option<(Layout, Vec<SideSamples>)> = None;
     let mut prev: Option<Surface> = None;
     let mut prev_worst = f64::INFINITY;
+    // sides whose gap the growth no longer lowers, and every side's gap in the round before
+    let mut frozen = vec![false; lp.sides.len()];
+    let mut prev_gaps: Vec<f64> = Vec::new();
     // the net before the last growth, and whether the last round already was a retry
     let mut from = start_net;
     let mut retried = false;
@@ -290,7 +374,7 @@ pub fn fit_patch(req: &Request) -> Result<Patch> {
             cache = Some((layout, rows::sample_sides(&lp, &layout)?));
         }
         let Some((_, samples)) = cache.as_ref() else { break };
-        let built = rows::build_problem(&Inputs {
+        let problem = rows::build_problem(&Inputs {
             lp: &lp,
             layout: &layout,
             sides: samples,
@@ -299,22 +383,39 @@ pub fn fit_patch(req: &Request) -> Result<Patch> {
             prev: prev.as_ref(),
             smoothing,
         })?;
-        let solution = vpatch::solve(&built.problem)?;
+        let solution = vpatch::solve(&problem)?;
         let probe = SurfaceProbe::new(&solution.surface)?;
-        let m = measure::measure(&solution.surface, &probe, &lp, &layout, samples, &mut interior, req.tolerance)?;
+        let goal = measure::Goal { tolerance: req.tolerance, frozen: &frozen };
+        let m = measure::measure(&solution.surface, &probe, &lp, &layout, samples, &mut interior, &goal)?;
+        #[cfg(test)]
+        trace.push(RoundTrace {
+            net,
+            rms: m.rms,
+            max: m.max,
+            gap_max: m.sides.iter().filter(|s| !s.soft).map(|s| s.gap_max).fold(0.0, f64::max),
+        });
 
-        let done = m.sides_ok && (m.points == 0 || m.max <= req.tolerance);
-        let worst = m.worst;
+        // a side whose gap the growth lowered by less than MIN_IMPROVEMENT is as close as it gets
+        for (k, (s, before)) in m.sides.iter().zip(&prev_gaps).enumerate() {
+            if !s.soft
+                && s.gap_max > G0_TARGET
+                && before - s.gap_max < MIN_IMPROVEMENT * before
+                && let Some(f) = frozen.get_mut(k)
+            {
+                *f = true;
+            }
+        }
+        prev_gaps = m.sides.iter().map(|s| s.gap_max).collect();
+
+        let data_ok = m.points == 0 || m.max <= req.tolerance;
+        let done = m.sides_ok(&frozen) && data_ok;
+        let worst = m.worst(&frozen);
         let miss = m.miss;
         let improved = round == 1 || prev_worst - worst >= MIN_IMPROVEMENT * prev_worst;
-        if best.as_ref().is_none_or(|b| worst < b.measure.worst) {
-            best = Some(Round {
-                surface: solution.surface.clone(),
-                measure: m,
-                net,
-                dropped: solution.dropped,
-                ignored: built.ignored,
-            });
+        let summary = Summary { data_ok, data_max: m.max, side_miss: m.side_miss() };
+        if best.as_ref().is_none_or(|b| prefer(&summary, &b.summary)) {
+            best =
+                Some(Round { surface: solution.surface.clone(), measure: m, net, dropped: solution.dropped, summary });
         }
         if done || round == MAX_ROUNDS {
             break;
@@ -352,21 +453,26 @@ pub fn fit_patch(req: &Request) -> Result<Patch> {
 
     let m = &best.measure;
     let within_tolerance = m.points == 0 || m.max <= req.tolerance;
-    let within_targets = m.sides_ok && corner_reports.is_empty();
-    let mut warnings = Vec::new();
-    if interior.data.is_empty() {
+    let within_targets = m.sides_ok(&frozen) && corner_reports.is_empty();
+    let mut warnings = notes;
+    if m.points == 0 {
         warnings.push(WARN_NO_DATA.to_string());
-    } else if interior.data.len() < 3 * best.net[0] * best.net[1] {
+    } else if m.points < 3 * best.net[0] * best.net[1] {
         warnings.push(WARN_FEW_DATA.to_string());
     }
     if (best.net[0] >= max || best.net[1] >= max) && (best.net != start_net || !(within_tolerance && within_targets)) {
         warnings.push(WARN_MAX_CONTROL.to_string());
     }
-    if best.ignored > 0 {
-        warnings.push(format!("{} data points lie outside the parameter domain and were ignored", best.ignored));
+    if m.outside > 0 {
+        warnings.push(format!("{} data points lie outside the outline and were ignored", m.outside));
     }
     if m.hard_max > G0_TARGET {
         warnings.push(format!("interior points or curves miss the patch by up to {:.4} mm", m.hard_max));
+    }
+    for (k, (s, f)) in m.sides.iter().zip(&frozen).enumerate() {
+        if *f && !s.soft && s.gap_max > G0_TARGET {
+            warnings.push(format!("side {k}: the gap of {:.4} mm is the accuracy of the side itself", s.gap_max));
+        }
     }
     let report = Report {
         control: best.net,
@@ -375,6 +481,7 @@ pub fn fit_patch(req: &Request) -> Result<Patch> {
         p99: m.p99,
         max: m.max,
         points: m.points,
+        outside: m.outside,
         within_tolerance,
         within_targets,
         sides: m.sides.clone(),

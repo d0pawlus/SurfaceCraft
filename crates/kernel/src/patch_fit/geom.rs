@@ -72,6 +72,23 @@ pub(super) fn area2(p: &[V2]) -> f64 {
         .sum()
 }
 
+/// Is `p` inside the closed polygon (even-odd rule)? A point on the boundary counts either way.
+pub(super) fn inside_polygon(poly: &[V2], p: V2) -> bool {
+    let Some(&last) = poly.last() else { return false };
+    let mut inside = false;
+    let mut prev = last;
+    for &cur in poly {
+        if (prev[1] > p[1]) != (cur[1] > p[1]) {
+            let x = prev[0] + (p[1] - prev[1]) * (cur[0] - prev[0]) / (cur[1] - prev[1]);
+            if p[0] < x {
+                inside = !inside;
+            }
+        }
+        prev = cur;
+    }
+    inside
+}
+
 fn cross2(o: V2, a: V2, b: V2) -> f64 {
     (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
 }

@@ -2,7 +2,7 @@
 //! side on the dense samples, the fold test, the deviation of the data, and where the misses lie.
 //! Also re-projects the interior points onto the patch for the next round.
 use super::geom::{V2, add, cross, dot, scale, sub, unit};
-use super::rows::{Layout, SideSamples};
+use super::rows::{Layout, MIN_DATA, SideSamples};
 use super::start::{Interior, Loop, Pt};
 use super::{Continuity, G0_TARGET, G1_TARGET_DEG, G2_TARGET_REL, SideReport};
 use crate::Result;
@@ -13,6 +13,14 @@ use crate::vpatch::derivatives;
 /// `S_d` pointing back over the reference face at this cosine or more counts as a fold.
 const FOLD_COS: f64 = 0.1;
 
+/// What a round is measured against.
+pub(super) struct Goal<'a> {
+    /// Target of the data deviation (max), mm.
+    pub tolerance: f64,
+    /// Sides whose gap is as small as their own accuracy allows: it does not steer the growth.
+    pub frozen: &'a [bool],
+}
+
 /// Everything measured of one round's surface.
 pub(super) struct Measure {
     pub sides: Vec<SideReport>,
@@ -22,14 +30,52 @@ pub(super) struct Measure {
     pub p99: f64,
     pub max: f64,
     pub points: usize,
+    /// Data points that lie outside the outline (not measured, not fitted).
+    pub outside: usize,
     /// Largest distance of a hard point or curve sample from the patch.
     pub hard_max: f64,
-    /// Every side within its targets (and nothing folded), hard points and curves on the patch.
-    pub sides_ok: bool,
-    /// Worst miss in units of its target (a fold counts as 2).
-    pub worst: f64,
+    /// Hard points and curves on the patch.
+    pub hard_ok: bool,
+    /// Per side: its angle, curvature and fold targets are met (true for a soft side).
+    pub rest_ok: Vec<bool>,
+    /// Per side: the gap and the larger of the other misses, in units of their targets (a fold
+    /// counts as 2); `[0, 0]` for a soft side.
+    pub side_terms: Vec<[f64; 2]>,
+    /// Miss of the hard points and curves in units of their target.
+    pub hard_term: f64,
+    /// Largest data distance in units of the tolerance.
+    pub data_term: f64,
     /// Misses by direction: the largest root-mean-square miss over slabs of the parameter domain.
     pub miss: [f64; 2],
+}
+
+impl Measure {
+    /// Largest miss of the hard conditions (sides, interior points and curves) in units of their
+    /// targets, every gap counted: at most 1 when all are met.
+    pub fn side_miss(&self) -> f64 {
+        self.side_terms.iter().flatten().fold(self.hard_term, |a, b| a.max(*b))
+    }
+
+    /// Worst miss, the data included, in units of the targets; the gap of a `frozen` side (as close
+    /// to its polyline as its own accuracy allows) is left out.
+    pub fn worst(&self, frozen: &[bool]) -> f64 {
+        let mut w = self.hard_term.max(self.data_term);
+        for (k, t) in self.side_terms.iter().enumerate() {
+            let gap = if frozen.get(k).copied().unwrap_or(false) { 0.0 } else { t[0] };
+            w = w.max(gap).max(t[1]);
+        }
+        w
+    }
+
+    /// Every side within its targets and the interior on the patch. The gap of a `frozen` side may
+    /// be up to ten times the target.
+    pub fn sides_ok(&self, frozen: &[bool]) -> bool {
+        self.hard_ok
+            && self.sides.iter().zip(&self.rest_ok).enumerate().all(|(k, (s, rest))| {
+                let lenient = frozen.get(k).copied().unwrap_or(false) && s.gap_max < 10.0 * G0_TARGET;
+                s.soft || (*rest && (s.gap_max <= G0_TARGET || lenient))
+            })
+    }
 }
 
 /// Misses (in units of their targets) collected in slabs of the parameter domain.
@@ -101,8 +147,33 @@ fn reproject(
     Ok(out)
 }
 
+/// Re-projects the data onto the patch: the distances of those whose foot lies inside the outline
+/// (the others are marked `out`, and counted), and their misses go to `slabs`.
+fn reproject_data(
+    probe: &SurfaceProbe,
+    lp: &Loop,
+    pts: &mut [Pt],
+    slabs: &mut Slabs,
+    target: f64,
+) -> Result<(Vec<f64>, usize)> {
+    let mut dists = Vec::with_capacity(pts.len());
+    let mut outside = 0usize;
+    for p in pts.iter_mut() {
+        let (d, _, f) = probe.closest_uv(p.xyz)?;
+        p.uv = f;
+        p.out = !lp.contains(f);
+        if p.out {
+            outside += 1;
+            continue;
+        }
+        slabs.add(f, d / target);
+        dists.push(d);
+    }
+    Ok((dists, outside))
+}
+
 /// Measures `surface` against the sides, the interior and the tolerance; the interior's parameters
-/// become the closest points on `surface`.
+/// become the closest points on `surface`. The gap of a frozen side does not steer the growth.
 pub(super) fn measure(
     surface: &Surface,
     probe: &SurfaceProbe,
@@ -110,16 +181,18 @@ pub(super) fn measure(
     layout: &Layout,
     sides: &[SideSamples],
     interior: &mut Interior,
-    tolerance: f64,
+    goal: &Goal,
 ) -> Result<Measure> {
+    let (tolerance, frozen) = (goal.tolerance, goal.frozen);
     let mut slabs = Slabs::new(layout);
     let floor = 1.0 / (4.0 * lp.diag.max(1e-9));
     let mut reports = Vec::with_capacity(sides.len());
     let mut all_feet = Vec::with_capacity(sides.len());
-    let mut sides_ok = true;
-    let mut worst = 0.0_f64;
+    let mut rest_ok_all = Vec::with_capacity(sides.len());
+    let mut side_terms = Vec::with_capacity(sides.len());
 
-    for (sd, ss) in lp.sides.iter().zip(sides) {
+    for (k, (sd, ss)) in lp.sides.iter().zip(sides).enumerate() {
+        let is_frozen = frozen.get(k).copied().unwrap_or(false);
         let g1 = sd.continuity != Continuity::G0;
         let g2 = sd.continuity == Continuity::G2;
         let (mut gap_max, mut angle_max, mut curv_max) = (0.0_f64, 0.0_f64, 0.0_f64);
@@ -129,7 +202,7 @@ pub(super) fn measure(
             let (d, _, f) = probe.closest_uv(smp.xyz)?;
             feet.push(f);
             gap_max = gap_max.max(d);
-            let mut miss = d / G0_TARGET;
+            let mut miss = if is_frozen { 0.0 } else { d / G0_TARGET };
             if let Some(r) = smp.refs.as_ref().filter(|_| g1) {
                 let der = derivatives(surface, f)?;
                 let (su, sv) = (der[1], der[2]);
@@ -161,25 +234,26 @@ pub(super) fn measure(
                     }
                 }
             }
-            slabs.add(f, miss);
+            // a soft side is reported but does not steer the growth of the net
+            if !sd.soft {
+                slabs.add(f, miss);
+            }
         }
-        let ok = gap_max <= G0_TARGET
-            && (!g1 || angle_max <= G1_TARGET_DEG)
-            && (!g2 || curv_max <= G2_TARGET_REL)
-            && !folded;
-        sides_ok &= ok;
-        worst = worst
-            .max(gap_max / G0_TARGET)
-            .max(if g1 { angle_max / G1_TARGET_DEG } else { 0.0 })
+        let rest_ok = (!g1 || angle_max <= G1_TARGET_DEG) && (!g2 || curv_max <= G2_TARGET_REL) && !folded;
+        let rest_term = (if g1 { angle_max / G1_TARGET_DEG } else { 0.0 })
             .max(if g2 { curv_max / G2_TARGET_REL } else { 0.0 })
             .max(if folded { 2.0 } else { 0.0 });
+        rest_ok_all.push(rest_ok || sd.soft);
+        side_terms.push(if sd.soft { [0.0, 0.0] } else { [gap_max / G0_TARGET, rest_term] });
         reports.push(SideReport {
             continuity: sd.continuity,
+            soft: sd.soft,
             gap_max,
             angle_max_deg: g1.then_some(angle_max),
             curvature_error_max: g2.then_some(curv_max),
             samples: ss.samples.len(),
             folded,
+            snap_max: sd.snap,
         });
         all_feet.push(feet);
     }
@@ -191,12 +265,12 @@ pub(super) fn measure(
         let d = reproject(probe, layout, c, &mut slabs, G0_TARGET)?;
         hard_max = d.iter().fold(hard_max, |m, x| m.max(*x));
     }
-    if hard_max > G0_TARGET {
-        sides_ok = false;
-    }
-    worst = worst.max(hard_max / G0_TARGET);
+    let hard_term = hard_max / G0_TARGET;
 
-    let mut dists = reproject(probe, layout, &mut interior.data, &mut slabs, tolerance)?;
+    let (mut dists, outside) = reproject_data(probe, lp, &mut interior.data, &mut slabs, tolerance)?;
+    if dists.len() < MIN_DATA {
+        dists.clear();
+    }
     dists.sort_by(|a, b| a.total_cmp(b));
     let points = dists.len();
     let (rms, p99, max) = if points == 0 {
@@ -206,7 +280,6 @@ pub(super) fn measure(
         let k = ((0.99 * points as f64).ceil() as usize).clamp(1, points) - 1;
         (rms, dists.get(k).copied().unwrap_or(0.0), dists.last().copied().unwrap_or(0.0))
     };
-    worst = worst.max(max / tolerance);
 
     Ok(Measure {
         sides: reports,
@@ -215,9 +288,13 @@ pub(super) fn measure(
         p99,
         max,
         points,
+        outside,
         hard_max,
-        sides_ok,
-        worst,
+        hard_ok: hard_max <= G0_TARGET,
+        rest_ok: rest_ok_all,
+        side_terms,
+        hard_term,
+        data_term: max / tolerance,
         miss: slabs.score(),
     })
 }

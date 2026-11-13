@@ -209,6 +209,58 @@ fn noise_stays_smooth() {
     assert!((0.024..=0.036).contains(&rms), "residual rms {rms}");
 }
 
+fn data_rms(s: &Surface, data: &[DataPoint]) -> f64 {
+    let mut sum = 0.0;
+    for d in data {
+        let p = sample(s, d.uv);
+        sum += (0..3).map(|c| (d.at[c] - p[c]).powi(2)).sum::<f64>();
+    }
+    (sum / data.len() as f64).sqrt()
+}
+
+#[test]
+fn soft_rows_do_not_stiffen_the_fit() {
+    let mut rng = Lcg(11);
+    // uniform noise of standard deviation 0.03 on a 40 x 24 region of the wave, uv = (x, y)
+    let half_width = 0.03 * 3.0_f64.sqrt();
+    let mut data = Vec::new();
+    for _ in 0..2000 {
+        let (x, y) = (40.0 * rng.next_unit(), 24.0 * rng.next_unit());
+        let noise = (2.0 * rng.next_unit() - 1.0) * half_width;
+        data.push(DataPoint { uv: [x, y], at: [x, y, wave(x, y) + noise], weight: 1.0 });
+    }
+    // 1000 exact positions along the boundary of the domain, perimeter 128
+    let mut soft = Vec::new();
+    for k in 0..1000 {
+        let s = 128.0 * k as f64 / 1000.0;
+        let (x, y) = if s < 40.0 {
+            (s, 0.0)
+        } else if s < 64.0 {
+            (40.0, s - 40.0)
+        } else if s < 104.0 {
+            (104.0 - s, 24.0)
+        } else {
+            (0.0, 128.0 - s)
+        };
+        soft.push((Row::Position { uv: [x, y], at: [x, y, wave(x, y)] }, 1e4));
+    }
+    let free = Problem {
+        domain: [[0.0, 40.0], [0.0, 24.0]],
+        control: [12, 12],
+        hard: Vec::new(),
+        soft: Vec::new(),
+        data: data.clone(),
+        outline: Vec::new(),
+        smoothing: 1e-3,
+    };
+    let pinned = Problem { soft, ..free.clone() };
+    let rms_free = data_rms(&solve(&free).unwrap().surface, &data);
+    let rms_pinned = data_rms(&solve(&pinned).unwrap().surface, &data);
+    assert!((0.024..=0.036).contains(&rms_free), "residual rms without soft rows {rms_free}");
+    assert!((0.024..=0.036).contains(&rms_pinned), "residual rms with soft rows {rms_pinned}");
+    assert!((rms_free - rms_pinned).abs() < 0.003, "rms differs: {rms_free} vs {rms_pinned}");
+}
+
 #[test]
 fn empty_area_is_filled_by_energy() {
     let mut data = Vec::new();

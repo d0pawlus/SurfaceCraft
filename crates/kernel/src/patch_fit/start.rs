@@ -1,9 +1,10 @@
 //! Request checks and start parameters of the patch driver: the closed loop of sides, its
 //! parameters (given by a flattening, or the best-fit plane), loop checks, the interior points,
 //! curves and data in the same parameters, and the corner check of design doc §4.3.
+use super::curve::smooth_sides;
 use super::geom::{
-    V2, V3, add, area2, cross, dist, dist2, dot, finite2, finite3, polygon_self_intersects, scale, sub, thin_indices,
-    unit,
+    V2, V3, add, area2, cross, dist, dist2, dot, finite2, finite3, inside_polygon, polygon_self_intersects, scale, sub,
+    thin_indices, unit,
 };
 use super::reference::RefProbe;
 use super::{Continuity, Request};
@@ -27,6 +28,12 @@ const MAX_AFFINE_POINTS: usize = 2_000;
 const COS_MAX_TILT: f64 = 0.258_819_045_102_520_8;
 /// Share of a side's length from its ends where the tangent of a G0 side is taken.
 const TANGENT_SPAN: f64 = 0.02;
+/// Vertices of the polygon data points are tested against (thinned evenly per side).
+const MAX_POLYGON: usize = 600;
+/// Largest distance a point of a referenced side may move onto its reference face, mm.
+pub(super) const SNAP_LIMIT: f64 = 0.1;
+/// Search radius of the closest point on a reference face, as a share of the loop's size (at least 1 mm).
+const SNAP_ACCEPT_REL: f64 = 1e-2;
 const NOT_A_HEIGHT_FIELD: &str = "the outline is not a height field: give a mesh region";
 
 fn arg(msg: impl Into<String>) -> KernelError {
@@ -147,6 +154,10 @@ pub(super) struct SideData {
     pub uv: Vec<V2>,
     pub continuity: Continuity,
     pub probe: Option<RefProbe>,
+    /// The side is approximate: the patch follows the data, the gap is reported only.
+    pub soft: bool,
+    /// Largest move of a point onto the reference face (G1/G2 sides).
+    pub snap: Option<f64>,
 }
 
 impl SideData {
@@ -202,9 +213,16 @@ pub(super) struct Loop {
     pub bbox: [[f64; 2]; 2],
     /// Diagonal of the loop's bounding box in space.
     pub diag: f64,
+    /// The outline in the parameter plane (thinned): what lies outside it is not on the trimmed sheet.
+    pub polygon: Vec<V2>,
 }
 
 impl Loop {
+    /// Does the parameter point lie inside the outline?
+    pub fn contains(&self, uv: V2) -> bool {
+        inside_polygon(&self.polygon, uv)
+    }
+
     /// The parameter direction normal to `t`, pointing into the loop.
     pub fn inward(&self, t: V2) -> V2 {
         if self.ccw { [-t[1], t[0]] } else { [t[1], -t[0]] }
@@ -217,6 +235,8 @@ pub(super) struct Pt {
     pub xyz: V3,
     pub uv: V2,
     pub w: f64,
+    /// Data only: the point lies outside the outline in the parameter plane and is ignored.
+    pub out: bool,
 }
 
 /// Points of the interior: scan data (soft), hard points and hard curves.
@@ -239,6 +259,8 @@ pub(super) struct Prepared {
     pub lp: Loop,
     pub interior: Interior,
     pub corners: Vec<Corner>,
+    /// Sides that could not be smoothed (see [`smooth_sides`]).
+    pub warnings: Vec<String>,
 }
 
 fn validate(req: &Request) -> Result<()> {
@@ -388,9 +410,63 @@ fn bbox2(points: impl Iterator<Item = V2>) -> [[f64; 2]; 2] {
     b
 }
 
+/// Moves every point of a G1/G2 side onto its reference face (a closest point) and keeps the loop
+/// closed: a corner takes the position on the referenced side, the middle of the two where both are
+/// referenced. Returns the largest move per referenced side; a side that lies more than
+/// [`SNAP_LIMIT`] off its face is refused.
+fn snap_to_references(pts: &mut [Vec<V3>], probes: &[Option<RefProbe>], accept: f64) -> Result<Vec<Option<f64>>> {
+    let before: Vec<Vec<V3>> = pts.to_vec();
+    let n = pts.len();
+    let mut snapped = vec![false; n];
+    for (k, (side, probe)) in pts.iter_mut().zip(probes).enumerate() {
+        let Some(probe) = probe else { continue };
+        for p in side.iter_mut() {
+            match probe.closest(*p, accept)? {
+                Some(q) => *p = q,
+                None => return Err(arg(format!("side {k} lies more than {accept:.3} mm off its reference face"))),
+            }
+        }
+        if let Some(flag) = snapped.get_mut(k) {
+            *flag = true;
+        }
+    }
+    for k in 0..n {
+        let nxt = (k + 1) % n;
+        let was = |i: usize| snapped.get(i).copied().unwrap_or(false);
+        let ends = (pts.get(k).and_then(|p| p.last()).copied(), pts.get(nxt).and_then(|p| p.first()).copied());
+        let (Some(end), Some(start)) = ends else { continue };
+        let corner = match (was(k), was(nxt)) {
+            (false, false) => continue,
+            (true, false) => end,
+            (false, true) => start,
+            (true, true) => scale(add(end, start), 0.5),
+        };
+        if let Some(l) = pts.get_mut(k).and_then(|p| p.last_mut()) {
+            *l = corner;
+        }
+        if let Some(f) = pts.get_mut(nxt).and_then(|p| p.first_mut()) {
+            *f = corner;
+        }
+    }
+    let mut out = Vec::with_capacity(n);
+    for (k, (now, was)) in pts.iter().zip(&before).enumerate() {
+        if !snapped.get(k).copied().unwrap_or(false) {
+            out.push(None);
+            continue;
+        }
+        let moved = now.iter().zip(was).map(|(a, b)| dist(*a, *b)).fold(0.0_f64, f64::max);
+        if moved.is_nan() || moved > SNAP_LIMIT {
+            return Err(arg(format!("side {k} lies {moved:.3} mm off its reference face (at most {SNAP_LIMIT} mm)")));
+        }
+        out.push(Some(moved));
+    }
+    Ok(out)
+}
+
 /// The loop with parameters, checked: closed, a height field (or a flattening that does not cross
-/// itself), its references usable.
-fn build_loop(req: &Request) -> Result<Loop> {
+/// itself), its references usable. Hard sides of three or more points are densified along a smooth
+/// curve through their points; the warnings say which could not be.
+fn build_loop(req: &Request) -> Result<(Loop, Vec<String>)> {
     let flat = req.sides.iter().all(|s| s.uv.is_some());
     let all: Vec<V3> = req.sides.iter().flat_map(|s| s.points.iter().copied()).collect();
     let mut lo = [f64::INFINITY; 3];
@@ -451,6 +527,12 @@ fn build_loop(req: &Request) -> Result<Loop> {
         })
         .collect::<Result<_>>()?;
 
+    let accept = (SNAP_ACCEPT_REL * span).max(10.0 * SNAP_LIMIT);
+    let snaps = snap_to_references(&mut pts, &probes, accept)?;
+    // the points are samples of a smooth curve: the dense samples between them follow it, not the chords
+    let soft: Vec<bool> = req.sides.iter().map(|s| s.soft).collect();
+    let notes = smooth_sides(&mut pts, &mut uvs, flat, &soft, diag);
+
     let affine = if flat {
         let all_pts: Vec<V3> = pts.iter().flatten().copied().collect();
         let all_uv: Vec<V2> = uvs.iter().flatten().copied().collect();
@@ -506,15 +588,32 @@ fn build_loop(req: &Request) -> Result<Loop> {
         return Err(arg(if flat { "the flattening of the outline crosses itself" } else { NOT_A_HEIGHT_FIELD }));
     }
 
+    let pcap = (MAX_POLYGON / n).max(8);
+    let polygon: Vec<V2> = side_uv
+        .iter()
+        .flat_map(|u| {
+            let body = &u[..u.len() - 1];
+            thin_indices(body.len(), pcap).into_iter().filter_map(move |i| body.get(i).copied())
+        })
+        .collect();
+
     let sides: Vec<SideData> = req
         .sides
         .iter()
         .zip(pts)
         .zip(side_uv)
         .zip(probes)
-        .map(|(((s, p), q), probe)| SideData { poly: Poly::new(p), uv: q, continuity: s.continuity, probe })
+        .zip(snaps)
+        .map(|((((s, p), q), probe), snap)| SideData {
+            poly: Poly::new(p),
+            uv: q,
+            continuity: s.continuity,
+            probe,
+            soft: s.soft,
+            snap,
+        })
         .collect();
-    Ok(Loop { sides, affine, ccw, bbox, diag })
+    Ok((Loop { sides, affine, ccw, bbox, diag, polygon }, notes))
 }
 
 /// A curve as `n` points equally spaced in arc length.
@@ -529,13 +628,14 @@ fn resample(points: &[V3], n: usize, tol: f64) -> Result<Vec<V3>> {
 }
 
 fn interior(req: &Request, lp: &Loop) -> Result<Interior> {
-    let pt = |p: V3, w: f64| Pt { xyz: p, uv: lp.affine.uv(p), w };
+    let pt = |p: V3, w: f64| Pt { xyz: p, uv: lp.affine.uv(p), w, out: false };
+    let datum = |xyz: V3, uv: V2, w: f64| Pt { xyz, uv, w, out: !lp.contains(uv) };
     let mut data: Vec<Pt> = Vec::with_capacity(req.data.len() + req.soft_points.len());
     for (i, p) in req.data.iter().enumerate() {
         let uv = req.data_uv.as_ref().and_then(|u| u.get(i)).copied().unwrap_or_else(|| lp.affine.uv(*p));
-        data.push(Pt { xyz: *p, uv, w: 1.0 });
+        data.push(datum(*p, uv, 1.0));
     }
-    data.extend(req.soft_points.iter().map(|(p, w)| pt(*p, *w)));
+    data.extend(req.soft_points.iter().map(|(p, w)| datum(*p, lp.affine.uv(*p), *w)));
     let data: Vec<Pt> = thin_indices(data.len(), MAX_DATA).into_iter().filter_map(|i| data.get(i).copied()).collect();
     let hard: Vec<Pt> = req.hard_points.iter().map(|p| pt(*p, 1.0)).collect();
 
@@ -583,10 +683,10 @@ fn corners(lp: &Loop) -> Result<Vec<Corner>> {
 /// Checks the request and prepares the loop, the interior and the corner angles.
 pub(super) fn prepare(req: &Request) -> Result<Prepared> {
     validate(req)?;
-    let lp = build_loop(req)?;
+    let (lp, warnings) = build_loop(req)?;
     let interior = interior(req, &lp)?;
     let corners = corners(&lp)?;
-    Ok(Prepared { lp, interior, corners })
+    Ok(Prepared { lp, interior, corners, warnings })
 }
 
 /// Hard points and curves must lie in the parameter domain (a hard condition cannot be ignored).

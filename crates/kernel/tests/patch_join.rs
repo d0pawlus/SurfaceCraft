@@ -150,7 +150,7 @@ fn loop_sides(top: Top) -> Vec<Side> {
                     [x, a[1] + t * (b[1] - a[1]), top(x)]
                 })
                 .collect();
-            Side { points, continuity: Continuity::G0, reference: None, uv: None }
+            Side { points, continuity: Continuity::G0, reference: None, uv: None, soft: false }
         })
         .collect()
 }

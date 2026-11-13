@@ -114,8 +114,10 @@ pub struct Problem {
     /// Closed polygon in (u, v): bending energy is integrated over knot cells that touch or lie
     /// inside it plus one ring of cells; other cells get only `REGULARIZE`. Empty = whole domain.
     pub outline: Vec<[f64; 2]>,
-    /// Relative stiffness (> 0): energy weight = smoothing · trace(data normal matrix) / trace(K);
-    /// with no data and no soft rows the energy weight is 1.
+    /// Relative stiffness (> 0): energy weight = smoothing · trace(data normal matrix) / trace(K).
+    /// Only the data points (with their weights) enter that trace; soft rows never do. With no data
+    /// but soft rows the trace of the soft rows' normal matrix is used instead; with neither the
+    /// energy weight is 1.
     pub smoothing: f64,
 }
 
@@ -551,22 +553,24 @@ pub fn solve(p: &Problem) -> Result<Solution> {
     // data and soft position rows: the scalar normal matrix and right-hand sides
     let mut a_s = DMatrix::<f64>::zeros(nn, nn);
     let mut b_s = DMatrix::<f64>::zeros(nn, 3);
-    let mut tr_a = 0.0;
-    let mut add_position = |uv: [f64; 2], at: [f64; 3], w: f64| -> Result<()> {
+    // Returns the point's contribution to a trace; the caller decides whether it counts as data.
+    let mut add_position = |uv: [f64; 2], at: [f64; 3], w: f64| -> Result<f64> {
         let st = Stencil::new(&g, g.clamp(uv))?;
         let phi = st.coefficient(0, 0);
-        tr_a += 3.0 * w * phi.iter().map(|v| v * v).sum::<f64>();
         accumulate(&mut a_s, &mut b_s, &st.indices(&g), &phi, scale.forward(at), w);
-        Ok(())
+        Ok(3.0 * w * phi.iter().map(|v| v * v).sum::<f64>())
     };
+    // The energy weight is scaled by the trace of the DATA normal matrix only; soft rows (which
+    // may be numerous and heavy) must not stiffen the fit, so they are traced separately.
+    let mut tr_data = 0.0;
     for d in &p.data {
-        add_position(d.uv, d.at, d.weight)?;
+        tr_data += add_position(d.uv, d.at, d.weight)?;
     }
     let mut soft_coupled: Vec<(LinRow, f64)> = Vec::new();
     let mut tr_soft = 0.0;
     for (row, w) in &p.soft {
         match row {
-            Row::Position { uv, at } => add_position(*uv, *at, *w)?,
+            Row::Position { uv, at } => tr_soft += add_position(*uv, *at, *w)?,
             _ => {
                 for lr in build_rows(&g, &scale, row, true)? {
                     tr_soft += w * lr.cols.iter().map(|(_, a)| a * a).sum::<f64>();
@@ -575,8 +579,9 @@ pub fn solve(p: &Problem) -> Result<Solution> {
             }
         }
     }
-    let tr_a = tr_a + tr_soft;
-    let lambda = if tr_a > 0.0 { p.smoothing * tr_a / (3.0 * tr_k) } else { 1.0 };
+    // with data: relative to the data; with soft rows only: relative to them; with neither: 1
+    let tr_scale = if tr_data > 0.0 { tr_data } else { tr_soft };
+    let lambda = if tr_scale > 0.0 { p.smoothing * tr_scale / (3.0 * tr_k) } else { 1.0 };
     if !lambda.is_finite() {
         return Err(arg("the smoothing weight is not finite"));
     }
