@@ -8,8 +8,9 @@
 use std::path::Path;
 
 const SRC: &str = "crates/ui-egui/src";
-/// Files that may spell colours: the theme resolves tokens to colours.
-const COLOUR_FILES: &[&str] = &["theme.rs"];
+/// Files that may spell colours: the theme resolves tokens to colours, and a `tests.rs` module is
+/// test code (declared under `#[cfg(test)]` by its parent), which may use any colour.
+const COLOUR_FILES: &[&str] = &["theme.rs", "tests.rs"];
 /// The outer containers and the most of each the shell may have.
 const CONTAINERS: &[(&str, usize)] = &[("CentralPanel::", 1), ("DockArea::new(", 1)];
 
