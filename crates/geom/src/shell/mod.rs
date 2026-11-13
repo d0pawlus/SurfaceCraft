@@ -19,6 +19,7 @@ mod feature;
 mod normals;
 mod relax;
 mod repair;
+mod selfx;
 mod strip;
 mod topology;
 
@@ -80,6 +81,8 @@ pub struct ThickenReport {
     pub flipped_triangles: usize,
     /// Vertices whose offset was reduced to avoid a fold.
     pub clamped_vertices: usize,
+    /// Vertices of the scan moved (by at most one median edge) to remove crossings of the scan with itself.
+    pub repaired_vertices: usize,
     /// Vertices whose offset was bounded before any fold was looked for, by the distance along the
     /// offset direction to another part of the scan (the local feature size).
     pub limited_vertices: usize,
@@ -212,6 +215,30 @@ pub enum ThickenError {
         "the offset folds at {0} vertices that cannot be relaxed to more than a tenth of the thickness: use a smaller thickness"
     )]
     Unresolved(usize),
+    /// Too many vertices stay on a crossing of the shell that even the thinnest wall allowed does not remove.
+    #[error(
+        "{vertices} of {total} vertices ({share_percent:.2} %, more than {limit_percent:.1} % are refused) stay on a crossing of the shell that no wall down to a tenth of the thickness removes (sharp creases, folded or doubled sheets of the scan closer than a tenth of the wall): repair the scan (mesh.clean; isolate the part with scan.split) before thickening; a thinner wall helps only where the sheets are farther apart than a tenth of it"
+    )]
+    UnresolvedCrossings {
+        /// Vertices on a crossing.
+        vertices: usize,
+        /// Vertices of the scan.
+        total: usize,
+        /// Their share (percent).
+        share_percent: f64,
+        /// The share above which the call is refused (percent).
+        limit_percent: f64,
+    },
+    /// One vertex belongs to an absurd number of triangles (a fan around a hub): not a scan.
+    #[error(
+        "a vertex belongs to {triangles} triangles (more than {limit}): this is not a scan surface; clean the mesh (mesh.clean, mesh.remesh) before thickening"
+    )]
+    HubVertex {
+        /// Triangles at the vertex.
+        triangles: usize,
+        /// The most accepted.
+        limit: usize,
+    },
     /// The result is not a closed, outward-oriented surface (never expected).
     #[error("the shell could not be closed consistently ({0}): use a smaller thickness or clean the mesh")]
     NotClosed(&'static str),
@@ -278,26 +305,52 @@ pub fn thicken(mesh: &Mesh, params: &ThickenParams) -> Result<Thickened, Thicken
     if boundary.is_empty() {
         return Err(ThickenError::Closed);
     }
+    check_hubs(&work)?;
     let adjacent = topology::adjacency(work.positions.len(), &sorted);
+    let scan_edge = median_edge(&work);
+    work.repaired = selfx::smooth_scan_crossings(&mut work, &adjacent, scan_edge);
     let radius = (SMOOTHING_SHARE * params.thickness.abs()).max(mean_edge(&work));
     let normals =
         normals::smoothed(&work.positions, &work.triangles, &boundary, radius).ok_or(ThickenError::NoNormals)?;
     let (a, b) = layer_offsets(params);
     let rim = make_rim(&work, &boundary, params)?;
-    let edge = mean_edge(&work);
+    let edge = median_edge(&work);
     let relaxed = fold_free_scale(&work, &normals, &adjacent, &boundary, &rim, &[a, b], params.thickness)?;
     (work.folded, work.unresolved) = (relaxed.folded, relaxed.unresolved);
     let inputs = Inputs {
-        normals: &normals,
+        normals: &relaxed.normals,
         scale: &relaxed.scale,
         offsets: (a, b),
         boundary: &boundary,
         rim: &rim,
         adjacent: &adjacent,
         edge,
+        size: Aabb::from_points(&work.positions).diagonal(),
         limited: relaxed.limited,
     };
     assemble(&work, &inputs, params)
+}
+
+/// A vertex belongs to at most this many triangles (a scan has a few dozen; a hub of a hundred thousand
+/// would cost the neighbourhood searches the square of that).
+pub const MAX_VERTEX_TRIANGLES: usize = 4_096;
+
+/// Refuses a mesh with a vertex on more than [`MAX_VERTEX_TRIANGLES`] triangles.
+fn check_hubs(work: &Work) -> Result<(), ThickenError> {
+    let mut count = vec![0usize; work.positions.len()];
+    for t in &work.triangles {
+        for &v in t {
+            if let Some(c) = count.get_mut(v as usize) {
+                *c += 1;
+            }
+        }
+    }
+    match count.into_iter().max() {
+        Some(triangles) if triangles > MAX_VERTEX_TRIANGLES => {
+            Err(ThickenError::HubVertex { triangles, limit: MAX_VERTEX_TRIANGLES })
+        }
+        _ => Ok(()),
+    }
 }
 
 /// The ids of the strip along the rim; the shell must be indexable with 32 bits.
@@ -309,6 +362,22 @@ fn make_rim(work: &Work, boundary: &[(u32, u32)], params: &ThickenParams) -> Res
         Some(n32) => Ok(Rim::new(n32, rows, boundary)),
         None => Err(ThickenError::Invalid(MeshError::TooManyVertices(total))),
     }
+}
+
+/// Median length of the edges of the triangles (mm; robust against a few huge triangles).
+fn median_edge(work: &Work) -> f64 {
+    let mut lengths: Vec<f64> = work
+        .triangles
+        .iter()
+        .flat_map(|t| [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])])
+        .filter_map(|(a, b)| Some((work.positions.get(a as usize)? - work.positions.get(b as usize)?).norm()))
+        .collect();
+    if lengths.is_empty() {
+        return 0.0;
+    }
+    let mid = lengths.len() / 2;
+    let (_, m, _) = lengths.select_nth_unstable_by(mid, f64::total_cmp);
+    *m
 }
 
 /// Mean length of the edges of the triangles (mm).
@@ -348,13 +417,21 @@ fn fold_free_scale(
         around: &around,
         adjacent,
         thickness: thickness.abs(),
-        edge: mean_edge(work),
+        edge: median_edge(work),
+        size: Aabb::from_points(&work.positions).diagonal(),
         boundary,
         rim,
     };
     let relaxed = relax::relax(&field).map_err(ThickenError::Unresolved)?;
     if relaxed.unresolved as f64 > MAX_UNRESOLVED_SHARE * relaxed.scale.len() as f64 {
-        return Err(ThickenError::Unresolved(relaxed.unresolved));
+        let total = relaxed.scale.len();
+        let share = relaxed.unresolved as f64 / total.max(1) as f64;
+        return Err(ThickenError::UnresolvedCrossings {
+            vertices: relaxed.unresolved,
+            total,
+            share_percent: 100.0 * share,
+            limit_percent: 100.0 * MAX_UNRESOLVED_SHARE,
+        });
     }
     let vertices = relaxed.scale.len();
     if relaxed.folded as f64 > MAX_CLAMPED_SHARE * vertices as f64 {

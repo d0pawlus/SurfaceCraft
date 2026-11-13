@@ -43,6 +43,8 @@ pub struct ThickenMeshOut {
     pub clamped_vertices: usize,
     /// Vertices whose offset was bounded up front by the distance to another part of the scan close to them along the surface (a bead, a crease: the local feature size), so the offset sheet stays on its side of the scanned sheet.
     pub limited_vertices: usize,
+    /// Vertices of the scan moved (by at most one median edge) to remove crossings of the scan with itself (a fold of the sheet): the thickened face differs from the scan there by that much.
+    pub repaired_vertices: usize,
     /// Largest reduction of the thickness at a vertex (mm; 0 when nothing was reduced).
     pub largest_reduction: f64,
     /// Triangles removed from the mesh before the offset (fins on edges of three or more triangles, duplicates).
@@ -97,6 +99,7 @@ pub(super) fn thicken_cmd(s: &mut Session, i: ThickenMeshIn) -> CmdResult<Thicke
         boundary_loops: shell.report.boundary_loops,
         clamped_vertices: shell.report.clamped_vertices,
         limited_vertices: shell.report.limited_vertices,
+        repaired_vertices: shell.report.repaired_vertices,
         largest_reduction: shell.report.largest_reduction,
         removed_non_manifold: shell.report.removed_non_manifold,
         flipped_triangles: shell.report.flipped_triangles,

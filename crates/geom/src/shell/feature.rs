@@ -16,11 +16,11 @@
 //! [`Surface::near`]): the two flanks of a bead, the walls of a crease. A part of the sheet far
 //! along the surface (the opposite wall of a channel narrower than the wall) is real geometry: the
 //! offset is not reduced for it, the crossing stays and is reported.
-use super::crossing::Surface;
+use super::crossing::{Reach, Surface};
 use super::relax::Field;
 use super::topology::Csr;
+use crate::bvh::RayCast;
 use crate::{Bvh, Vec3, par};
-use std::cell::OnceCell;
 
 /// Share of the distance to a part met from its far side the offset may reach (just below one half:
 /// the two walls would touch at one half).
@@ -34,14 +34,26 @@ const MIN_RAY_COS: f64 = 0.3;
 /// scan's noise lives there, and the smoothing of the normals has already dealt with it.
 const OWN_HOPS: usize = 2;
 
-/// The vertices within [`OWN_HOPS`] edges of `v` (ascending, `v` included).
+/// The neighbourhood of a vertex holds at most this many vertices, and a row of the adjacency is read
+/// up to this many entries: a hub with a hundred thousand triangles must not cost a hundred thousand
+/// steps per neighbour. A truncated neighbourhood excludes fewer triangles from the ray test, so the
+/// bound can only get tighter: it errs on the safe side.
+const OWN_MAX: usize = 64;
+/// Triangles one ray tests at most.
+const MAX_RAY_TESTS: usize = 512;
+
+/// The vertices within [`OWN_HOPS`] edges of `v` (ascending, `v` included), at most [`OWN_MAX`] of them.
 fn neighbourhood(adjacent: &Csr, v: u32) -> Vec<u32> {
     let mut seen = vec![v];
     let mut frontier = vec![v];
-    for _ in 0..OWN_HOPS {
+    'hops: for _ in 0..OWN_HOPS {
         let mut next = Vec::new();
         for &u in &frontier {
-            for &w in adjacent.row(u as usize) {
+            for &w in adjacent.row(u as usize).iter().take(OWN_MAX) {
+                if seen.len() + next.len() >= OWN_MAX {
+                    seen.extend_from_slice(&next);
+                    break 'hops;
+                }
                 if !seen.contains(&w) && !next.contains(&w) {
                     next.push(w);
                 }
@@ -51,6 +63,7 @@ fn neighbourhood(adjacent: &Csr, v: u32) -> Vec<u32> {
         frontier = next;
     }
     seen.sort_unstable();
+    seen.dedup();
     seen
 }
 
@@ -58,11 +71,12 @@ fn neighbourhood(adjacent: &Csr, v: u32) -> Vec<u32> {
 fn cap(field: &Field, sheet: &Bvh, surface: &Surface, v: u32) -> f64 {
     let (Some(p), Some(n)) = (field.positions.get(v as usize), field.normals.get(v as usize)) else { return 1.0 };
     let own = neighbourhood(field.adjacent, v);
-    let near: OnceCell<Vec<u32>> = OnceCell::new();
+    // a triangle is within reach along the scan when any of its vertices is; when the search gives up
+    // (a huge neighbourhood) it counts as within reach: the bound errs on the safe side
     let keep = |ti: usize| -> bool {
         field.triangles.get(ti).is_some_and(|t| {
             t.iter().all(|w| own.binary_search(w).is_err())
-                && near.get_or_init(|| surface.within_reach(v)).iter().any(|w| t.contains(w))
+                && surface.reaches(&[v], &|w| t.contains(&w)) != Reach::Missed
         })
     };
     let mut cap: f64 = 1.0;
@@ -71,7 +85,12 @@ fn cap(field: &Field, sheet: &Bvh, surface: &Surface, v: u32) -> f64 {
         let reach = o.abs() / BACK_SAFETY;
         let usable =
             |ti: usize| keep(ti) && sheet.triangle_normal(ti).is_some_and(|m| m.dot(&dir).abs() >= MIN_RAY_COS);
-        let Some((ti, t)) = sheet.ray_cast_where(p, &dir, reach, &usable) else { continue };
+        let (ti, t) = match sheet.ray_cast_bounded(p, &dir, reach, &usable, MAX_RAY_TESTS) {
+            RayCast::Hit(ti, t) => (ti, t),
+            RayCast::Miss => continue,
+            // a pile of triangles along the ray: the tightest bound, which the floor then limits
+            RayCast::Exhausted => return 0.0,
+        };
         let safety = match sheet.triangle_normal(ti) {
             Some(m) if m.dot(&dir) < 0.0 => FRONT_SAFETY,
             _ => BACK_SAFETY,

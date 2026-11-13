@@ -60,8 +60,8 @@ fn rim_tangents(positions: &[Point3], boundary: &[(u32, u32)]) -> Vec<Vec3> {
 }
 
 /// The normal field of the neighbours `ids` extrapolated to the rim vertex `i`: every component of
-/// the normals is fitted by a plane over the position in the surface (weighted least squares, with a
-/// small ridge on the slopes), and the value of the fit at the vertex is returned. A one-sided average
+/// the normals is fitted by a plane over the position in the surface (least squares, every neighbour
+/// alike, with a small ridge on the slopes), and the value of the fit at the vertex is returned. A one-sided average
 /// belongs to the middle of the neighbours, which lie on one side of the rim, and leans towards the
 /// sheet by the slope of the field times the distance to that middle; the extrapolation does not.
 /// `None` when the neighbours do not determine a fit, or when it moves the normal by more than

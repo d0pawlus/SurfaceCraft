@@ -527,3 +527,40 @@ fn a_channel_narrower_than_the_wall_is_reported_as_crossing_itself_and_caps_the_
     let codes: Vec<&str> = out["issues"].as_array().unwrap().iter().map(|i| i["code"].as_str().unwrap()).collect();
     assert!(codes.contains(&"self_intersection") && out["verdict"] != "pass", "{out}");
 }
+
+/// A ridge panel `x` mm by 8 mm whose crest has the slope `k`, upward normals.
+fn crease_panel(k: f64, cell: f64) -> Mesh {
+    let mut panel =
+        synth::plane(Point3::origin(), Vec3::x(), Vec3::y(), 14.0, 8.0, (14.0 / cell) as usize, (8.0 / cell) as usize);
+    for p in &mut panel.positions {
+        p.z = -k * (p.x - 7.0).abs();
+    }
+    panel
+}
+
+fn issue_codes(out: &Value) -> Vec<String> {
+    out["issues"].as_array().unwrap().iter().map(|i| i["code"].as_str().unwrap().to_string()).collect()
+}
+
+#[test]
+fn a_shell_that_keeps_crossings_never_passes_whether_they_are_near_or_far_apart() {
+    // Arrange: a crease 11 degrees wide (wall 2 mm: the relaxation leaves sampled crossings of
+    // neighbouring triangles) and one 18 degrees wide with a wall of 4 mm (far apart flanks)
+    let cases = [(crease_panel(5.0, 0.4), 2.0), (crease_panel(3.0, 0.4), 4.0)];
+
+    for (k, (panel, thickness)) in cases.into_iter().enumerate() {
+        let mut s = session_with(panel);
+
+        // Act
+        let thick = s.execute("mesh.thicken", json!({"object": "scan", "thickness": thickness})).unwrap();
+        let out = s.execute("scan.to_solid", json!({"scan": "scan", "thickness": thickness})).unwrap();
+
+        // Assert: crossings are known (counted), so the verdict is capped and the issue is raised
+        let known = thick["self_intersections_local"].as_u64().unwrap()
+            + thick["self_intersections"].as_u64().unwrap()
+            + thick["unresolved_vertices"].as_u64().unwrap();
+        assert!(known > 0, "case {k} must keep crossings: {thick}");
+        assert!(issue_codes(&out).iter().any(|c| c == "self_intersection"), "case {k}: {out}");
+        assert_ne!(out["verdict"], "pass", "case {k}: {out}");
+    }
+}

@@ -70,14 +70,13 @@ impl Rim {
         (2 * self.vertices as usize + (k - 1) * self.order.len() + slot) as u32
     }
 
-    /// The vertex of the scan that shell vertex `v` stems from.
-    pub(super) fn origin(&self, v: u32) -> u32 {
-        let n = self.vertices.max(1);
+    /// The vertex of the scan that shell vertex `v` stems from (`None` for an id past the strip).
+    pub(super) fn origin(&self, v: u32) -> Option<u32> {
         if v < 2 * self.vertices {
-            return v % n;
+            return Some(v % self.vertices.max(1));
         }
         let slot = (v - 2 * self.vertices) as usize % self.order.len().max(1);
-        self.order.get(slot).copied().unwrap_or(0)
+        self.order.get(slot).copied()
     }
 }
 

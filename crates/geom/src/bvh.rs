@@ -125,6 +125,17 @@ pub struct SurfaceHit {
     pub distance: f64,
 }
 
+/// Outcome of [`Bvh::ray_cast_bounded`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RayCast {
+    /// The first hit: triangle and ray parameter.
+    Hit(usize, f64),
+    /// No triangle is hit.
+    Miss,
+    /// The bound on the number of triangle tests was reached before the search ended.
+    Exhausted,
+}
+
 /// Triangle BVH. Holds a copy of the triangle corners so it outlives edits to the mesh.
 #[derive(Clone, Debug, Default)]
 pub struct Bvh {
@@ -226,7 +237,7 @@ impl Bvh {
         self.ray_cast_where(origin, dir, f64::INFINITY, &|_| true)
     }
 
-    /// First hit of the ray `origin + t·dir` with `t <= max_t` among the triangles `keep` accepts.
+    /// First hit of the ray `origin + t·dir` with `t < max_t` among the triangles `keep` accepts.
     #[must_use]
     pub fn ray_cast_where(
         &self,
@@ -235,13 +246,30 @@ impl Bvh {
         max_t: f64,
         keep: &dyn Fn(usize) -> bool,
     ) -> Option<(usize, f64)> {
+        match self.ray_cast_bounded(origin, dir, max_t, keep, usize::MAX) {
+            RayCast::Hit(t, d) => Some((t, d)),
+            RayCast::Miss | RayCast::Exhausted => None,
+        }
+    }
+
+    /// [`Bvh::ray_cast_where`] that gives up after testing `max_tests` triangles
+    /// ([`RayCast::Exhausted`]: a pile of coincident triangles would cost the square of its size).
+    #[must_use]
+    pub fn ray_cast_bounded(
+        &self,
+        origin: &Point3,
+        dir: &Vec3,
+        max_t: f64,
+        keep: &dyn Fn(usize) -> bool,
+        max_tests: usize,
+    ) -> RayCast {
         if self.nodes.is_empty() || !crate::finite(origin) || !crate::finite_vec(dir) {
-            return None;
+            return RayCast::Miss;
         }
         let inv = Vec3::new(1.0 / dir.x, 1.0 / dir.y, 1.0 / dir.z);
         let mut best: Option<(usize, f64)> = None;
         let mut best_t = if max_t.is_nan() { f64::INFINITY } else { max_t };
-        let mut stack: Vec<u32> = vec![0];
+        let (mut stack, mut tests): (Vec<u32>, usize) = (vec![0], 0);
         while let Some(ni) = stack.pop() {
             let Some(node) = self.nodes.get(ni as usize) else { continue };
             if !slab(&node.bbox, origin, &inv, best_t) {
@@ -249,6 +277,10 @@ impl Bvh {
             }
             if node.leaf {
                 for &ti in self.order.get(node.start as usize..node.end as usize).unwrap_or(&[]) {
+                    tests += 1;
+                    if tests > max_tests {
+                        return RayCast::Exhausted;
+                    }
                     if let Some([a, b, c]) = self.tris.get(ti as usize)
                         && let Some(t) = tri::ray_hit(origin, dir, a, b, c)
                         && t < best_t
@@ -263,7 +295,32 @@ impl Bvh {
                 stack.push(node.right);
             }
         }
-        best
+        best.map_or(RayCast::Miss, |(t, d)| RayCast::Hit(t, d))
+    }
+
+    /// [`Bvh::candidates`] that stops after `max` triangles (ascending among those found).
+    #[must_use]
+    pub fn candidates_up_to(&self, keep: &dyn Fn(&Aabb) -> bool, max: usize) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut stack: Vec<u32> = if self.nodes.is_empty() { Vec::new() } else { vec![0] };
+        while let Some(ni) = stack.pop() {
+            let Some(node) = self.nodes.get(ni as usize) else { continue };
+            if !keep(&node.bbox) {
+                continue;
+            }
+            if node.leaf {
+                out.extend_from_slice(self.order.get(node.start as usize..node.end as usize).unwrap_or(&[]));
+                if out.len() >= max {
+                    break;
+                }
+            } else {
+                stack.push(node.left);
+                stack.push(node.right);
+            }
+        }
+        out.truncate(max);
+        out.sort_unstable();
+        out
     }
 
     /// The triangles under every box on their way down that `keep` accepts, ascending. A box that

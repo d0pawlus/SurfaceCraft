@@ -38,8 +38,10 @@ pub(super) struct Inputs<'a> {
     pub boundary: &'a [(u32, u32)],
     pub rim: &'a Rim,
     pub adjacent: &'a Csr,
-    /// Mean edge length of the scan (mm).
+    /// Median edge length of the scan (mm).
     pub edge: f64,
+    /// Diagonal of the bounding box of the scan (mm).
+    pub size: f64,
     /// Vertices whose offset the feature size of the scan bounded.
     pub limited: usize,
 }
@@ -57,7 +59,7 @@ pub(super) fn assemble(work: &Work, inp: &Inputs, params: &ThickenParams) -> Res
     let thickness = params.thickness.abs();
     let crossings = {
         let bvh = Bvh::build(&mesh);
-        let surface = Surface::new(&work.positions, inp.adjacent, rim, thickness, inp.edge);
+        let surface = Surface::new(&work.positions, inp.adjacent, rim, thickness, inp.edge, inp.size);
         crossing::sample(&mesh, &bvh, &surface, MAX_CROSSING_SAMPLES)
     };
     let (min_wall, median_wall) = measured_wall(&outer, &inner, &work.triangles, params.thickness);
@@ -76,6 +78,7 @@ pub(super) fn assemble(work: &Work, inp: &Inputs, params: &ThickenParams) -> Res
         flipped_triangles: work.flipped,
         clamped_vertices: scale.iter().filter(|&&s| s < 1.0).count(),
         limited_vertices: inp.limited,
+        repaired_vertices: work.repaired,
         largest_reduction: thickness * (1.0 - scale.iter().copied().fold(1.0, f64::min)),
         median_reduction: median_reduction(scale, thickness),
         folded_vertices: work.folded,

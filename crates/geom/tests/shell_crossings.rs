@@ -27,6 +27,23 @@ fn crossing_pairs(m: &Mesh) -> Vec<(usize, usize)> {
     out
 }
 
+/// Parameter at which the segment `p + s·d`, `s` in [0, 1], passes through the triangle `a`, `b`, `c`
+/// (a tolerance relative to the lengths, so that the oracle does not depend on the unit).
+fn segment_param(p: &Point3, d: &Vec3, a: &Point3, b: &Point3, c: &Point3) -> Option<f64> {
+    let (e1, e2) = (b - a, c - a);
+    let pv = d.cross(&e2);
+    let det = e1.dot(&pv);
+    if !(det.abs() > 1e-12 * d.norm() * e1.norm() * e2.norm()) {
+        return None;
+    }
+    let tv = p - a;
+    let u = tv.dot(&pv) / det;
+    let qv = tv.cross(&e1);
+    let v = d.dot(&qv) / det;
+    let s = e2.dot(&qv) / det;
+    ((0.0..=1.0).contains(&u) && v >= 0.0 && u + v <= 1.0 && (0.0..=1.0).contains(&s)).then_some(s)
+}
+
 fn pair_crosses(m: &Mesh, a: usize, b: usize) -> bool {
     let (ia, ib) = (m.triangles[a], m.triangles[b]);
     let shared: Vec<u32> = ia.iter().copied().filter(|v| ib.contains(v)).collect();
@@ -38,7 +55,7 @@ fn pair_crosses(m: &Mesh, a: usize, b: usize) -> bool {
                 return false;
             }
             let (p, q) = (pt(u), pt(v));
-            tri::ray_hit(&p, &(q - p), &pt(y[0]), &pt(y[1]), &pt(y[2])).is_some_and(|s| s > 1e-9 && s < 1.0 - 1e-9)
+            segment_param(&p, &(q - p), &pt(y[0]), &pt(y[1]), &pt(y[2])).is_some_and(|s| s > 1e-9 && s < 1.0 - 1e-9)
         })
     };
     match shared.len() {
@@ -219,28 +236,19 @@ fn the_rim_of_a_window_and_of_a_rolled_scan_does_not_cut_the_wall() {
 }
 
 #[test]
-fn crossings_that_cannot_be_relaxed_away_are_counted_as_unresolved_vertices() {
-    // Arrange: noise as large as half a cell leaves a cliff of the scan at the rim where even the
-    // floor of the offset crosses
-    let cases = [
-        bead(0.8, 1.5, 0.2, 0.1),
-        heightfield(14.0, 14.0, 0.2, 0.1, |x, y| {
-            1.5 * (-((x - 7.0).powi(2) + (y - 7.0).powi(2)) / (2.0 * 0.35f64.powi(2))).exp()
-        }),
-    ];
-    let mut left_over = 0;
+fn a_shell_that_keeps_a_crossing_reports_it_and_never_leaves_it_silent() {
+    // Arrange: a sharp ridge (half angle 18 degrees) with a wall of 4 mm: the wedge is narrower than
+    // the wall over a long stretch, and what the relaxation cannot remove must show in the report
+    let panel = heightfield(14.0, 8.0, 0.4, 0.0, |x, _| -3.0 * (x - 7.0).abs());
 
-    for panel in cases {
-        // Act
-        let r = thicken(&panel, &params(1.0)).expect("a few unresolved vertices are no refusal");
+    // Act
+    let r = thicken(&panel, &params(4.0)).expect("a few crossings are no refusal");
 
-        // Assert: what crosses is on the account of the unresolved vertices
-        let pairs = crossing_pairs(&r.mesh).len();
-        left_over += pairs;
-        assert!(pairs == 0 || r.report.unresolved_vertices > 0, "{pairs} crossings, {:?}", r.report);
-        assert!(r.report.unresolved_vertices as f64 <= 0.001 * panel.vertex_count() as f64);
-    }
-    assert!(left_over > 0, "the test needs a shell that keeps a crossing");
+    // Assert
+    let pairs = crossing_pairs(&r.mesh).len();
+    assert!(pairs > 0, "the test needs a shell that keeps a crossing");
+    let reported = r.report.unresolved_vertices + r.report.crossing_local + r.report.crossing_triangles;
+    assert!(reported > 0, "{pairs} crossing pairs, none reported: {:?}", r.report);
 }
 
 #[test]
@@ -316,4 +324,101 @@ fn the_bounds_and_the_crossing_rounds_give_bit_identical_shells_for_one_and_eigh
         assert_eq!(one.report, eight.report);
         assert!(one.report.clamped_vertices > 0, "{:?}", one.report);
     }
+}
+
+/// Seconds a hostile mesh may take to be thickened or refused.
+const HOSTILE_SECONDS: f64 = 30.0;
+
+#[test]
+fn a_hub_with_a_hundred_thousand_triangles_is_refused_within_seconds() {
+    // Arrange: a fan of 100 000 triangles around one vertex (a valid manifold disc)
+    let n = 100_000usize;
+    let mut positions = vec![Point3::origin()];
+    for i in 0..=n {
+        let a = 1.8 * std::f64::consts::PI * i as f64 / n as f64;
+        positions.push(Point3::new(10.0 * a.cos(), 10.0 * a.sin(), 0.001 * (i % 7) as f64));
+    }
+    let triangles = (0..n as u32).map(|i| [0, i + 1, i + 2]).collect();
+    let fan = Mesh { positions, triangles };
+    let started = std::time::Instant::now();
+
+    // Act
+    let result = thicken(&fan, &params(0.5));
+
+    // Assert: a refusal that says why, in no time
+    let seconds = started.elapsed().as_secs_f64();
+    assert!(seconds < HOSTILE_SECONDS, "{seconds} s");
+    assert!(
+        matches!(result, Err(ThickenError::HubVertex { triangles: 100_000, .. })),
+        "{:?}",
+        result.map(|r| r.report)
+    );
+}
+
+#[test]
+fn twenty_thousand_coincident_triangles_are_thickened_or_refused_within_seconds() {
+    // Arrange: the same triangle 20 000 times, each with vertices of its own
+    let corner = |k: u32| Point3::new(f64::from(k % 2), f64::from(k / 2), 0.0);
+    let n = 20_000u32;
+    let positions = (0..3 * n).map(|v| corner(v % 3)).collect();
+    let triangles = (0..n).map(|i| [3 * i, 3 * i + 1, 3 * i + 2]).collect();
+    let pile = Mesh { positions, triangles };
+    let started = std::time::Instant::now();
+
+    // Act
+    let result = thicken(&pile, &params(0.2));
+
+    // Assert
+    let seconds = started.elapsed().as_secs_f64();
+    assert!(
+        seconds < HOSTILE_SECONDS,
+        "{seconds} s, {:?}",
+        result.as_ref().map(|r| r.report).map_err(|e| e.to_string())
+    );
+}
+
+fn scaled(m: &Mesh, factor: f64) -> Mesh {
+    Mesh {
+        positions: m.positions.iter().map(|p| Point3::from(p.coords * factor)).collect(),
+        triangles: m.triangles.clone(),
+    }
+}
+
+#[test]
+fn the_shells_and_the_crossing_tests_do_not_depend_on_the_unit() {
+    // Arrange: a bead with noise, a noisy plate with a window (strip), in micrometres-per-unit,
+    // millimetres and kilometres-per-unit
+    let cases = [(bead(0.35, 1.3, 0.25, 0.07), 1.0), (plate_with_holes(10.0, 0.15, 1.0, 0.06), 2.0)];
+    for (k, (panel, t)) in cases.into_iter().enumerate() {
+        let reference = thicken(&panel, &params(t)).expect("thickens");
+        for factor in [1e-4, 1e3] {
+            // Act
+            let r = thicken(&scaled(&panel, factor), &params(t * factor)).expect("thickens at any scale");
+
+            // Assert: the same shell in other units: no crossing, the same counts
+            assert_free_of_crossings(&r, &format!("case {k} x{factor}"));
+            assert_eq!(r.report.clamped_vertices, reference.report.clamped_vertices, "case {k} x{factor}");
+            assert_eq!(r.report.limited_vertices, reference.report.limited_vertices, "case {k} x{factor}");
+        }
+    }
+}
+
+#[test]
+fn a_fold_of_the_scan_that_cuts_through_itself_is_smoothed_away_before_the_offset() {
+    // Arrange: a flat panel whose vertices at the middle are pulled over their neighbours so that two
+    // triangles pass through each other
+    let mut panel = heightfield(10.0, 10.0, 0.5, 0.0, |_, _| 0.0);
+    let per_row = 21usize;
+    let centre = 10 * per_row + 10;
+    panel.positions[centre] = Point3::new(5.9, 5.4, 0.0);
+    panel.positions[centre + 1] = Point3::new(5.1, 4.9, 0.0);
+    let before = crossing_pairs(&panel).len();
+
+    // Act
+    let r = thicken(&panel, &params(0.5)).expect("thickens");
+
+    // Assert: the scan layer of the shell no longer cuts itself, and the report says what moved
+    assert!(before > 0, "the test needs a scan that crosses itself");
+    assert!(r.report.repaired_vertices > 0, "{:?}", r.report);
+    assert!(crossing_pairs(&r.scan_face()).is_empty(), "{:?}", r.report);
 }

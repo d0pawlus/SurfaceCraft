@@ -20,7 +20,7 @@ use super::crossing::{self, Surface};
 use super::feature;
 use super::strip::{self, Rim};
 use super::topology::Csr;
-use crate::{Bvh, Mesh, Point3, Vec3, par};
+use crate::{Bvh, Mesh, Point3, Vec3, normalize, par};
 
 /// A triangle whose offset copy keeps less than this share of its area is folded.
 pub(super) const MIN_AREA_RATIO: f64 = 0.15;
@@ -42,6 +42,7 @@ const MAX_CROSSING_ROUNDS: usize = 40;
 const MAX_ROUNDS: usize = 60;
 
 /// What the test reads.
+#[derive(Clone, Copy)]
 pub(super) struct Field<'a> {
     pub positions: &'a [Point3],
     pub normals: &'a [Vec3],
@@ -56,8 +57,10 @@ pub(super) struct Field<'a> {
     pub adjacent: &'a Csr,
     /// The thickness (mm): the offsets are `scale` times it.
     pub thickness: f64,
-    /// Mean edge length of the mesh (mm).
+    /// Median edge length of the mesh (mm).
     pub edge: f64,
+    /// Diagonal of the bounding box of the mesh (mm).
+    pub size: f64,
     /// Boundary edges (the strip along them joins the two layers).
     pub boundary: &'a [(u32, u32)],
     /// Ids of the vertices of the strip along the boundary.
@@ -143,11 +146,16 @@ fn taper(field: &Field, scale: &mut [f64], changed: &[u32]) -> Vec<u32> {
 pub(super) struct Relaxed {
     /// The share of the offset every vertex keeps (1 where nothing folds and nothing was tapered).
     pub scale: Vec<f64>,
-    /// Vertices of triangles that folded or crossed another in some round (the others were only tapered).
+    /// Vertices of triangles that folded at the full offset or in a round of the per-triangle test, and
+    /// that were reduced (the others were only tapered). Crossings are counted apart (`unresolved`).
     pub folded: usize,
-    /// Vertices that still lie on a folded or crossing triangle at the floor [`MIN_SCALE`] (sharp
-    /// creases on the side of the offset: no wall of that thickness fits there).
+    /// Vertices of the scan that, after all rounds, lie on a triangle of the shell mesh that crosses
+    /// another one (the exact test of [`crossing`] on the final state: both layers, every row of the strip;
+    /// both triangles of a pair count) or on a folded triangle at the floor [`MIN_SCALE`]. Sharp
+    /// creases on the side of the offset: no wall that thick fits there. Counted once.
     pub unresolved: usize,
+    /// The normals the offset follows: those given, smoothed around vertices that stayed unresolved.
+    pub normals: Vec<Vec3>,
     /// Vertices whose offset the local feature size of the scan bounded before any round.
     pub limited: usize,
 }
@@ -162,12 +170,12 @@ struct State {
 impl State {
     /// Splits `bad` into the vertices that can still be reduced (returned) and those already at the
     /// floor (frozen), and records that they all folded.
-    fn partition(&mut self, bad: Vec<u32>) -> Vec<u32> {
+    fn partition(&mut self, bad: Vec<u32>, fold: bool) -> Vec<u32> {
         let mut movable = Vec::new();
         for v in bad {
             let at_floor = self.scale.get(v as usize).is_some_and(|&s| s <= MIN_SCALE * 1.000_001);
             if let (Some(f), Some(e)) = (self.frozen.get_mut(v as usize), self.ever.get_mut(v as usize)) {
-                *e = true;
+                *e |= fold;
                 if at_floor {
                     *f = true;
                 } else {
@@ -195,7 +203,7 @@ fn fold_rounds(field: &Field, st: &mut State, mut dirty: Vec<u32>) -> Result<(),
     for _ in 0..MAX_ROUNDS {
         let movable = {
             let bad = flagged(field, &st.scale, &dirty);
-            st.partition(bad)
+            st.partition(bad, true)
         };
         if movable.is_empty() {
             return Ok(());
@@ -209,11 +217,11 @@ fn fold_rounds(field: &Field, st: &mut State, mut dirty: Vec<u32>) -> Result<(),
     if left == 0 { Ok(()) } else { Err(left) }
 }
 
-/// The shell mesh of the current scales, and the scales at the last test.
+/// The shell mesh of the current offsets, and the offsets at the last test.
 struct ShellTest {
     mesh: Mesh,
-    /// The scales when the mesh was last tested (`None` before the first test).
-    tested: Option<Vec<f64>>,
+    /// The scales and normals when the mesh was last tested (`None` before the first test).
+    tested: Option<(Vec<f64>, Vec<Vec3>)>,
 }
 
 impl ShellTest {
@@ -223,14 +231,25 @@ impl ShellTest {
     }
 
     /// The triangles of the shell mesh to test: all of them the first time; afterwards those that touch
-    /// a vertex whose scale changed since (both layers; the rows of the strip along a rim edge with a
-    /// changed end). Pairs of triangles that did not move have been tested already.
-    fn ids(&self, field: &Field, scale: &[f64]) -> Vec<u32> {
+    /// a vertex whose offset (scale or normal) changed since, or one of `also` (both layers; the rows of
+    /// the strip along a rim edge with such an end). A pair of triangles that did not move and does not
+    /// touch `also` has been tested already: if it crossed, its vertices were reduced (and so changed)
+    /// or are among `also`.
+    fn ids(&self, field: &Field, scale: &[f64], also: &[u32]) -> Vec<u32> {
         let total = self.mesh.triangles.len();
-        let Some(before) = &self.tested else { return (0..total as u32).collect() };
-        let changed = |v: u32| scale.get(v as usize) != before.get(v as usize);
+        let Some((scales, normals)) = &self.tested else { return (0..total as u32).collect() };
+        let mut marked = vec![false; field.positions.len()];
+        for (v, slot) in marked.iter_mut().enumerate() {
+            *slot = scale.get(v) != scales.get(v) || field.normals.get(v) != normals.get(v);
+        }
+        for &v in also {
+            if let Some(slot) = marked.get_mut(v as usize) {
+                *slot = true;
+            }
+        }
+        let is_marked = |v: u32| marked.get(v as usize).copied().unwrap_or(false);
         let mut tris: Vec<u32> = (0..field.positions.len() as u32)
-            .filter(|&v| changed(v))
+            .filter(|&v| is_marked(v))
             .flat_map(|v| field.around.row(v as usize).iter().copied())
             .collect();
         tris.sort_unstable();
@@ -239,7 +258,7 @@ impl ShellTest {
         let mut ids: Vec<u32> = tris.iter().flat_map(|&i| [i, i + layer]).collect();
         let per_edge = 2 * field.rim.rows;
         for (e, &(u, v)) in field.boundary.iter().enumerate() {
-            if changed(u) || changed(v) {
+            if is_marked(u) || is_marked(v) {
                 let first = 2 * field.triangles.len() + e * per_edge;
                 ids.extend((first..(first + per_edge).min(total)).map(|i| i as u32));
             }
@@ -247,14 +266,15 @@ impl ShellTest {
         ids
     }
 
-    /// The vertices of the scan on a local crossing of the shell mesh (both layers, every row of the strip).
-    fn crossing_vertices(&mut self, field: &Field, scale: &[f64], surface: &Surface) -> Vec<u32> {
+    /// The vertices of the scan on a local crossing of the shell mesh among the triangles [`Self::ids`]
+    /// picks (with `also` always included).
+    fn crossing_vertices(&mut self, field: &Field, scale: &[f64], surface: &Surface, also: &[u32]) -> Vec<u32> {
         let (a, b) = (field.layers[0], field.layers[1]);
         let outer = strip::layer(field.positions, field.normals, scale, a);
         let inner = strip::layer(field.positions, field.normals, scale, b);
         self.mesh.positions = strip::shell_positions(&outer, &inner, field.rim);
-        let ids = self.ids(field, scale);
-        self.tested = Some(scale.to_vec());
+        let ids = self.ids(field, scale, also);
+        self.tested = Some((scale.to_vec(), field.normals.to_vec()));
         if ids.is_empty() {
             return Vec::new();
         }
@@ -275,16 +295,55 @@ fn limit_by_feature_size(field: &Field, surface: &Surface, st: &mut State) -> us
     limited.len()
 }
 
+/// Rounds of normal smoothing around the vertices that stay on a crossing at the floor, at most.
+const MAX_SMOOTHING_PASSES: usize = 8;
+
+/// Crossing rounds: the vertices of local crossings above the floor are reduced (and the folds this
+/// causes relaxed) until none is left or [`MAX_CROSSING_ROUNDS`] rounds are done.
+fn crossing_rounds(field: &Field, st: &mut State, surface: &Surface, shell: &mut ShellTest) -> Result<(), usize> {
+    for round in 0..=MAX_CROSSING_ROUNDS {
+        let bad = shell.crossing_vertices(field, &st.scale, surface, &[]);
+        let movable = st.partition(bad, false);
+        if movable.is_empty() || round == MAX_CROSSING_ROUNDS {
+            break;
+        }
+        let changed = st.shrink(field, &movable);
+        fold_rounds(field, st, changed)?;
+    }
+    Ok(())
+}
+
+/// Replaces the normals of `region` by the mean of their own and their neighbours' normals: where the
+/// offset of neighbouring vertices diverges at the floor (a cluster of tiny triangles whose normals
+/// disagree) the offset layer then moves as a whole, and its triangles stop cutting the sheet.
+fn smoothed_normals(field: &Field, normals: &[Vec3], region: &[u32]) -> Vec<Vec3> {
+    let mut out = normals.to_vec();
+    for &v in region {
+        let sum: Vec3 = std::iter::once(v)
+            .chain(field.adjacent.row(v as usize).iter().copied().take(MAX_SMOOTHING_ROW))
+            .filter_map(|w| normals.get(w as usize))
+            .sum();
+        if let (Some(slot), Some(n)) = (out.get_mut(v as usize), normalize(sum)) {
+            *slot = n;
+        }
+    }
+    out
+}
+
+/// A row of the adjacency is read up to this many entries when normals are smoothed.
+const MAX_SMOOTHING_ROW: usize = 64;
+
 /// Relaxes the offset, or returns the number of vertices that still fold when [`MAX_ROUNDS`] rounds
 /// could not resolve the others. The offset is first bounded by the local feature size
-/// ([`limit_by_feature_size`]). After the per-triangle rounds, the neighbourhood of every reduced
-/// vertex and the strip are tested exactly for triangles that cross; their vertices count as folded
-/// and are reduced, for at most [`MAX_CROSSING_ROUNDS`] rounds; vertices that still lie on a crossing
-/// then are unresolved.
+/// ([`limit_by_feature_size`]). After the per-triangle rounds, the shell mesh is tested exactly for
+/// triangles that cross; their vertices are reduced, for at most [`MAX_CROSSING_ROUNDS`] rounds. The
+/// vertices that cannot be reduced further (at the floor) and still cross get their normals smoothed
+/// ([`smoothed_normals`]) for at most [`MAX_SMOOTHING_PASSES`] passes; what still crosses then is
+/// `unresolved`.
 pub(super) fn relax(field: &Field) -> Result<Relaxed, usize> {
     let n = field.positions.len();
     let mut st = State { scale: vec![1.0; n], ever: vec![false; n], frozen: vec![false; n] };
-    let surface = Surface::new(field.positions, field.adjacent, field.rim, field.thickness, field.edge);
+    let surface = Surface::new(field.positions, field.adjacent, field.rim, field.thickness, field.edge, field.size);
     // what would fold at the full offset is counted as folded, whatever the bound does to it
     for v in flagged(field, &st.scale, &(0..n as u32).collect::<Vec<_>>()) {
         if let Some(e) = st.ever.get_mut(v as usize) {
@@ -294,36 +353,53 @@ pub(super) fn relax(field: &Field) -> Result<Relaxed, usize> {
     let limited = limit_by_feature_size(field, &surface, &mut st);
     fold_rounds(field, &mut st, (0..n as u32).collect())?;
     let mut shell = ShellTest::new(field);
-    for round in 0..=MAX_CROSSING_ROUNDS {
-        let bad = shell.crossing_vertices(field, &st.scale, &surface);
-        let movable = st.partition(bad);
-        if movable.is_empty() || round == MAX_CROSSING_ROUNDS {
+    let mut normals = field.normals.to_vec();
+    crossing_rounds(field, &mut st, &surface, &mut shell)?;
+    for _ in 0..MAX_SMOOTHING_PASSES {
+        let now = Field { normals: &normals, ..*field };
+        let stuck = stuck_vertices(&now, &st, &surface, &mut shell);
+        if stuck.is_empty() {
             break;
         }
-        let changed = st.shrink(field, &movable);
-        fold_rounds(field, &mut st, changed)?;
+        let mut region = stuck.clone();
+        region.extend(stuck.iter().flat_map(|&v| now.adjacent.row(v as usize).iter().copied().take(MAX_SMOOTHING_ROW)));
+        region.sort_unstable();
+        region.dedup();
+        let next = smoothed_normals(&now, &normals, &region);
+        normals = next;
+        let now = Field { normals: &normals, ..*field };
+        for &v in &region {
+            if let Some(f) = st.frozen.get_mut(v as usize) {
+                *f = false;
+            }
+        }
+        fold_rounds(&now, &mut st, region)?;
+        crossing_rounds(&now, &mut st, &surface, &mut shell)?;
     }
-    let unresolved = unresolved_vertices(field, &st, &surface, &mut shell);
+    let now = Field { normals: &normals, ..*field };
+    let unresolved = stuck_vertices(&now, &st, &surface, &mut shell).len();
     Ok(Relaxed {
         folded: st.ever.iter().zip(&st.scale).filter(|&(&e, &s)| e && s < 1.0).count(),
         unresolved,
         limited,
         scale: st.scale,
+        normals,
     })
 }
 
 /// The vertices that are on a fold at the floor of the offset or on a crossing of the shell mesh in
-/// its final state (a full test: a crossing seen in an early round may have been resolved since by the
-/// reduction of its other triangle), counted once.
-fn unresolved_vertices(field: &Field, st: &State, surface: &Surface, shell: &mut ShellTest) -> usize {
-    shell.tested = None;
-    let mut stuck = shell.crossing_vertices(field, &st.scale, surface);
+/// its current state, ascending, each once. Exact: what changed since the last test is tested again,
+/// and so is everything around the vertices that were stuck at the floor before (their crossing may
+/// have been resolved by the movement of the other triangle).
+fn stuck_vertices(field: &Field, st: &State, surface: &Surface, shell: &mut ShellTest) -> Vec<u32> {
+    let frozen: Vec<u32> = (0..st.frozen.len() as u32).filter(|&v| st.frozen.get(v as usize) == Some(&true)).collect();
+    let mut stuck = shell.crossing_vertices(field, &st.scale, surface, &frozen);
     let all: Vec<u32> = (0..field.positions.len() as u32).collect();
     let at_floor = |v: &u32| st.scale.get(*v as usize).is_some_and(|&s| s <= MIN_SCALE * 1.000_001);
     stuck.extend(flagged(field, &st.scale, &all).into_iter().filter(at_floor));
     stuck.sort_unstable();
     stuck.dedup();
-    stuck.len()
+    stuck
 }
 
 #[cfg(test)]
@@ -331,9 +407,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_fold_that_survives_the_floor_is_counted_as_unresolved() {
-        // Arrange: a triangle whose normals point up, up and down: with an offset this large it stands
-        // on its edge at every scale down to the floor
+    fn a_fold_that_survives_the_floor_and_the_smoothing_is_counted_as_unresolved() {
+        // Arrange: a triangle whose normals point up, up and down, without neighbours to smooth them with:
+        // with an offset this large it stands on its edge at every scale down to the floor
+        let positions = [Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 0.0, 0.0), Point3::new(0.0, 1.0, 0.0)];
+        let normals = [Vec3::z(), Vec3::z(), -Vec3::z()];
+        let triangles = [[0u32, 1, 2]];
+        let around = Csr::from_pairs(3, &[(0, 0), (1, 0), (2, 0)]);
+        let adjacent = Csr::from_pairs(3, &[]);
+        let offsets = [-1000.0];
+        let rim = Rim::new(3, 1, &[]);
+        let field = Field {
+            positions: &positions,
+            normals: &normals,
+            triangles: &triangles,
+            offsets: &offsets,
+            layers: [offsets[0], 0.0],
+            around: &around,
+            adjacent: &adjacent,
+            thickness: 1000.0,
+            edge: 1.0,
+            boundary: &[],
+            rim: &rim,
+            size: 1000.0,
+        };
+
+        // Act
+        let result = relax(&field);
+
+        // Assert: they stay at the floor and are counted
+        let relaxed = result.expect("relaxed");
+        assert_eq!(relaxed.unresolved, 3);
+        assert!(relaxed.scale.iter().all(|&s| (s - MIN_SCALE).abs() < 1e-9));
+    }
+
+    #[test]
+    fn a_fold_at_the_floor_is_resolved_by_smoothing_the_normals_with_those_of_the_neighbours() {
+        // Arrange: the same triangle, now with its neighbours: the mean of the three normals is up
         let positions = [Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 0.0, 0.0), Point3::new(0.0, 1.0, 0.0)];
         let normals = [Vec3::z(), Vec3::z(), -Vec3::z()];
         let triangles = [[0u32, 1, 2]];
@@ -353,14 +463,14 @@ mod tests {
             edge: 1.0,
             boundary: &[],
             rim: &rim,
+            size: 1000.0,
         };
 
         // Act
-        let result = relax(&field);
+        let relaxed = relax(&field).expect("relaxed");
 
-        // Assert: they stay at the floor and are counted
-        let relaxed = result.expect("relaxed");
-        assert_eq!(relaxed.unresolved, 3);
-        assert!(relaxed.scale.iter().all(|&s| (s - MIN_SCALE).abs() < 1e-9));
+        // Assert
+        assert_eq!(relaxed.unresolved, 0);
+        assert!(relaxed.normals.iter().all(|n| (n - Vec3::z()).norm() < 1e-9), "{:?}", relaxed.normals);
     }
 }
