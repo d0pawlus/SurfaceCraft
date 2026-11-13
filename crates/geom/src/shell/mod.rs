@@ -16,13 +16,14 @@
 mod assemble;
 mod normals;
 mod relax;
+mod repair;
 mod topology;
 
 use crate::{Aabb, Mesh, MeshError, Vec3};
 use assemble::assemble;
 use topology::{Csr, Work};
 
-/// Share of the vertices that may need their offset reduced; more is refused.
+/// Share of the vertices that may lie on a folded triangle of the offset (before it is relaxed); more is refused.
 pub const MAX_CLAMPED_SHARE: f64 = 0.15;
 /// The thickness is at most this share of the diagonal of the mesh's bounding box. (A wall of that
 /// size is not a shell; the limit also keeps every coordinate finite.)
@@ -64,6 +65,10 @@ pub struct ThickenReport {
     pub pinch_splits: usize,
     /// Degenerate triangles dropped from the input.
     pub dropped_triangles: usize,
+    /// Triangles removed because they lay on an edge shared by three or more triangles.
+    pub removed_non_manifold: usize,
+    /// Triangles turned around to make the orientation consistent.
+    pub flipped_triangles: usize,
     /// Vertices whose offset was reduced to avoid a fold.
     pub clamped_vertices: usize,
     /// Largest reduction of the thickness at a vertex (mm).
@@ -205,7 +210,12 @@ pub fn thicken(mesh: &Mesh, params: &ThickenParams) -> Result<Thickened, Thicken
         return Err(ThickenError::Empty);
     }
     check_size(&work, params)?;
-    topology::require_oriented(&topology::directed_edges(&work.triangles))?;
+    let repairs = repair::repair(&mut work);
+    (work.removed, work.flipped) = (repairs.removed, repairs.flipped);
+    topology::drop_unused_vertices(&mut work);
+    if work.triangles.is_empty() {
+        return Err(ThickenError::Empty);
+    }
     topology::split_pinches(&mut work);
     let sorted = topology::directed_edges(&work.triangles);
     topology::require_oriented(&sorted)?;
@@ -214,10 +224,26 @@ pub fn thicken(mesh: &Mesh, params: &ThickenParams) -> Result<Thickened, Thicken
         return Err(ThickenError::Closed);
     }
     let adjacent = topology::adjacency(work.positions.len(), &sorted);
-    let normals = normals::smoothed(&work.positions, &work.triangles, &adjacent).ok_or(ThickenError::NoNormals)?;
+    let passes = normals::passes_for(params.thickness, mean_edge(&work));
+    let normals =
+        normals::smoothed(&work.positions, &work.triangles, &adjacent, passes).ok_or(ThickenError::NoNormals)?;
     let (a, b) = layer_offsets(params);
     let scale = fold_free_scale(&work, &normals, &adjacent, &[a, b], params.thickness)?;
     assemble(&work, &normals, &scale, (a, b), &boundary, params)
+}
+
+/// Mean length of the edges of the triangles (mm).
+fn mean_edge(work: &Work) -> f64 {
+    let (mut sum, mut count) = (0.0, 0usize);
+    for t in &work.triangles {
+        for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+            if let (Some(p), Some(q)) = (work.positions.get(a as usize), work.positions.get(b as usize)) {
+                sum += (p - q).norm();
+                count += 1;
+            }
+        }
+    }
+    if count == 0 { 0.0 } else { sum / count as f64 }
 }
 
 /// The share of the offset each vertex keeps; refused when too many vertices need less than all.
@@ -241,15 +267,15 @@ fn fold_free_scale(
         adjacent,
         thickness: thickness.abs(),
     };
-    let scale = relax::relax(&field).map_err(ThickenError::Unresolved)?;
-    let clamped = scale.iter().filter(|&&s| s < 1.0).count();
+    let relaxed = relax::relax(&field).map_err(ThickenError::Unresolved)?;
+    let scale = relaxed.scale;
     let vertices = scale.len();
-    if clamped as f64 > MAX_CLAMPED_SHARE * vertices as f64 {
+    if relaxed.folded as f64 > MAX_CLAMPED_SHARE * vertices as f64 {
         let smallest = scale.iter().copied().fold(1.0, f64::min);
         return Err(ThickenError::Folds {
             thickness,
-            share_percent: 100.0 * clamped as f64 / vertices as f64,
-            clamped,
+            share_percent: 100.0 * relaxed.folded as f64 / vertices as f64,
+            clamped: relaxed.folded,
             vertices,
             largest: thickness.abs() * (1.0 - smallest),
             suggested: thickness.abs() * quantile_scale(&scale),

@@ -117,24 +117,36 @@ fn taper(field: &Field, scale: &mut [f64], changed: &[u32]) -> Vec<u32> {
     all
 }
 
-/// The share of the offset every vertex keeps (1 where nothing folds), or the number of vertices
-/// that still fold when [`MAX_ROUNDS`] rounds could not resolve them.
-pub(super) fn relax(field: &Field) -> Result<Vec<f64>, usize> {
+/// The outcome of the relaxation.
+pub(super) struct Relaxed {
+    /// The share of the offset every vertex keeps (1 where nothing folds and nothing was tapered).
+    pub scale: Vec<f64>,
+    /// Vertices of triangles that folded in some round (the others were only tapered).
+    pub folded: usize,
+}
+
+/// Relaxes the offset, or returns the number of vertices that still fold when [`MAX_ROUNDS`] rounds
+/// could not resolve them.
+pub(super) fn relax(field: &Field) -> Result<Relaxed, usize> {
     let n = field.positions.len();
     let mut scale = vec![1.0; n];
+    let mut ever = vec![false; n];
     let mut dirty: Vec<u32> = (0..n as u32).collect();
     for _ in 0..MAX_ROUNDS {
         let bad = flagged(field, &scale, &dirty);
         if bad.is_empty() {
-            return Ok(scale);
+            return Ok(Relaxed { folded: ever.iter().filter(|&&e| e).count(), scale });
         }
         for &v in &bad {
             if let Some(s) = scale.get_mut(v as usize) {
                 *s *= SHRINK;
             }
+            if let Some(e) = ever.get_mut(v as usize) {
+                *e = true;
+            }
         }
         dirty = taper(field, &mut scale, &bad);
     }
     let left = flagged(field, &scale, &dirty).len();
-    if left == 0 { Ok(scale) } else { Err(left) }
+    if left == 0 { Ok(Relaxed { folded: ever.iter().filter(|&&e| e).count(), scale }) } else { Err(left) }
 }

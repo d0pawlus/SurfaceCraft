@@ -76,9 +76,12 @@ kernel refuses sheets of many faces. Give the wall thickness instead:
 - Where the surface curves more tightly than the wall is thick (a bead, a tight corner on the side
   of the offset), the offset is reduced locally and the wall is thinner there: `clamped_vertices` and
   `largest_reduction` say where, and more than 1 % of the vertices is the issue `thickness_reduced`.
-  A thickness that folds more than 15 % of the surface is refused (verdict `fail`, issue `no_solid`)
+  A thickness whose offset folds triangles at more than 15 % of the vertices is refused (verdict `fail`, issue `no_solid`)
   with a thickness the surface can carry as the next step. Thin gaps between two sheets of the scan
   that are narrower than the wall are not detected.
+- Before the offset the mesh is repaired: triangles on edges shared by three or more triangles are
+  removed and the orientation is made consistent per piece; places where boundary loops touch are
+  split. The normals are smoothed over about half the wall, so noise finer than that does not fold it.
 - `mesh.thicken` does the first half alone: a new mesh, closed and outward, from `object`,
   `thickness`, `symmetric` and `name`.
 

@@ -411,8 +411,12 @@ fn hostile_meshes_and_thicknesses_are_errors_not_panics() {
     assert_eq!(thicken(&closed, &params(1.0)).unwrap_err(), ThickenError::Closed);
     assert!(matches!(thicken(&nan_vertex, &params(1.0)), Err(ThickenError::Invalid(_))));
     assert!(matches!(thicken(&out_of_range, &params(1.0)), Err(ThickenError::Invalid(_))));
-    assert!(matches!(thicken(&three_on_an_edge, &params(0.1)), Err(ThickenError::NonOrientable { .. })));
-    assert!(matches!(thicken(&flipped, &params(0.1)), Err(ThickenError::NonOrientable { .. })));
+    assert!(thicken(&flipped, &params(0.1)).is_ok(), "a consistently orientable mesh is repaired");
+    assert_eq!(
+        thicken(&three_on_an_edge, &params(0.1)).unwrap_err(),
+        ThickenError::Empty,
+        "every triangle is on the edge"
+    );
     for t in [0.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.0] {
         assert!(matches!(thicken(&cap, &params(t)), Err(ThickenError::BadThickness(_))), "{t}");
     }
@@ -420,4 +424,27 @@ fn hostile_meshes_and_thicknesses_are_errors_not_panics() {
         assert!(matches!(thicken(&cap, &params(t)), Err(ThickenError::TooThick { .. })), "{t}");
     }
     assert!(thicken(&cap, &params(1e-12)).is_ok() || thicken(&cap, &params(1e-12)).is_err());
+}
+
+#[test]
+fn a_scan_with_inconsistent_orientation_and_a_fin_is_repaired() {
+    // Arrange: the cap with every tenth triangle turned around and a third triangle on an edge
+    let mut m = noisy_cap(0.0, 0).0;
+    let turned = m.triangles.iter().step_by(10).count();
+    for t in m.triangles.iter_mut().step_by(10) {
+        t.swap(1, 2);
+    }
+    let [a, b, _] = m.triangles[1];
+    let apex = m.positions[a as usize] + Vec3::new(0.0, 0.0, 3.0);
+    m.positions.push(apex);
+    m.triangles.push([b, a, m.positions.len() as u32 - 1]);
+    let fin_edges_removed = 1;
+
+    // Act
+    let r = thicken(&m, &params(1.0)).expect("repaired and thickened");
+
+    // Assert
+    assert_closed_outward(&r.mesh);
+    assert!(r.report.flipped_triangles >= turned - 3 * fin_edges_removed - 10, "{:?}", r.report);
+    assert!(r.report.removed_non_manifold >= 1, "{:?}", r.report);
 }

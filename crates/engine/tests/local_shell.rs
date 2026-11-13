@@ -39,6 +39,11 @@ fn run_one(number: usize, path: &std::path::Path, thickness: f64) -> Result<Stri
     let mut s = Session::new();
     let e = |x: surfacecraft_engine::EngineError| x.to_string();
     let info = s.execute("mesh.import", json!({"path": path.to_string_lossy(), "name": "scan"})).map_err(e)?;
+    let qa = s.execute("scan.qa", json!({"object": "scan"})).map_err(e)?;
+    eprintln!(
+        "S{number:02} bbox {} {} edge {} sigma {} holes {}",
+        qa["bbox_min"], qa["bbox_max"], qa["edge_length"], qa["noise_sigma"], qa["holes"]
+    );
     let started = Instant::now();
     let out = s.execute("scan.to_solid", json!({"scan": "scan", "thickness": thickness})).map_err(e)?;
     let seconds = started.elapsed().as_secs_f64();
@@ -64,6 +69,9 @@ fn run_one(number: usize, path: &std::path::Path, thickness: f64) -> Result<Stri
         out["retry"]["reason"],
         codes(&out),
     );
+    if verdict == "fail" {
+        eprintln!("S{number:02} {}", out["issues"][0]["message"]);
+    }
     Ok(verdict)
 }
 

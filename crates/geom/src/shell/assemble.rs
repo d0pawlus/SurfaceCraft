@@ -108,6 +108,8 @@ pub(super) fn assemble(
         strip_rows: rows,
         pinch_splits: work.pinch_splits,
         dropped_triangles: work.dropped,
+        removed_non_manifold: work.removed,
+        flipped_triangles: work.flipped,
         clamped_vertices: scale.iter().filter(|&&s| s < 1.0).count(),
         largest_reduction: params.thickness.abs() * (1.0 - reduction),
     };

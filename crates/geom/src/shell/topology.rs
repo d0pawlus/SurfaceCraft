@@ -12,6 +12,10 @@ pub(super) struct Work {
     pub dropped: usize,
     /// Vertices added by splitting the places where boundary loops touch.
     pub pinch_splits: usize,
+    /// Triangles removed because they lay on an edge shared by three or more triangles.
+    pub removed: usize,
+    /// Triangles turned around to make the orientation consistent.
+    pub flipped: usize,
 }
 
 /// Compressed rows: `row(i)` lists the items of vertex `i`.
@@ -88,7 +92,32 @@ pub(super) fn compact(mesh: &Mesh) -> Work {
     }
     let triangles =
         kept.iter().map(|t| [0, 1, 2].map(|k| slot.get(t[k] as usize).copied().unwrap_or(0))).collect::<Vec<_>>();
-    Work { positions, triangles, dropped, pinch_splits: 0 }
+    Work { positions, triangles, dropped, pinch_splits: 0, removed: 0, flipped: 0 }
+}
+
+/// Drops the vertices no triangle uses (the order of the others is kept).
+pub(super) fn drop_unused_vertices(w: &mut Work) {
+    let mut slot = vec![u32::MAX; w.positions.len()];
+    for t in &w.triangles {
+        for &v in t {
+            if let Some(s) = slot.get_mut(v as usize) {
+                *s = 0;
+            }
+        }
+    }
+    let mut positions = Vec::new();
+    for (i, s) in slot.iter_mut().enumerate() {
+        if *s == 0
+            && let Some(p) = w.positions.get(i)
+        {
+            *s = positions.len() as u32;
+            positions.push(*p);
+        }
+    }
+    for t in &mut w.triangles {
+        *t = t.map(|v| slot.get(v as usize).copied().unwrap_or(0));
+    }
+    w.positions = positions;
 }
 
 /// The sorted directed edges of the triangles.
