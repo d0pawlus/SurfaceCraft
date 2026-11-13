@@ -4,4 +4,3 @@
 crates/engine/src/cmd/primitive.rs 1045
 crates/engine/src/cmd/region.rs 867
 crates/doc/src/object.rs 834
-crates/engine/src/cmd/quad/unstructured.rs 824
