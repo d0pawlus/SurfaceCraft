@@ -6,19 +6,25 @@
 //! across neighbouring triangles whose corners lie within the tolerance of the primitive and
 //! whose normal agrees with it, refitting as it doubles. Regions below `min_triangles` are
 //! released. Everything is mesh-side (design doc §5).
+mod bow;
 mod fits;
 mod freeform;
 #[cfg(test)]
 mod freeform_tests;
 mod grow;
 mod merge;
+mod protect;
+#[cfg(test)]
+mod protect_tests;
 mod relax;
 mod seeds;
 
 use crate::primitive::{Primitive, PrimitiveKind};
+pub use bow::{Bow, region_bow};
 use fits::fit_tris;
-pub use freeform::{LARGE_SOUND_FACTOR, PROTECT_RMS_SHARE, protected_by_tolerance, residual_spread};
+pub use freeform::{LARGE_SOUND_FACTOR, residual_spread};
 use grow::Ctx;
+pub use protect::{FORM_ERROR_SHARE, protected_by_tolerance};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -268,7 +274,7 @@ fn run(mesh: &Mesh, opts: &SegmentOptions, cancel: &Cancel) -> Option<(Vec<Segme
         tol,
         cos,
     };
-    let fset = freeform_settings(opts, nt, seed_tris, tol);
+    let fset = freeform_settings(opts, mesh, seed_tris, tol);
     // with noise above the tolerance no fit can be judged: nothing is consolidated
     let consolidate = opts.freeform && !(fset.noise_known && fset.noise > tol);
     let hints = consolidate.then_some(seeds::FreeformHints { weak_tris: fset.strong_tris });
@@ -309,9 +315,11 @@ pub fn fallback_noise(tolerance: f64) -> f64 {
     FALLBACK_NOISE_SHARE * tolerance
 }
 
-/// Settings of the freeform consolidation for a scan of `nt` triangles; options that make no
+/// Settings of the freeform consolidation for the scan `mesh`; options that make no
 /// sense (not finite, out of range) fall back to the defaults.
-fn freeform_settings(opts: &SegmentOptions, nt: usize, seed_tris: usize, tol: f64) -> freeform::Settings {
+fn freeform_settings(opts: &SegmentOptions, mesh: &Mesh, seed_tris: usize, tol: f64) -> freeform::Settings {
+    let nt = mesh.triangle_count();
+    let scene = protect::Scene::of(mesh);
     let share = if opts.freeform_min_share.is_finite() && (0.0..=1.0).contains(&opts.freeform_min_share) {
         opts.freeform_min_share
     } else {
@@ -328,7 +336,8 @@ fn freeform_settings(opts: &SegmentOptions, nt: usize, seed_tris: usize, tol: f6
         noise: known_noise.unwrap_or_else(|| fallback_noise(tol)),
         noise_known: known_noise.is_some(),
         dominant_tris: (DOMINANT_SHARE * nt as f64).ceil() as usize,
-        protect_tris: freeform::ProtectSizes::for_scan(nt),
+        scene,
+        protect_noise: known_noise.unwrap_or(0.0),
         min_cluster: MIN_FREEFORM_CLUSTER,
         min_triangles: opts.min_triangles,
         tolerance: tol,

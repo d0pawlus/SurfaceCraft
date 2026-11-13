@@ -3,7 +3,8 @@
 //! other is run too (unless the caller forbids it, or the scan is too large for a second run to be
 //! worth its time), and the better result is returned. The losing attempt leaves nothing in the
 //! document, and the whole run is still one undo step.
-use super::super::{CANCELLED, CmdError};
+use super::super::{CANCELLED, CmdError, cancelled};
+use super::budget::Budget;
 use super::{
     CmdResult, Issue, MIN_MODELLED_SHARE, Method, NextStep, ScanSummary, Settings, ToSolidIn, ToSolidOut, Verdict,
     freeform, message_of, primitives_solid, scan_primitive_share, segment_scan, step,
@@ -256,13 +257,25 @@ pub(super) fn orchestrate(
     if first_result.verdict == Verdict::Pass || !plausible {
         return Ok(ToSolidReport { result: first_result, attempts: vec![first_record] });
     }
-    if let Some(reason) = skip_reason(plan, first_seconds) {
+    // a cancelled call does not start another attempt (the first one has ended; its result is dropped)
+    if s.cancel.is_cancelled() {
+        return Err(cancelled());
+    }
+    let mut budget = Budget::after_first(first_seconds);
+    let refusal = skip_reason(plan, first_seconds).or_else(|| (!budget.draw()).then(|| budget.refusal()));
+    if let Some(reason) = refusal {
         let skipped = skipped_attempt(plan, second, reason);
         return Ok(ToSolidReport { result: first_result, attempts: vec![first_record, skipped] });
     }
     let after_first = std::mem::replace(&mut s.doc, base);
     let timer = Timer::start();
-    let second_result = match exec(s, second) {
+    let second_outcome = exec(s, second);
+    budget.spend(timer.seconds());
+    // a call cancelled while the second attempt ran ends in the cancellation, whatever it returned
+    if s.cancel.is_cancelled() {
+        return Err(cancelled());
+    }
+    let second_result = match second_outcome {
         Ok(r) => r,
         Err(e) if is_cancelled(&e) => return Err(e),
         Err(e) => {
@@ -310,7 +323,8 @@ fn alone(
 /// The noise issue, with the tolerance that would work: three times the estimated sigma.
 fn noise_issue(report: &ScanSummary, scan: ObjectId, name: &str, result: &mut ToSolidOut) {
     let sigma = report.noise_used.unwrap_or(0.0);
-    let tolerance = (3.0 * sigma * 1000.0).ceil() / 1000.0;
+    // three times the noise, rounded down to 0.001 so that it never exceeds it
+    let tolerance = ((3.0 * sigma * 1000.0).floor() / 1000.0).min(3.0 * sigma);
     result.issues.push(Issue {
         code: "noise_above_tolerance".into(),
         message: format!(
@@ -639,5 +653,60 @@ mod tests {
         assert!(result.next_steps.iter().all(|st| st.params["method"].is_null()), "{:?}", result.next_steps);
         assert_eq!(result.next_steps.len(), 1);
         assert!(result.issues.iter().any(|i| i.code == "other_method_tried" && i.message.contains("freeform")));
+    }
+
+    // --- cancellation, truncation, the suggested tolerance ----------------------------------------
+
+    /// A call cancelled during the first attempt does not start the second.
+    #[test]
+    fn a_cancelled_call_does_not_start_the_second_attempt() {
+        let mut s = Session::new();
+        let mut called = Vec::new();
+        let report = orchestrate(&mut s, &plan(0.9), &mut |s, m| {
+            called.push(method_name(m));
+            s.cancel.cancel();
+            Ok(result(Verdict::Fail, SOLID, 1.0, 0.5))
+        });
+        assert!(matches!(report, Err(e) if is_cancelled(&e)));
+        assert_eq!(called, ["primitives"]);
+    }
+
+    /// A call cancelled while the second attempt runs ends in the cancellation, even if that attempt
+    /// returns a result.
+    #[test]
+    fn a_cancellation_during_the_second_attempt_ends_the_call() {
+        let mut s = Session::new();
+        let report = orchestrate(&mut s, &plan(0.9), &mut |s, m| {
+            if m == Method::Freeform {
+                s.cancel.cancel();
+            }
+            Ok(result(Verdict::Fail, SOLID, 1.0, 0.5))
+        });
+        assert!(matches!(report, Err(e) if is_cancelled(&e)));
+    }
+
+    /// An error text of multi-byte characters is cut between characters, never inside one.
+    #[test]
+    fn truncating_multibyte_text_never_splits_a_character() {
+        for unit in ["é", "日本語", "🙂", "aé日🙂"] {
+            let text = unit.repeat(300);
+            let cut = short(&text);
+            assert_eq!(cut.chars().count(), ERROR_TEXT_LIMIT);
+            assert!(text.starts_with(&cut), "the cut is a prefix of the text");
+        }
+        assert_eq!(short("abc"), "abc");
+    }
+
+    /// The suggested tolerance is three times the noise, never more.
+    #[test]
+    fn the_suggested_tolerance_is_at_most_three_times_the_noise() {
+        for sigma in [0.2004, 0.4127, 1.0, 0.2501] {
+            let mut r = result(Verdict::Fail, None, 0.0, 0.0);
+            let mut report = r.scan_report.clone();
+            report.noise_used = Some(sigma);
+            noise_issue(&report, ObjectId(1), "solid", &mut r);
+            let tolerance = r.next_steps[0].params["tolerance"].as_f64().expect("a tolerance");
+            assert!(tolerance <= 3.0 * sigma && tolerance > 3.0 * sigma - 0.001, "{tolerance} for {sigma}");
+        }
     }
 }

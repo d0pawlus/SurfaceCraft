@@ -5,7 +5,7 @@
 //! `cargo test --profile ci -p surfacecraft-engine --test p9_noise_calibration print_table -- --ignored --nocapture`
 //! prints the table the threshold of `freeform.rs` (`LARGE_SOUND_FACTOR`) was chosen from.
 use surfacecraft_deviation::noise_estimate;
-use surfacecraft_fit::segment::{LARGE_SOUND_FACTOR, SegmentOptions, residual_spread, segment};
+use surfacecraft_fit::segment::{LARGE_SOUND_FACTOR, SegmentOptions, region_bow, residual_spread, segment};
 use surfacecraft_fit::{PrimitiveKind, fit_auto};
 use surfacecraft_geom::{Mesh, Point3, Rng, synth};
 
@@ -324,7 +324,7 @@ fn whole_patch(m: &Mesh) -> Option<surfacecraft_fit::segment::Segment> {
 /// Both sides of the protection by the tolerance, on real noisy data: planes with a waviness of
 /// 0.02 and 0.035 mm and a cylinder with 0.03 mm of ovality (scanner noise 0.003 and 0.01) are
 /// protected; no region the segmentation finds on a wavy surface is (spread of the residuals of
-/// those regions: at least 0.13 of the tolerance for planes, `PROTECT_RMS_SHARE` is 0.12).
+/// those regions: at least 0.13 of the tolerance for planes, `FORM_ERROR_SHARE` is 0.12).
 #[test]
 fn the_tolerance_protects_primitives_with_form_error_and_no_organic_fragment() {
     for sigma in [0.003, 0.01] {
@@ -333,9 +333,8 @@ fn the_tolerance_protects_primitives_with_form_error_and_no_organic_fragment() {
                 [wavy_plane(0.02, sigma, seed), wavy_plane(0.035, sigma, seed), oval_cylinder(0.03, sigma, seed)];
             for (k, m) in patches.iter().enumerate() {
                 let seg = whole_patch(m).expect("a fit");
-                let n = m.triangle_count();
                 assert!(
-                    surfacecraft_fit::segment::protected_by_tolerance(m, &seg, 0.2, n),
+                    surfacecraft_fit::segment::protected_by_tolerance(m, &seg, 0.2, sigma),
                     "patch {k} sigma {sigma} seed {seed}: {:?} rms {:.4}",
                     seg.primitive.kind(),
                     seg.rms
@@ -352,7 +351,7 @@ fn the_tolerance_protects_primitives_with_form_error_and_no_organic_fragment() {
             for s in segment(&m, &opts).iter().filter(|s| s.triangles.len() >= 300) {
                 checked += 1;
                 assert!(
-                    !surfacecraft_fit::segment::protected_by_tolerance(&m, s, 0.2, n),
+                    !surfacecraft_fit::segment::protected_by_tolerance(&m, s, 0.2, sigma),
                     "a fragment is protected: {:?} {} triangles of {n}, rms {:.4}",
                     s.primitive.kind(),
                     s.triangles.len(),
@@ -362,4 +361,61 @@ fn the_tolerance_protects_primitives_with_form_error_and_no_organic_fragment() {
         }
     }
     assert!(checked > 100, "{checked} fragments checked");
+}
+
+/// `(r_p, r_q, bow, extent, bow / extent)` of a region (all mm), `None` when too small to fit.
+fn bow_row(m: &Mesh, tris: &[u32], prim: &surfacecraft_fit::Primitive) -> Option<[f64; 5]> {
+    let b = region_bow(m, tris, prim)?;
+    Some([b.primitive_rms, b.quadric_rms, b.bow(), b.extent, b.bow() / b.extent])
+}
+
+#[test]
+#[ignore = "prints the bow table (minutes)"]
+fn print_bow_table() {
+    println!("form-error primitives: r_p, r_q, bow, extent, bow/extent (60 mm patches)");
+    let patches: Vec<(String, Mesh)> = vec![
+        ("plane waviness 0.035".into(), wavy_plane(0.035, 0.003, 1)),
+        ("plane waviness 0.05".into(), wavy_plane(0.05, 0.003, 1)),
+        ("plane waviness 0.05 sigma 0.03".into(), wavy_plane(0.05, 0.03, 1)),
+        ("cylinder ovality 0.05".into(), oval_cylinder(0.05, 0.01, 1)),
+        ("plane noise only 0.03".into(), wavy_plane(0.0, 0.03, 1)),
+    ];
+    for (name, m) in &patches {
+        if let Some(seg) = whole_patch(m) {
+            if let Some(r) = bow_row(m, &seg.triangles, &seg.primitive) {
+                println!(
+                    "  {name}: r_p {:.4} r_q {:.4} bow {:.4} extent {:.1} slope {:.2e}",
+                    r[0], r[1], r[2], r[3], r[4]
+                );
+            }
+        }
+    }
+    println!("large fragments of a wavy surface (>= 1 % of the scan, 300 triangles): slope bow / extent");
+    for (sigma, spacing) in [(0.003, 1.0), (0.01, 1.0), (0.03, 1.0), (0.01, 0.7), (0.03, 0.7)] {
+        let mut slopes = Vec::new();
+        let mut rows = Vec::new();
+        for seed in 1..=6 {
+            let m = wavy(sigma, spacing, seed);
+            let n = m.triangle_count();
+            let opts = SegmentOptions { freeform: false, ..SegmentOptions::default() };
+            for s in segment(&m, &opts).iter().filter(|s| s.triangles.len() >= 300 && s.triangles.len() * 100 >= n) {
+                if let Some(r) = bow_row(&m, &s.triangles, &s.primitive) {
+                    slopes.push(r[4]);
+                    rows.push(r);
+                }
+            }
+        }
+        let sl = sorted(slopes);
+        let med = |k: usize| sorted(rows.iter().map(|r| r[k]).collect());
+        println!(
+            "  sigma {sigma} spacing {spacing}: n {} slope min {:.2e} p5 {:.2e} p50 {:.2e}; median r_p {:.4} r_q {:.4} extent {:.1}",
+            sl.len(),
+            percentile(&sl, 0.0),
+            percentile(&sl, 0.05),
+            percentile(&sl, 0.5),
+            percentile(&med(0), 0.5),
+            percentile(&med(1), 0.5),
+            percentile(&med(3), 0.5)
+        );
+    }
 }

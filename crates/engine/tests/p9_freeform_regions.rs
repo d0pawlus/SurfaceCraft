@@ -391,3 +391,57 @@ fn large_primitives_with_form_error_stay_and_the_organic_surface_is_consolidated
     let regions = |v: &Value| v["regions"].as_array().unwrap().len();
     assert!(regions(&new) * 3 < regions(&old), "{} regions against {}", regions(&new), regions(&old));
 }
+
+/// A plane (waviness of `amp` mm, wavelength 20 mm: form error) that an organic surface runs into,
+/// and a cone (half angle 25 degrees, the same waviness) that it runs into, side by side; noise 0.003.
+fn plane_and_cone_with_form_error(amp: f64) -> Mesh {
+    let k = std::f64::consts::TAU / 20.0;
+    let organic = |x: f64, y: f64| 2.5 * (0.25 * x + 0.3).sin() * (0.2 * y + 1.1).sin();
+    let mut plane = sheet(120.0, 120.0, 150, |x, y| {
+        let r = (x - 60.0).hypot(y - 60.0);
+        let form = amp * (k * x).sin() * (k * y + 0.7).sin();
+        Point3::new(x, y, form + organic(x, y) * smoothstep((r - 25.0) / 10.0))
+    });
+    let cone = sheet(120.0, 120.0, 150, |x, y| {
+        let r = (x - 60.0).hypot(y - 60.0);
+        let form = amp * (k * x).sin() * (k * y + 0.7).sin();
+        let slope = 25f64.to_radians().tan() * (r.max(8.0) - 8.0).min(36.0);
+        Point3::new(200.0 + x, y, slope + form + organic(x, y) * smoothstep((r - 44.0) / 10.0))
+    });
+    plane.append(&cone);
+    synth::add_noise(&mut plane, 0.003, &mut Rng::new(6));
+    plane
+}
+
+/// A plane and a cone with a form error of 0.4 x the tolerance (waviness 0.16 mm, RMS 0.08 mm) and
+/// low scanner noise stay primitives (the share of every large region within half a point of the
+/// unconsolidated segmentation); the organic surface around them is consolidated.
+#[test]
+fn a_plane_and_a_cone_with_form_error_of_04_tolerance_stay_primitives() {
+    let mesh = plane_and_cone_with_form_error(0.16);
+    let total = mesh.triangle_count();
+    let run = |options: Value| {
+        let mut s = Session::new();
+        s.doc.add_mesh("scan", mesh.clone());
+        s.execute("region.auto_segment", json!({"mesh": "scan", "options": options})).unwrap()
+    };
+    let old = run(json!({"freeform": false}));
+    let new = run(json!({}));
+    let kinds: Vec<&str> = ["plane", "cone", "cylinder", "sphere", "torus"]
+        .into_iter()
+        .filter(|k| largest_share(&old, k, total) > 0.03)
+        .collect();
+    assert!(
+        kinds.contains(&"plane") && kinds.len() >= 2,
+        "the scene has a large plane and a large curved face: {kinds:?}"
+    );
+    for kind in kinds {
+        let (before, after) = (largest_share(&old, kind, total), largest_share(&new, kind, total));
+        eprintln!("{kind}: old {before:.4} new {after:.4}");
+        assert!(after >= before - 0.005, "the {kind} went from {before:.4} to {after:.4} of the scan: {new}");
+    }
+    assert!(
+        new["regions"].as_array().unwrap().iter().any(|r| r["freeform"] == true),
+        "the organic surface is consolidated"
+    );
+}
