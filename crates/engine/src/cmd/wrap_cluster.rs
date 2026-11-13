@@ -5,17 +5,21 @@
 //! turn a neighbouring triangle around. The result is therefore made manifold and consistently
 //! oriented, and refused (`Thin`) when it keeps too little of the surface.
 use std::collections::{BTreeMap, HashMap, HashSet};
-use surfacecraft_geom::edit::remove_non_manifold;
+use surfacecraft_geom::edit::{components, remove_non_manifold};
 use surfacecraft_geom::{Mesh, Point3};
 
 /// Bisection steps of the cell size of the clustering.
 const CLUSTER_STEPS: usize = 18;
 /// The widest cell is the diagonal of the box; the finest is this fraction of it.
 const FINEST_CELL: f64 = 1.0 / 4096.0;
-/// The clustered mesh must keep MORE than this share of the area of the mesh it was made from. It is
-/// above one half on purpose: a wall thinner than the cell merges its two sheets into one layer and
-/// keeps almost exactly half of the area, which must not pass or fail on rounding.
+/// The clustered mesh must keep MORE than this share of the area of the pieces the cells can
+/// represent (see [`lasting_area`]). It is above one half on purpose: a wall thinner than the cell
+/// merges its two sheets into one layer and keeps almost exactly half of the area, which must not
+/// pass or fail on rounding.
 pub(super) const MIN_AREA_SHARE: f64 = 0.55;
+/// A connected piece whose box diagonal is below this many cells cannot be represented by the cells
+/// (debris, small islands): losing it is the purpose of the clustering, not thinning.
+const SMALL_PIECE_CELLS: f64 = 2.0;
 /// Six times the volume below which a closed piece is taken to enclose nothing (its sign means nothing).
 const NO_VOLUME: f64 = 1e-9;
 /// ...and at least this share of the triangles the cap allows (never fewer than four).
@@ -213,9 +217,33 @@ pub(super) fn orient_consistently(mesh: &mut Mesh) {
     mesh.triangles = kept;
 }
 
+/// Diagonal of the box of the triangles `piece` of `mesh` (0 for none).
+fn piece_diagonal(mesh: &Mesh, piece: &[u32]) -> f64 {
+    let corners = piece.iter().filter_map(|&i| mesh.triangle(i as usize)).flatten();
+    let (lo, hi) = corners.fold(([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]), |(lo, hi), p| {
+        let c = [p.x, p.y, p.z];
+        (std::array::from_fn(|k| lo[k].min(c[k])), std::array::from_fn(|k| hi[k].max(c[k])))
+    });
+    let squared: f64 = lo.iter().zip(&hi).map(|(a, b)| (b - a).max(0.0).powi(2)).sum();
+    squared.sqrt()
+}
+
+/// Area of the pieces of `mesh` that cells of size `cell` can represent: the connected pieces whose
+/// box diagonal is at least [`SMALL_PIECE_CELLS`] cells. A mesh whose pieces cannot be told apart
+/// (invalid indices) counts as a whole.
+fn lasting_area(mesh: &Mesh, cell: f64) -> f64 {
+    let pieces = components(mesh);
+    if pieces.is_empty() {
+        return mesh.area();
+    }
+    let lasting = pieces.iter().filter(|piece| piece_diagonal(mesh, piece) >= SMALL_PIECE_CELLS * cell);
+    lasting.flat_map(|piece| piece.iter().map(|&i| area_of(mesh, i as usize))).sum()
+}
+
 /// The clustering of `mesh` with the finest cell that leaves at most `cap` triangles (bisection of
 /// the cell size, [`CLUSTER_STEPS`] steps). `Over` when even the widest cell leaves more; `Thin`
-/// when the result keeps less than [`MIN_AREA_SHARE`] of the area of `mesh` or fewer than
+/// when the result keeps less than [`MIN_AREA_SHARE`] of the area of the pieces of `mesh` its cells
+/// can represent, when they can represent no piece at all, or when it has fewer than
 /// [`MIN_CAP_SHARE`] of the cap (at least four) triangles.
 pub(super) fn cluster_to_cap(mesh: &Mesh, cap: usize) -> Result<Mesh, ClusterError> {
     let bbox = mesh.bbox();
@@ -224,22 +252,25 @@ pub(super) fn cluster_to_cap(mesh: &Mesh, cap: usize) -> Result<Mesh, ClusterErr
     }
     let diagonal = (bbox.max - bbox.min).norm().max(1e-9);
     let (mut fine, mut wide) = (diagonal * FINEST_CELL, diagonal);
-    let mut best =
-        Some(cluster(mesh, &bbox.min, wide)).filter(|m| m.triangle_count() <= cap).ok_or(ClusterError::Over)?;
+    let widest = Some(cluster(mesh, &bbox.min, wide)).filter(|m| m.triangle_count() <= cap);
+    let mut best = (widest.ok_or(ClusterError::Over)?, wide);
     for _ in 0..CLUSTER_STEPS {
         let mid = (fine * wide).sqrt();
         let m = cluster(mesh, &bbox.min, mid);
         if m.triangle_count() <= cap {
             wide = mid;
-            if m.triangle_count() >= best.triangle_count() {
-                best = m;
+            if m.triangle_count() >= best.0.triangle_count() {
+                best = (m, mid);
             }
         } else {
             fine = mid;
         }
     }
+    let (best, cell) = best;
     let enough = best.triangle_count() >= ((cap as f64 * MIN_CAP_SHARE) as usize).max(4);
-    if enough && best.area() >= MIN_AREA_SHARE * mesh.area() { Ok(best) } else { Err(ClusterError::Thin) }
+    let lasting = lasting_area(mesh, cell);
+    let kept = lasting > 0.0 && best.area() >= MIN_AREA_SHARE * lasting;
+    if enough && kept { Ok(best) } else { Err(ClusterError::Thin) }
 }
 
 #[cfg(test)]
@@ -373,6 +404,29 @@ mod tests {
 
         // Assert
         assert_eq!(out, Err(ClusterError::Thin));
+    }
+
+    #[test]
+    fn small_pieces_the_cells_cannot_hold_do_not_count_as_lost_surface() {
+        // Arrange: a sphere and 200 separate small triangles beside it; any cell that brings the
+        // sphere under the cap swallows the small triangles (the sphere among a thousand small
+        // shells of `wrap_cap::tests` is the case where they outweigh the sphere)
+        let mut mesh = sphere(40);
+        for i in 0..200u32 {
+            let k = mesh.positions.len() as u32;
+            let at = Point3::new(30.0 + 5.0 * f64::from(i % 20), 5.0 * f64::from(i / 20), 0.0);
+            mesh.positions.extend([at, Point3::new(at.x + 0.2, at.y, 0.0), Point3::new(at.x, at.y + 0.2, 0.0)]);
+            mesh.triangles.push([k, k + 1, k + 2]);
+        }
+        let ball = sphere(40).area();
+
+        // Act
+        let out = cluster_to_cap(&mesh, 600).expect("the sphere is kept");
+
+        // Assert: the sphere survives (most of its area), and the lost debris is not held against it
+        assert!(out.area() > 0.8 * ball && out.area() < 1.05 * ball, "{} of {ball}", out.area());
+        assert!(lasting_area(&mesh, 5.0) < ball * 1.001 && lasting_area(&mesh, 5.0) > ball * 0.999);
+        assert!((lasting_area(&mesh, 0.01) - mesh.area()).abs() < 1e-9, "every piece lasts in fine cells");
     }
 
     #[test]

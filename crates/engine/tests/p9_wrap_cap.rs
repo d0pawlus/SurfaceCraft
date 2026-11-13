@@ -208,7 +208,12 @@ fn the_smallest_caps_are_hard_bounds_too() {
 /// A sphere among a thousand small closed shells (tetrahedra of four triangles): edge collapse cannot
 /// reduce the shells, so the coarse mesh stays far over a small cap until it is clustered.
 fn sphere_with_debris() -> Mesh {
-    let mut m = synth::sphere(Point3::origin(), 10.0, 60, 30);
+    ball_with_debris(10.0)
+}
+
+/// A sphere of the given radius among the same thousand small closed shells.
+fn ball_with_debris(radius: f64) -> Mesh {
+    let mut m = synth::sphere(Point3::origin(), radius, 60, 30);
     for i in -5..=5 {
         for j in -5..=5 {
             for k in -5..=5 {
@@ -241,9 +246,23 @@ fn a_scan_whose_coarse_mesh_decimation_cannot_reduce_still_respects_the_cap_and_
 }
 
 #[test]
-fn a_cap_that_only_clustering_could_meet_by_merging_the_surface_away_is_an_error() {
-    // Arrange: the cap is so small that the cells needed would swallow the sphere as well
+fn a_small_cap_keeps_the_part_and_does_not_count_the_lost_debris_as_lost_surface() {
+    // Arrange: the debris has more area than the sphere; cells that meet the cap swallow it
     let mut s = session_with(sphere_with_debris());
+
+    // Act
+    let w = wrap(&mut s, 1500, "adaptive", TOLERANCE);
+
+    // Assert
+    assert!(patches(&w) <= 1500, "{} patches", patches(&w));
+    assert_eq!(w["clustered"], true, "{w}");
+}
+
+#[test]
+fn a_cap_that_only_clustering_could_meet_by_merging_the_surface_away_is_an_error() {
+    // Arrange: every piece (the ball too) is smaller than the cells the cap needs, so the cells can
+    // represent nothing of the scan
+    let mut s = session_with(ball_with_debris(0.4));
 
     // Act
     let r = s.execute("surface.wrap", json!({"mesh": "scan", "max_patches": 1500, "tolerance": TOLERANCE}));
