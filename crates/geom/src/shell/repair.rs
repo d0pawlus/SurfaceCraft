@@ -38,14 +38,23 @@ fn users(table: &[(u64, u32)], key: u64) -> impl Iterator<Item = u32> + '_ {
     table.get(start..).unwrap_or(&[]).iter().take_while(move |&&(k, _)| k == key).map(|&(_, t)| t)
 }
 
-/// Removes the triangles on edges with more than two triangles; returns how many.
+/// Removes the triangles on edges with more than two triangles; returns how many. One linear pass
+/// over the runs of equal edges of the sorted table.
 fn remove_non_manifold(w: &mut Work) -> usize {
     let table = edge_table(&w.triangles);
-    let bad: Vec<bool> = w
-        .triangles
-        .iter()
-        .map(|t| edges_of(t).iter().any(|&(a, b)| users(&table, undirected(a, b)).count() > 2))
-        .collect();
+    let mut bad = vec![false; w.triangles.len()];
+    let mut start = 0;
+    while let Some(&(key, _)) = table.get(start) {
+        let run = table.get(start..).map_or(0, |r| r.iter().take_while(|&&(k, _)| k == key).count());
+        if run > 2 {
+            for &(_, t) in table.get(start..start + run).unwrap_or(&[]) {
+                if let Some(b) = bad.get_mut(t as usize) {
+                    *b = true;
+                }
+            }
+        }
+        start += run.max(1);
+    }
     let before = w.triangles.len();
     let mut flags = bad.iter();
     w.triangles.retain(|_| !flags.next().copied().unwrap_or(false));

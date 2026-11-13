@@ -448,3 +448,22 @@ fn a_scan_with_inconsistent_orientation_and_a_fin_is_repaired() {
     assert!(r.report.flipped_triangles >= turned - 3 * fin_edges_removed - 10, "{:?}", r.report);
     assert!(r.report.removed_non_manifold >= 1, "{:?}", r.report);
 }
+
+#[test]
+fn a_fan_of_two_hundred_thousand_triangles_on_one_edge_is_handled_without_hanging() {
+    // Arrange: a flat panel plus 200 000 fins on one of its edges
+    let mut m = noisy_cap(0.0, 0).0;
+    let [a, b, _] = m.triangles[0];
+    for i in 0..200_000u32 {
+        m.positions.push(Point3::new(0.0, 0.0, 1.0 + f64::from(i)));
+        m.triangles.push([a, b, m.positions.len() as u32 - 1]);
+    }
+
+    // Act
+    let r = thicken(&m, &params(1.0));
+
+    // Assert: repaired, closed, and no edge with more than two triangles
+    let r = r.expect("repaired");
+    assert_closed_outward(&r.mesh);
+    assert!(r.report.removed_non_manifold >= 200_000, "{:?}", r.report);
+}
