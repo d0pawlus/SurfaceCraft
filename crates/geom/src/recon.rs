@@ -19,12 +19,12 @@
 use crate::{Aabb, KdTree, Mesh, Point3, Vec3, cloud::CloudError, cloud::PointCloud, edit};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
-use std::f64::consts::{PI, TAU};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::ops::Range;
 mod grid;
 mod normals;
 mod pivot;
+mod snap;
 #[cfg(test)]
 mod tests;
 
@@ -85,7 +85,7 @@ pub enum ReconError {
 pub struct ReconReport {
     /// Points in the input.
     pub points: usize,
-    /// Exact duplicates dropped.
+    /// Duplicates dropped (points equal after rounding to the canonical lattice of `snap`).
     pub duplicates_removed: usize,
     /// Mean nearest-neighbour spacing (mm).
     pub spacing: f64,

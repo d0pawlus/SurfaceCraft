@@ -14,13 +14,18 @@
 //! in front of it (`a = |thickness|`, `b = 0`), `symmetric` half on each side. The layer at `a` keeps
 //! the orientation of the mesh, the layer at `b` is reversed, so the result is oriented outward.
 mod assemble;
+mod crossing;
+mod feature;
 mod normals;
 mod relax;
 mod repair;
+mod selfx;
+mod strip;
 mod topology;
 
 use crate::{Aabb, Mesh, MeshError, Vec3};
-use assemble::assemble;
+use assemble::{Inputs, assemble};
+use strip::Rim;
 use topology::{Csr, Work};
 
 /// Share of the vertices that may lie on a folded triangle of the offset (before it is relaxed); more is refused.
@@ -76,6 +81,14 @@ pub struct ThickenReport {
     pub flipped_triangles: usize,
     /// Vertices whose offset was reduced to avoid a fold.
     pub clamped_vertices: usize,
+    /// Vertices of the scan moved (by at most one median edge) to remove crossings of the scan with itself.
+    /// The rim never moves; [`Thickened::scan_face`] gives the scan as it was.
+    pub repaired_vertices: usize,
+    /// The largest distance a vertex of the scan was moved by that repair (mm).
+    pub repair_largest_shift: f64,
+    /// Vertices whose offset was bounded before any fold was looked for, by the distance along the
+    /// offset direction to another part of the scan (the local feature size).
+    pub limited_vertices: usize,
     /// Largest reduction of the thickness at a vertex (mm).
     pub largest_reduction: f64,
     /// Median reduction of the thickness over the vertices that were reduced (mm; 0 when none).
@@ -92,8 +105,16 @@ pub struct ThickenReport {
     pub median_wall: f64,
     /// Triangles of the shell tested for crossing a triangle they share no vertex with (an even sample).
     pub crossing_samples: usize,
-    /// Of them, triangles that cross another: the offset sheet meets another part of the shell.
+    /// Of them, triangles that cross only triangles close to them along the scan (a fold of the offset:
+    /// neighbouring triangles, the flanks of a crease, the two sheets of a collapsed wall, the strip
+    /// along the rim). The relaxation removes these; the count is 0 unless vertices stay unresolved.
+    pub crossing_local: usize,
+    /// Of them, triangles that cross a triangle far from them along the scan: the offset sheet meets
+    /// another part of the shell (a channel or gap narrower than the wall), real geometry.
     pub crossing_triangles: usize,
+    /// Of those, the triangles the exhaustive test of the relaxation found (the count above is the larger of
+    /// this and the sampled one, so a small crossing between the strides of the sample is not lost).
+    pub crossing_far_exhaustive: usize,
 }
 
 /// A closed shell.
@@ -109,10 +130,13 @@ pub struct Thickened {
     pub scale: Vec<f64>,
     layer_vertices: usize,
     layer_triangles: usize,
+    /// For every vertex of the scan, where it was minus where the repair put it (empty: nothing moved).
+    scan_shift: Vec<Vec3>,
 }
 
 impl Thickened {
-    /// The layer the scan lies on as a mesh of its own: the scan's triangles over the vertices of
+    /// The layer the scan lies on as a mesh of its own (with the vertices where the scan had them, also
+    /// where the repair of folds moved them): the scan's triangles over the vertices of
     /// that layer, wound like the shell's outside there (so its normals face the way the shell's do,
     /// which is against the scan's normals for `thickness < 0`).
     #[must_use]
@@ -122,7 +146,11 @@ impl Thickened {
             ScanLayer::Outer => (0, 0),
             ScanLayer::Inner => (n, t),
         };
-        let positions = self.mesh.positions.get(v0..v0 + n).unwrap_or(&[]).to_vec();
+        let mut positions = self.mesh.positions.get(v0..v0 + n).unwrap_or(&[]).to_vec();
+        // the repair of folds of the scan moved vertices: the face is the scan as it was
+        for (p, d) in positions.iter_mut().zip(&self.scan_shift) {
+            *p += d;
+        }
         let triangles =
             self.mesh.triangles.get(t0..t0 + t).unwrap_or(&[]).iter().map(|tri| tri.map(|v| v - v0 as u32)).collect();
         Mesh { positions, triangles }
@@ -200,6 +228,40 @@ pub enum ThickenError {
         "the offset folds at {0} vertices that cannot be relaxed to more than a tenth of the thickness: use a smaller thickness"
     )]
     Unresolved(usize),
+    /// Too many vertices stay on a crossing of the shell that even the thinnest wall allowed does not remove.
+    #[error(
+        "{vertices} of {total} vertices ({share_percent:.2} %, more than {limit_percent:.1} % are refused) stay on a crossing of the shell that no wall down to a tenth of the thickness removes (sharp creases, folded or doubled sheets of the scan closer than a tenth of the wall): repair the scan (mesh.clean; isolate the part with scan.split) before thickening; a thinner wall helps only where the sheets are farther apart than a tenth of it"
+    )]
+    UnresolvedCrossings {
+        /// Vertices on a crossing.
+        vertices: usize,
+        /// Vertices of the scan.
+        total: usize,
+        /// Their share (percent).
+        share_percent: f64,
+        /// The share above which the call is refused (percent).
+        limit_percent: f64,
+    },
+    /// Many layers of triangles lie on top of each other: doubled or coincident sheets, not a scan.
+    #[error(
+        "about {layers} layers of triangles lie on top of each other (more than {limit}): coincident or doubled sheets, not a scan surface; keep one sheet (scan.split) before thickening"
+    )]
+    TrianglePile {
+        /// Layers in the densest spot.
+        layers: usize,
+        /// The most accepted.
+        limit: usize,
+    },
+    /// One vertex belongs to an absurd number of triangles (a fan around a hub): not a scan.
+    #[error(
+        "a vertex belongs to {triangles} triangles (more than {limit}): this is not a scan surface; clean the mesh (mesh.clean, mesh.remesh) before thickening"
+    )]
+    HubVertex {
+        /// Triangles at the vertex.
+        triangles: usize,
+        /// The most accepted.
+        limit: usize,
+    },
     /// The result is not a closed, outward-oriented surface (never expected).
     #[error("the shell could not be closed consistently ({0}): use a smaller thickness or clean the mesh")]
     NotClosed(&'static str),
@@ -259,6 +321,9 @@ pub fn thicken(mesh: &Mesh, params: &ThickenParams) -> Result<Thickened, Thicken
     if work.triangles.is_empty() {
         return Err(ThickenError::Empty);
     }
+    // after the repair (fins on one edge are removed there), before anything that looks at the fans
+    check_hubs(&work)?;
+    check_piles(&work)?;
     topology::split_pinches(&mut work);
     let sorted = topology::directed_edges(&work.triangles);
     topology::require_oriented(&sorted)?;
@@ -267,13 +332,130 @@ pub fn thicken(mesh: &Mesh, params: &ThickenParams) -> Result<Thickened, Thicken
         return Err(ThickenError::Closed);
     }
     let adjacent = topology::adjacency(work.positions.len(), &sorted);
+    repair_scan(&mut work, &adjacent, &boundary);
     let radius = (SMOOTHING_SHARE * params.thickness.abs()).max(mean_edge(&work));
-    let normals = normals::smoothed(&work.positions, &work.triangles, radius).ok_or(ThickenError::NoNormals)?;
+    let normals =
+        normals::smoothed(&work.positions, &work.triangles, &boundary, radius).ok_or(ThickenError::NoNormals)?;
     let (a, b) = layer_offsets(params);
-    let (scale, folded, unresolved) =
-        fold_free_scale(&work, &normals, &adjacent, &boundary, &[a, b], params.thickness)?;
-    (work.folded, work.unresolved) = (folded, unresolved);
-    assemble(&work, &normals, &scale, (a, b), &boundary, params)
+    let rim = make_rim(&work, &boundary, params)?;
+    let edge = median_edge(&work);
+    let relaxed = fold_free_scale(&work, &normals, &adjacent, &boundary, &rim, &[a, b], params.thickness)?;
+    (work.folded, work.unresolved) = (relaxed.folded, relaxed.unresolved);
+    let inputs = Inputs {
+        normals: &relaxed.normals,
+        scale: &relaxed.scale,
+        offsets: (a, b),
+        boundary: &boundary,
+        rim: &rim,
+        adjacent: &adjacent,
+        edge,
+        size: Aabb::from_points(&work.positions).diagonal(),
+        limited: relaxed.limited,
+        far: relaxed.far,
+    };
+    assemble(&work, &inputs, params)
+}
+
+/// Smooths the scan where it crosses itself (not at the rim) and keeps where the vertices were.
+fn repair_scan(work: &mut Work, adjacent: &Csr, boundary: &[(u32, u32)]) {
+    let mut rim = vec![false; work.positions.len()];
+    for &(a, b) in boundary {
+        for v in [a, b] {
+            if let Some(slot) = rim.get_mut(v as usize) {
+                *slot = true;
+            }
+        }
+    }
+    let original = work.positions.clone();
+    let scan_edge = median_edge(work);
+    let repair = selfx::smooth_scan_crossings(work, adjacent, scan_edge, &rim);
+    (work.repaired, work.repair_shift) = (repair.vertices, repair.largest_shift);
+    if repair.vertices > 0 {
+        work.shift = original.iter().zip(&work.positions).map(|(o, p)| o - p).collect();
+    }
+}
+
+/// A vertex belongs to at most this many triangles (a scan has a few dozen; a hub of a hundred thousand
+/// would cost the neighbourhood searches the square of that).
+pub const MAX_VERTEX_TRIANGLES: usize = 4_096;
+
+/// Refuses a mesh with a vertex on more than [`MAX_VERTEX_TRIANGLES`] triangles.
+fn check_hubs(work: &Work) -> Result<(), ThickenError> {
+    let mut count = vec![0usize; work.positions.len()];
+    for t in &work.triangles {
+        for &v in t {
+            if let Some(c) = count.get_mut(v as usize) {
+                *c += 1;
+            }
+        }
+    }
+    match count.into_iter().max() {
+        Some(triangles) if triangles > MAX_VERTEX_TRIANGLES => {
+            Err(ThickenError::HubVertex { triangles, limit: MAX_VERTEX_TRIANGLES })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Layers of triangles on top of each other (the summed area of the triangles with their centres in one
+/// cell, in cell areas) above which the mesh is refused. A surface through a cell holds about one layer
+/// (more where it is steep or folded); a pile of coincident or doubled sheets holds as many as there are
+/// sheets. How fine the mesh is does not matter: a triangle counts at most one cell area.
+pub const MAX_LAYERS: f64 = 32.0;
+
+/// Refuses a mesh with more than [`MAX_LAYERS`] layers of triangles in one cell of a quarter of the
+/// median edge: coincident or doubled sheets, which no test could sort out (a triangle would overlap
+/// thousands of others).
+fn check_piles(work: &Work) -> Result<(), ThickenError> {
+    let cell = 0.25 * median_edge(work);
+    if !(cell > 0.0) {
+        return Ok(());
+    }
+    let mut layers: std::collections::HashMap<(i64, i64, i64), f64> = std::collections::HashMap::new();
+    for t in &work.triangles {
+        let (Some(a), Some(b), Some(c)) =
+            (work.positions.get(t[0] as usize), work.positions.get(t[1] as usize), work.positions.get(t[2] as usize))
+        else {
+            continue;
+        };
+        let g = (a.coords + b.coords + c.coords) / 3.0;
+        let share = ((b - a).cross(&(c - a)).norm() / 2.0 / (cell * cell)).min(1.0);
+        let key = ((g.x / cell).floor() as i64, (g.y / cell).floor() as i64, (g.z / cell).floor() as i64);
+        *layers.entry(key).or_default() += share;
+    }
+    let most = layers.into_values().fold(0.0, f64::max);
+    if most > MAX_LAYERS {
+        Err(ThickenError::TrianglePile { layers: most as usize, limit: MAX_LAYERS as usize })
+    } else {
+        Ok(())
+    }
+}
+
+/// The ids of the strip along the rim; the shell must be indexable with 32 bits.
+fn make_rim(work: &Work, boundary: &[(u32, u32)], params: &ThickenParams) -> Result<Rim, ThickenError> {
+    let n = work.positions.len();
+    let rows = strip::strip_rows(params.thickness, strip::mean_rim_edge(&work.positions, boundary), boundary.len());
+    let total = 2 * n + rows.saturating_sub(1) * boundary.len();
+    match u32::try_from(n).ok().filter(|_| u32::try_from(total).is_ok()) {
+        Some(n32) => Ok(Rim::new(n32, rows, boundary)),
+        None => Err(ThickenError::Invalid(MeshError::TooManyVertices(total))),
+    }
+}
+
+/// Median length of the edges of the triangles (mm; robust against a few huge triangles).
+fn median_edge(work: &Work) -> f64 {
+    let mut lengths: Vec<f64> = work
+        .triangles
+        .iter()
+        .flat_map(|t| [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])])
+        .filter_map(|(a, b)| Some((work.positions.get(a as usize)? - work.positions.get(b as usize)?).norm()))
+        .collect();
+    if lengths.is_empty() {
+        return 0.0;
+    }
+    let mid = lengths.len() / 2;
+    let (_, m, _) = lengths.select_nth_unstable_by(mid, f64::total_cmp);
+    *m
 }
 
 /// Mean length of the edges of the triangles (mm).
@@ -296,9 +478,10 @@ fn fold_free_scale(
     normals: &[Vec3],
     adjacent: &Csr,
     boundary: &[(u32, u32)],
+    rim: &Rim,
     offsets: &[f64; 2],
     thickness: f64,
-) -> Result<(Vec<f64>, usize, usize), ThickenError> {
+) -> Result<relax::Relaxed, ThickenError> {
     let pairs: Vec<(u32, u32)> =
         work.triangles.iter().enumerate().flat_map(|(i, t)| t.iter().map(move |&v| (v, i as u32))).collect();
     let around = Csr::from_pairs(work.positions.len(), &pairs);
@@ -312,27 +495,35 @@ fn fold_free_scale(
         around: &around,
         adjacent,
         thickness: thickness.abs(),
-        edge: mean_edge(work),
+        edge: median_edge(work),
+        size: Aabb::from_points(&work.positions).diagonal(),
         boundary,
+        rim,
     };
     let relaxed = relax::relax(&field).map_err(ThickenError::Unresolved)?;
     if relaxed.unresolved as f64 > MAX_UNRESOLVED_SHARE * relaxed.scale.len() as f64 {
-        return Err(ThickenError::Unresolved(relaxed.unresolved));
+        let total = relaxed.scale.len();
+        let share = relaxed.unresolved as f64 / total.max(1) as f64;
+        return Err(ThickenError::UnresolvedCrossings {
+            vertices: relaxed.unresolved,
+            total,
+            share_percent: 100.0 * share,
+            limit_percent: 100.0 * MAX_UNRESOLVED_SHARE,
+        });
     }
-    let scale = relaxed.scale;
-    let vertices = scale.len();
+    let vertices = relaxed.scale.len();
     if relaxed.folded as f64 > MAX_CLAMPED_SHARE * vertices as f64 {
-        let smallest = scale.iter().copied().fold(1.0, f64::min);
+        let smallest = relaxed.scale.iter().copied().fold(1.0, f64::min);
         return Err(ThickenError::Folds {
             thickness,
             share_percent: 100.0 * relaxed.folded as f64 / vertices as f64,
             clamped: relaxed.folded,
             vertices,
             largest: thickness.abs() * (1.0 - smallest),
-            suggested: thickness.abs() * quantile_scale(&scale),
+            suggested: thickness.abs() * quantile_scale(&relaxed.scale),
         });
     }
-    Ok((scale, relaxed.folded, relaxed.unresolved))
+    Ok(relaxed)
 }
 
 /// The scale below which a share [`MAX_CLAMPED_SHARE`] of the vertices lies (1 when empty).
