@@ -17,9 +17,13 @@
 //!
 //! Memory is bounded and checked before it is spent: eight bytes per ray crossing
 //! ([`Limits::max_crossings`]), four bytes per grid column plus eight per run ([`Limits::max_columns`]),
-//! and about 60 bytes per surface quad ([`Limits::max_quads`]). A scan of 1 million triangles and
-//! 300 mm at 0.3 mm voxels has about 1.1 million columns, 3 million crossings and 1.5 million quads: roughly
-//! 24 MB for the crossings plus 4.4 MB of column index, 90 MB for the quads: never a dense grid of 10^9 voxels.
+//! and about 60 bytes per surface quad while it is built ([`Limits::max_quads`]; quads grow with
+//! area / voxel², not with the triangles of the scan). Measured on a synthetic scan of 998 000
+//! triangles, 300 mm across, 285 000 mm² of surface, at the default voxel of 0.3 mm: grid 1012 x 1014 x
+//! 1022 cells (a dense grid would be 10^9 voxels), 1.6 million crossings, 4.7 million quads (9.5 million
+//! triangles out), 83 s on a loaded machine, peak resident memory of the process 3.4 GB (the scan, its
+//! tree and BVH, the voxel stage of about 0.3 GB and the result); [`RemeshReport::peak_bytes`] estimates the
+//! voxel stage only.
 mod fit;
 mod occupancy;
 mod raster;
@@ -287,7 +291,7 @@ pub struct RemeshReport {
     pub genus_after: Vec<Option<usize>>,
     /// Non-manifold edges of the input.
     pub non_manifold_before: usize,
-    /// Peak bytes the large buffers needed (estimate: crossings, column index, runs and quads).
+    /// Bytes of the voxel stage (crossings, column index, runs and quads); not the whole process.
     pub peak_bytes: usize,
     /// Original vertices to the remeshed surface.
     pub original_to_result: Deviation,

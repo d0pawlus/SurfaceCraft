@@ -118,11 +118,10 @@ pub(super) fn split_parts(
         return Ok(None);
     }
     let Some(mesh) = mesh_of(s, set.scan) else { return Ok(None) };
-    let a = scan_split::analyse(&mesh, MIN_SHARE, false);
+    let a = scan_split::analyse(&mesh, MIN_SHARE, true);
     if a.parts.len() < 2 {
         return Ok(None);
     }
-    let a = scan_split::analyse(&mesh, MIN_SHARE, true);
     let distinct = a.distinct();
     if distinct.len() < 2 {
         return Ok(None);
@@ -170,12 +169,20 @@ fn run_part(
         ..i.clone()
     };
     let triangles = mesh_of(s, id).map_or(0, |m| m.triangle_count());
-    let run = settings(s, &part_in)
-        .and_then(|pset| prepare(s, &part_in, pset.scan).and_then(|r| solve(s, &part_in, pset, r)));
-    let out = match run {
-        Ok(o) => o,
-        Err(e) => failure(set, id, message_of(&e)),
-    };
+    let mut out = model_part(s, &part_in, set, id);
+    if i.method == Method::Auto && out.verdict == Verdict::Fail && out.body.is_none() {
+        // the primitives found no closed solid in this part: model it as freeform instead
+        let again = model_part(s, &ToSolidIn { method: Method::Freeform, ..part_in.clone() }, set, id);
+        if again.body.is_some() {
+            let step = PrepStep {
+                step: "freeform_fallback".into(),
+                reason: "the primitives built no solid for this part, so it was wrapped in patches".into(),
+                numbers: json!({"primitive_issues": out.issues.iter().map(|x| x.code.clone()).collect::<Vec<_>>()}),
+            };
+            out = again;
+            out.preparation.insert(0, step);
+        }
+    }
     let comp = ComponentOut {
         mesh: id,
         name: name.to_string(),
@@ -189,6 +196,13 @@ fn run_part(
         preparation: out.preparation.clone(),
     };
     (comp, out)
+}
+
+/// One run of the single-scan pipeline on a part; an error becomes a failed result.
+fn model_part(s: &mut Session, part_in: &ToSolidIn, set: &Settings, id: ObjectId) -> ToSolidOut {
+    let run =
+        settings(s, part_in).and_then(|pset| prepare(s, part_in, pset.scan).and_then(|r| solve(s, part_in, pset, r)));
+    run.unwrap_or_else(|e| failure(set, id, message_of(&e)))
 }
 
 fn failure(set: &Settings, id: ObjectId, why: &str) -> ToSolidOut {

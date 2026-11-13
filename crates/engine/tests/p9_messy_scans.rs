@@ -442,3 +442,34 @@ fn gate_a_thousand_handles_stall_the_wrap_and_the_rebuild_cures_it() {
     let v = t["body"]["volume"].as_f64().unwrap();
     assert!((v - blob_volume()).abs() / blob_volume() < 0.005, "volume {v}");
 }
+
+/// Footprint of `mesh.remesh` on a scan of about a million triangles and 300 mm at the default voxel:
+/// run it alone under `/usr/bin/time -l` to read the peak memory of the process.
+#[test]
+#[ignore = "measurement: run alone under /usr/bin/time -l"]
+fn measure_remesh_footprint_of_a_million_triangles() {
+    let mut m = weld(synth::sphere(Point3::origin(), 1.0, 1000, 500));
+    for p in &mut m.positions {
+        let d = p.coords;
+        p.coords = d * 150.0 * (1.0 + 0.05 * (3.0 * d.x).sin() * (2.0 * d.y).cos());
+    }
+    synth::add_noise(&mut m, 0.03, &mut Rng::new(2));
+    eprintln!("scan: {} triangles, extent {:?}, area {:.0} mm2", m.triangle_count(), m.bbox().size(), m.area());
+    let mut s = session_with("scan", m);
+    let started = std::time::Instant::now();
+    let r = s.execute("mesh.remesh", json!({"object": "scan"}));
+    match r {
+        Ok(r) => eprintln!(
+            "remesh in {:.1} s: voxel {} grid {} crossings {} triangles {} estimated peak {} MB deviation to scan p99 {} max {}",
+            started.elapsed().as_secs_f64(),
+            r["voxel"],
+            r["grid"],
+            r["crossings"],
+            r["triangles"],
+            r["peak_bytes"].as_u64().unwrap_or(0) / 1_000_000,
+            r["original_to_result"]["p99"],
+            r["original_to_result"]["max"]
+        ),
+        Err(e) => eprintln!("refused: {e}"),
+    }
+}

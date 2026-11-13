@@ -90,7 +90,7 @@ pub struct RemeshOut {
     pub genus_after: Vec<Option<usize>>,
     /// Non-manifold edges of the scan.
     pub non_manifold_before: usize,
-    /// Estimated peak bytes of the large buffers.
+    /// Bytes of the voxel stage (not the whole process).
     pub peak_bytes: usize,
     /// Scan vertices to the new surface.
     pub original_to_result: DeviationFigures,
