@@ -213,15 +213,47 @@ fn from_curves_ngon_patch_fills_triangle_and_pentagon() {
     assert!(r["warning"].as_str().unwrap().contains("single trimmed patches"), "{r}");
 }
 
+/// The default of `ngon` is the old behaviour, pinned against what `surface.from_curves` gave before
+/// the option existed (and still gives under `split`): one Bézier patch per four-sided region, a
+/// closed network with a solid, no trimmed patches. (`gate_p8_h9_from_curves_ngon_regions` in
+/// `curves_ngon.rs` and `gate_p4` in `organic.rs` pin the same default on the n-sided cube and on a
+/// box: closed, a solid, volume within 0.1 % / 1 %.)
 #[test]
-fn from_curves_default_is_split() {
-    let mut s = scan_session();
-    let default = s.execute("surface.from_curves", json!({"mesh": "scan", "angle": ANGLE, "name": "a"})).unwrap();
-    let split = s
-        .execute("surface.from_curves", json!({"mesh": "scan", "angle": ANGLE, "ngon": "split", "name": "b"}))
-        .unwrap();
-    assert!(default["trimmed_patches"].is_null() && default["side_gap_max_mm"].is_null(), "{default}");
-    assert_eq!(without_ids(default), without_ids(split));
+fn from_curves_default_keeps_the_old_closed_network() {
+    let mut s = cube_session();
+    let r = s.execute("surface.from_curves", json!({"mesh": "cube", "min_triangles": 4, "degree": 3})).unwrap();
+    assert_eq!(r["patches"], 6, "{r}");
+    assert_eq!(r["curves"], 12, "{r}");
+    assert_eq!(r["closed"], true, "{r}");
+    assert!(r["solid"].as_u64().is_some(), "{r}");
+    assert!(r["trimmed_patches"].is_null() && r["side_gap_max_mm"].is_null(), "{r}");
+    assert!(r["volume"].as_f64().unwrap() > 0.0, "{r}");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_cancelled_from_curves_with_patches_adds_nothing() {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use surfacecraft_engine::{EngineError, Job, JobPoll, cmd};
+    let s = scan_session();
+    let before = s.doc.surfaces.len();
+    let params = json!({"mesh": "scan", "angle": ANGLE, "ngon": "patch"});
+    let job = Job::start(&s, "surface.from_curves", Arc::new(params)).unwrap();
+    job.cancel();
+    let started = Instant::now();
+    let done = loop {
+        match job.poll() {
+            JobPoll::Finished(d) => break *d,
+            JobPoll::Lost => panic!("the job was lost"),
+            JobPoll::Running => {
+                assert!(started.elapsed() < Duration::from_secs(300));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    };
+    assert_eq!(done.result, Err(EngineError::Failed(cmd::CANCELLED.into())));
+    assert_eq!(done.session.doc.surfaces.len(), before, "a cancelled command is rolled back");
 }
 
 #[test]

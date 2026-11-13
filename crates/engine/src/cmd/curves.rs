@@ -195,15 +195,46 @@ fn separate_sheets_note(count: usize) -> String {
     )
 }
 
-fn from_curves(s: &mut Session, i: FromCurvesIn) -> CmdResult<FromCurvesOut> {
-    let (mesh, region) = match (&i.region, &i.mesh) {
+/// The mesh and the region (when given) the command works on.
+fn source_mesh(s: &Session, i: &FromCurvesIn) -> CmdResult<(ObjectId, Option<ObjectId>)> {
+    match (&i.region, &i.mesh) {
         (Some(r), None) => {
             let rid = r.resolve(s, ObjectKind::Region)?;
-            (s.doc.region(rid).map(|r| r.mesh).ok_or_else(|| CmdError::Params("no region".into()))?, Some(rid))
+            let mesh = s.doc.region(rid).map(|r| r.mesh).ok_or_else(|| CmdError::Params("no region".into()))?;
+            Ok((mesh, Some(rid)))
         }
-        (None, Some(m)) => (m.resolve(s, ObjectKind::Mesh)?, None),
-        _ => return Err(CmdError::Params("give `region` or `mesh`".into())),
-    };
+        (None, Some(m)) => Ok((m.resolve(s, ObjectKind::Mesh)?, None)),
+        _ => Err(CmdError::Params("give `region` or `mesh`".into())),
+    }
+}
+
+/// The notes of the result, joined with `; `: the deviation, skipped regions, unmeasured patches
+/// and the separate sheets of trimmed patches.
+fn result_warning(
+    within: bool,
+    max: f64,
+    tol: f64,
+    skipped: &[String],
+    unmeasured: &[String],
+    trimmed: usize,
+) -> Option<String> {
+    let mut notes: Vec<String> = Vec::new();
+    if !within {
+        notes.push(format!("max deviation {max:.4} mm exceeds {tol} mm: raise `degree` or check the edge angle"));
+    } else if !skipped.is_empty() {
+        notes.push(format!("{} region(s) skipped (see `skipped` for the reason)", skipped.len()));
+    }
+    if !unmeasured.is_empty() {
+        notes.push(format!("not within tolerance, nothing was measured: {}", unmeasured.join("; ")));
+    }
+    if trimmed > 0 {
+        notes.push(separate_sheets_note(trimmed));
+    }
+    (!notes.is_empty()).then(|| notes.join("; "))
+}
+
+fn from_curves(s: &mut Session, i: FromCurvesIn) -> CmdResult<FromCurvesOut> {
+    let (mesh, region) = source_mesh(s, &i)?;
     let tol = i.tolerance.unwrap_or(0.2);
     if !(tol.is_finite() && tol > 0.0) {
         return Err(CmdError::Params("tolerance must be positive".into()));
@@ -247,7 +278,7 @@ fn from_curves(s: &mut Session, i: FromCurvesIn) -> CmdResult<FromCurvesOut> {
         Some(bezier_part(s, &m, &net, &target)?)
     };
     let NgonFit { patches: trimmed, skipped: ngon_skipped, unmeasured, sq: ngon_sq, max: ngon_max, count: ngon_count } =
-        fit_regions(s, &net.ngons, &Target { name: &name, region, tolerance: tol });
+        fit_regions(s, &net.ngons, &Target { name: &name, region, tolerance: tol })?;
     let Some(surface) = bezier.as_ref().map(|b| b.surface).or_else(|| trimmed.first().map(|p| p.surface)) else {
         let reasons: Vec<&str> = net.skipped.iter().chain(ngon_skipped.iter()).map(String::as_str).collect();
         return Err(CmdError::Failed(format!("no region could be turned into a patch: {}", reasons.join("; "))));
@@ -260,27 +291,7 @@ fn from_curves(s: &mut Session, i: FromCurvesIn) -> CmdResult<FromCurvesOut> {
     let mut skipped = net.skipped;
     skipped.extend(ngon_skipped);
     let within = max <= tol;
-    let mut warning = if !within {
-        Some(format!("max deviation {max:.4} mm exceeds {tol} mm: raise `degree` or check the edge angle"))
-    } else if !skipped.is_empty() {
-        Some(format!("{} region(s) skipped (see `skipped` for the reason)", skipped.len()))
-    } else {
-        None
-    };
-    if !unmeasured.is_empty() {
-        let note = format!("not within tolerance, nothing was measured: {}", unmeasured.join("; "));
-        warning = Some(match warning {
-            Some(w) => format!("{w}; {note}"),
-            None => note,
-        });
-    }
-    if !trimmed.is_empty() {
-        let note = separate_sheets_note(trimmed.len());
-        warning = Some(match warning {
-            Some(w) => format!("{w}; {note}"),
-            None => note,
-        });
-    }
+    let warning = result_warning(within, max, tol, &skipped, &unmeasured, trimmed.len());
     let side_gap_max_mm = trimmed.iter().map(|p| p.side_gap_max_mm).reduce(f64::max);
     Ok(FromCurvesOut {
         surface,

@@ -16,7 +16,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use surfacecraft_doc::{ObjectId, SurfaceObject};
-use surfacecraft_kernel::patch_fit::{Conflicts, Continuity, Patch, Request, Side, fit_patch};
+use surfacecraft_kernel::patch_fit::{Conflicts, Continuity, Patch, Request, Side, fit_patch_cancellable};
+use surfacecraft_kernel::KernelError;
 use surfacecraft_kernel::tess::tessellate_all;
 use surfacecraft_kernel::vpatch::{DEGREE, MAX_CONTROL, MIN_CONTROL};
 
@@ -165,9 +166,11 @@ pub struct PatchIn {
 pub struct SideOut {
     /// Index of the side in the request's `sides` (the report lists the sides in loop order).
     pub side: usize,
-    /// Continuity asked for.
+    /// Continuity asked for (not what was achieved: see `met`).
     pub continuity: ContinuityIn,
-    /// Largest distance from the side to the patch, measured densely (mm).
+    /// The side meets its targets: gap 1e-3 mm and, for g1/g2, angle 0.05 degrees, curvature 5 % and no fold. Always true for a soft side, which has none. A warning names the target that was missed.
+    pub met: bool,
+    /// Largest distance from the side to the patch, measured densely (mm). For a g1/g2 side the side's points are first moved onto the reference face (`snap_max_mm`), and the gap is measured against those points.
     pub gap_max_mm: f64,
     /// Largest angle between the neighbouring face's normal and the patch's along the side (degrees), G1/G2.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -220,8 +223,14 @@ pub struct PatchOut {
     pub outside: usize,
     /// The data's largest distance is within `tolerance`.
     pub within_tolerance: bool,
-    /// Every side within its targets (gap 1e-3 mm, angle 0.05 degrees, curvature 5 %), nothing folded, no corner relaxed.
+    /// Every hard side within its targets (gap 1e-3 mm, angle 0.05 degrees, curvature 5 %), interior points and curves on the patch, nothing folded, the hard conditions not contradicting each other, the data within `tolerance` (`within_tolerance`) and no corner relaxed.
     pub within_targets: bool,
+    /// The patch folds: back over a neighbouring face along a side, or over itself inside the outline.
+    pub folded: bool,
+    /// The control net stopped growing because the solve of the next net exceeds the cost bound (about 8 s per solve); the result is that of the net reached (a warning says which).
+    pub cost_limited: bool,
+    /// Largest miss of a hard condition after the solve, as the control point motion that would satisfy it (mm): about 0 when consistent, the size of the contradiction otherwise.
+    pub hard_residual_mm: f64,
     /// How (u, v) were found: `flattened` (the region's mesh) or `plane` (best-fit plane of the outline).
     pub parameters: String,
     /// One entry per side, in loop order.
@@ -289,21 +298,23 @@ fn interior_points(points: &[PointIn]) -> CmdResult<(Vec<[f64; 3]>, Vec<([f64; 3
     Ok((hard, soft))
 }
 
-fn patch_cmd(s: &mut Session, i: PatchIn) -> CmdResult<PatchOut> {
-    let st = settings(&i)?;
-    let (hard_points, soft_points) = interior_points(&i.points)?;
-    let resolved = sides::resolve(s, &i.sides)?;
-    let (outline, mut warnings) = sides::chain(resolved, st.gap_tolerance)?;
-    let scan = data::resolve_scan(s, &i)?;
-    let got = data::gather(scan.as_ref(), &outline, st.gap_tolerance, MAX_DATA, &mut warnings);
+/// Notes on what the request gave that has no effect: a `face` on a g0 side.
+fn ignored_inputs(sides: &[SideIn]) -> Vec<String> {
+    sides
+        .iter()
+        .enumerate()
+        .filter(|(_, sd)| sd.face.is_some() && matches!(sd.continuity, None | Some(ContinuityIn::G0)))
+        .map(|(k, _)| format!("side {k}: `face` is ignored for a g0 side (give continuity g1 or g2 to continue it)"))
+        .collect()
+}
 
-    let order: Vec<usize> = outline.iter().map(|r| r.index).collect();
-    let kernel_sides: Vec<Side> = outline
+/// The kernel's sides, in loop order: a body edge is densified, a polyline goes as given.
+fn kernel_sides(outline: Vec<sides::Resolved>, got: &data::Gathered) -> Vec<Side> {
+    outline
         .into_iter()
         .enumerate()
         .map(|(k, r)| {
             let given_uv = got.side_uv.as_ref().and_then(|all| all.get(k));
-            // a body edge is a dense tessellation and is densified as before; a polyline goes as given
             let (points, uv) = if r.from_edge {
                 sides::densify(&r.points, given_uv.map(Vec::as_slice))
             } else {
@@ -311,10 +322,41 @@ fn patch_cmd(s: &mut Session, i: PatchIn) -> CmdResult<PatchOut> {
             };
             Side { points, continuity: r.continuity, reference: r.reference, uv, soft: r.soft }
         })
-        .collect();
+        .collect()
+}
+
+fn side_outs(report: &surfacecraft_kernel::patch_fit::Report, order: &[usize]) -> Vec<SideOut> {
+    report
+        .sides
+        .iter()
+        .zip(order)
+        .map(|(r, &side)| SideOut {
+            side,
+            continuity: ContinuityIn::from_kernel(r.continuity),
+            met: r.met,
+            gap_max_mm: r.gap_max,
+            angle_max_deg: r.angle_max_deg,
+            curvature_error_max: r.curvature_error_max,
+            samples: r.samples,
+            folded: r.folded,
+            soft: r.soft,
+            snap_max_mm: r.snap_max,
+        })
+        .collect()
+}
+
+fn patch_cmd(s: &mut Session, i: PatchIn) -> CmdResult<PatchOut> {
+    let st = settings(&i)?;
+    let (hard_points, soft_points) = interior_points(&i.points)?;
+    let resolved = sides::resolve(s, &i.sides)?;
+    let (outline, mut warnings) = sides::chain(resolved, st.gap_tolerance)?;
+    warnings.extend(ignored_inputs(&i.sides));
+    let scan = data::resolve_scan(s, &i)?;
+    let got = data::gather(scan.as_ref(), &outline, st.gap_tolerance, MAX_DATA, &mut warnings);
+    let order: Vec<usize> = outline.iter().map(|r| r.index).collect();
     let parameters = if got.side_uv.is_some() { "flattened" } else { "plane" };
     let request = Request {
-        sides: kernel_sides,
+        sides: kernel_sides(outline, &got),
         data: got.data,
         data_uv: got.data_uv,
         hard_points,
@@ -328,8 +370,12 @@ fn patch_cmd(s: &mut Session, i: PatchIn) -> CmdResult<PatchOut> {
             ConflictsIn::Relax => Conflicts::Relax,
             ConflictsIn::Fail => Conflicts::Fail,
         },
+        side_ids: order.clone(),
     };
-    let Patch { sheet, report, .. } = fit_patch(&request)?;
+    let Patch { sheet, report, .. } = fit_patch_cancellable(&request, &s.cancel).map_err(|e| match e {
+        KernelError::Cancelled => super::cancelled(),
+        other => other.into(),
+    })?;
 
     let display = tessellate_all(&sheet, None)?;
     let id = s.doc.add_surface(SurfaceObject {
@@ -345,6 +391,7 @@ fn patch_cmd(s: &mut Session, i: PatchIn) -> CmdResult<PatchOut> {
         parent: None,
         visible: true,
     });
+    let sides_out = side_outs(&report, &order);
     warnings.extend(report.warnings);
     Ok(PatchOut {
         surface: id,
@@ -358,23 +405,11 @@ fn patch_cmd(s: &mut Session, i: PatchIn) -> CmdResult<PatchOut> {
         outside: report.outside,
         within_tolerance: report.within_tolerance,
         within_targets: report.within_targets,
+        folded: report.folded,
+        cost_limited: report.cost_limited,
+        hard_residual_mm: report.hard_residual,
         parameters: parameters.into(),
-        sides: report
-            .sides
-            .iter()
-            .zip(order)
-            .map(|(r, side)| SideOut {
-                side,
-                continuity: ContinuityIn::from_kernel(r.continuity),
-                gap_max_mm: r.gap_max,
-                angle_max_deg: r.angle_max_deg,
-                curvature_error_max: r.curvature_error_max,
-                samples: r.samples,
-                folded: r.folded,
-                soft: r.soft,
-                snap_max_mm: r.snap_max,
-            })
-            .collect(),
+        sides: sides_out,
         corners: report
             .corners
             .iter()

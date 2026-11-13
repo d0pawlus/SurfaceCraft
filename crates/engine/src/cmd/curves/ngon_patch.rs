@@ -1,13 +1,16 @@
 //! `surface.from_curves` with `ngon: "patch"`: every region that is not four-sided is fitted as
 //! one trimmed patch by `kernel::patch_fit::fit_patch`. Its sides are the shared feature curves the
 //! four-sided neighbours use (G0, no reference face), its data are the region's vertices.
+use super::super::{CmdError, cancelled};
 use crate::Session;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use surfacecraft_doc::{ObjectId, SurfaceObject};
 use surfacecraft_fit::features::NgonRegion;
-use surfacecraft_kernel::patch_fit::{Conflicts, Continuity, Patch, Request, Side, fit_patch};
+use surfacecraft_kernel::patch_fit::{Conflicts, Continuity, Patch, Request, Side, fit_patch_cancellable};
+use surfacecraft_geom::Cancel;
+use surfacecraft_kernel::KernelError;
 use surfacecraft_kernel::tess::tessellate_all;
 use surfacecraft_kernel::vpatch::DEGREE;
 
@@ -92,24 +95,35 @@ fn request(rg: &NgonRegion, tolerance: f64) -> Request {
         control: None,
         max_control: MAX_CONTROL,
         conflicts: Conflicts::Relax,
+        side_ids: Vec::new(),
     }
 }
 
 /// Fits `rg` and returns the patch with its display mesh.
-fn fit_region(rg: &NgonRegion, tolerance: f64) -> Result<(Patch, surfacecraft_geom::Mesh), String> {
-    let patch = fit_patch(&request(rg, tolerance)).map_err(|e| e.to_string())?;
-    let display = tessellate_all(&patch.sheet, None).map_err(|e| e.to_string())?;
+fn fit_region(rg: &NgonRegion, tolerance: f64, cancel: &Cancel) -> Result<(Patch, surfacecraft_geom::Mesh), FitFail> {
+    let patch = fit_patch_cancellable(&request(rg, tolerance), cancel).map_err(|e| match e {
+        KernelError::Cancelled => FitFail::Cancelled,
+        other => FitFail::Failed(other.to_string()),
+    })?;
+    let display = tessellate_all(&patch.sheet, None).map_err(|e| FitFail::Failed(e.to_string()))?;
     Ok((patch, display))
+}
+
+/// Why a region was not fitted: the call was cancelled (it ends), or the fit failed (the region is skipped).
+enum FitFail {
+    Cancelled,
+    Failed(String),
 }
 
 /// Fits every region as one trimmed patch and adds each as its own surface object. A region that
 /// cannot be fitted is listed in `skipped` with the error text; the others are still made.
-pub(super) fn fit_regions(s: &mut Session, regions: &[NgonRegion], target: &Target<'_>) -> NgonFit {
+pub(super) fn fit_regions(s: &mut Session, regions: &[NgonRegion], target: &Target<'_>) -> Result<NgonFit, CmdError> {
     let mut out = NgonFit::default();
     for rg in regions {
-        let (patch, display) = match fit_region(rg, target.tolerance) {
+        let (patch, display) = match fit_region(rg, target.tolerance, &s.cancel) {
             Ok(x) => x,
-            Err(e) => {
+            Err(FitFail::Cancelled) => return Err(cancelled()),
+            Err(FitFail::Failed(e)) => {
                 out.skipped.push(format!(
                     "region of {} triangles with {} corners: {e}",
                     rg.triangles.len(),
@@ -162,5 +176,5 @@ pub(super) fn fit_regions(s: &mut Session, regions: &[NgonRegion], target: &Targ
             warnings,
         });
     }
-    out
+    Ok(out)
 }
