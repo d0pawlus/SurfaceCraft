@@ -27,11 +27,69 @@ fn to_records(breps: Vec<solidcore::topology::Brep>) -> Result<Vec<Brep>> {
 }
 
 /// Every body of a STEP file, as records.
+///
+/// A sheet this application wrote ([`FILE_MARK`] in the header) of [`OWN_SHEET_FACES`] faces or
+/// more is built from the topology the file states (every edge and vertex shared as the writer
+/// shared them) instead of being stitched by geometry, which takes time quadratic in the faces
+/// (80 s at 4 000 patches, measured). Anything else, and any such sheet whose topology build does
+/// not give every face, goes the importer's way.
 pub fn import(text: &[u8]) -> Result<Vec<Brep>> {
+    check_size(text)?;
+    let breps = if is_own_file(text) {
+        import_own(text)?
+    } else {
+        step_brep::import(text, &Default::default()).map_err(|e| op_err("step_brep::import", format!("{e:?}")))?
+    };
+    to_records(breps)
+}
+
+/// [`import`] with every body stitched by geometry, as the importer does by default: the reference
+/// of the faster build of this application's own sheets.
+pub fn import_stitched(text: &[u8]) -> Result<Vec<Brep>> {
     check_size(text)?;
     let breps =
         step_brep::import(text, &Default::default()).map_err(|e| op_err("step_brep::import", format!("{e:?}")))?;
     to_records(breps)
+}
+
+/// What the file header of this application's writer says in its originating-system fields.
+const FILE_MARK: &[u8] = b"'SurfaceCraft','SurfaceCraft'";
+
+/// Sheets with at least this many faces are built from the file's topology.
+const OWN_SHEET_FACES: usize = 300;
+
+/// Bytes of the file searched for [`FILE_MARK`]: the header comes first.
+const HEADER_BYTES: usize = 2048;
+
+/// Entities a file of `bytes` may hold: the 4 000 000 of the importer's default, or one per 32
+/// bytes (the writer's entities average 25 to 30), whichever is more, up to a file's size limit.
+const BYTES_PER_ENTITY: usize = 32;
+
+fn is_own_file(text: &[u8]) -> bool {
+    let head = text.get(..HEADER_BYTES.min(text.len())).unwrap_or_default();
+    head.windows(FILE_MARK.len()).any(|w| w == FILE_MARK)
+}
+
+fn import_own(text: &[u8]) -> Result<Vec<solidcore::topology::Brep>> {
+    let limits = step_import::Limits {
+        max_entities: step_import::Limits::default().max_entities.max(text.len() / BYTES_PER_ENTITY),
+        ..Default::default()
+    };
+    let model = step_import::import(text, &limits).map_err(|e| op_err("step_import::import", e.to_string()))?;
+    model.bodies.iter().map(build_own).collect()
+}
+
+fn build_own(body: &step_import::model::Body) -> Result<solidcore::topology::Brep> {
+    let sheet = body.kind == step_import::model::BodyKind::ShellModel;
+    if sheet && body.faces.len() >= OWN_SHEET_FACES {
+        let topology = step_brep::build_from_topology(body, step_brep::BuildOptions::default());
+        if let Ok(built) = topology
+            && built.face_failures.is_empty()
+        {
+            return Ok(built.brep);
+        }
+    }
+    step_brep::build(body).map_err(|e| op_err("step_brep::build", format!("{e:?}")))
 }
 
 /// What the importer made of a file's PCURVEs when asked to build the faces' UV trims from them
