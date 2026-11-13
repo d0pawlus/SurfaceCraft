@@ -145,7 +145,11 @@ fn measure_to_solid_on_messy_scans() {
     for n in numbers() {
         let Some(path) = files.get(n - 1) else { continue };
         let mut s = Session::new();
-        s.execute("mesh.import", json!({"path": path.to_string_lossy(), "name": "scan"})).unwrap();
+        let mut import = json!({"path": path.to_string_lossy(), "name": "scan"});
+        if let Ok(units) = std::env::var("SURFACECRAFT_LOCAL_UNITS") {
+            import["units"] = json!(units);
+        }
+        s.execute("mesh.import", import).unwrap();
         let started = std::time::Instant::now();
         let out = s.execute("scan.to_solid", json!({"scan": "scan"}));
         let seconds = started.elapsed().as_secs_f64();
