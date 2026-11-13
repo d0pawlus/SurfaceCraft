@@ -59,8 +59,10 @@ pub fn inside_share(inner: &Mesh, outer: &Bvh, eps: f64) -> f64 {
         return 0.0;
     }
     let count = NEST_SAMPLES.min(n);
-    let inside =
-        (0..count).filter_map(|k| inner.positions.get(k * n / count)).filter(|p| point_inside(outer, p, eps)).count();
+    let inside = (0..count)
+        .filter_map(|k| inner.positions.get(crate::even_index(k, n, count)))
+        .filter(|p| point_inside(outer, p, eps))
+        .count();
     inside as f64 / count as f64
 }
 
@@ -92,7 +94,7 @@ pub fn sampled_self_intersections(mesh: &Mesh, bvh: &Bvh, max_samples: usize) ->
     let count = max_samples.min(n);
     let mut out = IntersectionSample::default();
     for k in 0..count {
-        let ti = k * n / count.max(1);
+        let ti = crate::even_index(k, n, count);
         let (Some(x), Some(idx)) = (mesh.triangle(ti), mesh.triangles.get(ti)) else { continue };
         out.tested += 1;
         let bx = Aabb::from_points(x.iter());

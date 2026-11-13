@@ -67,35 +67,71 @@ fn subtract(a: &[Run], b: &[Run], out: &mut Vec<Run>) {
     }
 }
 
+/// Column data in flat buffers: the columns that have runs, the end of each one's runs, the runs.
+#[derive(Clone, Debug, Default)]
+pub struct Flat {
+    cols: Vec<u32>,
+    ends: Vec<u32>,
+    runs: Vec<Run>,
+}
+
+impl Flat {
+    /// Adds column `col` (after every earlier one): `list` is sorted, merged and clipped to `nz`.
+    pub fn push(&mut self, col: u32, list: &mut Vec<Run>, nz: u32) {
+        list.iter_mut().for_each(|r| r[1] = r[1].min(nz));
+        list.retain(|r| r[0] < r[1]);
+        list.sort_unstable();
+        merge_sorted(list);
+        if list.is_empty() {
+            return;
+        }
+        self.runs.extend_from_slice(list);
+        self.cols.push(col);
+        self.ends.push(self.runs.len() as u32);
+    }
+
+    fn append(&mut self, other: Flat) {
+        let offset = self.runs.len() as u32;
+        self.cols.extend(other.cols);
+        self.ends.extend(other.ends.into_iter().map(|e| e + offset));
+        self.runs.extend(other.runs);
+    }
+
+    /// Bytes held.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.cols.len() * 8 + self.runs.len() * 8
+    }
+}
+
 impl Occupancy {
     /// Builds the set from the runs of every column, given as `(column, runs)` ascending by column;
     /// runs are merged and clipped to `nz`.
     #[must_use]
     pub fn from_columns(nx: usize, ny: usize, nz: u32, columns: Vec<(u32, Vec<Run>)>) -> Self {
-        let mut start = vec![0u32; nx * ny + 1];
-        let mut runs: Vec<Run> = Vec::new();
-        let mut next = 0usize;
+        let mut flat = Flat::default();
         for (c, mut list) in columns {
-            let c = c as usize;
-            while next <= c {
-                if let Some(s) = start.get_mut(next) {
-                    *s = runs.len() as u32;
-                }
-                next += 1;
-            }
-            list.iter_mut().for_each(|r| r[1] = r[1].min(nz));
-            list.retain(|r| r[0] < r[1]);
-            list.sort_unstable();
-            merge_sorted(&mut list);
-            runs.extend(list);
+            flat.push(c, &mut list, nz);
         }
-        while next <= nx * ny {
-            if let Some(s) = start.get_mut(next) {
-                *s = runs.len() as u32;
+        Self::from_flat(nx, ny, nz, flat)
+    }
+
+    /// Builds the set from flat column data (ascending columns).
+    #[must_use]
+    pub fn from_flat(nx: usize, ny: usize, nz: u32, flat: Flat) -> Self {
+        let n = nx.saturating_mul(ny);
+        let mut start = vec![0u32; n + 1];
+        let mut prev = 0u32;
+        for (c, end) in flat.cols.iter().zip(&flat.ends) {
+            if let Some(s) = start.get_mut(*c as usize + 1) {
+                *s = end - prev;
             }
-            next += 1;
+            prev = *end;
         }
-        Self { nx, ny, nz, start, runs }
+        for k in 0..n {
+            start[k + 1] += start[k];
+        }
+        Self { nx, ny, nz, start, runs: flat.runs }
     }
 
     /// The runs of column `(i, j)` (none outside the grid).
@@ -143,19 +179,21 @@ impl Occupancy {
     where
         F: Fn(&Occupancy, usize, usize, &mut Vec<Run>) + Sync + Send,
     {
-        let rows: Vec<Vec<(u32, Vec<Run>)>> = par::map(self.ny, |j| {
-            let mut row = Vec::new();
+        let rows: Vec<Flat> = par::map(self.ny, |j| {
+            let mut row = Flat::default();
             let mut list = Vec::new();
             for i in 0..self.nx {
                 list.clear();
                 f(self, i, j, &mut list);
-                if !list.is_empty() {
-                    row.push(((j * self.nx + i) as u32, list.clone()));
-                }
+                row.push((j * self.nx + i) as u32, &mut list, self.nz);
             }
             row
         });
-        Self::from_columns(self.nx, self.ny, self.nz, rows.into_iter().flatten().collect())
+        let mut all = Flat::default();
+        for row in rows {
+            all.append(row);
+        }
+        Self::from_flat(self.nx, self.ny, self.nz, all)
     }
 
     /// Erosion (`grow = false`) or dilation (`grow = true`) by a cube of half-size `k` along z.

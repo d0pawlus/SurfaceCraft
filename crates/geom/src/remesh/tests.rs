@@ -48,7 +48,11 @@ fn a_resolution_beyond_the_limits_is_refused_before_memory_is_spent() {
     let tight = Params { limits: Limits { max_columns: 1000, ..Limits::default() }, ..Params::default() };
     assert!(matches!(remesh(&scan, &tight), Err(RemeshError::TooMuchWork { .. })));
     let fine = Params { voxel: Some(0.01), ..Params::default() };
-    assert!(matches!(remesh(&scan, &fine), Err(RemeshError::TooMuchWork { .. })));
+    // refused from the area alone, before a single voxel is built
+    match remesh(&scan, &fine) {
+        Err(RemeshError::TooMuchWork { what, .. }) => assert!(what.contains("before any voxel is built"), "{what}"),
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]
@@ -75,4 +79,121 @@ fn the_refusal_does_not_depend_on_the_thread_count() {
         pool.install(|| remesh(&scan, &p).unwrap_err())
     };
     assert_eq!(run(1), run(8));
+}
+
+#[test]
+fn absurd_voxels_and_tolerances_are_refused_not_overflowed() {
+    let scan = synth::sphere(Point3::origin(), 15.0, 40, 20);
+    for p in [
+        Params { voxel: Some(1e-18), ..Params::default() },
+        Params { tolerance: 1e-300, ..Params::default() },
+        Params { voxel: Some(f64::MIN_POSITIVE), ..Params::default() },
+    ] {
+        assert!(
+            matches!(remesh(&scan, &p), Err(RemeshError::TooMuchWork { .. } | RemeshError::ThinWall { .. })),
+            "{p:?}"
+        );
+    }
+}
+
+#[test]
+fn a_doubled_shell_is_one_shell_and_a_nearly_coincident_one_is_not_irregular() {
+    let sphere = {
+        let mut m = synth::sphere(Point3::origin(), 15.0, 80, 40);
+        m.weld(1e-9);
+        m
+    };
+    let mut doubled = sphere.clone();
+    doubled.append(&sphere);
+    let (out, rep) = remesh(&doubled, &Params::default()).unwrap();
+    assert!(rep.duplicate_triangles > 0 && rep.irregular_columns == 0, "{rep:?}");
+    assert_eq!(pieces::pieces(&out)[0].genus(), Some(0));
+    let mut near = sphere.clone();
+    let mut shifted = sphere.clone();
+    shifted.positions.iter_mut().for_each(|p| *p += Vec3::new(1e-3, 0.0, 0.0));
+    near.append(&shifted);
+    let (_, rep) = remesh(&near, &Params::default()).unwrap();
+    assert!((rep.irregular_columns as f64) < 0.05 * rep.columns as f64, "{rep:?}");
+}
+
+fn sphere_with_a_hole(radius: f64) -> Mesh {
+    let mut m = synth::sphere(Point3::origin(), 15.0, 200, 100);
+    m.weld(1e-9);
+    let pole = Point3::new(0.0, 0.0, 15.0);
+    let keep: Vec<bool> =
+        (0..m.triangle_count()).map(|i| (m.face_centroid(i).unwrap() - pole).norm() > radius).collect();
+    let mut k = keep.iter();
+    m.triangles.retain(|_| *k.next().unwrap());
+    m
+}
+
+#[test]
+fn a_small_hole_with_more_edges_than_the_limit_is_refused_not_ignored() {
+    let m = sphere_with_a_hole(2.2);
+    let loops = pieces::pieces(&m)[0].loops.clone();
+    assert!(loops.len() == 1 && loops[0].edges > 20 && loops[0].length / std::f64::consts::PI < 5.0, "{loops:?}");
+    let few = Params { max_hole_edges: 20, ..Params::default() };
+    assert!(matches!(remesh(&m, &few), Err(RemeshError::Open { .. })));
+    let (out, rep) = remesh(&m, &Params::default()).unwrap();
+    assert_eq!(rep.holes_filled, 1);
+    assert!(pieces::pieces(&out)[0].closed());
+}
+
+#[test]
+fn a_thin_plate_is_refined_and_an_explicit_coarse_voxel_is_refused() {
+    let plate = {
+        let mut p = synth::cuboid(Point3::origin(), Vec3::new(30.0, 30.0, 0.7), 60);
+        synth::add_noise(&mut p, 0.005, &mut Rng::new(3));
+        p
+    };
+    let (out, rep) = remesh(&plate, &Params::default()).unwrap();
+    assert!(rep.voxel_refined && rep.voxel < 0.3, "{rep:?}");
+    let n = out.vertex_normals();
+    let mean = |up: bool| {
+        let z: Vec<f64> = out
+            .positions
+            .iter()
+            .zip(&n)
+            .filter(|(p, v)| {
+                (if up { v.z > 0.95 } else { v.z < -0.95 }) && p.x > 5.0 && p.x < 25.0 && p.y > 5.0 && p.y < 25.0
+            })
+            .map(|(p, _)| p.z)
+            .collect();
+        z.iter().sum::<f64>() / z.len().max(1) as f64
+    };
+    assert!((mean(true) - mean(false) - 0.7).abs() < 0.05, "{} {}", mean(true), mean(false));
+    let coarse = Params { voxel: Some(0.3), ..Params::default() };
+    assert!(matches!(remesh(&plate, &coarse), Err(RemeshError::ThinWall { .. })));
+}
+
+#[test]
+fn an_axis_aligned_cube_has_no_ray_trouble_and_the_report_says_what_it_measured() {
+    let cube = synth::cuboid(Point3::new(0.0, 0.0, 0.0), Vec3::new(20.0, 20.0, 20.0), 10);
+    let (out, rep) = remesh(&cube, &Params::default()).unwrap();
+    let ps = pieces::pieces(&out);
+    assert!(ps[0].closed() && ps[0].genus() == Some(0));
+    assert!((volume(&out) - 8000.0).abs() / 8000.0 < 0.02, "{}", volume(&out));
+    assert!(rep.original_to_result.exact && rep.result_to_original.exact);
+    assert_eq!(rep.self_intersections, 0, "{rep:?}");
+    assert!(rep.self_intersection_samples > 0);
+}
+
+#[test]
+fn a_removed_fin_shows_in_the_removed_share_and_the_exact_maximum() {
+    let mut m = synth::sphere(Point3::origin(), 15.0, 80, 40);
+    m.weld(1e-9);
+    let n = m.positions.len() as u32;
+    m.positions.push(Point3::new(0.2, 0.0, 15.9));
+    let t = m.triangles[0];
+    m.triangles.push([t[1], t[0], n]);
+    let (_, rep) = remesh(&m, &Params::default()).unwrap();
+    assert!(rep.original_to_result.exact);
+    assert!(rep.original_to_result.max > 0.5, "{rep:?}");
+    assert!(rep.removed_share > 0.0 && rep.removed_share < 0.01, "{}", rep.removed_share);
+}
+
+#[test]
+fn even_indices_do_not_wrap_in_32_bits() {
+    assert_eq!(crate::even_index(65_535, 100_000, 65_536), 99_998);
+    assert_eq!(crate::even_index(0, 0, 0), 0);
 }

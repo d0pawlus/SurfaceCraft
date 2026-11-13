@@ -64,6 +64,13 @@ pub type Mat4 = nalgebra::Matrix4<f64>;
 /// Lengths below this are treated as zero (mm).
 pub const EPS_LEN: f64 = 1e-12;
 
+/// The `k`-th of `count` evenly spaced indices into `n` items (`k < count`), computed in `u64` so that
+/// the product cannot wrap where `usize` is 32 bits.
+#[must_use]
+pub(crate) fn even_index(k: usize, n: usize, count: usize) -> usize {
+    ((k as u64) * (n as u64) / (count.max(1) as u64)) as usize
+}
+
 /// A unit vector or `None` when `v` is (numerically) zero or not finite.
 #[must_use]
 pub fn normalize(v: Vec3) -> Option<Vec3> {

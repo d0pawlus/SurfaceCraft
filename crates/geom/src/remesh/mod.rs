@@ -25,30 +25,28 @@
 //! tree and BVH, the voxel stage of about 0.3 GB and the result); [`RemeshReport::peak_bytes`] estimates the
 //! voxel stage only.
 mod fit;
+mod grid;
 mod occupancy;
+mod prepare;
 mod raster;
 mod surface;
+mod walls;
 
-use crate::{Aabb, Bvh, KdTree, Mesh, Point3, edit, par, pieces};
+use crate::{Bvh, KdTree, Mesh, Point3, edit, nesting, par, pieces};
+use grid::Grid;
+pub use grid::{MAX_AXIS, cell_product};
 pub use occupancy::Occupancy;
+use prepare::prepare;
 pub use surface::split_pinched_vertices;
 
 /// Voxels around the part (room for the closing and the surface).
 const MIN_BORDER: usize = 3;
 /// Largest half-size of the closing and opening cube (voxels).
 const MAX_K: u32 = 4;
-/// Grid axes may have at most this many cells (the cell key has 21 bits per axis).
-const MAX_AXIS: usize = (1 << 21) - 4;
-/// Samples of the surface probed for its thickness.
-const PROBE_SAMPLES: usize = 2000;
-/// A wall must be this many voxels thick beyond the closing: `2k + 2`.
-const THIN_EXTRA_VOXELS: f64 = 2.0;
-/// Share of the probes allowed to find a thinner wall (those are detail, not the wall).
-const THIN_PERCENTILE: usize = 2;
-/// The voxel is never made finer than the default divided by this.
-const MAX_REFINE: f64 = 8.0;
 /// Closing rounds that remove checkerboard voxel blocks.
 const DIAGONAL_ROUNDS: usize = 12;
+/// Triangles of the result tested for self-intersection.
+const SELF_INTERSECTION_SAMPLES: usize = 3000;
 /// Samples of each surface in the deviation report.
 const DEVIATION_SAMPLES: usize = 100_000;
 /// Median edge lengths of the scan that the projection looks around.
@@ -73,7 +71,11 @@ pub struct Limits {
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { max_columns: 16_000_000, max_crossings: 40_000_000, max_quads: 6_000_000 }
+        if cfg!(target_pointer_width = "32") {
+            Self { max_columns: 4_000_000, max_crossings: 10_000_000, max_quads: 1_500_000 }
+        } else {
+            Self { max_columns: 16_000_000, max_crossings: 40_000_000, max_quads: 6_000_000 }
+        }
     }
 }
 
@@ -123,7 +125,7 @@ pub enum RemeshError {
     Empty,
     /// The scan has an open boundary after the small holes were filled.
     #[error(
-        "the scan is open: {loops} boundary loops wider than {max_hole} mm remain after filling holes of up to {max_hole_edges} edges, the largest with {largest_edges} edges ({length:.1} mm long); remeshing builds a closed solid and does not close large openings"
+        "the scan is open: {loops} boundary loops remain after filling holes of up to {max_hole_edges} edges and {max_hole} mm (a loop of more than three edges is not a flap), the largest with {largest_edges} edges ({length:.1} mm long); remeshing builds a closed solid and does not close large openings"
     )]
     Open {
         /// Loops left.
@@ -192,41 +194,6 @@ pub enum RemeshError {
     },
 }
 
-/// The grid: voxel `(i, j, k)` has its centre at `origin + (i + ½, j + ½, k + ½) · h`.
-#[derive(Clone, Copy, Debug)]
-pub struct Grid {
-    /// Lower corner.
-    pub origin: Point3,
-    /// Voxel edge (mm).
-    pub h: f64,
-    /// Cells along x.
-    pub nx: usize,
-    /// Cells along y.
-    pub ny: usize,
-    /// Cells along z.
-    pub nz: usize,
-}
-
-impl Grid {
-    /// A grid of voxels of `h` around `bbox` with `border` empty voxels on every side.
-    pub fn new(bbox: &Aabb, h: f64, border: usize) -> Result<Self, RemeshError> {
-        let size = bbox.size();
-        let cells = |s: f64| (s / h).ceil() as usize + 2 * border + 1;
-        let (nx, ny, nz) = (cells(size.x), cells(size.y), cells(size.z));
-        let origin = bbox.min - crate::Vec3::new(1.0, 1.0, 1.0) * (border as f64 * h);
-        if nx > MAX_AXIS || ny > MAX_AXIS || nz > MAX_AXIS {
-            let needed = nx.max(ny).max(nz);
-            return Err(RemeshError::TooMuchWork {
-                what: "cells along one axis".into(),
-                needed,
-                limit: MAX_AXIS,
-                advice: "use a larger voxel".into(),
-            });
-        }
-        Ok(Self { origin, h, nx, ny, nz })
-    }
-}
-
 /// Distances between two surfaces in one direction (mm).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Deviation {
@@ -238,8 +205,11 @@ pub struct Deviation {
     pub p95: f64,
     /// 99th percentile.
     pub p99: f64,
-    /// Largest distance.
+    /// Largest distance among the points measured: exact when `exact`, else of an even sample, which
+    /// can miss a single removed fin.
     pub max: f64,
+    /// Every vertex was measured (not a sample).
+    pub exact: bool,
 }
 
 /// What a remesh did.
@@ -293,10 +263,22 @@ pub struct RemeshReport {
     pub non_manifold_before: usize,
     /// Bytes of the voxel stage (crossings, column index, runs and quads); not the whole process.
     pub peak_bytes: usize,
-    /// Original vertices to the remeshed surface.
+    /// Original vertices to the remeshed surface: the error of the result and, in its tail, what the
+    /// closing and opening removed.
     pub original_to_result: Deviation,
-    /// Remeshed vertices to the original surface.
+    /// Remeshed vertices to the original surface: the error of the result alone.
     pub result_to_original: Deviation,
+    /// Share of the measured original vertices farther from the result than the tolerance: fins,
+    /// bridges and other features removed on purpose (or lost), not error of the surface.
+    pub removed_share: f64,
+    /// Duplicate triangles dropped before the remesh.
+    pub duplicate_triangles: usize,
+    /// Triangles of the result that cross another one (of an even sample) after the projection.
+    pub self_intersections: usize,
+    /// Triangles tested for that.
+    pub self_intersection_samples: usize,
+    /// What the caller should know (thin features removed).
+    pub warnings: Vec<String>,
 }
 
 fn check(p: &Params) -> Result<(), RemeshError> {
@@ -327,118 +309,27 @@ fn signed_volume(mesh: &Mesh) -> f64 {
         .sum()
 }
 
-/// A thickness of the walls: the low percentile of the distances from area-weighted sample points,
-/// along the inward normal, to the surface on the other side. Distances up to `ignore` (features the
-/// closing removes anyway: handles, fins) do not count.
-fn thickness(mesh: &Mesh, bvh: &Bvh, h: f64, ignore: f64) -> Option<f64> {
-    let probe = 0.5 * h;
-    let samples = mesh.sample_points(PROBE_SAMPLES, &mut crate::Rng::new(7));
-    let mut found: Vec<f64> = par::map_slice(&samples, |(p, n)| {
-        let dir = -crate::normalize(*n)?;
-        bvh.ray_cast(&(p + dir * probe), &dir).map(|(_, t)| t + probe)
-    })
-    .into_iter()
-    .flatten()
-    .filter(|t| *t > ignore)
-    .collect();
-    if found.is_empty() {
-        return None;
-    }
-    found.sort_by(f64::total_cmp);
-    found.get(found.len() * THIN_PERCENTILE / 100).copied()
-}
-
-/// Distances from a sample of `points` to the surface `bvh`.
-fn deviation<'a>(points: impl Iterator<Item = &'a Point3>, bvh: &Bvh) -> Deviation {
+/// Distances from the `points` to the surface `bvh`: all of them up to [`DEVIATION_SAMPLES`] points,
+/// else an even sample (the report says which).
+fn deviation<'a>(points: impl Iterator<Item = &'a Point3>, bvh: &Bvh) -> (Deviation, Vec<f64>) {
     let all: Vec<&Point3> = points.collect();
     let count = DEVIATION_SAMPLES.min(all.len());
     let mut d: Vec<f64> = par::map(count, |k| {
-        all.get(k * all.len() / count.max(1)).and_then(|p| bvh.closest(p, f64::INFINITY)).map_or(0.0, |h| h.distance)
+        all.get(crate::even_index(k, all.len(), count))
+            .and_then(|p| bvh.closest(p, f64::INFINITY))
+            .map_or(0.0, |h| h.distance)
     });
     d.sort_by(f64::total_cmp);
     let at = |q: usize| d.get((d.len().saturating_sub(1) * q) / 100).copied().unwrap_or(0.0);
-    Deviation { samples: d.len(), p50: at(50), p95: at(95), p99: at(99), max: d.last().copied().unwrap_or(0.0) }
-}
-
-/// Width of a boundary loop: its perimeter over pi (the diameter of a round hole).
-fn loop_width(mesh: &Mesh, lp: &[u32]) -> f64 {
-    let perimeter: f64 = (0..lp.len())
-        .filter_map(|k| {
-            Some(
-                (mesh.positions.get(*lp.get(k)? as usize)?
-                    - mesh.positions.get(*lp.get((k + 1) % lp.len())? as usize)?)
-                .norm(),
-            )
-        })
-        .sum();
-    perimeter / std::f64::consts::PI
-}
-
-/// The scan prepared for the solid: holes filled, debris dropped, open boundaries refused.
-struct Prepared {
-    work: Mesh,
-    holes_filled: usize,
-    debris_triangles: usize,
-    genus: Vec<Option<usize>>,
-    non_manifold: usize,
-}
-
-fn prepare(mesh: &Mesh, p: &Params) -> Result<Prepared, RemeshError> {
-    mesh.validate().map_err(|e| RemeshError::Params(e.to_string()))?;
-    let mut work = mesh.clone();
-    work.remove_degenerate(0.0);
-    if work.triangle_count() < 4 {
-        return Err(RemeshError::Empty);
-    }
-    let wide = p.max_hole;
-    let accept = move |m: &Mesh, lp: &[u32]| loop_width(m, lp) <= wide;
-    let holes_filled = edit::fill_holes_where(&mut work, p.max_hole_edges, &accept).filled;
-    let debris_triangles = edit::remove_small_components(&mut work, p.min_component_fraction, 8);
-    let ps = pieces::pieces(&work);
-    // tiny loops are flaps and slivers (a fin of two edges is not a hole): the columns tolerate them
-    let wide = p.max_hole * std::f64::consts::PI;
-    let loops: Vec<_> = ps.iter().flat_map(|q| q.loops.iter()).filter(|l| l.length > wide).collect();
-    if let Some(biggest) = loops.iter().max_by(|a, b| a.length.total_cmp(&b.length)) {
-        let (largest_edges, length) = (biggest.edges, biggest.length);
-        return Err(RemeshError::Open {
-            loops: loops.len(),
-            largest_edges,
-            length,
-            max_hole_edges: p.max_hole_edges,
-            max_hole: p.max_hole,
-        });
-    }
-    let genus = ps.iter().map(pieces::Piece::genus).collect();
-    Ok(Prepared {
-        work,
-        holes_filled,
-        debris_triangles,
-        genus,
-        non_manifold: ps.iter().map(|q| q.non_manifold_edges).sum(),
-    })
-}
-
-/// Voxel and cube size for a scan with walls of `wall` mm. The width of what is removed stays fixed
-/// in mm: a finer voxel gets a larger cube, so a wall is resolved without keeping the handles.
-fn resolution(p: &Params, wall: Option<f64>) -> Result<(f64, u32, bool), RemeshError> {
-    let h0 = p.voxel.unwrap_or(1.5 * p.tolerance);
-    let k0 = match p.min_feature {
-        None => 1,
-        Some(w) => ((w / (2.0 * h0)).round() as u32).min(MAX_K),
+    let dev = Deviation {
+        samples: d.len(),
+        p50: at(50),
+        p95: at(95),
+        p99: at(99),
+        max: d.last().copied().unwrap_or(0.0),
+        exact: count == all.len(),
     };
-    let removed = 2.0 * f64::from(k0) * h0;
-    let need = |k: u32, h: f64| (2.0 * f64::from(k) + THIN_EXTRA_VOXELS) * h;
-    let Some(t) = wall.filter(|t| *t < need(k0, h0)) else { return Ok((h0, k0, false)) };
-    if p.voxel.is_some() {
-        let suggested = t / (2.0 * f64::from(k0) + THIN_EXTRA_VOXELS + 0.5);
-        return Err(RemeshError::ThinWall { thickness: t, required: need(k0, h0), voxel: h0, suggested });
-    }
-    let (mut h, mut k) = (h0, k0);
-    for _ in 0..8 {
-        k = ((removed / (2.0 * h)).ceil() as u32).clamp(1, MAX_K);
-        h = h.min(t / (2.0 * f64::from(k) + THIN_EXTRA_VOXELS + 0.5)).max(h0 / MAX_REFINE);
-    }
-    Ok((h, k, true))
+    (dev, d)
 }
 
 /// The surface of the solid as a mesh with consistent triangles, and the facts about it.
@@ -461,14 +352,23 @@ struct Solid {
 
 fn solid_of(work: &Mesh, h: f64, k: u32, limits: &Limits) -> Result<Solid, RemeshError> {
     let grid = Grid::new(&work.bbox(), h, MIN_BORDER + 2 * k as usize)?;
-    if grid.nx * grid.ny > limits.max_columns {
+    let columns = grid::cell_product(grid.nx, grid.ny);
+    if columns > limits.max_columns as u64 {
         let advice = "use a larger voxel".to_string();
+        let needed = usize::try_from(columns).unwrap_or(usize::MAX);
         return Err(RemeshError::TooMuchWork {
             what: "grid columns".into(),
-            needed: grid.nx * grid.ny,
+            needed,
             limit: limits.max_columns,
             advice,
         });
+    }
+    // every voxel face of the boundary covers at most h² of the area: the area bounds the quads from below
+    let quads = work.area() / (h * h);
+    if quads > limits.max_quads as f64 {
+        let (needed, advice) = (quads as usize, "use a larger voxel".to_string());
+        let what = "surface quads (at least, from the area and the voxel, before any voxel is built)".into();
+        return Err(RemeshError::TooMuchWork { what, needed, limit: limits.max_quads, advice });
     }
     let flipped = signed_volume(work) < 0.0;
     let (raw, stats) = raster::solid(work, &grid, flipped, limits.max_crossings)?;
@@ -495,8 +395,10 @@ pub fn remesh(mesh: &Mesh, p: &Params) -> Result<(Mesh, RemeshReport), RemeshErr
     let bvh = Bvh::build(&prep.work);
     let h_probe = p.voxel.unwrap_or(1.5 * p.tolerance);
     let ignore = p.min_feature.unwrap_or(2.0 * h_probe) + 0.5 * h_probe;
-    let wall = thickness(&prep.work, &bvh, h_probe, ignore);
-    let (h, k, refined) = resolution(p, wall)?;
+    let walls = walls::probe(&prep.work, &bvh, h_probe, ignore);
+    let res = walls::resolution(p.voxel, p.min_feature, p.tolerance, &walls)?;
+    let (h, k, refined) = (res.h, res.k, res.refined);
+    let wall = walls.wall;
     let solid = solid_of(&prep.work, h, k, &p.limits)?;
     let (mut net, pinches_split) = build_surface(&solid.occ, &solid.grid, &p.limits)?;
     let islands_removed = edit::remove_small_components(&mut net, p.min_component_fraction, 8);
@@ -520,11 +422,13 @@ pub fn remesh(mesh: &Mesh, p: &Params) -> Result<(Mesh, RemeshReport), RemeshErr
         islands_removed,
         genus_before: prep.genus,
         non_manifold_before: prep.non_manifold,
+        duplicate_triangles: prep.duplicate_triangles,
+        warnings: res.warnings,
         peak_bytes: 8 * solid.raster.crossings + solid.raw_bytes + 60 * net.triangle_count() / 2,
         ..Default::default()
     };
     let out = fit_to_scan(net, &prep.work, h, p, &mut report);
-    finish(out, &prep.work, &bvh, h, k, &mut report)
+    finish(out, &prep.work, &bvh, h, k, p.tolerance, &mut report)
 }
 
 /// Smooths and projects the surface onto the scan's vertices and triangle centroids.
@@ -550,11 +454,14 @@ fn finish(
     scan_bvh: &Bvh,
     h: f64,
     k: u32,
+    tolerance: f64,
     report: &mut RemeshReport,
 ) -> Result<(Mesh, RemeshReport), RemeshError> {
     let result_bvh = Bvh::build(&out);
-    report.original_to_result = deviation(scan.positions.iter(), &result_bvh);
-    report.result_to_original = deviation(out.positions.iter(), scan_bvh);
+    let (back, distances) = deviation(scan.positions.iter(), &result_bvh);
+    report.original_to_result = back;
+    report.removed_share = distances.iter().filter(|d| **d > tolerance).count() as f64 / distances.len().max(1) as f64;
+    report.result_to_original = deviation(out.positions.iter(), scan_bvh).0;
     let lost = lost_share(scan, &result_bvh, 3.0 * h);
     if lost > MAX_LOST_SHARE {
         return Err(RemeshError::Lost { share: 100.0 * lost, distance: 3.0 * h, width: 2.0 * f64::from(k) * h });
@@ -564,6 +471,9 @@ fn finish(
         return Err(RemeshError::NotManifold("the surface has boundary or non-manifold edges".into()));
     }
     report.genus_after = ps.iter().map(pieces::Piece::genus).collect();
+    let crossing = nesting::sampled_self_intersections(&out, &result_bvh, SELF_INTERSECTION_SAMPLES);
+    report.self_intersections = crossing.crossing;
+    report.self_intersection_samples = crossing.tested;
     report.triangles = out.triangle_count();
     Ok((out, report.clone()))
 }
@@ -573,7 +483,7 @@ fn lost_share(scan: &Mesh, bvh: &Bvh, distance: f64) -> f64 {
     let n = scan.positions.len();
     let count = DEVIATION_SAMPLES.min(n);
     let far: usize = par::map(count, |k| {
-        scan.positions.get(k * n / count.max(1)).is_some_and(|p| bvh.closest(p, distance).is_none())
+        scan.positions.get(crate::even_index(k, n, count)).is_some_and(|p| bvh.closest(p, distance).is_none())
     })
     .into_iter()
     .filter(|f| *f)

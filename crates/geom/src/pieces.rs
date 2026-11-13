@@ -34,6 +34,10 @@ pub struct Piece {
     pub edges: usize,
     /// Euler characteristic `V − E + F`.
     pub euler: i64,
+    /// Vertices whose triangles form more than one fan (pinch points).
+    pub pinched_vertices: usize,
+    /// Edges of two triangles that run the same way in both (inconsistent orientation, or not orientable).
+    pub unoriented_edges: usize,
 }
 
 impl Piece {
@@ -43,11 +47,11 @@ impl Piece {
         self.boundary_edges == 0 && self.non_manifold_edges == 0
     }
 
-    /// Genus of the surface assuming it is an orientable manifold with simple boundary loops;
-    /// `None` when it has non-manifold edges or the Euler characteristic is inconsistent with that.
+    /// Genus of the surface; `None` unless it is an oriented manifold (no non-manifold edge, no pinched
+    /// vertex, no edge that runs the same way twice) with a consistent Euler characteristic.
     #[must_use]
     pub fn genus(&self) -> Option<usize> {
-        if self.non_manifold_edges > 0 {
+        if self.non_manifold_edges > 0 || self.pinched_vertices > 0 || self.unoriented_edges > 0 {
             return None;
         }
         let twice = 2 - self.loops.len() as i64 - self.euler;
@@ -73,39 +77,90 @@ fn find(parent: &mut [u32], mut x: u32) -> u32 {
     x
 }
 
-/// Edge facts of the whole mesh, attributed to the piece of the first triangle of each edge:
-/// `(boundary edges as (a, b, piece), non-manifold edges per piece, distinct edges per piece)`.
-fn edge_facts(mesh: &Mesh, piece_of: &[u32], pieces: usize) -> (Vec<(u32, u32, u32)>, Vec<usize>, Vec<usize>) {
+/// Edge facts of the whole mesh, attributed to the piece of the first triangle of each edge.
+struct EdgeFacts {
+    /// Boundary edges as `(a, b, piece)`.
+    boundary: Vec<(u32, u32, u32)>,
+    non_manifold: Vec<usize>,
+    edges: Vec<usize>,
+    /// Edges of two triangles that run the same way in both: not an oriented surface.
+    unoriented: Vec<usize>,
+    /// Union-find over the corners `3 · triangle + k`: corners of one vertex joined across the edges
+    /// of two triangles; more classes than vertices means a pinched vertex.
+    corners: Vec<u32>,
+}
+
+fn corner_of(mesh: &Mesh, tri: u32, vertex: u32) -> u32 {
+    let k = mesh.triangles.get(tri as usize).and_then(|t| t.iter().position(|v| *v == vertex)).unwrap_or(0);
+    tri * 3 + k as u32
+}
+
+fn edge_facts(mesh: &Mesh, piece_of: &[u32], pieces: usize) -> EdgeFacts {
     let mut half: Vec<(u64, u32)> = Vec::with_capacity(mesh.triangles.len() * 3);
     for (ti, t) in mesh.triangles.iter().enumerate() {
         for k in 0..3 {
             let (a, b) = (t[k], t[(k + 1) % 3]);
             if a != b {
-                half.push((edge_key(a, b), ti as u32));
+                half.push((edge_key(a, b), (ti as u32) << 1 | u32::from(a < b)));
             }
         }
     }
     par::sort_unstable(&mut half);
-    let (mut boundary, mut non_manifold, mut edges) = (Vec::new(), vec![0usize; pieces], vec![0usize; pieces]);
+    let mut f = EdgeFacts {
+        boundary: Vec::new(),
+        non_manifold: vec![0; pieces],
+        edges: vec![0; pieces],
+        unoriented: vec![0; pieces],
+        corners: (0..mesh.triangles.len() as u32 * 3).collect(),
+    };
     let mut i = 0;
-    while let Some(&(key, tri)) = half.get(i) {
+    while let Some(&(key, first)) = half.get(i) {
         let run = half.get(i..).map_or(0, |r| r.iter().take_while(|h| h.0 == key).count());
-        let piece = piece_of.get(tri as usize).copied().unwrap_or(0);
-        if let Some(e) = edges.get_mut(piece as usize) {
+        let (a, b) = ((key >> 32) as u32, (key & 0xffff_ffff) as u32);
+        let piece = piece_of.get((first >> 1) as usize).copied().unwrap_or(0) as usize;
+        if let Some(e) = f.edges.get_mut(piece) {
             *e += 1;
         }
-        match run {
-            1 => boundary.push(((key >> 32) as u32, (key & 0xffff_ffff) as u32, piece)),
-            2 => {}
+        match (run, half.get(i + 1)) {
+            (1, _) => f.boundary.push((a, b, piece as u32)),
+            (2, Some(&(_, second))) => {
+                if (first & 1) == (second & 1)
+                    && let Some(u) = f.unoriented.get_mut(piece)
+                {
+                    *u += 1;
+                }
+                for v in [a, b] {
+                    let (x, y) = (corner_of(mesh, first >> 1, v), corner_of(mesh, second >> 1, v));
+                    let (rx, ry) = (find(&mut f.corners, x), find(&mut f.corners, y));
+                    if rx != ry
+                        && let Some(slot) = f.corners.get_mut(ry as usize)
+                    {
+                        *slot = rx;
+                    }
+                }
+            }
             _ => {
-                if let Some(n) = non_manifold.get_mut(piece as usize) {
+                if let Some(n) = f.non_manifold.get_mut(piece) {
                     *n += 1;
                 }
             }
         }
         i += run;
     }
-    (boundary, non_manifold, edges)
+    f
+}
+
+/// Vertices per piece and the pinched ones (corner classes beyond one per vertex).
+fn pinches(piece_of: &[u32], vertices: &[usize], corners: &mut [u32]) -> Vec<usize> {
+    let mut classes = vec![0usize; vertices.len()];
+    for c in 0..corners.len() as u32 {
+        if find(corners, c) == c
+            && let Some(n) = piece_of.get((c / 3) as usize).and_then(|p| classes.get_mut(*p as usize))
+        {
+            *n += 1;
+        }
+    }
+    classes.iter().zip(vertices).map(|(c, v)| c.saturating_sub(*v)).collect()
 }
 
 /// Boundary loops per piece: boundary edges that share vertices belong to one loop.
@@ -142,11 +197,8 @@ fn loops_of(mesh: &Mesh, boundary: &[(u32, u32, u32)], pieces: usize) -> Vec<Vec
     out
 }
 
-/// The connected pieces of `mesh`, most triangles first (ties: lowest triangle index first).
-/// An invalid mesh has none.
-#[must_use]
-pub fn pieces(mesh: &Mesh) -> Vec<Piece> {
-    let groups = edit::components(mesh);
+/// Which piece every triangle and vertex belongs to, and the vertices per piece.
+fn assign(mesh: &Mesh, groups: &[Vec<u32>]) -> (Vec<u32>, Vec<usize>) {
     let mut piece_of = vec![0u32; mesh.triangles.len()];
     let mut vertex_piece = vec![u32::MAX; mesh.positions.len()];
     for (pi, g) in groups.iter().enumerate() {
@@ -167,14 +219,25 @@ pub fn pieces(mesh: &Mesh) -> Vec<Piece> {
             *n += 1;
         }
     }
-    let (boundary, non_manifold, edges) = edge_facts(mesh, &piece_of, groups.len());
-    let mut loops = loops_of(mesh, &boundary, groups.len());
+    (piece_of, vertices)
+}
+
+/// The connected pieces of `mesh`, most triangles first (ties: lowest triangle index first).
+/// An invalid mesh has none.
+#[must_use]
+pub fn pieces(mesh: &Mesh) -> Vec<Piece> {
+    let groups = edit::components(mesh);
+    let (piece_of, vertices) = assign(mesh, &groups);
+    let mut facts = edge_facts(mesh, &piece_of, groups.len());
+    let pinched = pinches(&piece_of, &vertices, &mut facts.corners);
+    let mut loops = loops_of(mesh, &facts.boundary, groups.len());
     let mut boundary_edges = vec![0usize; groups.len()];
-    for &(_, _, p) in &boundary {
+    for &(_, _, p) in &facts.boundary {
         if let Some(n) = boundary_edges.get_mut(p as usize) {
             *n += 1;
         }
     }
+    let at = |v: &[usize], i: usize| v.get(i).copied().unwrap_or(0);
     groups
         .into_iter()
         .enumerate()
@@ -187,16 +250,18 @@ pub fn pieces(mesh: &Mesh) -> Vec<Piece> {
                     .flatten()
                     .filter_map(|&v| mesh.positions.get(v as usize)),
             );
-            let (v, e) = (vertices.get(pi).copied().unwrap_or(0), edges.get(pi).copied().unwrap_or(0));
+            let (v, e) = (at(&vertices, pi), at(&facts.edges, pi));
             Piece {
                 euler: v as i64 - e as i64 + triangles.len() as i64,
                 vertices: v,
                 area,
                 bbox,
-                boundary_edges: boundary_edges.get(pi).copied().unwrap_or(0),
+                boundary_edges: at(&boundary_edges, pi),
                 loops: loops.get_mut(pi).map(std::mem::take).unwrap_or_default(),
-                non_manifold_edges: non_manifold.get(pi).copied().unwrap_or(0),
+                non_manifold_edges: at(&facts.non_manifold, pi),
                 edges: e,
+                pinched_vertices: at(&pinched, pi),
+                unoriented_edges: at(&facts.unoriented, pi),
                 triangles,
             }
         })
@@ -221,6 +286,50 @@ mod tests {
         let t = pieces(&torus);
         assert!(t[0].closed());
         assert_eq!(t[0].genus(), Some(1));
+    }
+
+    #[test]
+    fn genus_is_none_for_pinched_non_manifold_and_inconsistently_oriented_pieces() {
+        let sphere = {
+            let mut m = synth::sphere(Point3::origin(), 5.0, 24, 12);
+            m.weld(1e-9);
+            m
+        };
+        let mut flipped = sphere.clone();
+        flipped.triangles[0].swap(1, 2);
+        let p = &pieces(&flipped)[0];
+        assert!(p.unoriented_edges > 0 && p.genus().is_none(), "{p:?}");
+        // two spheres sharing one vertex: a pinch point
+        let mut touching = sphere.clone();
+        let mut other = sphere.clone();
+        let top = sphere.positions.iter().map(|p| p.z).fold(f64::MIN, f64::max);
+        let bottom = other.positions.iter().map(|p| p.z).fold(f64::MAX, f64::min);
+        other.positions.iter_mut().for_each(|p| p.z += top - bottom);
+        let base = touching.positions.len() as u32;
+        touching.append(&other);
+        let at_pole = |p: &Point3| (p.z - top).abs() < 1e-9 && p.x.abs() < 1e-9 && p.y.abs() < 1e-9;
+        let pole_a = touching.positions.iter().position(at_pole).unwrap();
+        let bottom_b = touching
+            .positions
+            .iter()
+            .enumerate()
+            .skip(base as usize)
+            .find(|(_, p)| at_pole(p))
+            .map(|(i, _)| i as u32)
+            .unwrap();
+        for t in touching.triangles.iter_mut().skip(sphere.triangles.len()) {
+            t.iter_mut().filter(|v| **v == bottom_b).for_each(|v| *v = pole_a as u32);
+        }
+        let p = &pieces(&touching)[0];
+        assert!(p.pinched_vertices > 0, "{p:?}");
+        assert!(p.genus().is_none());
+        // a fin: an edge of three triangles
+        let mut finned = sphere;
+        let n = finned.positions.len() as u32;
+        finned.positions.push(Point3::new(0.0, 0.0, 9.0));
+        let t = finned.triangles[0];
+        finned.triangles.push([t[1], t[0], n]);
+        assert!(pieces(&finned)[0].genus().is_none());
     }
 
     #[test]

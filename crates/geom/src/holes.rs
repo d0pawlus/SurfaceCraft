@@ -493,6 +493,19 @@ mod tests {
         rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap().install(f)
     }
 
+    #[test]
+    fn fill_holes_where_fills_only_the_holes_the_predicate_accepts() {
+        let mut m = punched(3);
+        let loops = boundary_loops(&m);
+        assert!(loops.len() >= 2, "{}", loops.len());
+        let first = loops[0].clone();
+        let only_first = move |_: &Mesh, lp: &[u32]| lp == first.as_slice();
+        let rep = fill_holes_where(&mut m, 400, &only_first);
+        assert_eq!(rep.filled, 1);
+        assert_eq!(rep.skipped, loops.len() - 1);
+        assert_eq!(boundary_loops(&m).len(), loops.len() - 1);
+    }
+
     /// A sphere with holes punched around `count` well-spread vertices.
     fn punched(count: usize) -> Mesh {
         let m = synth::sphere(Point3::origin(), 10.0, 120, 60);

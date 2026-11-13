@@ -18,6 +18,11 @@ const MIN_QUADRIC_POINTS: usize = 10;
 const MIN_WEIGHT: f64 = 1e-3;
 /// Samples of the scan used to measure its median edge length.
 const EDGE_SAMPLES: usize = 20_000;
+/// Scan vertices used per fit at most (a dense scan would otherwise cost thousands per vertex).
+const MAX_NEIGHBOURS: usize = 160;
+/// The quadric is fitted only when the smallest eigenvalue of the normal equations is at least this
+/// share of the largest: a degenerate neighbourhood (points on a line) gets the weighted mean instead.
+const MIN_CONDITION: f64 = 1e-7;
 
 /// Neighbours of every vertex in compressed form.
 pub(super) struct Rings {
@@ -86,7 +91,7 @@ pub(super) fn median_edge(pos: &[Point3], triangles: &[[u32; 3]]) -> f64 {
     let count = EDGE_SAMPLES.min(n);
     let mut lengths: Vec<f64> = Vec::with_capacity(count * 3);
     for k in 0..count {
-        let Some(t) = triangles.get(k * n / count.max(1)) else { continue };
+        let Some(t) = triangles.get(crate::even_index(k, n, count)) else { continue };
         for e in 0..3 {
             if let (Some(a), Some(b)) = (pos.get(t[e] as usize), pos.get(t[(e + 1) % 3] as usize)) {
                 lengths.push((a - b).norm());
@@ -111,6 +116,13 @@ pub(super) struct Fit {
     pub max_move: f64,
 }
 
+/// Is the 6 x 6 system far enough from singular for the fit to mean something?
+fn well_conditioned(ata: &SMatrix<f64, TERMS, TERMS>) -> bool {
+    let e = ata.symmetric_eigen().eigenvalues;
+    let (lo, hi) = (e.min(), e.max());
+    hi > 0.0 && lo >= MIN_CONDITION * hi
+}
+
 /// Height of the quadric fitted around `p` (frame `n`, `t1`, `t2`), and its gradient `(c1, c2)`.
 fn quadric(p: &Point3, frame: &(Vec3, Vec3, Vec3), scan: &KdTree, fit: &Fit, robust: f64) -> Option<(f64, f64, f64)> {
     let (n, t1, t2) = frame;
@@ -119,7 +131,9 @@ fn quadric(p: &Point3, frame: &(Vec3, Vec3, Vec3), scan: &KdTree, fit: &Fit, rob
     let mut ata = SMatrix::<f64, TERMS, TERMS>::zeros();
     let mut atb = SVector::<f64, TERMS>::zeros();
     let (mut sum_w, mut sum_wz, mut used) = (0.0, 0.0, 0usize);
-    for idx in scan.within(p, rho) {
+    let near = scan.within(p, rho);
+    // a dense neighbourhood is thinned evenly (never cut short: that would bias it towards one side)
+    for idx in near.iter().copied().step_by(near.len().div_ceil(MAX_NEIGHBOURS).max(1)) {
         let Some(q) = scan.point(idx) else { continue };
         let d = q - p;
         let (x, y, z) = (d.dot(t1), d.dot(t2), d.dot(n));
@@ -137,6 +151,7 @@ fn quadric(p: &Point3, frame: &(Vec3, Vec3, Vec3), scan: &KdTree, fit: &Fit, rob
         return None;
     }
     if used >= MIN_QUADRIC_POINTS
+        && well_conditioned(&ata)
         && let Some(c) = ata.lu().solve(&atb)
         && c.iter().all(|x| x.is_finite())
     {

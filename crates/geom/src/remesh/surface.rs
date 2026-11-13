@@ -236,6 +236,13 @@ mod tests {
     }
 
     #[test]
+    fn a_solid_in_the_first_column_and_voxel_does_not_panic() {
+        let (occ, grid) = cube(8, 0, 3);
+        let (positions, quads) = quads(&occ, &grid, usize::MAX).unwrap();
+        assert!(!positions.is_empty() && !quads.is_empty());
+    }
+
+    #[test]
     fn two_cubes_touching_along_an_edge_are_two_fans_after_splitting() {
         let n = 12;
         let mut cols = Vec::new();
