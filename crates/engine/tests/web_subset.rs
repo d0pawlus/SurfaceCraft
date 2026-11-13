@@ -14,6 +14,8 @@ fn gate_m6_web_subset_runs_without_files() {
         ("mesh.import", json!({"data": data, "format": "stl", "name": "scan"})),
         ("align.principal", json!({"object": "scan"})),
         ("region.auto_segment", json!({"mesh": "scan"})),
+        ("mesh.synth", json!({"shape": "plane", "name": "sheet"})),
+        ("mesh.thicken", json!({"object": "sheet", "thickness": 1.0})),
         ("body.box", json!({"size": [10, 10, 10]})),
         ("feature.fillet", json!({"body": "box", "edges": [0], "size": 1.0})),
         ("export.step", json!({"objects": ["box"]})),

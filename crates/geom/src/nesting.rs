@@ -67,7 +67,7 @@ pub fn inside_share(inner: &Mesh, outer: &Bvh, eps: f64) -> f64 {
 }
 
 /// Does triangle `[a, b, c]` cross triangle `[d, e, f]`? (An edge of one passes through the other.)
-fn crosses(x: &[Point3; 3], y: &[Point3; 3]) -> bool {
+pub(crate) fn crosses(x: &[Point3; 3], y: &[Point3; 3]) -> bool {
     let hit = |s: &[Point3; 3], t: &[Point3; 3]| {
         (0..3).any(|k| {
             let (p, q) = (s[k], s[(k + 1) % 3]);

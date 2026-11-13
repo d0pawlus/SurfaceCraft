@@ -29,6 +29,8 @@ mod freeform;
 mod judge;
 #[path = "pipeline_prepare.rs"]
 mod prepare;
+#[path = "pipeline_shell.rs"]
+mod shell;
 pub use prepare::{ComponentOut, PrepOut, PrepStep};
 #[path = "pipeline_rebuild.rs"]
 mod rebuild;
@@ -136,6 +138,15 @@ pub struct ToSolidIn {
     /// A part of a scan with several pieces is co-equal, and modelled, when its area is at least this share of the largest piece's (0..1, default 0.1). Smaller pieces and debris are reported, not modelled.
     #[serde(default)]
     pub part_share: Option<f64>,
+    /// Wall thickness in mm of the solid made from an open scan (no default; not 0, at most half the scan's size): the cleaned scan is thickened and the shell wrapped (method `freeform`); deviation and verdict are measured against the scan. Positive puts the material behind the scanned face, negative in front of it; an error when the scan is closed, or has several co-equal parts (`scan.split` first).
+    #[serde(default)]
+    pub thickness: Option<f64>,
+    /// Put half of `thickness` on each side of the scan (default false; needs `thickness`); the scan is then measured against the face moved half the thickness.
+    #[serde(default)]
+    pub symmetric: bool,
+    /// Keep the thickened mesh in the document (default false: it is removed; needs `thickness`).
+    #[serde(default)]
+    pub keep_thickened: bool,
     /// Name of the solid (default "solid").
     #[serde(default)]
     pub name: Option<String>,
@@ -384,7 +395,11 @@ fn relate(s: &mut Session, modelled: &[Modelled], sigma: Option<f64>) -> usize {
 }
 
 pub(super) fn to_solid(s: &mut Session, i: ToSolidIn) -> CmdResult<ToSolidOut> {
+    shell::check(&i)?;
     let set = settings(s, &i)?;
+    if i.thickness.is_some() {
+        return shell::run(s, &set, &i);
+    }
     let scan_report = prepare(s, &i, set.scan)?;
     if let Some(done) = prepare::split_parts(s, &i, &set, &scan_report)? {
         return Ok(done);
@@ -474,6 +489,7 @@ fn primitives_solid(s: &mut Session, i: &ToSolidIn, set: &Settings, scan_report:
         next_steps: next,
         attempts: Vec::new(),
         prep: PrepOut::default(),
+        thickened: None,
     })
 }
 

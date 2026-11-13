@@ -37,6 +37,7 @@ pub mod reduce;
 pub mod remesh;
 pub mod rng;
 pub mod section;
+pub mod shell;
 pub mod synth;
 pub mod transform;
 pub mod tri;

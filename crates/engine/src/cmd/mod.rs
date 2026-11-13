@@ -239,6 +239,7 @@ const HEAVY: &[&str] = &[
     "mesh.remove_outliers",
     "mesh.smooth",
     "mesh.store_info",
+    "mesh.thicken",
     "primitive.auto_constrain",
     "primitive.fit",
     "primitive.symmetry",

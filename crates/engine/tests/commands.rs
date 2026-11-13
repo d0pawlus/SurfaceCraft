@@ -101,6 +101,10 @@ fn hostile_values() -> Vec<Value> {
         json!({"rotate": {"axis": [0, 0, 0], "degrees": 1}, "object": 1}),
         json!({"id": "unknown.command"}),
         json!({"filter": 3}),
+        json!({"object": 1, "thickness": 1e308, "symmetric": true}),
+        json!({"object": 1, "thickness": -1e-300}),
+        json!({"scan": 1, "thickness": 1e308, "symmetric": true, "keep_thickened": true}),
+        json!({"scan": 1, "thickness": 0.0}),
     ]
 }
 

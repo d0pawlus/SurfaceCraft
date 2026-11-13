@@ -1005,5 +1005,8 @@
   "param.max_hole": "Największa wypełniana dziura",
   "param.min_share": "Najmniejszy udział części",
   "param.keep_debris": "Zachowaj okruchy",
-  "param.components": "Części do modelowania"
+  "param.components": "Części do modelowania",
+  "cmd.mesh.thicken": "Pogrub siatkę",
+  "cmd.mesh.thicken.hint": "Z otwartego skanu robi zamkniętą skorupę o stałej grubości jako nową siatkę.",
+  "param.keep_thickened": "Zostaw pogrubioną siatkę"
 }

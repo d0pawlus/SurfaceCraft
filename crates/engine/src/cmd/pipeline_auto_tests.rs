@@ -49,6 +49,7 @@ fn result(verdict: Verdict, body: Option<Option<f64>>, within: f64, coverage: f6
         next_steps: Vec::new(),
         attempts: Vec::new(),
         prep: super::super::PrepOut::default(),
+        thickened: None,
     }
 }
 

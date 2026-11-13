@@ -1005,5 +1005,8 @@
   "param.max_hole": "Largest hole filled",
   "param.min_share": "Smallest part share",
   "param.keep_debris": "Keep debris",
-  "param.components": "Parts to model"
+  "param.components": "Parts to model",
+  "cmd.mesh.thicken": "Thicken mesh",
+  "cmd.mesh.thicken.hint": "Makes a closed shell of constant thickness from an open scan, as a new mesh.",
+  "param.keep_thickened": "Keep thickened mesh"
 }
