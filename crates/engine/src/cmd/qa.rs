@@ -2,6 +2,7 @@
 //! in a scan (holes, debris, bad triangles, noise); `body.compare` says where a body departs from the
 //! scan, face by face.
 use super::deviation::{CHORD_BOUNDS, NOISE_PRIMITIVE_MM, NOISE_WARNING_MM, REACH, TOLERANCE, positive, yes};
+use super::mesh::size_check;
 use super::{CmdError, CmdResult, CommandSpec, ObjRef};
 use crate::{Session, command};
 use schemars::JsonSchema;
@@ -180,6 +181,7 @@ struct Facts {
     degenerate: usize,
     duplicates: usize,
     noise: Option<f64>,
+    scale: Option<Finding>,
 }
 
 fn finding(severity: Severity, code: &str, message: String) -> Finding {
@@ -246,6 +248,7 @@ fn findings(f: &Facts) -> Vec<Finding> {
             )
         }),
         noise_finding(f),
+        f.scale.clone(),
     ];
     let mut out: Vec<Finding> = checks.into_iter().flatten().collect();
     out.sort_by_key(|f| std::cmp::Reverse(f.severity));
@@ -298,6 +301,7 @@ pub(crate) fn scan_qa(s: &Session, i: QaIn) -> CmdResult<QaOut> {
         degenerate,
         duplicates,
         noise,
+        scale: size_check::scale_finding(&s.doc, id),
     };
     let (bbox_min, bbox_max) = bbox_corners(&mesh);
     let area = mesh.area();
