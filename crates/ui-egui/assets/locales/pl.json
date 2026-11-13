@@ -728,6 +728,8 @@
   "cmd.surface.from_curves": "Płaty z krzywych",
   "cmd.surface.from_curves.hint": "Buduje płaty powierzchni między krzywymi charakterystycznymi.",
   "cmd.surface.info": "Informacje o powierzchni",
+  "cmd.surface.patch": "Płat z warunkami",
+  "cmd.surface.patch.hint": "Wypełnia zamknięty obrys jednym gładkim płatem, który łączy się z sąsiednimi ścianami, punktami i skanem.",
   "cmd.surface.thicken": "Pogrub",
   "cmd.surface.thicken.hint": "Nadaje powierzchni grubość, zamieniając ją w bryłę.",
   "cmd.surface.trim_to_region": "Przytnij do regionu",
