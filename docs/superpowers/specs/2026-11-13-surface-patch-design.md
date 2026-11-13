@@ -386,7 +386,7 @@ wymuszanym w 2p + 3 punktach na przedział. Dług P4 w STATUS.md pozostaje otwar
 
 ## Wynik wdrożenia (2026-11-13)
 
-Wdrożono w gałęzi `surface-patch`: siedem commitów na `main` 6ae45ea. `18efcbd` projekt i plan;
+Wdrożono w gałęzi `surface-patch`: commity na `main` 6ae45ea (lista w planie). `18efcbd` projekt i plan;
 `5073cdb` solver `kernel::vpatch` i spłaszczanie `fit::param`; `aec35cb` sterownik
 `kernel::patch_fit`; `656e9c4` i `1939c00` poprawki sterownika i pomiar łączenia; `ede16a4`
 komenda `surface.patch`; `866968e` opcja `ngon` w `surface.from_curves`. Treść powyżej nie została
@@ -415,7 +415,7 @@ zmieniona. Poniżej wyniki i odstępstwa od projektu.
   zamkniętą bryłę o 6 ścianach; STEP zachowuje ściany i objętość; odcięcie pudełkiem
   10 × 10 × 30 mm się udaje. Błąd objętości: płaska dokładna, zakrzywione krawędzie 5e-5 względnie,
   wypukła 5e-4 względnie. Max odchyłka danych 0,026 mm.
-- Testy: biblioteka kernela 93 OK; engine `surface_patch` 7, `curves_ngon_patch` 5, bramka
+- Testy: biblioteka kernela 103 OK; engine `surface_patch` 8, `curves_ngon_patch` 5, bramka
   `curves_ngon` 1, `commands` 8, `organic` 4; ui-egui `shell` 14; `cargo xtask quick` dla kernel,
   fit, engine i ui-egui OK; `cargo xtask wasm` OK.
 - Lokalna uwaga środowiskowa: `cargo xtask wasm` uruchomiono bez sccache. Na tym stanowisku
@@ -448,3 +448,24 @@ zmieniona. Poniżej wyniki i odstępstwa od projektu.
   (szkic, niewysłany, wymaga reprodukcji kernel-only).
 - Komentarz do tangency-labs/solidcraft#759 w `docs/upstream/10-comment-solidcraft-759-constrained-patch.md`
   (szkic, niewysłany).
+
+### Po niezależnym przeglądzie gałęzi (commit `f04c902`)
+
+Przegląd znalazł wady, których testy nie pokazywały; wszystkie są naprawione i mają testy:
+
+- G2 nie było nakładane, gdy sieć nie mogła rosnąć (wiersze krzywizny powstają dopiero względem
+  poprzedniej rundy): teraz zawsze jest druga runda, a linearyzacja jest iterowana.
+- `within_targets` jest ścisłe: bok „zamrożony” (taki, którego szczelina przestała się poprawiać)
+  nie jest zwalniany z celu; bok zamraża się tylko po zagęszczeniu sieci wzdłuż niego.
+- Punkty wewnętrzne z wagą są osobnymi wierszami miękkimi z własną wagą i raportowaną odległością
+  (`soft_points_max_mm`); wcześniej mogły zostać po cichu pominięte.
+- Wygładzanie boku ma limit punktów na cały bok; obrys przycięcia używa parametrów startowych dla
+  boków miękkich i jako rezerwy; miękkie wiersze styczności i krzywizny nie zależą od jednostek.
+- `surface.from_curves` z `ngon: "patch"` podaje dla każdego płata liczbę zmierzonych punktów,
+  punkty poza obrysem i ostrzeżenia; płat bez zmierzonych punktów nie jest „w tolerancji”.
+
+Uwagi z przeglądu pozostawione otwarte: koszt sprzężonego układu przy sieci 24 × 24 recenzent
+szacuje na ok. 1e11 operacji na rundę (projekt zakładał 2e9) — niezmierzone, limit może być za
+wysoki dla wasm; wykrywanie zawinięcia płata jest testowane na poziomie funkcji pomiarowej, a nie
+całego dopasowania; reguła wyboru rundy stawia tolerancję danych przed szczeliną boków twardych.
+
