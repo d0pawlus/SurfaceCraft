@@ -25,6 +25,7 @@ pub mod refit;
 pub mod solid;
 pub mod step;
 pub mod tess;
+pub mod vpatch;
 
 pub use solid::{BodyInfo, Counts};
 /// The neutral B-rep record (solidcore-record), re-exported so higher layers never name solidcore.
