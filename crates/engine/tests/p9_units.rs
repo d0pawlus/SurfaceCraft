@@ -378,13 +378,11 @@ fn point_cloud_import_respects_units() {
     let out = import_as(&mut b, &m_path, Some("m"), "cloud");
     assert!(out["point_cloud"].is_object());
     let (ma, mb) = (mesh_of(&a, "cloud"), mesh_of(&b, "cloud"));
-    // Ball pivoting breaks ties on the last bits of the coordinates, so the two runs may differ by a
-    // few triangles; the size and the place of the reconstruction must agree.
-    let (ta, tb) = (ma.triangle_count() as f64, mb.triangle_count() as f64);
-    assert!((ta - tb).abs() <= 0.02 * ta, "triangles {ta} and {tb}");
-    let (da, db) = (ma.bbox(), mb.bbox());
-    assert!((da.min - db.min).norm() <= 1e-6 * da.diagonal(), "placement differs");
-    assert!((da.max - db.max).norm() <= 1e-6 * da.diagonal(), "size differs");
+    // The points of the two files differ in the last bits (0.001 is not a power of two), and the
+    // bracket is a regular lattice full of exact ties; reconstruction rounds the cloud to a lattice
+    // far below scanner accuracy first, so both runs triangulate the very same points.
+    assert_eq!(ma.triangles, mb.triangles, "the stated unit changed the triangulation");
+    assert_eq!(ma.positions, mb.positions, "the stated unit changed the points");
 }
 
 #[test]
@@ -627,8 +625,8 @@ fn reconstruct_takes_units_like_import() {
     let mut b = Session::new();
     b.execute("mesh.reconstruct", json!({"path": m_path, "units": "m", "name": "cloud"})).unwrap();
     let (ma, mb) = (mesh_of(&a, "cloud"), mesh_of(&b, "cloud"));
-    let (ta, tb) = (ma.triangle_count() as f64, mb.triangle_count() as f64);
-    assert!((ta - tb).abs() <= 0.02 * ta, "triangles {ta} and {tb}");
+    assert_eq!(ma.triangles, mb.triangles, "the stated unit changed the triangulation");
+    assert_eq!(ma.positions, mb.positions, "the stated unit changed the points");
 }
 
 #[test]
