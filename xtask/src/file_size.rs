@@ -1,8 +1,9 @@
 //! `cargo xtask file-size`: no Rust file under `crates/`, `apps/` or `xtask/` has more than 800
 //! lines, unless it is on the allowlist `xtask/file-size.txt` with its current line count.
 //! The list only shrinks: a listed file may not grow, and a listed file that is now 800 lines or
-//! fewer must leave the list.
-use std::collections::BTreeMap;
+//! fewer must leave the list. A listed file that shrank but is still over the limit passes with a
+//! note, so a change that deletes a few lines of it need not touch the list.
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The most lines a Rust file may have unless it is on the allowlist.
 const MAX_LINES: usize = 800;
@@ -36,24 +37,33 @@ fn parse_allowlist(text: &str) -> Result<BTreeMap<String, usize>, String> {
     Ok(listed)
 }
 
-/// What to do about one file, given its line count and its recorded count (if listed):
-/// `None` when it is fine, otherwise the reason it fails.
-fn verdict(lines: usize, recorded: Option<usize>) -> Option<String> {
+/// What the check says about one file.
+#[derive(Debug, PartialEq)]
+enum Verdict {
+    Fine,
+    /// Passes; the text is printed as a note.
+    Note(String),
+    /// Fails for this reason.
+    Fail(String),
+}
+
+/// What to do about one file, given its line count and its recorded count (if listed).
+fn verdict(lines: usize, recorded: Option<usize>) -> Verdict {
     match recorded {
-        None if lines > MAX_LINES => Some(format!(
+        None if lines > MAX_LINES => Verdict::Fail(format!(
             "{lines} lines, over {MAX_LINES}: split it into modules (or, if it cannot be split yet, list it in {ALLOWLIST})"
         )),
-        None => None,
+        None => Verdict::Fine,
         Some(_) if lines <= MAX_LINES => {
-            Some(format!("{lines} lines, {MAX_LINES} or fewer: remove it from {ALLOWLIST}"))
+            Verdict::Fail(format!("{lines} lines, {MAX_LINES} or fewer: remove it from {ALLOWLIST}"))
         }
-        Some(recorded) if lines > recorded => {
-            Some(format!("grew from {recorded} to {lines} lines: the list only shrinks, split the file instead"))
-        }
+        Some(recorded) if lines > recorded => Verdict::Fail(format!(
+            "grew from {recorded} to {lines} lines: the list only shrinks, split the file instead"
+        )),
         Some(recorded) if lines < recorded => {
-            Some(format!("shrank from {recorded} to {lines} lines: update its count in {ALLOWLIST}"))
+            Verdict::Note(format!("shrank from {recorded} to {lines} lines: lower its count in {ALLOWLIST}"))
         }
-        Some(_) => None,
+        Some(_) => Verdict::Fine,
     }
 }
 
@@ -64,7 +74,8 @@ pub(crate) fn check() -> Result<(), String> {
     let text = std::fs::read_to_string(root.join(ALLOWLIST)).map_err(|e| format!("read {ALLOWLIST}: {e}"))?;
     let listed = parse_allowlist(&text)?;
     let mut errors = Vec::new();
-    let mut seen = Vec::new();
+    let mut notes = Vec::new();
+    let mut seen = BTreeSet::new();
     for dir in DIRS {
         crate::walk(&root.join(dir), &mut |p| {
             if !p.extension().is_some_and(|e| e == "rs") {
@@ -72,21 +83,22 @@ pub(crate) fn check() -> Result<(), String> {
             }
             let rel = crate::rel(p);
             match std::fs::read_to_string(p) {
-                Ok(source) => {
-                    if let Some(reason) = verdict(line_count(&source), listed.get(&rel).copied()) {
-                        errors.push(format!("{rel}: {reason}"));
-                    }
-                }
+                Ok(source) => match verdict(line_count(&source), listed.get(&rel).copied()) {
+                    Verdict::Fine => {}
+                    Verdict::Note(note) => notes.push(format!("{rel}: {note}")),
+                    Verdict::Fail(reason) => errors.push(format!("{rel}: {reason}")),
+                },
                 Err(e) => errors.push(format!("{rel}: cannot read: {e}")),
             }
-            seen.push(rel);
+            seen.insert(rel);
         });
     }
-    for path in listed.keys() {
-        if !seen.contains(path) {
-            errors.push(format!("{ALLOWLIST} lists {path}, which does not exist: remove the entry"));
-        }
-    }
+    let missing = listed.keys().filter(|path| !seen.contains(*path));
+    errors.extend(missing.map(|path| format!("{ALLOWLIST} lists {path}, which does not exist: remove the entry")));
+    // The directory walk has no stable order; the report does.
+    notes.sort();
+    errors.sort();
+    notes.iter().for_each(|note| eprintln!("note: {note}"));
     if errors.is_empty() { Ok(()) } else { Err(errors.join("\n")) }
 }
 
@@ -94,36 +106,59 @@ pub(crate) fn check() -> Result<(), String> {
 mod tests {
     use super::*;
 
+    fn fails_with(v: &Verdict, text: &str) -> bool {
+        matches!(v, Verdict::Fail(reason) if reason.contains(text))
+    }
+
     #[test]
     fn unlisted_file_over_the_limit_fails() {
-        assert!(verdict(801, None).is_some());
+        assert!(fails_with(&verdict(801, None), "over 800"));
     }
 
     #[test]
     fn unlisted_file_at_the_limit_passes() {
-        assert!(verdict(800, None).is_none());
+        assert_eq!(verdict(800, None), Verdict::Fine);
     }
 
     #[test]
     fn listed_file_with_its_recorded_count_passes() {
-        assert!(verdict(1045, Some(1045)).is_none());
+        assert_eq!(verdict(1045, Some(1045)), Verdict::Fine);
     }
 
     #[test]
     fn listed_file_that_grew_fails() {
-        let reason = verdict(1046, Some(1045));
-        assert!(reason.is_some_and(|r| r.contains("grew from 1045 to 1046")));
+        assert!(fails_with(&verdict(1046, Some(1045)), "grew from 1045 to 1046"));
     }
 
     #[test]
     fn listed_file_that_is_now_small_fails_with_the_removal_message() {
-        let reason = verdict(790, Some(1045));
-        assert!(reason.is_some_and(|r| r.contains("remove it from xtask/file-size.txt")));
+        assert!(fails_with(&verdict(790, Some(1045)), "remove it from xtask/file-size.txt"));
+        assert!(fails_with(&verdict(800, Some(1045)), "remove it from xtask/file-size.txt"));
     }
 
     #[test]
-    fn listed_file_that_shrank_but_is_still_over_fails_until_its_count_is_updated() {
-        assert!(verdict(900, Some(1045)).is_some_and(|r| r.contains("update its count")));
+    fn listed_file_that_shrank_but_is_still_over_passes_with_a_note() {
+        let v = verdict(900, Some(1045));
+        assert!(matches!(&v, Verdict::Note(note) if note.contains("shrank from 1045 to 900")), "{v:?}");
+        assert!(matches!(verdict(801, Some(802)), Verdict::Note(_)));
+    }
+
+    #[test]
+    fn a_line_without_a_final_newline_is_not_counted() {
+        assert_eq!(line_count("a\nb\n"), 2);
+        assert_eq!(line_count("a\r\nb"), 1);
+        assert_eq!(line_count(""), 0);
+    }
+
+    #[test]
+    fn allowlist_rejects_hostile_lines() {
+        for text in
+            ["crates/a.rs many\n", "crates/a.rs -3\n", "crates/a.rs 900 extra\n", "crates/a.rs 900\ncrates/a.rs 901\n"]
+        {
+            assert!(parse_allowlist(text).is_err(), "{text:?} was accepted");
+        }
+        let odd = parse_allowlist("/etc/passwd 900\n../x.rs 900\n").expect("paths are only names here");
+        assert_eq!(odd.len(), 2, "such entries match no checked file and are reported as not existing");
     }
 
     #[test]
