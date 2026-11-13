@@ -103,6 +103,116 @@ patch network over a whole scan.
   network stays watertight. A crease of a scan that is resampled coarsely is blurred over two
   triangles; lower `angle` (for example to 20 degrees) when creases of about 55 degrees are
   missed.
+- `ngon` says what happens to regions that are not four-sided. `split` (the default) cuts each of
+  them into four-sided patches around a centre, so the network stays watertight and a closed
+  network also gives a solid. `patch` keeps the four-sided regions as Bezier patches and fits every
+  other region with one outline as a single trimmed patch of its own, with `surface.patch`:
+  its sides are its feature curves (soft: the patch follows the scan, and `side_gap_max_mm` in the
+  result is the largest distance from them), its data are the region's vertices. Each trimmed
+  patch is a separate surface object named `<name>_patch_<k>` and is listed in `trimmed_patches`.
+  Such a network is reported open and no solid is made, because the trimmed patches are separate
+  sheets (see `build-solid`). In `patch` mode regions with one or two corners are still skipped.
+
+## Constrained patch
+
+- `surface.patch` fills one closed outline with one trimmed bicubic patch. The outline is `sides`,
+  in any order. A side is a body edge (`body`, `edge`) or a polyline (`points`, at least two
+  points, two points being a straight segment). The sides are chained into one loop. A gap between
+  two ends that is larger than `gap_tolerance` (default 0.01 mm) is an error that gives the gap and
+  its position; smaller gaps are closed. A polyline of three or more points is densified along a
+  smooth cubic interpolant through its points, so the patch is not pulled towards the chords; a turn
+  of more than 45 degrees at a point divides the side there.
+- Use it for one outline: a hole or a missing piece bounded by edges of a body or by curves traced
+  on a scan, where the new surface has to meet its neighbours. For a whole network of feature
+  curves use `surface.from_curves`.
+- Side kinds. `soft` false (the default) makes a hard side: the patch has to meet it within the
+  targets (gap 0.001 mm, angle 0.05 degrees, normal curvature 5 %). `soft: true` makes the side
+  follow the scan: the patch comes as close to it as the data allow, and the gap is reported, not
+  a target. Sides traced on a scan are soft, because a scanned edge is rounded and noisy, and a
+  hard G0 on it makes the fit worse than the scan noise.
+- Continuity per side, `continuity`: `g0` (the default, position only), `g1` (the same tangent
+  plane along the side) or `g2` (also the same normal curvature across it).
+- The reference face. G1 and G2 continue a neighbouring face. A body edge uses its only face (the
+  face on the other side of the edge); if the edge has more faces, give `face: {body, face}`. A
+  polyline has no face of its own, so G1 or G2 on a polyline needs `face`. Before the fit the side's
+  points are moved onto the reference face; `snap_max_mm` reports how far.
+- Corners. Where two G1 or G2 sides meet, their tangent planes must agree. `conflicts: "relax"`
+  (the default) relaxes the tangent conditions over a short stretch of each side next to the corner
+  and reports it (`corners`: the mismatch angle and the relaxed length). `conflicts: "fail"`
+  refuses instead.
+- Interior conditions: `points` (`hard: true` makes the patch pass through the point; otherwise
+  `weight` sets how strongly it is pulled to the point) and `curves` (polylines the patch must
+  contain, G0).
+- Scan data: `region`, or `mesh` with `triangles`, gives the scan points, fitted softly. The
+  parameters of the patch come from a flattening of the region (`parameters: "flattened"`) when
+  every side point lies within `gap_tolerance` of a boundary vertex of the region, that is, when the
+  sides are the region's own edge. Otherwise the plane of the outline is used (`"plane"`). On the
+  plane route an outline whose projection crosses itself, or a reference face more than 75 degrees
+  away from the plane, is refused.
+- Net size: `control` sets the start net `[u, v]`, `max_control` (default 16, at most 24) bounds
+  how far it grows.
+
+Reading the report:
+
+- `within_tolerance`: the largest distance of the scan points from the patch (`max`) is within
+  `tolerance` (default 0.2 mm). `rms`, `p99` and `max` give the distribution; `points` counts the
+  scan points used and `outside` those lying outside the outline (ignored).
+- `within_targets`: every hard side meets its targets, nothing folds back, and no corner had to be
+  relaxed. False is a result to read, not a failure: `sides` and `corners` say which condition
+  missed and by how much.
+- `sides`, one per side in loop order: `gap_max_mm` (the largest distance of the side from the
+  patch), `angle_max_deg` (G1 and G2), `curvature_error_max` (G2, relative), `samples`, `soft`,
+  `snap_max_mm`, and `folded`. A folded side means the patch turned back over the reference face:
+  that is an error of the side, not a success.
+- `control`, `rounds` (solve and refine passes), `dropped` (conditions found dependent and left
+  out) and `warnings`.
+
+Example 1: G1 on the edges of a hole. `tube` is a body whose five edges bound a five-sided hole
+in a cylindrical sheet. Each edge belongs to one face, the cylinder, so no `face` is needed:
+
+```json
+{
+  "command": "surface.patch",
+  "params": {
+    "sides": [
+      {"body": "tube", "edge": 0, "continuity": "g1"},
+      {"body": "tube", "edge": 1, "continuity": "g1"},
+      {"body": "tube", "edge": 2, "continuity": "g1"},
+      {"body": "tube", "edge": 3, "continuity": "g1"},
+      {"body": "tube", "edge": 4, "continuity": "g1"}
+    ],
+    "tolerance": 0.2,
+    "name": "hole_patch"
+  }
+}
+```
+
+Read `within_targets` and each side's `angle_max_deg` (the target is 0.05 degrees).
+
+Example 2: polyline sides traced on a scan, with the region as data. The coordinates are
+illustrative, on the surface z = 3·sin(x/12)·cos(y/9); real sides are points of the region's
+boundary, so that the flattening applies:
+
+```json
+{
+  "command": "surface.patch",
+  "params": {
+    "sides": [
+      {"points": [[0, 0, 0], [10, 0, 2.24], [20, 0, 2.99]], "soft": true},
+      {"points": [[20, 0, 2.99], [20, 12, 0.70], [20, 24, -2.66]], "soft": true},
+      {"points": [[20, 24, -2.66], [10, 24, -1.99], [0, 24, 0]], "soft": true},
+      {"points": [[0, 24, 0], [0, 0, 0]], "soft": true}
+    ],
+    "region": "wave_scan",
+    "tolerance": 0.2,
+    "name": "wave_patch"
+  }
+}
+```
+
+Here `within_tolerance` says whether the scan lies within 0.2 mm of the patch, and `sides` gives
+the gap of each traced side (not a target, since the sides are soft). `parameters` tells which
+parameters were used.
 
 ## Quad layouts
 

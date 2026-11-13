@@ -383,3 +383,68 @@ dobierane niezależnie; potrzebny jest wspólny symetryczny operator kształtu w
 wierzchołku układu (z dopasowania kwadryki do skanu), pola normalnych krawędzi z pochodnymi
 końcowymi zgodnymi z tym operatorem, i łaty stopnia 5 dopasowywane z warunkiem `D · n = 0`
 wymuszanym w 2p + 3 punktach na przedział. Dług P4 w STATUS.md pozostaje otwarty.
+
+## Wynik wdrożenia (2026-11-13)
+
+Wdrożono w gałęzi `surface-patch`: siedem commitów na `main` 6ae45ea. `18efcbd` projekt i plan;
+`5073cdb` solver `kernel::vpatch` i spłaszczanie `fit::param`; `aec35cb` sterownik
+`kernel::patch_fit`; `656e9c4` i `1939c00` poprawki sterownika i pomiar łączenia; `ede16a4`
+komenda `surface.patch`; `866968e` opcja `ngon` w `surface.from_curves`. Treść powyżej nie została
+zmieniona. Poniżej wyniki i odstępstwa od projektu.
+
+### Zmierzone (dane syntetyczne)
+
+- Pięciobocny otwór w walcu R = 20 mm, same boki (tylko obrys): G1 → siatka 6×6, szczelina do
+  0,0006 mm, kąt do 0,047°, 91 ms. G2 → siatka 9×9, szczelina do 0,0004 mm, kąt do 0,016°, błąd
+  krzywizny normalnej do 2,0 %, 187 ms. G0 → szczelina do 0,001 mm.
+- Falista powierzchnia z = 3·sin(x/12)·cos(y/9), region 40 × 24 mm, 2150 punktów, szum σ = 0,03 mm,
+  cztery twarde boki zadane łamanymi po 401, 41 lub 21 punktów: w każdym przypadku siatka 13×13,
+  jedna runda, rms 0,030 mm, max 0,100 mm, szczelina boków 0,00018 mm.
+- Płaszczyzna z szumem σ = 0,03 mm, pięciokąt R = 20 mm, boki z tym samym szumem: twarde boki
+  rms 0,110 mm, max 0,60 mm, `within_targets` = false (zgłoszone). Miękkie boki: rms w granicy
+  szumu.
+- `surface.from_curves` na skanie (σ = 0,03 mm) sześcianu z jednym ściętym narożnikiem (3 regiony
+  czworoboczne, 3 pięciobocne, 1 trójbocny). `ngon: "split"`: 30 płatów Béziera, rms 0,031 mm,
+  max 0,167 mm, sieć zamknięta. `ngon: "patch"`: 3 płaty Béziera i 4 przycięte płaty, max każdego
+  ≤ 0,2 mm, bez bryły.
+- Łączenie (blok 40 × 30 × 20 mm; czapa z `fit_patch`: płaska, wypukła o 2 mm, na zakrzywionych
+  krawędziach górnych). `nurbs::stitch` nie zszywa osobnych arkuszy przy żadnej tolerancji
+  z zakresu 1e-6 … 1e-2 mm, także dla płaskiej czapy o szczelinie 1e-14 mm. Rekord niezszytych
+  arkuszy jest odrzucany przy dekodowaniu (`from_record`). Droga hybrydowa (`hybrid::cut_by_spline`
+  we wszystkich trzech wariantach, `hybrid::replace_face` dla płaskiej i wypukłej czapy) daje
+  zamkniętą bryłę o 6 ścianach; STEP zachowuje ściany i objętość; odcięcie pudełkiem
+  10 × 10 × 30 mm się udaje. Błąd objętości: płaska dokładna, zakrzywione krawędzie 5e-5 względnie,
+  wypukła 5e-4 względnie. Max odchyłka danych 0,026 mm.
+- Testy: biblioteka kernela 93 OK; engine `surface_patch` 7, `curves_ngon_patch` 5, bramka
+  `curves_ngon` 1, `commands` 8, `organic` 4; ui-egui `shell` 14; `cargo xtask quick` dla kernel,
+  fit, engine i ui-egui OK; `cargo xtask wasm` OK.
+- Lokalna uwaga środowiskowa: `cargo xtask wasm` uruchomiono bez sccache. Na tym stanowisku
+  sccache kończy się na web-sys błędem 206 Windows (za długa linia poleceń). To problem środowiska,
+  nie kodu.
+
+### Odstępstwa od projektu
+
+1. **Boki z skanu są miękkie.** Nowa flaga boku `soft` (`surface.patch`); automat `surface.from_curves`
+   używa miękkich boków. Twardy G0 na zaszumionym boku albo na boku z zamazaną ostrą krawędzią dawał
+   dopasowanie 2 do 4 razy gorsze niż szum. Projekt zakładał twardy G0 wszędzie. Szczelina boku
+   miękkiego jest raportowana, nie jest celem.
+2. **Brak `side_tolerance` i wygładzania łamanych przez tolerancję.** Parametr `side_tolerance`
+   i wygładzanie B-splajnem w tolerancji zostały usunięte. Bok z co najmniej trzema punktami jest
+   zagęszczany wzdłuż gładkiej interpolacji sześciennej przez te punkty (solidcore `crv_fit::p2::interp`);
+   zwrot powyżej 45° w punkcie dzieli bok. Zaszumione łamane obsługują
+   miękkie boki.
+3. **`ngon: "patch"` nie tworzy bryły.** Przycięte płaty wracają jako osobne obiekty powierzchni
+   (patrz pomiar łączenia). Regiony z jednym lub dwoma rogami nadal są pomijane.
+4. **`surface.patch` zwraca arkusz.** Komenda nie wszywa arkusza w bryłę. Bryłę z takim płatem daje
+   istniejąca droga hybrydowa: płat jako cięcie albo jako zastąpiona ściana. Obie funkcje są
+   kernelowe, bez polecenia.
+5. **Nie zrobiono:** siły i ciśnienia, wewnętrzne pętle przycięcia, dedykowane narzędzie w GUI
+   albo pozycja na wstążce (polecenie jest w palecie, CLI i MCP). Domyślna wartość `ngon` pozostaje
+   `split`.
+
+### Otwarte
+
+- Zszywanie osobnych arkuszy: zgłoszenie upstream w `docs/upstream/11-decode-unsewn-sheets-refused.md`
+  (szkic, niewysłany, wymaga reprodukcji kernel-only).
+- Komentarz do tangency-labs/solidcraft#759 w `docs/upstream/10-comment-solidcraft-759-constrained-patch.md`
+  (szkic, niewysłany).

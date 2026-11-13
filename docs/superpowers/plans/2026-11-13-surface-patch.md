@@ -135,7 +135,7 @@ Decisions the implementer cannot make alone:
   domain, `uv` outside the domain by more than 1e-9 of its span (clamp inside that), weights ≤ 0,
   zero `dir` or `normal`, more than 50 000 data points, more than 20 000 rows.
 
-- [ ] **Step 1: tests** (in `vpatch.rs`, `#[cfg(test)]`), exact assertions:
+- [x] **Step 1: tests** (in `vpatch.rs`, `#[cfg(test)]`), exact assertions:
   - `recovers_known_surface`: sample a known 8×8 bicubic `Surface::Spline` (control z = 3·sin(x/12)·cos(y/9) on a 60×40 grid of x, y) at 40×40 uv points as data, `control: [8, 8]`, hard `Position` rows on a 12-per-side boundary ring, `smoothing: 1e-9` → every control point within `1e-6 · 72.1` of the original.
   - `boundary_only_plane`: 5-gon boundary of 40 `Position` rows on the plane `z = 0.2x − 0.1y + 3`, no data → `max |z − plane| ≤ 1e-9` over a 30×30 grid of the domain.
   - `tangent_rows_hold`: boundary as above plus `Tangent` rows along one side with normal `(0, 0.6, 0.8)` → `|S_d·n| ≤ 1e-9` at those uv.
@@ -145,8 +145,10 @@ Decisions the implementer cannot make alone:
   - `empty_area_is_filled_by_energy`: data only in the quarter `u, v < 0.5` of the unit domain → all control points finite, `max |S|` over the domain ≤ 5 × the data's bounding-box diagonal.
   - `nonconvex_outline_decouples_arms`: U-shaped `outline`, data on arm A only vs data on both arms → the surface over arm A differs by ≤ 10 % of arm B's data amplitude.
   - `hostile_input_is_refused`: NaN uv, `control: [3, 9]`, `[25, 4]`, inverted domain, zero normal, zero weight → `Err`, no panic.
-- [ ] **Step 2: implement** `solve` and `derivatives`.
-- [ ] **Step 3:** `cargo fmt`; report files changed, the solidcore routines used, and anything you could not verify without compiling.
+- [x] **Step 2: implement** `solve` and `derivatives`.
+- [x] **Step 3:** `cargo fmt`; report files changed, the solidcore routines used, and anything you could not verify without compiling.
+
+**Commit:** `5073cdb` (together with Task 3).
 
 ### Task 2: driver `kernel::patch_fit`  (Sonnet) — after Task 1 builds
 
@@ -238,7 +240,7 @@ Decisions (spec §4.2–4.5; follow them, these are the pins):
   `"the control net reached max_control"`, `"too few data points for the control net"` (fewer than
   3 data points per control point).
 
-- [ ] **Step 1: tests** (`#[cfg(test)]` in `patch_fit.rs`):
+- [x] **Step 1: tests** (`#[cfg(test)]` in `patch_fit.rs`):
   - `flat_pentagon`: 5 sides on `z = 0`, G0, no data → `max |z| ≤ 1e-9` on the sheet's tessellation vertices, one face, 5·k edges, `within_targets`.
   - `sphere_cap_boundary_only`: 5 sides on a sphere R = 50 (outline radius 15), G0, no data → gap ≤ `G0_TARGET`; `p99/median` of |mean curvature| over a 20×20 interior grid ≤ 5.
   - `wave_with_data`: 6 sides on `z = 3·sin(x/12)·cos(y/9)` (outline radius 15 about (30, 20)), 2000 data points with σ = 0.03 → `max ≤ 0.2`, `within_tolerance`.
@@ -247,7 +249,9 @@ Decisions (spec §4.2–4.5; follow them, these are the pins):
   - `refuses_self_crossing_projection`: a figure-eight loop → `Err` containing `"height field"`.
   - `degenerate_sides`: a side with two identical points, a side of 2 points, 65 sides → `Err` or valid patch, never a panic.
   - `hostile_request`: NaN points, empty sides, tolerance 0, `max_control` 99 → `Err`.
-- [ ] **Step 2: implement.**  - [ ] **Step 3:** `cargo fmt`; report as in Task 1.
+- [x] **Step 2: implement.**  - [x] **Step 3:** `cargo fmt`; report as in Task 1.
+
+**Commit:** `aec35cb`; follow-ups `656e9c4` (the other net direction grows before giving up) and `1939c00` (soft sides, outline data filter, reference snap, smoothing of sides, energy scale).
 
 ### Task 3: flattening `fit::param`  (Sonnet) — parallel with Task 1
 
@@ -279,12 +283,14 @@ boundary loop, a non-manifold edge, a closed surface (no boundary), non-finite v
 400 000 triangles. Dense solves are not acceptable here: use a conjugate-gradient or Gauss–Seidel
 solver written on the CSR/adjacency lists (no new dependency).
 
-- [ ] **Step 1: tests:** `plane_is_isometric` (synth plane 40×30: `distortion_max ≤ 1e-6`, `flipped == 0`);
+- [x] **Step 1: tests:** `plane_is_isometric` (synth plane 40×30: `distortion_max ≤ 1e-6`, `flipped == 0`);
   `cylinder_patch_unrolls` (120° of a cylinder R = 20, h = 30: `distortion_mean ≤ 0.02`, `flipped == 0`);
   `sphere_cap` (cap of half-angle 40°: `flipped == 0`, `distortion_mean ≤ 0.08`);
   `l_shape_is_bijective` (concave planar L: `flipped == 0`, `distortion_max ≤ 1e-6`);
   `refuses_two_loops`, `refuses_closed_surface`, `refuses_non_finite`, `empty_triangles`.
-- [ ] **Step 2: implement.**  - [ ] **Step 3:** `cargo fmt`; report.
+- [x] **Step 2: implement.**  - [x] **Step 3:** `cargo fmt`; report.
+
+**Commit:** `5073cdb` (together with Task 1).
 
 ### Task 4: command `surface.patch`  (Sonnet) — after Task 2 builds
 
@@ -313,7 +319,7 @@ polyline ends onto the common corner. With `region`/`mesh`: data = the region's 
 point within `gap_tolerance` of a boundary vertex); otherwise the plane projection of the driver.
 `SurfaceObject { parent: None, degree: 3, control, rms, max, .. }`.
 
-- [ ] **Step 1: tests** (`crates/engine/tests/surface_patch.rs`): `patch_flat_pentagon_from_polylines`
+- [x] **Step 1: tests** (`crates/engine/tests/surface_patch.rs`): `patch_flat_pentagon_from_polylines`
   (5 polyline sides on z = 0 → surface object, `max` 0, `within_targets`);
   `patch_fills_hole_in_wavy_sheet_g1` (a `surface.fit` sheet, trimmed 5-gon hole built with
   `kernel::nurbs::trimmed_sheet` and added as a body; sides = the hole's edges, `continuity: g1` →
@@ -322,7 +328,9 @@ point within `gap_tolerance` of a boundary vertex); otherwise the plane projecti
   `open_loop_is_refused` (gap 1 mm → error containing the gap size);
   `patch_with_region_data` (region of a noisy synth wave bounded by 4 polylines → `max ≤ 0.2`);
   `hostile_params_never_panic` additions for the command (follow the existing hostile test file).
-- [ ] **Step 2: implement.**  - [ ] **Step 3:** `cargo fmt`; report.
+- [x] **Step 2: implement.**  - [x] **Step 3:** `cargo fmt`; report.
+
+**Commit:** `ede16a4` (the command; `1939c00` changed only the kernel).
 
 ### Task 5: joining measurement  (Sonnet) — after Task 4 builds
 
@@ -332,6 +340,8 @@ that prints, for a box whose top face is replaced by (a) a flat and (b) a domed 
 stitching at tolerance = gap gives a closed shell, a volume, a STEP round trip, and a boolean cut by
 a small box. No assertions beyond "does not panic". The orchestrator runs it and records the numbers
 in the spec and `docs/STATUS.md`; the result decides whether Task 6 may report a solid.
+
+- [x] **Commit:** `656e9c4` (adds `crates/kernel/tests/patch_join.rs`; `1939c00` changed two lines of it). Task 5 had no checkbox; this line is its tick.
 
 ### Task 6: `surface.from_curves` option `ngon`  (Sonnet) — after Tasks 3–5
 
@@ -345,6 +355,8 @@ data = region vertices; uv from `fit::param::flatten`). Output gains `trimmed_pa
 stitched shell is accepted; otherwise `closed: false` and a warning with the gap).
 Tests: `from_curves_ngon_patch_fills_triangle_and_pentagon` (σ = 0.03; `skipped` empty, `max ≤ 0.2`,
 `trimmed_patches == 2`), `from_curves_default_unchanged` (existing gates untouched), hostile params.
+
+- [x] **Commit:** `866968e`. Task 6 had no checkbox; this line is its tick.
 
 ### Task 7: documentation  (Haiku) — last
 
