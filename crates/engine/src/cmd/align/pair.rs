@@ -64,9 +64,9 @@ pub struct PairOut {
     pub icp_iterations: usize,
     /// Did the final ICP converge?
     pub icp_converged: bool,
-    /// How firmly the matched part pins the pose: below 0.001 it can slide or turn freely (a flat or cylindrical patch; the verdict is then `ambiguous`); up to 0.04 the pose is pushed along its loose directions and refined again, and a different pose that fits as well makes it `ambiguous`.
+    /// How firmly the matched part pins the pose (smallest eigenvalue of its point-to-plane system): 0.2 for a bracket, 0.01 and up for a real scan, below 0.001 it can slide or turn freely (the verdict is then `ambiguous`). It is evidence only: every pose is pushed along its three weakest directions (see `probed`, `slides`), and the verdict follows from what those pushes do.
     pub stability: f64,
-    /// Displaced starts tried for a weakly pinned pose (a pinned pose, or one that slides freely, is not tried).
+    /// Displaced starts tried: the pose is displaced by 0.2 of the moving scan's extent along each of its three weakest directions (more when further ones read below 0.04), in both senses, and refined again (6 for every pose, at most 12).
     pub probed: usize,
     /// Of those, the starts that ended in a different pose that fits as well: slides, listed as alternatives.
     pub slides: usize,

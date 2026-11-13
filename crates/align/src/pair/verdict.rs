@@ -14,17 +14,15 @@ pub const AMBIGUITY_MARGIN: f64 = 0.03;
 pub const CONFIDENCE_THRESHOLD: f64 = 0.5;
 /// Largest share of the moving scan that may lie where the fixed scan is but off it.
 pub(super) const MAX_CONFLICT: f64 = 0.25;
-/// Stability ([`super::score::stability`]) below which the matched part can slide or turn freely
-/// and nothing is tried: `ambiguous`. Measured: such parts read 0.00001 to 0.0004 (cylinder
-/// sector, long cylinder, a patch strictly inside a flat face, on Linux, macOS and Windows), and
-/// the least pinned part that must be found 0.0116 (a real scan): a factor 2.5 above the highest
-/// free one, which does not matter (a free part between the two would be probed and found
-/// ambiguous anyway), and 11 below the lowest legitimate one, which does (it must not be caught).
+/// Stability ([`super::score::stability`]) below which a pose is called `ambiguous` whatever the
+/// probes found: the matched part can slide or turn freely. A safeguard, not the decision (every
+/// pose is probed). Measured on ambiguous parts: 0.00001 to 0.0004 (cylinder sector, long cylinder,
+/// a patch strictly inside a flat face; macOS, Linux, Windows) and, on garbage poses of a patch
+/// that nothing holds, up to 0.04; the lowest legitimate pose measured is 0.0116 (a real scan),
+/// 11 times above the floor, so the floor never catches one.
 pub(super) const STABILITY_FLOOR: f64 = 0.001;
-/// Poses with a stability up to this are probed for slides (see `probe`); above it they are pinned
-/// as far as can matter. Measured legitimate poses: 0.0116 and up, of which only the weakest few
-/// fall below (3.4 times the lowest); every pose above is taken as pinned, the weakest of those
-/// measured being a plate with a bump and partial scans at 0.05.
+/// Directions beyond the three weakest are probed when their eigenvalue is below this (the three
+/// weakest are probed whatever they read). Extra evidence only: no verdict hangs on it.
 pub(super) const WEAK_BELOW: f64 = 0.04;
 /// Largest RMS of the matched part as a fraction of the tolerance.
 pub(super) const MAX_RMS_FRACTION: f64 = 0.5;

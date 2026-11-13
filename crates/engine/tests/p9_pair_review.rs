@@ -273,9 +273,9 @@ type Build = Box<dyn Fn(bool) -> (Mesh, Mesh)>;
 /// What a case must give: ambiguous, or unique within a pose bound (degrees, mm).
 #[derive(Clone, Copy)]
 enum Expect {
-    /// Never unique; `no_match` is accepted where ICP, steered by the raw normals of a fine noisy
-    /// face, drifts off a patch that has nothing to hold it.
-    NotUnique,
+    /// Ambiguous, and the probe itself found slides (displaced starts that settle elsewhere).
+    Slides,
+    /// Ambiguous by whatever route (candidates that fit as well, or slides).
     Ambiguous,
     Unique(f64, f64),
 }
@@ -309,7 +309,7 @@ fn cases() -> Vec<(&'static str, Expect, Build)> {
     vec![
         (
             "strictly flat patch",
-            Expect::NotUnique,
+            Expect::Slides,
             Box::new(move |f| {
                 if f {
                     duo(fine(&plain_plate(10), 1), cut(&fine(&plain_plate(14), 5), interior))
@@ -320,7 +320,7 @@ fn cases() -> Vec<(&'static str, Expect, Build)> {
         ),
         (
             "patch held by slivers",
-            Expect::Ambiguous,
+            Expect::Slides,
             Box::new(move |f| {
                 if f {
                     duo(fine(&bracket_at(12, 48, 16), 1), cut(&fine(&bracket_at(17, 64, 20), 5), sliver))
@@ -331,7 +331,7 @@ fn cases() -> Vec<(&'static str, Expect, Build)> {
         ),
         (
             "cylinder sector",
-            Expect::Ambiguous,
+            Expect::Slides,
             Box::new(move |f| {
                 if f {
                     duo(cyl_at(30.0, 210, 100, 1), cut(&cyl_at(30.0, 250, 120, 5), sector))
@@ -397,7 +397,7 @@ fn cases() -> Vec<(&'static str, Expect, Build)> {
         ),
         (
             "long cylinder",
-            Expect::Ambiguous,
+            Expect::Slides,
             Box::new(move |f| {
                 if f {
                     duo(cyl_at(400.0, 180, 1150, 1), cyl_at(400.0, 210, 1300, 5))
@@ -435,9 +435,9 @@ fn gate_m2_loose_poses_are_decided_by_pushing_them() {
                 out["alternatives"].as_array().unwrap().len()
             );
             match expect {
-                Expect::NotUnique => {
-                    assert_ne!(out["verdict"], "unique", "{name} [{label}]: {out}");
-                    assert!(stability < 0.04 || out["verdict"] == "no_match", "{name} [{label}]: {stability}");
+                Expect::Slides => {
+                    assert_eq!(out["verdict"], "ambiguous", "{name} [{label}]: {out}");
+                    assert!(slides >= 1, "{name} [{label}]: the probe found no slide ({probed} starts)");
                 }
                 Expect::Ambiguous => {
                     assert_eq!(out["verdict"], "ambiguous", "{name} [{label}]: {out}");
@@ -484,4 +484,34 @@ fn gate_m2_a_slender_bar_is_unique_and_a_long_cylinder_is_not() {
     let out = pair(&mut s, json!({}));
     eprintln!("STABILITY long cylinder: {:.5} {}", stab(&out), out["verdict"]);
     assert_eq!(out["verdict"], "ambiguous", "{out}");
+}
+
+/// Restored (it was replaced by the table above in round 3 because the old "flat patch" case read
+/// 0.00001 to 0.014 depending on where ICP left a barely held pose, which says nothing about the
+/// density; that case was a garbage pose, see `gate_m2_loose_poses...`): the stability of a pose
+/// does not move with the density of the mesh. Free parts (a patch strictly inside a flat face, a
+/// cylinder sector) read below the floor 0.001 on both the coarse and the 0.35 mm mesh, with at
+/// least a factor 4 to spare; pinned ones move by less than a factor 3 between the meshes.
+#[test]
+fn gate_m2_stability_does_not_move_with_the_density_of_the_mesh() {
+    let wanted = ["strictly flat patch", "cylinder sector", "blob patch", "plate, 5 % bump", "near-cubic with a bump"];
+    for (name, expect, build) in cases().into_iter().filter(|c| wanted.contains(&c.0)) {
+        let mut read = Vec::new();
+        for fine_mesh in [false, true] {
+            let (fixed, moving) = build(fine_mesh);
+            let mut s = session(&fixed, &moving, &random_motion(1));
+            read.push(stab(&pair(&mut s, json!({}))));
+        }
+        eprintln!("DENSITY {name}: coarse {:.5}, fine {:.5}", read[0], read[1]);
+        match expect {
+            Expect::Slides | Expect::Ambiguous => {
+                assert!(read.iter().all(|&v| v < FLOOR), "{name}: free parts read {read:?}, floor {FLOOR}");
+                assert!(read.iter().all(|&v| 4.0 * v < FLOOR), "{name}: not 4 times below the floor: {read:?}");
+            }
+            Expect::Unique(..) => {
+                let ratio = read[1] / read[0];
+                assert!((1.0 / 3.0..=3.0).contains(&ratio), "{name}: moved with the density, {read:?}");
+            }
+        }
+    }
 }

@@ -10,7 +10,7 @@ use crate::AlignError;
 use nalgebra::{Matrix6, Vector6};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use surfacecraft_geom::{Bvh, Cancel, Mesh, Point3, Transform, Vec3};
+use surfacecraft_geom::{Bvh, Cancel, Mesh, Point3, SurfaceHit, Transform, Vec3};
 
 /// ICP settings.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -83,6 +83,35 @@ pub fn icp_cancellable(
     opts: &IcpOptions,
     cancel: &Cancel,
 ) -> Result<IcpReport, AlignError> {
+    icp_impl(source, target, init, opts, cancel, &|h| target.triangle_normal(h.triangle), false)
+}
+
+/// [`icp_cancellable`] with the surface normal at each correspondence given by `normal` instead of
+/// the normal of the triangle hit. On a fine noisy scan the normal of a single triangle tilts by
+/// about the noise over the edge length, and where the target slides (a flat patch on a plane) the
+/// tilts alone decide the motion; a smoothed normal does not. Also, a step that would move a sample
+/// by more than the trimming distance is damped (a patch whose normals are all alike has an
+/// almost singular system, and the solution would throw it off the target).
+pub fn icp_with_normals(
+    source: &Mesh,
+    target: &Bvh,
+    init: &Transform,
+    opts: &IcpOptions,
+    cancel: &Cancel,
+    normal: &(dyn Fn(&SurfaceHit) -> Option<Vec3> + Sync),
+) -> Result<IcpReport, AlignError> {
+    icp_impl(source, target, init, opts, cancel, normal, true)
+}
+
+fn icp_impl(
+    source: &Mesh,
+    target: &Bvh,
+    init: &Transform,
+    opts: &IcpOptions,
+    cancel: &Cancel,
+    normal: &(dyn Fn(&SurfaceHit) -> Option<Vec3> + Sync),
+    limit_step: bool,
+) -> Result<IcpReport, AlignError> {
     let pts = samples(source, opts.max_samples);
     if pts.len() < 6 {
         return Err(AlignError::NotEnough(format!("{} source points; at least 6 are needed", pts.len())));
@@ -104,9 +133,7 @@ pub fn icp_cancellable(
         // correspondences
         let moved: Vec<Point3> = pts.iter().map(|p| t.apply(p)).collect();
         let hits: Vec<Option<(Point3, Vec3, f64)>> = surfacecraft_geom::par::map_slice(&moved, |p| {
-            target
-                .closest(p, f64::INFINITY)
-                .and_then(|h| target.triangle_normal(h.triangle).map(|n| (h.point, n, h.distance)))
+            target.closest(p, f64::INFINITY).and_then(|h| normal(&h).map(|n| (h.point, n, h.distance)))
         });
         let mut dists: Vec<f64> = hits.iter().flatten().map(|h| h.2).collect();
         if dists.len() < 6 {
@@ -140,16 +167,28 @@ pub fn icp_cancellable(
             return Err(AlignError::NotEnough("too few pairs within the trimming distance".into()));
         }
         rms = (sq / pairs as f64).sqrt();
-        // Levenberg damping only where the system is singular (sliding directions)
+        // Levenberg damping where the system is singular (sliding directions), and where it is so
+        // nearly singular that the solution would move a sample by more than the trimming distance
+        // (a patch that nothing holds, whose normals differ by noise only)
         let scale = ata.diagonal().max().max(1e-300);
+        let reach = |x: &Vector6<f64>| {
+            let (w, tr) = (Vec3::new(x[0], x[1], x[2]), Vec3::new(x[3], x[4], x[5]));
+            moved.iter().map(|p| (w.cross(&(p.coords - c)) + tr).norm()).fold(0.0, f64::max)
+        };
+        let mut last = None;
         let sol = loop {
             let damped = ata + Matrix6::identity() * (lambda * scale);
             if let Some(ch) = damped.cholesky() {
-                break Some(ch.solve(&(-atb)));
+                let x = ch.solve(&(-atb));
+                let small = !limit_step || reach(&x) <= cut;
+                last = Some(x);
+                if small {
+                    break last;
+                }
             }
             lambda = if lambda == 0.0 { 1e-12 } else { lambda * 10.0 };
             if lambda > 1.0 {
-                break None;
+                break last;
             }
         };
         let Some(x) = sol else {

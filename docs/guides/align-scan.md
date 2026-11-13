@@ -143,14 +143,20 @@ Normals, colours and per-vertex data go with the coordinates.
   the pose, `overlap_moving` and `overlap_fixed` (shares of each scan's area that lie on the other
   within `tolerance`), a `verdict` and a `confidence`.
 - `verdict`: `unique` (one pose clearly fits better than any other: every other pose has at least
-  3 % of the moving scan's area more in conflict or less on the target), `ambiguous` (a symmetric
-  part: the near-tied poses are in `alternatives`; or a matched part that can slide or turn freely,
-  such as a flat or cylindrical patch: `stability` near 0, or a displaced start that settles in a
-  different pose that fits as well, see `probed` and `slides`) or `no_match` (too
-  little overlap, or different parts). It proposes by default (`apply` false); a pose that is
-  not `unique` is applied only when `choose` names it (0 the best, 1 and up the alternatives; `choose`
-  needs `apply`). The result then carries the numbers of the pose chosen. When `apply` was given
-  and nothing moved, `refused` is true.
+  3 % of the moving scan's area more in conflict or less on the target, and the pose survives being
+  pushed), `ambiguous` (a symmetric part: the near-tied poses are in `alternatives`; or a part that
+  can slide or turn freely, such as a flat or cylindrical patch) or `no_match` (too little overlap,
+  or different parts).
+- The push: every pose is displaced by 0.2 of the moving scan's extent along each of its three
+  weakest directions (the eigenvectors of its point-to-plane system), in both senses, and refined
+  again: 6 extra ICP runs, about 0.7 s on a scan of a million triangles. A start that settles in a
+  different pose (more than 2 % of the diagonal away) that fits as well is a slide (`slides`) and
+  is listed as an alternative; if all come back the pose is held. No verdict depends on how loose
+  the pose reads (`stability`: 0.2 for a bracket, 0.01 and up for real scans; below 0.001 the part
+  is free and always `ambiguous`).
+- It proposes by default (`apply` false); a pose that is not `unique` is applied only when
+  `choose` names it (0 the best, 1 and up the alternatives; `choose` needs `apply`). The result then
+  carries the numbers of the pose chosen. When `apply` was given and nothing moved, `refused` is true.
 - Limits: the triangles of both scans must be consistently oriented (the descriptors use the
   normals); surface that ends at the border of the other scan is no conflict, but a part whose
   shared region is only flat or a cylinder-like surface is reported `ambiguous`; a scan that

@@ -9,7 +9,7 @@
 //! The outcome is a large effect (the pose returns, or it does not), so it does not depend on
 //! rounding.
 use super::score::{clearance, fit_of, pose_gap, stability};
-use super::verdict::{STABILITY_FLOOR, WEAK_BELOW};
+use super::verdict::WEAK_BELOW;
 use super::{AMBIGUITY_MARGIN, Cancel, Cand, Ranked, SAME_POSE_AFTER, Scene};
 use crate::AlignError;
 use surfacecraft_geom::Transform;
@@ -36,16 +36,13 @@ pub(super) struct Probe {
 }
 
 impl Scene<'_> {
-    /// Tests `best` (already polished) for slides; see the module docs. Poses with a stability
-    /// above `WEAK_BELOW` are taken as pinned, those below `STABILITY_FLOOR` as free, without a
-    /// test.
+    /// Tests `best` (already polished) for slides; see the module docs. Every pose is tested, along
+    /// its three weakest directions and any further one below `WEAK_BELOW`: no verdict depends on
+    /// how loose the pose reads.
     pub(super) fn probe(&self, best: &Ranked, tau: f64, cancel: &Cancel) -> Result<Probe, AlignError> {
         let extent = surfacecraft_geom::Aabb::from_points(&self.mov.pts).diagonal();
         let st = stability(&self.fixed, &self.fix, &self.mov.pts, &best.cand.t, tau, WEAK_BELOW, PROBE_STEP * extent);
         let mut probe = Probe { stability: st.min, slides: Vec::new(), tested: 0, margin: None, returned_gap: 0.0 };
-        if st.min < STABILITY_FLOOR {
-            return Ok(probe);
-        }
         let probes = super::score::corners(&self.mov.pts);
         for twist in &st.weak {
             for sign in [1.0, -1.0] {
@@ -72,5 +69,60 @@ impl Scene<'_> {
     /// Is `t` the pose of one of `found`?
     fn known(&self, found: &[Ranked], t: &Transform, probes: &[surfacecraft_geom::Point3]) -> bool {
         found.iter().any(|r| pose_gap(&r.cand.t, t, probes) <= SAME_POSE_AFTER * self.diag)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pair::{CoarseMethod, PairOptions, PairVerdict, solve};
+    use surfacecraft_geom::{Mesh, Point3, Rng, Vec3, synth};
+
+    fn noisy(mut m: Mesh, seed: u64) -> Mesh {
+        synth::add_noise(&mut m, 0.03, &mut Rng::new(seed));
+        m
+    }
+
+    /// The pose "as built" (identity) as the only candidate, solved with the probes.
+    fn alone(moving: &Mesh, fixed: &Mesh) -> crate::pair::PairResult {
+        let scene = Scene::new(moving, fixed, &Cancel::new()).unwrap();
+        let only = Cand { t: Transform::identity(), method: CoarseMethod::PrincipalAxes };
+        solve(&scene, vec![only], &PairOptions::default(), &Cancel::new()).unwrap()
+    }
+
+    /// A patch strictly inside a plane slides: shifts and a turn are all free. With one candidate
+    /// there are no candidate alternatives, so every alternative is a slide found by the probe.
+    #[test]
+    fn a_plane_patch_on_a_plane_slides() {
+        let fixed = noisy(synth::plane(Point3::origin(), Vec3::x(), Vec3::y(), 60.0, 40.0, 24, 16), 1);
+        let patch = noisy(synth::plane(Point3::new(20.0, 10.0, 0.0), Vec3::x(), Vec3::y(), 22.0, 16.0, 11, 8), 2);
+        let r = alone(&patch, &fixed);
+        assert!(r.slides >= 3, "{} slides of {} starts", r.slides, r.probed);
+        assert_eq!(r.verdict, PairVerdict::Ambiguous);
+        assert!(!r.alternatives.is_empty());
+    }
+
+    /// A band of a cylinder slides along the axis and around it.
+    #[test]
+    fn a_cylinder_band_slides_along_and_around_the_axis() {
+        let fixed = noisy(synth::cylinder(Point3::origin(), Vec3::z(), 10.0, 60.0, 48, 24), 1);
+        let band = noisy(synth::cylinder(Point3::new(0.0, 0.0, 20.0), Vec3::z(), 10.0, 20.0, 40, 10), 2);
+        let r = alone(&band, &fixed);
+        assert!(r.slides >= 2, "{} slides of {} starts", r.slides, r.probed);
+        assert_eq!(r.verdict, PairVerdict::Ambiguous);
+    }
+
+    /// A pinned shape: every displaced start comes back (or fits clearly worse), no slide.
+    #[test]
+    fn a_pinned_shape_gives_no_slide() {
+        let fixed = noisy(synth::bracket(), 1);
+        let moving = noisy(synth::bracket(), 2);
+        let scene = Scene::new(&moving, &fixed, &Cancel::new()).unwrap();
+        let tau = 0.3;
+        let best = scene.rank(vec![Cand { t: Transform::identity(), method: CoarseMethod::PrincipalAxes }], tau);
+        let probe = scene.probe(&best[0], tau, &Cancel::new()).unwrap();
+        assert_eq!(probe.tested, 6, "the three weakest directions, both senses");
+        assert!(probe.slides.is_empty(), "{} slides", probe.slides.len());
+        assert!(probe.margin.is_none_or(|m| m >= 2.0 * AMBIGUITY_MARGIN), "{:?}", probe.margin);
     }
 }

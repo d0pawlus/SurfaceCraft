@@ -23,13 +23,15 @@ mod sample;
 mod score;
 mod verdict;
 
-use crate::{AlignError, IcpOptions, icp_cancellable};
+use crate::{AlignError, IcpOptions, IcpReport, icp_with_normals};
 use sample::Samples;
 use score::{Fit, Target, clearance, corners, fit_of, median, pose_gap};
-use surfacecraft_geom::{Cancel, Mesh, Point3, Transform};
+use surfacecraft_geom::{Cancel, Mesh, Point3, SurfaceHit, Transform};
 
 pub use verdict::{AMBIGUITY_MARGIN, CONFIDENCE_THRESHOLD, CoarseMethod, MIN_OVERLAP, PairCandidate, PairVerdict};
 
+/// A triangle and a fixed sample are on the same face when their normals agree to this cosine (30 degrees).
+const SAME_FACE_COS: f64 = 0.866;
 /// Fewest triangles a scan may have.
 const MIN_TRIANGLES: usize = 4;
 /// Most samples per scan in the coarse stage.
@@ -173,9 +175,25 @@ impl<'a> Scene<'a> {
             .into_iter()
             .map(|t| Cand { t, method: CoarseMethod::PrincipalAxes })
             .collect();
+        out.extend(self.on_surface_variants(&out));
         let poses = ransac::descriptor_poses(&self.mov, &self.fix, self.spacing, cancel)?;
         out.extend(poses.into_iter().map(|t| Cand { t, method: CoarseMethod::Descriptors }));
         Ok(out)
+    }
+
+    /// Each candidate again with the moving centroid moved from the fixed centroid onto the fixed
+    /// surface (to the point of it nearest to that centroid): a patch of a thick or a thin part has
+    /// its centroid inside the whole part, out of reach of ICP or midway between two faces, where
+    /// it hovers; on the surface it is within reach and flush.
+    fn on_surface_variants(&self, cands: &[Cand]) -> Vec<Cand> {
+        let n = self.fix.pts.len().max(1) as f64;
+        let centroid = Point3::from(self.fix.pts.iter().map(|p| p.coords).sum::<surfacecraft_geom::Vec3>() / n);
+        let Some(hit) = self.fixed.bvh.closest(&centroid, f64::INFINITY) else { return Vec::new() };
+        if hit.distance <= TAU_RANGE.0 * self.diag {
+            return Vec::new();
+        }
+        let shift = Transform::translation(hit.point - centroid);
+        cands.iter().map(|c| Cand { t: shift.then_after(&c.t), method: c.method }).collect()
     }
 
     /// The best distinct candidates under a loose tolerance, best first.
@@ -203,6 +221,24 @@ impl<'a> Scene<'a> {
         kept
     }
 
+    /// ICP of `source` onto the fixed scan with smoothed normals: the plane-fitted normal of the
+    /// nearest fixed sample where it lies on the same face as the triangle hit (their normals within
+    /// 30 degrees), the triangle's own normal elsewhere (at an edge). On a fine noisy fixed scan the
+    /// raw normals tilt by about noise over edge length, and a patch that nothing holds then walks
+    /// off by the tilts alone.
+    fn icp(&self, source: &Mesh, t: &Transform, opts: &IcpOptions, cancel: &Cancel) -> Result<IcpReport, AlignError> {
+        let normal = |h: &SurfaceHit| {
+            let raw = self.fixed.bvh.triangle_normal(h.triangle)?;
+            let near =
+                self.fix.tree.nearest(&h.point).and_then(|(j, _)| Some((self.fix.nrm.get(j)?, self.fix.fit.get(j)?)));
+            Some(match near {
+                Some((smooth, fit)) if raw.dot(smooth) > SAME_FACE_COS => *fit,
+                _ => raw,
+            })
+        };
+        icp_with_normals(source, &self.fixed.bvh, t, opts, cancel, &normal)
+    }
+
     /// Two ICP passes from `c`; `None` when ICP cannot run from there (the candidate is dropped).
     fn refine(&self, c: &Cand, cancel: &Cancel) -> Result<Option<Cand>, AlignError> {
         let mut t = c.t;
@@ -213,7 +249,7 @@ impl<'a> Scene<'a> {
                 max_distance: Some(cut * self.diag),
                 max_samples: SAMPLE_CAP,
             };
-            match icp_cancellable(&self.mov_cloud, &self.fixed.bvh, &t, &opts, cancel) {
+            match self.icp(&self.mov_cloud, &t, &opts, cancel) {
                 Ok(rep) => t = rep.transform,
                 Err(AlignError::Cancelled) => return Err(AlignError::Cancelled),
                 Err(_) => return Ok(None),
@@ -240,6 +276,15 @@ impl<'a> Scene<'a> {
 
     /// The tolerance: the user's, or five times the median residual of the best refined pose.
     fn tolerance(&self, refined: &[Cand], user: Option<f64>) -> f64 {
+        if std::env::var("PAIR_DBG").is_ok() {
+            for r in refined {
+                eprintln!(
+                    "DBG refined msac {:.4} share {:.3}",
+                    self.msac_at(&r.t, TAU_RANGE.1 * self.diag),
+                    fit_of(&self.fixed, &self.mov.pts, &r.t, TAU_RANGE.1 * self.diag, false).share
+                );
+            }
+        }
         let (lo, hi) = (TAU_RANGE.0 * self.diag, TAU_RANGE.1 * self.diag);
         if let Some(u) = user {
             return u;
@@ -296,7 +341,7 @@ impl<'a> Scene<'a> {
     fn converge(&self, t: &Transform, tau: f64, cancel: &Cancel) -> Result<Transform, AlignError> {
         let opts =
             IcpOptions { max_iterations: 100, tolerance: 1e-4, max_distance: Some(3.0 * tau), max_samples: SAMPLE_CAP };
-        match icp_cancellable(&self.mov_cloud, &self.fixed.bvh, t, &opts, cancel) {
+        match self.icp(&self.mov_cloud, t, &opts, cancel) {
             Ok(rep) => Ok(rep.transform),
             Err(AlignError::Cancelled) => Err(AlignError::Cancelled),
             Err(_) => Ok(*t),
@@ -307,7 +352,7 @@ impl<'a> Scene<'a> {
     /// worse), with the iterations it took and whether it converged.
     fn polish(&self, best: &Ranked, tau: f64, cancel: &Cancel) -> Result<(Ranked, usize, bool), AlignError> {
         let opts = IcpOptions { max_distance: Some(3.0 * tau), ..IcpOptions::default() };
-        let rep = match icp_cancellable(self.moving, &self.fixed.bvh, &best.cand.t, &opts, cancel) {
+        let rep = match self.icp(self.moving, &best.cand.t, &opts, cancel) {
             Ok(rep) => rep,
             Err(AlignError::Cancelled) => return Err(AlignError::Cancelled),
             Err(_) => return Ok((Ranked { cand: best.cand, fit: best.fit }, 0, false)),

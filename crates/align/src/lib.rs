@@ -34,7 +34,7 @@ mod turned;
 pub use auto::{AutoMethod, AutoPose, BaseFace, CONFIDENCE_THRESHOLD, LevelMode, auto_pose};
 pub use datum::{Datum, datum_321};
 pub use frame::InPlane;
-pub use icp::{IcpOptions, IcpReport, icp, icp_cancellable, rms_to_surface};
+pub use icp::{IcpOptions, IcpReport, icp, icp_cancellable, icp_with_normals, rms_to_surface};
 pub use kabsch::kabsch;
 pub use pair::{PairCandidate, PairOptions, PairResult, PairVerdict, pair_coarse};
 pub use principal::principal_frame;

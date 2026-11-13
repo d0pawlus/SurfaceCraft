@@ -171,14 +171,22 @@ impl Twist {
 pub(super) struct Stability {
     /// Smallest eigenvalue of the normalised point-to-plane system (see [`stability`]).
     pub min: f64,
-    /// The directions of the eigenvalues below the bound asked for, weakest first (at most six).
+    /// The weakest directions, weakest first (see [`stability`]).
     pub weak: Vec<Twist>,
 }
 
+/// Directions always returned: a rigid motion has at most three free directions on a surface that
+/// slides (a plane patch: two shifts and a turn; a sphere patch: three turns), and any free
+/// motion is a combination of free eigenvectors, so the three weakest cannot miss one.
+const ALWAYS_WEAK: usize = 3;
+/// Most directions returned.
+const MAX_WEAK: usize = 6;
+
 /// How firmly the matched part pins the pose (geometric stability, after Gelfand et al. 2003):
 /// the eigenvalues of the point-to-plane normal equations of the matched points at `t`. The
-/// smallest is 0 when the part can slide or turn freely; the eigenvectors of those below
-/// `weak_below` are returned as motions of largest displacement `step` mm, to be tried.
+/// smallest is 0 when the part can slide or turn freely. The eigenvectors of the three weakest
+/// (and of any further one below `weak_below`, up to six) are returned as motions of largest
+/// displacement `step` mm, to be tried: no verdict depends on where an eigenvalue lies.
 ///
 /// Two things keep it comparable between scans: the surface normals are the plane-fitted ones of
 /// the nearest fixed sample (a raw face normal of a fine noisy mesh tilts by about noise over edge
@@ -202,51 +210,89 @@ pub(super) fn stability(
         Some((q, *fixed.fit.get(j)?))
     });
     let used: Vec<&(Point3, Vec3)> = hits.iter().flatten().collect();
-    if used.len() < 6 {
-        return none;
-    }
-    let n = used.len() as f64;
-    let c = used.iter().map(|h| h.0.coords).sum::<Vec3>() / n;
-    let cov = used.iter().fold(Mat3::zeros(), |m, h| m + (h.0.coords - c) * (h.0.coords - c).transpose()) / n;
-    if cov.iter().any(|v| !v.is_finite()) {
-        return none;
-    }
-    let frame = cov.symmetric_eigen();
-    let trace = cov.trace();
-    let lever: Vec<f64> = (0..3).map(|i| (trace - frame.eigenvalues[i]).max(0.0).sqrt()).collect();
-    if lever.iter().any(|l| !(*l > 0.0)) {
-        return none;
-    }
-    let mut a = nalgebra::Matrix6::<f64>::zeros();
-    for (q, nrm) in used.iter().map(|h| (&h.0, &h.1)) {
-        let r = (q.coords - c).cross(nrm);
-        let mut row = nalgebra::Vector6::zeros();
-        for i in 0..3 {
-            let e = frame.eigenvectors.column(i);
-            row[i] = r.dot(&e) / lever[i];
-            row[3 + i] = nrm.dot(&e);
-        }
-        a += row * row.transpose();
-    }
-    let Some((eig, order)) = weakest_first(&(a / n)) else { return none };
+    let Some(frame) = Frame::of(&used) else { return none };
+    let Some((eig, order)) = weakest_first(&frame.system(&used)) else { return none };
     let min = eig.eigenvalues[order[0]].max(0.0);
-    let centre = Point3::from(c);
-    let mut weak = Vec::new();
-    for &k in order.iter().filter(|&&k| eig.eigenvalues[k] < weak_below).take(6) {
-        let v = eig.eigenvectors.column(k);
-        let (mut omega, mut shift) = (Vec3::zeros(), Vec3::zeros());
-        for i in 0..3 {
-            let e: Vec3 = frame.eigenvectors.column(i).into_owned();
-            omega += e * (v[i] / lever[i]);
-            shift += e * v[3 + i];
-        }
-        let reach = used.iter().map(|h| (omega.cross(&(h.0.coords - c)) + shift).norm()).fold(0.0, f64::max);
-        if reach > 0.0 && reach.is_finite() {
-            let scale = step / reach;
-            weak.push(Twist { centre, omega: omega * scale, shift: shift * scale });
-        }
-    }
+    let weak = frame.weak_twists(&used, &eig, &order, weak_below, step);
     Stability { min: if min.is_finite() { min } else { 0.0 }, weak }
+}
+
+/// The principal frame of the matched points: centroid, axes, and the lever arm of the rotation
+/// about each axis (the RMS distance of the points from that axis).
+struct Frame {
+    centre: Vec3,
+    axes: Vec<Vec3>,
+    lever: Vec<f64>,
+}
+
+impl Frame {
+    fn of(used: &[&(Point3, Vec3)]) -> Option<Frame> {
+        if used.len() < 6 {
+            return None;
+        }
+        let n = used.len() as f64;
+        let centre = used.iter().map(|h| h.0.coords).sum::<Vec3>() / n;
+        let cov =
+            used.iter().fold(Mat3::zeros(), |m, h| m + (h.0.coords - centre) * (h.0.coords - centre).transpose()) / n;
+        if cov.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+        let eig = cov.symmetric_eigen();
+        let trace = cov.trace();
+        let lever: Vec<f64> = (0..3).map(|i| (trace - eig.eigenvalues[i]).max(0.0).sqrt()).collect();
+        if lever.iter().any(|l| !(*l > 0.0)) {
+            return None;
+        }
+        let axes = (0..3).map(|i| eig.eigenvectors.column(i).into_owned()).collect();
+        Some(Frame { centre, axes, lever })
+    }
+
+    /// The normal equations of the matched points: rotation about each axis scaled by its lever
+    /// arm, then the shift along each axis; divided by the number of points.
+    fn system(&self, used: &[&(Point3, Vec3)]) -> nalgebra::Matrix6<f64> {
+        let mut a = nalgebra::Matrix6::<f64>::zeros();
+        for (q, nrm) in used.iter().map(|h| (&h.0, &h.1)) {
+            let r = (q.coords - self.centre).cross(nrm);
+            let mut row = nalgebra::Vector6::zeros();
+            for (i, e) in self.axes.iter().enumerate() {
+                row[i] = r.dot(e) / self.lever[i];
+                row[3 + i] = nrm.dot(e);
+            }
+            a += row * row.transpose();
+        }
+        a / used.len() as f64
+    }
+
+    /// The motions of the weakest eigenvectors (see [`stability`]), each scaled to move the matched
+    /// point that moves most by `step`.
+    fn weak_twists(
+        &self,
+        used: &[&(Point3, Vec3)],
+        eig: &nalgebra::linalg::SymmetricEigen<f64, nalgebra::U6>,
+        order: &[usize],
+        weak_below: f64,
+        step: f64,
+    ) -> Vec<Twist> {
+        let mut weak = Vec::new();
+        for (rank, &k) in order.iter().take(MAX_WEAK).enumerate() {
+            if rank >= ALWAYS_WEAK && eig.eigenvalues[k] >= weak_below {
+                break;
+            }
+            let v = eig.eigenvectors.column(k);
+            let (mut omega, mut shift) = (Vec3::zeros(), Vec3::zeros());
+            for (i, e) in self.axes.iter().enumerate() {
+                omega += e * (v[i] / self.lever[i]);
+                shift += e * v[3 + i];
+            }
+            let reach =
+                used.iter().map(|h| (omega.cross(&(h.0.coords - self.centre)) + shift).norm()).fold(0.0, f64::max);
+            if reach > 0.0 && reach.is_finite() {
+                let scale = step / reach;
+                weak.push(Twist { centre: Point3::from(self.centre), omega: omega * scale, shift: shift * scale });
+            }
+        }
+        weak
+    }
 }
 
 /// The eigen decomposition of a symmetric matrix with the indices of its eigenvalues, smallest
