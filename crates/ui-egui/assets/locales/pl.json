@@ -902,6 +902,7 @@
   "param.align_frame": "Wyprostuj szkic",
   "param.angle_tolerance_degrees": "Tolerancja kąta",
   "param.max_patches": "Maks. płatów",
+  "param.allow_retry": "Ponów z większym limitem",
   "param.refine": "Zagęszczanie",
   "param.crease_deg": "Kąt załamania",
   "param.continuity": "Ciągłość",

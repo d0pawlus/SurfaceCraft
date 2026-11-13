@@ -4,7 +4,7 @@
 //! worth its time), and the better result is returned. The losing attempt leaves nothing in the
 //! document, and the whole run is still one undo step.
 use super::super::{CANCELLED, CmdError, cancelled};
-use super::budget::Budget;
+use super::budget::CallBudget;
 use super::{
     CmdResult, Issue, MIN_MODELLED_SHARE, Method, NextStep, ScanSummary, Settings, ToSolidIn, ToSolidOut, Verdict,
     freeform, message_of, primitives_solid, scan_primitive_share, segment_scan, step,
@@ -153,6 +153,8 @@ pub(super) struct Plan {
     /// `retry` of the call.
     pub retry: bool,
     pub limits: Limits,
+    /// The call's budget of extra attempts, shared with the freeform fit's retry.
+    pub budget: CallBudget,
 }
 
 fn record(method: Method, result: &ToSolidOut, seconds: f64) -> Attempt {
@@ -261,8 +263,8 @@ pub(super) fn orchestrate(
     if s.cancel.is_cancelled() {
         return Err(cancelled());
     }
-    let mut budget = Budget::after_first(first_seconds);
-    let refusal = skip_reason(plan, first_seconds).or_else(|| (!budget.draw()).then(|| budget.refusal()));
+    plan.budget.set_first(first_seconds);
+    let refusal = skip_reason(plan, first_seconds).or_else(|| (!plan.budget.draw()).then(|| plan.budget.refusal()));
     if let Some(reason) = refusal {
         let skipped = skipped_attempt(plan, second, reason);
         return Ok(ToSolidReport { result: first_result, attempts: vec![first_record, skipped] });
@@ -270,7 +272,7 @@ pub(super) fn orchestrate(
     let after_first = std::mem::replace(&mut s.doc, base);
     let timer = Timer::start();
     let second_outcome = exec(s, second);
-    budget.spend(timer.seconds());
+    plan.budget.spend(timer.seconds());
     // a call cancelled while the second attempt ran ends in the cancellation, whatever it returned
     if s.cancel.is_cancelled() {
         return Err(cancelled());
@@ -367,6 +369,7 @@ pub(super) fn run(s: &mut Session, i: &ToSolidIn, set: &Settings, mut report: Sc
             triangles: report.triangles,
             retry: i.retry.unwrap_or(true),
             limits: Limits::default(),
+            budget: set.budget.clone(),
         };
         orchestrate(s, &plan, &mut exec)?
     };
@@ -406,6 +409,7 @@ mod tests {
             scan: ObjectId(1),
             body: body.map(|volume| BodyOut { id: ObjectId(2), faces: 6, edges: 12, vertices: 8, volume }),
             patches: None,
+            retry: None,
             tolerance: 0.2,
             deviation: Some(DeviationSummary {
                 count: 1000,
@@ -509,7 +513,15 @@ mod tests {
     type Outcomes = HashMap<&'static str, CmdResult<ToSolidOut>>;
 
     fn plan(share: f64) -> Plan {
-        Plan { scan: ObjectId(1), tolerance: 0.2, share, triangles: 1000, retry: true, limits: Limits::default() }
+        Plan {
+            scan: ObjectId(1),
+            tolerance: 0.2,
+            share,
+            triangles: 1000,
+            retry: true,
+            limits: Limits::default(),
+            budget: CallBudget::default(),
+        }
     }
 
     /// Runs `orchestrate` with a fake that leaves a mesh named after the method in the document and
