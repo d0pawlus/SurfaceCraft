@@ -9,14 +9,18 @@ pub(crate) const MAX_DESCRIPTION_CHARS: usize = 120;
 /// Hard cap (characters) of one command summary in an area tool's verb list.
 pub(crate) const MAX_SUMMARY_CHARS: usize = 80;
 /// Abbreviations whose full stop does not end a sentence.
-const ABBREVIATIONS: &[&str] = &["e.g", "i.e", "vs", "cf"];
+const ABBREVIATIONS: &[&str] = &["e.g", "i.e", "vs", "cf", "etc", "approx"];
 const ELLIPSIS: char = '…';
 
 /// Whether the full stop at byte `at` of `text` ends a sentence: it is followed by white space or
-/// the end, and does not close an abbreviation.
+/// the end, the text after it does not go on in lower case or with a digit ("1. cut 2. fill",
+/// "no. 5"), and it does not close an abbreviation.
 fn ends_sentence(text: &str, at: usize) -> bool {
     let after = text.get(at + 1..).unwrap_or_default();
     if after.chars().next().is_some_and(|c| !c.is_whitespace()) {
+        return false;
+    }
+    if after.trim_start().chars().next().is_some_and(|c| c.is_lowercase() || c.is_ascii_digit()) {
         return false;
     }
     let before = text.get(..at).unwrap_or_default();
@@ -60,7 +64,18 @@ pub(crate) fn shorten_description(text: &str, cap: usize) -> String {
     let cut = cut_point(sentence, cap.saturating_sub(1));
     let head =
         sentence.get(..cut).unwrap_or_default().trim_end_matches(|c: char| c.is_whitespace() || ",;:".contains(c));
-    format!("{head}{ELLIPSIS}")
+    format!("{}{ELLIPSIS}", balanced(head))
+}
+
+/// `head` without its last backtick when it opens a code span the cut left unclosed (a span longer
+/// than the cap that starts the sentence), so the output never carries a dangling backtick.
+fn balanced(head: &str) -> String {
+    if head.matches('`').count().is_multiple_of(2) {
+        return head.to_string();
+    }
+    let Some(at) = head.rfind('`') else { return head.to_string() };
+    let (before, after) = head.split_at(at);
+    format!("{before}{}", after.get(1..).unwrap_or_default())
 }
 
 /// Keywords whose value is one schema.

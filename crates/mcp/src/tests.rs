@@ -271,10 +271,9 @@ fn rpc<B: Backend + Send + 'static>(s: &mut Server<B>, method: &str, params: Val
 /// transport, unchanged: the structural shortening brought the listing to about 37 400 bytes, and
 /// the space below the budget is what lets commands gain parameters without hand trimming.
 const MAX_DEFAULT_LISTING: usize = 48_000;
-/// Bytes the default listing must stay below its limit, so a new parameter never forces a hand trim.
+/// Smallest gap (bytes) between the default listing and its limit: when less is left, the listing
+/// is shortened structurally before a new parameter has to be trimmed by hand.
 const MIN_HEADROOM: usize = 2_000;
-/// Length and FNV-1a hash of the full listing (`--tools full`), which the shortening must not touch.
-const FULL_LISTING_PIN: (usize, u64) = (478_118, 0x5af6_fdf8_b8cc_cf6c);
 
 #[test]
 fn the_default_listing_is_small_and_carries_the_workflow_tools_in_full() {
@@ -285,8 +284,6 @@ fn the_default_listing_is_small_and_carries_the_workflow_tools_in_full() {
     let reply = rpc(&mut s, "tools/list", Value::Null);
 
     // Assert
-    let size = reply.to_string().len();
-    assert!(size < MAX_DEFAULT_LISTING, "the default listing is {size} bytes");
     let tools = reply["result"]["tools"].as_array().expect("tools");
     let tool = |name: &str| tools.iter().find(|t| t["name"] == name);
     for id in FEATURED {
@@ -408,11 +405,6 @@ mod shortening {
     use super::*;
     use crate::shorten::{MAX_DESCRIPTION_CHARS, first_sentence, shorten_description, shorten_schema};
 
-    /// FNV-1a, enough to pin a listing byte for byte.
-    fn fnv(text: &str) -> u64 {
-        text.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
-    }
-
     fn listing_text(s: &mut Server<LocalBackend>) -> String {
         rpc(s, "tools/list", Value::Null).to_string()
     }
@@ -471,20 +463,46 @@ mod shortening {
 
     #[test]
     fn a_cut_never_lands_inside_code_or_a_number() {
-        let text = format!("{} `some_long_identifier_name` end", "x".repeat(100));
+        // The word boundary before the cap lies inside the code span: the cut backs out of it.
+        let text = format!("{} `a b c d e f g h i j k l m n o p` end", "x".repeat(100));
         let cut = shorten_description(&text, MAX_DESCRIPTION_CHARS);
-        assert_eq!(cut.matches('`').count() % 2, 0, "{cut}");
-        let text = format!("{} 0.25 tail", "y".repeat(112));
+        assert_eq!(cut, format!("{}…", "x".repeat(100)), "{cut}");
+        // The cap lands inside the number: the number goes as a whole.
+        let text = format!("{} 0.25 tail", "y".repeat(116));
         let cut = shorten_description(&text, MAX_DESCRIPTION_CHARS);
-        assert!(!cut.contains("0.") || cut.contains("0.25"), "{cut}");
+        assert_eq!(cut, format!("{}…", "y".repeat(116)), "{cut}");
+    }
+
+    #[test]
+    fn a_code_span_longer_than_the_cap_leaves_no_dangling_backtick() {
+        let text = format!("`{}` selects the mode", "word ".repeat(40).trim_end());
+        let cut = shorten_description(&text, MAX_DESCRIPTION_CHARS);
+        assert!(!cut.contains('`'), "{cut}");
+        assert!(cut.starts_with("word word") && cut.ends_with("word…"), "{cut}");
+        assert!(cut.chars().count() <= MAX_DESCRIPTION_CHARS, "{cut}");
+    }
+
+    #[test]
+    fn a_full_stop_before_lower_case_or_a_digit_is_not_a_sentence_end() {
+        assert_eq!(first_sentence("Steps: 1. cut 2. fill. Then stop."), "Steps: 1. cut 2. fill.");
+        assert_eq!(first_sentence("Units: mm, cm, etc. Default mm."), "Units: mm, cm, etc. Default mm.");
+        assert_eq!(first_sentence("Region no. 5 of the scan. More."), "Region no. 5 of the scan.");
+        assert_eq!(first_sentence("Size, approx. Twice the edge. More."), "Size, approx. Twice the edge.");
+        assert_eq!(first_sentence("Angle ≥ 5°. `x` × 2 follows."), "Angle ≥ 5°.");
     }
 
     #[test]
     fn cutting_multi_byte_text_is_valid_utf8_at_every_cap() {
-        let text = "zażółć gęślą jaźń ".repeat(20) + "日本語のテキスト ".repeat(20).as_str();
-        for cap in 0..200 {
+        let text = "zażółć gęślą ≥ 5° × 2 jaźń ".repeat(8) + "日本語のテキスト ".repeat(8).as_str();
+        let whole = first_sentence(&text);
+        for cap in 0..whole.chars().count() + 2 {
             let cut = shorten_description(&text, cap);
-            assert!(cut.chars().count() <= cap.max(1) + 1, "cap {cap}: {cut}");
+            assert!(cut.chars().count() <= cap.max(1), "cap {cap}: {cut}");
+            assert!(cut.ends_with('…') || cut == whole, "cap {cap}: {cut}");
+            let kept = cut.trim_end_matches('…');
+            assert!(whole.starts_with(kept), "cap {cap}: {cut} is not a prefix");
+            // A cut backs up by at most one word (the longest here has 8 characters) and its space.
+            assert!(kept.chars().count() + 12 > cap.min(whole.chars().count()), "cap {cap}: {cut} lost text");
         }
         let no_space = "ę".repeat(500);
         assert!(shorten_description(&no_space, 120).chars().count() <= 120);
@@ -631,9 +649,19 @@ mod shortening {
     }
 
     #[test]
-    fn the_full_listing_is_byte_identical_to_before_the_shortening() {
-        let text = listing_text(&mut server());
-        assert_eq!((text.len(), fnv(&text)), FULL_LISTING_PIN, "the full listing changed");
+    fn the_full_listing_carries_every_command_unshortened() {
+        let mut full = server();
+        let tools = listed_tools(&mut full);
+        for c in registry() {
+            let name = tool_name(c.id);
+            let tool = tools.iter().find(|t| t["name"] == name.as_str()).unwrap_or_else(|| panic!("{} missing", c.id));
+            assert_eq!(tool["inputSchema"], crate::listing::queueable((c.input)()), "{}: input schema", c.id);
+            assert_eq!(tool["description"], format!("{} ({})", c.summary, c.id), "{}: description", c.id);
+            assert_eq!(tool["outputSchema"], (c.output)(), "{}: output schema", c.id);
+        }
+        let text = listing_text(&mut full);
+        assert!(!text.contains("Parameter notes shortened"), "a full-mode tool says it was shortened");
+        assert!(!text.contains(crate::listing::QUEUED_NOTE), "full mode carries the short `queued` text");
     }
 
     #[test]
@@ -642,7 +670,7 @@ mod shortening {
         let mut full = server();
         let mut compact = default_server();
         let (f, c) = (listing_text(&mut full), listing_text(&mut compact));
-        println!("TOTAL default={} full={} full_fnv={:#x}", c.len(), f.len(), fnv(&f));
+        println!("TOTAL default={} full={}", c.len(), f.len());
         for t in listed_tools(&mut compact) {
             println!(
                 "TOOL {} {} bytes, description {} bytes, schema {} bytes",

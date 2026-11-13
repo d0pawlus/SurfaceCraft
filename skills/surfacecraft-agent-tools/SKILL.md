@@ -23,6 +23,8 @@ description: Driving SurfaceCraft from an agent — MCP server, bridged mode, CL
   featured schemas and the verb lines of the area tools shrink to their first sentence (capped), enums,
   names and `required` stay, and `describe_command` / parameter errors carry the full text. Never hand-trim
   command docs to fit the budget; when the headroom test fails, shorten structurally in `crates/mcp`.
+  Write a parameter's first sentence so that it stands alone: what it is, its unit, range and default
+  (the first sentence, at most 120 characters, is all an agent sees before its first call).
 - Results are lean (`crates/mcp/src/lean.rs`): compact JSON text, floats rounded to 6 decimals. A parameter
   error carries the command's `input_schema`; an unknown command, verb or tool carries `did_you_mean`.
 - Prompt `scan_to_solid` (`prompts/get`), resources `surfacecraft://design`, `surfacecraft://commands` and

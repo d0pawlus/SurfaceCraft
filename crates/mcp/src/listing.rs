@@ -127,7 +127,7 @@ pub(crate) fn featured_tool(c: &CommandSpec) -> Value {
 
 /// Description of the `queued` flag in the compact listing (full mode keeps the long text; the
 /// queue is explained by `job_status` and `job_wait`).
-const QUEUED_NOTE: &str = "true: queue the call, return a job id (see job_wait).";
+pub(crate) const QUEUED_NOTE: &str = "true: queue the call, return a job id (see job_wait).";
 
 /// `tool` with the short description of its `queued` flag, for the compact listing, where the flag
 /// appears on every tool.
