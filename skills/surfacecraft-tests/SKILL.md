@@ -16,7 +16,7 @@ description: Writing and running SurfaceCraft tests and the accuracy gates of de
   (`docs/integration.md`).
 - GPU tests (anything creating a wgpu device) are opt-in: they return early unless
   `SURFACECRAFT_GPU_TESTS=1`, and serialise device creation behind a lock (`gpu_test_guard` in
-  `crates/ui-egui/src/viewport.rs`). CI runners have only software adapters, and concurrent device
+  `crates/ui-egui/src/viewport/tests.rs`). CI runners have only software adapters, and concurrent device
   creation there crashed the Windows test binary with STATUS_ACCESS_VIOLATION. Run them locally with
   `SURFACECRAFT_GPU_TESTS=1 cargo test -p surfacecraft-ui-egui --lib viewport`.
 - Documentation-only commits (`*.md`, STATUS, plans, merge resolutions of those) skip the local
