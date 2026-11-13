@@ -32,7 +32,8 @@ pub struct EdgeCensus {
     pub lengths: LengthStats,
 }
 
-/// Edge census of `mesh`. A mesh that does not validate has none.
+/// Edge census of `mesh`. A mesh that does not validate has an empty census (validity is reported
+/// by `scan.qa` separately), so zero non-manifold edges is not a statement about an invalid mesh.
 #[must_use]
 pub fn edge_census(mesh: &Mesh) -> EdgeCensus {
     if mesh.validate().is_err() {

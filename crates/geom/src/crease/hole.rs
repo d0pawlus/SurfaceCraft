@@ -112,6 +112,8 @@ fn flip_gains(mesh: &Mesh, wedge: &Wedge, min_area: f64, [a, b, c, d]: [u32; 4])
 
 /// Flips patch edges that cut across a sharp edge of the wedge (see [`flip_gains`]).
 pub(super) fn align_edges(mesh: &mut Mesh, hole: &Hole, wedge: &Wedge) {
+    // a flip must not put a patch edge on an edge of the mesh around the patch
+    let outside = crate::holes::outside_edges(mesh, hole.first_tri);
     for _pass in 0..FLIP_PASSES {
         let mut edge: HashMap<(u32, u32), (usize, usize)> = HashMap::new();
         for (ti, t) in mesh.triangles.iter().enumerate().skip(hole.first_tri) {
@@ -125,7 +127,10 @@ pub(super) fn align_edges(mesh: &mut Mesh, hole: &Hole, wedge: &Wedge) {
         let mut made: HashSet<(u32, u32)> = HashSet::new();
         for (a, b) in keys {
             let Some((t0, t1, c, d)) = flip_of(mesh, &edge, a, b) else { continue };
-            let fresh = !done.contains(&t0) && !done.contains(&t1) && !made.contains(&(c.min(d), c.max(d)));
+            let fresh = !done.contains(&t0)
+                && !done.contains(&t1)
+                && !made.contains(&(c.min(d), c.max(d)))
+                && !outside.contains(&(c.min(d), c.max(d)));
             if !fresh || !flip_gains(mesh, wedge, hole.min_area(), [a, b, c, d]) {
                 continue;
             }

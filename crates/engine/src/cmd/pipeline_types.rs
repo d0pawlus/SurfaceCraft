@@ -41,7 +41,7 @@ pub struct ScanSummary {
     pub holes_before: usize,
     /// Holes filled.
     pub holes_filled: usize,
-    /// Holes left open (above the size limit).
+    /// Holes left open (above the size limit, not triangulable, or whose fill would put three triangles on one edge).
     pub holes_left: usize,
     /// Edges shared by three or more triangles, after cleaning.
     pub non_manifold_edges: usize,

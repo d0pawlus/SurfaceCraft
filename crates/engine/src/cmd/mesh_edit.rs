@@ -25,7 +25,7 @@ pub struct EditOut {
     /// Holes filled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub holes_filled: Option<usize>,
-    /// Holes left open (above the size limit).
+    /// Holes left open (above the size limit, not triangulable, or whose fill would put three triangles on one edge).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub holes_left: Option<usize>,
     /// Largest vertex displacement (smoothing), mm.
