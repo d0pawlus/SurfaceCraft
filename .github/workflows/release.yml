@@ -181,15 +181,36 @@ jobs:
           fi
           sha256sum --check SHA256SUMS.txt
           cat SHA256SUMS.txt
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+          path: source
+          sparse-checkout: CHANGELOG.md
+          sparse-checkout-cone-mode: false
       - name: write the release notes
         run: |
           set -euo pipefail
+          # the section of CHANGELOG.md for this version: from its "## [X.Y.Z]" heading to the next one
+          changes=""
+          if [[ "$TAG" != "nightly" && -f source/CHANGELOG.md ]]; then
+            changes=$(awk -v version="${TAG#v}" '
+              /^## \[/ { inside = (index($0, "## [" version "]") == 1); next }
+              /^\[[^]]+\]: / { next }
+              inside { print }
+            ' source/CHANGELOG.md)
+            if [[ -z "${changes//[[:space:]]/}" ]]; then
+              echo "::warning::CHANGELOG.md has no section for ${TAG#v}; the release notes list only the files."
+            fi
+          fi
           {
             if [[ "$TAG" == "nightly" ]]; then
               printf '# SurfaceCraft nightly, %s\n\n' "$(TZ=Europe/Warsaw date +%F)"
               printf 'Automatic build of main at %s. Not an official release: it is replaced every night.\n\n' "$REF"
             else
               printf '# SurfaceCraft %s\n\n' "$TAG"
+            fi
+            if [[ -n "${changes//[[:space:]]/}" ]]; then
+              printf '%s\n\n## Downloads\n\n' "$changes"
             fi
             cat <<'NOTES'
           These builds are not code-signed yet. Windows SmartScreen warns about an unknown publisher, and
