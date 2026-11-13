@@ -1,6 +1,7 @@
 //! Soft interior points: soft position rows with their weight, not scan data.
 use super::tests::{polygon, regular, request};
 use super::*;
+use crate::nurbs::SurfaceProbe;
 use crate::vpatch::derivatives;
 
 /// A flat pentagon of radius 15 in the plane z = 0 with the given soft points and a small

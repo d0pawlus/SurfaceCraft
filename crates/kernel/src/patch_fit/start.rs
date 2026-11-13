@@ -9,8 +9,9 @@ use super::geom::{
 use super::reference::RefProbe;
 use super::{Continuity, Request};
 use crate::vpatch::{MAX_CONTROL, MIN_CONTROL};
-use crate::{KernelError, Result};
+use crate::{KernelError, Result, poll};
 use nalgebra::{DMatrix, Matrix3, SymmetricEigen};
+use surfacecraft_geom::Cancel;
 
 /// Most sides of a loop.
 pub(super) const MAX_SIDES: usize = 64;
@@ -35,10 +36,21 @@ const MAX_POLYGON: usize = 600;
 pub(super) const SNAP_LIMIT: f64 = 0.1;
 /// Search radius of the closest point on a reference face, as a share of the loop's size (at least 1 mm).
 const SNAP_ACCEPT_REL: f64 = 1e-2;
+/// Closest-point queries between two looks at the cancellation flag.
+const POLL_EVERY: usize = 256;
 const NOT_A_HEIGHT_FIELD: &str = "the outline is not a height field: give a mesh region";
 
 fn arg(msg: impl Into<String>) -> KernelError {
     KernelError::Argument(msg.into())
+}
+
+/// `e` with the side it concerns named (the caller's number of the side).
+pub(super) fn named(label: usize, e: KernelError) -> KernelError {
+    match e {
+        KernelError::Argument(m) => KernelError::Argument(format!("side {label}: {m}")),
+        KernelError::Op { op, message } => KernelError::Op { op, message: format!("side {label}: {message}") },
+        other => other,
+    }
 }
 
 /// A polyline with its cumulative length.
@@ -109,6 +121,12 @@ impl Affine {
         [dot(self.a[0], p) + self.b[0], dot(self.a[1], p) + self.b[1]]
     }
 
+    /// Unit normal of the plane the map projects onto, oriented so that a surface whose
+    /// parameters `uv` agree with this map (positive Jacobian) has `S_u × S_v` along it.
+    pub fn normal(&self) -> Option<V3> {
+        unit(cross(self.a[0], self.a[1]))
+    }
+
     /// The space direction (in the row space of `A`) whose image is the parameter direction `d`.
     pub fn lift(&self, d: V2) -> Option<V3> {
         let (a0, a1) = (self.a[0], self.a[1]);
@@ -151,6 +169,8 @@ fn fit_affine(points: &[V3], uvs: &[V2]) -> Result<Affine> {
 
 /// One side of the loop in space and in parameters.
 pub(super) struct SideData {
+    /// The caller's number of the side (for messages).
+    pub label: usize,
     pub poly: Poly,
     pub uv: Vec<V2>,
     pub continuity: Continuity,
@@ -422,16 +442,30 @@ fn bbox2(points: impl Iterator<Item = V2>) -> [[f64; 2]; 2] {
 /// closed: a corner takes the position on the referenced side, the middle of the two where both are
 /// referenced. Returns the largest move per referenced side; a side that lies more than
 /// [`SNAP_LIMIT`] off its face is refused.
-fn snap_to_references(pts: &mut [Vec<V3>], probes: &[Option<RefProbe>], accept: f64) -> Result<Vec<Option<f64>>> {
+fn snap_to_references(
+    pts: &mut [Vec<V3>],
+    probes: &[Option<RefProbe>],
+    labels: &[usize],
+    accept: f64,
+    cancel: &Cancel,
+) -> Result<Vec<Option<f64>>> {
     let before: Vec<Vec<V3>> = pts.to_vec();
     let n = pts.len();
     let mut snapped = vec![false; n];
     for (k, (side, probe)) in pts.iter_mut().zip(probes).enumerate() {
         let Some(probe) = probe else { continue };
-        for p in side.iter_mut() {
-            match probe.closest(*p, accept)? {
+        let label = labels.get(k).copied().unwrap_or(k);
+        for (i, p) in side.iter_mut().enumerate() {
+            if i % POLL_EVERY == 0 {
+                poll(cancel)?;
+            }
+            match probe.closest(*p, accept).map_err(|e| named(label, e))? {
                 Some(q) => *p = q,
-                None => return Err(arg(format!("side {k} lies more than {accept:.3} mm off its reference face"))),
+                None => {
+                    return Err(arg(format!(
+                        "side {label} lies more than {accept:.3} mm off its reference face (is the face adjacent to the side?)"
+                    )));
+                }
             }
         }
         if let Some(flag) = snapped.get_mut(k) {
@@ -464,147 +498,213 @@ fn snap_to_references(pts: &mut [Vec<V3>], probes: &[Option<RefProbe>], accept: 
         }
         let moved = now.iter().zip(was).map(|(a, b)| dist(*a, *b)).fold(0.0_f64, f64::max);
         if moved.is_nan() || moved > SNAP_LIMIT {
-            return Err(arg(format!("side {k} lies {moved:.3} mm off its reference face (at most {SNAP_LIMIT} mm)")));
+            let label = labels.get(k).copied().unwrap_or(k);
+            return Err(arg(format!("side {label} lies {moved:.3} mm off its reference face (at most {SNAP_LIMIT} mm)")));
         }
         out.push(Some(moved));
     }
     Ok(out)
 }
 
-/// The loop with parameters, checked: closed, a height field (or a flattening that does not cross
-/// itself), its references usable. Hard sides of three or more points are densified along a smooth
-/// curve through their points; the warnings say which could not be.
-fn build_loop(req: &Request) -> Result<(Loop, Vec<String>)> {
-    let flat = req.sides.iter().all(|s| s.uv.is_some());
-    let all: Vec<V3> = req.sides.iter().flat_map(|s| s.points.iter().copied()).collect();
+/// The size of the loop: its largest extent along an axis and the diagonal of its box.
+struct Extent {
+    span: f64,
+    diag: f64,
+}
+
+fn extent(req: &Request) -> Extent {
     let mut lo = [f64::INFINITY; 3];
     let mut hi = [f64::NEG_INFINITY; 3];
-    for p in &all {
+    for p in req.sides.iter().flat_map(|s| s.points.iter()) {
         for c in 0..3 {
             lo[c] = lo[c].min(p[c]);
             hi[c] = hi[c].max(p[c]);
         }
     }
-    let span = (0..3).map(|c| hi[c] - lo[c]).fold(0.0_f64, f64::max);
-    let diag = dist(lo, hi);
-    let dup_tol = 1e-9 * span.max(1.0);
-    let close_tol = 1e-7 * span.max(1.0);
+    Extent { span: (0..3).map(|c| hi[c] - lo[c]).fold(0.0_f64, f64::max), diag: dist(lo, hi) }
+}
 
+/// The caller's number of every side.
+fn labels(req: &Request) -> Vec<usize> {
+    (0..req.sides.len()).map(|i| req.side_ids.get(i).copied().unwrap_or(i)).collect()
+}
+
+type SidePoints = (Vec<Vec<V3>>, Vec<Vec<V2>>);
+
+/// The sides without repeated points (and their parameters).
+fn dedupe_sides(req: &Request, labels: &[usize], tol: f64) -> Result<SidePoints> {
     let mut pts: Vec<Vec<V3>> = Vec::with_capacity(req.sides.len());
     let mut uvs: Vec<Vec<V2>> = Vec::with_capacity(req.sides.len());
     for (i, s) in req.sides.iter().enumerate() {
-        let (p, q) = dedupe(&s.points, s.uv.as_ref(), dup_tol);
+        let (p, q) = dedupe(&s.points, s.uv.as_ref(), tol);
         if p.len() < 2 {
-            return Err(arg(format!("side {i} has no length")));
+            return Err(arg(format!("side {} has no length", labels.get(i).copied().unwrap_or(i))));
         }
         pts.push(p);
         uvs.push(q);
     }
-    // close the loop: the next side starts where this one ends
+    Ok((pts, uvs))
+}
+
+/// Closes the loop: the next side starts where this one ends (within `close_tol`).
+fn close_loop(pts: &mut [Vec<V3>], uvs: &mut [Vec<V2>], flat: bool, close_tol: f64, labels: &[usize]) -> Result<()> {
     let n = pts.len();
-    let lasts: Vec<(V3, V2)> = (0..n)
-        .map(|k| (pts[k].last().copied().unwrap_or([0.0; 3]), uvs[k].last().copied().unwrap_or([0.0; 2])))
-        .collect();
-    let uv_close = lasts.iter().map(|(_, q)| q[0].abs().max(q[1].abs())).fold(1.0_f64, f64::max) * 1e-7;
-    for k in 0..n {
+    let end_of = |k: usize| {
+        let end = pts.get(k).and_then(|p| p.last()).copied().unwrap_or([0.0; 3]);
+        (end, uvs.get(k).and_then(|q| q.last()).copied().unwrap_or([0.0; 2]))
+    };
+    let ends: Vec<(V3, V2)> = (0..n).map(end_of).collect();
+    let uv_close = ends.iter().map(|(_, q)| q[0].abs().max(q[1].abs())).fold(1.0_f64, f64::max) * 1e-7;
+    let label = |k: usize| labels.get(k).copied().unwrap_or(k);
+    for (k, &(end, end_uv)) in ends.iter().enumerate() {
         let nxt = (k + 1) % n;
-        let (end, end_uv) = lasts[k];
-        let first = pts[nxt][0];
+        let first = pts.get(nxt).and_then(|p| p.first()).copied().ok_or_else(|| arg("a side has no points"))?;
         let d = dist(end, first);
         if d > close_tol {
-            return Err(arg(format!("the sides do not close: side {k} ends {d:.3e} mm from the start of side {nxt}")));
+            return Err(arg(format!(
+                "the sides do not close: side {} ends {d:.3e} mm from the start of side {}",
+                label(k),
+                label(nxt)
+            )));
         }
-        if flat && dist2(end_uv, uvs[nxt][0]) > uv_close {
-            return Err(arg(format!("the parameters of side {k} and side {nxt} do not meet at their corner")));
+        let first_uv = uvs.get(nxt).and_then(|q| q.first()).copied();
+        if flat && first_uv.is_none_or(|f| dist2(end_uv, f) > uv_close) {
+            return Err(arg(format!(
+                "the parameters of side {} and side {} do not meet at their corner",
+                label(k),
+                label(nxt)
+            )));
         }
-        pts[nxt][0] = end;
-        if flat {
-            uvs[nxt][0] = end_uv;
+        if let Some(f) = pts.get_mut(nxt).and_then(|p| p.first_mut()) {
+            *f = end;
+        }
+        if flat && let Some(f) = uvs.get_mut(nxt).and_then(|q| q.first_mut()) {
+            *f = end_uv;
         }
     }
-    let corners_total: usize = pts.iter().map(|p| p.len() - 1).sum();
-    if corners_total < 3 {
-        return Err(arg("the outline needs at least 3 distinct points"));
-    }
+    Ok(())
+}
 
-    let probes: Vec<Option<RefProbe>> = req
-        .sides
+/// The reference probes of the G1/G2 sides.
+fn reference_probes(req: &Request, labels: &[usize]) -> Result<Vec<Option<RefProbe>>> {
+    req.sides
         .iter()
-        .map(|s| {
-            if s.continuity == Continuity::G0 { Ok(None) } else { s.reference.as_ref().map(RefProbe::new).transpose() }
+        .enumerate()
+        .map(|(i, s)| {
+            if s.continuity == Continuity::G0 {
+                return Ok(None);
+            }
+            let label = labels.get(i).copied().unwrap_or(i);
+            s.reference.as_ref().map(RefProbe::new).transpose().map_err(|e| named(label, e))
         })
-        .collect::<Result<_>>()?;
+        .collect()
+}
 
-    let accept = (SNAP_ACCEPT_REL * span).max(10.0 * SNAP_LIMIT);
-    let snaps = snap_to_references(&mut pts, &probes, accept)?;
-    // the points are samples of a smooth curve: the dense samples between them follow it, not the chords
-    let soft: Vec<bool> = req.sides.iter().map(|s| s.soft).collect();
-    let notes = smooth_sides(&mut pts, &mut uvs, flat, &soft, diag);
-
-    let affine = if flat {
+/// The affine map of the loop: fitted to the given parameters (a flattening), else the best-fit
+/// plane, oriented like the first reference face's normal; a G1/G2 side whose reference leans more
+/// than 75° off that plane makes the outline no height field.
+fn loop_affine(
+    pts: &[Vec<V3>],
+    uvs: &[Vec<V2>],
+    flat: bool,
+    probes: &[Option<RefProbe>],
+    labels: &[usize],
+) -> Result<Affine> {
+    if flat {
         let all_pts: Vec<V3> = pts.iter().flatten().copied().collect();
         let all_uv: Vec<V2> = uvs.iter().flatten().copied().collect();
         let keep = thin_indices(all_pts.len(), MAX_AFFINE_POINTS);
         let p: Vec<V3> = keep.iter().filter_map(|&i| all_pts.get(i).copied()).collect();
         let q: Vec<V2> = keep.iter().filter_map(|&i| all_uv.get(i).copied()).collect();
-        fit_affine(&p, &q)?
-    } else {
-        let mut plane = fit_plane(&pts)?;
-        let first = probes.iter().zip(pts.iter()).find_map(|(pr, p)| pr.as_ref().zip(p.first()));
-        let flip = match first {
-            Some((pr, p)) => dot(plane.n, pr.locate(*p)?.normal) < 0.0,
-            None => {
-                let k = (0..3).fold(0, |b, c| if plane.n[c].abs() > plane.n[b].abs() { c } else { b });
-                plane.n[k] < 0.0
-            }
-        };
-        if flip {
-            plane.n = scale(plane.n, -1.0);
-            plane.e2 = cross(plane.n, plane.e1);
+        return fit_affine(&p, &q);
+    }
+    let label = |k: usize| labels.get(k).copied().unwrap_or(k);
+    let mut plane = fit_plane(pts)?;
+    let first = probes.iter().zip(pts.iter()).enumerate().find_map(|(k, (pr, p))| pr.as_ref().zip(p.first()).map(|x| (k, x)));
+    let flip = match first {
+        Some((k, (pr, p))) => dot(plane.n, pr.locate(*p).map_err(|e| named(label(k), e))?.normal) < 0.0,
+        None => {
+            let k = (0..3).fold(0, |b, c| if plane.n[c].abs() > plane.n[b].abs() { c } else { b });
+            plane.n[k] < 0.0
         }
-        for (pr, p) in probes.iter().zip(pts.iter()) {
-            let Some(pr) = pr else { continue };
-            for i in thin_indices(p.len(), 5) {
-                let Some(q) = p.get(i) else { continue };
-                if dot(pr.locate(*q)?.normal, plane.n).abs() < COS_MAX_TILT {
-                    return Err(arg(NOT_A_HEIGHT_FIELD));
-                }
-            }
-        }
-        Affine { a: [plane.e1, plane.e2], b: [-dot(plane.e1, plane.c), -dot(plane.e2, plane.c)] }
     };
+    if flip {
+        plane.n = scale(plane.n, -1.0);
+        plane.e2 = cross(plane.n, plane.e1);
+    }
+    for (k, (pr, p)) in probes.iter().zip(pts.iter()).enumerate() {
+        let Some(pr) = pr else { continue };
+        for i in thin_indices(p.len(), 5) {
+            let Some(q) = p.get(i) else { continue };
+            if dot(pr.locate(*q).map_err(|e| named(label(k), e))?.normal, plane.n).abs() < COS_MAX_TILT {
+                return Err(arg(NOT_A_HEIGHT_FIELD));
+            }
+        }
+    }
+    Ok(Affine { a: [plane.e1, plane.e2], b: [-dot(plane.e1, plane.c), -dot(plane.e2, plane.c)] })
+}
 
-    let side_uv: Vec<Vec<V2>> =
-        if flat { uvs } else { pts.iter().map(|p| p.iter().map(|q| affine.uv(*q)).collect()).collect() };
-    let outline: Vec<V2> = side_uv.iter().flat_map(|u| u.iter().take(u.len() - 1).copied()).collect();
+/// A side's parameters without the last point (which is the next side's first).
+fn body(u: &[V2]) -> &[V2] {
+    u.get(..u.len().saturating_sub(1)).unwrap_or_default()
+}
+
+/// What the outline in the parameter plane gives the later stages.
+struct Outline {
+    ccw: bool,
+    bbox: [[f64; 2]; 2],
+    polygon: Vec<V2>,
+}
+
+/// Checks the outline in the parameter plane (not degenerate, not crossing itself) and thins it.
+fn check_outline(side_uv: &[Vec<V2>], flat: bool) -> Result<Outline> {
+    let n = side_uv.len();
+    let outline: Vec<V2> = side_uv.iter().flat_map(|u| body(u).iter().copied()).collect();
     let bbox = bbox2(side_uv.iter().flatten().copied());
     let ext = [bbox[0][1] - bbox[0][0], bbox[1][1] - bbox[1][0]];
     if !(ext[0].is_finite() && ext[1].is_finite() && ext[0].min(ext[1]) > 1e-9 * ext[0].max(ext[1])) {
         return Err(arg("the outline is degenerate in the parameter plane"));
     }
-    let ccw = area2(&outline) > 0.0;
+    let thinned = |cap: usize| -> Vec<V2> {
+        side_uv
+            .iter()
+            .flat_map(|u| {
+                let b = body(u);
+                thin_indices(b.len(), cap).into_iter().filter_map(move |i| b.get(i).copied())
+            })
+            .collect()
+    };
     // crossing check on a thinned copy
-    let cap = (MAX_CHECK_POINTS / n).max(8);
-    let check: Vec<V2> = side_uv
-        .iter()
-        .flat_map(|u| {
-            let body = &u[..u.len() - 1];
-            thin_indices(body.len(), cap).into_iter().filter_map(move |i| body.get(i).copied())
-        })
-        .collect();
-    if polygon_self_intersects(&check, 1e-9 * ext[0].max(ext[1])) {
+    if polygon_self_intersects(&thinned((MAX_CHECK_POINTS / n).max(8)), 1e-9 * ext[0].max(ext[1])) {
         return Err(arg(if flat { "the flattening of the outline crosses itself" } else { NOT_A_HEIGHT_FIELD }));
     }
+    Ok(Outline { ccw: area2(&outline) > 0.0, bbox, polygon: thinned((MAX_POLYGON / n).max(8)) })
+}
 
-    let pcap = (MAX_POLYGON / n).max(8);
-    let polygon: Vec<V2> = side_uv
-        .iter()
-        .flat_map(|u| {
-            let body = &u[..u.len() - 1];
-            thin_indices(body.len(), pcap).into_iter().filter_map(move |i| body.get(i).copied())
-        })
-        .collect();
-
+/// The loop with parameters, checked: closed, a height field (or a flattening that does not cross
+/// itself), its references usable. Hard sides of three or more points are densified along a smooth
+/// curve through their points; the warnings say which could not be.
+fn build_loop(req: &Request, cancel: &Cancel) -> Result<(Loop, Vec<String>)> {
+    let flat = req.sides.iter().all(|s| s.uv.is_some());
+    let ex = extent(req);
+    let labels = labels(req);
+    let (mut pts, mut uvs) = dedupe_sides(req, &labels, 1e-9 * ex.span.max(1.0))?;
+    close_loop(&mut pts, &mut uvs, flat, 1e-7 * ex.span.max(1.0), &labels)?;
+    if pts.iter().map(|p| p.len().saturating_sub(1)).sum::<usize>() < 3 {
+        return Err(arg("the outline needs at least 3 distinct points"));
+    }
+    let probes = reference_probes(req, &labels)?;
+    let accept = (SNAP_ACCEPT_REL * ex.span).max(10.0 * SNAP_LIMIT);
+    let snaps = snap_to_references(&mut pts, &probes, &labels, accept, cancel)?;
+    poll(cancel)?;
+    // the points are samples of a smooth curve: the dense samples between them follow it, not the chords
+    let soft: Vec<bool> = req.sides.iter().map(|s| s.soft).collect();
+    let notes = smooth_sides(&mut pts, &mut uvs, flat, &soft, ex.diag);
+    poll(cancel)?;
+    let affine = loop_affine(&pts, &uvs, flat, &probes, &labels)?;
+    let side_uv: Vec<Vec<V2>> =
+        if flat { uvs } else { pts.iter().map(|p| p.iter().map(|q| affine.uv(*q)).collect()).collect() };
+    let Outline { ccw, bbox, polygon } = check_outline(&side_uv, flat)?;
     let sides: Vec<SideData> = req
         .sides
         .iter()
@@ -612,7 +712,9 @@ fn build_loop(req: &Request) -> Result<(Loop, Vec<String>)> {
         .zip(side_uv)
         .zip(probes)
         .zip(snaps)
-        .map(|((((s, p), q), probe), snap)| SideData {
+        .zip(labels)
+        .map(|(((((s, p), q), probe), snap), label)| SideData {
+            label,
             poly: Poly::new(p),
             uv: q,
             continuity: s.continuity,
@@ -621,7 +723,7 @@ fn build_loop(req: &Request) -> Result<(Loop, Vec<String>)> {
             snap,
         })
         .collect();
-    Ok((Loop { sides, affine, ccw, bbox, diag, polygon }, notes))
+    Ok((Loop { sides, affine, ccw, bbox, diag: ex.diag, polygon }, notes))
 }
 
 /// A curve as `n` points equally spaced in arc length.
@@ -679,10 +781,10 @@ fn corners(lp: &Loop) -> Result<Vec<Corner>> {
         return Ok(out);
     }
     for k in 0..n {
-        let (a, b) = (&lp.sides[k], &lp.sides[(k + 1) % n]);
+        let (Some(a), Some(b)) = (lp.sides.get(k), lp.sides.get((k + 1) % n)) else { continue };
         let at = a.poly.points.last().copied().unwrap_or([0.0; 3]);
         let normal = |s: &SideData| -> Result<Option<V3>> {
-            s.probe.as_ref().map(|p| p.locate(at).map(|r| r.normal)).transpose()
+            s.probe.as_ref().map(|p| p.locate(at).map(|r| r.normal).map_err(|e| named(s.label, e))).transpose()
         };
         let off_plane = |t: Option<V3>, n: V3| t.map_or(0.0, |t| dot(t, n).abs().min(1.0).asin().to_degrees());
         let mismatch = match (normal(a)?, normal(b)?) {
@@ -697,9 +799,9 @@ fn corners(lp: &Loop) -> Result<Vec<Corner>> {
 }
 
 /// Checks the request and prepares the loop, the interior and the corner angles.
-pub(super) fn prepare(req: &Request) -> Result<Prepared> {
+pub(super) fn prepare(req: &Request, cancel: &Cancel) -> Result<Prepared> {
     validate(req)?;
-    let (lp, warnings) = build_loop(req)?;
+    let (lp, warnings) = build_loop(req, cancel)?;
     let interior = interior(req, &lp)?;
     let corners = corners(&lp)?;
     Ok(Prepared { lp, interior, corners, warnings })

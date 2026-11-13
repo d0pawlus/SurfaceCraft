@@ -6,7 +6,9 @@ use super::reference::RefSample;
 use super::start::{Interior, Loop};
 use crate::record::brep::Surface;
 use crate::vpatch::{DataPoint, Problem, Row, derivatives};
-use crate::{KernelError, Result};
+use super::start::named;
+use crate::{KernelError, Result, poll};
+use surfacecraft_geom::Cancel;
 
 /// Weight of the soft rows that stand in for dense side conditions, against a data weight of 1.
 pub(super) const W_SOFT: f64 = 1e4;
@@ -21,6 +23,8 @@ const TOTAL_DENSE: usize = 30_000;
 /// Soft rows handed to the solver (the solver takes 20 000 rows in all).
 const MAX_SOFT_ROWS: usize = 6_000;
 const MAX_ROWS: usize = 20_000;
+/// Samples between two looks at the cancellation flag.
+const POLL_EVERY: usize = 64;
 /// Points of the outline polygon given to the solver.
 const MAX_OUTLINE: usize = 3_000;
 /// Rows whose relaxation factor is below this are dropped.
@@ -107,7 +111,8 @@ pub(super) fn collocation(uv: &[V2], cell: V2) -> Vec<usize> {
     for j in 0..=m {
         let target = s * j as f64 / m as f64;
         let k = cum.partition_point(|c| *c < target).min(n - 1);
-        let lower = k.checked_sub(1).filter(|&l| target - cum[l] < cum[k] - target);
+        let at = |i: usize| cum.get(i).copied().unwrap_or(0.0);
+        let lower = k.checked_sub(1).filter(|&l| target - at(l) < at(k) - target);
         out.push(lower.unwrap_or(k));
     }
     out.push(0);
@@ -132,18 +137,21 @@ fn dense_count(lp: &Loop, layout: &Layout) -> usize {
 }
 
 /// Dense samples of every side for the current net, the same count on every side.
-pub(super) fn sample_sides(lp: &Loop, layout: &Layout) -> Result<Vec<SideSamples>> {
+pub(super) fn sample_sides(lp: &Loop, layout: &Layout, cancel: &Cancel) -> Result<Vec<SideSamples>> {
     let nd = dense_count(lp, layout);
     let mut out = Vec::with_capacity(lp.sides.len());
     for side in &lp.sides {
         let len = side.length();
         let mut samples = Vec::with_capacity(nd);
         for j in 0..nd {
+            if j % POLL_EVERY == 0 {
+                poll(cancel)?;
+            }
             let s = if j + 1 == nd { len } else { len * j as f64 / (nd - 1) as f64 };
             let (xyz, uv) = side.at(s);
             let dir = lp.inward(side.tangent_uv(s)?);
             let refs = match (&side.probe, side.continuity) {
-                (Some(p), Continuity::G1 | Continuity::G2) => Some(p.locate(xyz)?),
+                (Some(p), Continuity::G1 | Continuity::G2) => Some(p.locate(xyz).map_err(|e| named(side.label, e))?),
                 _ => None,
             };
             samples.push(Sample { xyz, uv, s, dir, refs });
@@ -166,24 +174,26 @@ pub(super) struct Inputs<'a> {
     pub smoothing: f64,
 }
 
-/// States one row: of a hard side, hard at a collocation point and heavily soft elsewhere; of a soft
-/// side (`soft_side` is its weight), soft with that weight. `factor` relaxes it near a conflict.
-fn put(
-    hard: &mut Vec<Row>,
-    soft: &mut Vec<(Row, f64)>,
-    row: Row,
-    collocation: bool,
-    factor: f64,
-    soft_side: Option<f64>,
-) {
-    if let Some(w) = soft_side {
-        if factor > MIN_FACTOR {
-            soft.push((row, w * factor));
+/// The hard and the soft rows of a round.
+#[derive(Default)]
+struct Rows {
+    hard: Vec<Row>,
+    soft: Vec<(Row, f64)>,
+}
+
+impl Rows {
+    /// States one row: of a hard side, hard at a collocation point and heavily soft elsewhere; of a
+    /// soft side (`soft_side` is its weight), soft with that weight. `factor` relaxes it near a conflict.
+    fn put(&mut self, row: Row, collocation: bool, factor: f64, soft_side: Option<f64>) {
+        if let Some(w) = soft_side {
+            if factor > MIN_FACTOR {
+                self.soft.push((row, w * factor));
+            }
+        } else if collocation && factor >= 1.0 {
+            self.hard.push(row);
+        } else if factor > MIN_FACTOR {
+            self.soft.push((row, W_SOFT * factor));
         }
-    } else if collocation && factor >= 1.0 {
-        hard.push(row);
-    } else if factor > MIN_FACTOR {
-        soft.push((row, W_SOFT * factor));
     }
 }
 
@@ -222,15 +232,8 @@ fn thin_rows(rows: &mut Vec<(Row, f64)>, budget: usize) {
     *rows = kept;
 }
 
-/// States the round's problem: hard rows at the collocation points, soft rows at the other dense
-/// samples (thinned to a budget), data, outline. A soft side puts only soft rows, at its collocation
-/// points (at every thinned sample when there is no data to follow), weighted like a mean data point;
-/// its corners stay hard where a hard side meets it.
-pub(super) fn build_problem(inp: &Inputs) -> Result<Problem> {
-    let mut hard: Vec<Row> = Vec::new();
-    let mut soft: Vec<(Row, f64)> = Vec::new();
-
-    // data that count: inside the outline and the parameter domain; fewer than 3 are none
+/// The data that count: inside the outline and the parameter domain; fewer than 3 are none.
+fn counted_data(inp: &Inputs) -> Vec<DataPoint> {
     let mut data = Vec::with_capacity(inp.interior.data.len());
     for p in &inp.interior.data {
         if !p.out && inp.layout.inside(p.uv) {
@@ -240,10 +243,11 @@ pub(super) fn build_problem(inp: &Inputs) -> Result<Problem> {
     if data.len() < MIN_DATA {
         data.clear();
     }
-    let mean_w = if data.is_empty() { 1.0 } else { data.iter().map(|d| d.weight).sum::<f64>() / data.len() as f64 };
-    let soft_w = SOFT_SIDE_WEIGHT * mean_w;
-    let dense_soft = data.is_empty();
+    data
+}
 
+/// Every how many candidate soft rows one is taken, so that at most [`MAX_SOFT_ROWS`] come out.
+fn soft_stride(inp: &Inputs, dense_soft: bool) -> usize {
     let mut candidates: usize = inp
         .sides
         .iter()
@@ -252,61 +256,104 @@ pub(super) fn build_problem(inp: &Inputs) -> Result<Problem> {
         .map(|(ss, sd)| ss.samples.len().saturating_sub(ss.colloc.len()) * rows_per_sample(sd.continuity))
         .sum();
     candidates += inp.interior.curves.iter().map(Vec::len).sum::<usize>();
-    let stride = candidates.div_ceil(MAX_SOFT_ROWS).max(1);
+    candidates.div_ceil(MAX_SOFT_ROWS).max(1)
+}
 
+/// Where the samples of a side are collocation points.
+fn collocation_flags(n: usize, colloc: &[usize]) -> Vec<bool> {
+    let mut is_col = vec![false; n];
+    for &c in colloc {
+        if let Some(x) = is_col.get_mut(c) {
+            *x = true;
+        }
+    }
+    is_col
+}
+
+/// How the rows of the sides are weighted.
+struct SideRows {
+    /// Weight of a row of a soft side (the mean data weight).
+    soft_w: f64,
+    /// Soft sides put rows at every thinned sample (there is no data to follow).
+    dense_soft: bool,
+    stride: usize,
+}
+
+/// The rows of the sides: position, tangent and curvature rows at the samples taken.
+fn side_rows(inp: &Inputs, w: &SideRows, rows: &mut Rows) -> Result<()> {
     let sides_n = inp.lp.sides.len();
     for (j, (ss, sd)) in inp.sides.iter().zip(&inp.lp.sides).enumerate() {
         let len = sd.length();
         let n = ss.samples.len();
         let prev_soft = inp.lp.sides.get((j + sides_n - 1) % sides_n.max(1)).is_some_and(|p| p.soft);
-        let side_w = sd.soft.then_some(soft_w);
-        let mut is_col = vec![false; n];
-        for &c in &ss.colloc {
-            if let Some(x) = is_col.get_mut(c) {
-                *x = true;
-            }
-        }
+        let side_w = sd.soft.then_some(w.soft_w);
+        let is_col = collocation_flags(n, &ss.colloc);
         for (i, smp) in ss.samples.iter().enumerate() {
             let col = is_col.get(i).copied().unwrap_or(false);
-            let take = if sd.soft && !dense_soft { col } else { col || i.is_multiple_of(stride) };
+            let take = if sd.soft && !w.dense_soft { col } else { col || i.is_multiple_of(w.stride) };
             if !take {
                 continue;
             }
             // the corner is stated once, by the side that starts there: hard when either side is hard
             if i + 1 < n {
-                let w = if i == 0 && !prev_soft { None } else { side_w };
-                put(&mut hard, &mut soft, Row::Position { uv: smp.uv, at: smp.xyz }, col, 1.0, w);
+                let weight = if i == 0 && !prev_soft { None } else { side_w };
+                rows.put(Row::Position { uv: smp.uv, at: smp.xyz }, col, 1.0, weight);
             }
             let Some(r) = &smp.refs else { continue };
             let f = relax_factor(inp.zones, j, smp.s, len);
-            put(&mut hard, &mut soft, Row::Tangent { uv: smp.uv, dir: smp.dir, normal: r.normal }, col, f, side_w);
+            rows.put(Row::Tangent { uv: smp.uv, dir: smp.dir, normal: r.normal }, col, f, side_w);
             if sd.continuity == Continuity::G2
                 && let Some(prev) = inp.prev
                 && let Some(row) = curvature_row(prev, smp, r)?
             {
-                put(&mut hard, &mut soft, row, col, f, side_w);
+                rows.put(row, col, f, side_w);
             }
         }
     }
+    Ok(())
+}
 
+/// The rows of the interior: hard points, and the curves at their collocation points.
+fn interior_rows(inp: &Inputs, stride: usize, rows: &mut Rows) {
     for p in &inp.interior.hard {
-        hard.push(Row::Position { uv: p.uv, at: p.xyz });
+        rows.hard.push(Row::Position { uv: p.uv, at: p.xyz });
     }
     for c in &inp.interior.curves {
         let uvs: Vec<V2> = c.iter().map(|p| p.uv).collect();
-        let mut is_col = vec![false; c.len()];
-        for k in collocation(&uvs, inp.layout.cell) {
-            if let Some(x) = is_col.get_mut(k) {
-                *x = true;
-            }
-        }
+        let is_col = collocation_flags(c.len(), &collocation(&uvs, inp.layout.cell));
         for (i, p) in c.iter().enumerate() {
             let col = is_col.get(i).copied().unwrap_or(false);
             if col || i.is_multiple_of(stride) {
-                put(&mut hard, &mut soft, Row::Position { uv: p.uv, at: p.xyz }, col, 1.0, None);
+                rows.put(Row::Position { uv: p.uv, at: p.xyz }, col, 1.0, None);
             }
         }
     }
+}
+
+/// The outline polygon given to the solver: the side samples' parameters, thinned.
+fn outline_polygon(sides: &[SideSamples]) -> Vec<V2> {
+    let mut outline: Vec<V2> = Vec::new();
+    for ss in sides {
+        let n = ss.samples.len();
+        outline.extend(ss.samples.iter().take(n.saturating_sub(1)).map(|s| s.uv));
+    }
+    thin_indices(outline.len(), MAX_OUTLINE).into_iter().filter_map(|i| outline.get(i).copied()).collect()
+}
+
+/// States the round's problem: hard rows at the collocation points, soft rows at the other dense
+/// samples (thinned to a budget), data, outline. A soft side puts only soft rows, at its collocation
+/// points (at every thinned sample when there is no data to follow), weighted like a mean data point;
+/// its corners stay hard where a hard side meets it.
+pub(super) fn build_problem(inp: &Inputs) -> Result<Problem> {
+    let data = counted_data(inp);
+    let mean_w = if data.is_empty() { 1.0 } else { data.iter().map(|d| d.weight).sum::<f64>() / data.len() as f64 };
+    let dense_soft = data.is_empty();
+    let stride = soft_stride(inp, dense_soft);
+    let mut rows = Rows::default();
+    side_rows(inp, &SideRows { soft_w: SOFT_SIDE_WEIGHT * mean_w, dense_soft, stride }, &mut rows)?;
+    interior_rows(inp, stride, &mut rows);
+    let Rows { hard, mut soft } = rows;
+
     let soft_points = inp.interior.soft.iter().filter(|p| inp.layout.inside(p.uv)).count();
     if hard.len() + soft_points > MAX_ROWS {
         return Err(KernelError::Argument(format!(
@@ -321,22 +368,13 @@ pub(super) fn build_problem(inp: &Inputs) -> Result<Problem> {
     for p in inp.interior.soft.iter().filter(|p| inp.layout.inside(p.uv)) {
         soft.push((Row::Position { uv: p.uv, at: p.xyz }, p.w * mean_w));
     }
-
-    let mut outline: Vec<V2> = Vec::new();
-    for ss in inp.sides {
-        let n = ss.samples.len();
-        outline.extend(ss.samples.iter().take(n.saturating_sub(1)).map(|s| s.uv));
-    }
-    let outline: Vec<V2> =
-        thin_indices(outline.len(), MAX_OUTLINE).into_iter().filter_map(|i| outline.get(i).copied()).collect();
-
     Ok(Problem {
         domain: inp.layout.domain,
         control: inp.layout.net,
         hard,
         soft,
         data,
-        outline,
+        outline: outline_polygon(inp.sides),
         smoothing: inp.smoothing,
     })
 }

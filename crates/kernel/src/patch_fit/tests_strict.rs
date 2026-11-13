@@ -3,8 +3,10 @@
 //! every row of the solve places the interior points by their own positions, which keeps the patch a
 //! graph over the plane of the outline.
 use super::measure::{Goal, Measure};
+use super::rows::Layout;
 use super::tests::{g0, request};
 use super::*;
+use crate::nurbs::SurfaceProbe;
 
 fn side_report(gap: f64) -> SideReport {
     SideReport {
@@ -16,6 +18,7 @@ fn side_report(gap: f64) -> SideReport {
         samples: 20,
         folded: false,
         snap_max: None,
+        met: gap <= G0_TARGET,
     }
 }
 
@@ -38,6 +41,7 @@ fn measure_of(sides: Vec<SideReport>) -> Measure {
         hard_term: 0.0,
         data_term: 0.0,
         miss: [0.0, 0.0],
+        interior_folded: false,
     }
 }
 
@@ -110,7 +114,7 @@ fn flat_spline(domain: [[f64; 2]; 2], flip: bool) -> Surface {
 
 /// The measurement of `flat_spline` against the square's sides.
 fn measure_square(flip: bool) -> Measure {
-    let mut prep = start::prepare(&square_request()).unwrap();
+    let mut prep = start::prepare(&square_request(), &Cancel::new()).unwrap();
     let net = [6, 6];
     let margin = |d: usize| (prep.lp.bbox[d][1] - prep.lp.bbox[d][0]) / (net[d] as f64 - 1.0);
     let domain = [
@@ -118,10 +122,11 @@ fn measure_square(flip: bool) -> Measure {
         [prep.lp.bbox[1][0] - margin(1), prep.lp.bbox[1][1] + margin(1)],
     ];
     let layout = Layout::new(domain, net);
-    let samples = rows::sample_sides(&prep.lp, &layout).unwrap();
+    let samples = rows::sample_sides(&prep.lp, &layout, &Cancel::new()).unwrap();
     let surface = flat_spline(domain, flip);
     let probe = SurfaceProbe::new(&surface).unwrap();
-    let goal = Goal { tolerance: 0.2, frozen: &[false; 4] };
+    let cancel = Cancel::new();
+    let goal = Goal { tolerance: 0.2, frozen: &[false; 4], cancel: &cancel };
     measure::measure(&surface, &probe, &prep.lp, &layout, &samples, &mut prep.interior, &goal).unwrap()
 }
 

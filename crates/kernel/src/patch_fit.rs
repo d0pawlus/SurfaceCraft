@@ -8,25 +8,31 @@
 //! conditions (hard rows at collocation points, soft rows between them), solves, re-projects the
 //! interior points and measures densely; the net grows where the misses are until every target holds,
 //! the worst miss stops improving, or six rounds are done.
-use crate::nurbs::{SurfaceProbe, trimmed_sheet};
+use crate::nurbs::trimmed_sheet;
 use crate::record::brep::{Brep, Face, Surface};
-use crate::vpatch;
-use crate::{KernelError, Result};
+use crate::{KernelError, Result, poll};
 use geom::{V2, thin_indices};
-use rows::{Inputs, Layout, SideSamples, Zone};
+use rows::Zone;
+use surfacecraft_geom::Cancel;
 
 mod curve;
 mod geom;
 mod measure;
 mod reference;
+mod report;
+mod rounds;
 mod rows;
 mod start;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_cost;
+#[cfg(test)]
 mod tests_g2;
 #[cfg(test)]
 mod tests_points;
+#[cfg(test)]
+mod tests_report;
 #[cfg(test)]
 mod tests_rounds;
 #[cfg(test)]
@@ -95,10 +101,12 @@ pub struct Request {
     pub smoothing: Option<f64>,
     /// Start control net; default from the number of data points.
     pub control: Option<[usize; 2]>,
-    /// Most control points per direction, at most [`vpatch::MAX_CONTROL`].
+    /// Most control points per direction, at most [`crate::vpatch::MAX_CONTROL`].
     pub max_control: usize,
     /// What to do at incompatible corners.
     pub conflicts: Conflicts,
+    /// The caller's number of every side, named in messages; empty: the position in `sides`.
+    pub side_ids: Vec<usize>,
 }
 
 /// How one side fared, measured on dense samples (at least 20 per knot interval).
@@ -120,6 +128,9 @@ pub struct SideReport {
     pub folded: bool,
     /// Largest distance a point of the side was moved onto its reference face (G1/G2 sides), mm.
     pub snap_max: Option<f64>,
+    /// The side meets its targets: gap, and for G1/G2 angle, curvature and no fold. Always true for
+    /// a soft side, which has none.
+    pub met: bool,
 }
 
 /// A corner whose sides ask for tangent planes that disagree.
@@ -153,9 +164,13 @@ pub struct Report {
     /// The data's largest distance is within the request's tolerance.
     pub within_tolerance: bool,
     /// Every hard side meets every target (gap, angle, curvature, not folded), the interior points
-    /// and curves lie on the patch, the data are within the tolerance and no corner was relaxed. A
-    /// side whose gap stopped improving is not excused: it is reported with a warning instead.
+    /// and curves lie on the patch, the patch does not fold inside the outline, the hard conditions
+    /// do not contradict each other, the data are within the tolerance (`within_tolerance`) and no
+    /// corner was relaxed. A side whose gap stopped improving is not excused: it is reported with a
+    /// warning instead.
     pub within_targets: bool,
+    /// The patch folds: back over a reference face along a side, or over itself inside the outline.
+    pub folded: bool,
     /// One entry per side.
     pub sides: Vec<SideReport>,
     /// Corners that were relaxed.
@@ -164,6 +179,12 @@ pub struct Report {
     pub soft_points_max: Option<f64>,
     /// Hard scalar rows found dependent and dropped by the last solve.
     pub dropped: usize,
+    /// Largest miss of a hard row after the solve, as the control point motion that would satisfy it
+    /// (mm): about 0 for consistent rows, the size of the contradiction otherwise.
+    pub hard_residual: f64,
+    /// The net stopped growing because the solve of the next net exceeds the cost bound
+    /// ([`crate::vpatch::MAX_SOLVE_SECONDS`]); the report is that of the net reached.
+    pub cost_limited: bool,
     /// Things the caller should know.
     pub warnings: Vec<String>,
 }
@@ -189,6 +210,12 @@ pub const G2_TARGET_REL: f64 = 0.05;
 pub const CORNER_MISMATCH_DEG: f64 = 0.5;
 
 const MAX_ROUNDS: u32 = 6;
+/// A hard row missed by more than this share of [`G0_TARGET`] (as control point motion, mm) means the
+/// hard conditions contradict each other.
+const HARD_RESIDUAL_SHARE: f64 = 0.1;
+/// The default start net of a call with G1/G2 sides (coupled solve) stays at this size; growth goes on
+/// within the cost bound of [`crate::vpatch::MAX_SOLVE_SECONDS`].
+const COUPLED_START_MAX: usize = 16;
 const DEFAULT_SMOOTHING: f64 = 1e-3;
 /// Share of a side's length around a conflicting corner where its G1/G2 rows are relaxed.
 const RELAX_SPAN: f64 = 0.15;
@@ -222,6 +249,7 @@ struct Round {
     measure: measure::Measure,
     net: [usize; 2],
     dropped: usize,
+    hard_residual: f64,
     summary: Summary,
 }
 
@@ -254,6 +282,10 @@ pub(crate) struct RoundTrace {
     pub max: f64,
     /// Largest gap of a hard side, mm.
     pub gap_max: f64,
+    /// Wall-clock seconds of the solve.
+    pub solve_secs: f64,
+    /// Hard scalar rows of the solve.
+    pub hard_rows: usize,
 }
 
 /// One direction's size after growing by 1.5×, capped.
@@ -334,8 +366,21 @@ fn conflict_list(corners: &[start::Corner]) -> String {
 /// otherwise); the largest distance of one from the patch is reported. When the trimmer refuses
 /// the outline of closest points, it is tried with the start parameters of the sides (a warning).
 pub fn fit_patch(req: &Request) -> Result<Patch> {
+    fit_patch_cancellable(req, &Cancel::new())
+}
+
+/// [`fit_patch`] that gives up with [`KernelError::Cancelled`] when `cancel` is set: checked between
+/// the stages, every round, and inside the loops over the samples, the rows and the data, so a stop
+/// waits for one dense factorisation at most. Nothing is produced for a cancelled call.
+///
+/// The cost of a round is bounded: a round whose solve is estimated above
+/// [`crate::vpatch::MAX_SOLVE_SECONDS`] (see [`crate::vpatch::solve_seconds`]) is not run. A net that would have to
+/// grow past it stops at the net reached (`Report::cost_limited`, a warning); a start net over the
+/// bound is an error.
+pub fn fit_patch_cancellable(req: &Request, cancel: &Cancel) -> Result<Patch> {
     fit(
         req,
+        cancel,
         #[cfg(test)]
         &mut Vec::new(),
     )
@@ -345,18 +390,14 @@ pub fn fit_patch(req: &Request) -> Result<Patch> {
 #[cfg(test)]
 pub(crate) fn fit_patch_rounds(req: &Request) -> Result<(Patch, Vec<RoundTrace>)> {
     let mut trace = Vec::new();
-    let patch = fit(req, &mut trace)?;
+    let patch = fit(req, &Cancel::new(), &mut trace)?;
     Ok((patch, trace))
 }
 
-fn fit(req: &Request, #[cfg(test)] trace: &mut Vec<RoundTrace>) -> Result<Patch> {
-    let start::Prepared { lp, mut interior, corners, warnings: notes } = start::prepare(req)?;
-
-    // corners whose tangent planes disagree: refuse, or relax the rows near them
+/// The corners whose tangent planes disagree: refused, or the zones where the rows are relaxed.
+fn corner_zones(req: &Request, lp: &start::Loop, corners: &[start::Corner]) -> Result<(Vec<Zone>, Vec<CornerReport>)> {
     let conflicts: Vec<start::Corner> =
         corners.iter().filter(|c| c.mismatch_deg > CORNER_MISMATCH_DEG).copied().collect();
-    let mut zones: Vec<Zone> = Vec::new();
-    let mut corner_reports: Vec<CornerReport> = Vec::new();
     if !conflicts.is_empty() && req.conflicts == Conflicts::Fail {
         return Err(KernelError::Argument(format!(
             "the tangent planes of neighbouring sides disagree at {} corner(s) (limit {CORNER_MISMATCH_DEG}°): {}",
@@ -364,20 +405,27 @@ fn fit(req: &Request, #[cfg(test)] trace: &mut Vec<RoundTrace>) -> Result<Patch>
             conflict_list(&conflicts)
         )));
     }
+    let mut zones: Vec<Zone> = Vec::new();
+    let mut reports: Vec<CornerReport> = Vec::new();
     for c in &conflicts {
         let len = |k: usize| lp.sides.get(k).map_or(0.0, |s| s.length());
         let (zb, za) = (RELAX_SPAN * len(c.before), RELAX_SPAN * len(c.after));
         zones.push(Zone { side: c.before, at_end: true, length: zb });
         zones.push(Zone { side: c.after, at_end: false, length: za });
-        corner_reports.push(CornerReport { at: c.at, mismatch_deg: c.mismatch_deg, relaxed_length: zb + za });
+        reports.push(CornerReport { at: c.at, mismatch_deg: c.mismatch_deg, relaxed_length: zb + za });
     }
+    Ok((zones, reports))
+}
 
-    // start net and the fixed parameter domain: the loop's box grown by one control spacing
+/// The start net and the fixed parameter domain: the loop's box grown by one control spacing.
+fn start_net_and_domain(req: &Request, lp: &start::Loop, interior: &start::Interior) -> ([usize; 2], [[f64; 2]; 2]) {
     let max = req.max_control;
     let n_data = interior.data.iter().filter(|p| !p.out).count();
+    let coupled = lp.sides.iter().any(|s| s.continuity != Continuity::G0);
     let start_net = req.control.unwrap_or_else(|| {
         let k = ((n_data as f64 / 12.0).sqrt().round() as usize).max(6);
         let k = std::cmp::min(max, k);
+        let k = if coupled { k.min(COUPLED_START_MAX) } else { k };
         [k, k]
     });
     let margin = |d: usize| (lp.bbox[d][1] - lp.bbox[d][0]) / (start_net[d] as f64 - 1.0);
@@ -385,173 +433,55 @@ fn fit(req: &Request, #[cfg(test)] trace: &mut Vec<RoundTrace>) -> Result<Patch>
         [lp.bbox[0][0] - margin(0), lp.bbox[0][1] + margin(0)],
         [lp.bbox[1][0] - margin(1), lp.bbox[1][1] + margin(1)],
     ];
-    start::check_hard_inside(&interior, &domain)?;
-    let smoothing = req.smoothing.unwrap_or(DEFAULT_SMOOTHING);
+    (start_net, domain)
+}
 
-    let mut net = start_net;
-    let mut best: Option<Round> = None;
-    let mut cache: Option<(Layout, Vec<SideSamples>)> = None;
-    let mut prev: Option<Surface> = None;
-    let mut prev_worst = f64::INFINITY;
-    // sides whose gap the growth no longer lowers, and every side's gap in the round before
-    let mut frozen = vec![false; lp.sides.len()];
-    let mut prev_gaps: Vec<f64> = Vec::new();
-    let main = measure::main_directions(&lp);
-    // the net before the last growth, whether the last step grew the net, and whether the last
-    // round already was a retry
-    let mut from = start_net;
-    let mut grew = false;
-    let mut retried = false;
-    // G2 rows are linearised about the previous round's surface: the curvature error of the last
-    // round that had them
-    let has_g2 = lp.sides.iter().any(|s| s.continuity == Continuity::G2);
-    let mut prev_curv: Option<f64> = None;
-    let mut rounds = 0u32;
-    for round in 1..=MAX_ROUNDS {
-        rounds = round;
-        let had_rows = prev.is_some();
-        let layout = Layout::new(domain, net);
-        if cache.as_ref().is_none_or(|(l, _)| l.net != net) {
-            cache = Some((layout, rows::sample_sides(&lp, &layout)?));
-        }
-        let Some((_, samples)) = cache.as_ref() else { break };
-        let problem = rows::build_problem(&Inputs {
-            lp: &lp,
-            layout: &layout,
-            sides: samples,
-            interior: &interior,
-            zones: &zones,
-            prev: prev.as_ref(),
-            smoothing,
-        })?;
-        let solution = vpatch::solve(&problem)?;
-        let probe = SurfaceProbe::new(&solution.surface)?;
-        let goal = measure::Goal { tolerance: req.tolerance, frozen: &frozen };
-        let m = measure::measure(&solution.surface, &probe, &lp, &layout, samples, &mut interior, &goal)?;
-        #[cfg(test)]
-        trace.push(RoundTrace {
-            net,
-            rms: m.rms,
-            max: m.max,
-            gap_max: m.sides.iter().filter(|s| !s.soft).map(|s| s.gap_max).fold(0.0, f64::max),
-        });
-
-        // a side whose gap a growth step along it lowered by less than MIN_IMPROVEMENT is as close as
-        // it gets (a step that grew only the other direction says nothing about the side)
-        for (k, (s, before)) in m.sides.iter().zip(&prev_gaps).enumerate() {
-            let along = grew && main.get(k).is_some_and(|&d| net.get(d) > from.get(d));
-            if along
-                && !s.soft
-                && s.gap_max > G0_TARGET
-                && before - s.gap_max < MIN_IMPROVEMENT * before
-                && let Some(f) = frozen.get_mut(k)
-            {
-                *f = true;
-            }
-        }
-        prev_gaps = m.sides.iter().map(|s| s.gap_max).collect();
-
-        let data_ok = m.points == 0 || m.max <= req.tolerance;
-        let done = m.sides_ok(&frozen) && data_ok;
-        let worst = m.worst(&frozen);
-        let miss = m.miss;
-        let improved = round == 1 || prev_worst - worst >= MIN_IMPROVEMENT * prev_worst;
-        let summary = Summary { data_ok, data_max: m.max, side_miss: m.side_miss() };
-        // G2 on a net that cannot grow: the first round has no curvature rows, so another round at the
-        // same net states them; then rounds repeat while the curvature error still falls by 5 %
-        let curv = m.curvature_miss();
-        let refine = has_g2
-            && !done
-            && (!had_rows || (curv > G2_TARGET_REL && prev_curv.is_none_or(|p| p - curv >= MIN_IMPROVEMENT * p)));
-        prev_curv = had_rows.then_some(curv);
-        if best.as_ref().is_none_or(|b| prefer(&summary, &b.summary)) {
-            best =
-                Some(Round { surface: solution.surface.clone(), measure: m, net, dropped: solution.dropped, summary });
-        }
-        if done || round == MAX_ROUNDS {
-            break;
-        }
-        // a round that did not help gets one retry in the direction(s) not grown last time
-        let wanted = if improved {
-            retried = false;
-            Some(grow(net, miss, max))
-        } else if retried {
-            None
-        } else {
-            retried = true;
-            Some(grow_other(net, from, max))
-        };
-        let next = match wanted {
-            Some(n) if n != net => n,
-            _ if refine => net,
-            _ => break,
-        };
-        prev_worst = prev_worst.min(worst);
-        prev = Some(solution.surface);
-        grew = next != net;
-        if grew {
-            from = net;
-        }
-        net = next;
-    }
-    let Some(best) = best else {
-        return Err(KernelError::Argument("the patch could not be fitted".into()));
-    };
-
-    // trimming outline: the closest points of the dense samples of the hard sides on the final patch,
-    // the samples' own parameters for soft sides (which may lie off the patch, where the feet clamp
-    // or cross); when the trimmer refuses it, once more with the own parameters of every side
+/// The trimmed sheet: the outline of the closest points of the dense samples of the hard sides on
+/// the final patch, the samples' own parameters for soft sides (which may lie off the patch, where
+/// the feet clamp or cross); when the trimmer refuses it, once more with the own parameters of every
+/// side. The flag says the fallback was used.
+fn trim(lp: &start::Loop, best: &Round) -> Result<(Brep, bool)> {
     let m = &best.measure;
-    let mut trim_fallback = false;
-    let sheet = match trimmed_sheet(&best.surface, &trim_outline(&lp, m, false), &[]) {
-        Ok(sheet) => sheet,
+    match trimmed_sheet(&best.surface, &trim_outline(lp, m, false), &[]) {
+        Ok(sheet) => Ok((sheet, false)),
         Err(first) if lp.sides.iter().any(|s| !s.soft) => {
-            trim_fallback = true;
-            trimmed_sheet(&best.surface, &trim_outline(&lp, m, true), &[]).map_err(|_| first)?
+            let sheet = trimmed_sheet(&best.surface, &trim_outline(lp, m, true), &[]).map_err(|_| first)?;
+            Ok((sheet, true))
         }
-        Err(first) => return Err(first),
-    };
+        Err(first) => Err(first),
+    }
+}
 
-    let within_tolerance = m.points == 0 || m.max <= req.tolerance;
-    let within_targets = m.targets_met() && within_tolerance && corner_reports.is_empty();
-    let mut warnings = notes;
-    if trim_fallback {
-        warnings.push(WARN_TRIM_START.to_string());
-    }
-    if m.points == 0 {
-        warnings.push(WARN_NO_DATA.to_string());
-    } else if m.points < 3 * best.net[0] * best.net[1] {
-        warnings.push(WARN_FEW_DATA.to_string());
-    }
-    if (best.net[0] >= max || best.net[1] >= max) && (best.net != start_net || !(within_tolerance && within_targets)) {
-        warnings.push(WARN_MAX_CONTROL.to_string());
-    }
-    if m.outside > 0 {
-        warnings.push(format!("{} data points lie outside the outline and were ignored", m.outside));
-    }
-    if m.hard_max > G0_TARGET {
-        warnings.push(format!("interior points or curves miss the patch by up to {:.4} mm", m.hard_max));
-    }
-    for (k, (s, f)) in m.sides.iter().zip(&frozen).enumerate() {
-        if *f && !s.soft && s.gap_max > G0_TARGET {
-            warnings.push(format!("side {k}: the gap of {:.4} mm is the accuracy of the side itself", s.gap_max));
-        }
-    }
-    let report = Report {
-        control: best.net,
-        rounds,
-        rms: m.rms,
-        p99: m.p99,
-        max: m.max,
-        points: m.points,
-        outside: m.outside,
-        within_tolerance,
-        within_targets,
-        sides: m.sides.clone(),
-        corners: corner_reports,
-        soft_points_max: m.soft_max,
-        dropped: best.dropped,
-        warnings,
+fn fit(req: &Request, cancel: &Cancel, #[cfg(test)] trace: &mut Vec<RoundTrace>) -> Result<Patch> {
+    let start::Prepared { lp, mut interior, corners, warnings: notes } = start::prepare(req, cancel)?;
+    let (zones, corner_reports) = corner_zones(req, &lp, &corners)?;
+    let (start_net, domain) = start_net_and_domain(req, &lp, &interior);
+    start::check_hard_inside(&interior, &domain)?;
+    let cx = rounds::Context {
+        req,
+        lp: &lp,
+        zones: &zones,
+        domain,
+        start_net,
+        smoothing: req.smoothing.unwrap_or(DEFAULT_SMOOTHING),
+        cancel,
     };
-    Ok(Patch { surface: best.surface, sheet, report })
+    let outcome = cx.run(
+        &mut interior,
+        #[cfg(test)]
+        trace,
+    )?;
+    poll(cancel)?;
+    let (sheet, trim_fallback) = trim(&lp, &outcome.best)?;
+    let report = report::build(report::Inputs {
+        lp: &lp,
+        outcome: &outcome,
+        tolerance: req.tolerance,
+        max_control: req.max_control,
+        start_net,
+        corners: corner_reports,
+        notes,
+        trim_fallback,
+    });
+    Ok(Patch { surface: outcome.best.surface, sheet, report })
 }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::nurbs::SurfaceProbe;
 use crate::record::brep::Frame;
 use crate::tess::tessellate;
 use crate::vpatch::derivatives;
@@ -32,6 +33,7 @@ pub(super) fn request(sides: Vec<Side>) -> Request {
         control: None,
         max_control: 16,
         conflicts: Conflicts::Relax,
+        side_ids: Vec::new(),
     }
 }
 

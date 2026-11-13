@@ -432,3 +432,159 @@ fn soft_tangent_and_curvature_rows_do_not_depend_on_the_units() {
         }
     }
 }
+
+/// A coupled problem (G1 on three sides of the pentagon, positions on all five) over an `n × n` net
+/// with 7056 data points, 1600 soft rows and `extra` hard interior points, the plane the data lie on
+/// being the surface that satisfies every row.
+fn coupled_problem(n: usize, extra: usize) -> Problem {
+    let mut hard = Vec::new();
+    let mut soft = Vec::new();
+    let normal = [-0.2, 0.1, 1.0];
+    let across = |e: usize| [PENTAGON[(e + 1) % 5][1] - PENTAGON[e][1], PENTAGON[e][0] - PENTAGON[(e + 1) % 5][0]];
+    for e in 0..5 {
+        for k in 0..2 * n {
+            let uv = edge_point(e, k as f64 / (2 * n) as f64);
+            hard.push(Row::Position { uv, at: on_plane(uv) });
+            if e < 3 {
+                hard.push(Row::Tangent { uv, dir: across(e), normal });
+            }
+        }
+        for k in 0..200 {
+            let uv = edge_point(e, (k as f64 + 0.5) / 200.0);
+            if e < 3 {
+                soft.push((Row::Tangent { uv, dir: across(e), normal }, 1e4));
+            }
+            soft.push((Row::Position { uv, at: on_plane(uv) }, 1e4));
+        }
+    }
+    for k in 0..extra {
+        let uv = [0.25 + 0.5 * ((k * 7919) % 1000) as f64 / 1000.0, 0.25 + 0.5 * ((k * 104729) % 997) as f64 / 997.0];
+        hard.push(Row::Position { uv, at: on_plane(uv) });
+    }
+    let mut data = Vec::new();
+    for i in 0..84 {
+        for j in 0..84 {
+            let uv = [0.2 + 0.6 * i as f64 / 83.0, 0.2 + 0.6 * j as f64 / 83.0];
+            data.push(DataPoint { uv, at: on_plane(uv), weight: 1.0 });
+        }
+    }
+    Problem { domain: UNIT, control: [n, n], hard, soft, data, outline: PENTAGON.to_vec(), smoothing: 1e-3 }
+}
+
+#[test]
+fn a_solve_over_the_cost_bound_is_refused_before_it_starts() {
+    // 24 × 24 with 3000 hard interior points: tens of seconds of work, estimated over the bound
+    let p = coupled_problem(24, 3000);
+    assert!(p.is_coupled() && p.unknowns() == 1728);
+    assert!(p.estimated_seconds() > MAX_SOLVE_SECONDS, "{}", p.estimated_seconds());
+    let started = std::time::Instant::now();
+    let err = solve(&p).unwrap_err().to_string();
+    assert!(err.contains("limit") && err.contains("hard rows"), "{err}");
+    assert!(started.elapsed().as_secs_f64() < 1.0, "the refusal took {:?}", started.elapsed());
+    // the measured 26 s and 66 s cases (24 × 24 with 2000 and 9000 hard interior points) are refused
+    for extra in [2000, 9000] {
+        let p = coupled_problem(24, extra);
+        assert!(p.estimated_seconds() > MAX_SOLVE_SECONDS, "{extra}: {}", p.estimated_seconds());
+        assert!(solve(&p).is_err());
+    }
+    // the same net with few rows is accepted by the model, and a decoupled problem of that size too
+    assert!(coupled_problem(24, 0).estimated_seconds() <= MAX_SOLVE_SECONDS);
+    assert!(coupled_problem(16, 3000).estimated_seconds() <= MAX_SOLVE_SECONDS);
+}
+
+#[test]
+fn rows_that_can_never_hold_together_leave_a_residual() {
+    let uv = [0.5, 0.5];
+    let mut hard = pentagon_rows();
+    hard.push(Row::Position { uv, at: on_plane(uv) });
+    let consistent = solve(&plane_problem(hard.clone())).unwrap();
+    assert!(consistent.hard_residual <= 1e-9, "{}", consistent.hard_residual);
+    let mut at = on_plane(uv);
+    at[2] += 0.4;
+    hard.push(Row::Position { uv, at });
+    let sol = solve(&plane_problem(hard)).unwrap();
+    assert!(sol.hard_residual >= 0.05, "{}", sol.hard_residual);
+}
+
+#[test]
+fn a_cancelled_solve_returns_the_cancellation() {
+    let p = coupled_problem(12, 0);
+    let cancel = Cancel::new();
+    cancel.cancel();
+    assert_eq!(solve_cancellable(&p, &cancel).unwrap_err(), KernelError::Cancelled);
+    // a flag set while the solve runs stops it between stages, long before it would have ended
+    let big = coupled_problem(24, 0);
+    let cancel = Cancel::new();
+    let started = std::time::Instant::now();
+    let out = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            cancel.cancel();
+        });
+        solve_cancellable(&big, &cancel)
+    });
+    assert_eq!(out.unwrap_err(), KernelError::Cancelled);
+    assert!(started.elapsed().as_secs_f64() < 15.0, "the cancellation took {:?}", started.elapsed());
+}
+
+/// Measurement (ignored): time of one coupled solve against the net size and the hard interior
+/// points. `COST_NETS=8,12` picks the nets, `COST_EXTRA` the hard points; run with
+/// `-- --ignored --nocapture`. Measured on the development laptop (aarch64, `ci` profile, one
+/// thread; the model [`solve_seconds`] is fitted to these):
+///
+/// | net | unknowns | hard scalar rows | seconds | peak memory |
+/// |---|---|---|---|---|
+/// | 8 × 8 | 192 | 184 | 0.04 | 10 MB |
+/// | 12 × 12 | 432 | 338 | 0.23 | 30 MB |
+/// | 16 × 16 | 768 | 455 | 0.8 to 1.3 | 72 MB |
+/// | 20 × 20 | 1200 | 594 | 3.0 | 150 MB |
+/// | 24 × 24 | 1728 | 714 | 4.0 to 5.2 | 278 MB |
+/// | 16 × 16 | 768 | 552 (2256 rows) | 3.7 to 5.1 | 104 MB |
+/// | 24 × 24 | 1728 | 1136 (2384 rows) | 26 | 400 MB |
+/// | 16 × 16 | 768 | 552 (9256 rows) | 11.5 | 105 MB |
+/// | 24 × 24 | 1728 | 1131 (9384 rows) | 66 | 433 MB |
+/// | 24 × 24 | 1728 | 714 (864 rows, the largest the bound accepts) | 3.99 (estimate 5.7) | about 300 MB |
+#[test]
+#[ignore = "measurement"]
+fn cost_of_coupled_solves() {
+    let nets: Vec<usize> = std::env::var("COST_NETS")
+        .unwrap_or_else(|_| "8,12,16,24".into())
+        .split(',')
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    let extra: usize = std::env::var("COST_EXTRA").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    for n in nets {
+        let p = coupled_problem(n, extra);
+        let est = p.estimated_seconds();
+        let t = std::time::Instant::now();
+        // measured with the bound lifted: the estimate is printed next to the time
+        let out = solve(&p);
+        println!(
+            "COST net {n}x{n} unknowns {} hard rows {} soft {} data {}: {:.2} s (estimate {est:.1} s) {:?}",
+            p.unknowns(),
+            p.hard_scalar_rows(),
+            p.soft.len(),
+            p.data.len(),
+            t.elapsed().as_secs_f64(),
+            out.map(|s| s.rank).map_err(|e| e.to_string())
+        );
+    }
+}
+
+/// Measurement (ignored): the largest net the bound accepts, 24 × 24, with as many hard interior
+/// points as it allows, must solve within the bound. Measured: see the assertion message.
+#[test]
+#[ignore = "measurement"]
+fn the_largest_accepted_net_solves_within_the_bound() {
+    let mut extra = 0;
+    while coupled_problem(24, extra + 100).estimated_seconds() <= MAX_SOLVE_SECONDS {
+        extra += 100;
+    }
+    let p = coupled_problem(24, extra);
+    let est = p.estimated_seconds();
+    let started = std::time::Instant::now();
+    let sol = solve(&p).unwrap();
+    let took = started.elapsed().as_secs_f64();
+    println!("COST largest accepted: 24 x 24, {} hard rows, estimate {est:.1} s, took {took:.2} s, rank {}", p.hard_scalar_rows(), sol.rank);
+    assert!(took <= 1.5 * MAX_SOLVE_SECONDS, "took {took:.1} s against an estimate of {est:.1} s");
+}

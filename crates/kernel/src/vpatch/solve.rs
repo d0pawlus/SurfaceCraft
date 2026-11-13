@@ -1,7 +1,8 @@
 //! Dense linear algebra of the constrained minimisation: rank-revealing reduction of the hard rows and the solve in their null space. Pure matrix code; the geometry (basis rows, energy) is assembled in the parent module.
 
 use super::{LinRow, RANK_TOL};
-use crate::{Result, op_err};
+use crate::{Result, op_err, poll};
+use surfacecraft_geom::Cancel;
 use nalgebra::{DMatrix, SVD};
 
 fn all_finite(m: &DMatrix<f64>) -> bool {
@@ -37,7 +38,7 @@ fn spd_solve(a: &DMatrix<f64>, b: &DMatrix<f64>) -> Result<DMatrix<f64>> {
 
 /// The rows (scaled to unit norm) and their right-hand sides reduced to at most `c` rows with the
 /// same normal equations: `[C | D]` with `C` over the `c` unknowns and `D` the `k` right-hand sides.
-fn reduce_rows(rows: &[LinRow], c: usize, k: usize) -> DMatrix<f64> {
+fn reduce_rows(rows: &[LinRow], c: usize, k: usize, cancel: &Cancel) -> Result<DMatrix<f64>> {
     let w = c + k;
     let usable: Vec<(&LinRow, f64)> = rows
         .iter()
@@ -48,6 +49,7 @@ fn reduce_rows(rows: &[LinRow], c: usize, k: usize) -> DMatrix<f64> {
         .collect();
     let mut acc = DMatrix::<f64>::zeros(0, w);
     for chunk in usable.chunks(c.max(1)) {
+        poll(cancel)?;
         let top = acc.nrows();
         let mut st = DMatrix::<f64>::zeros(top + chunk.len(), w);
         if top > 0 {
@@ -72,15 +74,38 @@ fn reduce_rows(rows: &[LinRow], c: usize, k: usize) -> DMatrix<f64> {
             st
         };
     }
-    acc
+    Ok(acc)
+}
+
+/// Singular values, left vectors and right vectors (as rows) of the wide matrix `a` (`m × c`,
+/// `m ≤ c`), through a QR of `aᵀ` and the SVD of its small triangular factor: `aᵀ = Q R`,
+/// `Rᵀ = U S Wᵀ`, so `a = U S (Q W)ᵀ`. The same singular system as the SVD of `a`, at the cost of
+/// `m²·c` instead of a bidiagonalisation that carries `c`-wide factors.
+fn row_space_svd(a: &DMatrix<f64>) -> Result<(Vec<f64>, DMatrix<f64>, DMatrix<f64>)> {
+    let m = a.nrows();
+    let qr = a.transpose().qr();
+    let (q, r) = (qr.q(), qr.r());
+    let niter = 64 * (m + 8);
+    let svd = SVD::try_new_unordered(r.transpose(), true, true, f64::EPSILON, niter)
+        .ok_or_else(|| op_err("vpatch", "the SVD of the constraint rows did not converge"))?;
+    let (Some(u), Some(wt)) = (svd.u, svd.v_t) else {
+        return Err(op_err("vpatch", "the SVD of the constraint rows has no singular vectors"));
+    };
+    let vt = wt * q.transpose();
+    Ok((svd.singular_values.iter().copied().collect(), u, vt))
 }
 
 /// Minimises `½ xᵀ H x − bᵀ x` subject to the rows (`Σ a_j x_j = rhs`, right-hand sides in
 /// columns); returns `x` (one column per right-hand side) and the rank of the rows.
-pub(super) fn constrained_min(h: &DMatrix<f64>, b: &DMatrix<f64>, rows: &[LinRow]) -> Result<(DMatrix<f64>, usize)> {
+pub(super) fn constrained_min(
+    h: &DMatrix<f64>,
+    b: &DMatrix<f64>,
+    rows: &[LinRow],
+    cancel: &Cancel,
+) -> Result<(DMatrix<f64>, usize)> {
     let c = h.nrows();
     let k = b.ncols();
-    let m = reduce_rows(rows, c, k);
+    let m = reduce_rows(rows, c, k, cancel)?;
     if m.nrows() == 0 {
         return Ok((spd_solve(h, b)?, 0));
     }
@@ -89,13 +114,9 @@ pub(super) fn constrained_min(h: &DMatrix<f64>, b: &DMatrix<f64>, rows: &[LinRow
     }
     let cm = m.columns(0, c).into_owned();
     let dm = m.columns(c, k).into_owned();
-    let niter = 64 * (cm.nrows().min(c) + 8);
-    let svd = SVD::try_new_unordered(cm.clone(), true, true, f64::EPSILON, niter)
-        .ok_or_else(|| op_err("vpatch", "the SVD of the constraint rows did not converge"))?;
-    let (Some(u), Some(vt)) = (svd.u.as_ref(), svd.v_t.as_ref()) else {
-        return Err(op_err("vpatch", "the SVD of the constraint rows has no singular vectors"));
-    };
-    let sig = &svd.singular_values;
+    poll(cancel)?;
+    let (sig, u, vt) = row_space_svd(&cm)?;
+    poll(cancel)?;
     let smax = sig.iter().copied().fold(0.0_f64, f64::max);
     let keep: Vec<usize> = (0..sig.len()).filter(|&i| sig[i] > RANK_TOL * smax && sig[i] > 0.0).collect();
     let r = keep.len();
@@ -123,6 +144,7 @@ pub(super) fn constrained_min(h: &DMatrix<f64>, b: &DMatrix<f64>, rows: &[LinRow
     // minimise on x = xp + z with V z = 0 (V: row space of the rows): P H P z = P (b − H xp),
     // P = I − VᵀV; the block γ·VᵀV makes the matrix definite without touching the null space
     let vt_r = vr.transpose();
+    poll(cancel)?;
     let gamma = {
         let g = (0..c).map(|i| h[(i, i)]).sum::<f64>() / c as f64;
         if g.is_finite() && g > 0.0 { g } else { 1.0 }
@@ -135,6 +157,7 @@ pub(super) fn constrained_min(h: &DMatrix<f64>, b: &DMatrix<f64>, rows: &[LinRow
     let g = h - &t1 - t1.transpose() + &t3 + &vv * gamma;
     let r0 = b - h * &xp;
     let rp = &r0 - &vt_r * &(&vr * &r0);
+    poll(cancel)?;
     let z = spd_solve(&g, &rp)?;
     let z = &z - &vt_r * &(&vr * &z);
     let x = &xp + &z;

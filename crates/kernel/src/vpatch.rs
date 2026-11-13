@@ -16,7 +16,7 @@
 //! and mapped back afterwards, so the result does not depend on units. Hard rows are scaled to unit
 //! norm before the rank decision.
 use crate::record::brep::Surface;
-use crate::{KernelError, Result, op_err};
+use crate::{KernelError, Result, op_err, poll};
 use cells::active_cells;
 use nalgebra::DMatrix;
 use solidcore::nurbs::basis_basic::basis_derivs;
@@ -24,6 +24,7 @@ use solidcore::nurbs::knots::{KnotVector, Side};
 use solidcore::nurbs::math::{CPoint, NOW};
 use solidcore::nurbs::srf_basic::Surface as Nurb;
 use solve::constrained_min;
+use surfacecraft_geom::Cancel;
 
 mod cells;
 mod solve;
@@ -37,6 +38,8 @@ pub const DEGREE: usize = 3;
 
 const MAX_DATA: usize = 50_000;
 const MAX_ROWS: usize = 20_000;
+/// Data points or rows between two looks at the cancellation flag.
+const POLL_EVERY: usize = 512;
 /// Weight of the diagonal that keeps control points of inactive cells determined.
 const REGULARIZE: f64 = 1e-8;
 /// Weight of the diagonal added everywhere.
@@ -469,10 +472,14 @@ fn build_rows(g: &Grid, scale: &Scale, row: &Row, coupled: bool) -> Result<Vec<L
 fn accumulate(a: &mut DMatrix<f64>, b: &mut DMatrix<f64>, idx: &[usize; 16], phi: &[f64; 16], at: [f64; 3], w: f64) {
     for (p, &ip) in idx.iter().enumerate() {
         for (q, &iq) in idx.iter().enumerate() {
-            a[(ip, iq)] += w * phi[p] * phi[q];
+            if let Some(slot) = a.get_mut((ip, iq)) {
+                *slot += w * phi[p] * phi[q];
+            }
         }
         for (c, v) in at.iter().enumerate() {
-            b[(ip, c)] += w * phi[p] * v;
+            if let Some(slot) = b.get_mut((ip, c)) {
+                *slot += w * phi[p] * v;
+            }
         }
     }
 }
@@ -537,120 +544,200 @@ fn energy_matrix(g: &Grid, outline: &[[f64; 2]]) -> Result<(DMatrix<f64>, Vec<bo
     Ok((k, inactive))
 }
 
-/// Fits the patch.
-///
-/// Errors (`KernelError::Argument`) for non-finite input, a control net outside
-/// [`MIN_CONTROL`]..=[`MAX_CONTROL`], an empty or inverted domain, parameters outside the domain,
-/// non-positive weights, zero directions or normals, and too many data points or rows.
-pub fn solve(p: &Problem) -> Result<Solution> {
-    validate(p)?;
-    let g = Grid::new(p.domain, p.control)?;
-    let nn = g.count();
-    let scale = Scale::new(p)?;
-    let coupled = p.hard.iter().any(couples) || p.soft.iter().any(|(r, _)| couples(r));
+/// Largest estimated cost of one solve, in seconds of the measuring machine (see [`solve_seconds`]).
+/// The bound is a work estimate: a pure function of the number of unknowns and hard rows, so the
+/// same call is accepted or refused identically on every machine. Measured at the bound (24 × 24,
+/// 864 hard scalar rows, estimate 5.7 s): 3.99 s on the development laptop (aarch64, `ci` profile),
+/// about 300 MB; the full table is in `vpatch/tests.rs` (`cost_of_coupled_solves`). A web build is
+/// expected to be 2 to 3 times slower (not measured); a whole call is at most six rounds.
+pub const MAX_SOLVE_SECONDS: f64 = 8.0;
+/// Seconds per `c³` (dense products, Cholesky) at `c` unknowns.
+const SECONDS_PER_CUBE: f64 = 5e-10;
+/// Seconds per `h·c²` (QR reduction of `h` hard scalar rows over `c` unknowns).
+const SECONDS_PER_ROW: f64 = 7e-10;
+/// Seconds per `min(h, c)³` (SVD of the reduced rows).
+const SECONDS_PER_SVD: f64 = 2e-9;
 
-    let (kmat, inactive) = energy_matrix(&g, &p.outline)?;
-    let tr_k: f64 = (0..nn).map(|i| kmat[(i, i)]).sum();
-    if !tr_k.is_finite() || tr_k <= 0.0 {
-        return Err(op_err("vpatch", "the bending energy matrix is empty"));
+/// Estimated seconds of one solve over `unknowns` with `hard_rows` hard scalar rows, on the
+/// machine and build (`ci` profile) the model was fitted on. Measured (aarch64 laptop, one thread,
+/// coupled layout of G1/G2 sides): 16 × 16 net (768 unknowns) 0.8 to 1.3 s with 450 rows and 11 s
+/// with 27 000 rows; 24 × 24 (1728 unknowns) 4 to 5 s with 700 rows, 26 s with 7 000 and 66 s with
+/// 27 000. The model reproduces those within about 25 %; a web build runs it slower (not measured).
+#[must_use]
+pub fn solve_seconds(unknowns: usize, hard_rows: usize) -> f64 {
+    let (c, h) = (unknowns as f64, hard_rows as f64);
+    SECONDS_PER_CUBE * c * c * c + SECONDS_PER_ROW * h * c * c + SECONDS_PER_SVD * h.min(c).powi(3)
+}
+
+impl Problem {
+    /// Do tangent or curvature rows tie the three coordinates together (3 unknowns per control point)?
+    #[must_use]
+    pub fn is_coupled(&self) -> bool {
+        self.hard.iter().any(couples) || self.soft.iter().any(|(r, _)| couples(r))
     }
 
-    // data and soft position rows: the scalar normal matrix and right-hand sides
-    let mut a_s = DMatrix::<f64>::zeros(nn, nn);
-    let mut b_s = DMatrix::<f64>::zeros(nn, 3);
-    // Returns the point's contribution to a trace; the caller decides whether it counts as data.
+    /// Unknowns of the solve: three per control point when coupled, one otherwise.
+    #[must_use]
+    pub fn unknowns(&self) -> usize {
+        self.control[0] * self.control[1] * if self.is_coupled() { 3 } else { 1 }
+    }
+
+    /// Hard scalar rows of the solve (a position is three rows when coupled).
+    #[must_use]
+    pub fn hard_scalar_rows(&self) -> usize {
+        let coupled = self.is_coupled();
+        self.hard.iter().map(|r| if coupled && !couples(r) { 3 } else { 1 }).sum()
+    }
+
+    /// [`solve_seconds`] of this problem.
+    #[must_use]
+    pub fn estimated_seconds(&self) -> f64 {
+        solve_seconds(self.unknowns(), self.hard_scalar_rows())
+    }
+}
+
+/// Refuses a problem whose solve is estimated above [`MAX_SOLVE_SECONDS`], before anything is allocated.
+fn check_cost(p: &Problem) -> Result<()> {
+    let est = p.estimated_seconds();
+    if est > MAX_SOLVE_SECONDS {
+        return Err(arg(format!(
+            "the solve of {} unknowns with {} hard rows would take about {est:.1} s (limit {MAX_SOLVE_SECONDS:.1} s): \
+             use a smaller control net or fewer hard conditions",
+            p.unknowns(),
+            p.hard_scalar_rows()
+        )));
+    }
+    Ok(())
+}
+
+/// Data and soft rows: the scalar normal matrix and right-hand sides of the positions, the
+/// coupled soft rows, and the traces that scale the bending energy.
+struct SoftTerms {
+    a: DMatrix<f64>,
+    b: DMatrix<f64>,
+    coupled: Vec<(LinRow, f64)>,
+    /// Trace of the data's normal matrix.
+    tr_data: f64,
+    /// Trace of the soft rows' normal matrix.
+    tr_soft: f64,
+}
+
+/// A soft tangent or curvature row at unit Euclidean length (its right-hand side with it): its
+/// coefficients scale with 1/cell and 1/cell², and its weight against the positions must not
+/// depend on the units of the parameters. `None` for a row without length.
+fn unit_row(mut lr: LinRow) -> Option<LinRow> {
+    let len = lr.cols.iter().map(|(_, a)| a * a).sum::<f64>().sqrt();
+    if !(len.is_finite() && len > TINY) {
+        return None;
+    }
+    for c in lr.cols.iter_mut() {
+        c.1 /= len;
+    }
+    lr.rhs[0] /= len;
+    Some(lr)
+}
+
+fn assemble_soft(g: &Grid, scale: &Scale, p: &Problem, cancel: &Cancel) -> Result<SoftTerms> {
+    let nn = g.count();
+    let mut a = DMatrix::<f64>::zeros(nn, nn);
+    let mut b = DMatrix::<f64>::zeros(nn, 3);
+    // the point's contribution to a trace; the caller decides whether it counts as data
     let mut add_position = |uv: [f64; 2], at: [f64; 3], w: f64| -> Result<f64> {
-        let st = Stencil::new(&g, g.clamp(uv))?;
+        let st = Stencil::new(g, g.clamp(uv))?;
         let phi = st.coefficient(0, 0);
-        accumulate(&mut a_s, &mut b_s, &st.indices(&g), &phi, scale.forward(at), w);
+        accumulate(&mut a, &mut b, &st.indices(g), &phi, scale.forward(at), w);
         Ok(3.0 * w * phi.iter().map(|v| v * v).sum::<f64>())
     };
-    // The energy weight is scaled by the trace of the DATA normal matrix only; soft rows (which
-    // may be numerous and heavy) must not stiffen the fit, so they are traced separately.
+    // the energy weight is scaled by the trace of the DATA normal matrix only; soft rows (which
+    // may be numerous and heavy) must not stiffen the fit, so they are traced separately
     let mut tr_data = 0.0;
-    for d in &p.data {
+    for (i, d) in p.data.iter().enumerate() {
+        if i % POLL_EVERY == 0 {
+            poll(cancel)?;
+        }
         tr_data += add_position(d.uv, d.at, d.weight)?;
     }
-    let mut soft_coupled: Vec<(LinRow, f64)> = Vec::new();
+    let mut coupled: Vec<(LinRow, f64)> = Vec::new();
     let mut tr_soft = 0.0;
-    for (row, w) in &p.soft {
-        match row {
-            Row::Position { uv, at } => tr_soft += add_position(*uv, *at, *w)?,
-            _ => {
-                // like the hard rows, a soft tangent or curvature row has unit Euclidean length before
-                // its weight applies: its coefficients scale with 1/cell and 1/cell², and its weight
-                // against the positions must not depend on the units of the parameters
-                for mut lr in build_rows(&g, &scale, row, true)? {
-                    let len = lr.cols.iter().map(|(_, a)| a * a).sum::<f64>().sqrt();
-                    if !(len.is_finite() && len > TINY) {
-                        continue;
-                    }
-                    for c in lr.cols.iter_mut() {
-                        c.1 /= len;
-                    }
-                    lr.rhs[0] /= len;
-                    tr_soft += *w;
-                    soft_coupled.push((lr, *w));
-                }
-            }
+    for (i, (row, w)) in p.soft.iter().enumerate() {
+        if i % POLL_EVERY == 0 {
+            poll(cancel)?;
+        }
+        if let Row::Position { uv, at } = row {
+            tr_soft += add_position(*uv, *at, *w)?;
+            continue;
+        }
+        for lr in build_rows(g, scale, row, true)?.into_iter().filter_map(unit_row) {
+            tr_soft += *w;
+            coupled.push((lr, *w));
         }
     }
-    // with data: relative to the data; with soft rows only: relative to them; with neither: 1
-    let tr_scale = if tr_data > 0.0 { tr_data } else { tr_soft };
-    let lambda = if tr_scale > 0.0 { p.smoothing * tr_scale / (3.0 * tr_k) } else { 1.0 };
-    if !lambda.is_finite() {
-        return Err(arg("the smoothing weight is not finite"));
-    }
+    Ok(SoftTerms { a, b, coupled, tr_data, tr_soft })
+}
 
-    let mut h_s = &a_s + &kmat * lambda;
-    let mean_h = (0..nn).map(|i| h_s[(i, i)]).sum::<f64>() / nn as f64;
+/// `H = A + λK` with the diagonal that keeps the unknowns of inactive cells and the whole matrix definite.
+fn stiffness(a: &DMatrix<f64>, kmat: &DMatrix<f64>, lambda: f64, inactive: &[bool]) -> DMatrix<f64> {
+    let mut h = a + kmat * lambda;
+    let nn = h.nrows();
+    let diag = |m: &DMatrix<f64>, i: usize| m.get((i, i)).copied().unwrap_or(0.0);
+    let mean_h = (0..nn).map(|i| diag(&h, i)).sum::<f64>() / nn.max(1) as f64;
     let base = if mean_h.is_finite() && mean_h > 0.0 { mean_h } else { 1.0 };
-    let mean_e = lambda * tr_k / nn as f64;
+    let mean_e = lambda * (0..nn).map(|i| diag(kmat, i)).sum::<f64>() / nn.max(1) as f64;
     let reg_inactive = REGULARIZE * if mean_e.is_finite() && mean_e > 0.0 { mean_e } else { base };
     for i in 0..nn {
-        h_s[(i, i)] += DIAG_EPS * base + if inactive.get(i).copied().unwrap_or(false) { reg_inactive } else { 0.0 };
+        let extra = DIAG_EPS * base + if inactive.get(i).copied().unwrap_or(false) { reg_inactive } else { 0.0 };
+        if let Some(slot) = h.get_mut((i, i)) {
+            *slot += extra;
+        }
     }
+    h
+}
 
-    let mut hard_rows: Vec<LinRow> = Vec::new();
-    for r in &p.hard {
-        hard_rows.extend(build_rows(&g, &scale, r, coupled)?);
-    }
-
-    let (x, rank, unit) = if coupled {
-        let c = 3 * nn;
-        let mut h3 = DMatrix::<f64>::zeros(c, c);
-        let mut b3 = DMatrix::<f64>::zeros(c, 1);
-        for a in 0..nn {
-            for b in 0..nn {
-                let v = h_s[(a, b)];
-                if v != 0.0 {
-                    for q in 0..3 {
-                        h3[(3 * a + q, 3 * b + q)] = v;
-                    }
-                }
+/// The coupled layout `x[3·i + c]`: `H` repeated on the three coordinates, the soft tangent and
+/// curvature rows added; returns the matrix and the right-hand side.
+fn expand_coupled(h: &DMatrix<f64>, b: &DMatrix<f64>, soft: &[(LinRow, f64)], cancel: &Cancel) -> Result<(DMatrix<f64>, DMatrix<f64>)> {
+    let nn = h.nrows();
+    let c = 3 * nn;
+    let mut h3 = DMatrix::<f64>::zeros(c, c);
+    let mut b3 = DMatrix::<f64>::zeros(c, 1);
+    for a in 0..nn {
+        poll(cancel)?;
+        for bb in 0..nn {
+            let v = h.get((a, bb)).copied().unwrap_or(0.0);
+            if v == 0.0 {
+                continue;
             }
             for q in 0..3 {
-                b3[(3 * a + q, 0)] = b_s[(a, q)];
-            }
-        }
-        for (row, w) in &soft_coupled {
-            for &(i, ai) in &row.cols {
-                for &(j, aj) in &row.cols {
-                    h3[(i, j)] += w * ai * aj;
+                if let Some(slot) = h3.get_mut((3 * a + q, 3 * bb + q)) {
+                    *slot = v;
                 }
-                b3[(i, 0)] += w * row.rhs[0] * ai;
             }
         }
-        let (x, rank) = constrained_min(&h3, &b3, &hard_rows)?;
-        (x, rank, 1)
-    } else {
-        let (x, rank) = constrained_min(&h_s, &b_s, &hard_rows)?;
-        (x, rank, 3)
-    };
+        for q in 0..3 {
+            if let (Some(slot), Some(v)) = (b3.get_mut((3 * a + q, 0)), b.get((a, q))) {
+                *slot = *v;
+            }
+        }
+    }
+    for (row, w) in soft {
+        for &(i, ai) in &row.cols {
+            for &(j, aj) in &row.cols {
+                if let Some(slot) = h3.get_mut((i, j)) {
+                    *slot += w * ai * aj;
+                }
+            }
+            if let Some(slot) = b3.get_mut((i, 0)) {
+                *slot += w * row.rhs[0] * ai;
+            }
+        }
+    }
+    Ok((h3, b3))
+}
 
-    // residual of the hard rows, in the units of the input
+/// Largest `|row·x − rhs|` over the hard rows, in the units of the input.
+fn hard_residual(rows: &[LinRow], x: &DMatrix<f64>, unit: usize, scale: &Scale) -> Result<f64> {
     let mut residual = 0.0_f64;
-    for r in &hard_rows {
+    for r in rows {
         for q in 0..unit {
             let lhs: f64 = r.cols.iter().map(|&(j, a)| a * x.get((j, q)).copied().unwrap_or(f64::NAN)).sum();
             let d = (lhs - r.rhs[q]).abs();
@@ -660,7 +747,11 @@ pub fn solve(p: &Problem) -> Result<Solution> {
             residual = residual.max(d);
         }
     }
+    Ok(residual / scale.factor)
+}
 
+/// The control net from the solution `x`, back in the units of the input.
+fn control_net(g: &Grid, x: &DMatrix<f64>, coupled: bool, scale: &Scale) -> Result<Vec<Vec<[f64; 3]>>> {
     let (n, m) = (g.control[0], g.control[1]);
     let mut points = Vec::with_capacity(n);
     for i in 0..n {
@@ -669,7 +760,8 @@ pub fn solve(p: &Problem) -> Result<Solution> {
             let a = i * m + j;
             let mut pt = [0.0; 3];
             for (q, slot) in pt.iter_mut().enumerate() {
-                let v = if coupled { x[(3 * a + q, 0)] } else { x[(a, q)] };
+                let at = if coupled { (3 * a + q, 0) } else { (a, q) };
+                let v = x.get(at).copied().ok_or_else(|| op_err("vpatch", "the solution is too short"))?;
                 *slot = v / scale.factor + scale.center[q];
             }
             if !bounded(&pt) {
@@ -679,12 +771,65 @@ pub fn solve(p: &Problem) -> Result<Solution> {
         }
         points.push(line);
     }
+    Ok(points)
+}
+
+/// Fits the patch.
+///
+/// Errors (`KernelError::Argument`) for non-finite input, a control net outside
+/// [`MIN_CONTROL`]..=[`MAX_CONTROL`], an empty or inverted domain, parameters outside the domain,
+/// non-positive weights, zero directions or normals, too many data points or rows, and a solve
+/// estimated above [`MAX_SOLVE_SECONDS`] (see [`solve_seconds`]).
+pub fn solve(p: &Problem) -> Result<Solution> {
+    solve_cancellable(p, &Cancel::new())
+}
+
+/// [`solve`] that gives up with [`KernelError::Cancelled`] when `cancel` is set: checked between the
+/// stages and inside the loops over the data and the rows, so a stop waits for one dense
+/// factorisation at most (a few seconds at the largest accepted size).
+pub fn solve_cancellable(p: &Problem, cancel: &Cancel) -> Result<Solution> {
+    validate(p)?;
+    check_cost(p)?;
+    let g = Grid::new(p.domain, p.control)?;
+    let nn = g.count();
+    let scale = Scale::new(p)?;
+    let coupled = p.is_coupled();
+
+    let (kmat, inactive) = energy_matrix(&g, &p.outline)?;
+    poll(cancel)?;
+    let tr_k: f64 = (0..nn).filter_map(|i| kmat.get((i, i))).sum();
+    if !tr_k.is_finite() || tr_k <= 0.0 {
+        return Err(op_err("vpatch", "the bending energy matrix is empty"));
+    }
+    let soft = assemble_soft(&g, &scale, p, cancel)?;
+    // with data: relative to the data; with soft rows only: relative to them; with neither: 1
+    let tr_scale = if soft.tr_data > 0.0 { soft.tr_data } else { soft.tr_soft };
+    let lambda = if tr_scale > 0.0 { p.smoothing * tr_scale / (3.0 * tr_k) } else { 1.0 };
+    if !lambda.is_finite() {
+        return Err(arg("the smoothing weight is not finite"));
+    }
+    let h_s = stiffness(&soft.a, &kmat, lambda, &inactive);
+    let mut hard_rows: Vec<LinRow> = Vec::new();
+    for r in &p.hard {
+        hard_rows.extend(build_rows(&g, &scale, r, coupled)?);
+    }
+
+    let (x, rank, unit) = if coupled {
+        let (h3, b3) = expand_coupled(&h_s, &soft.b, &soft.coupled, cancel)?;
+        let (x, rank) = constrained_min(&h3, &b3, &hard_rows, cancel)?;
+        (x, rank, 1)
+    } else {
+        let (x, rank) = constrained_min(&h_s, &soft.b, &hard_rows, cancel)?;
+        (x, rank, 3)
+    };
+    let residual = hard_residual(&hard_rows, &x, unit, &scale)?;
+    let points = control_net(&g, &x, coupled, &scale)?;
     let total = hard_rows.len() * unit;
     Ok(Solution {
         surface: Surface::Spline { u_knots: g.knots[0].clone(), v_knots: g.knots[1].clone(), points },
         rank: rank * unit,
         dropped: total.saturating_sub(rank * unit),
-        hard_residual: residual / scale.factor,
+        hard_residual: residual,
     })
 }
 
