@@ -109,13 +109,25 @@ fn out(
         relations: 0,
         issues,
         next_steps,
+        preparation: Vec::new(),
+        components: Vec::new(),
     }
 }
 
-/// Wraps the scan and judges the result.
+/// Wraps the scan and judges the result (with the preparation of `pipeline_prepare` where it is needed).
 pub(super) fn freeform_solid(s: &mut Session, set: &Settings, report: ScanSummary) -> CmdResult<ToSolidOut> {
+    super::prepare::freeform_prepared(s, set, report)
+}
+
+/// Wraps `wrap_mesh` (the scan, or a prepared copy of it) and judges the result against the scan.
+pub(super) fn freeform_on(
+    s: &mut Session,
+    set: &Settings,
+    wrap_mesh: surfacecraft_doc::ObjectId,
+    report: ScanSummary,
+) -> CmdResult<ToSolidOut> {
     let params = WrapIn {
-        mesh: ObjRef::Id(set.scan.0),
+        mesh: ObjRef::Id(wrap_mesh.0),
         tolerance: Some(set.tolerance),
         min_within: Some(set.min_within),
         max_patches: None,

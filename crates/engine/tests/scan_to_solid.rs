@@ -61,6 +61,7 @@ fn gate_scan_to_solid_rebuilds_a_chamfered_pin_in_one_call() {
 
     // Act
     let out = s.execute("scan.to_solid", json!({"scan": "scan", "name": "pin solid"})).unwrap();
+    assert_eq!(out["preparation"], json!([]), "a scan that works takes the unchanged path");
 
     // Assert
     eprintln!("scan.to_solid: {}", serde_json::to_string_pretty(&out).unwrap());
@@ -92,7 +93,9 @@ fn a_scan_that_does_not_close_gets_a_verdict_and_next_steps_not_an_error() {
     // Act
     let out = s.execute("scan.to_solid", json!({"scan": "scan"})).unwrap();
 
-    // Assert
+    // Assert: the three shells are three parts; each is modelled on its own and the verdict is the worst of the three
+    assert_eq!(out["preparation"][0]["step"], "split", "{out}");
+    assert_eq!(out["components"].as_array().map(Vec::len), Some(3), "{out}");
     eprintln!("verdict {} issues {}", out["verdict"], out["issues"]);
     assert_ne!(out["verdict"], "pass", "{out}");
     assert!(!codes(&out["issues"]).is_empty(), "{out}");
@@ -123,6 +126,7 @@ fn reuse_regions_models_the_regions_the_scan_already_has() {
 
     // Act
     let out = s.execute("scan.to_solid", json!({"scan": "scan", "reuse_regions": true})).unwrap();
+    assert_eq!(out["preparation"], json!([]), "a scan that works takes the unchanged path");
 
     // Assert
     assert_eq!(out["verdict"], "pass", "{out}");
@@ -175,6 +179,7 @@ fn gate_scan_to_solid_wraps_an_organic_scan_in_patches() {
 
     // Act
     let out = s.execute("scan.to_solid", json!({"scan": "scan"})).unwrap();
+    assert_eq!(out["preparation"], json!([]), "a scan that works takes the unchanged path");
 
     // Assert: auto chose the freeform method and the solid passed
     eprintln!("organic: {}", serde_json::to_string(&json!({"verdict": out["verdict"], "method": out["method"], "patches": out["patches"], "body": out["body"], "deviation": out["deviation"], "issues": out["issues"]})).unwrap());
@@ -201,6 +206,7 @@ fn method_primitives_on_an_organic_scan_says_it_is_freeform() {
 
     // Act
     let out = s.execute("scan.to_solid", json!({"scan": "scan", "method": "primitives"})).unwrap();
+    assert_eq!(out["preparation"], json!([]), "a scan that works takes the unchanged path");
 
     // Assert
     assert_eq!(out["method"], "primitives", "{out}");
@@ -258,6 +264,7 @@ fn a_scan_with_non_manifold_edges_gets_a_verdict_not_an_error() {
 
     // Act
     let out = s.execute("scan.to_solid", json!({"scan": "scan", "clean": false})).unwrap();
+    assert_eq!(out["preparation"], json!([]), "a scan that works takes the unchanged path");
 
     // Assert
     assert!(out["scan_report"]["non_manifold_edges"].as_u64().unwrap() > 0, "{out}");

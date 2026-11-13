@@ -22,6 +22,9 @@ use surfacecraft_fit::PrimitiveKind;
 
 #[path = "pipeline_freeform.rs"]
 mod freeform;
+#[path = "pipeline_prepare.rs"]
+mod prepare;
+pub use prepare::{ComponentOut, PrepStep};
 
 /// Default tolerance the solid is held to against the scan (mm).
 const TOLERANCE: f64 = 0.2;
@@ -102,6 +105,9 @@ pub struct ToSolidIn {
     /// Name of the solid (default "solid").
     #[serde(default)]
     pub name: Option<String>,
+    /// Which parts of a scan with several significant parts are modelled: `all` (default, the largest 24, one solid each), `largest`, or a number of the largest parts.
+    #[serde(default)]
+    pub components: Option<prepare::Components>,
 }
 
 /// How the run ended.
@@ -255,6 +261,13 @@ pub struct ToSolidOut {
     pub issues: Vec<Issue>,
     /// Commands worth running next, most useful first.
     pub next_steps: Vec<NextStep>,
+    /// What was done to the scan before modelling it (`split`, `remesh`) and why; empty when the scan was modelled as it is.
+    #[serde(default)]
+    pub preparation: Vec<PrepStep>,
+    /// One result per part when the scan held several significant parts (the fields above then
+    /// describe the largest part, `verdict` and `issues` the worst of all); empty otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<ComponentOut>,
 }
 
 /// The parameters after validation.
@@ -724,6 +737,14 @@ fn relate(s: &mut Session, modelled: &[Modelled], sigma: Option<f64>) -> usize {
 fn to_solid(s: &mut Session, i: ToSolidIn) -> CmdResult<ToSolidOut> {
     let set = settings(s, &i)?;
     let scan_report = prepare(s, &i, set.scan)?;
+    if let Some(done) = prepare::split_parts(s, &i, &set, &scan_report)? {
+        return Ok(done);
+    }
+    solve(s, &i, set, scan_report)
+}
+
+/// Models one scan (a part, or the whole scan) once it is cleaned.
+fn solve(s: &mut Session, i: &ToSolidIn, set: Settings, scan_report: ScanSummary) -> CmdResult<ToSolidOut> {
     if i.method == Method::Freeform {
         return freeform::freeform_solid(s, &set, scan_report);
     }
@@ -782,6 +803,8 @@ fn to_solid(s: &mut Session, i: ToSolidIn) -> CmdResult<ToSolidOut> {
         relations,
         issues,
         next_steps: next,
+        preparation: Vec::new(),
+        components: Vec::new(),
     })
 }
 

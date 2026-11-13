@@ -93,6 +93,33 @@ Primitives:
 - `scan_defects`: holes too large to fill; `mesh.fill_holes` with a larger `max_edges` (it drops
   the regions), then `scan.to_solid` again without `reuse_regions`.
 
+## Messy scans: parts, handles, shells
+
+`scan.to_solid` looks at the cleaned scan before it models it and reports what it did in
+`preparation` (`[{step, reason, numbers}]`; empty when the scan was modelled as it is).
+
+- **Several parts in one file** (`split`). A piece of the scan that holds at least 1 % of the
+  triangles or of the area is a part; the rest is debris. With two or more parts every part is
+  modelled on its own (one solid each, at most the largest 24; `components` takes `all`,
+  `largest` or a number of parts), and `components[]` gives a verdict per part. The overall
+  `verdict` and `issues` are those of the worst part; the figures at the top level are the
+  largest part's. A part inside another closed part is not a part of its own when it is the inner
+  skin of a hollow part (`nested_shell_skipped`). `scan.split` does the separation alone: it makes
+  one mesh per part, reports triangles, area, box, closedness and genus, the debris, and which
+  parts are nested (`cavity`, a hollow part's inner skin, or `inclusion`, a separate part inside another).
+- **Topological noise** (`remesh`). A closed scan with many handles (genus 64 or more) or non-manifold
+  edges (20 or more) is rebuilt with `mesh.remesh` before it is wrapped; a closed scan that
+  wrapping does not pass on is rebuilt and wrapped again, and the better result is kept.
+  `mesh.remesh` makes a closed, manifold, outward oriented surface at a voxel of 1.5 x tolerance
+  (finer for a thin wall, coarser for a very large area): tunnels, bridges, fins, coincident second
+  shells and self-intersections up to two voxels wide are removed, genuine handles and walls of at
+  least two voxels beyond that are kept, and the vertices are projected back onto the scan. It
+  reports the deviation from the scan both ways. It refuses an open scan (an opening wider than
+  `max_hole`, default 5 mm, is not closed over), a resolution that would exceed its memory limits
+  (16 million grid columns, 40 million ray crossings, 6 million quads), and a wall the voxel cannot
+  resolve when `voxel` is given.
+- A scan that already works is not touched: no preparation step, the same result as before.
+
 ## Second run
 
 - Correct the regions (`region.merge`, `region.split`, `region.grow`, `region.insert`), then call
