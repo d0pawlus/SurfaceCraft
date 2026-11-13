@@ -174,3 +174,37 @@ fn filling_never_raises_the_non_manifold_edge_count_of_random_meshes() {
     }
     assert!(filled_any > 0, "the soups must contain fillable holes");
 }
+
+/// Two cones whose rims are quads that share the two non-adjacent vertices `u` and `w` (the two
+/// sides of a thin double wall): in the plane of each quad the diagonal `u`-`w` is the best one,
+/// so both ear clippers pick it; the second hole must get another diagonal.
+fn double_wall() -> Mesh {
+    let positions = vec![
+        Point3::new(-0.2, 0.0, 0.0), // 0: u
+        Point3::new(0.2, 0.0, 0.0),  // 1: w
+        Point3::new(0.0, 1.0, 0.0),  // 2: p
+        Point3::new(0.0, -1.0, 0.0), // 3: q
+        Point3::new(0.0, 0.0, 1.0),  // 4: r
+        Point3::new(0.0, 0.0, -1.0), // 5: s
+        Point3::new(0.0, 0.5, -3.0), // 6: apex of the cone over u, p, w, q
+        Point3::new(0.0, 3.0, 0.5),  // 7: apex of the cone over u, r, w, s
+    ];
+    let cone =
+        |rim: [u32; 4], apex: u32| -> Vec<[u32; 3]> { (0..4).map(|k| [rim[(k + 1) % 4], rim[k], apex]).collect() };
+    let mut triangles = cone([0, 2, 1, 3], 6);
+    triangles.extend(cone([0, 4, 1, 5], 7));
+    Mesh { positions, triangles }
+}
+
+#[test]
+fn a_second_hole_gets_another_diagonal_when_the_first_patch_took_the_shared_one() {
+    let m = double_wall();
+    assert_eq!(non_manifold(&m), 0);
+    for smooth in [false, true] {
+        let mut f = m.clone();
+        let rep = fill_holes(&mut f, 100, smooth);
+        assert_eq!(non_manifold(&f), 0, "smooth {smooth}");
+        assert_eq!(rep.skipped, 0, "smooth {smooth}: {rep:?}");
+        assert!(boundary_loops(&f).is_empty(), "smooth {smooth}: a hole stayed open");
+    }
+}

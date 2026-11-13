@@ -115,11 +115,16 @@ pub(crate) fn fill_holes_with(mesh: &mut Mesh, max_edges: usize, smooth: bool, s
     let patches: Vec<Patch> =
         if todo.len() < 2 { todo.iter().map(fill).collect() } else { par::map_slice(&todo, fill) };
     for (lp, patch) in todo.iter().zip(patches) {
+        // the patches were made against the mesh as it was; a refused one is made again against
+        // the edges as they are now (the accepted patches included), refined first, then flat
         let mut added = append_if_admitted(mesh, &mut uses, patch);
-        if added.is_none() && smooth {
-            // the refined patch overloads an edge: the flat one may not
-            let flat = fill_in_workspace(mesh, &faces, &uses, lp, false, false);
-            added = append_if_admitted(mesh, &mut uses, flat);
+        let retries = if smooth { vec![(true, sharpen), (false, false)] } else { vec![(false, false)] };
+        for (smooth, sharpen) in retries {
+            if added.is_some() {
+                break;
+            }
+            let again = fill_in_workspace(mesh, &faces, &uses, lp, smooth, sharpen);
+            added = append_if_admitted(mesh, &mut uses, again);
         }
         match added {
             Some(n) => {
@@ -301,17 +306,9 @@ impl Patch {
     }
 }
 
-/// Fills the loop `lp` in a copy of the triangles around it, which is all the fairing and the
-/// sharpening read; the copy numbers its vertices in the order of the mesh's, so the patch is the
-/// one the whole mesh would give.
-fn fill_in_workspace(
-    mesh: &Mesh,
-    faces: &VertexFaces,
-    uses: &EdgeUses,
-    lp: &[u32],
-    smooth: bool,
-    sharpen: bool,
-) -> Patch {
+/// The triangles around the loop (a few rings) as a mesh of their own, numbered in the order of the
+/// mesh's vertices, and the mesh vertex of every workspace vertex.
+fn workspace(mesh: &Mesh, faces: &VertexFaces, lp: &[u32]) -> (Vec<u32>, Mesh) {
     let mut tris: Vec<u32> = Vec::new();
     let mut seen: HashSet<u32> = HashSet::new();
     let mut front: Vec<u32> = lp.to_vec();
@@ -333,10 +330,26 @@ fn fill_in_workspace(
     origin.sort_unstable();
     origin.dedup();
     let local = |v: u32| origin.binary_search(&v).map_or(0, |k| k as u32);
-    let mut work = Mesh {
+    let work = Mesh {
         positions: origin.iter().map(|&v| mesh.positions[v as usize]).collect(),
         triangles: tris.iter().map(|&t| mesh.triangles[t as usize].map(local)).collect(),
     };
+    (origin, work)
+}
+
+/// Fills the loop `lp` in a copy of the triangles around it, which is all the fairing and the
+/// sharpening read; the copy numbers its vertices in the order of the mesh's, so the patch is the
+/// one the whole mesh would give.
+fn fill_in_workspace(
+    mesh: &Mesh,
+    faces: &VertexFaces,
+    uses: &EdgeUses,
+    lp: &[u32],
+    smooth: bool,
+    sharpen: bool,
+) -> Patch {
+    let (origin, mut work) = workspace(mesh, faces, lp);
+    let local = |v: u32| origin.binary_search(&v).map_or(0, |k| k as u32);
     let lp: Vec<u32> = lp.iter().map(|&v| local(v)).collect();
     let around = (smooth && sharpen).then(|| crate::crease::Around::new(&work));
     let (first_tri, first_vertex) = (work.triangles.len(), work.positions.len());
@@ -371,6 +384,7 @@ fn refine_and_fair(mesh: &mut Mesh, first: usize, lp: &[u32]) {
     if !(target > 0.0) {
         return;
     }
+    let outside = outside_edges(mesh, first);
     let first_vertex = mesh.positions.len();
     let target_area = target * target * 3f64.sqrt() / 4.0;
     for _round in 0..12 {
@@ -389,7 +403,7 @@ fn refine_and_fair(mesh: &mut Mesh, first: usize, lp: &[u32]) {
                 split = true;
             }
         }
-        flip_patch(mesh, first);
+        flip_patch(mesh, first, &outside);
         if !split {
             break;
         }
@@ -397,81 +411,86 @@ fn refine_and_fair(mesh: &mut Mesh, first: usize, lp: &[u32]) {
             break;
         }
     }
-    flip_patch(mesh, first);
+    flip_patch(mesh, first, &outside);
     fair_patch(mesh, first, first_vertex);
 }
 
-/// Delaunay-style edge flips among patch triangles (edges shared by two patch triangles).
-fn flip_patch(mesh: &mut Mesh, first: usize) {
-    // edges of the surrounding mesh: a flip must not put a patch edge on one of them
-    let outside: HashSet<(u32, u32)> = mesh
-        .triangles
+/// The undirected edges of the triangles before `first`: the mesh around a patch, which a flip of
+/// the patch must not put an edge on.
+pub(crate) fn outside_edges(mesh: &Mesh, first: usize) -> HashSet<(u32, u32)> {
+    mesh.triangles
         .iter()
         .take(first)
         .flat_map(|t| (0..3).map(move |k| (t[k].min(t[(k + 1) % 3]), t[k].max(t[(k + 1) % 3]))))
-        .collect();
+        .collect()
+}
+
+/// Delaunay-style edge flips among patch triangles (edges shared by two patch triangles);
+/// `outside` is [`outside_edges`] of the mesh around the patch.
+fn flip_patch(mesh: &mut Mesh, first: usize, outside: &HashSet<(u32, u32)>) {
     for _pass in 0..8 {
-        let mut edge: HashMap<(u32, u32), (usize, usize)> = HashMap::new();
-        for ti in first..mesh.triangles.len() {
-            let t = mesh.triangles[ti];
-            for k in 0..3 {
-                edge.insert((t[k], t[(k + 1) % 3]), (ti, k));
-            }
-        }
-        let mut flipped = false;
-        let mut done: HashSet<usize> = HashSet::new();
-        // edges this pass has made: `edge` is as the pass found the patch
-        let mut made: HashSet<(u32, u32)> = HashSet::new();
-        let mut keys: Vec<(u32, u32)> = edge.keys().copied().collect();
-        keys.sort_unstable();
-        for (a, b) in keys {
-            let (Some(&(t0, k0)), Some(&(t1, k1))) = (edge.get(&(a, b)), edge.get(&(b, a))) else { continue };
-            if done.contains(&t0) || done.contains(&t1) {
-                continue;
-            }
-            let c = mesh.triangles[t0][(k0 + 2) % 3];
-            let d = mesh.triangles[t1][(k1 + 2) % 3];
-            if c == d {
-                continue;
-            }
-            let (pa, pb, pc, pd) = (
-                mesh.positions[a as usize],
-                mesh.positions[b as usize],
-                mesh.positions[c as usize],
-                mesh.positions[d as usize],
-            );
-            let ang = |o: Point3, u: Point3, v: Point3| {
-                let (x, y) = (u - o, v - o);
-                x.angle(&y)
-            };
-            if ang(pc, pa, pb) + ang(pd, pa, pb) <= std::f64::consts::PI + 1e-9 {
-                continue;
-            }
-            // the new triangles must keep the orientation of the old pair
-            let n_old = tri::cross(&pa, &pb, &pc) + tri::cross(&pb, &pa, &pd);
-            let (n1, n2) = (tri::cross(&pc, &pd, &pb), tri::cross(&pd, &pc, &pa));
-            if n1.dot(&n_old) <= 0.0 || n2.dot(&n_old) <= 0.0 {
-                continue;
-            }
-            // do not create an edge that already exists
-            if edge.contains_key(&(c, d))
-                || edge.contains_key(&(d, c))
-                || outside.contains(&(c.min(d), c.max(d)))
-                || made.contains(&(c.min(d), c.max(d)))
-            {
-                continue;
-            }
-            mesh.triangles[t0] = [c, d, b];
-            mesh.triangles[t1] = [d, c, a];
-            done.insert(t0);
-            done.insert(t1);
-            made.insert((c.min(d), c.max(d)));
-            flipped = true;
-        }
-        if !flipped {
+        if !flip_pass(mesh, first, outside) {
             break;
         }
     }
+}
+
+/// Whether flipping the edge `a`-`b` of the quad `a, b, c, d` to `c`-`d` is a Delaunay gain that
+/// keeps the orientation of the two triangles.
+fn flip_wanted(mesh: &Mesh, [a, b, c, d]: [u32; 4]) -> bool {
+    let (pa, pb, pc, pd) = (
+        mesh.positions[a as usize],
+        mesh.positions[b as usize],
+        mesh.positions[c as usize],
+        mesh.positions[d as usize],
+    );
+    let ang = |o: Point3, u: Point3, v: Point3| (u - o).angle(&(v - o));
+    if ang(pc, pa, pb) + ang(pd, pa, pb) <= std::f64::consts::PI + 1e-9 {
+        return false;
+    }
+    let n_old = tri::cross(&pa, &pb, &pc) + tri::cross(&pb, &pa, &pd);
+    let (n1, n2) = (tri::cross(&pc, &pd, &pb), tri::cross(&pd, &pc, &pa));
+    n1.dot(&n_old) > 0.0 && n2.dot(&n_old) > 0.0
+}
+
+/// One pass of flips; whether any edge flipped.
+fn flip_pass(mesh: &mut Mesh, first: usize, outside: &HashSet<(u32, u32)>) -> bool {
+    let mut edge: HashMap<(u32, u32), (usize, usize)> = HashMap::new();
+    for ti in first..mesh.triangles.len() {
+        let t = mesh.triangles[ti];
+        for k in 0..3 {
+            edge.insert((t[k], t[(k + 1) % 3]), (ti, k));
+        }
+    }
+    let mut flipped = false;
+    let mut done: HashSet<usize> = HashSet::new();
+    // edges this pass has made: `edge` is as the pass found the patch
+    let mut made: HashSet<(u32, u32)> = HashSet::new();
+    let mut keys: Vec<(u32, u32)> = edge.keys().copied().collect();
+    keys.sort_unstable();
+    for (a, b) in keys {
+        let (Some(&(t0, k0)), Some(&(t1, k1))) = (edge.get(&(a, b)), edge.get(&(b, a))) else { continue };
+        if done.contains(&t0) || done.contains(&t1) {
+            continue;
+        }
+        let c = mesh.triangles[t0][(k0 + 2) % 3];
+        let d = mesh.triangles[t1][(k1 + 2) % 3];
+        let new_edge = (c.min(d), c.max(d));
+        // do not create an edge that already exists
+        let exists = edge.contains_key(&(c, d)) || edge.contains_key(&(d, c));
+        if c == d || exists || outside.contains(&new_edge) || made.contains(&new_edge) {
+            continue;
+        }
+        if !flip_wanted(mesh, [a, b, c, d]) {
+            continue;
+        }
+        mesh.triangles[t0] = [c, d, b];
+        mesh.triangles[t1] = [d, c, a];
+        done.extend([t0, t1]);
+        made.insert(new_edge);
+        flipped = true;
+    }
+    flipped
 }
 
 /// One row of the fairing operator (see [`fair_patch`]).
@@ -696,7 +715,7 @@ mod tests {
         };
         let mut m = Mesh::default();
         mesh(&mut m);
-        flip_patch(&mut m, 0);
+        flip_patch(&mut m, 0, &HashSet::new());
         let uses_of_cd = m
             .triangles
             .iter()

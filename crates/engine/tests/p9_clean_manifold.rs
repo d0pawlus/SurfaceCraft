@@ -75,3 +75,67 @@ fn clean_and_fill_holes_never_add_non_manifold_edges_to_random_meshes() {
         assert!(after <= before, "round {round}: mesh.fill_holes {before} -> {after}");
     }
 }
+
+/// `n x n` flat grid of unit squares; vertex `(i, j)` is `j * (n + 1) + i`.
+fn grid(n: u32) -> Mesh {
+    let w = n + 1;
+    let positions = (0..w * w).map(|k| Point3::new(f64::from(k % w), f64::from(k / w), 0.0)).collect();
+    let mut triangles = Vec::new();
+    for j in 0..n {
+        for i in 0..n {
+            let (a, b, c, d) = (j * w + i, j * w + i + 1, (j + 1) * w + i + 1, (j + 1) * w + i);
+            triangles.push([a, b, c]);
+            triangles.push([a, c, d]);
+        }
+    }
+    Mesh { positions, triangles }
+}
+
+/// The square hole of vertices 6, 7, 12, 11 in a 4x4 grid with a flap hanging on the diagonal
+/// 6-12. The old fill clipped the ear on that diagonal (an edge of the mesh already) and made it
+/// non-manifold: the geom test `a_hole_with_one_free_diagonal_is_filled_with_it` measured 3
+/// non-manifold edges on this very mesh before the fix.
+fn hole_next_to_a_flap() -> Mesh {
+    let mut m = grid(4);
+    let cell = 5;
+    let mut k = 0;
+    m.triangles.retain(|_| {
+        k += 1;
+        k - 1 != 2 * cell && k - 1 != 2 * cell + 1
+    });
+    m.positions.push(Point3::new(1.5, 1.5, 3.0));
+    let x = m.positions.len() as u32 - 1;
+    m.triangles.push([6, 12, x]);
+    m
+}
+
+#[test]
+fn fill_holes_closes_a_hole_beside_an_existing_diagonal_without_a_non_manifold_edge() {
+    for smooth in [false, true] {
+        let mut s = Session::new();
+        let id = s.doc.add_mesh("scan", hole_next_to_a_flap());
+        let out =
+            s.execute("mesh.fill_holes", json!({"object": "scan", "max_edges": 100, "smooth": smooth})).expect("fill");
+        assert!(out["holes_filled"].as_u64().unwrap_or(0) >= 2, "{out}");
+        assert_eq!(non_manifold(&s, id), 0, "smooth {smooth}");
+    }
+}
+
+#[test]
+fn random_meshes_do_get_holes_filled_by_mesh_fill_holes_alone() {
+    let mut rng = Rng::new(9_000_031);
+    let mut filled = 0;
+    for round in 0..150 {
+        let mesh = soup(&mut rng, round % 3 == 2);
+        let before = readable_non_manifold(&mesh);
+        let mut s = Session::new();
+        let id = s.doc.add_mesh("scan", mesh);
+        if let Ok(out) =
+            s.execute("mesh.fill_holes", json!({"object": "scan", "max_edges": 300, "smooth": round % 2 == 0}))
+        {
+            filled += out["holes_filled"].as_u64().unwrap_or(0);
+        }
+        assert!(non_manifold(&s, id) <= before, "round {round}");
+    }
+    assert!(filled > 0, "no round filled a hole: the test would pass on any fill");
+}

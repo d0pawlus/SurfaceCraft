@@ -68,6 +68,24 @@ fn judge(p2: &[[f64; 2]], idx: &[usize], k: usize, sign: f64) -> Ear {
     }
 }
 
+/// [`judge`], but an ear whose new diagonal `taken` says exists already is not clippable.
+fn judge_avoiding(
+    p2: &[[f64; 2]],
+    lp: &[u32],
+    idx: &[usize],
+    k: usize,
+    sign: f64,
+    taken: &dyn Fn(u32, u32) -> bool,
+) -> Ear {
+    let m = idx.len();
+    let ear = judge(p2, idx, k, sign);
+    let (ia, ic) = (idx[(k + m - 1) % m], idx[(k + 1) % m]);
+    match ear {
+        Ear::Valid(_) if taken(lp[ia], lp[ic]) => Ear::Flat,
+        other => other,
+    }
+}
+
 /// Ear clipping in the loop's mean plane; false when the projected polygon is not simple enough.
 #[cfg(test)]
 pub(crate) fn ear_clip(mesh: &mut Mesh, lp: &[u32]) -> bool {
@@ -94,15 +112,7 @@ pub(crate) fn ear_clip_avoiding(mesh: &mut Mesh, lp: &[u32], taken: &dyn Fn(u32,
         .sum();
     let sign = if area2 >= 0.0 { 1.0 } else { -1.0 };
     let mut idx: Vec<usize> = (0..lp.len()).collect();
-    let judge_ear = |idx: &[usize], k: usize| {
-        let m = idx.len();
-        let ear = judge(&p2, idx, k, sign);
-        let (ia, ic) = (idx[(k + m - 1) % m], idx[(k + 1) % m]);
-        match ear {
-            Ear::Valid(_) if taken(lp[ia], lp[ic]) => Ear::Flat,
-            other => other,
-        }
-    };
+    let judge_ear = |idx: &[usize], k: usize| judge_avoiding(&p2, lp, idx, k, sign, taken);
     let mut ears: Vec<Ear> = (0..lp.len()).map(|k| judge_ear(&idx, k)).collect();
     let mut out: Vec<[u32; 3]> = Vec::with_capacity(lp.len());
     while idx.len() > 3 {
