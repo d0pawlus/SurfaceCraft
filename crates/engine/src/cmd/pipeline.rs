@@ -29,6 +29,7 @@ mod budget;
 mod freeform;
 #[path = "pipeline_judge.rs"]
 mod judge;
+pub(crate) use auto::ToSolidReport;
 use judge::{Outcome, issues_of, next_steps, verdict_of};
 
 /// Default tolerance the solid is held to against the scan (mm).
@@ -577,7 +578,7 @@ fn relate(s: &mut Session, modelled: &[Modelled], sigma: Option<f64>) -> usize {
     auto_constrain(s, params).map_or(0, |r| if r.applied { r.relations.len() } else { 0 })
 }
 
-fn to_solid(s: &mut Session, i: ToSolidIn) -> CmdResult<auto::ToSolidReport> {
+pub(super) fn to_solid(s: &mut Session, i: ToSolidIn) -> CmdResult<auto::ToSolidReport> {
     let set = settings(s, &i)?;
     let scan_report = prepare(s, &i, set.scan)?;
     auto::run(s, &i, &set, scan_report)
@@ -667,7 +668,7 @@ pub static COMMANDS: &[CommandSpec] = &[command!(
     "From raw scan `scan` to a closed solid in one step, measured against the scan. Prismatic parts (`method` primitives): cleans the scan, segments it, fits a primitive to each sizeable region, relates the primitives and builds the solid. Organic parts, castings and body panels (`method` freeform): wraps the whole scan in a watertight network of patches. `method` auto (default) tries the suggested method, then the other if it fails, and returns the better (`attempts`). Returns `verdict` (pass, review or fail), the deviation, `issues`, and `next_steps` with ready parameters. A poor model is a verdict, not an error; regions stay for manual work. `reuse_regions` models corrected regions again (without cleaning).",
     ToSolidIn,
     auto::ToSolidReport,
-    to_solid
+    super::mesh::scan_size::to_solid_checked
 )];
 
 #[cfg(test)]

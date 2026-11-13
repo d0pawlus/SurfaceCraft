@@ -1,6 +1,6 @@
 //! `cargo xtask <task>`: the repository's checks.
 //!
-//! `ci` runs, in order: fmt → assets → licences → layers → ui-containers → app-geometry → clippy → wasm → test.
+//! `ci` runs, in order: fmt → assets → licences → layers → ui-containers → app-geometry → file-size → clippy → wasm → test.
 //! `web [--no-threads]` (not in ci) builds the browser bundles, `web --check` type-checks the threaded one
 //! (its own CI job); `web-toolchain` prints the nightly they need.
 //! `dist [--tag vX.Y.Z]` (not in ci) builds the host-target release packages in `dist/<target>/release/`.
@@ -8,6 +8,7 @@
 
 mod assets;
 mod dist;
+mod file_size;
 mod layers;
 mod licences;
 mod ui_containers;
@@ -196,6 +197,7 @@ fn ci() -> Result<(), String> {
     layers::check()?;
     ui_containers::check()?;
     app_geometry()?;
+    file_size::check()?;
     clippy()?;
     wasm()?;
     test()?;
@@ -214,6 +216,7 @@ fn quick(packages: &[String], with_tests: bool) -> Result<(), String> {
     layers::check()?;
     ui_containers::check()?;
     app_geometry()?;
+    file_size::check()?;
     if !packages.is_empty() {
         let mut c = cargo();
         c.args(["clippy", "--all-targets", "--profile", "ci"]);
@@ -252,6 +255,7 @@ fn main() -> ExitCode {
             "layers" => layers::check(),
             "ui-containers" => ui_containers::check(),
             "app-geometry" => app_geometry(),
+            "file-size" => file_size::check(),
             "clippy" => clippy(),
             "wasm" => wasm(),
             "test" => test(),
@@ -262,7 +266,7 @@ fn main() -> ExitCode {
                 Ok(())
             }
             "dist" => dist::run(&args),
-            _ => Err("tasks: ci, quick [--tests] [packages], fmt, assets, licences [--check], layers, ui-containers, app-geometry, clippy, wasm, test, web [--no-threads | --check], web-toolchain, dist [--tag vX.Y.Z]"
+            _ => Err("tasks: ci, quick [--tests] [packages], fmt, assets, licences [--check], layers, ui-containers, app-geometry, file-size, clippy, wasm, test, web [--no-threads | --check], web-toolchain, dist [--tag vX.Y.Z]"
                 .into()),
         };
     match r {
