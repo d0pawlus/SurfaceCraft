@@ -12,9 +12,9 @@
 //! held fixed (Grisetti et al. 2010 describe the same scheme for general pose graphs). A Huber
 //! weight per edge keeps one bad measurement from dragging the rest.
 use crate::AlignError;
+use nalgebra::{DMatrix, DVector, Matrix3, Rotation3, SMatrix, Vector3};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use nalgebra::{DMatrix, DVector, Matrix3, Rotation3, SMatrix, Vector3};
 use surfacecraft_geom::{Bvh, Cancel, Mesh, Point3, Rng, Transform};
 
 /// Most virtual correspondences per edge.
@@ -161,7 +161,13 @@ fn add_block(h: &mut DMatrix<f64>, r: Option<usize>, c: Option<usize>, m: &SMatr
     }
 }
 
-fn normal_equations(edges: &[Edge], poses: &[Transform], slot: &[Option<usize>], weights: &[f64], size: usize) -> System {
+fn normal_equations(
+    edges: &[Edge],
+    poses: &[Transform],
+    slot: &[Option<usize>],
+    weights: &[f64],
+    size: usize,
+) -> System {
     let mut sys = System { h: DMatrix::zeros(size, size), g: DVector::zeros(size), cost: 0.0 };
     for (e, &w) in edges.iter().zip(weights) {
         let (Some(xi), Some(xj)) = (poses.get(e.i), poses.get(e.j)) else { continue };
@@ -205,10 +211,11 @@ fn step_poses(poses: &[Transform], slot: &[Option<usize>], d: &DVector<f64>) -> 
         .map(|(x, s)| match s {
             None => *x,
             Some(s) => match d.as_slice().get(6 * s..6 * s + 6) {
-                Some(&[wx, wy, wz, vx, vy, vz]) => {
-                    Transform { rotation: Rotation3::new(Vector3::new(wx, wy, wz)), translation: Vector3::new(vx, vy, vz) }
-                        .then_after(x)
+                Some(&[wx, wy, wz, vx, vy, vz]) => Transform {
+                    rotation: Rotation3::new(Vector3::new(wx, wy, wz)),
+                    translation: Vector3::new(vx, vy, vz),
                 }
+                .then_after(x),
                 _ => *x,
             },
         })
@@ -240,10 +247,11 @@ fn improve(
             if after.is_finite() && after <= sys.cost {
                 let step = d
                     .as_slice()
-                    .chunks_exact(6)
-                    .map(|c| {
-                        let norm = |v: &[f64]| v.iter().map(|x| x * x).sum::<f64>().sqrt();
-                        norm(c.get(..3).unwrap_or(&[])) * reach + norm(c.get(3..).unwrap_or(&[]))
+                    .as_chunks::<6>()
+                    .0
+                    .iter()
+                    .map(|&[wx, wy, wz, vx, vy, vz]| {
+                        Vector3::new(wx, wy, wz).norm() * reach + Vector3::new(vx, vy, vz).norm()
                     })
                     .fold(0.0, f64::max);
                 return Some((next, after, sys.cost, step));
@@ -259,7 +267,13 @@ fn improve(
 ///
 /// # Errors
 /// [`AlignError::Cancelled`] when `cancel` is raised between iterations.
-pub fn relax(n: usize, root: usize, edges: &[Edge], init: &[Transform], cancel: &Cancel) -> Result<Relaxed, AlignError> {
+pub fn relax(
+    n: usize,
+    root: usize,
+    edges: &[Edge],
+    init: &[Transform],
+    cancel: &Cancel,
+) -> Result<Relaxed, AlignError> {
     let slot = slots(n, root, edges);
     let size = 6 * slot.iter().flatten().count();
     let mut poses = init.to_vec();
@@ -279,7 +293,8 @@ pub fn relax(n: usize, root: usize, edges: &[Edge], init: &[Transform], cancel: 
             continue;
         };
         poses = next;
-        converged = step <= STEP_TOLERANCE * reach || (before - after) <= COST_TOLERANCE * before.max(f64::MIN_POSITIVE);
+        converged =
+            step <= STEP_TOLERANCE * reach || (before - after) <= COST_TOLERANCE * before.max(f64::MIN_POSITIVE);
     }
     Ok(Relaxed { poses, iterations, converged })
 }

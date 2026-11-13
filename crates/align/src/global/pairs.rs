@@ -64,7 +64,8 @@ pub(super) fn run_pairs(
     let tried = par::map(list.len(), |k| {
         let &(fixed, moving) = list.get(k)?;
         let (f, m) = (scans.get(fixed)?, scans.get(moving)?);
-        let outcome = if cancel.is_cancelled() { Err(AlignError::Cancelled) } else { pair_coarse(m, f, &options, cancel) };
+        let outcome =
+            if cancel.is_cancelled() { Err(AlignError::Cancelled) } else { pair_coarse(m, f, &options, cancel) };
         Some(Tried { fixed, moving, outcome })
     });
     let tried: Vec<Tried> = tried.into_iter().flatten().collect();

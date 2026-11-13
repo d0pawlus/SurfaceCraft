@@ -63,6 +63,8 @@ pub enum Unplaced {
     NoUniquePair,
     /// It has unique pairs, but only with scans that are not connected to the fixed one either.
     OtherGroup,
+    /// Its unique pairs all contradicted the poses of the others and were left out.
+    Contradicted,
     /// None of its pairs was tried (the cap `max_pairs` was reached first).
     PairsNotTried,
 }

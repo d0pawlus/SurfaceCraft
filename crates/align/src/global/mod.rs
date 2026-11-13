@@ -92,13 +92,23 @@ fn check_scan(k: usize, m: &Mesh) -> Result<(), AlignError> {
 
 fn check_input(scans: &[&Mesh], opts: &GlobalOptions) -> Result<(), AlignError> {
     if scans.len() < 2 || scans.len() > MAX_SCANS {
-        return Err(AlignError::NotEnough(format!("{} scans given; between 2 and {MAX_SCANS} are needed", scans.len())));
+        return Err(AlignError::NotEnough(format!(
+            "{} scans given; between 2 and {MAX_SCANS} are needed",
+            scans.len()
+        )));
     }
     if opts.fixed >= scans.len() {
-        return Err(AlignError::Degenerate(format!("the fixed scan {} is not among the {} scans", opts.fixed, scans.len())));
+        return Err(AlignError::Degenerate(format!(
+            "the fixed scan {} is not among the {} scans",
+            opts.fixed,
+            scans.len()
+        )));
     }
     if opts.max_pairs == 0 || opts.max_pairs > MAX_PAIRS_LIMIT {
         return Err(AlignError::Degenerate(format!("max_pairs must be between 1 and {MAX_PAIRS_LIMIT}")));
+    }
+    if opts.tolerance.is_some_and(|t| !(t.is_finite() && t > 0.0)) {
+        return Err(AlignError::Degenerate("the tolerance must be a positive number of mm".into()));
     }
     scans.iter().enumerate().try_for_each(|(k, m)| check_scan(k, m))
 }

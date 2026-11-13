@@ -85,7 +85,9 @@ fn note_of(verdict: GlobalVerdict, applied: bool, refused: bool, unplaced: usize
         (GlobalVerdict::Aligned, true, _) => "every scan is placed and the pair poses agree: applied".into(),
         (GlobalVerdict::Aligned, false, _) => "every scan is placed and the pair poses agree".into(),
         (GlobalVerdict::Partial, true, _) => {
-            format!("partial: the placed scans were moved, {unplaced} scan(s) could not be connected and stay where they are")
+            format!(
+                "partial: the placed scans were moved, {unplaced} scan(s) could not be connected and stay where they are"
+            )
         }
         (GlobalVerdict::Partial, false, _) => {
             format!("partial: {unplaced} scan(s) could not be connected, or a loop does not close; check the edges")
@@ -97,7 +99,10 @@ fn note_of(verdict: GlobalVerdict, applied: bool, refused: bool, unplaced: usize
 
 fn resolve_all(s: &Session, i: &GlobalIn) -> CmdResult<(Vec<ObjectId>, usize)> {
     if i.objects.len() > MAX_SCANS {
-        return Err(CmdError::Params(format!("{} scans given; at most {MAX_SCANS} are taken at once", i.objects.len())));
+        return Err(CmdError::Params(format!(
+            "{} scans given; at most {MAX_SCANS} are taken at once",
+            i.objects.len()
+        )));
     }
     let mut ids = Vec::with_capacity(i.objects.len());
     for o in &i.objects {
@@ -111,7 +116,9 @@ fn resolve_all(s: &Session, i: &GlobalIn) -> CmdResult<(Vec<ObjectId>, usize)> {
         None => 0,
         Some(f) => {
             let id = f.resolve(s, ObjectKind::Mesh)?;
-            ids.iter().position(|x| *x == id).ok_or_else(|| CmdError::Params(format!("the fixed mesh {id} is not in `objects`")))?
+            ids.iter()
+                .position(|x| *x == id)
+                .ok_or_else(|| CmdError::Params(format!("the fixed mesh {id} is not in `objects`")))?
         }
     };
     Ok((ids, fixed))

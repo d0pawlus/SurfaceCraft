@@ -8,6 +8,8 @@ fn unplaced_reason(k: usize, cands: &[Cand]) -> Unplaced {
     let mine = || cands.iter().filter(move |c| c.report.fixed == k || c.report.moving == k);
     if mine().any(|c| c.report.status == EdgeStatus::Unplaced) {
         Unplaced::OtherGroup
+    } else if mine().any(|c| c.report.status == EdgeStatus::Rejected) {
+        Unplaced::Contradicted
     } else if mine().next().is_some() {
         Unplaced::NoUniquePair
     } else {
@@ -19,7 +21,9 @@ fn scan_poses(n: usize, opts: &GlobalOptions, cands: &[Cand], solved: &Solved) -
     (0..n)
         .map(|k| {
             let placed = solved.tree.reaches(k);
-            let pick = |poses: &[Transform]| if placed { poses.get(k).copied().unwrap_or_default() } else { Transform::identity() };
+            let pick = |poses: &[Transform]| {
+                if placed { poses.get(k).copied().unwrap_or_default() } else { Transform::identity() }
+            };
             let edges_used = solved.edges.iter().filter(|e| e.i == k || e.j == k).count();
             ScanPose {
                 index: k,

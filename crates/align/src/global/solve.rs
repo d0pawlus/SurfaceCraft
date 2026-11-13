@@ -1,6 +1,6 @@
 //! From pair results to the placed scans: the edges, the spanning tree, the relaxation and the
 //! rejection of an edge that contradicts the others.
-use super::graph::{Tree, chain, contradicted_edge, spanning_tree};
+use super::graph::{Tree, chain, consensus, spanning_tree};
 use super::pairs::Tried;
 use super::relax::{Edge, MIN_VIRTUAL, misfit, relax, virtual_points};
 use super::report::{EdgeReport, EdgeStatus, GlobalResult, LoopReport};
@@ -74,14 +74,8 @@ fn candidate(k: usize, t: &Tried, scans: &[&Mesh], bvhs: &[Option<Bvh>]) -> Cand
     if points.len() < MIN_VIRTUAL {
         return Cand { report: report_of(t, EdgeStatus::TooLittleOverlap, None), edge: None };
     }
-    let edge = Edge {
-        i: t.fixed,
-        j: t.moving,
-        measured: r.transform,
-        weight: weight_of(r),
-        tolerance: r.tolerance,
-        points,
-    };
+    let edge =
+        Edge { i: t.fixed, j: t.moving, measured: r.transform, weight: weight_of(r), tolerance: r.tolerance, points };
     Cand { report: report_of(t, EdgeStatus::Used, None), edge: Some(edge) }
 }
 
@@ -122,7 +116,11 @@ fn worst_edge(edges: &[Edge], poses: &[Transform]) -> Option<(usize, f64)> {
 }
 
 fn graph_of(cands: &[Cand]) -> (Vec<usize>, Vec<Edge>) {
-    cands.iter().enumerate().filter_map(|(k, c)| c.edge.clone().filter(|_| c.report.status == EdgeStatus::Used).map(|e| (k, e))).unzip()
+    cands
+        .iter()
+        .enumerate()
+        .filter_map(|(k, c)| c.edge.clone().filter(|_| c.report.status == EdgeStatus::Used).map(|e| (k, e)))
+        .unzip()
 }
 
 /// Spanning tree, chain and relaxation over the used edges; an edge that disagrees with the final
@@ -130,8 +128,13 @@ fn graph_of(cands: &[Cand]) -> (Vec<usize>, Vec<Edge>) {
 pub(super) fn solve_graph(n: usize, root: usize, cands: &mut [Cand], cancel: &Cancel) -> Result<Solved, AlignError> {
     loop {
         let (members, edges) = graph_of(cands);
-        if let Some(bad) = contradicted_edge(&edges, REJECT_FACTOR).and_then(|k| members.get(k)).and_then(|&k| cands.get_mut(k)) {
-            bad.report.status = EdgeStatus::Rejected;
+        let inlier = consensus(n, root, &edges, REJECT_FACTOR);
+        if inlier.iter().any(|x| !*x) {
+            for (&k, _) in members.iter().zip(&inlier).filter(|(_, ok)| !**ok) {
+                if let Some(c) = cands.get_mut(k) {
+                    c.report.status = EdgeStatus::Rejected;
+                }
+            }
             continue;
         }
         let tree = spanning_tree(n, root, &edges);

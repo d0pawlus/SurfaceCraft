@@ -636,5 +636,6 @@
   "scan {} has no finite surface area": "skan {} nie ma skończonego pola powierzchni",
   "{} scans given; at most {} are taken at once": "podano {} skanów, naraz przyjmuję najwyżej {}",
   "mesh {} is listed twice": "siatka {} jest wymieniona dwa razy",
-  "the fixed mesh {} is not in `objects`": "nieruchoma siatka {} nie występuje w „objects”"
+  "the fixed mesh {} is not in `objects`": "nieruchoma siatka {} nie występuje w „objects”",
+  "the tolerance must be a positive number of mm": "tolerancja musi być dodatnią liczbą mm"
 }
