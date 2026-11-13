@@ -3429,6 +3429,7 @@ dependencies = [
 name = "surfacecraft-engine"
 version = "0.2.0"
 dependencies = [
+ "rayon",
  "schemars",
  "serde",
  "serde_json",
@@ -3483,6 +3484,7 @@ dependencies = [
 name = "surfacecraft-kernel"
 version = "0.2.0"
 dependencies = [
+ "rayon",
  "serde",
  "serde_json",
  "solidcore",
@@ -3492,6 +3494,7 @@ dependencies = [
  "solidcore-tess",
  "step-brep",
  "step-export",
+ "step-import",
  "surfacecraft-geom",
  "thiserror 2.0.21",
 ]
