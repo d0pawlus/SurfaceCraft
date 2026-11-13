@@ -64,7 +64,7 @@ pub struct PairOut {
     pub icp_iterations: usize,
     /// Did the final ICP converge?
     pub icp_converged: bool,
-    /// How firmly the matched part pins the pose: 0 means it can slide or turn freely (a flat or cylindrical patch; the verdict is then `ambiguous`), pinned parts measure above 0.015.
+    /// How firmly the matched part pins the pose: 0 means it can slide or turn freely (a flat or cylindrical patch; the verdict is then `ambiguous`), pinned parts measure above 0.011.
     pub stability: f64,
     /// A sentence about the outcome.
     pub note: String,

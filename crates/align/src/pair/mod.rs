@@ -340,6 +340,12 @@ pub fn pair_coarse(moving: &Mesh, fixed: &Mesh, opts: &PairOptions, cancel: &Can
     let scene = Scene::new(moving, fixed, cancel)?;
     scene.check_tolerance(opts.tolerance)?;
     let hyps = scene.hypotheses(cancel)?;
+    solve(&scene, hyps, opts, cancel)
+}
+
+/// Everything after the candidates: shortlist, refinement, ranking, verdict. A separate step so
+/// that a test can hand it a chosen set of candidates.
+fn solve(scene: &Scene, hyps: Vec<Cand>, opts: &PairOptions, cancel: &Cancel) -> Result<PairResult, AlignError> {
     let candidates = hyps.len();
     let mut refined = Vec::new();
     for c in scene.shortlist(hyps) {
@@ -359,7 +365,7 @@ pub fn pair_coarse(moving: &Mesh, fixed: &Mesh, opts: &PairOptions, cancel: &Can
     let (best, icp_iterations, icp_converged) = scene.polish(&first, tau, cancel)?;
     let poses: Vec<Transform> = std::iter::once(best.cand.t).chain(ranked.iter().map(|r| r.cand.t)).collect();
     let shares = scene.overlaps_fixed(&poses, tau);
-    let stable = stability(&scene.fixed, &scene.mov.pts, &best.cand.t, tau);
+    let stable = stability(&scene.fixed, &scene.fix, &scene.mov.pts, &best.cand.t, tau);
     let mut result = conclude(&best, &ranked, tau, &shares, refined_count, stable)?;
     result.candidates = candidates;
     result.icp_iterations = icp_iterations;
@@ -474,5 +480,35 @@ mod tests {
             .map(|c| c.t.max_displacement(&pose.inverse(), &moved.positions))
             .fold(f64::INFINITY, f64::min);
         assert!(near < 3.0, "{near}");
+    }
+
+    /// Finding 6: the count of refined candidates is produced by `solve`; with a single candidate
+    /// there is nothing to compare, so the right pose is still not certain, and `refined` says 1.
+    #[test]
+    fn one_candidate_gives_refined_one_and_never_unique() {
+        let fixed = bracket(12, 1);
+        let pose = Transform::rotation_axis_angle(&Vec3::new(1.0, 0.1, 0.3), 2.8)
+            .then_after(&Transform::translation(Vec3::new(-50.0, 20.0, 90.0)));
+        let moved = bracket(15, 2).transformed(&pose);
+        let scene = Scene::new(&moved, &fixed, &Cancel::new()).unwrap();
+        let hyps = scene.hypotheses(&Cancel::new()).unwrap();
+        let truth = pose.inverse();
+        let best = hyps
+            .iter()
+            .min_by(|a, b| {
+                a.t.max_displacement(&truth, &moved.positions)
+                    .total_cmp(&b.t.max_displacement(&truth, &moved.positions))
+            })
+            .copied()
+            .unwrap();
+        let alone = solve(&scene, vec![best], &PairOptions::default(), &Cancel::new()).unwrap();
+        assert_eq!(alone.refined, 1);
+        assert_eq!(alone.verdict, PairVerdict::Ambiguous);
+        assert_eq!(alone.confidence, 0.0);
+        let err = alone.transform.max_displacement(&truth, &moved.positions);
+        assert!(err < 0.2, "the pose itself is right: {err}");
+        let all = solve(&scene, hyps, &PairOptions::default(), &Cancel::new()).unwrap();
+        assert!(all.refined >= 2, "{}", all.refined);
+        assert_eq!(all.verdict, PairVerdict::Unique);
     }
 }

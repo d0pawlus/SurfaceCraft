@@ -1,7 +1,8 @@
 //! Robust scoring of a pose: how much of the moving scan lies on the fixed surface, and how
 //! tightly. Truncated, so surface that has no counterpart (partial overlap) costs a fixed amount
 //! and does not drag a good pose down the way a mean or a median distance would.
-use surfacecraft_geom::{Bvh, Mesh, Point3, Transform, Vec3};
+use super::sample::Samples;
+use surfacecraft_geom::{Bvh, Mat3, Mesh, Point3, Transform, Vec3};
 
 /// Weight of a conflict against a match in [`Fit::score`].
 pub(super) const CONFLICT_WEIGHT: f64 = 3.0;
@@ -142,15 +143,20 @@ pub(super) fn fit_of(target: &Target, pts: &[Point3], t: &Transform, tau: f64, c
 }
 
 /// How firmly the matched part pins the pose (geometric stability, after Gelfand et al. 2003):
-/// the smallest eigenvalue of the point-to-plane normal equations of the matched points at `t`,
-/// with positions centred and scaled by their RMS radius so that rotations and shifts weigh alike
-/// (0 when the part can slide or turn freely, as a flat or cylindrical patch can; a bracket or a
-/// lumpy blob is orders of magnitude above).
-pub(super) fn stability(target: &Target, pts: &[Point3], t: &Transform, tau: f64) -> f64 {
+/// the smallest eigenvalue of the point-to-plane normal equations of the matched points at `t`
+/// (0 when the part can slide or turn freely, as a flat or cylindrical patch can).
+///
+/// Two things keep it comparable between scans: the surface normals are the plane-fitted ones of the
+/// nearest fixed sample (a raw face normal of a fine noisy mesh tilts by about noise over edge
+/// length, which would pin a sliding patch by tilt squared), and the rotation about each principal
+/// axis of the matched points is scaled by that axis's own lever arm, so a pinned direction reads
+/// alike for a compact part and a 20:1 bar.
+pub(super) fn stability(target: &Target, fixed: &Samples, pts: &[Point3], t: &Transform, tau: f64) -> f64 {
     let hits: Vec<Option<(Point3, Vec3)>> = surfacecraft_geom::par::map_slice(pts, |p| {
         let q = t.apply(p);
         let h = target.bvh.closest(&q, tau)?;
-        Some((q, target.bvh.triangle_normal(h.triangle)?))
+        let (j, _) = fixed.tree.nearest(&h.point)?;
+        Some((q, *fixed.fit.get(j)?))
     });
     let used: Vec<&(Point3, Vec3)> = hits.iter().flatten().collect();
     if used.len() < 6 {
@@ -158,17 +164,37 @@ pub(super) fn stability(target: &Target, pts: &[Point3], t: &Transform, tau: f64
     }
     let n = used.len() as f64;
     let c = used.iter().map(|h| h.0.coords).sum::<Vec3>() / n;
-    let radius = (used.iter().map(|h| (h.0.coords - c).norm_squared()).sum::<f64>() / n).sqrt();
-    if !(radius > 0.0) {
+    let cov = used.iter().fold(Mat3::zeros(), |m, h| m + (h.0.coords - c) * (h.0.coords - c).transpose()) / n;
+    if cov.iter().any(|v| !v.is_finite()) {
+        return 0.0;
+    }
+    let frame = cov.symmetric_eigen();
+    let trace = cov.trace();
+    let lever: Vec<f64> = (0..3).map(|i| (trace - frame.eigenvalues[i]).max(0.0).sqrt()).collect();
+    if lever.iter().any(|l| !(*l > 0.0)) {
         return 0.0;
     }
     let mut a = nalgebra::Matrix6::<f64>::zeros();
     for (q, nrm) in used.iter().map(|h| (&h.0, &h.1)) {
-        let r = ((q.coords - c) / radius).cross(nrm);
-        let row = nalgebra::Vector6::new(r.x, r.y, r.z, nrm.x, nrm.y, nrm.z);
+        let r = (q.coords - c).cross(nrm);
+        let mut row = nalgebra::Vector6::zeros();
+        for i in 0..3 {
+            let e = frame.eigenvectors.column(i);
+            row[i] = r.dot(&e) / lever[i];
+            row[3 + i] = nrm.dot(&e);
+        }
         a += row * row.transpose();
     }
-    let min = (a / n).symmetric_eigen().eigenvalues.min();
+    min_eigenvalue(&(a / n))
+}
+
+/// Smallest eigenvalue of a symmetric matrix; 0 when it is not finite (the iteration of the
+/// decomposition does not end on such input).
+pub(super) fn min_eigenvalue(a: &nalgebra::Matrix6<f64>) -> f64 {
+    if a.iter().any(|v| !v.is_finite()) {
+        return 0.0;
+    }
+    let min = a.symmetric_eigen().eigenvalues.min();
     if min.is_finite() { min.max(0.0) } else { 0.0 }
 }
 
@@ -237,6 +263,18 @@ mod tests {
         let f = fit_of(&target, &beyond, &Transform::identity(), 0.5, true);
         assert_eq!(f.conflict, 0.0);
         assert_eq!(f.share, 0.0);
+    }
+
+    /// Finding 4: a matrix that is not finite has no eigenvalue to report (and must not be handed to
+    /// the iteration).
+    #[test]
+    fn a_non_finite_system_has_zero_stability() {
+        let mut a = nalgebra::Matrix6::<f64>::identity();
+        assert_eq!(min_eigenvalue(&a), 1.0);
+        a[(2, 3)] = f64::NAN;
+        assert_eq!(min_eigenvalue(&a), 0.0);
+        a[(2, 3)] = f64::INFINITY;
+        assert_eq!(min_eigenvalue(&a), 0.0);
     }
 
     #[test]

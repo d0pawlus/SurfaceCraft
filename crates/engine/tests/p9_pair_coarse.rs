@@ -5,85 +5,13 @@
 //!
 //! Tolerances, fixed before the first run: pose error at most 0.1 degrees and 0.1 mm (largest
 //! displacement of any vertex of the moving scan against the true motion), the class of the noisy
-//! ICP gate of M1 (0.02 mm at sigma 0.02) scaled to sigma 0.05.
+//! ICP gate of M1 (0.02 mm at sigma 0.02) scaled to sigma 0.05. Only the small-patch gate has a
+//! looser, derived bound (a patch of a tenth of the part constrains the pose less; see there).
+mod pair_common;
+use pair_common::*;
 use serde_json::{Value, json};
 use surfacecraft_engine::Session;
-use surfacecraft_geom::{Bvh, Mesh, Point3, Rng, Transform, Vec3, synth};
-
-const SIGMA: f64 = 0.05;
-const MAX_ANGLE_DEG: f64 = 0.1;
-const MAX_DISPLACEMENT_MM: f64 = 0.1;
-
-/// The bracket at a given tessellation: block resolution, cylinder segments, sphere rings.
-fn bracket_at(block: usize, segments: usize, rings: usize) -> Mesh {
-    let mut m = synth::cuboid(Point3::origin(), Vec3::new(60.0, 40.0, 20.0), block);
-    m.append(&synth::cylinder(Point3::new(45.0, 12.0, 20.0), Vec3::z(), 6.0, 10.0, segments, 6));
-    m.append(&synth::sphere(Point3::new(15.0, 28.0, 20.0), 5.0, 2 * rings, rings));
-    m
-}
-
-/// The organic blob (a lumpy ellipsoid) at a given resolution.
-fn blob_at(nu: usize) -> Mesh {
-    let mut m = synth::sphere(Point3::origin(), 20.0, nu, nu / 2);
-    for p in &mut m.positions {
-        let lump = 1.0 + 0.12 * (0.21 * p.x).sin() * (0.17 * p.y).cos() + 0.08 * (0.3 * p.z).sin();
-        *p = Point3::new(p.x * 1.6 * lump, p.y * lump, p.z * 0.7 * lump);
-    }
-    m
-}
-
-fn noisy(mut m: Mesh, seed: u64) -> Mesh {
-    synth::add_noise(&mut m, SIGMA, &mut Rng::new(seed));
-    m
-}
-
-/// The two tessellations of a part: (fixed scan, moving scan before its motion), with the noise of
-/// trial `k` (independent for every trial).
-fn pair_of_trial(part: &str, k: u64) -> (Mesh, Mesh) {
-    match part {
-        "bracket" => (noisy(bracket_at(12, 48, 16), 1 + 10 * k), noisy(bracket_at(17, 64, 20), 2 + 10 * k)),
-        _ => (noisy(blob_at(48), 3 + 10 * k), noisy(blob_at(62), 4 + 10 * k)),
-    }
-}
-
-fn pair_of(part: &str) -> (Mesh, Mesh) {
-    pair_of_trial(part, 0)
-}
-
-/// A random rotation up to 180 degrees with a translation up to twice the part size (75 mm).
-fn random_motion(seed: u64) -> Transform {
-    let mut rng = Rng::new(1000 + seed);
-    let angle = rng.range(0.2, 180.0_f64.to_radians());
-    Transform::rotation_axis_angle(&rng.unit_vector(), angle)
-        .then_after(&Transform::translation(rng.unit_vector() * rng.range(20.0, 150.0)))
-}
-
-fn matrix_of(v: &Value) -> Transform {
-    Transform::from_rows(&serde_json::from_value(v["matrix"].clone()).unwrap()).unwrap()
-}
-
-/// Session with the fixed scan `fixed` and the moving scan `moving` put at `pose`.
-fn session(fixed: &Mesh, moving: &Mesh, pose: &Transform) -> Session {
-    let mut s = Session::new();
-    s.doc.add_mesh("fixed", fixed.clone());
-    s.doc.add_mesh("moving", moving.transformed(pose));
-    s
-}
-
-fn pair(s: &mut Session, extra: Value) -> Value {
-    let mut p = json!({"object": "moving", "target": "fixed"});
-    p.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-    s.execute("align.pair_coarse", p).unwrap()
-}
-
-/// (angle in degrees, largest displacement in mm) of `found` against the true motion `pose⁻¹`.
-fn pose_error(found: &Transform, pose: &Transform, moving: &Mesh) -> (f64, f64) {
-    let net = found.then_after(pose); // identity when `found` undoes `pose`
-    let on_scan = moving.transformed(pose);
-    let q = net.quaternion();
-    let angle = 2.0 * q.vector().norm().atan2(q.scalar().abs());
-    (angle.to_degrees(), found.max_displacement(&pose.inverse(), &on_scan.positions))
-}
+use surfacecraft_geom::{Mesh, Point3, Transform, Vec3, synth};
 
 /// Checks trial `seed` and returns (angle in degrees, displacement in mm).
 fn assert_recovers(part: &str, seed: u64) -> (f64, f64) {
@@ -93,7 +21,8 @@ fn assert_recovers(part: &str, seed: u64) -> (f64, f64) {
     let out = pair(&mut s, json!({}));
     let (angle, disp) = pose_error(&matrix_of(&out), &pose, &moving);
     eprintln!(
-        "{part} seed {seed}: angle {angle:.4} deg, displacement {disp:.4} mm, verdict {}, confidence {:.2}, overlap {:.3}/{:.3}, method {}, tolerance {:.3}, {} candidates, icp {} iterations",
+        "{part} seed {seed}: stability {:.5}, angle {angle:.4} deg, displacement {disp:.4} mm, verdict {}, confidence {:.2}, overlap {:.3}/{:.3}, method {}, tolerance {:.3}, {} candidates, icp {} iterations",
+        stab(&out),
         out["verdict"],
         out["confidence"].as_f64().unwrap(),
         out["overlap_moving"].as_f64().unwrap(),
@@ -129,23 +58,6 @@ fn gate_m2_pair_recovers_ten_random_motions_on_the_blob() {
     ten_trials("blob");
 }
 
-/// The triangles of `m` whose centroid satisfies `keep`.
-fn cut(m: &Mesh, keep: impl Fn(&Point3) -> bool) -> Mesh {
-    let ids: Vec<u32> =
-        (0..m.triangle_count()).filter(|&i| m.face_centroid(i).is_some_and(|c| keep(&c))).map(|i| i as u32).collect();
-    m.submesh(&ids)
-}
-
-/// Ground truth of the overlap: the share of the area of `of` (placed at the true pose) that lies
-/// within `tau` of `on`, by dense area-uniform samples and the BVH at the *true* motion. It does
-/// not use the method under test.
-fn true_share(of: &Mesh, on: &Mesh, tau: f64) -> f64 {
-    let bvh = Bvh::build(on);
-    let pts = of.sample_points(20_000, &mut Rng::new(77));
-    let hit = pts.iter().filter(|(p, _)| bvh.closest(p, tau).is_some()).count();
-    hit as f64 / pts.len() as f64
-}
-
 /// Two partial scans of a part, each from its own tessellation: (fixed, moving before its motion).
 fn partial_pair(part: &str, trial: u64) -> (Mesh, Mesh) {
     let (full_f, full_m) = pair_of_trial(part, trial);
@@ -174,8 +86,10 @@ fn assert_partial(part: &str, seed: u64) {
     let (angle, disp) = pose_error(&matrix_of(&out), &pose, &moving);
     let (om, of) = (out["overlap_moving"].as_f64().unwrap(), out["overlap_fixed"].as_f64().unwrap());
     eprintln!(
-        "{part} partial seed {seed}: angle {angle:.4} deg, displacement {disp:.4} mm, verdict {}, overlap {om:.3}/{of:.3}, method {}",
-        out["verdict"], out["method"]
+        "STABILITY {part} partial seed {seed}: {:.5}, angle {angle:.4} deg, displacement {disp:.4} mm, verdict {}, overlap {om:.3}/{of:.3}, method {}",
+        stab(&out),
+        out["verdict"],
+        out["method"]
     );
     assert!(angle <= MAX_ANGLE_DEG && disp <= MAX_DISPLACEMENT_MM, "{part} seed {seed}: {angle} deg {disp} mm {out}");
     assert!((om - truth_m).abs() <= 0.10, "overlap_moving {om} vs true {truth_m}");
@@ -193,32 +107,6 @@ fn gate_m2_partial_overlap_bracket() {
 #[test]
 fn gate_m2_partial_overlap_blob() {
     (0..5).for_each(|seed| assert_partial("blob", seed));
-}
-
-/// Does `net` (a motion of the part onto itself) map the surface of `part` onto its own surface?
-fn symmetry_error(net: &Transform, part: &Mesh) -> f64 {
-    let bvh = Bvh::build(part);
-    part.positions
-        .iter()
-        .map(|p| bvh.closest(&net.apply(p), f64::INFINITY).map_or(f64::INFINITY, |h| h.distance))
-        .fold(0.0, f64::max)
-}
-
-fn symmetric_pair(shape: &str) -> (Mesh, Mesh) {
-    match shape {
-        "box" => (
-            noisy(synth::cuboid(Point3::origin(), Vec3::new(40.0, 30.0, 20.0), 8), 5),
-            noisy(synth::cuboid(Point3::origin(), Vec3::new(40.0, 30.0, 20.0), 11), 6),
-        ),
-        "cube" => (
-            noisy(synth::cuboid(Point3::origin(), Vec3::new(30.0, 30.0, 30.0), 8), 5),
-            noisy(synth::cuboid(Point3::origin(), Vec3::new(30.0, 30.0, 30.0), 11), 6),
-        ),
-        _ => (
-            noisy(synth::cylinder(Point3::origin(), Vec3::z(), 10.0, 30.0, 48, 10), 5),
-            noisy(synth::cylinder(Point3::origin(), Vec3::z(), 10.0, 30.0, 64, 14), 6),
-        ),
-    }
 }
 
 /// Gate 3: a box, a cube and a cylinder have several equally good poses. The command says so, lists
@@ -279,12 +167,6 @@ fn p9_pair_ambiguous_apply_needs_a_choice_and_is_one_undo_step() {
     assert_ne!(s.doc.mesh(id).unwrap().mesh.positions, before);
     s.execute("edit.undo", Value::Null).unwrap();
     assert_eq!(s.doc.mesh(id).unwrap().mesh.positions, before, "one undo restores the scan");
-}
-
-fn pair_err(s: &mut Session, extra: Value) -> String {
-    let mut p = json!({"object": "moving", "target": "fixed"});
-    p.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-    s.execute("align.pair_coarse", p).unwrap_err().to_string()
 }
 
 /// A unique result applies as one undo step, `also` moves with it, a proposal changes nothing.
@@ -467,10 +349,12 @@ fn local_corpus_pair() {
     let out = pair(&mut s, json!({}));
     let (angle, disp) = pose_error(&matrix_of(&out), &pose, &other);
     eprintln!(
-        "scan {number}: {:.2} s, angle {angle:.4} deg, displacement {disp:.4} mm, verdict {}, overlap {}",
+        "scan {number}: {:.2} s, angle {angle:.4} deg, displacement {disp:.4} mm, verdict {}, overlap {}, stability {:.5}, {} refined",
         t.elapsed().as_secs_f64(),
         out["verdict"],
-        out["overlap_moving"]
+        out["overlap_moving"],
+        stab(&out),
+        out["refined"]
     );
 }
 
@@ -484,261 +368,4 @@ fn p9_pair_cancelled_before_it_starts_is_the_cancel_error() {
     let r = s.execute("align.pair_coarse", json!({"object": "moving", "target": "fixed", "apply": true}));
     assert_eq!(r, Err(surfacecraft_engine::EngineError::Failed(surfacecraft_engine::cmd::CANCELLED.into())));
     assert_eq!(s.history.undo_labels().len(), depth);
-}
-
-// ---------------------------------------------------------------------------------------------
-// Review round: a margin in shares, the chosen pose's own numbers, small patches, unwelded meshes.
-
-/// A 60 x 40 x 4 plate (symmetric under half turns) with one off-centre bump of about 5 % of its
-/// area: a half sphere of radius 7 at (15, 12).
-fn plate_at(block: usize, rings: usize) -> Mesh {
-    let mut m = synth::cuboid(Point3::origin(), Vec3::new(60.0, 40.0, 4.0), block);
-    m.append(&synth::sphere(Point3::new(15.0, 12.0, 4.0), 7.0, 2 * rings, rings));
-    m
-}
-
-/// Finding 1: the margin is a share of the moving scan's area. A symmetric plate whose only
-/// asymmetry is a bump of 5 % of the area has a unique pose, and the half-turn poses (which lose
-/// the bump) are never returned as unique.
-#[test]
-fn gate_m2_a_small_asymmetric_feature_makes_a_symmetric_plate_unique() {
-    let mut worst = (0.0_f64, 0.0_f64);
-    for seed in 0..10u64 {
-        let fixed = noisy(plate_at(10, 16), 1 + 10 * seed);
-        let moving = noisy(plate_at(14, 20), 2 + 10 * seed);
-        let pose = random_motion(seed);
-        let mut s = session(&fixed, &moving, &pose);
-        let out = pair(&mut s, json!({}));
-        let (angle, disp) = pose_error(&matrix_of(&out), &pose, &moving);
-        eprintln!(
-            "plate seed {seed}: angle {angle:.4} deg, displacement {disp:.4} mm, verdict {}, confidence {:.2}",
-            out["verdict"],
-            out["confidence"].as_f64().unwrap()
-        );
-        assert!(
-            out["verdict"] != "unique" || (angle <= MAX_ANGLE_DEG && disp <= MAX_DISPLACEMENT_MM),
-            "plate seed {seed}: a wrong pose is unique: {angle} deg {disp} mm"
-        );
-        assert_eq!(out["verdict"], "unique", "plate seed {seed}: {out}");
-        worst = (worst.0.max(angle), worst.1.max(disp));
-    }
-    eprintln!("plate: worst of ten trials: angle {:.4} deg, displacement {:.4} mm", worst.0, worst.1);
-}
-
-/// Finding 2: `choose` shows and applies the chosen pose with its own numbers.
-#[test]
-fn p9_pair_choose_reports_the_chosen_poses_own_numbers() {
-    let (fixed, moving) = symmetric_pair("box");
-    let pose = random_motion(4);
-    let mut s = session(&fixed, &moving, &pose);
-    let proposal = pair(&mut s, json!({}));
-    let alt = &proposal["alternatives"].as_array().unwrap()[0];
-    let out = pair(&mut s, json!({"apply": true, "choose": 1}));
-    let applied = matrix_of(&out);
-    let wanted = Transform::from_rows(&serde_json::from_value(alt["transform"].clone()).unwrap()).unwrap();
-    assert!(applied.max_displacement(&wanted, &moving.positions) < 1e-9, "the matrix is the alternative's");
-    assert_eq!(out["applied"], true);
-    for key in ["rms", "overlap_moving", "overlap_fixed", "confidence", "method"] {
-        let (a, b) =
-            (if key == "rms" { &out["rms"] } else { &out[key] }, if key == "rms" { &alt["rms"] } else { &alt[key] });
-        assert_eq!(a, b, "{key} of the chosen pose");
-    }
-    assert_eq!(out["confidence"], 0.0, "an alternative is not certain");
-    assert_ne!(out["rms"], proposal["rms"], "not the best pose's rms");
-}
-
-/// Finding 7: `choose` without `apply` is a parameter error; a refused `apply` says so.
-#[test]
-fn p9_pair_choose_needs_apply_and_a_refusal_is_explicit() {
-    let (fixed, moving) = symmetric_pair("box");
-    let mut s = session(&fixed, &moving, &random_motion(4));
-    assert!(pair_err(&mut s, json!({"choose": 1})).contains("apply"));
-    let out = pair(&mut s, json!({"apply": true}));
-    assert_eq!(
-        (out["refused"].clone(), out["applied"].clone()),
-        (json!(true), json!(false)),
-        "ambiguous, no choose: {out}"
-    );
-    let out = pair(&mut s, json!({}));
-    assert_eq!(out["refused"], false, "a proposal is not a refusal");
-    let (bracket, _) = pair_of("bracket");
-    let blob = noisy(blob_at(60), 8);
-    let mut s = session(&bracket, &blob, &random_motion(6));
-    let out = pair(&mut s, json!({"apply": true}));
-    assert_eq!(
-        (out["verdict"].clone(), out["refused"].clone(), out["applied"].clone()),
-        (json!("no_match"), json!(true), json!(false))
-    );
-    assert!(out["note"].as_str().unwrap().contains("nothing was moved"));
-}
-
-/// Finding 6: a mesh that repeats its vertices per triangle gives the pose and verdict of the
-/// welded one (borders are found by position).
-#[test]
-fn p9_pair_unwelded_scans_give_the_same_answer() {
-    let unweld = |m: &Mesh| {
-        let mut positions = Vec::new();
-        let mut triangles = Vec::new();
-        for t in &m.triangles {
-            let base = positions.len() as u32;
-            positions.extend(t.iter().map(|&i| m.positions[i as usize]));
-            triangles.push([base, base + 1, base + 2]);
-        }
-        Mesh { positions, triangles }
-    };
-    let (full_f, full_m) = pair_of("bracket");
-    let (fixed, moving) = (cut(&full_f, |c| c.z > 1.0 && c.x <= 54.0), cut(&full_m, |c| c.z > 1.0 && c.x >= 6.0));
-    let pose = random_motion(2);
-    let mut welded = session(&fixed, &moving, &pose);
-    let mut loose = session(&unweld(&fixed), &unweld(&moving), &pose);
-    let (a, b) = (pair(&mut welded, json!({})), pair(&mut loose, json!({})));
-    let (ea, eb) = (pose_error(&matrix_of(&a), &pose, &moving), pose_error(&matrix_of(&b), &pose, &moving));
-    eprintln!("welded {ea:?} {}, unwelded {eb:?} {}", a["verdict"], b["verdict"]);
-    assert_eq!(a["verdict"], "unique");
-    assert_eq!(b["verdict"], "unique", "{b}");
-    assert!(eb.0 <= MAX_ANGLE_DEG && eb.1 <= MAX_DISPLACEMENT_MM, "{eb:?}");
-}
-
-/// Finding 4: a near-cubic part whose only asymmetry is a small bump has 24 near-equal principal
-/// candidates; the true pose must survive the shortlist.
-#[test]
-fn gate_m2_near_cubic_part_with_a_small_feature_is_unique() {
-    let cube = |n: usize| {
-        let mut m = synth::cuboid(Point3::origin(), Vec3::new(30.0, 30.0, 30.0), n);
-        m.append(&synth::sphere(Point3::new(8.0, 9.0, 30.0), 5.0, 32, 16));
-        m
-    };
-    for seed in 0..5u64 {
-        let (fixed, moving) = (noisy(cube(8), 1 + 10 * seed), noisy(cube(11), 2 + 10 * seed));
-        let pose = random_motion(seed);
-        let mut s = session(&fixed, &moving, &pose);
-        let out = pair(&mut s, json!({}));
-        let (angle, disp) = pose_error(&matrix_of(&out), &pose, &moving);
-        eprintln!("cube seed {seed}: {angle:.4} deg {disp:.4} mm {} ({} refined)", out["verdict"], out["refined"]);
-        assert!(
-            out["verdict"] != "unique" || (angle <= MAX_ANGLE_DEG && disp <= MAX_DISPLACEMENT_MM),
-            "wrong unique pose"
-        );
-        assert_eq!(out["verdict"], "unique", "cube seed {seed}: {out}");
-    }
-}
-
-/// Finding 5a: a patch of about a tenth of the blob on the whole blob. Never a wrong `unique`.
-#[test]
-fn gate_m2_a_small_patch_of_the_blob_is_found_or_not_unique() {
-    let mut outcomes = Vec::new();
-    for seed in 0..5u64 {
-        let (full_f, full_m) = pair_of_trial("blob", seed);
-        let patch = cut(&full_m, |c| c.x > 15.0 && c.z > -4.0);
-        let share = patch.area() / full_m.area();
-        assert!((0.05..=0.2).contains(&share), "construction: the patch is {share} of the blob");
-        let pose = random_motion(seed);
-        let mut s = session(&full_f, &patch, &pose);
-        let out = pair(&mut s, json!({}));
-        let (angle, disp) = pose_error(&matrix_of(&out), &pose, &patch);
-        eprintln!(
-            "blob patch {share:.2} seed {seed}: {angle:.3} deg {disp:.3} mm, {} overlap {:.2}/{:.2}",
-            out["verdict"],
-            out["overlap_moving"].as_f64().unwrap(),
-            out["overlap_fixed"].as_f64().unwrap()
-        );
-        // a small patch fixes the pose less tightly than a whole scan; a wrong pose is centimetres off
-        assert!(
-            out["verdict"] != "unique" || (angle <= 0.5 && disp <= 0.3),
-            "seed {seed}: a wrong pose is unique ({angle} deg, {disp} mm)"
-        );
-        outcomes.push(out["verdict"].as_str().unwrap().to_string());
-    }
-    assert!(outcomes.iter().all(|v| v == "unique"), "the patch of an organic part has one place: {outcomes:?}");
-}
-
-fn ribbed_plate(block: usize, rings: usize) -> Mesh {
-    let mut m = synth::cuboid(Point3::origin(), Vec3::new(70.0, 30.0, 4.0), block);
-    for x in [10.0, 25.0, 40.0, 55.0] {
-        for y in [8.0, 22.0] {
-            m.append(&synth::sphere(Point3::new(x, y, 4.0), 3.0, 2 * rings, rings));
-        }
-    }
-    m
-}
-
-/// Finding 5b: a patch that fits in many places is never `unique`: a flat patch of the bracket, a
-/// sector of a cylinder, two bumps of a plate with eight.
-#[test]
-fn gate_m2_a_patch_that_fits_in_many_places_is_never_unique() {
-    let cyl = |nu: usize, seed: u64| noisy(synth::cylinder(Point3::origin(), Vec3::z(), 10.0, 30.0, nu, 12), seed);
-    for seed in 0..3u64 {
-        let cases: Vec<(&str, Mesh, Mesh)> = vec![
-            (
-                "flat patch",
-                noisy(bracket_at(12, 48, 16), 1 + seed),
-                cut(&noisy(bracket_at(17, 64, 20), 5 + seed), |c| {
-                    (19.9..20.1).contains(&c.z) && c.x > 21.0 && c.y > 19.0
-                }),
-            ),
-            (
-                "cylinder sector",
-                cyl(48, 1 + seed),
-                cut(&cyl(64, 5 + seed), |c| c.y > 0.0 && c.x > 0.0 && c.x * c.x < 0.5 * (c.x * c.x + c.y * c.y)),
-            ),
-            (
-                "repeated bumps",
-                noisy(ribbed_plate(14, 8), 1 + seed),
-                cut(&noisy(ribbed_plate(19, 10), 5 + seed), |c| c.z > 3.0 && c.x > 18.0 && c.x < 47.0),
-            ),
-        ];
-        for (name, fixed, patch) in cases {
-            let mut s = session(&fixed, &patch, &random_motion(seed));
-            let out = pair(&mut s, json!({}));
-            eprintln!(
-                "{name} seed {seed}: {} overlap {:.2}, {} alternatives",
-                out["verdict"],
-                out["overlap_moving"].as_f64().unwrap(),
-                out["alternatives"].as_array().unwrap().len()
-            );
-            assert_ne!(out["verdict"], "unique", "{name} seed {seed} fits in many places: {out}");
-        }
-    }
-}
-
-/// Finding 9: malformed meshes and parameter combinations give the specific error or verdict.
-#[test]
-fn p9_pair_malformed_meshes_and_choices_give_specific_answers() {
-    let (fixed, moving) = pair_of("bracket");
-    let pose = random_motion(1);
-    // duplicate and degenerate triangles are harmless
-    let mut messy = moving.clone();
-    messy.triangles.extend([messy.triangles[0], messy.triangles[0], [0, 0, 1], [5, 5, 5]]);
-    let mut s = session(&fixed, &messy, &pose);
-    let out = pair(&mut s, json!({}));
-    let (angle, disp) = pose_error(&matrix_of(&out), &pose, &moving);
-    assert_eq!(out["verdict"], "unique", "{out}");
-    assert!(angle <= MAX_ANGLE_DEG && disp <= MAX_DISPLACEMENT_MM, "{angle} {disp}");
-    // an index outside the vertex list is an invalid-scan error naming the scan, in either role
-    let mut broken = moving.clone();
-    broken.triangles.push([0, 1, u32::MAX]);
-    for (obj, tgt, who) in [("moving", "fixed", "moving"), ("moving", "fixed", "fixed")] {
-        let mut s = Session::new();
-        s.doc.add_mesh("fixed", if who == "fixed" { broken.clone() } else { fixed.clone() });
-        s.doc.add_mesh("moving", if who == "moving" { broken.clone() } else { moving.clone() });
-        let e = s.execute("align.pair_coarse", json!({"object": obj, "target": tgt})).unwrap_err();
-        assert!(
-            matches!(
-                e,
-                surfacecraft_engine::EngineError::Failed(_) | surfacecraft_engine::EngineError::InvalidParams(_)
-            ),
-            "{e:?}"
-        );
-        assert!(e.to_string().contains(&format!("the {who} scan is invalid")), "{e}");
-    }
-    // `choose` on a unique result: 0 applies the best pose, anything else is a parameter error
-    let mut s = session(&fixed, &moving, &pose);
-    assert!(pair_err(&mut s, json!({"apply": true, "choose": 1})).contains("unique (use 0)"));
-    let out = pair(&mut s, json!({"apply": true, "choose": 0}));
-    assert_eq!((out["applied"].clone(), out["verdict"].clone()), (json!(true), json!("unique")));
-    // `choose` beyond the alternatives of an ambiguous result
-    let (bf, bm) = symmetric_pair("box");
-    let mut s = session(&bf, &bm, &pose);
-    let n = pair(&mut s, json!({}))["alternatives"].as_array().unwrap().len();
-    assert!(pair_err(&mut s, json!({"apply": true, "choose": n + 1})).contains(&format!("there are {n} alternatives")));
 }

@@ -14,10 +14,14 @@ pub const AMBIGUITY_MARGIN: f64 = 0.03;
 pub const CONFIDENCE_THRESHOLD: f64 = 0.5;
 /// Largest share of the moving scan that may lie where the fixed scan is but off it.
 pub(super) const MAX_CONFLICT: f64 = 0.25;
-/// Smallest stability ([`super::score::stability`]) of a pose that counts as pinned: below it the
-/// matched part can slide or turn freely (flat or cylindrical patches measure 0.0004 to 0.0013, the
-/// least constrained pinned part of the tests 0.016).
-pub(super) const MIN_STABILITY: f64 = 0.005;
+/// Smallest stability ([`super::score::stability`]) of a pose that counts as pinned. Measured on
+/// the tests (coarse and fine meshes agree within a factor of 3): parts that slide or turn freely
+/// 0.0002 to 0.0004 (cylinder sector, 400 mm cylinder), a flat patch pinned only by the border of
+/// its face 0.006 to 0.0076, and from above, the least pinned part that must be found, a 15 % blob
+/// patch, 0.011 to 0.017, a plate with a 5 % bump 0.06 to 0.09, a 20:1 bar 0.03, a bracket 0.18, and the 13 real scans (a moved decimated copy) 0.012 to 0.24.
+/// The threshold sits in the gap between 0.0076 and 0.011 (a factor 1.2 either way, a thin gap): a
+/// small patch on its edge is reported `ambiguous` rather than `unique`, which is the safe side.
+pub(super) const MIN_STABILITY: f64 = 0.009;
 /// Largest RMS of the matched part as a fraction of the tolerance.
 pub(super) const MAX_RMS_FRACTION: f64 = 0.5;
 /// Clearance (shares of the moving scan's area) that gives full confidence.

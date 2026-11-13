@@ -133,7 +133,7 @@ mod tests {
     fn coincident_samples_do_not_blow_up_the_neighbour_lists() {
         use surfacecraft_geom::KdTree;
         let pts = vec![Point3::new(1.0, 2.0, 3.0); 3000];
-        let s = Samples { tree: KdTree::build(&pts), nrm: vec![Vec3::z(); 3000], pts };
+        let s = Samples { tree: KdTree::build(&pts), nrm: vec![Vec3::z(); 3000], fit: vec![Vec3::z(); 3000], pts };
         let d = describe(&s, 1.0);
         assert_eq!(d.len(), 3000);
         assert!(d.iter().all(Option::is_some), "every point has neighbours and a descriptor");

@@ -8,6 +8,8 @@ use surfacecraft_geom::{Cancel, KdTree, Mesh, Point3, Rng, Vec3};
 const SEED: u64 = 0x5EED_0F5A;
 /// Normals are averaged over neighbours within this many sample spacings.
 const NORMAL_RADIUS: f64 = 2.5;
+/// Plane fits for `Samples::fit` reach this many sample spacings.
+const FIT_RADIUS: f64 = 4.0;
 /// Neighbours whose normal is within this cosine of the sample's own take part in the average
 /// (so a sharp edge is not rounded off).
 const NORMAL_AGREE_COS: f64 = 0.866;
@@ -18,6 +20,10 @@ pub(super) struct Samples {
     pub pts: Vec<Point3>,
     /// Smoothed unit normals, one per sample (oriented like the triangles).
     pub nrm: Vec<Vec3>,
+    /// Normals fitted to the positions of the neighbours (plane fit over the neighbours that lie on
+    /// the same face): unlike the averaged face normals, a fine noisy mesh does not tilt them. Used
+    /// where a tilt would count (the stability of a pose).
+    pub fit: Vec<Vec3>,
     /// Spatial index of `pts`.
     pub tree: KdTree,
 }
@@ -54,7 +60,36 @@ pub(super) fn sample(mesh: &Mesh, count: usize, spacing: f64, stream: u64, cance
         }
         surfacecraft_geom::normalize(sum).unwrap_or(*n0)
     });
-    Some(Samples { pts, nrm, tree })
+    let fit = fitted_normals(&pts, &nrm, &tree, FIT_RADIUS * spacing);
+    Some(Samples { pts, nrm, fit, tree })
+}
+
+/// The normal of the plane through the neighbours of each sample that lie on the sample's face
+/// (their smoothed normal within `NORMAL_AGREE_COS` of its own), oriented like the smoothed normal;
+/// the smoothed normal itself where there are too few neighbours.
+fn fitted_normals(pts: &[Point3], nrm: &[Vec3], tree: &KdTree, radius: f64) -> Vec<Vec3> {
+    surfacecraft_geom::par::map(pts.len(), |i| {
+        let (Some(p), Some(n0)) = (pts.get(i), nrm.get(i)) else { return Vec3::z() };
+        let near: Vec<Point3> = tree
+            .within(p, radius)
+            .into_iter()
+            .filter(|&j| nrm.get(j).is_some_and(|nj| nj.dot(n0) > NORMAL_AGREE_COS))
+            .filter_map(|j| pts.get(j).copied())
+            .collect();
+        if near.len() < 8 {
+            return *n0;
+        }
+        let c = near.iter().map(|q| q.coords).sum::<Vec3>() / near.len() as f64;
+        let cov =
+            near.iter().fold(surfacecraft_geom::Mat3::zeros(), |m, q| m + (q.coords - c) * (q.coords - c).transpose());
+        if cov.iter().any(|v| !v.is_finite()) {
+            return *n0;
+        }
+        let eig = cov.symmetric_eigen();
+        let k = (0..3).min_by(|&a, &b| eig.eigenvalues[a].total_cmp(&eig.eigenvalues[b])).unwrap_or(0);
+        let n: Vec3 = eig.eigenvectors.column(k).into_owned();
+        if n.dot(n0) < 0.0 { -n } else { n }
+    })
 }
 
 #[cfg(test)]
