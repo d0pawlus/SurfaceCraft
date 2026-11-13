@@ -160,7 +160,7 @@ fn the_wrap_is_deterministic_under_a_cap() {
 #[test]
 fn to_solid_retries_once_with_a_larger_cap_and_says_so() {
     // Arrange: the default cap is lowered to 300 patches so that the first attempt cannot pass
-    let mut s = session_with(rippled_scan(0.5, 6.0, 9));
+    let mut s = session_with(rippled_scan(0.7, 5.0, 9));
 
     // Act
     let out = s.execute("scan.to_solid", json!({"scan": "scan", "method": "freeform", "max_patches": 300})).unwrap();
