@@ -1,6 +1,7 @@
 //! Tests of the reconstruction: meshes recovered from synthetic clouds and degenerate inputs.
 
 use super::*;
+use std::f64::consts::PI;
 
 use crate::{Rng, synth};
 
@@ -91,4 +92,102 @@ fn given_normals_are_used_and_degenerate_input_is_refused() {
     assert!(reconstruct(&PointCloud::from_points(line), &ReconParams::default()).is_err());
     let bad = ReconParams { radius_scale: f64::NAN, ..ReconParams::default() };
     assert!(reconstruct(&c, &bad).is_err());
+}
+
+/// The points as a file in another unit holds them: scaled, written as text and read back, then
+/// converted to millimetres again (what `mesh.import` with `units` does).
+fn through_a_unit_file(pts: &[Point3], per_mm: f64, mm_per_unit: f64) -> Vec<Point3> {
+    let f = |v: f64| format!("{}", v * per_mm).parse::<f64>().unwrap_or(f64::NAN) * mm_per_unit;
+    pts.iter().map(|p| Point3::new(f(p.x), f(p.y), f(p.z))).collect()
+}
+
+/// A regular lattice (the bracket tessellation) is full of exact ties; a copy converted through
+/// another unit differs in the last bits of many coordinates and must still give the same mesh.
+#[test]
+fn units_do_not_change_the_reconstruction_of_a_regular_cloud() {
+    // Arrange
+    let original = synth::bracket().positions;
+    let (want, _) = reconstruct(&PointCloud::from_points(original.clone()), &ReconParams::default()).unwrap();
+    for (per_mm, mm_per_unit) in
+        [(0.001, 1000.0), (0.1, 10.0), (1.0 / 25.4, 25.4), (1.0 / 304.8, 304.8), (1000.0, 0.001)]
+    {
+        // Act
+        let converted = through_a_unit_file(&original, per_mm, mm_per_unit);
+        let (got, _) = reconstruct(&PointCloud::from_points(converted), &ReconParams::default()).unwrap();
+        // Assert
+        assert_eq!(got.triangles, want.triangles, "factor {per_mm}");
+        assert_eq!(got.positions, want.positions, "factor {per_mm}");
+    }
+}
+
+#[test]
+fn snapping_moves_points_by_a_billionth_of_the_extent_and_is_idempotent() {
+    let pts = vec![
+        Point3::new(0.1, 0.2, 0.3),
+        Point3::new(100.0 / 3.0, 7.7, -2.5),
+        Point3::new(5.0, 5.0, 5.0),
+        Point3::new(60.0, 40.0, 20.0),
+    ];
+    let once = snap::snapped(&pts);
+    for (a, b) in pts.iter().zip(&once) {
+        assert!((a - b).norm() <= 1e-9 * 60.0, "{a:?} moved to {b:?}");
+    }
+    assert_eq!(snap::snapped(&once), once);
+    // exact lattice values stay as they are
+    assert_eq!(once.get(2), pts.get(2));
+}
+
+#[test]
+fn snapping_leaves_degenerate_extents_alone() {
+    let one = vec![Point3::new(1.5, -2.0, 3.0)];
+    assert_eq!(snap::snapped(&one), one);
+    assert!(snap::snapped(&[]).is_empty());
+    let tiny = vec![Point3::origin(), Point3::new(1e-310, 0.0, 0.0)];
+    assert_eq!(snap::snapped(&tiny), tiny);
+}
+
+#[test]
+fn snapping_never_gives_a_negative_zero_so_duplicates_on_zero_are_dropped() {
+    // a coordinate a hair below zero and one a hair above land on the same lattice point; with a
+    // negative zero the total order of the duplicate sort would part them and the duplicate stay
+    let pts = vec![
+        Point3::new(-1e-12, 1.0, 0.0),
+        Point3::new(-1e-12, 5.0, 0.0),
+        Point3::new(1e-12, 1.0, 0.0),
+        Point3::new(10.0, 10.0, 10.0),
+    ];
+    let snapped = snap::snapped(&pts);
+    let negative_zero = |v: f64| v == 0.0 && v.is_sign_negative();
+    assert!(!snapped.iter().any(|p| negative_zero(p.x) || negative_zero(p.y) || negative_zero(p.z)), "{snapped:?}");
+    let (kept, _) = normals::dedupe(&PointCloud { positions: pts, normals: None });
+    assert_eq!(kept.len(), 3, "{kept:?}");
+}
+
+#[test]
+fn pseudo_angle_orders_like_the_angle() {
+    let mut last = f64::NEG_INFINITY;
+    for step in -199..=200 {
+        let a = f64::from(step) * PI / 200.0;
+        let p = pivot::pseudo_angle(a.sin(), a.cos());
+        assert!(p > last, "not monotone at {a}: {p} after {last}");
+        last = p;
+    }
+    assert_eq!(pivot::pseudo_angle(0.0, 0.0), 0.0);
+    assert_eq!(pivot::pseudo_angle(0.0, -1.0), 2.0);
+    assert!((pivot::pseudo_angle(1.0, 0.0) - 1.0).abs() < 1e-15);
+}
+
+#[test]
+fn lattice_step_ignores_noise_at_a_power_of_two_extent_and_caps_outliers() {
+    let part = |hi: f64| vec![Point3::new(10.0, 0.0, 0.0), Point3::new(hi, 1.0, 1.0)];
+    let hi = 74.0_f64;
+    let below = f64::from_bits(hi.to_bits() - 1);
+    assert_eq!(snap::lattice_step(&part(hi)), snap::lattice_step(&part(below)));
+    // one stray point at 1e7 mm must not coarsen the lattice beyond a nanometre
+    let mut with_outlier = synth::bracket().positions;
+    with_outlier.push(Point3::new(1e7, 0.0, 0.0));
+    let step = snap::lattice_step(&with_outlier).unwrap();
+    assert!(step <= 1e-6, "{step}");
+    let moved = snap::snapped(&with_outlier).iter().zip(&with_outlier).map(|(a, b)| (a - b).norm()).fold(0.0, f64::max);
+    assert!(moved <= 1e-6, "{moved}");
 }
