@@ -276,7 +276,7 @@ const MAX_DEFAULT_LISTING: usize = 48_000;
 const MIN_HEADROOM: usize = 2_000;
 
 #[test]
-fn the_default_listing_is_small_and_carries_the_workflow_tools_in_full() {
+fn the_default_listing_carries_the_workflow_tools_in_full() {
     // Arrange
     let mut s = default_server();
 
@@ -489,6 +489,8 @@ mod shortening {
         assert_eq!(first_sentence("Region no. 5 of the scan. More."), "Region no. 5 of the scan.");
         assert_eq!(first_sentence("Size, approx. Twice the edge. More."), "Size, approx. Twice the edge.");
         assert_eq!(first_sentence("Angle ≥ 5°. `x` × 2 follows."), "Angle ≥ 5°.");
+        // A command id after a full stop joins the sentences: more text is kept, none is lost.
+        assert_eq!(first_sentence("Run first. scan.qa reports. Then fit."), "Run first. scan.qa reports.");
     }
 
     #[test]

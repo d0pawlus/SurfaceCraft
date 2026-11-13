@@ -18,7 +18,7 @@ description: Driving SurfaceCraft from an agent — MCP server, bridged mode, CL
 - The default listing is compact: one tool per area (`verb`, `params`) plus the commands of `FEATURED`
   (`crates/mcp/src/lib.rs`) with their input schema. `--tools full` (or `SURFACECRAFT_MCP_TOOLS=full`) lists one
   tool per command with output schemas (about 380 KB). A command that an agent needs on the short path
-  belongs in `FEATURED`; keep the default listing under the size the test `the_default_listing_is_small…` holds.
+  belongs in `FEATURED`; keep the default listing under the size the test `the_default_listing_has_headroom…` holds.
   The compact listing shortens prose structurally (`crates/mcp/src/shorten.rs`): property descriptions of the
   featured schemas and the verb lines of the area tools shrink to their first sentence (capped), enums,
   names and `required` stay, and `describe_command` / parameter errors carry the full text. Never hand-trim
