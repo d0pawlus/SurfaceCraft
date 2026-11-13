@@ -119,8 +119,8 @@ fn lies_on_side(p: Part, v: [f64; 2], before: bool, radius: f64) -> bool {
 /// The box of a set of points.
 #[derive(Clone, Copy)]
 pub(super) struct Bounds {
-    lo: [f64; 2],
-    hi: [f64; 2],
+    pub(super) lo: [f64; 2],
+    pub(super) hi: [f64; 2],
 }
 
 impl Bounds {
