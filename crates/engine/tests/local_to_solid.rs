@@ -70,6 +70,10 @@ fn run_one(number: usize, path: &std::path::Path) -> Result<String, String> {
         codes(&out),
         out["next_steps"].as_array().into_iter().flatten().filter_map(|x| x["command"].as_str()).collect::<Vec<_>>(),
     );
+    eprintln!(
+        "C{number:02} within {} patches {} retry {} attempts {}",
+        out["deviation"]["within"], out["patches"], out["retry"], out["attempts"]
+    );
     // whatever the verdict, the answer must be usable: a non-pass names its issues and next steps
     if verdict != "pass" && (codes(&out).is_empty() || out["next_steps"].as_array().is_none_or(Vec::is_empty)) {
         return Err(format!("verdict {verdict} without issues or next steps"));

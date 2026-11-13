@@ -6,15 +6,25 @@
 //! across neighbouring triangles whose corners lie within the tolerance of the primitive and
 //! whose normal agrees with it, refitting as it doubles. Regions below `min_triangles` are
 //! released. Everything is mesh-side (design doc §5).
+mod bow;
 mod fits;
+mod freeform;
+#[cfg(test)]
+mod freeform_tests;
 mod grow;
 mod merge;
+mod protect;
+#[cfg(test)]
+mod protect_tests;
 mod relax;
 mod seeds;
 
 use crate::primitive::{Primitive, PrimitiveKind};
+pub use bow::{Bow, region_bow};
 use fits::fit_tris;
+pub use freeform::{LARGE_SOUND_FACTOR, residual_spread};
 use grow::Ctx;
+pub use protect::{FORM_ERROR_SHARE, protected_by_tolerance};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -32,13 +42,44 @@ pub struct SegmentOptions {
     pub min_triangles: usize,
     /// Size of the seed patch (triangles).
     pub seed_size: usize,
+    /// Merge the fragments of an organic surface into a few freeform regions (default true):
+    /// small regions that fit above the scan noise, five or more touching without a sharp crease.
+    /// `false` keeps every fragment.
+    pub freeform: bool,
+    /// Share of the scan's triangles (0 to 1) below which a region is small (default 0.005;
+    /// at least 10 seed patches).
+    pub freeform_min_share: f64,
+    /// Sharpest crease a freeform region crosses (degrees, default 40).
+    pub freeform_crease_deg: f64,
+    /// Scanner noise sigma (mm) that fits are judged by; omitted: measured on the scan, else a fallback.
+    pub noise: Option<f64>,
 }
 
 impl Default for SegmentOptions {
     fn default() -> Self {
-        Self { tolerance: 0.2, max_angle_deg: 20.0, min_triangles: 30, seed_size: 60 }
+        Self {
+            tolerance: 0.2,
+            max_angle_deg: 20.0,
+            min_triangles: 30,
+            seed_size: 60,
+            freeform: true,
+            freeform_min_share: DEFAULT_FREEFORM_SHARE,
+            freeform_crease_deg: DEFAULT_FREEFORM_CREASE_DEG,
+            noise: None,
+        }
     }
 }
+
+/// Default of [`SegmentOptions::freeform_min_share`].
+const DEFAULT_FREEFORM_SHARE: f64 = 0.005;
+/// Default of [`SegmentOptions::freeform_crease_deg`].
+const DEFAULT_FREEFORM_CREASE_DEG: f64 = 40.0;
+/// A primitive region of fewer seed patches than this is weak evidence, whatever the scan size.
+const WEAK_SEED_PATCHES: usize = 10;
+/// Share of the scan that makes a region a major part of it.
+const DOMINANT_SHARE: f64 = 0.2;
+/// Fewest weak regions in one smooth area for it to be freeform.
+const MIN_FREEFORM_CLUSTER: usize = 5;
 
 /// One region found.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -49,6 +90,9 @@ pub struct Segment {
     pub primitive: Primitive,
     /// RMS of the region's vertices to it (mm).
     pub rms: f64,
+    /// A freeform area (see [`SegmentOptions::freeform`]): `primitive` and `rms` are then only a
+    /// stand-in (the least-squares plane) and say nothing about the region.
+    pub freeform: bool,
 }
 
 /// Vertices and their normals of a set of triangles.
@@ -230,8 +274,12 @@ fn run(mesh: &Mesh, opts: &SegmentOptions, cancel: &Cancel) -> Option<(Vec<Segme
         tol,
         cos,
     };
+    let fset = freeform_settings(opts, mesh, seed_tris, tol);
+    // with noise above the tolerance no fit can be judged: nothing is consolidated
+    let consolidate = opts.freeform && !(fset.noise_known && fset.noise > tol);
+    let hints = consolidate.then_some(seeds::FreeformHints { weak_tris: fset.strong_tris });
     let sw = crate::stats::Stopwatch::start();
-    let (found, stats) = seeds::grow_regions(&ctx, &order, opts.min_triangles, cancel);
+    let (found, stats) = seeds::grow_regions(&ctx, &order, opts.min_triangles, hints, cancel);
     sw.stop(crate::stats::Phase::Regions);
     if cancel.is_cancelled() {
         return None;
@@ -246,7 +294,55 @@ fn run(mesh: &Mesh, opts: &SegmentOptions, cancel: &Cancel) -> Option<(Vec<Segme
     let sw = crate::stats::Stopwatch::start();
     let merged = merge::merge_adjacent(mesh, &normals, &nb, out, tol);
     sw.stop(crate::stats::Phase::Merge);
-    (!cancel.is_cancelled()).then_some((merged, stats))
+    if cancel.is_cancelled() {
+        return None;
+    }
+    let sw = crate::stats::Stopwatch::start();
+    let merged = if consolidate { freeform::consolidate(mesh, &normals, &nb, merged, &fset) } else { merged };
+    sw.stop(crate::stats::Phase::Freeform);
+    Some((merged, stats))
+}
+
+/// Share of the tolerance taken as scanner noise when none is known.
+const FALLBACK_NOISE_SHARE: f64 = 0.25;
+
+/// The scanner noise (sigma, mm) the freeform consolidation uses when [`SegmentOptions::noise`]
+/// is absent or unusable: a quarter of the tolerance. It is a conservative guess, never derived
+/// from the fits of the regions it judges, and with it no large region is demoted: only small
+/// regions are consolidated.
+#[must_use]
+pub fn fallback_noise(tolerance: f64) -> f64 {
+    FALLBACK_NOISE_SHARE * tolerance
+}
+
+/// Settings of the freeform consolidation for the scan `mesh`; options that make no
+/// sense (not finite, out of range) fall back to the defaults.
+fn freeform_settings(opts: &SegmentOptions, mesh: &Mesh, seed_tris: usize, tol: f64) -> freeform::Settings {
+    let nt = mesh.triangle_count();
+    let scene = protect::Scene::of(mesh);
+    let share = if opts.freeform_min_share.is_finite() && (0.0..=1.0).contains(&opts.freeform_min_share) {
+        opts.freeform_min_share
+    } else {
+        DEFAULT_FREEFORM_SHARE
+    };
+    let crease = if opts.freeform_crease_deg.is_finite() {
+        opts.freeform_crease_deg.clamp(1.0, 89.0)
+    } else {
+        DEFAULT_FREEFORM_CREASE_DEG
+    };
+    let known_noise = opts.noise.filter(|n| n.is_finite() && *n > 0.0);
+    freeform::Settings {
+        strong_tris: ((share * nt as f64).ceil() as usize).max(WEAK_SEED_PATCHES * seed_tris),
+        noise: known_noise.unwrap_or_else(|| fallback_noise(tol)),
+        noise_known: known_noise.is_some(),
+        dominant_tris: (DOMINANT_SHARE * nt as f64).ceil() as usize,
+        scene,
+        protect_noise: known_noise.unwrap_or(0.0),
+        min_cluster: MIN_FREEFORM_CLUSTER,
+        min_triangles: opts.min_triangles,
+        tolerance: tol,
+        cos_crease: crease.to_radians().cos(),
+    }
 }
 
 /// The automatic fit of every region on its final triangles (the growth fit saw fewer); one that
@@ -274,7 +370,7 @@ fn final_fits(mesh: &Mesh, normals: &[Vec3], mut segs: Vec<Segment>, tol: f64) -
 #[must_use]
 pub fn kinds(segs: &[Segment]) -> Vec<(PrimitiveKind, usize)> {
     let mut v: Vec<(PrimitiveKind, usize)> = Vec::new();
-    for s in segs {
+    for s in segs.iter().filter(|s| !s.freeform) {
         let k = s.primitive.kind();
         match v.iter_mut().find(|(kk, _)| *kk == k) {
             Some(e) => e.1 += 1,

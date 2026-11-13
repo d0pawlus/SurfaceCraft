@@ -8,6 +8,23 @@ or torus) and fit a primitive to each region. A region is a set of triangles of 
 - `region.auto_segment` with `mesh`: splits the mesh into regions, one per primitive. `options`
   takes `tolerance` (mm, default 0.2), `max_angle_deg` (default 20) and `min_triangles`
   (default 30). `replace` (default true) deletes the mesh's existing regions first.
+- Organic surfaces: a bumpy surface is never one primitive for long, so fit-and-grow would end
+  in thousands of slivers. With `options.freeform` (default true) the small regions (less than
+  `freeform_min_share` of the scan's triangles, default 0.005, never fewer than 10 seed patches)
+  whose fit is not at the scanner noise, or that cover less than a radius of their curved
+  primitive, are fragments. When at least five of them touch without a crease (face normals
+  further apart than `freeform_crease_deg`, default 40), they are merged, with the triangles
+  between them, into one region per smooth area. A region with a sound fit (large, a plane or
+  spanning a radius, residuals at the noise) stays a primitive whatever lies around it: a
+  mounting face in a sculpted surface, a shallow cylindrical panel, small genuine features joined
+  by tangent fillets. A region that is cut by the merge is split into its connected pieces, each
+  fitted again; a piece under `min_triangles` is released. A merged region has `freeform: true`
+  and `kind: null`; fit a surface to it with `surface.fit`. `freeform: false` gives every
+  fragment as a primitive region, as before.
+- The scanner noise is measured on the scan (`deviation.noise`) or given in `options.noise`
+  (sigma, mm); the result reports `noise_used` and `noise_source` (`estimated`, `given` or
+  `fallback`). Without a reliable estimate (a very coarse mesh) a quarter of the tolerance is
+  used and no large region is ever merged, only small ones.
 - By hand: `region.grow` from seed `triangles` across edges sharper than `max_angle_deg`
   (default 15), or `region.create` from exact `triangles`.
 - Correct the result with `region.split` (triangles into a new region, or into connected

@@ -121,8 +121,8 @@ pub(crate) fn fit_cmd(s: &mut Session, i: FitIn) -> CmdResult<FitOut> {
     if let Some(rid) = region
         && let Some(r) = s.doc.region_mut(rid)
     {
-        r.kind = Some(best.primitive.kind());
-        r.rms = Some(best.rms);
+        // a region a primitive was fitted to is a primitive region, whatever segmentation said
+        (r.kind, r.rms, r.freeform) = (Some(best.primitive.kind()), Some(best.rms), false);
     }
     Ok(FitOut {
         id,
