@@ -18,6 +18,7 @@ pub mod feature;
 pub mod format;
 pub mod history;
 pub mod object;
+mod object_names;
 pub mod param_use;
 pub mod params;
 pub mod working;

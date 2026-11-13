@@ -20,7 +20,7 @@ pub use crate::decimate::{DecimateOptions, DecimateReport, decimate, decimate_wi
 pub(crate) use crate::decimate::{Guard, decimate_guarded};
 #[cfg(test)]
 pub(crate) use crate::holes::fill_holes_with;
-pub use crate::holes::{FillReport, MAX_FILL_EDGES, boundary_loops, fill_holes};
+pub use crate::holes::{FillReport, MAX_FILL_EDGES, boundary_loops, fill_holes, fill_holes_where};
 
 /// Removes every triangle on an edge that three or more triangles share, until no such edge is
 /// left; returns how many triangles were removed. What stays is a surface whose edges have one or
