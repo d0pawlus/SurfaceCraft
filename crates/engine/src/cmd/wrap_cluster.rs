@@ -12,8 +12,12 @@ use surfacecraft_geom::{Mesh, Point3};
 const CLUSTER_STEPS: usize = 18;
 /// The widest cell is the diagonal of the box; the finest is this fraction of it.
 const FINEST_CELL: f64 = 1.0 / 4096.0;
-/// The clustered mesh must keep at least this share of the area of the mesh it was made from.
-pub(super) const MIN_AREA_SHARE: f64 = 0.5;
+/// The clustered mesh must keep MORE than this share of the area of the mesh it was made from. It is
+/// above one half on purpose: a wall thinner than the cell merges its two sheets into one layer and
+/// keeps almost exactly half of the area, which must not pass or fail on rounding.
+pub(super) const MIN_AREA_SHARE: f64 = 0.55;
+/// Six times the volume below which a closed piece is taken to enclose nothing (its sign means nothing).
+const NO_VOLUME: f64 = 1e-9;
 /// ...and at least this share of the triangles the cap allows (never fewer than four).
 pub(super) const MIN_CAP_SHARE: f64 = 0.1;
 
@@ -152,20 +156,49 @@ fn is_closed(mesh: &Mesh, ids: &[usize]) -> bool {
     uses.values().all(|&n| n == 2)
 }
 
+/// Area of triangle `i`.
+fn area_of(mesh: &Mesh, i: usize) -> f64 {
+    mesh.triangle(i).map_or(0.0, |t| 0.5 * (t[1] - t[0]).cross(&(t[2] - t[0])).norm())
+}
+
+/// Whether to reverse a piece whose triangles are consistent but may be turned the wrong way as a
+/// whole (`flip[i]` is relative to the input): the orientation the larger part of the piece had as
+/// given, by area, wins; on an exact tie (or an area that is not a number) the input orientation of
+/// the largest triangle (the lowest index among equals) is kept. The rule depends on the input only,
+/// never on which triangle the propagation started from.
+fn input_majority_reverses(mesh: &Mesh, live: &[usize], flip: &[bool]) -> bool {
+    let (mut turned, mut kept) = (0.0, 0.0);
+    let mut largest: Option<(f64, usize)> = None;
+    for &i in live {
+        let a = area_of(mesh, i);
+        if flip[i] {
+            turned += a
+        } else {
+            kept += a
+        }
+        if a.is_finite() && largest.is_none_or(|(m, _)| a > m) {
+            largest = Some((a, i));
+        }
+    }
+    if turned.is_finite() && kept.is_finite() && turned != kept {
+        return turned > kept;
+    }
+    largest.is_some_and(|(_, i)| flip[i])
+}
+
 /// Makes triangles that share an edge traverse it in opposite directions and drops the ones that
 /// cannot be made consistent. The sense of each connected piece does not depend on which triangle
-/// the propagation started from: a closed piece is turned outward (positive enclosed volume), an
-/// open one keeps the orientation most of its triangles had as given.
+/// the propagation started from: a closed piece is turned outward (positive enclosed volume; when
+/// that volume is zero or not a number, by the rule below), an open one keeps the orientation most
+/// of its area had as given ([`input_majority_reverses`]).
 pub(super) fn orient_consistently(mesh: &mut Mesh) {
     let by_edge = edge_users(mesh);
     let (mut flip, bad, pieces) = propagate(mesh, &by_edge);
     for piece in &pieces {
         let live: Vec<usize> = piece.iter().copied().filter(|&i| !bad[i]).collect();
-        let reverse = if is_closed(mesh, &live) {
-            signed_volume(mesh, &live, &flip) < 0.0
-        } else {
-            live.iter().filter(|&&i| flip[i]).count() * 2 > live.len()
-        };
+        let volume = signed_volume(mesh, &live, &flip);
+        let outward = is_closed(mesh, &live) && volume.is_finite() && volume.abs() > NO_VOLUME;
+        let reverse = if outward { volume < 0.0 } else { input_majority_reverses(mesh, &live, &flip) };
         if reverse {
             live.iter().for_each(|&i| flip[i] = !flip[i]);
         }
@@ -311,5 +344,63 @@ mod tests {
 
         // Assert
         assert_eq!(out, Err(ClusterError::Thin));
+    }
+
+    #[test]
+    fn a_thin_plate_whose_two_sheets_merge_in_the_cells_is_refused_as_thin() {
+        // Arrange: two 40 x 40 grids 0.2 mm apart facing away from each other; a cap of 300 needs cells
+        // of a few millimetres, so the sheets fall into one layer and half of the area is gone
+        let mut mesh = Mesh::default();
+        for (z, up) in [(0.1, true), (-0.1, false)] {
+            let base = mesh.positions.len() as u32;
+            for i in 0..=40u32 {
+                for j in 0..=40u32 {
+                    mesh.positions.push(Point3::new(f64::from(i), f64::from(j), z));
+                }
+            }
+            for i in 0..40u32 {
+                for j in 0..40u32 {
+                    let v = |a: u32, b: u32| base + a * 41 + b;
+                    let (p, q, r, t) = (v(i, j), v(i + 1, j), v(i + 1, j + 1), v(i, j + 1));
+                    let quad = if up { [[p, q, r], [p, r, t]] } else { [[p, r, q], [p, t, r]] };
+                    mesh.triangles.extend(quad);
+                }
+            }
+        }
+
+        // Act
+        let out = cluster_to_cap(&mesh, 300);
+
+        // Assert
+        assert_eq!(out, Err(ClusterError::Thin));
+    }
+
+    #[test]
+    fn a_tied_vote_keeps_the_input_orientation_of_the_largest_triangle() {
+        // Arrange: a square of two triangles of equal area turned against each other; then the same with
+        // the second triangle slightly larger
+        let square = |far: f64| Mesh {
+            positions: vec![
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(1.0, 0.0, 0.0),
+                Point3::new(1.0, 1.0, 0.0),
+                Point3::new(0.0, far, 0.0),
+            ],
+            // [0,1,2] faces +z; [0,3,2] runs the shared edge the same way, so it must turn
+            triangles: vec![[0, 1, 2], [0, 3, 2]],
+        };
+        let normal_z = |m: &Mesh, i: usize| {
+            let t = m.triangle(i).unwrap();
+            (t[1] - t[0]).cross(&(t[2] - t[0])).z
+        };
+
+        // Act
+        let (mut tie, mut bigger) = (square(1.0), square(1.5));
+        orient_consistently(&mut tie);
+        orient_consistently(&mut bigger);
+
+        // Assert: tie -> the first (lowest index) triangle keeps +z; the larger second one is cw as given
+        assert!(normal_z(&tie, 0) > 0.0 && normal_z(&tie, 1) > 0.0);
+        assert!(normal_z(&bigger, 0) < 0.0 && normal_z(&bigger, 1) < 0.0);
     }
 }

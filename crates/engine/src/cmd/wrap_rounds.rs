@@ -159,9 +159,9 @@ pub(super) struct Target<'a> {
     pub(super) min_within: f64,
     max_triangles: usize,
     max_patches: usize,
-    /// The clustered first round (with the triangles of the mesh it was made from): the clustering
+    /// The clustered first round (keyed by the triangles of the mesh it was made from and the cap): the clustering
     /// is paid once per call, however many searches ask for the first round.
-    cluster_cache: RefCell<Option<(usize, Mesh)>>,
+    cluster_cache: RefCell<Option<((usize, usize), Mesh)>>,
 }
 
 impl<'a> Target<'a> {
@@ -331,14 +331,14 @@ impl Run {
 
 /// The first round, bigger than the cap: cut to it.
 fn first_round_over(t: &Target, raw: Mesh, budget: f64) -> CmdResult<Laid> {
-    let from = raw.triangle_count();
-    let cached = t.cluster_cache.borrow().as_ref().filter(|(n, _)| *n == from).map(|(_, m)| m.clone());
+    let key = (raw.triangle_count(), t.max_triangles);
+    let cached = t.cluster_cache.borrow().as_ref().filter(|(k, _)| *k == key).map(|(_, m)| m.clone());
     let cut = match cached {
         Some(mesh) => Trimmed { mesh, clustered: true },
         None => trim_to_cap(raw, t.max_triangles, true).map_err(cap_error)?,
     };
     if cut.clustered {
-        *t.cluster_cache.borrow_mut() = Some((from, cut.mesh.clone()));
+        *t.cluster_cache.borrow_mut() = Some((key, cut.mesh.clone()));
     }
     let (mesh, clustered) = (cut.mesh, cut.clustered);
     Ok(Laid {

@@ -11,6 +11,7 @@ use crate::cmd::{CmdResult, ObjRef};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use surfacecraft_doc::ObjectId;
 
 /// Smallest `max_patches` (the one of `surface.wrap`).
 pub(super) const MIN_PATCHES: usize = 12;
@@ -231,16 +232,28 @@ fn retry_larger(
         reason: RetryReason::Failed,
         error: None,
     };
+    let before: Vec<ObjectId> = s.doc.bodies.iter().map(|b| b.id).collect();
     let second = match wrap_with(s, cap_to) {
         Ok(w) => w,
-        Err(e) => return (first, Some(CapRetry { error: Some(message_of(&e).to_string()), ..base })),
+        Err(e) => {
+            // a failed retry never leaves a second body behind
+            let added: Vec<ObjectId> = s.doc.bodies.iter().map(|b| b.id).filter(|id| !before.contains(id)).collect();
+            for id in added {
+                s.doc.remove(id);
+            }
+            return (first, Some(CapRetry { error: Some(message_of(&e).to_string()), ..base }));
+        }
     };
     let reason = judge(Attempt::of(&first), Attempt::of(&second));
     let kept = reason == RetryReason::Better;
-    let info =
-        CapRetry { patches_to: Some(second.patches), within_to: Some(second.deviation.within), kept, reason, ..base };
+    let within_to = Some(second.deviation.within).filter(|v| v.is_finite());
+    let info = CapRetry { patches_to: Some(second.patches), within_to, kept, reason, ..base };
     let (keep, drop) = if kept { (second, first) } else { (first, second) };
     s.doc.remove(drop.body.id);
+    if kept {
+        // the second wrap ran while the first body still held the name: the result gets it back
+        s.doc.rename(keep.body.id, &set.name);
+    }
     (keep, Some(info))
 }
 
@@ -262,11 +275,22 @@ fn wrap_with(s: &mut Session, set: &Settings, max_patches: Option<usize>) -> Cmd
 
 /// Wraps the scan and judges the result.
 pub(super) fn freeform_solid(s: &mut Session, set: &Settings, report: ScanSummary) -> CmdResult<ToSolidOut> {
-    let first = match wrap_with(s, set, set.max_patches) {
+    freeform_with(s, set, report, |s, cap| wrap_with(s, set, cap))
+}
+
+/// [`freeform_solid`] with the wrap made by `wrap_fn` (given the patch limit, `None` for the default):
+/// the command's own, or a test's.
+fn freeform_with(
+    s: &mut Session,
+    set: &Settings,
+    report: ScanSummary,
+    mut wrap_fn: impl FnMut(&mut Session, Option<usize>) -> CmdResult<WrapOut>,
+) -> CmdResult<ToSolidOut> {
+    let first = match wrap_fn(s, set.max_patches) {
         Ok(w) => w,
         Err(e) => return Ok(failed(set, report, message_of(&e))),
     };
-    let (w, retry) = retry_larger(s, set, first, |s, cap| wrap_with(s, set, Some(cap)));
+    let (w, retry) = retry_larger(s, set, first, |s, cap| wrap_fn(s, Some(cap)));
     let cmp = compare(
         s,
         CompareIn {
@@ -379,6 +403,7 @@ mod tests {
         assert!(retry.kept && retry.reason == RetryReason::Better, "{retry:?}");
         assert!(kept.patches > first.patches && kept.patches <= 1500);
         assert_eq!(bodies(&s), 1);
+        assert_eq!(s.doc.body(kept.body.id).unwrap().name, set.name, "the result keeps the requested name");
     }
 
     #[test]
@@ -451,5 +476,106 @@ mod tests {
         // Assert
         assert!(fresh.iter().any(|st| st.command == "surface.wrap"));
         assert!(retried.iter().all(|st| st.command != "surface.wrap"));
+    }
+
+    #[test]
+    fn a_failed_retry_removes_any_body_it_added() {
+        // Arrange
+        let (mut s, set) = session();
+        let first = first_attempt(&mut s, &set, 300);
+        let (id, name) = (first.body.id, s.doc.body(first.body.id).unwrap().name.clone());
+
+        // Act: the wrap adds a body and then fails
+        let (kept, retry) = retry_larger(&mut s, &set, first, |s, cap| {
+            wrap_with(s, &set, Some(cap))?;
+            Err(CmdError::Failed("late failure".into()))
+        });
+
+        // Assert
+        assert_eq!(retry.unwrap().reason, RetryReason::Failed);
+        assert_eq!(bodies(&s), 1);
+        assert_eq!(kept.body.id, id);
+        assert_eq!(s.doc.body(id).unwrap().name, name);
+    }
+
+    #[test]
+    fn a_share_that_is_not_a_number_is_not_reported_as_one() {
+        // Arrange
+        let (mut s, set) = session();
+        let first = first_attempt(&mut s, &set, 300);
+
+        // Act
+        let (_, retry) = retry_larger(&mut s, &set, first, |s, cap| {
+            let mut w = wrap_with(s, &set, Some(cap))?;
+            w.deviation.within = f64::NAN;
+            Ok(w)
+        });
+
+        // Assert
+        let retry = retry.unwrap();
+        assert!(retry.within_to.is_none() && !retry.kept, "{retry:?}");
+        assert!(serde_json::to_value(&retry).unwrap().get("within_to").is_none());
+    }
+
+    fn scan_summary() -> ScanSummary {
+        ScanSummary {
+            triangles_before: 0,
+            triangles: 0,
+            holes_before: 0,
+            holes_filled: 0,
+            holes_left: 0,
+            non_manifold_edges: 0,
+            noise_sigma: None,
+            findings: Vec::new(),
+        }
+    }
+
+    /// The assembled output of `freeform_with` when the first wrap is forced to be capped and the
+    /// second is the real wrap, optionally forced to tie.
+    fn assembled(second_ties: bool) -> (Session, Settings, ToSolidOut) {
+        let (mut s, set) = session();
+        let mut first_within = 0.0;
+        let out = freeform_with(&mut s, &set, scan_summary(), |s, cap| {
+            let mut w = wrap_with(s, &set, Some(cap.unwrap_or(300)))?;
+            if cap.is_none() {
+                w.capped = true;
+                first_within = w.deviation.within;
+            } else if second_ties {
+                w.deviation.within = first_within;
+            }
+            Ok(w)
+        })
+        .unwrap();
+        (s, set, out)
+    }
+
+    #[test]
+    fn the_assembled_output_of_a_winning_retry_has_the_second_body_under_the_requested_name() {
+        // Act
+        let (s, set, out) = assembled(false);
+
+        // Assert
+        let retry = out.retry.as_ref().unwrap();
+        assert!(retry.kept && retry.reason == RetryReason::Better, "{retry:?}");
+        let id = out.body.as_ref().unwrap().id;
+        assert_eq!(s.doc.body(id).unwrap().name, set.name);
+        assert_eq!(bodies(&s), 1);
+        assert_eq!(out.patches, retry.patches_to);
+        assert!(out.next_steps.iter().all(|st| st.command != "surface.wrap"));
+    }
+
+    #[test]
+    fn the_assembled_output_of_a_losing_retry_keeps_the_first_body_and_suggests_no_larger_cap() {
+        // Act
+        let (s, set, out) = assembled(true);
+
+        // Assert
+        let retry = out.retry.as_ref().unwrap();
+        assert!(!retry.kept && retry.reason == RetryReason::NotBetter, "{retry:?}");
+        let id = out.body.as_ref().unwrap().id;
+        assert_eq!(s.doc.body(id).unwrap().name, set.name);
+        assert_eq!(bodies(&s), 1);
+        assert_eq!(out.patches, Some(retry.patches_from));
+        assert!(out.next_steps.iter().all(|st| st.command != "surface.wrap"));
     }
 }
