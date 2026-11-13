@@ -50,6 +50,7 @@ fn result(verdict: Verdict, body: Option<Option<f64>>, within: f64, coverage: f6
         attempts: Vec::new(),
         prep: super::super::PrepOut::default(),
         thickened: None,
+        analytic: None,
     }
 }
 
@@ -128,6 +129,7 @@ fn plan(share: f64) -> Plan {
         retry: true,
         limits: Limits::default(),
         budget: CallBudget::default(),
+        hybrid: false,
     }
 }
 
@@ -139,7 +141,8 @@ fn run_fake(plan: &Plan, mut outcomes: Outcomes) -> (Session, CmdResult<ToSolidR
     let report = orchestrate(&mut s, plan, &mut |s, m| {
         called.push(method_name(m));
         s.doc.add_mesh(&format!("m-{}", method_name(m)), synth::cuboid(Point3::origin(), Vec3::new(1.0, 1.0, 1.0), 1));
-        outcomes.remove(method_name(m)).expect("an outcome for the method")
+        // the result is the one of the method that was called
+        outcomes.remove(method_name(m)).expect("an outcome for the method").map(|r| ToSolidOut { method: m, ..r })
     });
     (s, report, called)
 }
@@ -368,4 +371,158 @@ fn a_freeform_second_method_draws_one_extra_attempt() {
     assert!(report.is_ok());
     assert_eq!(called, ["primitives", "freeform"]);
     assert!(p.budget.draw() && !p.budget.draw(), "one of the two was drawn");
+}
+
+// --- the hybrid attempt -----------------------------------------------------------------------
+
+use crate::cmd::pipeline::AnalyticSummary;
+
+fn with_analytic(mut r: ToSolidOut, method: Method, share: f64) -> ToSolidOut {
+    r.method = method;
+    r.analytic = Some(AnalyticSummary { faces: 3, total_faces: 200, area_share: share });
+    r
+}
+
+fn hybrid_plan(share: f64) -> Plan {
+    Plan { hybrid: true, ..plan(share) }
+}
+
+fn three(first: ToSolidOut, second: ToSolidOut, hybrid: CmdResult<ToSolidOut>) -> Outcomes {
+    HashMap::from([("primitives", Ok(first)), ("freeform", Ok(second)), ("hybrid", hybrid)])
+}
+
+/// The analytic share breaks a tie of everything else, in the one direction only.
+#[test]
+fn at_equal_verdict_share_and_body_the_result_with_more_analytic_area_is_better() {
+    let patches = ToSolidOut { method: Method::Freeform, ..result(Verdict::Pass, SOLID, 0.995, 1.0) };
+    let hybrid = with_analytic(result(Verdict::Pass, SOLID, 0.995, 1.0), Method::Hybrid, 0.16);
+    assert!(is_better(&hybrid, &patches) && !is_better(&patches, &hybrid));
+    // a share within the band is no difference; the order is never both ways
+    let nearly = with_analytic(result(Verdict::Pass, SOLID, 0.995, 1.0), Method::Hybrid, 0.004);
+    assert!(!is_better(&nearly, &patches) && !is_better(&patches, &nearly));
+    // a primitives solid is analytic all over
+    let primitives = result(Verdict::Pass, SOLID, 0.995, 1.0);
+    assert!(is_better(&primitives, &hybrid), "all of its area is analytic");
+}
+
+/// A hybrid result that explains less of the scan than the freeform one does not win on its
+/// analytic faces: the verdict and the share come first.
+#[test]
+fn a_hybrid_body_that_is_worse_is_not_returned_and_the_attempts_say_so() {
+    let freeform = result(Verdict::Review, SOLID, 0.97, 1.0);
+    let hybrid = with_analytic(result(Verdict::Review, SOLID, 0.90, 1.0), Method::Hybrid, 0.4);
+    let (s, report, called) =
+        run_fake(&hybrid_plan(0.3), three(result(Verdict::Fail, SHEET, 0.1, 0.5), freeform, Ok(hybrid)));
+    let report = report.expect("a report");
+    assert_eq!(called, ["freeform", "primitives", "hybrid"]);
+    assert_ne!(report.result.method, Method::Hybrid);
+    let flags: Vec<(Method, bool)> = report.attempts.iter().map(|a| (a.method, a.returned)).collect();
+    assert_eq!(flags.last(), Some(&(Method::Hybrid, false)), "{flags:?}");
+    assert_eq!(report.attempts.iter().filter(|a| a.returned).count(), 1);
+    assert!(!has_mesh(&s, "m-hybrid"), "the losing attempt left its mark");
+}
+
+/// With the other results tied, the hybrid body is returned and only its document remains.
+#[test]
+fn a_hybrid_body_that_ties_on_the_scan_wins_by_its_analytic_faces() {
+    let patches = result(Verdict::Pass, SOLID, 0.995, 1.0);
+    let hybrid = with_analytic(result(Verdict::Pass, SOLID, 0.995, 1.0), Method::Hybrid, 0.2);
+    // share 0.9: primitives first and failing, freeform second passing, hybrid third
+    let (s, report, called) =
+        run_fake(&hybrid_plan(0.9), three(result(Verdict::Fail, SOLID, 1.0, 0.5), patches, Ok(hybrid)));
+    let report = report.expect("a report");
+    assert_eq!(called, ["primitives", "freeform", "hybrid"]);
+    assert_eq!(report.result.method, Method::Hybrid);
+    assert!(has_mesh(&s, "m-hybrid") && !has_mesh(&s, "m-freeform") && !has_mesh(&s, "m-primitives"));
+    let flags: Vec<bool> = report.attempts.iter().map(|a| a.returned).collect();
+    assert_eq!(flags, [false, false, true]);
+}
+
+/// A freeform pass is not the end when the primitives cover enough of the scan: the hybrid is tried
+/// as well (for its analytic faces). A passing primitives solid is analytic all over: nothing to add.
+#[test]
+fn the_hybrid_is_tried_after_a_freeform_pass_but_not_after_a_primitives_pass() {
+    let hybrid = || with_analytic(result(Verdict::Pass, SOLID, 1.0, 1.0), Method::Hybrid, 0.2);
+    let (_, report, called) = run_fake(
+        &hybrid_plan(0.3),
+        three(result(Verdict::Fail, SHEET, 0.1, 0.5), result(Verdict::Pass, SOLID, 1.0, 1.0), Ok(hybrid())),
+    );
+    let report = report.expect("a report");
+    assert_eq!(called, ["freeform", "hybrid"], "freeform passed, so primitives are not run, hybrid is");
+    assert_eq!(report.result.method, Method::Hybrid);
+    let (_, report, called) = run_fake(
+        &hybrid_plan(0.9),
+        three(result(Verdict::Pass, SOLID, 1.0, 1.0), result(Verdict::Pass, SOLID, 1.0, 1.0), Ok(hybrid())),
+    );
+    assert_eq!(called, ["primitives"]);
+    assert_eq!(report.expect("a report").attempts.len(), 1);
+    // and without enough primitives it is not tried at all
+    let (_, _, called) = run_fake(
+        &plan(0.3),
+        three(result(Verdict::Fail, SHEET, 0.1, 0.5), result(Verdict::Pass, SOLID, 1.0, 1.0), Ok(hybrid())),
+    );
+    assert_eq!(called, ["freeform"]);
+}
+
+/// The hybrid attempt is an extra attempt: it draws from the call's budget (two in all), is skipped
+/// by `retry: false`, and says how to force it.
+#[test]
+fn the_hybrid_attempt_draws_from_the_budget_and_names_the_call_that_forces_it() {
+    let p = hybrid_plan(0.9);
+    let hybrid = with_analytic(result(Verdict::Pass, SOLID, 1.0, 1.0), Method::Hybrid, 0.2);
+    let (_, report, called) = run_fake(
+        &p,
+        three(result(Verdict::Fail, SOLID, 1.0, 0.5), result(Verdict::Pass, SOLID, 1.0, 1.0), Ok(hybrid.clone())),
+    );
+    assert!(report.is_ok());
+    assert_eq!(called, ["primitives", "freeform", "hybrid"]);
+    assert!(!p.budget.draw(), "freeform and hybrid used the two extra attempts");
+
+    let spent = hybrid_plan(0.9);
+    assert!(spent.budget.draw());
+    let (_, report, called) = run_fake(
+        &spent,
+        three(result(Verdict::Fail, SOLID, 1.0, 0.5), result(Verdict::Pass, SOLID, 1.0, 1.0), Ok(hybrid.clone())),
+    );
+    let skipped = report.expect("a report").attempts[2].skipped.clone().expect("a skipped entry");
+    assert_eq!(called, ["primitives", "freeform"]);
+    assert_eq!(skipped.call.params["method"], "hybrid");
+    assert!(skipped.reason.contains("extra attempts"), "{}", skipped.reason);
+
+    let no_retry = Plan { retry: false, ..hybrid_plan(0.9) };
+    let (_, report, _) = run_fake(
+        &no_retry,
+        three(result(Verdict::Fail, SOLID, 1.0, 0.5), result(Verdict::Pass, SOLID, 1.0, 1.0), Ok(hybrid)),
+    );
+    assert!(report.expect("a report").attempts.iter().any(|a| a.method == Method::Hybrid && a.skipped.is_some()));
+}
+
+/// A hybrid attempt that errors leaves the result so far, with its document, and keeps the message.
+#[test]
+fn a_hybrid_attempt_that_errors_keeps_the_result_so_far() {
+    let (s, report, _) = run_fake(
+        &hybrid_plan(0.9),
+        three(
+            result(Verdict::Fail, SOLID, 1.0, 0.5),
+            result(Verdict::Pass, SOLID, 1.0, 1.0),
+            Err(CmdError::Failed("kernel refused".into())),
+        ),
+    );
+    let report = report.expect("the result so far is returned");
+    assert_eq!(report.result.method, Method::Freeform, "the passing freeform result stands");
+    assert!(has_mesh(&s, "m-freeform") && !has_mesh(&s, "m-hybrid"));
+    let failed = report.attempts.last().expect("an attempt");
+    assert_eq!((failed.method, failed.error.as_deref()), (Method::Hybrid, Some("kernel refused")));
+}
+
+#[test]
+fn a_hybrid_winner_or_loser_is_named_in_the_next_steps_filter_and_the_issue() {
+    let mut first = result(Verdict::Review, SOLID, 0.99, 1.0);
+    first.next_steps =
+        vec![step("scan.to_solid", json!({"scan": 1, "method": "hybrid"}), "run again with method hybrid")];
+    let hybrid = with_analytic(result(Verdict::Review, SOLID, 0.5, 1.0), Method::Hybrid, 0.3);
+    let (_, report, _) = run_fake(&hybrid_plan(0.3), three(result(Verdict::Fail, SHEET, 0.1, 0.5), first, Ok(hybrid)));
+    let result = report.expect("a report").result;
+    assert!(result.next_steps.iter().all(|st| st.params["method"].is_null()), "{:?}", result.next_steps);
+    assert!(result.issues.iter().any(|i| i.code == "other_method_tried" && i.message.contains("hybrid")));
 }

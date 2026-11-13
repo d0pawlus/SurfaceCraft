@@ -7,7 +7,7 @@ use super::super::{CANCELLED, CmdError, cancelled};
 use super::budget::CallBudget;
 use super::{
     CmdResult, Issue, MIN_MODELLED_SHARE, Method, NextStep, ScanSummary, Settings, ToSolidIn, ToSolidOut, Verdict,
-    freeform, message_of, primitives_solid, scan_primitive_share, segment_scan, step,
+    freeform, hybrid_method, message_of, primitives_solid, scan_primitive_share, segment_scan, step,
 };
 use crate::Session;
 use schemars::JsonSchema;
@@ -18,6 +18,10 @@ use surfacecraft_doc::{Document, ObjectId};
 /// The share of the scan in primitive regions below which a primitives attempt is not tried after a
 /// failed freeform one (half the share that makes it the first choice).
 const PLAUSIBLE_SHARE: f64 = MIN_MODELLED_SHARE / 2.0;
+/// The share of the scan in primitive regions from which `auto` also tries the hybrid method: the
+/// same quarter as for the primitives attempt after a failed freeform one. Below it the primitives
+/// are too few to be worth a second wrap.
+const HYBRID_MIN_SHARE: f64 = PLAUSIBLE_SHARE;
 /// A second method is not tried on a scan of more triangles than this: first attempts of several
 /// minutes occur at a million triangles and more, and a second full run doubles that. A caller can
 /// force it with the call the skipped entry lists.
@@ -128,13 +132,27 @@ fn closedness(r: &ToSolidOut) -> u8 {
     r.body.as_ref().map_or(0, |b| if b.volume.is_some() { 2 } else { 1 })
 }
 
+/// Share of the body's area on analytic faces: all of it for a primitives solid, what the result
+/// reports for a hybrid one, none for a patch network.
+fn analytic_share(r: &ToSolidOut) -> f64 {
+    match r.method {
+        Method::Primitives if r.body.is_some() => 1.0,
+        _ => r.analytic.as_ref().map_or(0.0, |a| a.area_share),
+    }
+}
+
 /// Orders results: by verdict; then by the share of the scan explained, shares within
-/// [`EXPLAINED_BAND`] being equal; then a closed solid over a sheet over no body. Antisymmetric.
+/// [`EXPLAINED_BAND`] being equal; then a closed solid over a sheet over no body; then, when all of
+/// that is a tie, the one with more of its area on analytic faces (a hybrid body is worth more than
+/// a network of patches that explains the scan equally well). Antisymmetric.
 fn compare(a: &ToSolidOut, b: &ToSolidOut) -> std::cmp::Ordering {
     let by_verdict = rank(a.verdict).cmp(&rank(b.verdict));
     let (ea, eb) = (explained(a), explained(b));
     let by_share = if (ea - eb).abs() > EXPLAINED_BAND + 1e-9 { ea.total_cmp(&eb) } else { std::cmp::Ordering::Equal };
-    by_verdict.then(by_share).then(closedness(a).cmp(&closedness(b)))
+    let (xa, xb) = (analytic_share(a), analytic_share(b));
+    let by_analytic =
+        if (xa - xb).abs() > EXPLAINED_BAND + 1e-9 { xa.total_cmp(&xb) } else { std::cmp::Ordering::Equal };
+    by_verdict.then(by_share).then(closedness(a).cmp(&closedness(b))).then(by_analytic)
 }
 
 /// Is `b` a better result than `a`? A tie keeps `a`.
@@ -154,6 +172,8 @@ pub(super) struct Plan {
     pub limits: Limits,
     /// The call's budget of extra attempts, shared with the freeform fit's retry.
     pub budget: CallBudget,
+    /// The primitives cover enough of the scan for `auto` to try the hybrid method as well.
+    pub hybrid: bool,
 }
 
 fn record(method: Method, result: &ToSolidOut, seconds: f64) -> Attempt {
@@ -173,7 +193,11 @@ fn is_cancelled(e: &CmdError) -> bool {
 }
 
 fn method_name(m: Method) -> &'static str {
-    if m == Method::Freeform { "freeform" } else { "primitives" }
+    match m {
+        Method::Freeform => "freeform",
+        Method::Hybrid => "hybrid",
+        Method::Primitives | Method::Auto => "primitives",
+    }
 }
 
 /// The reason not to run a second attempt, with the call that forces it.
@@ -217,7 +241,8 @@ fn short(text: &str) -> String {
 /// advice would send the caller where it has been), and a winner that is no pass says so.
 fn finish(mut winner: ToSolidOut, loser_method: Method, loser: &ToSolidOut) -> ToSolidOut {
     winner.next_steps.retain(|st| {
-        st.command != "scan.to_solid" || !matches!(st.params["method"].as_str(), Some("primitives" | "freeform"))
+        st.command != "scan.to_solid"
+            || !matches!(st.params["method"].as_str(), Some("primitives" | "freeform" | "hybrid"))
     });
     if winner.verdict != Verdict::Pass {
         winner.issues.push(Issue {
@@ -251,22 +276,40 @@ fn order(plan: &Plan) -> (Method, Method) {
     }
 }
 
-/// The reason the second method is not run, if there is one. Only a freeform second method is an
-/// extra attempt of the call's budget (it wraps; the primitives method makes no wrap and costs
-/// nothing), so only that one draws from it.
+/// The reason the second method is not run, if there is one. Only a method that wraps (freeform,
+/// hybrid) is an extra attempt of the call's budget (the primitives method makes no wrap and costs
+/// nothing), so only those draw from it.
 fn refusal(plan: &Plan, first: &ToSolidOut, second: Method) -> Option<String> {
     skip_reason(plan, first)
-        .or_else(|| (second == Method::Freeform && !plan.budget.draw()).then(|| plan.budget.refusal()))
+        .or_else(|| (second != Method::Primitives && !plan.budget.draw()).then(|| plan.budget.refusal()))
 }
 
-/// Runs the attempts of `auto` with `exec` (one method on the document) and returns the best.
+/// Runs the attempts of `auto` with `exec` (one method on the document) and returns the best: the
+/// two methods of [`order`], then, when the primitives cover enough of the scan, the hybrid method
+/// as a third attempt that wins a tie of the others by its analytic faces.
 pub(super) fn orchestrate(
     s: &mut Session,
     plan: &Plan,
     exec: &mut dyn FnMut(&mut Session, Method) -> CmdResult<ToSolidOut>,
 ) -> CmdResult<ToSolidReport> {
-    let (method, second) = order(plan);
     let base = s.doc.clone();
+    let report = two_methods(s, plan, exec, base.clone())?;
+    // a passing primitives solid is analytic all over: a hybrid body has nothing to add
+    let nothing_to_add = report.result.method == Method::Primitives && report.result.verdict == Verdict::Pass;
+    if !plan.hybrid || nothing_to_add {
+        return Ok(report);
+    }
+    hybrid_attempt(s, plan, exec, base, report)
+}
+
+/// The first method and, when it does not pass, the second (see [`orchestrate`]).
+fn two_methods(
+    s: &mut Session,
+    plan: &Plan,
+    exec: &mut dyn FnMut(&mut Session, Method) -> CmdResult<ToSolidOut>,
+    base: Document,
+) -> CmdResult<ToSolidReport> {
+    let (method, second) = order(plan);
     let timer = Timer::start();
     let result = exec(s, method)?;
     let mut record = record(method, &result, timer.seconds());
@@ -284,6 +327,57 @@ pub(super) fn orchestrate(
         return Ok(ToSolidReport { result, attempts: vec![record, skipped] });
     }
     second_attempt(s, plan, exec, base, First { method, result, record }, second)
+}
+
+/// Runs the hybrid method on the document as it was before the first attempt and keeps it when it is
+/// better than the result so far (a tie goes to the one with more analytic area). The hybrid attempt
+/// draws from the call's budget and is skipped by the same bounds as a second method; one that ends
+/// in an error leaves the result so far as it is.
+fn hybrid_attempt(
+    s: &mut Session,
+    plan: &Plan,
+    exec: &mut dyn FnMut(&mut Session, Method) -> CmdResult<ToSolidOut>,
+    base: Document,
+    report: ToSolidReport,
+) -> CmdResult<ToSolidReport> {
+    let ToSolidReport { result: best, mut attempts } = report;
+    if s.cancel.is_cancelled() {
+        return Err(cancelled());
+    }
+    if let Some(reason) = refusal(plan, &best, Method::Hybrid) {
+        attempts.push(skipped_attempt(plan, Method::Hybrid, reason));
+        return Ok(ToSolidReport { result: best, attempts });
+    }
+    let after_best = std::mem::replace(&mut s.doc, base);
+    let timer = Timer::start();
+    let outcome = exec(s, Method::Hybrid);
+    if s.cancel.is_cancelled() {
+        return Err(cancelled());
+    }
+    let hybrid = match outcome {
+        Ok(r) => r,
+        Err(e) if is_cancelled(&e) => return Err(e),
+        Err(e) => {
+            s.doc = after_best;
+            let mut failed = skipped_attempt(plan, Method::Hybrid, String::new());
+            failed.skipped = None;
+            failed.error = Some(short(message_of(&e)));
+            failed.seconds = timer.seconds();
+            attempts.push(failed);
+            return Ok(ToSolidReport { result: best, attempts });
+        }
+    };
+    let mut hybrid_record = record(Method::Hybrid, &hybrid, timer.seconds());
+    let wins = is_better(&hybrid, &best);
+    if wins {
+        attempts.iter_mut().for_each(|a| a.returned = false);
+    } else {
+        s.doc = after_best;
+    }
+    hybrid_record.returned = wins;
+    attempts.push(hybrid_record);
+    let result = if wins { finish(hybrid, best.method, &best) } else { finish(best, Method::Hybrid, &hybrid) };
+    Ok(ToSolidReport { result, attempts })
 }
 
 /// Runs the second method on the document as it was before the first, and keeps the better result.
@@ -388,17 +482,21 @@ pub(super) fn run(s: &mut Session, i: &ToSolidIn, set: &Settings, mut report: Sc
         exec_report = report.clone();
     }
     let mut exec = |s: &mut Session, m: Method| attempt(s, i, set, &exec_report, m);
-    let mut out = if i.method == Method::Primitives || i.reuse_regions {
+    let mut out = if i.method == Method::Hybrid {
+        alone(s, Method::Hybrid, &mut exec)?
+    } else if i.method == Method::Primitives || i.reuse_regions {
         alone(s, Method::Primitives, &mut exec)?
     } else {
+        let share = scan_primitive_share(s, set, &report);
         let plan = Plan {
             scan: set.scan,
             tolerance: set.tolerance,
-            share: scan_primitive_share(s, set, &report),
+            share,
             triangles: report.triangles,
             retry: i.retry.unwrap_or(true),
             limits: Limits::default(),
             budget: set.budget.clone(),
+            hybrid: share >= HYBRID_MIN_SHARE,
         };
         orchestrate(s, &plan, &mut exec)?
     };
@@ -418,7 +516,8 @@ fn attempt(
 ) -> CmdResult<ToSolidOut> {
     match method {
         Method::Freeform => freeform::freeform_solid(s, set, report.clone()),
-        _ => primitives_solid(s, i, set, report.clone()),
+        Method::Hybrid => hybrid_method::hybrid_solid(s, i, set, report.clone()),
+        Method::Primitives | Method::Auto => primitives_solid(s, i, set, report.clone()),
     }
 }
 

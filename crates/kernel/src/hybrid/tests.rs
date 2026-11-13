@@ -300,3 +300,74 @@ fn bad_input_is_refused() {
     assert!(extract_face(&b, 99).is_err());
     assert!(replace_face(&b, 99, &wave_surface(0.0, 1.0, 0.0, 1.0)).is_err());
 }
+
+/// A 40 x 30 block with a wavy freeform top: a stock that is not a box.
+fn wavy_block() -> Brep {
+    let mut cuts = vec![];
+    for (p, n) in [
+        ([0.0, 0.0, 0.0], [-1.0, 0.0, 0.0]),
+        ([40.0, 0.0, 0.0], [1.0, 0.0, 0.0]),
+        ([0.0, 0.0, 0.0], [0.0, -1.0, 0.0]),
+        ([0.0, 30.0, 0.0], [0.0, 1.0, 0.0]),
+        ([0.0, 0.0, 0.0], [0.0, 0.0, -1.0]),
+    ] {
+        cuts.push(Cut { shape: Shape::Plane { point: p, normal: n }, convex: true, full: false });
+    }
+    let free = [FreeCut { surface: wave_surface(-3.0, 43.0, -3.0, 33.0), outward: [0.0, 0.0, 1.0] }];
+    solid_from_cuts([-6.0, -6.0, -3.0], [46.0, 36.0, 20.0], &cuts, &free).unwrap().brep
+}
+
+#[test]
+fn cut_stock_trims_a_given_solid_and_skips_what_the_kernel_cannot_do() {
+    let stock = wavy_block();
+    assert_eq!(analytic_faces(&stock).len(), stock.faces.len() - 1, "all faces but the wavy top are analytic");
+    let plane =
+        Cut { shape: Shape::Plane { point: [30.0, 0.0, 0.0], normal: [1.0, 0.0, 0.0] }, convex: true, full: false };
+    let hole = Cut {
+        shape: Shape::Cylinder { point: [12.0, 15.0, 0.0], axis: [0.0, 0.0, 1.0], radius: 3.0 },
+        convex: false,
+        full: true,
+    };
+    let fillet = Cut {
+        shape: Shape::Cylinder { point: [4.0, 4.0, 0.0], axis: [0.0, 0.0, 1.0], radius: 4.0 },
+        convex: true,
+        full: false,
+    };
+    // a plane without a direction cannot be cut with
+    let all_gone =
+        Cut { shape: Shape::Plane { point: [0.0, 0.0, 5.0], normal: [0.0, 0.0, 0.0] }, convex: true, full: false };
+    let built = cut_stock(&stock, &[plane.clone(), hole.clone(), fillet, all_gone], &[], &[]).unwrap();
+    assert!(matches!(built.primitives[0], CutStatus::Applied("halfspace")), "{:?}", built.primitives[0]);
+    assert!(matches!(built.primitives[1], CutStatus::Applied("subtract")), "{:?}", built.primitives[1]);
+    assert!(
+        matches!(&built.primitives[2], CutStatus::Skipped(why) if why.contains("blend")),
+        "{:?}",
+        built.primitives[2]
+    );
+    assert!(
+        matches!(built.primitives[3], CutStatus::Skipped(_)),
+        "a cut the kernel cannot make is skipped: {:?}",
+        built.primitives[3]
+    );
+    assert!(built.freeform.is_empty());
+    // the plane and the hole are faces of the result, the wavy top is still a spline
+    assert_eq!(faces_on_shape(&built.brep, &plane.shape, 1e-3).len(), 1);
+    assert_eq!(faces_on_shape(&built.brep, &hole.shape, 1e-3).len(), 1);
+    assert_eq!(analytic_faces(&built.brep).len(), built.brep.faces.len() - 1);
+    let v = solid::volume(&built.brep).unwrap();
+    let before = solid::volume(&stock).unwrap();
+    let expected = before * 30.0 / 40.0 - std::f64::consts::PI * 9.0 * 12.0;
+    assert!((v - expected).abs() < 0.03 * expected, "volume {v}, expected about {expected}");
+}
+
+#[test]
+fn cut_stock_with_nothing_applicable_is_an_error_and_bad_input_is_refused() {
+    let stock = wavy_block();
+    let all_gone =
+        Cut { shape: Shape::Plane { point: [0.0, 0.0, 5.0], normal: [0.0, 0.0, 0.0] }, convex: true, full: false };
+    assert!(cut_stock(&stock, &[all_gone], &[], &[]).is_err());
+    let nan =
+        Cut { shape: Shape::Plane { point: [f64::NAN, 0.0, 0.0], normal: [1.0, 0.0, 0.0] }, convex: true, full: false };
+    assert!(cut_stock(&stock, &[nan], &[], &[]).is_err());
+    assert!(cut_stock(&stock, &[], &[], &[]).is_err());
+}

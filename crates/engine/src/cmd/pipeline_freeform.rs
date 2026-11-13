@@ -98,6 +98,24 @@ pub(super) fn judge(first: Attempt, second: Attempt) -> RetryReason {
 
 /// What keeps a wrapped scan from a pass.
 pub(super) fn issues_of(w: &WrapOut, d: &DeviationSummary, set: &Settings, report: &ScanSummary) -> Vec<super::Issue> {
+    issues_for(&NetworkFacts { closed: w.closed, patches: w.patches, capped: w.capped }, d, set, report)
+}
+
+/// What the issues of a network of patches are read from (the hybrid method's stock has the same
+/// facts and the same issues).
+pub(super) struct NetworkFacts {
+    pub(super) closed: bool,
+    pub(super) patches: usize,
+    pub(super) capped: bool,
+}
+
+/// What keeps a body made of a patch network from a pass.
+pub(super) fn issues_for(
+    w: &NetworkFacts,
+    d: &DeviationSummary,
+    set: &Settings,
+    report: &ScanSummary,
+) -> Vec<super::Issue> {
     let mut list = Vec::new();
     if !w.closed {
         let msg = "the patch network is not closed (the scan has open boundaries): the result is a sheet, not a solid";
@@ -159,6 +177,18 @@ pub(super) fn next_steps(w: &WrapOut, issues: &[super::Issue], set: &Settings, r
     steps
 }
 
+/// The verdict of a body made of patches: a pass without issues, a review when the solid still
+/// represents the scan, else a fail.
+pub(super) fn verdict_of(issues: &[super::Issue], d: &DeviationSummary) -> Verdict {
+    if issues.is_empty() {
+        Verdict::Pass
+    } else if d.coverage >= MIN_COVERAGE {
+        Verdict::Review
+    } else {
+        Verdict::Fail
+    }
+}
+
 /// The result of a run in which nothing could be wrapped.
 fn failed(set: &Settings, report: ScanSummary, why: &str) -> ToSolidOut {
     let issues = vec![issue("no_solid", format!("the scan could not be wrapped in patches: {why}"))];
@@ -202,6 +232,7 @@ pub(super) fn out(
         attempts: Vec::new(),
         prep: super::PrepOut::default(),
         thickened: None,
+        analytic: None,
     }
 }
 
@@ -311,7 +342,12 @@ fn wrap_with(s: &mut Session, set: &Settings, max_patches: Option<usize>) -> Cmd
     wrap_mesh(s, set, set.scan, max_patches)
 }
 
-fn wrap_mesh(s: &mut Session, set: &Settings, mesh: ObjectId, max_patches: Option<usize>) -> CmdResult<WrapOut> {
+pub(super) fn wrap_mesh(
+    s: &mut Session,
+    set: &Settings,
+    mesh: ObjectId,
+    max_patches: Option<usize>,
+) -> CmdResult<WrapOut> {
     wrap(
         s,
         WrapIn {
@@ -389,13 +425,7 @@ fn freeform_with_mesh(
     }
     let tried = retry.as_ref().is_some_and(|r| r.reason != RetryReason::BudgetSpent);
     let next = next_steps(&w, &issues, set, tried);
-    let verdict = if issues.is_empty() {
-        Verdict::Pass
-    } else if d.coverage >= MIN_COVERAGE {
-        Verdict::Review
-    } else {
-        Verdict::Fail
-    };
+    let verdict = verdict_of(&issues, &d);
     Ok(out(set, retry, report, verdict, Some(&w), Some(d), issues, next))
 }
 

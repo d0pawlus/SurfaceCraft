@@ -25,6 +25,8 @@ mod auto;
 mod budget;
 #[path = "pipeline_freeform.rs"]
 mod freeform;
+#[path = "pipeline_hybrid.rs"]
+mod hybrid_method;
 #[path = "pipeline_judge.rs"]
 mod judge;
 #[path = "pipeline_prepare.rs"]
@@ -36,6 +38,7 @@ pub use prepare::{ComponentOut, PrepOut, PrepStep};
 mod rebuild;
 #[path = "pipeline_types.rs"]
 mod types;
+pub use hybrid_method::AnalyticSummary;
 pub use types::{DeviationSummary, Issue, LeftOut, Modelled, NextStep, ScanSummary, ToSolidOut};
 #[path = "pipeline_regions.rs"]
 mod regions;
@@ -80,6 +83,9 @@ pub enum Method {
     Primitives,
     /// A network of patches over the whole scan (castings, body panels, organic shapes).
     Freeform,
+    /// One closed body: the regions a primitive fits are exact analytic faces, the rest of the scan
+    /// is covered by patches (parts that are partly machined and partly organic).
+    Hybrid,
 }
 
 /// Parameters of `scan.to_solid`.
@@ -95,9 +101,12 @@ pub struct ToSolidIn {
     /// default 0.99).
     #[serde(default)]
     pub min_within: Option<f64>,
-    /// `auto` (default), `primitives` or `freeform`. `auto` segments the scan and takes
+    /// `auto` (default), `primitives`, `freeform` or `hybrid`. `auto` segments the scan and takes
     /// `primitives` when at least half of its triangles lie in regions a primitive fits, else
-    /// `freeform`: a watertight network of patches over the whole scan.
+    /// `freeform`: a watertight network of patches over the whole scan; when the primitives cover a
+    /// quarter of the scan or more it also tries `hybrid` and returns it when it is not worse.
+    /// `hybrid`: one closed body whose regions that fit a primitive are exact faces of it and the
+    /// rest patches (the result reports `analytic`); a closed scan is needed.
     #[serde(default)]
     pub method: Method,
     /// Clean the scan first: debris, spikes and holes (default true). Not done with
@@ -236,6 +245,11 @@ fn settings(s: &Session, i: &ToSolidIn) -> CmdResult<Settings> {
     let min_within = i.min_within.unwrap_or(MIN_WITHIN);
     if !(min_within.is_finite() && (0.0..=1.0).contains(&min_within)) {
         return Err(CmdError::Params("min_within must be within 0..=1".into()));
+    }
+    if i.thickness.is_some() && i.method == Method::Hybrid {
+        return Err(CmdError::Params(
+            "thickness makes a shell from an open scan with method `freeform` (or `auto`): it has no meaning with method `hybrid`".into(),
+        ));
     }
     if i.reuse_regions && i.method == Method::Freeform {
         return Err(CmdError::Params("reuse_regions has no meaning with method `freeform`".into()));
@@ -490,6 +504,7 @@ fn primitives_solid(s: &mut Session, i: &ToSolidIn, set: &Settings, scan_report:
         attempts: Vec::new(),
         prep: PrepOut::default(),
         thickened: None,
+        analytic: None,
     })
 }
 
@@ -499,7 +514,7 @@ pub static COMMANDS: &[CommandSpec] = &[command!(
     "Scan to solid",
     "Solid",
     true,
-    "From raw scan `scan` to a closed solid in one step, measured against the scan. Prismatic parts (`method` primitives): cleans the scan, segments it, fits a primitive to each sizeable region, relates the primitives and builds the solid. Organic parts, castings and body panels (`method` freeform): wraps the whole scan in a watertight network of patches. `method` auto (default) tries the suggested method, then the other if it fails, and returns the better (`attempts`). Returns `verdict` (pass, review or fail), the deviation, `issues`, and `next_steps` with ready parameters. A poor model is a verdict, not an error; regions stay for manual work. `reuse_regions` models corrected regions again (without cleaning).",
+    "From raw scan `scan` to a closed solid in one step, measured against the scan. Prismatic parts (`method` primitives): cleans the scan, segments it, fits a primitive to each sizeable region, relates the primitives and builds the solid. Organic parts, castings and body panels (`method` freeform): wraps the whole scan in a watertight network of patches. `method` hybrid builds one closed body with exact analytic faces on the regions a primitive fits and patches on the rest (`analytic`). `method` auto (default) tries the suggested method, then the other if it fails, and when the primitives cover a quarter of the scan also a hybrid body; it returns the best (`attempts`). Returns `verdict` (pass, review or fail), the deviation, `issues`, and `next_steps` with ready parameters. A poor model is a verdict, not an error; regions stay for manual work. `reuse_regions` models corrected regions again (without cleaning).",
     ToSolidIn,
     ToSolidOut,
     super::mesh::scan_size::to_solid_checked

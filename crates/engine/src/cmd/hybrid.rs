@@ -144,7 +144,7 @@ pub(super) fn cut_of(p: &Primitive, pts: &[Point3], nrm: &[Vec3]) -> Result<Cut,
 /// its direction, and those within 0.5 mm of its line also sit on it (coaxial). Fitted axes
 /// differ by noise, and the kernel's intersection of two nearly coaxial surfaces is the
 /// general (and fragile) case instead of the analytic one.
-fn snap_axes(cuts: &mut [Cut]) {
+pub(crate) fn snap_axes(cuts: &mut [Cut]) {
     let axis_of = |c: &Cut| match &c.shape {
         Shape::Cylinder { point, axis, .. } => Some((*point, *axis)),
         Shape::Cone { apex, axis, .. } => Some((*apex, *axis)),
@@ -322,7 +322,7 @@ fn describe(c: &CutStatus) -> (String, bool) {
 /// The fitted primitives of `refs` as planner items, all from one mesh, with the scan's points;
 /// `grow` sees the points of every region. Primitives whose cut cannot be made are returned as
 /// skipped.
-fn collect_items(
+pub(crate) fn collect_items(
     s: &Session,
     refs: &[ObjRef],
     cache: &mut HashMap<ObjectId, Arc<Vec<Vec3>>>,
@@ -373,6 +373,54 @@ fn kind_name(p: &Primitive) -> &'static str {
         Primitive::Cone { .. } => "cone",
         Primitive::Torus { .. } => "torus",
     }
+}
+
+/// How the cut, tool or addition of item `k` came out: the text, whether it was applied, and the
+/// shape as planned.
+fn item_outcome(k: usize, plan: &plan::Plan, cuts: &[Cut], built: &hybrid::Built) -> Option<(String, bool, Shape)> {
+    let role = plan.roles.get(k)?;
+    let of_tools = |sts: Vec<&CutStatus>, none: &str| match sts.iter().find(|st| matches!(st, CutStatus::Skipped(_))) {
+        Some(bad) => (describe(bad).0, false, role.shape.clone()),
+        None if sts.is_empty() => (none.to_string(), false, role.shape.clone()),
+        None => (sts.first().map_or(String::new(), |st| describe(st).0), true, role.shape.clone()),
+    };
+    Some(match role.kind {
+        RoleKind::Global | RoleKind::Blend => {
+            let ci = plan.cut_members.iter().position(|m| m.contains(&k));
+            match ci.and_then(|ci| built.primitives.get(ci).zip(cuts.get(ci))) {
+                Some((st, cut)) => {
+                    let (how, ok) = describe(st);
+                    (how, ok, cut.shape.clone())
+                }
+                None => ("skipped: not passed to the kernel".to_string(), false, role.shape.clone()),
+            }
+        }
+        RoleKind::LocalSubtract => {
+            of_tools(role.tools.iter().filter_map(|&t| built.tools.get(t)).collect(), "skipped: no tool")
+        }
+        RoleKind::LocalAdd => {
+            of_tools(role.adds.iter().filter_map(|&t| built.adds.get(t)).collect(), "skipped: no addition")
+        }
+        RoleKind::Skipped => (format!("skipped: {}", role.how), false, role.shape.clone()),
+    })
+}
+
+/// Per planned item: its role, how it was applied (or why not) and its faces in the built solid.
+pub(crate) fn item_faces(
+    items: &[Item],
+    plan: &plan::Plan,
+    cuts: &[Cut],
+    built: &hybrid::Built,
+    tol: f64,
+) -> Vec<FaceOf> {
+    let mut out = Vec::with_capacity(items.len());
+    for (k, it) in items.iter().enumerate() {
+        let Some(role) = plan.roles.get(k) else { continue };
+        let Some((how, applied, shape)) = item_outcome(k, plan, cuts, built) else { continue };
+        let faces = if applied { hybrid::faces_on_shape(&built.brep, &shape, tol) } else { Vec::new() };
+        out.push(FaceOf { object: it.id, faces, how, role: role.kind.name().to_string() });
+    }
+    out
 }
 
 pub(crate) fn from_regions(s: &mut Session, i: FromRegionsIn) -> CmdResult<FromRegionsOut> {
@@ -436,41 +484,9 @@ pub(crate) fn from_regions(s: &mut Session, i: FromRegionsIn) -> CmdResult<FromR
     let mut faces_of = skipped_early;
     let tol = 0.02 * diag.max(1.0) / 10.0 + 1e-3;
     let mut skipped = faces_of.len();
-    for (k, it) in items.iter().enumerate() {
-        let Some(role) = plan.roles.get(k) else { continue };
-        let (how, applied, shape) = match role.kind {
-            RoleKind::Global | RoleKind::Blend => {
-                let ci = plan.cut_members.iter().position(|m| m.contains(&k));
-                match ci.and_then(|ci| built.primitives.get(ci).zip(cuts.get(ci))) {
-                    Some((st, cut)) => {
-                        let (how, ok) = describe(st);
-                        (how, ok, cut.shape.clone())
-                    }
-                    None => ("skipped: not passed to the kernel".to_string(), false, role.shape.clone()),
-                }
-            }
-            RoleKind::LocalSubtract => {
-                let sts: Vec<&CutStatus> = role.tools.iter().filter_map(|&t| built.tools.get(t)).collect();
-                match sts.iter().find(|st| matches!(st, CutStatus::Skipped(_))) {
-                    Some(bad) => (describe(bad).0, false, role.shape.clone()),
-                    None if sts.is_empty() => ("skipped: no tool".to_string(), false, role.shape.clone()),
-                    None => (sts.first().map_or(String::new(), |st| describe(st).0), true, role.shape.clone()),
-                }
-            }
-            RoleKind::LocalAdd => {
-                let sts: Vec<&CutStatus> = role.adds.iter().filter_map(|&t| built.adds.get(t)).collect();
-                match sts.iter().find(|st| matches!(st, CutStatus::Skipped(_))) {
-                    Some(bad) => (describe(bad).0, false, role.shape.clone()),
-                    None if sts.is_empty() => ("skipped: no addition".to_string(), false, role.shape.clone()),
-                    None => (sts.first().map_or(String::new(), |st| describe(st).0), true, role.shape.clone()),
-                }
-            }
-            RoleKind::Skipped => (format!("skipped: {}", role.how), false, role.shape.clone()),
-        };
-        let faces = if applied { hybrid::faces_on_shape(&built.brep, &shape, tol) } else { Vec::new() };
-        skipped += usize::from(!applied);
-        faces_of.push(FaceOf { object: it.id, faces, how, role: role.kind.name().to_string() });
-    }
+    let of_items = item_faces(&items, &plan, &cuts, &built, tol);
+    skipped += of_items.iter().filter(|f| f.how.starts_with("skipped")).count();
+    faces_of.extend(of_items);
     for (((id, _), f), st) in surf_regions.iter().zip(&free).zip(&built.freeform) {
         let (how, applied) = describe(st);
         let faces = if applied { hybrid::faces_on_spline(&built.brep, &f.surface, tol)? } else { Vec::new() };
@@ -492,7 +508,7 @@ pub struct PlanRegionsIn {
     pub square_planes_deg: Option<f64>,
 }
 
-fn square_deg(v: Option<f64>) -> CmdResult<f64> {
+pub(crate) fn square_deg(v: Option<f64>) -> CmdResult<f64> {
     let d = v.unwrap_or(0.3);
     if d.is_finite() && (0.0..=5.0).contains(&d) {
         Ok(d)

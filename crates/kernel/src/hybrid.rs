@@ -113,6 +113,7 @@ mod build;
 mod cutters;
 mod faces;
 mod patch;
+mod stock;
 #[cfg(test)]
 mod tests;
 mod vector;
@@ -122,4 +123,5 @@ pub(crate) use cutters::keep_front;
 pub(crate) use faces::{axis_distance, face_vertices, frame_axis};
 pub use faces::{extract_face, faces_on_shape, faces_on_spline, planar_face_outward};
 pub use patch::{cut_by_spline, patch_rise, replace_face, replace_face_up_and_down};
+pub use stock::{analytic_faces, cut_stock};
 pub(crate) use vector::{V, add, corners, cross, dot, frame_matrix, norm, perpendicular, scale, sub, unit};
