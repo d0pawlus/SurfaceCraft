@@ -41,6 +41,7 @@ Methods implemented from publications; no code of the reference implementations 
 |---|---|---|
 | crates/fit/src/retopo.rs | Jakob, Tarini, Panozzo, Sorkine-Hornung, "Instant Field-Aligned Meshes", SIGGRAPH Asia 2015 (Instant Meshes, permissive licence, see NOTICE) | 4-RoSy orientation field and 2-PoSy position field by Gauss-Seidel smoothing, extraction of a quad-dominant layout; written from the paper, own extraction by lattice-cell adjacency. |
 | crates/fit/src/mls.rs | moving least squares projection (Levin 1998; Alexa et al. 2003) | Gaussian-weighted local quadric. |
+| crates/align/src/pair/ | Rusu, Blodow, Beetz, "Fast Point Feature Histograms (FPFH) for 3D registration", ICRA 2009 (descriptors); Fischler, Bolles, "Random Sample Consensus", CACM 1981 (RANSAC over descriptor matches); Besl, McKay 1992 and Chen, Medioni 1991 (ICP, already in `icp.rs`) | Written from the papers; no code of PCL, Open3D, Super4PCS or Go-ICP (GPL) was read or used. Pair angles of the Darboux frame, 3 × 11 bins, mutual nearest matches, three-point trials with side-length checks, truncated inlier scoring with border-aware conflicts are our own. |
 
 ## Adapted code
 

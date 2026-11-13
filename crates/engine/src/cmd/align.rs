@@ -9,6 +9,7 @@ use surfacecraft_doc::{ObjectId, ObjectKind};
 use surfacecraft_geom::{Bvh, Mesh, Point3, Transform, Vec3};
 
 mod auto;
+mod pair;
 mod settle;
 
 /// The motion an alignment applied.
@@ -436,5 +437,15 @@ pub static COMMANDS: &[CommandSpec] = &[
         settle::SettleIn,
         settle::SettleOut,
         settle::settle
+    ),
+    command!(
+        "align.pair_coarse",
+        "Align two scans",
+        "Align",
+        true,
+        "Brings `object` onto the overlapping scan `target` (mesh or body) with no picked points: candidates from the principal axes (24 signed permutations) and from local shape descriptors with RANSAC (partial overlap, down to about half shared), scored robustly, refined by ICP. Reports the pose, the overlap shares, a verdict (`unique`, `ambiguous` with the near-tied alternatives, or `no_match`) and a confidence. `apply` false (default) only proposes; a pose that is not `unique` is applied only when `choose` names it.",
+        pair::PairIn,
+        pair::PairOut,
+        pair::pair
     ),
 ];

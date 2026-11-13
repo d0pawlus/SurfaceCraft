@@ -24,7 +24,7 @@ description: Adding or changing a SurfaceCraft command, crate boundaries, the CL
   must not). `Session::execute`, the CLI, MCP and scripts are unchanged; a headless
   `SurfaceCraftApp` (tests) runs everything in place. A long loop may look at `Session::cancel`
   and return `cmd::cancelled()` (today: `region.auto_segment`, `region.resegment`, `align.icp`,
-  `mesh.smooth`); `cmd::write_file` writes nothing for a cancelled command. A cancelled command
+  `align.pair_coarse`, `mesh.smooth`); `cmd::write_file` writes nothing for a cancelled command. A cancelled command
   that does not look at the flag runs to its end, and no other heavy command starts before that.
   UI code that changes the session takes it from `SurfaceCraftApp::idle_session`, which refuses
   while a command runs.
