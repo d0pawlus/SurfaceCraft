@@ -19,6 +19,11 @@ use surfacecraft_geom::pieces::pieces;
 const HANDLE_TRIGGER: usize = 64;
 /// ... or with at least this many non-manifold edges.
 const NON_MANIFOLD_TRIGGER: usize = 20;
+/// Topology evidence lower than the triggers above: with it a closed result that is short of the tolerance
+/// may still be a victim of the topology, so the rebuild-and-wrap-again is tried; without it a closed
+/// result short of the tolerance is limited by the patch budget, which a rebuild does not change.
+const SOFT_HANDLES: usize = 16;
+const SOFT_NON_MANIFOLD: usize = 5;
 /// The surface of a rebuilt scan has about this many quads at most: the voxel grows with the area.
 const REMESH_QUAD_BUDGET: f64 = 1_500_000.0;
 /// A boundary loop of this many edges or fewer is a flap or a sliver, not an opening.
@@ -57,14 +62,15 @@ fn mesh_of(s: &Session, id: ObjectId) -> Option<std::sync::Arc<Mesh>> {
 
 /// Evidence from the cleaned scan that rebuilding it is possible and whether it is worth doing first:
 /// every significant piece is closed (flaps aside); many handles or non-manifold edges is strong.
-fn evidence(mesh: &Mesh) -> Option<(bool, Value)> {
+fn evidence(mesh: &Mesh) -> Option<(bool, bool, Value)> {
     let ps = pieces(mesh);
     let big: Vec<_> = ps.iter().filter(|p| p.triangles.len() * 100 >= mesh.triangle_count()).collect();
     let closed = !big.is_empty() && big.iter().all(|p| p.loops.iter().all(|l| l.edges <= MAX_FLAP_EDGES));
     let genus: usize = big.iter().filter_map(|p| p.genus()).sum();
     let non_manifold: usize = ps.iter().map(|p| p.non_manifold_edges).sum();
     let strong = genus >= HANDLE_TRIGGER || non_manifold >= NON_MANIFOLD_TRIGGER;
-    closed.then(|| (strong, json!({"genus": genus, "non_manifold_edges": non_manifold})))
+    let soft = genus >= SOFT_HANDLES || non_manifold >= SOFT_NON_MANIFOLD;
+    closed.then(|| (strong, soft, json!({"genus": genus, "non_manifold_edges": non_manifold})))
 }
 
 /// What a remesh attempt came to: the new mesh and the step, or the step saying why it was not done.
@@ -106,6 +112,16 @@ fn refused(reason: &str, why: &str, figures: Value, ms: u64) -> PrepStep {
         reason: format!("{reason}; not done: {why}"),
         numbers: json!({"refused": why, "evidence": figures, "ms": ms}),
     }
+}
+
+/// Can a rebuild of the scan improve this plain result? The rebuild repairs topology. A closed result
+/// whose only issue is `out_of_tolerance` is limited by the patch budget (the cap was reached, or the
+/// larger-cap retry already ran), not by topology: unless the scan shows some topology evidence
+/// (`soft`), rebuilding it only costs time. An open or failed result, or one with other issues, may
+/// be a victim of the topology.
+fn rebuild_can_help(base: &ToSolidOut, soft: bool) -> bool {
+    let closed_and_short = base.body.is_some() && base.issues.iter().all(|i| i.code == "out_of_tolerance");
+    !closed_and_short || soft
 }
 
 /// What the rule of the retry sees of a result: whether the solid is closed and the share within the tolerance.
@@ -168,7 +184,7 @@ fn restore_name(s: &mut Session, set: &Settings, out: &ToSolidOut) {
 /// handles or non-manifold edges) is rebuilt first. With `rebuild` off, only the plain wrap.
 pub(super) fn freeform_prepared(s: &mut Session, set: &Settings, report: ScanSummary) -> CmdResult<ToSolidOut> {
     let found = if set.rebuild { mesh_of(s, set.scan).and_then(|m| evidence(&m)) } else { None };
-    let Some((strong, figures)) = found else { return freeform_on(s, set, set.scan, report) };
+    let Some((strong, soft, figures)) = found else { return freeform_on(s, set, set.scan, report) };
     // the larger-cap retry belongs to the first attempt only: a second attempt never makes a third wrap
     let second = Settings { allow_retry: false, name: set.name.clone(), ..*set };
     let mut refusal = None;
@@ -189,7 +205,7 @@ pub(super) fn freeform_prepared(s: &mut Session, set: &Settings, report: ScanSum
         }
     }
     let mut base = freeform_on(s, set, set.scan, report.clone())?;
-    if base.verdict == Verdict::Pass || strong {
+    if base.verdict == Verdict::Pass || strong || !rebuild_can_help(&base, soft) {
         base.prep.preparation.extend(refusal);
         return Ok(base);
     }
@@ -342,5 +358,25 @@ mod tests {
             },
         );
         assert!(matches!(c, Err(ref e) if is_cancelled(e)), "the command itself checks too");
+    }
+
+    #[test]
+    fn a_closed_result_short_only_of_the_tolerance_is_not_rebuilt_unless_the_topology_says_so() {
+        let mut s = Session::new();
+        let body = box_body(&mut s, "solid");
+        let issue = |code: &str| Issue { code: code.into(), message: String::new() };
+        let mut closed_short = result(body, 0.8, false);
+        closed_short.issues = vec![issue("out_of_tolerance")];
+        assert!(!rebuild_can_help(&closed_short, false), "limited by the patch budget");
+        assert!(rebuild_can_help(&closed_short, true), "with topology evidence the rebuild may help");
+        let mut open = closed_short.clone();
+        open.issues = vec![issue("open_surface"), issue("out_of_tolerance")];
+        assert!(rebuild_can_help(&open, false), "an open result may be the topology's");
+        let mut other = closed_short.clone();
+        other.issues = vec![issue("out_of_tolerance"), issue("non_manifold_edges")];
+        assert!(rebuild_can_help(&other, false));
+        let mut none = closed_short;
+        none.body = None;
+        assert!(rebuild_can_help(&none, false), "no solid at all");
     }
 }

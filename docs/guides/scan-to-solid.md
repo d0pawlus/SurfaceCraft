@@ -130,7 +130,9 @@ modelled as it is).
   does not pass on is rebuilt and wrapped again, and the result that is clearly better is kept (the
   rule of the larger-cap retry: a closed result is never replaced by an open one, the share within
   tolerance must gain more than 0.5 points; a tie keeps the plain result). `rebuild: false` turns it
-  off. The rebuild-and-wrap-again runs at most once per part and for at most the 4 largest parts. The
+  off. A rebuild repairs topology, so it is not tried for a closed result whose only issue is
+  `out_of_tolerance` (that is the patch budget) unless the scan shows some topology evidence (genus
+  16 or more, or 5 or more non-manifold edges). The rebuild-and-wrap-again runs at most once per part and for at most the 4 largest parts. The
   larger-cap retry (`allow_retry`) is made for the largest part only and only in its first attempt, so
   at most once per call. The true worst case is 29 wraps per call: 24 parts (a part the primitives
   could not close is wrapped as freeform once, as its one wrap), 4 rebuilds and 1 retry.
