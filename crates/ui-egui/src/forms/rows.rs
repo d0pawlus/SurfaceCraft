@@ -209,7 +209,7 @@ pub fn described_default(description: &str) -> Option<Value> {
     }
 }
 
-pub(super) fn marked(label: &str, required: bool) -> String {
+fn marked(label: &str, required: bool) -> String {
     if required { format!("{label} *") } else { label.to_string() }
 }
 

@@ -48,14 +48,7 @@ pub(super) fn fmt_num(n: f64) -> String {
     if i18n::lang() == Lang::Pl { s.replace('.', ",") } else { s.to_string() }
 }
 
-pub(super) fn check(
-    root: &Value,
-    schema: &Value,
-    value: &Value,
-    path: &str,
-    objects: &[ObjInfo],
-    out: &mut Vec<Issue>,
-) {
+fn check(root: &Value, schema: &Value, value: &Value, path: &str, objects: &[ObjInfo], out: &mut Vec<Issue>) {
     let (kind, nullable, s) = classify(root, schema);
     if value.is_null() {
         if !nullable && kind != Kind::Any {
