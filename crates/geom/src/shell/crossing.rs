@@ -490,11 +490,11 @@ mod tests {
 
     #[test]
     fn a_triangle_that_overlaps_more_than_the_candidate_limit_is_reported_as_truncated() {
-        // Arrange: one big triangle over 4200 tiny ones
+        // Arrange: one big triangle over 8300 tiny ones (twice the limit)
         let mut positions = vec![p(0.0, 0.0, 0.0), p(100.0, 0.0, 0.0), p(0.0, 100.0, 0.0)];
         let mut triangles = vec![[0u32, 1, 2]];
-        for i in 0..4200u32 {
-            let (x, y) = (f64::from(i % 64) + 1.0, f64::from(i / 64) + 1.0);
+        for i in 0..8300u32 {
+            let (x, y) = (0.4 * f64::from(i % 64) + 1.0, 0.4 * f64::from(i / 64) + 1.0);
             let base = positions.len() as u32;
             positions.extend([p(x, y, 0.0), p(x + 0.1, y, 0.0), p(x, y + 0.1, 0.0)]);
             triangles.push([base, base + 1, base + 2]);
