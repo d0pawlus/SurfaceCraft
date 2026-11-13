@@ -24,6 +24,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 surfacecraft-kernel.workspace = true
+rayon.workspace = true
 
 [lints]
 workspace = true

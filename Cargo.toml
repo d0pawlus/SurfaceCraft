@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "apps/*", "xtask"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.95"
@@ -32,6 +32,7 @@ solidcore-record = { git = "https://github.com/tangency-labs/solidcore", rev = "
 solidcore-convert = { git = "https://github.com/tangency-labs/solidcore", rev = "4f2da85c26f7d608808d94cffcf06ebe867ef61d" }
 solidcore-tess = { git = "https://github.com/tangency-labs/solidcore", rev = "4f2da85c26f7d608808d94cffcf06ebe867ef61d" }
 step-brep = { git = "https://github.com/tangency-labs/solidcore", rev = "4f2da85c26f7d608808d94cffcf06ebe867ef61d" }
+step-import = { git = "https://github.com/tangency-labs/solidcore", rev = "4f2da85c26f7d608808d94cffcf06ebe867ef61d" }
 step-export = { git = "https://github.com/tangency-labs/solidcore", rev = "4f2da85c26f7d608808d94cffcf06ebe867ef61d" }
 
 thiserror = "2"
