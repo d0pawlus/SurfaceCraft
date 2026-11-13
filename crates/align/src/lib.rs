@@ -4,6 +4,7 @@
 //! - [`icp`]: fine alignment of a mesh to a target surface, point-to-plane, on a BVH.
 //! - [`datum`]: 3-2-1 frames from planes, axes and points (primary / secondary / tertiary).
 //! - [`principal`]: principal axes of a mesh (align to world axes).
+//! - [`pair`]: two scans of one part into one pose with no picked points (descriptors, RANSAC, ICP).
 //! - [`auto`]: a pose from the scan alone (largest flat face, turned axis, open rims).
 //! - [`settle`]: the pose that puts the mirror plane on a world plane.
 //!
@@ -23,6 +24,7 @@ mod faces;
 mod frame;
 pub mod icp;
 pub mod kabsch;
+pub mod pair;
 pub mod principal;
 mod rim;
 pub mod settle;
@@ -32,8 +34,9 @@ mod turned;
 pub use auto::{AutoMethod, AutoPose, BaseFace, CONFIDENCE_THRESHOLD, LevelMode, auto_pose};
 pub use datum::{Datum, datum_321};
 pub use frame::InPlane;
-pub use icp::{IcpOptions, IcpReport, icp, icp_cancellable, rms_to_surface};
+pub use icp::{IcpOptions, IcpReport, icp, icp_cancellable, icp_with_normals, rms_to_surface};
 pub use kabsch::kabsch;
+pub use pair::{PairCandidate, PairOptions, PairResult, PairVerdict, pair_coarse};
 pub use principal::principal_frame;
 pub use settle::{Settled, WorldPlane, settle_symmetry};
 pub use symmetry::{SymmetryPlane, symmetry_plane};
