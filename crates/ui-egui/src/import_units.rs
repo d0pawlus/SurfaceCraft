@@ -1,8 +1,8 @@
 //! The unit of a scan import in the interface (P9-U1). A scan file has no unit, so an import never
-//! takes a unit silently: imports started without the form (menu, welcome card, drag-and-drop, the
-//! browser's inbox) are always millimetres. The import form starts with the unit chosen last in this
-//! session (never kept across a restart), and says so. What an import or a conversion did is said in
-//! words in the interface language.
+//! states a unit silently: imports started without the form (the menu, the welcome card, the browser's
+//! file picker) send no `units`, which keeps the size check on. The import form starts with the unit
+//! chosen last in this session (never kept across a restart) and sends it only when it is not
+//! millimetres. What an import or a conversion did is said in words in the interface language.
 use crate::i18n::{t, tf};
 use serde_json::{Value, json};
 use surfacecraft_doc::LengthUnit;
@@ -12,25 +12,28 @@ pub const IMPORT: &str = "mesh.import";
 /// The parameter that carries the unit.
 const UNITS: &str = "units";
 
-/// `params` of `command` with the unit of this session put in, so that the form starts with it.
+/// `params` of `command` with the unit of this session put in, so that the form starts with it. A
+/// millimetre session sends no unit: the size check stays on until the user chooses one.
 #[must_use]
 pub fn prefilled(command: &str, params: Value, remembered: LengthUnit) -> Value {
     match params {
         Value::Object(mut map) if command == IMPORT => {
-            map.insert(UNITS.to_string(), json!(remembered));
+            map.remove(UNITS);
+            if !remembered.is_mm() {
+                map.insert(UNITS.to_string(), json!(remembered));
+            }
             Value::Object(map)
         }
         other => other,
     }
 }
 
-/// Parameters of an import started without the form: always millimetres, never the unit of an
-/// earlier choice.
+/// Parameters of an import started without the form: no unit is stated, so the size check applies.
 #[must_use]
 pub fn file_import_params(params: Value) -> Value {
     match params {
         Value::Object(mut map) => {
-            map.insert(UNITS.to_string(), json!(LengthUnit::Mm));
+            map.remove(UNITS);
             Value::Object(map)
         }
         other => other,
@@ -98,15 +101,20 @@ mod tests {
 
     #[test]
     fn the_form_starts_with_the_session_unit_for_an_import_only() {
-        let params = json!({"path": "a.stl", "units": null});
+        let params = json!({"path": "a.stl"});
         assert_eq!(prefilled(IMPORT, params.clone(), LengthUnit::In)["units"], "in");
         assert_eq!(prefilled("mesh.info", params.clone(), LengthUnit::In), params);
     }
 
     #[test]
-    fn a_menu_or_inbox_import_is_always_millimetres() {
-        assert_eq!(file_import_params(json!({"path": "a.stl"}))["units"], "mm");
-        assert_eq!(file_import_params(json!({"data": "x", "units": "m"}))["units"], "mm");
+    fn a_millimetre_session_states_no_unit() {
+        assert!(prefilled(IMPORT, json!({"units": "m"}), LengthUnit::Mm).get("units").is_none());
+    }
+
+    #[test]
+    fn a_menu_or_inbox_import_states_no_unit() {
+        assert!(file_import_params(json!({"path": "a.stl"})).get("units").is_none());
+        assert!(file_import_params(json!({"data": "x", "units": "m"})).get("units").is_none());
     }
 
     #[test]

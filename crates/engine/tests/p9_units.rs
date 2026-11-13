@@ -100,12 +100,11 @@ fn import_as(s: &mut Session, path: &str, units: Option<&str>, name: &str) -> Va
     s.execute("mesh.import", params).unwrap()
 }
 
-/// A box with one far outlier vertex, as an OBJ file (eight corners plus the outlier).
-fn box_with_outlier(dir: &TempDir, name: &str, size: f64) -> String {
+/// A plain box of eight corners as an OBJ file (no outlier: a few vertices are measured exactly).
+fn plain_box(dir: &TempDir, name: &str, size: f64) -> String {
     let h = size / 2.0;
     let corners = [[-h, -h, -h], [h, -h, -h], [h, h, -h], [-h, h, -h], [-h, -h, h], [h, -h, h], [h, h, h], [-h, h, h]];
     let mut text: String = corners.iter().map(|c| format!("v {} {} {}\n", c[0], c[1], c[2])).collect();
-    text.push_str("v 1000000 0 0\n");
     text.push_str("f 1 2 3\nf 1 3 4\nf 5 6 7\nf 5 7 8\n");
     let path = dir.file(name);
     std::fs::write(&path, text).unwrap();
@@ -248,6 +247,73 @@ fn one_far_outlier_does_not_change_the_decision_on_a_mesh_of_a_hundred_vertices_
     let half = plane_with_outlier(&dir, "half.obj", 0.5, 0.5);
     let out = import_as(&mut s, &half, None, "half");
     assert_eq!(warning_code(&out), Some("suspicious_scale"), "a 0.5 mm part is still too small");
+    let huge = plane_with_outlier(&dir, "huge.obj", 30000.0, 20000.0);
+    let out = import_as(&mut s, &huge, None, "huge");
+    assert_eq!(out["scale_warning"]["problem"], "micrometres", "a genuinely large part is still reported");
+}
+
+#[test]
+fn acknowledging_millimetres_is_not_refused_by_a_dependent_body() {
+    let mut s = Session::new();
+    s.execute("mesh.synth", json!({"shape": "box", "size": [0.5, 0.5, 0.5], "name": "tiny"})).unwrap();
+    s.execute("body.box", json!({"size": [40.0, 30.0, 15.0], "name": "block"})).unwrap();
+    let out = s.execute("mesh.set_units", json!({"object": "tiny", "from": "mm"}));
+    let out = out.expect("an acknowledgement changes nothing, so bodies do not refuse it");
+    assert_eq!(out["factor"], 1.0);
+    assert!(info_of(&mut s, "tiny").get("scale_warning").is_none(), "the warning goes away");
+    assert!(
+        s.execute("mesh.set_units", json!({"object": "tiny", "from": "m"})).is_err(),
+        "a real rescale is still refused"
+    );
+}
+
+#[test]
+fn set_units_with_force_has_no_units_note() {
+    let dir = TempDir::new("force-note");
+    let mut s = Session::new();
+    import_as(&mut s, &scaled_file(&dir, "metres.obj", units_per_mm("m")), None, "scan");
+    s.execute("body.box", json!({"size": [40.0, 30.0, 15.0], "name": "block"})).unwrap();
+    let out = s.execute("mesh.set_units", json!({"object": "scan", "from": "m", "force": true})).unwrap();
+    assert!(out.get("units_note").is_none(), "no note after force: {out}");
+}
+
+#[test]
+fn a_rejected_overwrite_keeps_the_units_record() {
+    let dir = TempDir::new("keep-record");
+    let m_path = scaled_file(&dir, "stream-m.stl", units_per_mm("m"));
+    let store = dir.file("store");
+    let mut s = Session::new();
+    s.execute("mesh.import_stream", json!({"path": m_path, "store_dir": store, "units": "m"})).unwrap();
+    let rejected = s
+        .execute("mesh.import_stream", json!({"path": dir.file("missing.stl"), "store_dir": store, "overwrite": true}));
+    assert!(rejected.is_err());
+    let info = s.execute("mesh.store_info", json!({"store_dir": store})).unwrap();
+    assert_eq!(info["units"], "m", "the record survives a rejected call: {info}");
+}
+
+#[test]
+fn a_hostile_units_record_falls_back_to_nothing_remembered() {
+    let dir = TempDir::new("hostile-record");
+    let m_path = scaled_file(&dir, "stream-m.stl", units_per_mm("m"));
+    let store = dir.file("store");
+    let mut s = Session::new();
+    s.execute("mesh.import_stream", json!({"path": m_path, "store_dir": store, "units": "m"})).unwrap();
+    let record = std::path::Path::new(&store).join("units.json");
+    let hostile: Vec<Vec<u8>> = vec![
+        b"not json".to_vec(),
+        br#"{"units": 5, "stated": true}"#.to_vec(),
+        br#"{"units": "m", "units": "yd"}"#.to_vec(),
+        br#"{"units": "m", "stated": "yes"}"#.to_vec(),
+        vec![0xff, 0xfe, 0x00, 0x81],
+        vec![b' '; 5 * 1024 * 1024],
+    ];
+    for bytes in hostile {
+        std::fs::write(&record, &bytes).unwrap();
+        let info = s
+            .execute("mesh.store_info", json!({"store_dir": store}))
+            .unwrap_or_else(|e| panic!("store_info must not fail on a hostile record: {e:?}"));
+        assert!(info.get("units").is_none(), "nothing remembered: {info}");
+    }
 }
 
 #[test]
@@ -525,7 +591,7 @@ fn set_units_corrects_in_to_ft() {
 #[test]
 fn set_units_mm_acknowledges_a_defaulted_unit_without_rescaling() {
     let dir = TempDir::new("ack");
-    let path = box_with_outlier(&dir, "pin.obj", 0.8);
+    let path = plain_box(&dir, "pin.obj", 0.8);
     let mut s = Session::new();
     let before = import_as(&mut s, &path, None, "pin");
     assert_eq!(warning_code(&before), Some("suspicious_scale"), "an unstated 0.8 mm part warns");
@@ -539,7 +605,7 @@ fn set_units_mm_acknowledges_a_defaulted_unit_without_rescaling() {
 #[test]
 fn explicit_mm_silences_the_warning_on_a_real_small_part() {
     let dir = TempDir::new("pin-mm");
-    let path = box_with_outlier(&dir, "pin.obj", 0.8);
+    let path = plain_box(&dir, "pin.obj", 0.8);
     let mut s = Session::new();
     let out = import_as(&mut s, &path, Some("mm"), "pin");
     assert!(out.get("scale_warning").is_none(), "a stated unit is not second-guessed: {out}");
@@ -558,7 +624,7 @@ fn a_stated_unit_that_does_not_fit_gives_no_warning() {
 #[test]
 fn a_25_metre_hull_section_stated_in_mm_gives_no_warning() {
     let dir = TempDir::new("hull");
-    let path = box_with_outlier(&dir, "hull.obj", 25000.0);
+    let path = plain_box(&dir, "hull.obj", 25000.0);
     let mut s = Session::new();
     let out = import_as(&mut s, &path, Some("mm"), "hull");
     assert!(out.get("scale_warning").is_none(), "{out}");

@@ -149,26 +149,49 @@ fn write_units(dir: &std::path::Path, record: UnitsRecord) -> CmdResult<()> {
     std::fs::write(dir.join(UNITS_FILE), text).map_err(|e| CmdError::Failed(format!("cannot record the units: {e}")))
 }
 
-/// Removes the units record before a store is replaced (the store's own check refuses other files).
+/// Largest units record read or replaced: a real record is a few dozen bytes.
 #[cfg(not(target_arch = "wasm32"))]
-fn forget_units(dir: &std::path::Path) -> CmdResult<()> {
-    match std::fs::remove_file(dir.join(UNITS_FILE)) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(CmdError::Failed(format!("cannot replace the units record of the store: {e}"))),
+const MAX_UNITS_RECORD: u64 = 4096;
+
+/// Takes the units record out of the way of a store that is replaced, and returns its bytes so that
+/// a rejected call can put them back. A record too large to be ours is refused before anything
+/// changes.
+#[cfg(not(target_arch = "wasm32"))]
+fn take_units_record(dir: &std::path::Path) -> CmdResult<Option<Vec<u8>>> {
+    let path = dir.join(UNITS_FILE);
+    let size = match std::fs::metadata(&path) {
+        Ok(meta) => meta.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(CmdError::Failed(format!("cannot read the units record of the store: {e}"))),
+    };
+    if size > MAX_UNITS_RECORD {
+        return Err(CmdError::Failed("the units record of the store is too large to replace: remove it first".into()));
+    }
+    let bytes = std::fs::read(&path).map_err(|e| CmdError::Failed(format!("cannot read the units record: {e}")))?;
+    std::fs::remove_file(&path).map_err(|e| CmdError::Failed(format!("cannot replace the units record: {e}")))?;
+    Ok(Some(bytes))
+}
+
+/// Puts a units record taken by [`take_units_record`] back, after a rejected call.
+#[cfg(not(target_arch = "wasm32"))]
+fn put_back_units_record(dir: &std::path::Path, previous: Option<Vec<u8>>) -> CmdResult<()> {
+    match previous {
+        Some(bytes) => std::fs::write(dir.join(UNITS_FILE), bytes)
+            .map_err(|e| CmdError::Failed(format!("cannot restore the units record: {e}"))),
+        None => Ok(()),
     }
 }
 
-/// The units record of a store; `None` for a store that has none (made before units existed).
+/// The units record of a store. A record that is missing, oversized, not UTF-8 or not a record is
+/// nothing remembered: the store's files are not touched, and the size check then applies.
 #[cfg(not(target_arch = "wasm32"))]
-fn read_units(dir: &std::path::Path) -> CmdResult<Option<UnitsRecord>> {
-    match std::fs::read_to_string(dir.join(UNITS_FILE)) {
-        Ok(text) => serde_json::from_str(&text)
-            .map(Some)
-            .map_err(|e| CmdError::Failed(format!("the units record of the store is damaged: {e}"))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(CmdError::Failed(format!("cannot read the units record of the store: {e}"))),
+fn read_units(dir: &std::path::Path) -> Option<UnitsRecord> {
+    let path = dir.join(UNITS_FILE);
+    if std::fs::metadata(&path).ok()?.len() > MAX_UNITS_RECORD {
+        return None;
     }
+    let text = String::from_utf8(std::fs::read(&path).ok()?).ok()?;
+    serde_json::from_str(&text).ok()
 }
 
 /// The size check on the bounds of a store (its largest side), unless its unit was stated.
@@ -250,10 +273,15 @@ fn import_stream(s: &mut Session, i: ImportStreamIn) -> CmdResult<StoreOut> {
         overwrite: i.overwrite.unwrap_or(false),
         ..StreamImportOptions::default()
     };
-    if i.overwrite.unwrap_or(false) {
-        forget_units(Path::new(&i.store_dir))?;
-    }
-    let report = import_to_store(Path::new(&i.path), Path::new(&i.store_dir), &opts)?;
+    let dir = Path::new(&i.store_dir);
+    let previous = if i.overwrite.unwrap_or(false) { take_units_record(dir)? } else { None };
+    let report = match import_to_store(Path::new(&i.path), dir, &opts) {
+        Ok(report) => report,
+        Err(e) => {
+            put_back_units_record(dir, previous)?;
+            return Err(e.into());
+        }
+    };
     let stated = i.units.is_some();
     let units = i.units.unwrap_or_default();
     write_units(Path::new(&i.store_dir), UnitsRecord { units, stated })?;
@@ -290,7 +318,7 @@ fn store_info(s: &mut Session, i: StoreInfoIn) -> CmdResult<StoreOut> {
     let mut out = store_out(&i.store_dir, &store.summary());
     out.bytes_on_disk = Some(surfacecraft_geom::chunked::disk::store_bytes(&store, std::path::Path::new(&i.store_dir)));
     out.verified = verified;
-    let record = read_units(std::path::Path::new(&i.store_dir))?;
+    let record = read_units(std::path::Path::new(&i.store_dir));
     out.units = record.map(|r| r.units);
     out.scale_warning = store_warning(&out, record.is_some_and(|r| r.stated));
     Ok(out)

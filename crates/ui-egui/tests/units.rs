@@ -37,7 +37,7 @@ fn the_import_form_shows_the_units_as_a_choice_of_six() {
 fn the_import_form_starts_with_the_unit_chosen_last_time() {
     let mut app = SurfaceCraftApp::headless();
     app.choose_command("mesh.import");
-    assert_eq!(params(&app)["units"], "mm");
+    assert!(params(&app).get("units").is_none(), "a millimetre session states no unit");
     app.palette_params = json!({"data": triangle_data(), "format": "obj", "name": "a", "units": "in"}).to_string();
     app.run_palette();
     assert_eq!(app.settings.import_units, LengthUnit::In);
@@ -99,7 +99,47 @@ fn the_form_preselects_the_session_unit_and_says_so() {
 }
 
 #[test]
-fn menu_and_inbox_imports_always_use_millimetres_unless_the_user_picks() {
+fn menu_and_inbox_imports_state_no_unit() {
     let params = surfacecraft_ui_egui::import_units::file_import_params(json!({"path": "scan.stl"}));
-    assert_eq!(params["units"], "mm");
+    assert!(params.get("units").is_none(), "an unstated unit keeps the size check: {params}");
+}
+
+/// A box 50 mm × 40 mm × 90 mm written in metres: its largest side reads as 0.09 mm when millimetres
+/// are assumed (the size check must say so).
+fn metre_box_data() -> String {
+    let text = "v 0 0 0\nv 0.05 0 0\nv 0.05 0.04 0\nv 0 0.04 0\nv 0 0 0.09\nv 0.05 0 0.09\nv 0.05 0.04 0.09\nv 0 0.04 0.09\nf 1 2 3\nf 1 3 4\nf 5 6 7\nf 5 7 8\n";
+    base64::encode(text.as_bytes())
+}
+
+#[test]
+fn a_metre_looking_file_warns_from_the_menu_path_and_from_the_form_alike() {
+    use surfacecraft_ui_egui::import_units;
+    let mut app = SurfaceCraftApp::headless();
+    let menu = import_units::file_import_params(json!({"data": metre_box_data(), "format": "obj", "name": "menu"}));
+    let result = app.run_command("mesh.import", menu).unwrap();
+    assert_eq!(result["scale_warning"]["problem"], "metres_or_inches", "the menu path warns: {result}");
+
+    let mut form = SurfaceCraftApp::headless();
+    form.choose_command("mesh.import");
+    let mut p = params(&form);
+    p["data"] = json!(metre_box_data());
+    p["format"] = json!("obj");
+    p["name"] = json!("form");
+    form.palette_params = p.to_string();
+    form.run_palette();
+    assert!(form.status.starts_with("The largest side is 0.0900 mm"), "the form path warns: {}", form.status);
+}
+
+#[test]
+fn the_same_metre_file_with_metres_chosen_does_not_warn() {
+    let mut app = SurfaceCraftApp::headless();
+    app.choose_command("mesh.import");
+    let mut p = params(&app);
+    p["data"] = json!(metre_box_data());
+    p["format"] = json!("obj");
+    p["name"] = json!("chosen");
+    p["units"] = json!("m");
+    app.palette_params = p.to_string();
+    app.run_palette();
+    assert!(!app.status.contains("largest side"), "a stated unit is not second-guessed: {}", app.status);
 }

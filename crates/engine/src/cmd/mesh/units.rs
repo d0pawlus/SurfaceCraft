@@ -88,8 +88,9 @@ pub struct SetUnitsOut {
     pub quads: usize,
     /// What was NOT rescaled (it stays at the old size).
     pub left_alone: LeftAlone,
-    /// In words, what was done.
-    pub units_note: String,
+    /// In words, what was done (not after `force`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub units_note: Option<String>,
 }
 
 fn too_big() -> CmdError {
@@ -97,8 +98,12 @@ fn too_big() -> CmdError {
 }
 
 /// Refuses what cannot be converted: a mesh sized from a length, and a document with objects a
-/// unit change would leave behind (unless `force`).
-fn check_settable(obj: &MeshObject, left: LeftAlone, force: bool) -> CmdResult<()> {
+/// unit change would leave behind (unless `force`). An acknowledgement (`factor` 1) changes nothing,
+/// so nothing refuses it.
+fn check_settable(obj: &MeshObject, factor: f64, left: LeftAlone, force: bool) -> CmdResult<()> {
+    if factor == 1.0 {
+        return Ok(());
+    }
     if obj.rescaled {
         return Err(CmdError::Params(
             "this mesh was sized by mesh.scale_from_length: its unit cannot be set; undo that first".into(),
@@ -139,17 +144,20 @@ fn rescale_mesh(s: &mut Session, id: ObjectId, factor: f64) -> CmdResult<Rescale
 pub(super) fn set_units(s: &mut Session, i: SetUnitsIn) -> CmdResult<SetUnitsOut> {
     let id = i.object.resolve(s, ObjectKind::Mesh)?;
     let obj = s.doc.mesh(id).ok_or_else(|| CmdError::Params(format!("no mesh {id}")))?;
-    check_settable(obj, left_alone(&s.doc), i.force)?;
     let factor = i.from.mm_per_unit() / obj.source_units.mm_per_unit();
+    check_settable(obj, factor, left_alone(&s.doc), i.force)?;
     let done = if factor == 1.0 { Rescaled::default() } else { rescale_mesh(s, id, factor)? };
     let obj = s.doc.mesh_mut(id).ok_or_else(|| CmdError::Params(format!("no mesh {id}")))?;
     obj.source_units = i.from;
     obj.units_stated = true;
-    let units_note = if factor == 1.0 {
-        format!("the unit is {} and stays: nothing was rescaled", i.from.symbol())
-    } else {
-        format!("the coordinates were in {} and are now millimetres (multiplied by {factor})", i.from.symbol())
-    };
+    // after `force` the caller has overridden the left-alone check: no note about what was done
+    let units_note = (!i.force).then(|| {
+        if factor == 1.0 {
+            format!("the unit is {} and stays: nothing was rescaled", i.from.symbol())
+        } else {
+            format!("the coordinates were in {} and are now millimetres (multiplied by {factor})", i.from.symbol())
+        }
+    });
     Ok(SetUnitsOut {
         id,
         from: i.from,

@@ -66,7 +66,14 @@ pub struct ScaleWarning {
 fn sampled(mesh: &Mesh) -> Vec<Point3> {
     let n = mesh.positions.len();
     let count = n.min(SAMPLE_VERTICES);
-    (0..count).map(|i| mesh.positions[i * n / count]).collect()
+    (0..count).map(|k| mesh.positions[sample_index(k, n, count)]).collect()
+}
+
+/// Index of the `k`-th of `count` samples taken evenly through `n` vertices (`k < count <= n`). The
+/// product is computed in 128 bits, so it cannot overflow on any target, wasm32 included.
+pub(crate) fn sample_index(k: usize, n: usize, count: usize) -> usize {
+    let index = (k as u128 * n as u128) / count.max(1) as u128;
+    usize::try_from(index).unwrap_or(n.saturating_sub(1))
 }
 
 /// How many of the most extreme measured vertices are cut at each end of an axis.
@@ -206,6 +213,17 @@ mod tests {
         // A small mesh: its apex is a real corner, not an outlier.
         let pin = mesh_of(vec![[0.0, 0.0, 0.0], [0.6, 0.0, 0.0], [-0.6, 0.0, 0.0], [0.0, 0.0, 1.2]]);
         assert!(warning_of_extent_for(&pin).is_none(), "1.2 mm is plausible");
+    }
+
+    #[test]
+    fn sample_index_stays_inside_the_mesh_for_huge_vertex_counts() {
+        // above u32::MAX vertices, where a 32-bit product would overflow
+        let n = u32::MAX as usize + 7;
+        for k in [0, 1, SAMPLE_VERTICES / 2, SAMPLE_VERTICES - 1] {
+            let i = sample_index(k, n, SAMPLE_VERTICES);
+            assert!(i < n, "index {i} outside {n} vertices");
+            assert_eq!(i as u128, k as u128 * n as u128 / SAMPLE_VERTICES as u128);
+        }
     }
 
     #[test]
