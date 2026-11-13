@@ -551,8 +551,9 @@ impl<B: Backend> Server<B> {
         let wanted = |area: &str| self.config.areas.as_ref().is_none_or(|list| list.iter().any(|a| a == area));
         if self.config.compact {
             let featured = FEATURED.iter().filter_map(|id| find(id)).filter(|c| wanted(area_of(c.id)));
-            tools.extend(featured.map(|c| listing::command_tool(c, false)));
+            tools.extend(featured.map(listing::featured_tool));
             tools.extend(areas().into_iter().filter(|a| wanted(a)).map(listing::area_tool_spec));
+            tools = tools.into_iter().map(listing::with_short_queued).collect();
         } else {
             tools.extend(registry().iter().filter(|c| wanted(area_of(c.id))).map(|c| listing::command_tool(c, true)));
         }
@@ -709,3 +710,4 @@ mod jobs;
 pub mod lean;
 mod listing;
 pub mod prompts;
+mod shorten;
