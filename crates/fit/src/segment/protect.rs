@@ -17,7 +17,7 @@
 //! over extent of genuine large faces on three real scans ran 2e-4 to 1.2e-3 (the large sphere of
 //! one: 1.2e-3); that of the large fragments of a synthetic wavy surface had minimum 6.8e-4, 5th
 //! percentile 1.0 to 1.5e-3, median 2e-3. So by construction (a) a genuine face under 5 % of the
-//! scan with a bow over 5e-4 of its extent is lost to freeform; (b) a freeform fragment of 5 % of the
+//! scan with a bow over 5e-4 of its extent is lost to freeform (measured example: on one real scan a genuine cone of 2.83 % of the area has bow 0.026 over extent 31.7, 8.3e-4, and is not protected; the limit is not moved to get it back); (b) a freeform fragment of 5 % of the
 //! scan or more with a bow under 2e-3 of its extent is protected; (c) the 5 % tier rests on three
 //! real scans and one synthetic family (no fragment there reached 3.2 %). The scan-wide `tolerance`
 //! moves the bow limit; there is no per-region override: a region wrongly merged can be recreated

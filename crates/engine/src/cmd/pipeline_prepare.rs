@@ -7,6 +7,7 @@
 //! largest piece is *co-equal*. Pieces between the two are minor, pieces below `min_share` are
 //! debris; neither is modelled, and when their area is more than [`UNMODELLED_REVIEW_SHARE`] of the
 //! scan the verdict is at most `review` and an issue says so.
+use super::freeform::RetryReason;
 use super::rebuild::Stopwatch;
 use super::{
     CmdError, CmdResult, DeviationSummary, Issue, Method, NextStep, ScanSummary, Settings, ToSolidIn, ToSolidOut,
@@ -106,6 +107,12 @@ pub struct ComponentOut {
     pub issues: Vec<Issue>,
     /// What was done to the part first.
     pub preparation: Vec<PrepStep>,
+    /// The methods tried for this part (the top level of a split scan lists the largest part's).
+    #[serde(default)]
+    pub attempts: Vec<super::auto::Attempt>,
+    /// The larger-cap retry of this part, or the note that the call's budget was spent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<super::freeform::CapRetry>,
 }
 
 pub(super) fn rank(v: Verdict) -> u8 {
@@ -254,7 +261,7 @@ struct Tally {
 /// qualifies for it (capped by the patch limit and short of the tolerance, which is the retry's own test).
 /// The parts after it do not get it; a part that does not qualify leaves it for the next.
 pub(super) fn retry_allowed(allow: bool, done: &[(ComponentOut, ToSolidOut)]) -> bool {
-    allow && done.iter().all(|(_, o)| o.retry.is_none())
+    allow && done.iter().all(|(_, o)| o.retry.as_ref().is_none_or(|r| r.reason == RetryReason::BudgetSpent))
 }
 
 /// Models one part on its own (`(name, mesh, area)`); a cancelled run is an error, any other failure a failed part.
@@ -288,7 +295,12 @@ fn run_part(
                 reason: "the primitives built no solid for this part, so it was wrapped in patches".into(),
                 numbers: json!({"primitive_issues": out.issues.iter().map(|x| x.code.clone()).collect::<Vec<_>>(), "ms": watch.ms()}),
             };
+            // the attempts that came before stay in the list (none of them is the returned one now)
+            let mut tried = std::mem::take(&mut out.attempts);
+            tried.iter_mut().for_each(|a| a.returned = false);
             out = again;
+            tried.append(&mut out.attempts);
+            out.attempts = tried;
             out.prep.preparation.insert(0, step);
         }
     }
@@ -304,6 +316,8 @@ fn run_part(
         deviation: out.deviation.clone(),
         issues: out.issues.clone(),
         preparation: out.prep.preparation.clone(),
+        attempts: out.attempts.clone(),
+        retry: out.retry.clone(),
     };
     Ok((comp, out))
 }
@@ -319,18 +333,35 @@ fn needs_freeform(method: Method, out: &ToSolidOut) -> bool {
         && !wrapped_already
 }
 
-/// One run of the single-scan pipeline on a part; an error other than a cancellation becomes a failed result.
+/// Runs `run` on the document; a failure other than a cancellation takes back everything the run
+/// added (a rebuilt mesh, a body, regions) and is returned as the inner `Err`; a cancellation is the
+/// outer one and leaves the document to the caller's own clean-up.
+pub(super) fn restoring_on_failure<T>(
+    s: &mut Session,
+    run: impl FnOnce(&mut Session) -> CmdResult<T>,
+) -> CmdResult<Result<T, CmdError>> {
+    let before = s.doc.clone();
+    match run(s) {
+        Ok(v) => Ok(Ok(v)),
+        Err(e) if is_cancelled(&e) => Err(e),
+        Err(e) => {
+            s.doc = before;
+            Ok(Err(e))
+        }
+    }
+}
+
+/// One run of the single-scan pipeline on a part; an error other than a cancellation becomes a failed
+/// result and leaves nothing of the run in the document.
 fn model_part(s: &mut Session, part_in: &ToSolidIn, set: &Settings, id: ObjectId) -> CmdResult<ToSolidOut> {
     // the extra attempts of all parts of a call draw from one budget (the call's own)
-    let run = settings(s, part_in).map(|pset| Settings { budget: set.budget.clone(), ..pset }).and_then(|pset| {
+    let run = |s: &mut Session| {
+        let pset = Settings { budget: set.budget.clone(), ..settings(s, part_in)? };
         let scan = pset.scan;
-        prepare(s, part_in, scan).and_then(|r| solve(s, part_in, pset, r))
-    });
-    match run {
-        Err(e) if is_cancelled(&e) => Err(e),
-        Err(e) => Ok(failure(set, id, message_of(&e))),
-        Ok(o) => Ok(o),
-    }
+        let report = prepare(s, part_in, scan)?;
+        solve(s, part_in, pset, report)
+    };
+    Ok(restoring_on_failure(s, run)?.unwrap_or_else(|e| failure(set, id, message_of(&e))))
 }
 
 #[cfg(test)]
@@ -347,6 +378,8 @@ pub(super) fn component_for_tests(out: &ToSolidOut) -> ComponentOut {
         deviation: out.deviation.clone(),
         issues: out.issues.clone(),
         preparation: Vec::new(),
+        attempts: out.attempts.clone(),
+        retry: out.retry.clone(),
     }
 }
 
@@ -724,5 +757,40 @@ mod tests {
         assert_eq!((on.chosen.len(), on.minor.len()), (2, 0), "exactly 0.1 x the largest is co-equal");
         let below = plan_of(&at(99.99), PART_SHARE, None);
         assert_eq!((below.chosen.len(), below.minor.len()), (1, 1), "just below is minor");
+    }
+
+    /// A failed part takes back what its run added (a body, a mesh), a cancellation does not touch
+    /// the document, and a success keeps everything.
+    #[test]
+    fn a_failed_part_leaves_nothing_of_its_run_in_the_document() {
+        // Arrange
+        let mut s = Session::new();
+        let keep = s.doc.add_mesh("part", balls(1));
+        let add = |s: &mut Session| {
+            s.doc.add_mesh("rebuilt", balls(1));
+            Ok(())
+        };
+
+        // Act
+        let failed: CmdResult<Result<(), CmdError>> = restoring_on_failure(&mut s, |s| {
+            add(s)?;
+            Err(CmdError::Failed("boom".into()))
+        });
+        let failed_meshes = s.doc.meshes.len();
+        let cancelled_run: CmdResult<Result<(), CmdError>> = restoring_on_failure(&mut s, |s| {
+            add(s)?;
+            Err(cancelled())
+        });
+        let after_cancel = s.doc.meshes.len();
+        let fine = restoring_on_failure(&mut s, add);
+
+        // Assert
+        assert!(matches!(failed, Ok(Err(_))), "a failure is returned as the inner error");
+        assert_eq!(failed_meshes, 1, "the mesh the run added is gone");
+        assert!(s.doc.mesh(keep).is_some());
+        assert!(cancelled_run.is_err_and(|e| is_cancelled(&e)));
+        assert_eq!(after_cancel, 2, "a cancellation leaves the clean-up to the caller");
+        assert!(matches!(fine, Ok(Ok(()))));
+        assert_eq!(s.doc.meshes.len(), 3);
     }
 }

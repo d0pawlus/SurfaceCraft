@@ -729,7 +729,7 @@ fn scan_split_counts_pieces_beyond_its_limit_of_listed_parts() {
 /// outcome of each part. With `auto` (P9-O7) the segmentation merges the boss's holes into a freeform
 /// area and the boss is wrapped in patches as the part's second method; see the next test.
 #[test]
-fn gate_all_defaults_a_boss_the_planner_cannot_close_is_not_a_pass_and_has_reasons_and_next_steps() {
+fn gate_with_primitives_a_boss_the_planner_cannot_close_is_not_a_pass_and_has_reasons_and_next_steps() {
     let block = synth::cuboid(Point3::new(0.0, 0.0, 0.0), Vec3::new(40.0, 30.0, 20.0), 16);
     let mut boss = weld(synth::cylinder(Point3::origin(), Vec3::z(), 8.0, 31.0, 96, 24));
     boss.positions.iter_mut().for_each(|p| p.x += 80.0);
@@ -764,7 +764,16 @@ fn gate_all_defaults_a_boss_that_no_primitive_closes_is_wrapped_as_a_freeform_pa
     let out = s.execute("scan.to_solid", json!({"scan": "scan"})).unwrap();
     let parts = out["components"].as_array().unwrap();
     assert_eq!(parts.len(), 2, "{out}");
-    assert!(parts.iter().any(|c| c["method"] == "freeform" && c["body"].is_object()), "{out}");
-    assert!(parts.iter().all(|c| c["body"].is_object()), "every part has a solid: {out}");
-    assert!(out["verdict"] == "pass" || out["verdict"] == "review", "{out}");
+    let part = |method: &str| parts.iter().find(|c| c["method"] == method).unwrap_or_else(|| panic!("{method}: {out}"));
+    let (cube, boss) = (part("primitives"), part("freeform"));
+    assert_eq!((cube["verdict"].clone(), cube["body"]["faces"].clone()), (json!("pass"), json!(6)), "{out}");
+    assert_eq!(boss["verdict"], "pass", "{out}");
+    assert!(boss["patches"].as_u64().unwrap() > 0 && boss["body"].is_object(), "{out}");
+    assert_eq!(out["verdict"], "pass", "{out}");
+    assert_eq!(out["issues"], json!([]), "{out}");
+    let steps = out["next_steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 1, "{out}");
+    assert_eq!(steps[0]["command"], "export.step", "{out}");
+    let ids: Vec<&Value> = out["bodies"].as_array().unwrap().iter().map(|b| &b["id"]).collect();
+    assert_eq!(steps[0]["params"]["objects"].as_array().unwrap().iter().collect::<Vec<_>>(), ids, "{out}");
 }

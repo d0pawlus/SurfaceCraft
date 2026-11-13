@@ -29,9 +29,11 @@ within the tolerance, then a closed solid over a sheet. `attempts` lists what wa
 verdict, issue codes, seconds, `returned`); the attempt that lost leaves nothing in the document and
 one `edit.undo` takes the whole run back. A winner that is no pass carries `other_method_tried`.
 Pass `method` to choose yourself (one attempt), or `retry: false` to forbid the second one. It is
-skipped on its own for a scan of more than 600 000 triangles and after a first attempt of more than
-120 s: `attempts` then holds an entry with `skipped.reason` and `skipped.call`, the call that runs
-that method.
+skipped on its own, by counts and never by a clock, when the cleaned mesh of the call (or of the
+part) has more than 600 000 triangles or the first result has 30 000 patches or more: `attempts`
+then holds an entry with `skipped.reason` and `skipped.call`, the call that runs that method. A
+second method that is freeform is also an extra attempt of the call's budget (see "Extra attempts
+of one call"); the primitives method makes no wrap and costs none.
 
 The scan noise (`scan_report.noise_used`, `noise_source`, `noise_spread`) is what the segmentation
 judges fits by. When it is above the tolerance, nothing is merged into freeform regions and a
@@ -110,7 +112,7 @@ Primitives:
   replaces the first only if it is not open where the first is closed and puts at least 0.5
   percentage points more of the scan within the tolerance (or closes an open network at no loss).
   `retry` reports both limits, patches and shares, `kept`, a `reason` (`better`, `not_better`,
-  `open_result`, `failed`) and the `error` of a failed second wrap. A `max_patches` you give is
+  `open_result`, `failed`, `budget_spent`) and the `error` of a failed second wrap. `budget_spent`: the retry was due but the call had used its extra attempts, so no second network was made (a call that needed no retry has no `retry`). A `max_patches` you give is
   never exceeded. Beyond that, `surface.wrap` with a larger `max_patches` (up to 60000); the STEP
   file grows with the patch count.
 - `non_manifold_edges`: edges shared by three or more triangles are left after cleaning; the
@@ -161,7 +163,11 @@ modelled as it is).
   that was not run is listed with its reason). A part's own wrap is not an extra attempt (a part the
   primitives could not close is wrapped as freeform once, as its one wrap; a scan with strong topology
   evidence is rebuilt and that wrap is made on the rebuilt scan). The worst case is therefore 26 wraps
-  per call: one for each of the 24 parts and the 2 extra attempts, and at most 4 rebuilds.
+  per call: one for each of the 24 parts and the 2 extra attempts, and at most 4 rebuilds. A part that
+  was refused shows it: `components[].retry` with reason `budget_spent`, a `remesh` step in
+  `components[].preparation` saying "not done: the call has used its 2 extra attempts", or the
+  skipped entry in `components[].attempts`. For a split scan the top-level `attempts` and `retry`
+  are those of the largest part; every part's own are in `components[]`.
   `mesh.remesh` makes a closed, manifold, outward oriented surface at a voxel of 1.5 x tolerance
   (finer for a thin wall, coarser for a very large area): tunnels, bridges, fins, coincident second
   shells and self-intersections up to two voxels wide are removed, genuine handles and walls of at

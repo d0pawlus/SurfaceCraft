@@ -104,6 +104,11 @@ fn auto_on_the_three_shell_scan_models_the_box_with_primitives_and_the_boss_as_f
     assert_eq!(out["verdict"], "review", "{out}");
     let issues: Vec<&str> = out["issues"].as_array().unwrap().iter().map(|i| i["code"].as_str().unwrap()).collect();
     assert_eq!(issues, ["unmodelled_pieces"], "{out}");
+    let commands: Vec<&str> =
+        out["next_steps"].as_array().unwrap().iter().map(|n| n["command"].as_str().unwrap()).collect();
+    assert_eq!(commands, ["export.step", "scan.split"], "{out}");
+    let ids: Vec<&Value> = out["bodies"].as_array().unwrap().iter().map(|b| &b["id"]).collect();
+    assert_eq!(out["next_steps"][0]["params"]["objects"].as_array().unwrap().iter().collect::<Vec<_>>(), ids, "{out}");
 }
 
 #[test]
