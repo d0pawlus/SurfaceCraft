@@ -18,7 +18,8 @@ patch network over a whole scan.
   that fits is built (adaptive: the most deviating scan points first; uniform: the budget between
   the two rounds), within 90 % to 100 % of the cap when the search lands there (at most 4
   reductions of the scan, `probes` in `levels`), and `levels[].partial` says why a round was cut.
-  The best round is the result, so a larger `max_patches` never gives a lower `deviation.within`.
+  The best round is the result. A larger `max_patches` usually raises the share of points within the
+  tolerance (the `within` field of the result's deviation), but that is not guaranteed.
   `capped` is true when the cap cut a round and the tolerance is still missed. A scan whose
   surface carries thousands of tiny handles cannot be reduced by edge collapse; its coarse mesh
   is then clustered on a grid, which keeps the cap at the price of a coarser network.
