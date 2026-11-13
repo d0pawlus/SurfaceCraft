@@ -75,6 +75,22 @@ const ISLAND_ORGANIC: f64 = 0.3;
 const ISLAND_CREASE: f64 = 0.5;
 /// Rounds of absorbing islands (an absorbed island can make the next one an island).
 const ISLAND_PASSES: usize = 4;
+/// The tolerance protects a plane or cylinder of at least this share of the scan's triangles ...
+const PROTECT_SHARE_PRIMARY: f64 = 0.01;
+/// ... and any other primitive of at least this share (the large organic fragments found on
+/// synthetic scenes held at most 3.2 %), and never fewer than this many triangles.
+const PROTECT_SHARE_OTHER: f64 = 0.05;
+const PROTECT_MIN_TRIANGLES: usize = 500;
+/// ... if its RMS is within this share of the tolerance. Calibrated (`p9_noise_calibration.rs`,
+/// `print_tolerance_table`): planes and cylinders with form error (waviness up to 0.05 mm,
+/// ovality up to 0.05 mm, sigma up to 0.01 mm) read 0.02 to 0.135 of the tolerance 0.2 mm, the
+/// large organic fragments of a wavy surface 0.11 (cylinder) and 0.14 (plane) and above. The
+/// fragments that read below the share span less than a radius.
+pub const PROTECT_RMS_SHARE: f64 = 0.12;
+/// ... and its RMS (which a shoulder inflates) within this share of the tolerance.
+const PROTECT_RMS_CAP: f64 = 0.5;
+/// A plane needs to span this many tolerances to be protected.
+const PLANE_MIN_EXTENT_TOL: f64 = 50.0;
 /// Owner of a triangle in no region, and component of one outside the mask.
 const NONE: u32 = u32::MAX;
 
@@ -86,6 +102,9 @@ pub(super) struct Settings {
     /// Regions with at least this many triangles are a major part of the scan: a curved primitive
     /// that large is believed even when it spans less than a radius (a shallow panel).
     pub dominant_tris: usize,
+    /// Fewest triangles of a plane or cylinder, and of any other primitive, that the tolerance
+    /// protects (see [`protected_by_tolerance`]).
+    pub protect_tris: ProtectSizes,
     /// Fewest fragments in one piece of the mask for it to be a freeform area.
     pub min_cluster: usize,
     /// Fewest triangles of a freeform area.
@@ -136,6 +155,9 @@ pub fn residual_spread(mesh: &Mesh, triangles: &[u32], primitive: &Primitive) ->
 /// ([`Settings::noise_known`]) no fit is judged by it: a large region is never demoted, a small
 /// one is judged against the fallback.
 fn standing_of(mesh: &Mesh, seg: &Segment, set: &Settings) -> Standing {
+    if protects(mesh, seg, set.tolerance, set.protect_tris) {
+        return Standing::Protected;
+    }
     let large = seg.triangles.len() >= set.strong_tris;
     if large && !set.noise_known {
         return Standing::Protected;
@@ -157,6 +179,54 @@ fn standing_of(mesh: &Mesh, seg: &Segment, set: &Settings) -> Standing {
         (false, true, true) => Standing::Neutral,
         (false, _, _) => Standing::Fragment,
     }
+}
+
+/// The fewest triangles from which the tolerance protects a region: of a plane or a cylinder, and
+/// of any other primitive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ProtectSizes {
+    pub plane_or_cylinder: usize,
+    pub other: usize,
+}
+
+impl ProtectSizes {
+    /// The sizes for a scan of `scan_triangles` triangles.
+    pub(super) fn for_scan(scan_triangles: usize) -> Self {
+        let share = |s: f64| ((s * scan_triangles as f64).ceil() as usize).max(PROTECT_MIN_TRIANGLES);
+        Self { plane_or_cylinder: share(PROTECT_SHARE_PRIMARY), other: share(PROTECT_SHARE_OTHER) }
+    }
+}
+
+/// Is `seg` protected by the tolerance, whatever the scanner noise: a real manufactured face has
+/// form error (waviness, draft, wear) far above the noise of a good scan, and a plane that fits a
+/// large part of the scan within a fraction of the tolerance is a design plane. All of: large (at
+/// least [`PROTECT_SHARE_PRIMARY`] of the scan for a plane or cylinder, [`PROTECT_SHARE_OTHER`]
+/// for the other kinds, and [`PROTECT_MIN_TRIANGLES`]); robust spread of the residuals at most [`PROTECT_RMS_SHARE`] of the
+/// tolerance, measured by the robust spread of its residuals (a systematic bow shows in it); and it
+/// spans enough of its
+/// primitive (a curved one at least a radius, a plane [`PLANE_MIN_EXTENT_TOL`] tolerances).
+fn protects(mesh: &Mesh, seg: &Segment, tolerance: f64, sizes: ProtectSizes) -> bool {
+    let fewest = match seg.primitive.kind() {
+        PrimitiveKind::Plane | PrimitiveKind::Cylinder => sizes.plane_or_cylinder,
+        _ => sizes.other,
+    };
+    // the robust spread, not the RMS: where the region grew into a tangent neighbour its shoulder
+    // inflates the RMS (and the largest residual) but not the spread of most of its residuals
+    let spread = residual_spread(mesh, &seg.triangles, &seg.primitive);
+    if seg.triangles.len() < fewest || spread > PROTECT_RMS_SHARE * tolerance || seg.rms > PROTECT_RMS_CAP * tolerance {
+        return false;
+    }
+    match seg.primitive.kind() {
+        PrimitiveKind::Plane => extent(&sample_corners(mesh, &seg.triangles), None) >= PLANE_MIN_EXTENT_TOL * tolerance,
+        _ => curvature_support(mesh, seg) >= MIN_SUPPORT,
+    }
+}
+
+/// [`protects`] for a scan of `scan_triangles` triangles: the tolerance protects `seg` from
+/// consolidation into a freeform area.
+#[must_use]
+pub fn protected_by_tolerance(mesh: &Mesh, seg: &Segment, tolerance: f64, scan_triangles: usize) -> bool {
+    protects(mesh, seg, tolerance, ProtectSizes::for_scan(scan_triangles))
 }
 
 /// Corners of at most [`SAMPLE_TRIANGLES`] triangles of `tris`, evenly strided.

@@ -20,8 +20,23 @@ Use the step-by-step guides when you need a feature history.
 
 ## What it does
 
-`auto` segments the scan; when less than half of its triangles lie in regions a primitive fits,
-the freeform method runs. Pass `method` to choose yourself.
+`auto` segments the scan (at your `tolerance`) and starts with the method the scan suggests: the
+primitives when at least half of its triangles lie in regions a primitive fits, else freeform. When
+that attempt does not end in `pass`, the other method runs too (the primitives after a freeform
+attempt only if at least a quarter of the scan lies in primitive regions) and the better result is
+returned: pass, then review, then fail; at the same verdict the larger share of all scan points
+within the tolerance, then a closed solid over a sheet. `attempts` lists what was tried (method,
+verdict, issue codes, seconds, `returned`); the attempt that lost leaves nothing in the document and
+one `edit.undo` takes the whole run back. A winner that is no pass carries `other_method_tried`.
+Pass `method` to choose yourself (one attempt), or `retry: false` to forbid the second one. It is
+skipped on its own for a scan of more than 600 000 triangles and after a first attempt of more than
+120 s: `attempts` then holds an entry with `skipped.reason` and `skipped.call`, the call that runs
+that method.
+
+The scan noise (`scan_report.noise_used`, `noise_source`, `noise_spread`) is what the segmentation
+judges fits by. When it is above the tolerance, nothing is merged into freeform regions and a
+result that is not a pass carries `noise_above_tolerance`: the first next step repeats the call with
+a tolerance of three times the noise.
 
 Freeform (`surface.wrap` inside):
 
@@ -80,6 +95,9 @@ Primitives:
 - `left_out_regions` with an RMS reason: the region is freeform. `surface.fit` it and build with
   `body.from_regions`, passing the primitives of `modelled` and the surface in `surfaces`.
 - `unassigned_triangles`: `region.grow` from a seed, or `region.resegment` with a looser tolerance.
+- `noise_above_tolerance`: the scan is rougher than the tolerance; use the tolerance of the first
+  next step (about 3 times the noise) or a smoother scan.
+- `other_method_tried`: `auto` ran the other method as well and it did not do better; see `attempts`.
 - `mostly_freeform` (only with `method: primitives`): less than half of the scan lies in regions
   a primitive fits. Run again with `method: freeform`.
 - `open_surface` (freeform): the network is a sheet because the scan has open boundaries. Fill

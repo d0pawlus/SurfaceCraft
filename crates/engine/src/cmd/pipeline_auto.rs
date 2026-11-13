@@ -1,32 +1,75 @@
 //! `scan.to_solid` with `method: auto`: the choice of method is by outcome. The share of the scan in
 //! regions a primitive fits only orders the attempts; when the first does not end in a pass the
-//! other is run too, and the better result is returned. The losing attempt leaves nothing in the
+//! other is run too (unless the caller forbids it, or the scan is too large for a second run to be
+//! worth its time), and the better result is returned. The losing attempt leaves nothing in the
 //! document, and the whole run is still one undo step.
+use super::super::{CANCELLED, CmdError};
 use super::{
-    CmdResult, MIN_MODELLED_SHARE, Method, ScanSummary, Settings, ToSolidIn, ToSolidOut, Verdict, freeform,
-    primitives_solid, scan_primitive_share, segment_scan,
+    CmdResult, Issue, MIN_MODELLED_SHARE, Method, NextStep, ScanSummary, Settings, ToSolidIn, ToSolidOut, Verdict,
+    freeform, message_of, primitives_solid, scan_primitive_share, segment_scan, step,
 };
 use crate::Session;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use surfacecraft_doc::ObjectId;
 
 /// The share of the scan in primitive regions below which a primitives attempt is not tried after a
 /// failed freeform one (half the share that makes it the first choice).
 const PLAUSIBLE_SHARE: f64 = MIN_MODELLED_SHARE / 2.0;
+/// A second method is not tried on a scan of more triangles than this: first attempts of several
+/// minutes occur at a million triangles and more, and a second full run doubles that. A caller can
+/// force it with the call the skipped entry lists.
+const SECOND_ATTEMPT_MAX_TRIANGLES: usize = 600_000;
+/// ... nor after a first attempt that took longer than this (s).
+const SECOND_ATTEMPT_MAX_SECONDS: f64 = 120.0;
+/// Two results explain the scan equally well when their shares differ by no more than this (a
+/// sheet at 0.995 does not beat a closed solid at 0.990).
+const EXPLAINED_BAND: f64 = 0.005;
+/// Longest error text kept in an attempt.
+const ERROR_TEXT_LIMIT: usize = 200;
 
-/// One method tried by `scan.to_solid`.
+/// What bounds the second attempt.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Limits {
+    pub max_triangles: usize,
+    pub max_seconds: f64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self { max_triangles: SECOND_ATTEMPT_MAX_TRIANGLES, max_seconds: SECOND_ATTEMPT_MAX_SECONDS }
+    }
+}
+
+/// Why a second attempt was not run, and the call that forces it.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+pub struct Skipped {
+    /// Why.
+    pub reason: String,
+    /// The call that runs that method alone.
+    pub call: NextStep,
+}
+
+/// One method tried (or skipped) by `scan.to_solid`.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 pub struct Attempt {
     /// The method tried.
     pub method: Method,
-    /// How it ended.
-    pub verdict: Verdict,
+    /// How it ended; absent when it was skipped or failed with an error.
+    pub verdict: Option<Verdict>,
     /// The codes of the issues that kept it from a pass.
     pub issues: Vec<String>,
     /// Wall time of the attempt (s; 0 where there is no clock).
     pub seconds: f64,
     /// This attempt's result is the one returned.
     pub returned: bool,
+    /// The error that ended it, when it ended in one (the other attempt's result is returned).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Set when the attempt was not run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<Skipped>,
 }
 
 /// Result of `scan.to_solid`: the result of the method returned, and the attempts.
@@ -66,29 +109,6 @@ impl Timer {
     }
 }
 
-/// Runs one method and records the attempt.
-fn attempt(
-    s: &mut Session,
-    i: &ToSolidIn,
-    set: &Settings,
-    report: &ScanSummary,
-    method: Method,
-) -> CmdResult<(ToSolidOut, Attempt)> {
-    let timer = Timer::start();
-    let result = match method {
-        Method::Freeform => freeform::freeform_solid(s, set, report.clone())?,
-        _ => primitives_solid(s, i, set, report.clone())?,
-    };
-    let record = Attempt {
-        method,
-        verdict: result.verdict,
-        issues: result.issues.iter().map(|x| x.code.clone()).collect(),
-        seconds: timer.seconds(),
-        returned: false,
-    };
-    Ok((result, record))
-}
-
 fn rank(v: Verdict) -> u8 {
     match v {
         Verdict::Pass => 2,
@@ -97,66 +117,527 @@ fn rank(v: Verdict) -> u8 {
     }
 }
 
-/// Is `b` a better result than `a`: a better verdict; at the same verdict the larger share of the
-/// points within the tolerance; then a closed solid over a sheet. A tie keeps `a`.
+/// Share of ALL the scan's points that the result measures and finds within the tolerance (points
+/// facing away from the solid are not measured, so they do not count).
+fn explained(r: &ToSolidOut) -> f64 {
+    r.deviation.as_ref().map_or(0.0, |d| d.within * d.coverage)
+}
+
+/// 2 for a closed solid, 1 for a sheet, 0 for no body.
+fn closedness(r: &ToSolidOut) -> u8 {
+    r.body.as_ref().map_or(0, |b| if b.volume.is_some() { 2 } else { 1 })
+}
+
+/// Orders results: by verdict; then by the share of the scan explained, shares within
+/// [`EXPLAINED_BAND`] being equal; then a closed solid over a sheet over no body. Antisymmetric.
+fn compare(a: &ToSolidOut, b: &ToSolidOut) -> std::cmp::Ordering {
+    let by_verdict = rank(a.verdict).cmp(&rank(b.verdict));
+    let (ea, eb) = (explained(a), explained(b));
+    let by_share = if (ea - eb).abs() > EXPLAINED_BAND + 1e-9 { ea.total_cmp(&eb) } else { std::cmp::Ordering::Equal };
+    by_verdict.then(by_share).then(closedness(a).cmp(&closedness(b)))
+}
+
+/// Is `b` a better result than `a`? A tie keeps `a`.
 fn is_better(b: &ToSolidOut, a: &ToSolidOut) -> bool {
-    let within = |r: &ToSolidOut| r.deviation.as_ref().map_or(0.0, |d| d.within);
-    let solid = |r: &ToSolidOut| r.body.as_ref().is_some_and(|b| b.volume.is_some());
-    (rank(b.verdict), within(b), solid(b)) > (rank(a.verdict), within(a), solid(a))
+    compare(b, a) == std::cmp::Ordering::Greater
 }
 
-fn single(result: ToSolidOut, mut record: Attempt) -> ToSolidReport {
-    record.returned = true;
-    ToSolidReport { result, attempts: vec![record] }
+/// What `orchestrate` needs to know about the scan.
+pub(super) struct Plan {
+    pub scan: ObjectId,
+    pub tolerance: f64,
+    /// Share of the scan in regions a primitive fits.
+    pub share: f64,
+    pub triangles: usize,
+    /// `retry` of the call.
+    pub retry: bool,
+    pub limits: Limits,
 }
 
-/// `scan.to_solid` after cleaning: the given method once, or `auto`'s ordered attempts.
-pub(super) fn run(s: &mut Session, i: &ToSolidIn, set: &Settings, report: ScanSummary) -> CmdResult<ToSolidReport> {
-    if i.method == Method::Freeform {
-        let (result, record) = attempt(s, i, set, &report, Method::Freeform)?;
-        return Ok(single(result, record));
+fn record(method: Method, result: &ToSolidOut, seconds: f64) -> Attempt {
+    Attempt {
+        method,
+        verdict: Some(result.verdict),
+        issues: result.issues.iter().map(|x| x.code.clone()).collect(),
+        seconds,
+        returned: false,
+        error: None,
+        skipped: None,
     }
-    segment_scan(s, i, set)?;
-    if i.method == Method::Primitives || i.reuse_regions {
-        let (result, record) = attempt(s, i, set, &report, Method::Primitives)?;
-        return Ok(single(result, record));
+}
+
+fn is_cancelled(e: &CmdError) -> bool {
+    matches!(e, CmdError::Failed(m) if m == CANCELLED)
+}
+
+fn method_name(m: Method) -> &'static str {
+    if m == Method::Freeform { "freeform" } else { "primitives" }
+}
+
+/// The reason not to run a second attempt, with the call that forces it.
+fn skip_reason(plan: &Plan, first_seconds: f64) -> Option<String> {
+    if !plan.retry {
+        return Some("`retry` is false".to_string());
     }
-    let share = scan_primitive_share(s, set, &report);
-    let (first, second) = if share >= MIN_MODELLED_SHARE {
+    if plan.triangles > plan.limits.max_triangles {
+        return Some(format!(
+            "the scan has {} triangles, more than the {} a second attempt is worth",
+            plan.triangles, plan.limits.max_triangles
+        ));
+    }
+    (first_seconds > plan.limits.max_seconds).then(|| {
+        format!(
+            "the first attempt took {first_seconds:.0} s, more than the {:.0} s a second attempt is worth",
+            plan.limits.max_seconds
+        )
+    })
+}
+
+fn skipped_attempt(plan: &Plan, method: Method, reason: String) -> Attempt {
+    let call = step(
+        "scan.to_solid",
+        json!({"scan": plan.scan.0, "method": method_name(method), "tolerance": plan.tolerance}),
+        "runs the method that was not tried",
+    );
+    Attempt {
+        method,
+        verdict: None,
+        issues: Vec::new(),
+        seconds: 0.0,
+        returned: false,
+        error: None,
+        skipped: Some(Skipped { reason, call }),
+    }
+}
+
+fn short(text: &str) -> String {
+    text.chars().take(ERROR_TEXT_LIMIT).collect()
+}
+
+/// The winner after both methods ran: next steps that name a method `auto` tried are dropped (the
+/// advice would send the caller where it has been), and a winner that is no pass says so.
+fn finish(mut winner: ToSolidOut, loser_method: Method, loser: &ToSolidOut) -> ToSolidOut {
+    winner.next_steps.retain(|st| {
+        st.command != "scan.to_solid" || !matches!(st.params["method"].as_str(), Some("primitives" | "freeform"))
+    });
+    if winner.verdict != Verdict::Pass {
+        winner.issues.push(Issue {
+            code: "other_method_tried".into(),
+            message: format!(
+                "`auto` tried `{}` too: {:?}, {:.0} % of the scan explained against {:.0} %; it did not do better",
+                method_name(loser_method),
+                loser.verdict,
+                100.0 * explained(loser),
+                100.0 * explained(&winner)
+            ),
+        });
+    }
+    winner
+}
+
+/// Runs the attempts of `auto` with `exec` (one method on the document) and returns the best.
+pub(super) fn orchestrate(
+    s: &mut Session,
+    plan: &Plan,
+    exec: &mut dyn FnMut(&mut Session, Method) -> CmdResult<ToSolidOut>,
+) -> CmdResult<ToSolidReport> {
+    let (first, second) = if plan.share >= MIN_MODELLED_SHARE {
         (Method::Primitives, Method::Freeform)
     } else {
         (Method::Freeform, Method::Primitives)
     };
     let base = s.doc.clone();
-    let (first_result, first_record) = attempt(s, i, set, &report, first)?;
-    let second_plausible = first == Method::Primitives || share >= PLAUSIBLE_SHARE;
-    if first_result.verdict == Verdict::Pass || !second_plausible {
-        return Ok(single(first_result, first_record));
+    let timer = Timer::start();
+    let first_result = exec(s, first)?;
+    let first_seconds = timer.seconds();
+    let mut first_record = record(first, &first_result, first_seconds);
+    first_record.returned = true;
+    let plausible = first == Method::Primitives || plan.share >= PLAUSIBLE_SHARE;
+    if first_result.verdict == Verdict::Pass || !plausible {
+        return Ok(ToSolidReport { result: first_result, attempts: vec![first_record] });
+    }
+    if let Some(reason) = skip_reason(plan, first_seconds) {
+        let skipped = skipped_attempt(plan, second, reason);
+        return Ok(ToSolidReport { result: first_result, attempts: vec![first_record, skipped] });
     }
     let after_first = std::mem::replace(&mut s.doc, base);
-    let (second_result, second_record) = match attempt(s, i, set, &report, second) {
-        Ok(x) => x,
-        Err(_) => {
-            // a second method that errors is no better than the first result: keep that
+    let timer = Timer::start();
+    let second_result = match exec(s, second) {
+        Ok(r) => r,
+        Err(e) if is_cancelled(&e) => return Err(e),
+        Err(e) => {
+            // a second method that errors is no better than the first result: keep that, say why
             s.doc = after_first;
-            let failed = Attempt {
-                method: second,
-                verdict: Verdict::Fail,
-                issues: vec!["error".into()],
-                seconds: 0.0,
-                returned: false,
-            };
-            let mut first_record = first_record;
-            first_record.returned = true;
+            let mut failed = skipped_attempt(plan, second, String::new());
+            failed.skipped = None;
+            failed.error = Some(short(message_of(&e)));
+            failed.seconds = timer.seconds();
             return Ok(ToSolidReport { result: first_result, attempts: vec![first_record, failed] });
         }
     };
+    let mut second_record = record(second, &second_result, timer.seconds());
     let second_wins = is_better(&second_result, &first_result);
     if !second_wins {
         s.doc = after_first;
     }
-    let (mut a, mut b) = (first_record, second_record);
-    (a.returned, b.returned) = (!second_wins, second_wins);
-    let result = if second_wins { second_result } else { first_result };
-    Ok(ToSolidReport { result, attempts: vec![a, b] })
+    first_record.returned = !second_wins;
+    second_record.returned = second_wins;
+    let result = if second_wins {
+        finish(second_result, first, &first_result)
+    } else {
+        finish(first_result, second, &second_result)
+    };
+    Ok(ToSolidReport { result, attempts: vec![first_record, second_record] })
+}
+
+fn single(result: ToSolidOut, method: Method, seconds: f64) -> ToSolidReport {
+    let mut record = record(method, &result, seconds);
+    record.returned = true;
+    ToSolidReport { result, attempts: vec![record] }
+}
+
+/// One method alone, timed.
+fn alone(
+    s: &mut Session,
+    method: Method,
+    exec: &mut dyn FnMut(&mut Session, Method) -> CmdResult<ToSolidOut>,
+) -> CmdResult<ToSolidReport> {
+    let timer = Timer::start();
+    let result = exec(s, method)?;
+    Ok(single(result, method, timer.seconds()))
+}
+
+/// The noise issue, with the tolerance that would work: three times the estimated sigma.
+fn noise_issue(report: &ScanSummary, scan: ObjectId, name: &str, result: &mut ToSolidOut) {
+    let sigma = report.noise_used.unwrap_or(0.0);
+    let tolerance = (3.0 * sigma * 1000.0).ceil() / 1000.0;
+    result.issues.push(Issue {
+        code: "noise_above_tolerance".into(),
+        message: format!(
+            "the scan noise (sigma {sigma:.3} mm) is above the tolerance {:.3} mm: no primitive can be judged and the regions were not merged",
+            result.tolerance
+        ),
+    });
+    result.next_steps.insert(
+        0,
+        step(
+            "scan.to_solid",
+            json!({"scan": scan.0, "tolerance": tolerance, "name": name}),
+            "a tolerance of about three times the scan noise, which the scan can meet",
+        ),
+    );
+}
+
+/// `scan.to_solid` after cleaning: the given method once, or `auto`'s ordered attempts.
+pub(super) fn run(s: &mut Session, i: &ToSolidIn, set: &Settings, mut report: ScanSummary) -> CmdResult<ToSolidReport> {
+    let mut exec_report = report.clone();
+    if i.method == Method::Freeform {
+        let mut exec = |s: &mut Session, m: Method| attempt(s, i, set, &exec_report, m);
+        return alone(s, Method::Freeform, &mut exec);
+    }
+    if let Some(noise) = segment_scan(s, i, set)? {
+        report.noise_used = noise.noise_used;
+        report.noise_source = noise.noise_source;
+        report.noise_spread = noise.noise_spread;
+        report.noise_above_tolerance = noise.noise_above_tolerance;
+        exec_report = report.clone();
+    }
+    let mut exec = |s: &mut Session, m: Method| attempt(s, i, set, &exec_report, m);
+    let mut out = if i.method == Method::Primitives || i.reuse_regions {
+        alone(s, Method::Primitives, &mut exec)?
+    } else {
+        let plan = Plan {
+            scan: set.scan,
+            tolerance: set.tolerance,
+            share: scan_primitive_share(s, set, &report),
+            triangles: report.triangles,
+            retry: i.retry.unwrap_or(true),
+            limits: Limits::default(),
+        };
+        orchestrate(s, &plan, &mut exec)?
+    };
+    if report.noise_above_tolerance && out.result.verdict != Verdict::Pass {
+        noise_issue(&report, set.scan, &set.name, &mut out.result);
+    }
+    Ok(out)
+}
+
+/// One method on the document.
+fn attempt(
+    s: &mut Session,
+    i: &ToSolidIn,
+    set: &Settings,
+    report: &ScanSummary,
+    method: Method,
+) -> CmdResult<ToSolidOut> {
+    match method {
+        Method::Freeform => freeform::freeform_solid(s, set, report.clone()),
+        _ => primitives_solid(s, i, set, report.clone()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{DeviationSummary, ScanSummary};
+    use super::*;
+    use crate::cmd::body::BodyOut;
+    use surfacecraft_doc::ObjectId;
+
+    /// A result for the comparison: `body` is `Some(Some(volume))` for a closed solid, `Some(None)`
+    /// for a sheet, `None` for no body; `within` of the measured points, `coverage` measured.
+    fn result(verdict: Verdict, body: Option<Option<f64>>, within: f64, coverage: f64) -> ToSolidOut {
+        ToSolidOut {
+            verdict,
+            method: Method::Primitives,
+            scan: ObjectId(1),
+            body: body.map(|volume| BodyOut { id: ObjectId(2), faces: 6, edges: 12, vertices: 8, volume }),
+            patches: None,
+            tolerance: 0.2,
+            deviation: Some(DeviationSummary {
+                count: 1000,
+                coverage,
+                not_facing: 0.0,
+                within,
+                rms: 0.05,
+                max_abs: 0.3,
+                mean: 0.0,
+            }),
+            worst_faces: Vec::new(),
+            scan_report: ScanSummary {
+                triangles_before: 0,
+                triangles: 0,
+                holes_before: 0,
+                holes_filled: 0,
+                holes_left: 0,
+                non_manifold_edges: 0,
+                noise_sigma: None,
+                noise_used: None,
+                noise_source: None,
+                noise_spread: None,
+                noise_above_tolerance: false,
+                findings: Vec::new(),
+            },
+            modelled: Vec::new(),
+            left_out: Vec::new(),
+            left_out_regions: 0,
+            left_out_triangles: 0,
+            unassigned_triangles: 0,
+            relations: 0,
+            issues: Vec::new(),
+            next_steps: Vec::new(),
+        }
+    }
+
+    const SOLID: Option<Option<f64>> = Some(Some(1000.0));
+    const SHEET: Option<Option<f64>> = Some(None);
+
+    /// A: both fail; one measures 3 % of the scan (all of it within), the other 95 % (90 % within):
+    /// the one that describes the scan wins.
+    #[test]
+    fn the_result_that_explains_more_of_the_scan_wins_a_tie_of_verdict() {
+        let almost_nothing = result(Verdict::Fail, SOLID, 1.0, 0.03);
+        let most_of_it = result(Verdict::Fail, SOLID, 0.9, 0.95);
+        assert!(is_better(&most_of_it, &almost_nothing));
+        assert!(!is_better(&almost_nothing, &most_of_it));
+    }
+
+    /// B: an open sheet at 0.995 does not beat a closed solid at 0.990 of the same verdict: the
+    /// difference is inside the band, so the closed solid decides.
+    #[test]
+    fn a_closed_solid_beats_a_sheet_within_the_band() {
+        let sheet = result(Verdict::Review, SHEET, 0.995, 1.0);
+        let solid = result(Verdict::Review, SOLID, 0.990, 1.0);
+        assert!(is_better(&solid, &sheet));
+        assert!(!is_better(&sheet, &solid));
+        // outside the band the share decides
+        let far = result(Verdict::Review, SHEET, 0.90, 1.0);
+        assert!(is_better(&far, &result(Verdict::Review, SOLID, 0.80, 1.0)));
+    }
+
+    #[test]
+    fn a_missing_body_ranks_last_within_its_verdict() {
+        let none = result(Verdict::Fail, None, 0.0, 0.0);
+        let sheet = result(Verdict::Fail, SHEET, 0.0, 0.0);
+        assert!(is_better(&sheet, &none) && !is_better(&none, &sheet));
+        // but a better verdict wins whatever the body
+        assert!(is_better(&result(Verdict::Review, None, 0.0, 0.0), &result(Verdict::Fail, SOLID, 1.0, 1.0)));
+    }
+
+    #[test]
+    fn an_exact_tie_keeps_the_first_and_the_order_is_never_both_ways() {
+        let a = result(Verdict::Review, SOLID, 0.95, 0.98);
+        let b = result(Verdict::Review, SOLID, 0.95, 0.98);
+        assert!(!is_better(&a, &b) && !is_better(&b, &a));
+        let verdicts = [Verdict::Pass, Verdict::Review, Verdict::Fail];
+        let bodies = [SOLID, SHEET, None];
+        let shares = [(0.5, 1.0), (0.99, 0.5), (0.99, 0.502), (1.0, 1.0)];
+        let mut all: Vec<ToSolidOut> = Vec::new();
+        for &v in &verdicts {
+            for &b in &bodies {
+                for &(w, c) in &shares {
+                    all.push(result(v, b, w, c));
+                }
+            }
+        }
+        for x in &all {
+            for y in &all {
+                assert!(!(is_better(x, y) && is_better(y, x)));
+            }
+        }
+    }
+
+    // --- the attempts ---------------------------------------------------------------------------
+
+    use crate::cmd::cancelled;
+    use std::collections::HashMap;
+    use surfacecraft_geom::{Point3, Vec3, synth};
+
+    type Outcomes = HashMap<&'static str, CmdResult<ToSolidOut>>;
+
+    fn plan(share: f64) -> Plan {
+        Plan { scan: ObjectId(1), tolerance: 0.2, share, triangles: 1000, retry: true, limits: Limits::default() }
+    }
+
+    /// Runs `orchestrate` with a fake that leaves a mesh named after the method in the document and
+    /// returns the outcome given for it.
+    fn run_fake(plan: &Plan, mut outcomes: Outcomes) -> (Session, CmdResult<ToSolidReport>, Vec<&'static str>) {
+        let mut s = Session::new();
+        let mut called = Vec::new();
+        let report = orchestrate(&mut s, plan, &mut |s, m| {
+            called.push(method_name(m));
+            s.doc.add_mesh(
+                &format!("m-{}", method_name(m)),
+                synth::cuboid(Point3::origin(), Vec3::new(1.0, 1.0, 1.0), 1),
+            );
+            outcomes.remove(method_name(m)).expect("an outcome for the method")
+        });
+        (s, report, called)
+    }
+
+    fn outcomes(primitives: ToSolidOut, freeform: ToSolidOut) -> Outcomes {
+        HashMap::from([("primitives", Ok(primitives)), ("freeform", Ok(freeform))])
+    }
+
+    fn has_mesh(s: &Session, name: &str) -> bool {
+        s.doc.find_by_name(name).is_some()
+    }
+
+    /// The first attempt wins after the second ran: the document is the first attempt's alone.
+    #[test]
+    fn when_the_first_attempt_wins_its_document_is_restored() {
+        let (s, report, called) = run_fake(
+            &plan(0.9),
+            outcomes(result(Verdict::Fail, SOLID, 1.0, 0.5), result(Verdict::Fail, SOLID, 1.0, 0.1)),
+        );
+        let report = report.expect("a report");
+        assert_eq!(called, ["primitives", "freeform"]);
+        assert!(has_mesh(&s, "m-primitives") && !has_mesh(&s, "m-freeform"), "the losing attempt left its mark");
+        assert_eq!(s.doc.meshes.len(), 1);
+        assert_eq!(report.attempts.iter().map(|a| a.returned).collect::<Vec<_>>(), [true, false]);
+    }
+
+    #[test]
+    fn when_the_second_attempt_wins_only_its_document_remains() {
+        let (s, report, _) = run_fake(
+            &plan(0.9),
+            outcomes(result(Verdict::Fail, SOLID, 1.0, 0.1), result(Verdict::Pass, SOLID, 1.0, 1.0)),
+        );
+        let report = report.expect("a report");
+        assert_eq!(report.result.verdict, Verdict::Pass);
+        assert!(has_mesh(&s, "m-freeform") && !has_mesh(&s, "m-primitives"));
+        assert_eq!(report.attempts.iter().map(|a| a.returned).collect::<Vec<_>>(), [false, true]);
+    }
+
+    /// A second attempt that errors: the first result stays, with its document, and the attempt keeps
+    /// the message and the time; a cancellation is re-raised.
+    #[test]
+    fn a_second_attempt_that_errors_keeps_the_first_result_and_the_message() {
+        let long = "x".repeat(500);
+        let (s, report, _) = run_fake(
+            &plan(0.9),
+            HashMap::from([
+                ("primitives", Ok(result(Verdict::Fail, SOLID, 1.0, 0.5))),
+                ("freeform", Err(CmdError::Failed(long.clone()))),
+            ]),
+        );
+        let report = report.expect("the first result is returned");
+        assert_eq!(report.result.verdict, Verdict::Fail);
+        assert!(has_mesh(&s, "m-primitives") && !has_mesh(&s, "m-freeform"));
+        let failed = &report.attempts[1];
+        assert!(failed.verdict.is_none() && failed.seconds >= 0.0);
+        assert_eq!(failed.error.as_deref().map(str::len), Some(ERROR_TEXT_LIMIT));
+        assert!(report.attempts[0].returned && !failed.returned);
+    }
+
+    #[test]
+    fn a_cancellation_of_the_second_attempt_is_not_swallowed() {
+        let (_, report, _) = run_fake(
+            &plan(0.9),
+            HashMap::from([("primitives", Ok(result(Verdict::Fail, SOLID, 1.0, 0.5))), ("freeform", Err(cancelled()))]),
+        );
+        assert!(matches!(report, Err(e) if is_cancelled(&e)));
+    }
+
+    /// Between a quarter and a half of the scan in primitive regions: freeform first, and when it
+    /// does not pass the primitives are tried; below a quarter they are not.
+    #[test]
+    fn the_order_is_freeform_then_primitives_for_a_share_between_a_quarter_and_a_half() {
+        let both = || outcomes(result(Verdict::Pass, SOLID, 1.0, 1.0), result(Verdict::Fail, SHEET, 0.5, 0.5));
+        let (_, report, called) = run_fake(&plan(0.3), both());
+        let report = report.expect("a report");
+        assert_eq!(called, ["freeform", "primitives"]);
+        assert_eq!(report.result.verdict, Verdict::Pass);
+        let (_, report, called) = run_fake(&plan(0.1), both());
+        assert_eq!(called, ["freeform"]);
+        assert_eq!(report.expect("a report").attempts.len(), 1);
+    }
+
+    #[test]
+    fn a_pass_with_the_first_method_is_one_attempt() {
+        let (_, report, called) = run_fake(
+            &plan(0.9),
+            outcomes(result(Verdict::Pass, SOLID, 1.0, 1.0), result(Verdict::Pass, SOLID, 1.0, 1.0)),
+        );
+        assert_eq!(called, ["primitives"]);
+        assert_eq!(report.expect("a report").attempts.len(), 1);
+    }
+
+    /// `retry: false`, a scan over the triangle limit and a first attempt over the time limit skip the
+    /// second attempt, and say how to force it. No sleeping: the limits are set low.
+    #[test]
+    fn the_second_attempt_is_bounded_and_the_skip_names_the_call_that_forces_it() {
+        let slow = || Limits { max_triangles: 600_000, max_seconds: -1.0 };
+        let few = || Limits { max_triangles: 10, max_seconds: 120.0 };
+        for (reason, p) in [
+            ("`retry` is false", Plan { retry: false, ..plan(0.9) }),
+            ("triangles", Plan { limits: few(), ..plan(0.9) }),
+            ("took", Plan { limits: slow(), ..plan(0.9) }),
+        ] {
+            let (_, report, called) =
+                run_fake(&p, outcomes(result(Verdict::Fail, SOLID, 1.0, 0.5), result(Verdict::Pass, SOLID, 1.0, 1.0)));
+            let report = report.expect("a report");
+            assert_eq!(called, ["primitives"], "{reason}");
+            let skipped = report.attempts[1].skipped.as_ref().expect("a skipped entry");
+            assert!(skipped.reason.contains(reason), "{}", skipped.reason);
+            assert_eq!(skipped.call.params["method"], "freeform");
+            assert_eq!(skipped.call.command, "scan.to_solid");
+            assert!(report.attempts[1].verdict.is_none() && !report.attempts[1].returned);
+        }
+    }
+
+    /// The winner of a both-fail comparison does not advise the method `auto` just tried, and says
+    /// the other was tried.
+    #[test]
+    fn next_steps_naming_a_tried_method_are_dropped_and_the_winner_says_so() {
+        let mut first = result(Verdict::Fail, SOLID, 1.0, 0.5);
+        first.next_steps = vec![
+            step("scan.to_solid", json!({"scan": 1, "method": "freeform"}), "run again with method freeform"),
+            step("body.plan_regions", json!({}), "look at the planner"),
+        ];
+        let (_, report, _) = run_fake(&plan(0.9), outcomes(first, result(Verdict::Fail, SOLID, 1.0, 0.1)));
+        let result = report.expect("a report").result;
+        assert!(result.next_steps.iter().all(|st| st.params["method"].is_null()), "{:?}", result.next_steps);
+        assert_eq!(result.next_steps.len(), 1);
+        assert!(result.issues.iter().any(|i| i.code == "other_method_tried" && i.message.contains("freeform")));
+    }
 }

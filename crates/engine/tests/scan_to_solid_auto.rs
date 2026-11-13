@@ -113,3 +113,64 @@ fn an_explicit_method_makes_one_attempt() {
     assert_eq!(methods_of(&out), vec![("primitives".to_string(), "fail".to_string())]);
     assert!(codes(&out["issues"]).contains(&"low_coverage".to_string()));
 }
+
+/// A flat plate of 100 x 100 mm with `cells` cells a side and noise `sigma`.
+fn plate_session(cells: usize, sigma: f64, seed: u64) -> Session {
+    let mut m = surfacecraft_geom::synth::plane(
+        surfacecraft_geom::Point3::origin(),
+        surfacecraft_geom::Vec3::x(),
+        surfacecraft_geom::Vec3::y(),
+        100.0,
+        100.0,
+        cells,
+        cells,
+    );
+    if sigma > 0.0 {
+        synth::add_noise(&mut m, sigma, &mut Rng::new(seed));
+    }
+    let mut s = Session::new();
+    s.doc.add_mesh("scan", m);
+    s
+}
+
+/// The tolerance of the call reaches the segmentation (it was the default 0.2 whatever the call
+/// said): the noise floor of a clean scan is 5 % of it, and the report says which noise was used.
+#[test]
+fn the_callers_tolerance_reaches_the_segmentation_and_the_noise_is_reported() {
+    let used = |tolerance: Option<f64>| {
+        let mut s = plate_session(60, 0.0, 1);
+        let params = match tolerance {
+            Some(t) => json!({"scan": "scan", "tolerance": t}),
+            None => json!({"scan": "scan"}),
+        };
+        let out = s.execute("scan.to_solid", params).unwrap();
+        (out["scan_report"]["noise_used"].as_f64(), out["scan_report"]["noise_source"].clone())
+    };
+    let (default, source) = used(None);
+    assert_eq!((default.map(|x| (x * 1e6).round()), source), (Some(10_000.0), json!("estimated")));
+    let (fine, _) = used(Some(0.02));
+    assert_eq!(fine.map(|x| (x * 1e6).round()), Some(1_000.0), "the floor is 5 % of the caller's tolerance");
+}
+
+/// A scan whose noise (sigma 0.4 mm) is above the tolerance cannot be judged: the result says so
+/// and names a tolerance the scan can meet.
+#[test]
+fn a_scan_rougher_than_the_tolerance_gets_the_issue_and_a_workable_tolerance() {
+    // a closed sphere of about 3 mm cells: no hole to fill, so no clean patch among the noisy points
+    let mut m = synth::sphere(surfacecraft_geom::Point3::origin(), 30.0, 64, 32);
+    synth::add_noise(&mut m, 0.4, &mut Rng::new(3));
+    let mut s = Session::new();
+    s.doc.add_mesh("scan", m);
+    // the primitives method: a freeform wrap can smooth the noise away and pass
+    let out = s.execute("scan.to_solid", json!({"scan": "scan", "method": "primitives"})).unwrap();
+    assert_ne!(out["verdict"], "pass", "{out}");
+    assert_eq!(out["scan_report"]["noise_above_tolerance"], true, "{out}");
+    assert_eq!(out["scan_report"]["noise_source"], "estimated", "{out}");
+    assert!(codes(&out["issues"]).contains(&"noise_above_tolerance".to_string()), "{out}");
+    let step = &out["next_steps"][0];
+    assert_eq!(step["command"], "scan.to_solid", "{out}");
+    let tolerance = step["params"]["tolerance"].as_f64().unwrap();
+    let sigma = out["scan_report"]["noise_used"].as_f64().unwrap();
+    assert!((tolerance - 3.0 * sigma).abs() < 0.002, "{tolerance} for sigma {sigma}");
+    assert!(tolerance > 0.2);
+}

@@ -20,7 +20,7 @@ pub fn instructions(files: Option<bool>) -> String {
     };
     format!(
         "SurfaceCraft turns 3D scans into CAD models. Units are mm. \
-The short path is three calls: mesh_import, then scan_to_solid (cleans the scan, builds the solid and measures it against the scan; it fits primitives to prismatic parts and wraps organic parts, castings and body panels in a patch network, `method` chooses), then export_step. \
+The short path is three calls: mesh_import, then scan_to_solid (cleans the scan, builds the solid and measures it against the scan; it fits primitives to prismatic parts and wraps organic parts, castings and body panels in a patch network, `method` chooses; with `auto` it tries the other method when the first does not pass and lists them in `attempts`; `retry` false keeps one attempt), then export_step. \
 Read `verdict` of scan_to_solid: on `pass` export; on `review` or `fail` follow its `next_steps` (each has a command and parameters) and guide_read topic scan-to-solid. \
 Never report a model as done without a `pass` or a body_compare you have read. \
 {files} \

@@ -316,3 +316,78 @@ fn noise_above_the_tolerance_is_flagged_and_nothing_is_consolidated() {
     assert_eq!(out["noise_above_tolerance"], true, "{out}");
     assert!(out["regions"].as_array().unwrap().iter().all(|r| r["freeform"] == false), "{out}");
 }
+
+// --- large primitives with form error are protected whatever the scanner noise -----------------------
+
+/// A planar face (r < 25 mm, waviness of 0.03 mm: form error) that an organic surface runs into
+/// tangentially, at `x0`, with scanner noise 0.003.
+fn real_plane_scene(x0: f64, seed: u64) -> Mesh {
+    let mut m = sheet(120.0, 120.0, 150, |x, y| {
+        let r = (x - 60.0).hypot(y - 60.0);
+        let k = std::f64::consts::TAU / 20.0;
+        let form = 0.03 * (k * x).sin() * (k * y + 0.7).sin();
+        let organic = 2.5 * (0.25 * x + 0.3).sin() * (0.2 * y + 1.1).sin();
+        Point3::new(x0 + x, y, form + organic * smoothstep((r - 25.0) / 10.0))
+    });
+    synth::add_noise(&mut m, 0.003, &mut Rng::new(seed));
+    m
+}
+
+/// A cylindrical strip (R = 40 mm, 40 mm wide, ovality 0.03 mm) that the organic surface runs into.
+fn real_cylinder_scene(x0: f64, seed: u64) -> Mesh {
+    const R: f64 = 40.0;
+    let mut m = sheet(120.0, 120.0, 150, |x, y| {
+        let u = (x - 60.0).clamp(-20.0, 20.0);
+        let th = u / R;
+        let r = R + 0.03 * (2.0 * th).cos();
+        // the strip continues tangentially beyond |u| = 20
+        let (sx, sz) = (r * th.sin() + (x - 60.0 - u) * th.cos(), r * th.cos() - R - (x - 60.0 - u) * th.sin());
+        let organic = 2.5 * (0.25 * x + 0.3).sin() * (0.2 * y + 1.1).sin();
+        let w = smoothstep(((x - 60.0).abs() - 20.0) / 10.0);
+        Point3::new(x0 + 60.0 + sx, y, sz + organic * w)
+    });
+    synth::add_noise(&mut m, 0.003, &mut Rng::new(seed));
+    m
+}
+
+/// Share of the scan held by the largest region of `kind` (0 when none).
+fn largest_share(out: &Value, kind: &str, total: usize) -> f64 {
+    out["regions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["kind"] == kind)
+        .map(|r| r["triangles"].as_u64().unwrap() as f64 / total as f64)
+        .fold(0.0, f64::max)
+}
+
+/// A scan of a part with a large plane and a large cylinder, both with 0.03 mm of form error (far
+/// above the scanner noise of 0.003, well inside the tolerance 0.2), each running into an organic
+/// surface: they stay primitives (their share within half a point of the unconsolidated
+/// segmentation), the organic surface is consolidated.
+#[test]
+fn large_primitives_with_form_error_stay_and_the_organic_surface_is_consolidated() {
+    let mut mesh = real_plane_scene(0.0, 1);
+    mesh.append(&real_cylinder_scene(200.0, 2));
+    let total = mesh.triangle_count();
+    let run = |options: Value| {
+        let mut s = Session::new();
+        s.doc.add_mesh("scan", mesh.clone());
+        s.execute("region.auto_segment", json!({"mesh": "scan", "options": options})).unwrap()
+    };
+    let old = run(json!({"freeform": false}));
+    let new = run(json!({}));
+    eprintln!("noise {} {}", new["noise_used"], new["noise_source"]);
+    for kind in ["plane", "cylinder"] {
+        let (before, after) = (largest_share(&old, kind, total), largest_share(&new, kind, total));
+        eprintln!("{kind}: old {before:.4} new {after:.4}");
+        assert!(before > 0.03, "the scene has a large {kind}: {before}");
+        assert!(after >= before - 0.005, "the {kind} went from {before:.4} to {after:.4} of the scan: {new}");
+    }
+    assert!(
+        new["regions"].as_array().unwrap().iter().any(|r| r["freeform"] == true),
+        "the organic surface is consolidated"
+    );
+    let regions = |v: &Value| v["regions"].as_array().unwrap().len();
+    assert!(regions(&new) * 3 < regions(&old), "{} regions against {}", regions(&new), regions(&old));
+}

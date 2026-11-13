@@ -9,7 +9,7 @@ use super::hybrid::{FaceOf, FromRegionsIn, from_regions};
 use super::mesh_edit::{CleanIn, clean};
 use super::primitive::{AutoConstrainIn, FitIn, KindChoice, auto_constrain, fit_cmd};
 use super::qa::{CompareIn, CompareOut, Finding, QaIn, compare, scan_qa};
-use super::region::{AutoIn, auto_segment};
+use super::region::{AutoIn, NoiseSource, NoiseSpread, RegionsOut, auto_segment};
 use super::{CmdError, CmdResult, CommandSpec, ObjRef};
 use crate::{Session, command};
 use schemars::JsonSchema;
@@ -19,6 +19,7 @@ use surfacecraft_deviation::faces::FaceDeviation;
 use surfacecraft_deviation::noise_estimate;
 use surfacecraft_doc::{ObjectId, ObjectKind};
 use surfacecraft_fit::PrimitiveKind;
+use surfacecraft_fit::segment::SegmentOptions;
 
 #[path = "pipeline_auto.rs"]
 mod auto;
@@ -101,6 +102,9 @@ pub struct ToSolidIn {
     /// coaxial, equal radii (default true).
     #[serde(default = "yes")]
     pub constrain: bool,
+    /// `auto` only: also try the other method when the first does not pass (default true).
+    #[serde(default)]
+    pub retry: Option<bool>,
     /// Name of the solid (default "solid").
     #[serde(default)]
     pub name: Option<String>,
@@ -155,6 +159,18 @@ pub struct ScanSummary {
     pub non_manifold_edges: usize,
     /// Estimated scanner noise sigma after cleaning (mm); null when it cannot be estimated.
     pub noise_sigma: Option<f64>,
+    /// The noise the segmentation judged the fits by (sigma, mm; see `region.auto_segment`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noise_used: Option<f64>,
+    /// Where it came from: `estimated`, `estimated_mesh`, `given` or `fallback`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noise_source: Option<NoiseSource>,
+    /// Smallest and largest noise measured on blocks of the scan, when two or more were measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noise_spread: Option<NoiseSpread>,
+    /// The noise is above the tolerance: nothing was merged into freeform regions.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub noise_above_tolerance: bool,
     /// Findings of the quality check before cleaning.
     pub findings: Vec<Finding>,
 }
@@ -662,6 +678,10 @@ fn prepare(s: &mut Session, i: &ToSolidIn, scan: ObjectId) -> CmdResult<ScanSumm
         holes_left: left,
         non_manifold_edges: non_manifold,
         noise_sigma: noise,
+        noise_used: None,
+        noise_source: None,
+        noise_spread: None,
+        noise_above_tolerance: false,
         findings: qa.findings,
     })
 }
@@ -729,12 +749,14 @@ fn to_solid(s: &mut Session, i: ToSolidIn) -> CmdResult<auto::ToSolidReport> {
     auto::run(s, &i, &set, scan_report)
 }
 
-/// Segments the scan into regions (unless the caller's regions are reused).
-fn segment_scan(s: &mut Session, i: &ToSolidIn, set: &Settings) -> CmdResult<()> {
-    if !i.reuse_regions {
-        auto_segment(s, AutoIn { mesh: ObjRef::Id(set.scan.0), options: Default::default(), replace: true })?;
+/// Segments the scan into regions at the caller's tolerance (unless the regions are reused) and
+/// returns what the segmentation reports, the noise it used among it.
+fn segment_scan(s: &mut Session, i: &ToSolidIn, set: &Settings) -> CmdResult<Option<RegionsOut>> {
+    if i.reuse_regions {
+        return Ok(None);
     }
-    Ok(())
+    let options = SegmentOptions { tolerance: set.tolerance, ..SegmentOptions::default() };
+    auto_segment(s, AutoIn { mesh: ObjRef::Id(set.scan.0), options, replace: true }).map(Some)
 }
 
 /// The smallest region the primitives method models, and the RMS above which a fit is no primitive.
@@ -808,7 +830,7 @@ pub static COMMANDS: &[CommandSpec] = &[command!(
     "Scan to solid",
     "Solid",
     true,
-    "From raw scan `scan` to a closed solid in one step, measured against the scan. Prismatic parts (`method` primitives): cleans the scan, segments it, fits a primitive to each sizeable region, relates the primitives and builds the solid. Organic parts, castings and body panels (`method` freeform): wraps the whole scan in a watertight network of patches. `method` auto (default) tries first the method that the share of the scan primitives fit suggests; when that does not end in a pass it tries the other too and returns the better result (`attempts` lists them). Returns `verdict` (pass, review or fail), the deviation, `issues`, and `next_steps` with ready parameters. A poor model is a verdict, not an error; regions and primitives stay for manual work. `reuse_regions` models corrected regions again (without cleaning).",
+    "From raw scan `scan` to a closed solid in one step, measured against the scan. Prismatic parts (`method` primitives): cleans the scan, segments it, fits a primitive to each sizeable region, relates the primitives and builds the solid. Organic parts, castings and body panels (`method` freeform): wraps the whole scan in a watertight network of patches. `method` auto (default) tries the suggested method, then the other if it fails, and returns the better (`attempts`). Returns `verdict` (pass, review or fail), the deviation, `issues`, and `next_steps` with ready parameters. A poor model is a verdict, not an error; regions stay for manual work. `reuse_regions` models corrected regions again (without cleaning).",
     ToSolidIn,
     auto::ToSolidReport,
     to_solid

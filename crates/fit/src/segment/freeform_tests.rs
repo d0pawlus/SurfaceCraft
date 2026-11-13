@@ -10,6 +10,7 @@ fn settings(noise: f64) -> Settings {
     Settings {
         strong_tris: 1000,
         dominant_tris: 1_000_000,
+        protect_tris: super::freeform::ProtectSizes { plane_or_cylinder: 1_000_000, other: 1_000_000 },
         min_cluster: 5,
         min_triangles: 10,
         noise,

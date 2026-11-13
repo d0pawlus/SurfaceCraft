@@ -5,8 +5,8 @@
 //! `cargo test --profile ci -p surfacecraft-engine --test p9_noise_calibration print_table -- --ignored --nocapture`
 //! prints the table the threshold of `freeform.rs` (`LARGE_SOUND_FACTOR`) was chosen from.
 use surfacecraft_deviation::noise_estimate;
-use surfacecraft_fit::fit_auto;
 use surfacecraft_fit::segment::{LARGE_SOUND_FACTOR, SegmentOptions, residual_spread, segment};
+use surfacecraft_fit::{PrimitiveKind, fit_auto};
 use surfacecraft_geom::{Mesh, Point3, Rng, synth};
 
 const SIGMAS: [f64; 3] = [0.01, 0.03, 0.1];
@@ -198,4 +198,168 @@ fn the_threshold_keeps_genuine_primitives_and_rejects_most_fragments_of_a_clean_
             "sigma {sigma}: only {above:.3} of the fragments are above"
         );
     }
+}
+
+// --- protection by the tolerance: large primitives with form error ---------------------------------
+
+/// A 60 x 60 mm plane with a waviness of amplitude `amp` (wavelength 20 mm) and noise `sigma`.
+fn wavy_plane(amp: f64, sigma: f64, seed: u64) -> Mesh {
+    let mut m = sheet(60.0, 60.0, 60, 60, |x, y| {
+        let k = std::f64::consts::TAU / 20.0;
+        Point3::new(x, y, amp * (k * x).sin() * (k * y + 0.7).sin())
+    });
+    synth::add_noise(&mut m, sigma, &mut Rng::new(seed));
+    m
+}
+
+/// A cylinder arc (R = 30 mm, 1.5 rad, 60 mm long) with an ovality of `oval` mm and noise `sigma`.
+fn oval_cylinder(oval: f64, sigma: f64, seed: u64) -> Mesh {
+    let mut m = sheet(1.5, 60.0, 60, 60, |th, y| {
+        let r = 30.0 + oval * (2.0 * th).cos();
+        Point3::new(r * th.sin(), y, r * th.cos() - 30.0)
+    });
+    synth::add_noise(&mut m, sigma, &mut Rng::new(seed));
+    m
+}
+
+/// Robust spread of the residuals / tolerance of the whole patch fitted with the automatic fit (the
+/// tolerance is 0.2 mm).
+fn form_error_ratio(m: &Mesh) -> Option<(PrimitiveKind, f64)> {
+    let fit = fit_auto(&m.positions, &m.vertex_normals())?.best;
+    let tris: Vec<u32> = (0..m.triangle_count() as u32).collect();
+    Some((fit.primitive.kind(), residual_spread(m, &tris, &fit.primitive) / 0.2))
+}
+
+/// The large regions (at least 1 % of the triangles and 300) the segmentation finds on a wavy
+/// surface: `(kind, share of the scan, RMS / tolerance)`.
+fn large_fragments(sigma: f64, spacing: f64, seed: u64) -> Vec<(PrimitiveKind, f64, f64)> {
+    let m = wavy(sigma, spacing, seed);
+    let nt = m.triangle_count();
+    let opts = SegmentOptions { freeform: false, ..SegmentOptions::default() };
+    segment(&m, &opts)
+        .iter()
+        .filter(|s| s.triangles.len() >= 300 && s.triangles.len() * 100 >= nt)
+        .map(|s| {
+            (
+                s.primitive.kind(),
+                s.triangles.len() as f64 / nt as f64,
+                residual_spread(&m, &s.triangles, &s.primitive) / 0.2,
+            )
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "prints the tolerance calibration table (minutes)"]
+fn print_tolerance_table() {
+    println!("genuine primitives with form error (spread of residuals / tolerance 0.2 of the whole patch)");
+    for sigma in [0.003, 0.01] {
+        for amp in [0.02, 0.035, 0.05] {
+            let r = sorted(
+                (1..=10).filter_map(|seed| form_error_ratio(&wavy_plane(amp, sigma, seed))).map(|x| x.1).collect(),
+            );
+            println!(
+                "  plane waviness {amp} sigma {sigma}: p50 {:.3} max {:.3}",
+                percentile(&r, 0.5),
+                percentile(&r, 1.0)
+            );
+        }
+        for oval in [0.03, 0.05] {
+            let r = sorted(
+                (1..=10).filter_map(|seed| form_error_ratio(&oval_cylinder(oval, sigma, seed))).map(|x| x.1).collect(),
+            );
+            println!(
+                "  cylinder ovality {oval} sigma {sigma}: p50 {:.3} max {:.3}",
+                percentile(&r, 0.5),
+                percentile(&r, 1.0)
+            );
+        }
+    }
+    println!("large fragments of a wavy surface (>= 1 % of the scan): kind, share, spread / tolerance");
+    let mut all = Vec::new();
+    for sigma in [0.003, 0.01, 0.03] {
+        for spacing in [0.7, 1.0] {
+            let found: Vec<_> = (1..=10).flat_map(|seed| large_fragments(sigma, spacing, seed)).collect();
+            let ratios = sorted(found.iter().map(|f| f.2).collect());
+            println!(
+                "  sigma {sigma} spacing {spacing}: n {} min {:.3} p5 {:.3} p50 {:.3}; largest share {:.3}",
+                found.len(),
+                percentile(&ratios, 0.0),
+                percentile(&ratios, 0.05),
+                percentile(&ratios, 0.5),
+                found.iter().map(|f| f.1).fold(0.0, f64::max)
+            );
+            all.extend(found);
+        }
+    }
+    for kind in [
+        PrimitiveKind::Plane,
+        PrimitiveKind::Cylinder,
+        PrimitiveKind::Cone,
+        PrimitiveKind::Sphere,
+        PrimitiveKind::Torus,
+    ] {
+        let r = sorted(all.iter().filter(|f| f.0 == kind).map(|f| f.2).collect());
+        println!(
+            "  {kind:?}: n {} min {:.3} p5 {:.3} p50 {:.3}",
+            r.len(),
+            percentile(&r, 0.0),
+            percentile(&r, 0.05),
+            percentile(&r, 0.5)
+        );
+    }
+}
+
+/// A region of all the triangles of `m` with the primitive of the automatic fit.
+fn whole_patch(m: &Mesh) -> Option<surfacecraft_fit::segment::Segment> {
+    let fit = fit_auto(&m.positions, &m.vertex_normals())?.best;
+    Some(surfacecraft_fit::segment::Segment {
+        triangles: (0..m.triangle_count() as u32).collect(),
+        primitive: fit.primitive,
+        rms: fit.rms,
+        freeform: false,
+    })
+}
+
+/// Both sides of the protection by the tolerance, on real noisy data: planes with a waviness of
+/// 0.02 and 0.035 mm and a cylinder with 0.03 mm of ovality (scanner noise 0.003 and 0.01) are
+/// protected; no region the segmentation finds on a wavy surface is (spread of the residuals of
+/// those regions: at least 0.13 of the tolerance for planes, `PROTECT_RMS_SHARE` is 0.12).
+#[test]
+fn the_tolerance_protects_primitives_with_form_error_and_no_organic_fragment() {
+    for sigma in [0.003, 0.01] {
+        for seed in 1..=4 {
+            let patches =
+                [wavy_plane(0.02, sigma, seed), wavy_plane(0.035, sigma, seed), oval_cylinder(0.03, sigma, seed)];
+            for (k, m) in patches.iter().enumerate() {
+                let seg = whole_patch(m).expect("a fit");
+                let n = m.triangle_count();
+                assert!(
+                    surfacecraft_fit::segment::protected_by_tolerance(m, &seg, 0.2, n),
+                    "patch {k} sigma {sigma} seed {seed}: {:?} rms {:.4}",
+                    seg.primitive.kind(),
+                    seg.rms
+                );
+            }
+        }
+    }
+    let mut checked = 0;
+    for (sigma, spacing) in [(0.01, 1.0), (0.03, 1.0), (0.01, 0.7), (0.03, 0.7)] {
+        for seed in 1..=3 {
+            let m = wavy(sigma, spacing, seed);
+            let n = m.triangle_count();
+            let opts = SegmentOptions { freeform: false, ..SegmentOptions::default() };
+            for s in segment(&m, &opts).iter().filter(|s| s.triangles.len() >= 300) {
+                checked += 1;
+                assert!(
+                    !surfacecraft_fit::segment::protected_by_tolerance(&m, s, 0.2, n),
+                    "a fragment is protected: {:?} {} triangles of {n}, rms {:.4}",
+                    s.primitive.kind(),
+                    s.triangles.len(),
+                    s.rms
+                );
+            }
+        }
+    }
+    assert!(checked > 100, "{checked} fragments checked");
 }

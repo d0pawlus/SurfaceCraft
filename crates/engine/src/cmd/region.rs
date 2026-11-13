@@ -10,7 +10,8 @@ mod edit;
 #[path = "region_noise.rs"]
 mod noise;
 use edit::*;
-use noise::{NoiseSource, NoiseSpread, with_noise};
+use noise::with_noise;
+pub(crate) use noise::{NoiseSource, NoiseSpread};
 use surfacecraft_doc::{ObjectId, ObjectKind};
 use surfacecraft_fit::segment::{Segment, SegmentOptions, grow_smooth, region_points, segment_cancellable};
 use surfacecraft_fit::{PrimitiveKind, fit_auto};
