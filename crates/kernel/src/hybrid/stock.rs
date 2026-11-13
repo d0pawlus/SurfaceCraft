@@ -106,13 +106,52 @@ fn local_step(body: &mut ops::Body, apply: impl FnOnce(ops::Body) -> (ops::Body,
     }
 }
 
+/// The text of a cut that was not made because the stock's work bound was reached.
+pub const OVER_WORK_BOUND: &str = "left as patches: over the work bound of the stock";
+
+/// How many operations may still run, and whether the call was cancelled.
+struct Work<'a> {
+    left: usize,
+    cancelled: &'a dyn Fn() -> bool,
+}
+
+impl Work<'_> {
+    /// `Ok(true)`: run the next operation (counted); `Ok(false)`: the bound is reached, leave it;
+    /// `Err`: the call was cancelled.
+    fn next(&mut self) -> Result<bool> {
+        if (self.cancelled)() {
+            return Err(KernelError::Op { op: "cut_stock", message: "cancelled".into() });
+        }
+        if self.left == 0 {
+            return Ok(false);
+        }
+        self.left -= 1;
+        Ok(true)
+    }
+
+    fn run(&mut self, op: impl FnOnce() -> CutStatus) -> Result<CutStatus> {
+        Ok(if self.next()? { op() } else { CutStatus::Skipped(OVER_WORK_BOUND.into()) })
+    }
+}
+
 /// Trims `stock` with the primitives of the plan: planes and full-revolution shapes first, then the
 /// local subtractions (`tools`), then the additions (`adds`). The result is verified to be one closed
 /// manifold solid; a cut that cannot be made is skipped (see [`Built`]), and `freeform` is empty.
 ///
+/// At most `max_operations` cuts, tools and additions are made (the rest are skipped with
+/// [`OVER_WORK_BOUND`]): each is a boolean on the whole stock, whose cost grows with its patches.
+/// `cancelled` is polled before every operation.
+///
 /// # Errors
-/// When the stock cannot be read by the kernel or nothing could be applied.
-pub fn cut_stock(stock: &Brep, cuts: &[Cut], tools: &[LocalTool], adds: &[LocalAdd]) -> Result<Built> {
+/// When the stock cannot be read by the kernel, nothing could be applied, or the call was cancelled.
+pub fn cut_stock(
+    stock: &Brep,
+    cuts: &[Cut],
+    tools: &[LocalTool],
+    adds: &[LocalAdd],
+    max_operations: usize,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Built> {
     if cuts.len() > 256 || tools.len() > 256 || adds.len() > 256 {
         return Err(KernelError::Argument("at most 256 cuts, tools or additions".into()));
     }
@@ -120,18 +159,24 @@ pub fn cut_stock(stock: &Brep, cuts: &[Cut], tools: &[LocalTool], adds: &[LocalA
     let half = 4.0 * norm(sub(hi, lo)).max(1.0);
     let mut body = decode(stock)?;
     is_one_solid(&body).map_err(|e| KernelError::Argument(format!("the stock is not usable: {e}")))?;
+    let mut work = Work { left: max_operations, cancelled };
     let mut primitives: Vec<CutStatus> = vec![CutStatus::Skipped("not applied".into()); cuts.len()];
     // planes before revolutions, as in the box stock: a revolution is cut from what the planes left
     for pass_planes in [true, false] {
         for (cut, st) in cuts.iter().zip(primitives.iter_mut()) {
             if matches!(cut.shape, Shape::Plane { .. }) == pass_planes {
-                *st = cut_step(&mut body, cut, half, lo, hi);
+                *st = work.run(|| cut_step(&mut body, cut, half, lo, hi))?;
             }
         }
     }
-    let tool_status: Vec<CutStatus> =
-        tools.iter().map(|t| local_step(&mut body, |b| subtract_tool(b, t, lo, hi))).collect();
-    let add_status: Vec<CutStatus> = adds.iter().map(|a| local_step(&mut body, |b| unite_add(b, a))).collect();
+    let mut tool_status = Vec::with_capacity(tools.len());
+    for t in tools {
+        tool_status.push(work.run(|| local_step(&mut body, |b| subtract_tool(b, t, lo, hi)))?);
+    }
+    let mut add_status = Vec::with_capacity(adds.len());
+    for a in adds {
+        add_status.push(work.run(|| local_step(&mut body, |b| unite_add(b, a)))?);
+    }
     let applied = primitives.iter().chain(&tool_status).chain(&add_status).any(|s| matches!(s, CutStatus::Applied(_)));
     if !applied {
         return Err(KernelError::Op { op: "cut_stock", message: "no cut could be applied to the stock".into() });
@@ -140,7 +185,7 @@ pub fn cut_stock(stock: &Brep, cuts: &[Cut], tools: &[LocalTool], adds: &[LocalA
 }
 
 /// The record faces that lie on an analytic surface (plane, cylinder, cone, sphere, torus), as
-/// opposed to a spline.
+/// opposed to a spline. The corner patch of three equal rounds is not one (as in `refit`).
 #[must_use]
 pub fn analytic_faces(body: &Brep) -> Vec<usize> {
     body.faces
@@ -155,7 +200,6 @@ pub fn analytic_faces(body: &Brep) -> Vec<usize> {
                     | Surface::Cone { .. }
                     | Surface::Sphere { .. }
                     | Surface::Torus { .. }
-                    | Surface::BallPatch { .. }
             )
         })
         .map(|(i, _)| i)

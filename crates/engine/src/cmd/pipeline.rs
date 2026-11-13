@@ -447,12 +447,13 @@ fn region_limits(set: &Settings, total: usize, scan_report: &ScanSummary) -> (us
 }
 
 /// Share of the scan's triangles in the regions a primitive fits (freeform regions have no kind and
-/// never count): the heuristic that orders the attempts of `method: auto`.
-fn scan_primitive_share(s: &Session, set: &Settings, scan_report: &ScanSummary) -> f64 {
+/// never count), and how many regions that is: the heuristic that orders the attempts of `method: auto`.
+fn scan_primitive_share(s: &Session, set: &Settings, scan_report: &ScanSummary) -> (f64, usize) {
     let (list, _) = candidates(s, set.scan);
     let total = triangle_count(s, set.scan);
     let (min_triangles, rms_limit) = region_limits(set, total, scan_report);
-    primitive_share(&list, min_triangles, rms_limit, total)
+    let regions = list.iter().filter(|c| regions::refusal(c, min_triangles, rms_limit, 0).is_none()).count();
+    (primitive_share(&list, min_triangles, rms_limit, total), regions)
 }
 
 /// The primitives method on the regions the scan has: fits, relates and builds.

@@ -33,9 +33,10 @@ within the tolerance, then a closed solid over a sheet. `attempts` lists what wa
 verdict, issue codes, seconds, `returned`); the attempt that lost leaves nothing in the document and
 one `edit.undo` takes the whole run back. A winner that is no pass carries `other_method_tried`.
 When the primitives cover at least a quarter of the scan (the same share as for the primitives
-attempt after a freeform one), `auto` also tries the hybrid method as a further attempt, after a
-freeform pass as well (not after a passing primitives solid, which is analytic all over). The hybrid
-body is returned when it is not worse: the verdict and the share of the scan within the tolerance
+attempt after a freeform one) and the best result is no pass, `auto` also tries the hybrid method as
+a further attempt. After a pass it does not (the hybrid attempt is slower and was not better on real
+scans): the result carries a next step with the `scan.to_solid` call with `method: hybrid` and what
+it would add. The hybrid body is returned when it is not worse: the verdict and the share of the scan within the tolerance
 (shares within 0.5 percentage points are equal) decide first, then a closed solid over a sheet,
 and only at a tie the larger share of the area on analytic faces; a hybrid body that explains the
 scan less well is listed in `attempts` and not returned.
@@ -79,7 +80,8 @@ Hybrid (trim a stock; `surface.wrap`, `mesh.remesh` and the kernel inside):
   are exactly the primitives, bounded by their intersections with the patches; the rest stays
   patches. A cut the kernel refuses, a partial cylinder, cone, sphere or torus (a fillet needs the
   sharp edge of two planes, which a network of patches has not) and anything else that is not
-  applied stays patches at most 0.4 of the tolerance from the scan; `modelled[].skipped` says why.
+  applied stays patches, up to about 1.4 times the tolerance from the scan (the stock's own deviation plus the 0.4 offset; the verdict reports it as `out_of_tolerance` where it is over); `modelled[].skipped` says why.
+- The kernel does at most `4000 / patches` operations (at least one) on the stock, each a boolean on the whole network; the cuts over that bound stay patches and `analytic.left_by_work_bound` counts them. A cancelled call stops between operations.
 - Needs a scan that is closed after cleaning (the rebuild refuses an open one). It is judged
   against the scan by the same rules as the freeform method.
 

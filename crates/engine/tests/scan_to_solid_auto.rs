@@ -74,36 +74,33 @@ fn methods_of(out: &Value) -> Vec<(String, String)> {
 }
 
 /// The share rule picks the primitives (the sides are 70 % of the block), the planner cannot close
-/// a solid over the wavy top and ends in `fail`; `auto` then runs the freeform wrap too, and, as the
-/// primitives cover enough of the scan, the hybrid method (the planes of the block as exact faces, the
-/// wavy top as patches). All three attempts are listed; the hybrid body is returned: it explains the
-/// scan as well as the wrap and has analytic faces. The attempts that lost leave nothing behind; one
-/// undo removes the whole run.
+/// a solid over the wavy top and ends in `fail`; `auto` then runs the freeform wrap, which passes. The
+/// primitives cover enough of the scan for a hybrid body, but a pass is not followed by a hybrid
+/// attempt (it costs time and nobody asked for it): the result is the wrap, and a next step names the
+/// `scan.to_solid` call with `method: hybrid`. The primitives attempt leaves nothing behind; one undo
+/// removes the whole run.
 #[test]
-fn auto_falls_back_to_the_freeform_wrap_and_hybrid_when_the_primitives_do_not_close() {
+fn auto_falls_back_to_the_freeform_wrap_and_offers_hybrid_when_the_primitives_do_not_close() {
     let mut s = block_with_wavy_top(21);
     let before = (s.doc.meshes.len(), s.doc.meshes[0].mesh.triangle_count());
 
     let out = s.execute("scan.to_solid", json!({"scan": "scan"})).unwrap();
 
     eprintln!("verdict {} method {} attempts {}", out["verdict"], out["method"], out["attempts"]);
-    assert!(["pass", "review"].contains(&out["verdict"].as_str().unwrap()), "{out}");
-    assert_eq!(out["method"], "hybrid", "{out}");
-    let verdict = out["verdict"].as_str().unwrap().to_string();
-    let wrap_verdict = out["attempts"][1]["verdict"].as_str().unwrap().to_string();
+    assert_eq!(out["verdict"], "pass", "{out}");
+    assert_eq!(out["method"], "freeform", "{out}");
     assert_eq!(
         methods_of(&out),
-        vec![
-            ("primitives".to_string(), "fail".to_string()),
-            ("freeform".to_string(), wrap_verdict),
-            ("hybrid".to_string(), verdict)
-        ]
+        vec![("primitives".to_string(), "fail".to_string()), ("freeform".to_string(), "pass".to_string())]
     );
     let returned: Vec<bool> = out["attempts"].as_array().unwrap().iter().map(|a| a["returned"] == true).collect();
-    assert_eq!(returned, vec![false, false, true]);
-    assert!(out["analytic"]["faces"].as_u64().unwrap() >= 5, "the block's planes are analytic faces: {out}");
+    assert_eq!(returned, vec![false, true]);
+    let offer =
+        out["next_steps"].as_array().unwrap().iter().find(|n| n["params"]["method"] == "hybrid").expect("an offer");
+    assert_eq!(offer["command"], "scan.to_solid", "{offer}");
+    assert!(offer["why"].as_str().unwrap().contains("primitive regions"), "{offer}");
     assert!(!out["attempts"][0]["issues"].as_array().unwrap().is_empty() && out["attempts"][0]["seconds"].is_number());
-    assert!(!s.doc.primitives.is_empty(), "the hybrid body keeps its primitives");
+    assert!(s.doc.primitives.is_empty(), "the losing attempt left primitives behind");
     assert_eq!(s.doc.bodies.len(), 1, "exactly the returned solid");
     s.execute("edit.undo", Value::Null).unwrap();
     assert!(s.doc.bodies.is_empty() && s.doc.primitives.is_empty() && s.doc.regions.is_empty());

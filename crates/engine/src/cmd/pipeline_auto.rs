@@ -172,8 +172,11 @@ pub(super) struct Plan {
     pub limits: Limits,
     /// The call's budget of extra attempts, shared with the freeform fit's retry.
     pub budget: CallBudget,
-    /// The primitives cover enough of the scan for `auto` to try the hybrid method as well.
+    /// The primitives cover enough of the scan for `auto` to offer, or after a failure to try, the
+    /// hybrid method.
     pub hybrid: bool,
+    /// Regions a primitive fits (for the hint of the hybrid method).
+    pub primitive_regions: usize,
 }
 
 fn record(method: Method, result: &ToSolidOut, seconds: f64) -> Attempt {
@@ -285,8 +288,10 @@ fn refusal(plan: &Plan, first: &ToSolidOut, second: Method) -> Option<String> {
 }
 
 /// Runs the attempts of `auto` with `exec` (one method on the document) and returns the best: the
-/// two methods of [`order`], then, when the primitives cover enough of the scan, the hybrid method
-/// as a third attempt that wins a tie of the others by its analytic faces.
+/// two methods of [`order`], then, when the best is no pass and the primitives cover enough of the
+/// scan, the hybrid method as a third attempt (it wins a tie of the others by its analytic faces).
+/// A result that is a pass is never swapped for a hybrid body and costs no hybrid attempt (it was
+/// 4 x slower and not better on the real scans); a next step names the call that would add one.
 pub(super) fn orchestrate(
     s: &mut Session,
     plan: &Plan,
@@ -294,12 +299,29 @@ pub(super) fn orchestrate(
 ) -> CmdResult<ToSolidReport> {
     let base = s.doc.clone();
     let report = two_methods(s, plan, exec, base.clone())?;
-    // a passing primitives solid is analytic all over: a hybrid body has nothing to add
-    let nothing_to_add = report.result.method == Method::Primitives && report.result.verdict == Verdict::Pass;
-    if !plan.hybrid || nothing_to_add {
+    if !plan.hybrid {
         return Ok(report);
     }
+    if report.result.verdict == Verdict::Pass {
+        return Ok(offer_hybrid(plan, report));
+    }
     hybrid_attempt(s, plan, exec, base, report)
+}
+
+/// A passing result with enough primitives in the scan gets the next step that builds the hybrid body
+/// (a passing primitives solid is analytic all over and gets none).
+fn offer_hybrid(plan: &Plan, mut report: ToSolidReport) -> ToSolidReport {
+    if report.result.method == Method::Primitives {
+        return report;
+    }
+    let why = format!(
+        "would add analytic faces (plane, cylinder, cone, sphere) on up to {} primitive regions covering {:.0} % of the scan, with patches on the rest (not run: it is slower and is not tried after a pass)",
+        plan.primitive_regions,
+        100.0 * plan.share
+    );
+    let params = json!({"scan": plan.scan.0, "method": "hybrid", "tolerance": plan.tolerance});
+    report.result.next_steps.push(step("scan.to_solid", params, &why));
+    report
 }
 
 /// The first method and, when it does not pass, the second (see [`orchestrate`]).
@@ -487,7 +509,7 @@ pub(super) fn run(s: &mut Session, i: &ToSolidIn, set: &Settings, mut report: Sc
     } else if i.method == Method::Primitives || i.reuse_regions {
         alone(s, Method::Primitives, &mut exec)?
     } else {
-        let share = scan_primitive_share(s, set, &report);
+        let (share, primitive_regions) = scan_primitive_share(s, set, &report);
         let plan = Plan {
             scan: set.scan,
             tolerance: set.tolerance,
@@ -497,6 +519,7 @@ pub(super) fn run(s: &mut Session, i: &ToSolidIn, set: &Settings, mut report: Sc
             limits: Limits::default(),
             budget: set.budget.clone(),
             hybrid: share >= HYBRID_MIN_SHARE,
+            primitive_regions,
         };
         orchestrate(s, &plan, &mut exec)?
     };

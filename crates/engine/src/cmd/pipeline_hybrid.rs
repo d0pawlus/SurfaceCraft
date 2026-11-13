@@ -23,7 +23,7 @@ use crate::cmd::hybrid::{FaceOf, collect_items, item_faces, snap_axes, square_de
 use crate::cmd::mesh_remesh::{RemeshIn, remesh_cmd};
 use crate::cmd::plan::{self, Item, RoleKind};
 use crate::cmd::qa::{CompareIn, compare};
-use crate::cmd::{CmdError, ObjRef, cancelled, is_cancelled};
+use crate::cmd::{CmdError, ObjRef, cancelled as cancelled_error, is_cancelled};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -40,8 +40,9 @@ mod snap;
 use snap::{SnapRegion, primitive_of, snapped};
 
 /// How far beyond its primitive the prepared scan lies, as a share of the tolerance. The cut only has
-/// to clear the fit error of the stock; a cut the kernel refuses leaves the region this far from the
-/// scan, which stays inside the tolerance.
+/// to clear the fit error of the stock; a cut that is not made leaves its region this far from the
+/// scan on top of the stock's own deviation (up to about 1.4 x the tolerance in all, which the
+/// judge then reports as `out_of_tolerance` where it exceeds it).
 const OFFSET_SHARE_OF_TOLERANCE: f64 = 0.4;
 /// The voxel of the rebuild, as a share of the tolerance (the default of `mesh.remesh` is 1.5): finer,
 /// because the hybrid body is judged against the scan like a plain wrap, and a coarse voxel rounds
@@ -53,6 +54,14 @@ const REMESH_QUAD_BUDGET: f64 = 1_500_000.0;
 /// it grows (measured: a few seconds at 400 patches, 15 s at 2 000, refusals above); a network that
 /// would be larger is not cut.
 pub(super) const STOCK_MAX_PATCHES: usize = 4_000;
+/// The work the kernel is given, in patch-operations: every cut, tool or addition is a boolean on
+/// the whole stock, so the number of operations allowed is this divided by the stock's patches (at
+/// least one). Measured on synthetic stocks (ci profile): 366 patches 1.4 s per plane cut, about 800
+/// patches 2-3 s, 2 010 patches 15 s, and refusals (status 1001) or 137 s on some 800-2 200 patch
+/// stocks of noisy scans. 4 000 allows 10 operations at 400 patches (about 15-30 s), 2 at 2 000
+/// (about 30 s) and one at 4 000; the rest of the regions stay patches and are counted in
+/// `AnalyticSummary::left_by_work_bound`.
+const STOCK_WORK_BOUND: usize = 4_000;
 /// Chord of the tessellation the area of the faces is measured on, as a share of the tolerance.
 const AREA_CHORD_SHARE: f64 = 1.0;
 
@@ -65,6 +74,10 @@ pub struct AnalyticSummary {
     pub total_faces: usize,
     /// Share of the body's surface area on those faces (0..1).
     pub area_share: f64,
+    /// Cuts, tools and additions left out because the stock was too large for the kernel's work
+    /// bound (their regions stay patches).
+    #[serde(default)]
+    pub left_by_work_bound: usize,
 }
 
 /// Why an attempt stopped.
@@ -85,7 +98,7 @@ fn failed_at(code: &'static str) -> impl Fn(CmdError) -> Halt {
 }
 
 fn check_cancel(s: &Session) -> Step<()> {
-    if s.cancel.is_cancelled() { Err(Halt::Cancelled(cancelled())) } else { Ok(()) }
+    if s.cancel.is_cancelled() { Err(Halt::Cancelled(cancelled_error())) } else { Ok(()) }
 }
 
 /// The primitives fitted to the regions of the scan.
@@ -208,11 +221,15 @@ fn make_stock(s: &mut Session, set: &Settings, planned: &Planned) -> Step<Stock>
 
 /// Trims the stock with the cuts, tools and additions of the plan.
 fn trim_stock(s: &Session, stock: &Stock, planned: &Planned) -> Step<Built> {
+    let operations = (STOCK_WORK_BOUND / stock.patches.max(1)).max(1);
     let brep =
         s.doc.body(stock.body).map(|b| b.brep.clone()).ok_or_else(|| halt("hybrid_failed", "the stock is gone"))?;
     let tools: Vec<LocalTool> = planned.plan.tools.iter().map(|t| t.tool.clone()).collect();
     let adds: Vec<LocalAdd> = planned.plan.adds.iter().map(|a| a.add.clone()).collect();
-    hybrid::cut_stock(&brep, &planned.cuts, &tools, &adds).map_err(|e| halt("hybrid_cut_failed", e.to_string()))
+    let cancelled = || s.cancel.is_cancelled();
+    hybrid::cut_stock(&brep, &planned.cuts, &tools, &adds, operations, &cancelled).map_err(|e| {
+        if cancelled() { Halt::Cancelled(cancelled_error()) } else { halt("hybrid_cut_failed", e.to_string()) }
+    })
 }
 
 /// Analytic faces and their share of the surface area, from a tessellation that knows its faces.
@@ -232,7 +249,18 @@ fn analytic_summary(brep: &Brep, tolerance: f64) -> Option<AnalyticSummary> {
         }
     }
     let share = if all > 0.0 { (on / all).clamp(0.0, 1.0) } else { 0.0 };
-    Some(AnalyticSummary { faces: analytic.len(), total_faces: brep.faces.len(), area_share: share })
+    Some(AnalyticSummary {
+        faces: analytic.len(),
+        total_faces: brep.faces.len(),
+        area_share: share,
+        left_by_work_bound: 0,
+    })
+}
+
+/// How many cuts, tools and additions the work bound left out.
+fn left_by_work_bound(built: &Built) -> usize {
+    let over = hybrid::CutStatus::Skipped(hybrid::OVER_WORK_BOUND.into());
+    built.primitives.iter().chain(&built.tools).chain(&built.adds).filter(|s| **s == over).count()
 }
 
 /// Everything the result is made of once the body is built and measured.
@@ -247,7 +275,9 @@ struct Measured {
 /// Puts the trimmed solid in the stock's body and measures it against the scan.
 fn measure(s: &mut Session, set: &Settings, stock: &Stock, built: Built, planned: &Planned) -> Step<Measured> {
     let brep = Arc::new(built.brep.clone());
+    let left = left_by_work_bound(&built);
     let analytic = analytic_summary(&brep, set.tolerance)
+        .map(|a| AnalyticSummary { left_by_work_bound: left, ..a })
         .ok_or_else(|| halt("hybrid_failed", "the faces could not be measured"))?;
     if analytic.faces == 0 {
         return Err(halt(
@@ -303,6 +333,7 @@ fn build(s: &mut Session, i: &ToSolidIn, set: &Settings, report: &ScanSummary) -
     let stock = make_stock(s, set, &planned)?;
     check_cancel(s)?;
     let built = trim_stock(s, &stock, &planned)?;
+    check_cancel(s)?;
     let measured = measure(s, set, &stock, built, &planned)?;
     apply_roles(&mut fitted.modelled, &measured.faces_of);
     let facts = NetworkFacts { closed: true, patches: stock.patches, capped: stock.capped };
@@ -362,5 +393,55 @@ pub(super) fn hybrid_solid(
             s.doc = before;
             Ok(failure(set, report, code, &message))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cmd::plan::Scan;
+    use surfacecraft_kernel::hybrid::{CutStatus, Shape};
+    use surfacecraft_kernel::solid::make_box;
+
+    /// A session with a box as the stock and a plan of `cuts` planes through it.
+    fn session_with_stock(cuts: usize) -> (Session, Stock, Planned) {
+        let mut s = Session::new();
+        let body = s.doc.add_body("stock", make_box([0.0; 3], [10.0, 10.0, 10.0]).expect("a box"));
+        let plan = plan::plan(&[], &Scan::from_points(Vec::new(), 1.0), 0.3);
+        let cuts = (0..cuts)
+            .map(|k| Cut {
+                shape: Shape::Plane { point: [8.0 - k as f64, 0.0, 0.0], normal: [1.0, 0.0, 0.0] },
+                convex: true,
+                full: false,
+            })
+            .collect();
+        (s, Stock { body, patches: 1, capped: false }, Planned { items: Vec::new(), plan, cuts })
+    }
+
+    #[test]
+    fn a_call_cancelled_during_the_cuts_ends_as_a_cancellation_and_changes_nothing() {
+        let (s, stock, planned) = session_with_stock(2);
+        let before = s.doc.body(stock.body).map(|b| b.brep.faces.len());
+        s.cancel.cancel();
+        assert!(matches!(trim_stock(&s, &stock, &planned), Err(Halt::Cancelled(_))));
+        assert_eq!(s.doc.body(stock.body).map(|b| b.brep.faces.len()), before, "the stock is untouched");
+    }
+
+    #[test]
+    fn the_cuts_are_made_when_the_call_runs() {
+        let (s, stock, planned) = session_with_stock(2);
+        let Ok(built) = trim_stock(&s, &stock, &planned) else { panic!("the cuts could not be made") };
+        assert!(built.primitives.iter().all(|c| matches!(c, CutStatus::Applied(_))));
+        assert_eq!(left_by_work_bound(&built), 0);
+    }
+
+    #[test]
+    fn a_stock_over_the_work_bound_leaves_the_rest_of_the_cuts_and_counts_them() {
+        // a stock of as many patches as the bound allows one operation for
+        let (s, stock, planned) = session_with_stock(3);
+        let big = Stock { patches: STOCK_WORK_BOUND, ..stock };
+        let Ok(built) = trim_stock(&s, &big, &planned) else { panic!("the first cut could not be made") };
+        assert_eq!(left_by_work_bound(&built), 2, "{:?}", built.primitives);
+        assert!(matches!(built.primitives[0], CutStatus::Applied(_)));
     }
 }

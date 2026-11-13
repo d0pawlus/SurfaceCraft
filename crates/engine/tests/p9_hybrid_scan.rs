@@ -70,6 +70,47 @@ fn scanned_session(seed: u64) -> (Session, Brep) {
     (s, part)
 }
 
+/// How far the analytic faces may be from the CAD's planes and cylinder (mm): the scan noise is 0.03.
+const GEOMETRY_TOLERANCE: f64 = 0.1;
+
+/// The plane of the flat cut is at `FLAT_Z` and the boss top at `BOSS_TOP` (normals along z), and the
+/// cylinder has the boss radius and its axis along z through the origin, within `GEOMETRY_TOLERANCE`.
+fn assert_analytic_geometry(b: &Brep) {
+    let unit = |v: [f64; 3]| {
+        let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        [v[0] / n, v[1] / n, v[2] / n]
+    };
+    let cross =
+        |a: [f64; 3], c: [f64; 3]| [a[1] * c[2] - a[2] * c[1], a[2] * c[0] - a[0] * c[2], a[0] * c[1] - a[1] * c[0]];
+    let mut plane_heights = Vec::new();
+    let mut cylinders = 0;
+    for f in &b.faces {
+        match &f.surface {
+            Surface::Plane { origin, u_axis, v_axis } => {
+                let n = unit(cross(*u_axis, *v_axis));
+                assert!(n[2].abs() > 0.999, "a plane normal {n:?} is not along z");
+                plane_heights.push(origin[2]);
+            }
+            Surface::Cylinder { frame, radius } => {
+                cylinders += 1;
+                assert!((radius - BOSS_R).abs() < GEOMETRY_TOLERANCE, "radius {radius}");
+                let axis = unit(cross(frame.x_axis, frame.y_axis));
+                assert!(axis[2].abs() > 0.999, "axis {axis:?}");
+                let (x, y) = (frame.origin[0], frame.origin[1]);
+                assert!(x.hypot(y) < GEOMETRY_TOLERANCE, "axis through ({x}, {y})");
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(cylinders, 1);
+    for want in [FLAT_Z, BOSS_TOP] {
+        assert!(
+            plane_heights.iter().any(|h| (h - want).abs() < GEOMETRY_TOLERANCE),
+            "no plane at z = {want}: {plane_heights:?}"
+        );
+    }
+}
+
 fn to_solid(s: &mut Session, method: &str) -> Value {
     s.execute("scan.to_solid", json!({"scan": "scan", "method": method, "tolerance": 0.2, "name": method})).unwrap()
 }
@@ -113,6 +154,7 @@ fn the_hybrid_method_puts_the_flat_cut_and_the_boss_on_analytic_faces() {
     let (planes, cylinders, splines, others) = kinds(&brep);
     eprintln!("hybrid: {planes} planes, {cylinders} cylinders, {splines} splines, {others} others; {}", r["analytic"]);
     assert!(planes >= 1 && cylinders == 1, "the flat cut is a plane and the boss wall a cylinder");
+    assert_analytic_geometry(&brep);
     assert!(splines > 50, "the organic rest is still patches: {splines}");
     assert_eq!(r["analytic"]["faces"].as_u64().unwrap() as usize, planes + cylinders + others);
     assert_eq!(r["analytic"]["total_faces"].as_u64().unwrap() as usize, brep.faces.len());
@@ -144,27 +186,22 @@ fn the_hybrid_method_puts_the_flat_cut_and_the_boss_on_analytic_faces() {
     assert!(f["analytic"].is_null());
 }
 
-/// `auto` tries the hybrid method as its third attempt on a scan with enough primitives and returns it
-/// when it is not worse: here the freeform wrap passes as well, and the analytic faces decide. The
-/// two extra attempts of the call's budget are the wrap and the hybrid body.
+/// `auto` does not run the hybrid method after a result that is a pass (here the freeform wrap passes):
+/// it returns that result and names the call that would build the hybrid body.
 #[test]
-fn auto_returns_the_hybrid_body_when_the_patch_network_is_no_better() {
+fn auto_offers_the_hybrid_body_after_a_pass_and_does_not_run_it() {
     let (mut s, _) = scanned_session(5);
     let bodies_before = s.doc.bodies.len();
     let r = to_solid(&mut s, "auto");
-    let attempts = r["attempts"].as_array().unwrap();
-    let methods: Vec<&str> = attempts.iter().map(|a| a["method"].as_str().unwrap()).collect();
-    eprintln!("auto: {methods:?}, returned {}, analytic {}", r["method"], r["analytic"]);
-    assert_eq!(methods.last(), Some(&"hybrid"), "{r}");
-    assert!(methods.contains(&"freeform"), "the patch network was tried too: {methods:?}");
-    let returned: Vec<&str> =
-        attempts.iter().filter(|a| a["returned"] == true).map(|a| a["method"].as_str().unwrap()).collect();
-    assert_eq!(returned, ["hybrid"], "{r}");
-    assert_eq!(r["verdict"], "pass");
-    assert!(r["analytic"]["faces"].as_u64().unwrap() >= 2, "{r}");
-    // the losers left nothing: one more body than before, the result's
+    let methods: Vec<&str> = r["attempts"].as_array().unwrap().iter().map(|a| a["method"].as_str().unwrap()).collect();
+    assert!(!methods.contains(&"hybrid"), "{methods:?}");
+    assert_eq!(r["verdict"], "pass", "{r}");
+    assert!(r["analytic"].is_null());
+    let offer =
+        r["next_steps"].as_array().unwrap().iter().find(|n| n["params"]["method"] == "hybrid").expect("an offer");
+    assert_eq!(offer["command"], "scan.to_solid");
+    assert!(offer["why"].as_str().unwrap().contains("analytic faces"), "{offer}");
     assert_eq!(s.doc.bodies.len(), bodies_before + 1, "a losing attempt left a body");
-    assert_eq!(s.doc.bodies.iter().filter(|b| b.name == "auto").count(), 1);
 }
 
 fn open_scan(mesh: Mesh) -> Session {
