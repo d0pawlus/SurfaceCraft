@@ -112,9 +112,25 @@ pub(super) fn assemble(
         flipped_triangles: work.flipped,
         clamped_vertices: scale.iter().filter(|&&s| s < 1.0).count(),
         largest_reduction: params.thickness.abs() * (1.0 - reduction),
+        median_reduction: median_reduction(scale, params.thickness.abs()),
+        folded_vertices: work.folded,
     };
     let scan_layer = if !params.symmetric && params.thickness < 0.0 { ScanLayer::Inner } else { ScanLayer::Outer };
-    Ok(Thickened { mesh, report, scan_layer, layer_vertices: n, layer_triangles: work.triangles.len() })
+    Ok(Thickened {
+        mesh,
+        report,
+        scan_layer,
+        scale: scale.to_vec(),
+        layer_vertices: n,
+        layer_triangles: work.triangles.len(),
+    })
+}
+
+/// Median of the reductions of the thickness over the vertices that were reduced (0 when none).
+fn median_reduction(scale: &[f64], thickness: f64) -> f64 {
+    let mut r: Vec<f64> = scale.iter().filter(|&&s| s < 1.0).map(|s| thickness * (1.0 - s)).collect();
+    r.sort_by(f64::total_cmp);
+    r.get(r.len() / 2).copied().unwrap_or(0.0)
 }
 
 /// The shell is closed (every edge has its opposite), and encloses a positive volume.

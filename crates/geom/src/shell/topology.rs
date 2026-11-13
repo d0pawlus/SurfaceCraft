@@ -16,6 +16,8 @@ pub(super) struct Work {
     pub removed: usize,
     /// Triangles turned around to make the orientation consistent.
     pub flipped: usize,
+    /// Vertices on a triangle of the offset that folded before it was relaxed.
+    pub folded: usize,
 }
 
 /// Compressed rows: `row(i)` lists the items of vertex `i`.
@@ -92,7 +94,7 @@ pub(super) fn compact(mesh: &Mesh) -> Work {
     }
     let triangles =
         kept.iter().map(|t| [0, 1, 2].map(|k| slot.get(t[k] as usize).copied().unwrap_or(0))).collect::<Vec<_>>();
-    Work { positions, triangles, dropped, pinch_splits: 0, removed: 0, flipped: 0 }
+    Work { positions, triangles, dropped, pinch_splits: 0, removed: 0, flipped: 0, folded: 0 }
 }
 
 /// Drops the vertices no triangle uses (the order of the others is kept).

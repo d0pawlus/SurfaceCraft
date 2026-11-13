@@ -73,6 +73,10 @@ pub struct ThickenReport {
     pub clamped_vertices: usize,
     /// Largest reduction of the thickness at a vertex (mm).
     pub largest_reduction: f64,
+    /// Median reduction of the thickness over the vertices that were reduced (mm; 0 when none).
+    pub median_reduction: f64,
+    /// Vertices of triangles that folded before the relaxation (the others reduced were only tapered).
+    pub folded_vertices: usize,
 }
 
 /// A closed shell.
@@ -84,6 +88,8 @@ pub struct Thickened {
     pub report: ThickenReport,
     /// Which layer of `mesh` the scan lies on.
     pub scan_layer: ScanLayer,
+    /// Share of the offset each vertex of the scan face keeps (1: all of it).
+    pub scale: Vec<f64>,
     layer_vertices: usize,
     layer_triangles: usize,
 }
@@ -228,7 +234,8 @@ pub fn thicken(mesh: &Mesh, params: &ThickenParams) -> Result<Thickened, Thicken
     let normals =
         normals::smoothed(&work.positions, &work.triangles, &adjacent, passes).ok_or(ThickenError::NoNormals)?;
     let (a, b) = layer_offsets(params);
-    let scale = fold_free_scale(&work, &normals, &adjacent, &[a, b], params.thickness)?;
+    let (scale, folded) = fold_free_scale(&work, &normals, &adjacent, &[a, b], params.thickness)?;
+    work.folded = folded;
     assemble(&work, &normals, &scale, (a, b), &boundary, params)
 }
 
@@ -253,7 +260,7 @@ fn fold_free_scale(
     adjacent: &Csr,
     offsets: &[f64; 2],
     thickness: f64,
-) -> Result<Vec<f64>, ThickenError> {
+) -> Result<(Vec<f64>, usize), ThickenError> {
     let pairs: Vec<(u32, u32)> =
         work.triangles.iter().enumerate().flat_map(|(i, t)| t.iter().map(move |&v| (v, i as u32))).collect();
     let around = Csr::from_pairs(work.positions.len(), &pairs);
@@ -281,7 +288,7 @@ fn fold_free_scale(
             suggested: thickness.abs() * quantile_scale(&scale),
         });
     }
-    Ok(scale)
+    Ok((scale, relaxed.folded))
 }
 
 /// The scale below which a share [`MAX_CLAMPED_SHARE`] of the vertices lies (1 when empty).

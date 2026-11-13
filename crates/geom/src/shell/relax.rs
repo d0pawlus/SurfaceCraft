@@ -14,7 +14,7 @@ use super::topology::Csr;
 use crate::{Point3, Vec3, par};
 
 /// A triangle whose offset copy keeps less than this share of its area is folded.
-pub(super) const MIN_AREA_RATIO: f64 = 0.15;
+pub(super) const MIN_AREA_RATIO: f64 = 0.05;
 /// A triangle whose offset copy has a normal with a smaller cosine to the original's is folded.
 pub(super) const MIN_NORMAL_COS: f64 = 0.3;
 /// Triangles thinner than this (twice the area over the longest edge squared; 0.87 for an
@@ -23,7 +23,7 @@ const MIN_QUALITY: f64 = 0.05;
 /// Factor a flagged vertex's offset is multiplied by in every round.
 const SHRINK: f64 = 0.8;
 /// Largest change of the offset distance per distance between neighbouring vertices.
-const MAX_OFFSET_SLOPE: f64 = 0.5;
+const MAX_OFFSET_SLOPE: f64 = 0.75;
 /// Rounds at most; `SHRINK^ROUNDS` is the smallest share of the offset a vertex can keep.
 const MAX_ROUNDS: usize = 60;
 

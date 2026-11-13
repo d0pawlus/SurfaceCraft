@@ -38,6 +38,10 @@ pub struct ThickenedInfo {
     pub clamped_vertices: usize,
     /// Largest reduction of the thickness at a vertex (mm).
     pub largest_reduction: f64,
+    /// Median reduction of the thickness over the reduced vertices (mm).
+    pub median_reduction: f64,
+    /// Vertices of triangles that folded before the relaxation; the other reduced vertices were tapered.
+    pub folded_vertices: usize,
     /// Boundary loops of the scan stitched to their offset copies (the rim, windows).
     pub boundary_loops: usize,
     /// Triangles of the thickened mesh.
@@ -91,6 +95,8 @@ fn info(shell: &Thickened, i: &ToSolidIn, kept: Option<ObjectId>) -> ThickenedIn
         symmetric: i.symmetric,
         clamped_vertices: shell.report.clamped_vertices,
         largest_reduction: shell.report.largest_reduction,
+        median_reduction: shell.report.median_reduction,
+        folded_vertices: shell.report.folded_vertices,
         boundary_loops: shell.report.boundary_loops,
         triangles: shell.mesh.triangle_count(),
         mesh: kept,
