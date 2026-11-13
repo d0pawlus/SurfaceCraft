@@ -66,6 +66,14 @@ pub struct PairOut {
     pub icp_converged: bool,
     /// How firmly the matched part pins the pose (smallest eigenvalue of its point-to-plane system): 0.2 for a bracket, 0.01 and up for a real scan, below 0.001 it can slide or turn freely (the verdict is then `ambiguous`). It is evidence only: every pose is pushed along its three weakest directions (see `probed`, `slides`), and the verdict follows from what those pushes do.
     pub stability: f64,
+    /// Displaced starts that could not be refined (no pairs within the trimming distance); the pose is then never `unique`.
+    pub probes_failed: usize,
+    /// Spread of the fit (shares of the moving scan's area) among the starts that came back.
+    pub probe_noise: f64,
+    /// Clearance below which a start that settled elsewhere counts as a slide: the larger of 0.02 and 8 times the spread.
+    pub probe_threshold: f64,
+    /// Largest clearance among the starts counted as slides (0 when none).
+    pub probe_slide_clearance: f64,
     /// Displaced starts tried: the pose is displaced by 0.2 of the moving scan's extent along each of its three weakest directions (more when further ones read below 0.04), in both senses, and refined again (6 for every pose, at most 12).
     pub probed: usize,
     /// Of those, the starts that ended in a different pose that fits as well: slides, listed as alternatives.
@@ -171,7 +179,12 @@ pub(super) fn pair(s: &mut Session, i: PairIn) -> CmdResult<PairOut> {
     let id = i.object.resolve(s, ObjectKind::Mesh)?;
     let moving = s.doc.mesh(id).map(|m| m.mesh.clone()).ok_or_else(|| CmdError::Params(format!("no mesh {id}")))?;
     let fixed = target_mesh(s, &i.target)?;
-    let r = match pair_coarse(&moving, &fixed, &PairOptions { tolerance: i.tolerance }, &s.cancel) {
+    let r = match pair_coarse(
+        &moving,
+        &fixed,
+        &PairOptions { tolerance: i.tolerance, ..PairOptions::default() },
+        &s.cancel,
+    ) {
         Ok(r) => r,
         Err(AlignError::Cancelled) => return Err(crate::cmd::cancelled()),
         Err(e) => return Err(e.into()),
@@ -195,6 +208,10 @@ pub(super) fn pair(s: &mut Session, i: PairIn) -> CmdResult<PairOut> {
         refined: r.refined,
         stability: r.stability,
         probed: r.probed,
+        probes_failed: r.probes_failed,
+        probe_noise: r.probe_noise,
+        probe_threshold: r.probe_threshold,
+        probe_slide_clearance: r.probe_slide_clearance,
         slides: r.slides,
         probe_margin: r.probe_margin,
         probe_return_gap: r.probe_return_gap,

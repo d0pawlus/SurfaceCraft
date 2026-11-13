@@ -64,6 +64,9 @@ pub struct PairOptions {
     /// Distance (mm) within which a point of one scan counts as lying on the other; `None` takes
     /// it from the residual of the best pose (between 0.15 % and 2 % of the diagonal).
     pub tolerance: Option<f64>,
+    /// How far the probes displace a pose, as a fraction of the extent of the moving scan (default
+    /// 0.2). For tests: a start displaced far beyond reach has no pairs and counts as failed.
+    pub probe_step: Option<f64>,
 }
 
 /// What [`pair_coarse`] found.
@@ -97,8 +100,16 @@ pub struct PairResult {
     pub stability: f64,
     /// Displaced starts tried for a weakly pinned pose (0 for a pinned or a free one).
     pub probed: usize,
-    /// Of those, the ones that ended in a different pose that fits as well (they are alternatives).
+    /// Of those, the ones whose refinement could not run (no pairs within the trimming distance); a pose with any is never `unique`.
+    pub probes_failed: usize,
+    /// Of the completed ones, the starts that ended in a different pose that fits as well (they are alternatives).
     pub slides: usize,
+    /// Spread of the conflicts among the starts that came back (shares of the moving scan's area).
+    pub probe_noise: f64,
+    /// Clearance below which a start that settled elsewhere counts as a slide: the larger of 0.02 and 8 times the spread.
+    pub probe_threshold: f64,
+    /// Largest clearance among the starts counted as slides (0 when none).
+    pub probe_slide_clearance: f64,
     /// Smallest clearance of the pose over the displaced starts that ended elsewhere; the
     /// ambiguity margin is the bound (`None`: all came back).
     pub probe_margin: Option<f64>,
@@ -119,6 +130,8 @@ struct Cand {
 struct Ranked {
     cand: Cand,
     fit: Fit,
+    /// A pose a displaced start of the best one settled in, as good as it: an alternative whatever its clearance.
+    slide: bool,
 }
 
 struct Scene<'a> {
@@ -241,14 +254,15 @@ impl<'a> Scene<'a> {
 
     /// Two ICP passes from `c`; `None` when ICP cannot run from there (the candidate is dropped).
     fn refine(&self, c: &Cand, cancel: &Cancel) -> Result<Option<Cand>, AlignError> {
+        self.refine_cuts(c, REFINE_CUTS.map(|f| f * self.diag), cancel)
+    }
+
+    /// [`Scene::refine`] with the cut distances (mm) of the two passes given.
+    fn refine_cuts(&self, c: &Cand, cuts: [f64; 2], cancel: &Cancel) -> Result<Option<Cand>, AlignError> {
         let mut t = c.t;
-        for cut in REFINE_CUTS {
-            let opts = IcpOptions {
-                max_iterations: 25,
-                tolerance: 1e-3,
-                max_distance: Some(cut * self.diag),
-                max_samples: SAMPLE_CAP,
-            };
+        for cut in cuts {
+            let opts =
+                IcpOptions { max_iterations: 25, tolerance: 1e-3, max_distance: Some(cut), max_samples: SAMPLE_CAP };
             match self.icp(&self.mov_cloud, &t, &opts, cancel) {
                 Ok(rep) => t = rep.transform,
                 Err(AlignError::Cancelled) => return Err(AlignError::Cancelled),
@@ -276,15 +290,6 @@ impl<'a> Scene<'a> {
 
     /// The tolerance: the user's, or five times the median residual of the best refined pose.
     fn tolerance(&self, refined: &[Cand], user: Option<f64>) -> f64 {
-        if std::env::var("PAIR_DBG").is_ok() {
-            for r in refined {
-                eprintln!(
-                    "DBG refined msac {:.4} share {:.3}",
-                    self.msac_at(&r.t, TAU_RANGE.1 * self.diag),
-                    fit_of(&self.fixed, &self.mov.pts, &r.t, TAU_RANGE.1 * self.diag, false).share
-                );
-            }
-        }
         let (lo, hi) = (TAU_RANGE.0 * self.diag, TAU_RANGE.1 * self.diag);
         if let Some(u) = user {
             return u;
@@ -306,7 +311,9 @@ impl<'a> Scene<'a> {
         let mut all: Vec<(usize, Ranked)> = refined
             .into_iter()
             .enumerate()
-            .map(|(i, cand)| (i, Ranked { fit: fit_of(&self.fixed, &self.mov.pts, &cand.t, tau, true), cand }))
+            .map(|(i, cand)| {
+                (i, Ranked { fit: fit_of(&self.fixed, &self.mov.pts, &cand.t, tau, true), cand, slide: false })
+            })
             .collect();
         all.sort_by(|a, b| {
             b.1.fit.score().total_cmp(&a.1.fit.score()).then(a.1.fit.msac.total_cmp(&b.1.fit.msac)).then(a.0.cmp(&b.0))
@@ -355,17 +362,17 @@ impl<'a> Scene<'a> {
         let rep = match self.icp(self.moving, &best.cand.t, &opts, cancel) {
             Ok(rep) => rep,
             Err(AlignError::Cancelled) => return Err(AlignError::Cancelled),
-            Err(_) => return Ok((Ranked { cand: best.cand, fit: best.fit }, 0, false)),
+            Err(_) => return Ok((Ranked { cand: best.cand, fit: best.fit, slide: false }, 0, false)),
         };
         let fit = fit_of(&self.fixed, &self.mov.pts, &rep.transform, tau, true);
         if fit.score() >= best.fit.score() - 1e-9 {
             Ok((
-                Ranked { cand: Cand { t: rep.transform, method: best.cand.method }, fit },
+                Ranked { cand: Cand { t: rep.transform, method: best.cand.method }, fit, slide: false },
                 rep.iterations,
                 rep.converged,
             ))
         } else {
-            Ok((Ranked { cand: best.cand, fit: best.fit }, rep.iterations, rep.converged))
+            Ok((Ranked { cand: best.cand, fit: best.fit, slide: false }, rep.iterations, rep.converged))
         }
     }
 
@@ -423,18 +430,24 @@ fn solve(scene: &Scene, hyps: Vec<Cand>, opts: &PairOptions, cancel: &Cancel) ->
     }
     let first = ranked.remove(0);
     let (best, icp_iterations, icp_converged) = scene.polish(&first, tau, cancel)?;
-    let probe = scene.probe(&best, tau, cancel)?;
+    let probe = scene.probe_at(&best, tau, cancel, opts.probe_step.unwrap_or(probe::PROBE_STEP))?;
     let probes = corners(&scene.mov.pts);
     for r in probe.slides.iter() {
         if ranked.iter().all(|k| pose_gap(&k.cand.t, &r.cand.t, &probes) > SAME_POSE_AFTER * scene.diag) {
-            ranked.push(Ranked { cand: r.cand, fit: r.fit });
+            ranked.push(Ranked { cand: r.cand, fit: r.fit, slide: true });
         }
     }
     let poses: Vec<Transform> = std::iter::once(best.cand.t).chain(ranked.iter().map(|r| r.cand.t)).collect();
     let shares = scene.overlaps_fixed(&poses, tau);
-    let mut result = conclude(&best, &ranked, tau, &shares, refined_count, probe.stability)?;
-    result.probed = probe.tested;
+    let checks =
+        verdict::ProbeFacts { attempted: probe.attempted, completed: probe.completed, slides: probe.slides.len() };
+    let mut result = conclude(&best, &ranked, tau, &shares, refined_count, probe.stability, checks)?;
+    result.probed = probe.attempted;
+    result.probes_failed = probe.attempted - probe.completed;
     result.slides = probe.slides.len();
+    result.probe_noise = probe.noise;
+    result.probe_threshold = probe.threshold;
+    result.probe_slide_clearance = probe.slide_clearance;
     result.probe_margin = probe.margin;
     result.probe_return_gap = probe.returned_gap;
     result.candidates = candidates;
@@ -452,6 +465,7 @@ fn conclude(
     shares: &[f64],
     refined: usize,
     stable: f64,
+    probes: verdict::ProbeFacts,
 ) -> Result<PairResult, AlignError> {
     if !best.cand.t.to_rows().iter().flatten().all(|v| v.is_finite()) {
         return Err(AlignError::Degenerate("the pose is not finite".into()));
@@ -462,11 +476,13 @@ fn conclude(
         .iter()
         .map(|r| clearance(&best.fit, &r.fit))
         .fold(None, |m: Option<f64>, c| Some(m.map_or(c, |x| x.min(c))));
-    let (verdict, confidence) = verdict::judge(&best.fit, overlap, tau, nearest, refined, stable);
+    let (verdict, confidence) = verdict::judge(&best.fit, overlap, tau, nearest, refined, stable, probes);
     let alternatives: Vec<PairCandidate> = others
         .iter()
         .zip(shares.iter().skip(1))
-        .filter(|(r, _)| verdict == PairVerdict::Ambiguous && clearance(&best.fit, &r.fit) < AMBIGUITY_MARGIN)
+        .filter(|(r, _)| {
+            verdict == PairVerdict::Ambiguous && (r.slide || clearance(&best.fit, &r.fit) < AMBIGUITY_MARGIN)
+        })
         .take(MAX_ALTERNATIVES)
         .map(|(r, s)| alternative(r, *s))
         .collect();
@@ -484,7 +500,11 @@ fn conclude(
         refined,
         stability: stable,
         probed: 0,
+        probes_failed: 0,
         slides: 0,
+        probe_noise: 0.0,
+        probe_threshold: 0.0,
+        probe_slide_clearance: 0.0,
         probe_margin: None,
         probe_return_gap: 0.0,
         icp_iterations: 0,

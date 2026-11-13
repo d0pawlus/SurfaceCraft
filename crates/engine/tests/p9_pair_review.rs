@@ -264,8 +264,6 @@ fn p9_pair_malformed_meshes_and_choices_give_specific_answers() {
 
 /// Mirrors `STABILITY_FLOOR` of the library (below it a pose is called free without a test).
 const FLOOR: f64 = 0.001;
-/// Mirrors `AMBIGUITY_MARGIN`.
-const MARGIN: f64 = 0.03;
 
 /// How a case is built: (fixed, moving before its motion) on a coarse or a fine mesh.
 type Build = Box<dyn Fn(bool) -> (Mesh, Mesh)>;
@@ -427,17 +425,28 @@ fn gate_m2_loose_poses_are_decided_by_pushing_them() {
             let (stability, probed, slides) =
                 (stab(&out), out["probed"].as_u64().unwrap(), out["slides"].as_u64().unwrap());
             let margin = out["probe_margin"].as_f64();
+            let (noise, threshold) = (out["probe_noise"].as_f64().unwrap(), out["probe_threshold"].as_f64().unwrap());
+            let (slide_max, failed) =
+                (out["probe_slide_clearance"].as_f64().unwrap(), out["probes_failed"].as_u64().unwrap());
+            let ratio = |num: f64, den: f64| if den > 0.0 { num / den } else { f64::INFINITY };
             let gap = out["probe_return_gap"].as_f64().unwrap();
             eprintln!(
-                "PUSH {name} [{label}, {} tris]: {} stability {stability:.5}, probed {probed}, slides {slides}, margin {margin:?}, return gap {gap:.3} mm, pose {angle:.3} deg {disp:.3} mm, {} alternatives",
+                "PUSH {name} [{label}, {} tris]: {} stability {stability:.5}, probed {probed}, slides {slides}, failed {failed}, spread {noise:.4}, threshold {threshold:.4}, margin {margin:?} (x{:.1} of threshold), slide clearance {slide_max:.4} (threshold x{:.1}), return gap {gap:.3} mm, pose {angle:.3} deg {disp:.3} mm, {} alternatives",
                 fixed.triangle_count(),
                 out["verdict"],
+                ratio(margin.unwrap_or(f64::INFINITY), threshold),
+                ratio(threshold, slide_max),
                 out["alternatives"].as_array().unwrap().len()
             );
             match expect {
                 Expect::Slides => {
                     assert_eq!(out["verdict"], "ambiguous", "{name} [{label}]: {out}");
                     assert!(slides >= 1, "{name} [{label}]: the probe found no slide ({probed} starts)");
+                    // every start counted as a slide fails to clear the pose by at least 2x
+                    assert!(
+                        2.0 * slide_max <= threshold,
+                        "{name} [{label}]: slide clearance {slide_max} vs threshold {threshold}"
+                    );
                 }
                 Expect::Ambiguous => {
                     assert_eq!(out["verdict"], "ambiguous", "{name} [{label}]: {out}");
@@ -449,8 +458,12 @@ fn gate_m2_loose_poses_are_decided_by_pushing_them() {
                     assert!(angle <= max_angle && disp <= max_disp, "{name} [{label}]: {angle} deg {disp} mm");
                     assert!(stability > 3.0 * FLOOR, "{name} [{label}]: the floor must not catch it ({stability})");
                     assert_eq!(slides, 0);
-                    // every displaced start that ended elsewhere fit clearly worse (twice the margin or more)
-                    assert!(margin.is_none_or(|m| m >= 2.0 * MARGIN), "{name} [{label}]: margin {margin:?}");
+                    assert_eq!(failed, 0, "{name} [{label}]: a displaced start could not be refined");
+                    // every displaced start that ended elsewhere clears the pose by at least 2x the threshold
+                    assert!(
+                        margin.is_none_or(|m| m >= 2.0 * threshold),
+                        "{name} [{label}]: margin {margin:?} vs threshold {threshold}"
+                    );
                     // and those that came back did so within a quarter of the pose tolerance (2 % of the diagonal)
                     assert!(gap <= 0.25 * 0.02 * fixed.bbox().diagonal(), "{name} [{label}]: returned {gap} mm off");
                 }
@@ -513,5 +526,45 @@ fn gate_m2_stability_does_not_move_with_the_density_of_the_mesh() {
                 assert!((1.0 / 3.0..=3.0).contains(&ratio), "{name}: moved with the density, {read:?}");
             }
         }
+    }
+}
+
+/// Review round 4: a weak patch of the same part is `ambiguous`, never `no_match`, whatever pose
+/// the candidates start from: a patch strictly inside the face of a thin plate (its centroid lies
+/// inside the plate, midway between two faces, where an ICP hovers), on coarse and fine meshes,
+/// for several noise seeds and plate thicknesses.
+#[test]
+fn p9_pair_a_weak_patch_of_a_thin_plate_is_ambiguous_never_no_match() {
+    let interior = |c: &Point3| c.z > 1.4 && c.x > 15.0 && c.x < 40.0 && c.y > 10.0 && c.y < 30.0;
+    for (seed, thickness, fine_mesh) in [
+        (0u64, 4.0, false),
+        (1, 4.0, false),
+        (2, 4.0, false),
+        (3, 2.0, false),
+        (4, 6.0, false),
+        (0, 4.0, true),
+        (1, 2.0, true),
+    ] {
+        let plate = |n: usize| synth::cuboid(Point3::origin(), Vec3::new(60.0, 40.0, thickness), n);
+        let (fixed, moving) = if fine_mesh {
+            (
+                fine(&plate(10), 1 + 10 * seed),
+                cut(&fine(&plate(14), 5 + 10 * seed), |c| interior(c) && c.z > thickness - 0.1),
+            )
+        } else {
+            (
+                noisy(plate(10), 1 + 10 * seed),
+                cut(&noisy(plate(14), 5 + 10 * seed), |c| interior(c) && c.z > thickness - 0.1),
+            )
+        };
+        let mut s = session(&fixed, &moving, &random_motion(seed));
+        let out = pair(&mut s, json!({}));
+        eprintln!(
+            "THIN seed {seed} thickness {thickness} fine {fine_mesh}: {} stability {:.5}, slides {}",
+            out["verdict"],
+            stab(&out),
+            out["slides"]
+        );
+        assert_eq!(out["verdict"], "ambiguous", "seed {seed}, thickness {thickness}, fine {fine_mesh}: {out}");
     }
 }

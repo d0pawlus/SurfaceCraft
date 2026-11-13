@@ -73,10 +73,21 @@ pub struct PairCandidate {
     pub method: CoarseMethod,
 }
 
+/// What the probes of a pose found, for the verdict.
+#[derive(Clone, Copy)]
+pub(super) struct ProbeFacts {
+    /// Displaced starts tried.
+    pub attempted: usize,
+    /// Of those, the ones whose refinement ran.
+    pub completed: usize,
+    /// Of those, the ones that settled elsewhere as well as the pose.
+    pub slides: usize,
+}
+
 /// Verdict and confidence from the facts of the best pose: `overlap` is the larger of the two
 /// shares, `tau` is in mm, `clearance` is the smallest [`super::score::clearance`] to any other
 /// distinct pose (`None` when all others are the same pose), `refined` the number of candidates
-/// that could be refined: with fewer than two, nothing was compared and the answer is never certain;
+/// that could be refined (with fewer than two, nothing was compared and the answer is never certain;
 /// `stable` below [`STABILITY_FLOOR`] means the part leaves the pose free to slide: ambiguous.
 pub(super) fn judge(
     best: &Fit,
@@ -85,6 +96,7 @@ pub(super) fn judge(
     clearance: Option<f64>,
     refined: usize,
     stable: f64,
+    probes: ProbeFacts,
 ) -> (PairVerdict, f64) {
     if !(overlap >= MIN_OVERLAP) || !(best.rms <= MAX_RMS_FRACTION * tau) || !(best.conflict <= MAX_CONFLICT) {
         return (PairVerdict::NoMatch, 0.0);
@@ -94,6 +106,11 @@ pub(super) fn judge(
     }
     let gap = clearance.unwrap_or(1.0);
     let confidence = (gap / FULL_CONFIDENCE_GAP).clamp(0.0, 1.0);
+    // a pose that slides, or that was not tested through (no direction, or a start whose ICP could not
+    // run), is not certain
+    if probes.slides > 0 || probes.attempted == 0 || probes.completed < probes.attempted {
+        return (PairVerdict::Ambiguous, confidence.min(0.25));
+    }
     if !(stable >= STABILITY_FLOOR) {
         return (PairVerdict::Ambiguous, confidence.min(0.25));
     }
@@ -105,6 +122,8 @@ pub(super) fn judge(
 mod tests {
     use super::*;
 
+    const OK: ProbeFacts = ProbeFacts { attempted: 6, completed: 6, slides: 0 };
+
     fn fit(share: f64, conflict: f64, rms: f64) -> Fit {
         Fit { share, conflict, rms, msac: 0.0 }
     }
@@ -112,30 +131,46 @@ mod tests {
     #[test]
     fn verdicts_follow_overlap_fit_and_the_clearance() {
         let best = fit(0.99, 0.01, 0.05);
-        assert_eq!(judge(&best, 0.99, 0.3, None, 8, 0.1).0, PairVerdict::Unique);
-        assert_eq!(judge(&best, 0.99, 0.3, Some(0.10), 8, 0.1).0, PairVerdict::Unique);
-        assert_eq!(judge(&best, 0.99, 0.3, Some(0.01), 8, 0.1).0, PairVerdict::Ambiguous);
-        assert_eq!(judge(&best, 0.99, 0.3, Some(0.0), 8, 0.1).1, 0.0);
-        assert_eq!(judge(&fit(0.1, 0.0, 0.05), 0.2, 0.3, None, 8, 0.1).0, PairVerdict::NoMatch);
-        assert_eq!(judge(&fit(0.9, 0.0, 0.2), 0.9, 0.3, None, 8, 0.1).0, PairVerdict::NoMatch);
-        assert_eq!(judge(&fit(0.5, 0.4, 0.05), 0.5, 0.3, None, 8, 0.1).0, PairVerdict::NoMatch);
-        assert_eq!(judge(&fit(f64::NAN, 0.0, 0.0), f64::NAN, 0.3, None, 8, 0.1).0, PairVerdict::NoMatch);
+        assert_eq!(judge(&best, 0.99, 0.3, None, 8, 0.1, OK).0, PairVerdict::Unique);
+        assert_eq!(judge(&best, 0.99, 0.3, Some(0.10), 8, 0.1, OK).0, PairVerdict::Unique);
+        assert_eq!(judge(&best, 0.99, 0.3, Some(0.01), 8, 0.1, OK).0, PairVerdict::Ambiguous);
+        assert_eq!(judge(&best, 0.99, 0.3, Some(0.0), 8, 0.1, OK).1, 0.0);
+        assert_eq!(judge(&fit(0.1, 0.0, 0.05), 0.2, 0.3, None, 8, 0.1, OK).0, PairVerdict::NoMatch);
+        assert_eq!(judge(&fit(0.9, 0.0, 0.2), 0.9, 0.3, None, 8, 0.1, OK).0, PairVerdict::NoMatch);
+        assert_eq!(judge(&fit(0.5, 0.4, 0.05), 0.5, 0.3, None, 8, 0.1, OK).0, PairVerdict::NoMatch);
+        assert_eq!(judge(&fit(f64::NAN, 0.0, 0.0), f64::NAN, 0.3, None, 8, 0.1, OK).0, PairVerdict::NoMatch);
     }
 
     /// A part that can slide is ambiguous however clear the other candidates are.
     #[test]
     fn a_part_that_can_slide_is_ambiguous() {
         let best = fit(0.99, 0.01, 0.05);
-        assert_eq!(judge(&best, 0.99, 0.3, None, 8, 0.0004).0, PairVerdict::Ambiguous);
-        assert!(judge(&best, 0.99, 0.3, None, 8, 0.0004).1 <= 0.25);
-        assert_eq!(judge(&best, 0.99, 0.3, None, 8, f64::NAN).0, PairVerdict::Ambiguous);
+        assert_eq!(judge(&best, 0.99, 0.3, None, 8, 0.0004, OK).0, PairVerdict::Ambiguous);
+        assert!(judge(&best, 0.99, 0.3, None, 8, 0.0004, OK).1 <= 0.25);
+        assert_eq!(judge(&best, 0.99, 0.3, None, 8, f64::NAN, OK).0, PairVerdict::Ambiguous);
     }
 
     /// One refined candidate means nothing was compared: never certain.
     #[test]
     fn a_single_refined_candidate_is_never_unique() {
         let best = fit(0.99, 0.01, 0.05);
-        assert_eq!(judge(&best, 0.99, 0.3, None, 1, 0.1), (PairVerdict::Ambiguous, 0.0));
-        assert_eq!(judge(&best, 0.99, 0.3, None, 5, 0.1).0, PairVerdict::Unique, "five refined, all the same pose");
+        assert_eq!(judge(&best, 0.99, 0.3, None, 1, 0.1, OK), (PairVerdict::Ambiguous, 0.0));
+        assert_eq!(judge(&best, 0.99, 0.3, None, 5, 0.1, OK).0, PairVerdict::Unique, "five refined, all the same pose");
+    }
+
+    /// Finding 1: a pose whose displaced starts could not all be refined (or none was tried), or that
+    /// has slides, is not certain, however clear the candidates are.
+    #[test]
+    fn untested_or_sliding_poses_are_never_unique() {
+        let best = fit(0.99, 0.01, 0.05);
+        let failed = ProbeFacts { attempted: 6, completed: 5, slides: 0 };
+        let none = ProbeFacts { attempted: 0, completed: 0, slides: 0 };
+        let slides = ProbeFacts { attempted: 6, completed: 6, slides: 2 };
+        for (name, p) in [("failed", failed), ("none", none), ("slides", slides)] {
+            let (verdict, confidence) = judge(&best, 0.99, 0.3, None, 8, 0.1, p);
+            assert_eq!(verdict, PairVerdict::Ambiguous, "{name}");
+            assert!(confidence <= 0.25, "{name}: {confidence}");
+        }
+        assert_eq!(judge(&best, 0.99, 0.3, None, 8, 0.1, OK).0, PairVerdict::Unique);
     }
 }

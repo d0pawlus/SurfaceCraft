@@ -150,8 +150,11 @@ Normals, colours and per-vertex data go with the coordinates.
 - The push: every pose is displaced by 0.2 of the moving scan's extent along each of its three
   weakest directions (the eigenvectors of its point-to-plane system), in both senses, and refined
   again: 6 extra ICP runs, about 0.7 s on a scan of a million triangles. A start that settles in a
-  different pose (more than 2 % of the diagonal away) that fits as well is a slide (`slides`) and
-  is listed as an alternative; if all come back the pose is held. No verdict depends on how loose
+  different pose (more than 2 % of the diagonal away) that does not clash with the target by at
+  least 2 % of the moving scan's area (`probe_threshold`; running off the end of a cylinder is no
+  clash) is a slide (`slides`) and is listed as an alternative; a start that flew off (lost 30 %
+  of the matches) or whose ICP found no pairs (`probes_failed`) says nothing: with any failed start,
+  or none tried, the pose is never `unique`; if all come back the pose is held. No verdict depends on how loose
   the pose reads (`stability`: 0.2 for a bracket, 0.01 and up for real scans; below 0.001 the part
   is free and always `ambiguous`).
 - It proposes by default (`apply` false); a pose that is not `unique` is applied only when

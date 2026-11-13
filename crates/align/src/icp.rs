@@ -175,25 +175,39 @@ fn icp_impl(
             let (w, tr) = (Vec3::new(x[0], x[1], x[2]), Vec3::new(x[3], x[4], x[5]));
             moved.iter().map(|p| (w.cross(&(p.coords - c)) + tr).norm()).fold(0.0, f64::max)
         };
+        // the damping of the plain entry point persists from iteration to iteration (as it always
+        // did); with a limited step it starts from zero every iteration, so one damped step does
+        // not slow all the later ones
+        let mut lam = if limit_step { 0.0 } else { lambda };
         let mut last = None;
+        let mut within = false;
         let sol = loop {
-            let damped = ata + Matrix6::identity() * (lambda * scale);
+            let damped = ata + Matrix6::identity() * (lam * scale);
             if let Some(ch) = damped.cholesky() {
                 let x = ch.solve(&(-atb));
-                let small = !limit_step || reach(&x) <= cut;
+                within = !limit_step || reach(&x) <= cut;
                 last = Some(x);
-                if small {
+                if within {
                     break last;
                 }
             }
-            lambda = if lambda == 0.0 { 1e-12 } else { lambda * 10.0 };
-            if lambda > 1.0 {
+            lam = if lam == 0.0 { 1e-12 } else { lam * 10.0 };
+            if lam > 1.0 {
                 break last;
             }
         };
+        if !limit_step {
+            lambda = lam;
+        }
         let Some(x) = sol else {
             return Err(AlignError::Degenerate("the point-to-plane system is singular".into()));
         };
+        if !within {
+            // even the heaviest damping leaves a step beyond the trimming distance: the pose is not
+            // moved on a step that would throw it off the target, and it has not converged
+            break;
+        }
+        let undamped = lam == 0.0;
         let w = Vec3::new(x[0], x[1], x[2]);
         let tr = Vec3::new(x[3], x[4], x[5]);
         // motion about the centroid c: p' = R(p − c) + c + tr
@@ -202,7 +216,7 @@ fn icp_impl(
         let delta = next.max_displacement(&t, &pts);
         t = next;
         deltas.push(delta);
-        if delta < tol {
+        if delta < tol && (undamped || !limit_step) {
             converged = true;
             break;
         }

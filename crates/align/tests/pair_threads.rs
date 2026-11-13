@@ -20,6 +20,8 @@ fn bits(r: &PairResult) -> Vec<u64> {
     let mut v: Vec<u64> = r.transform.to_rows().iter().flatten().map(|x| x.to_bits()).collect();
     v.extend([r.confidence, r.tolerance, r.overlap_moving, r.overlap_fixed, r.rms].map(f64::to_bits));
     v.push(r.candidates as u64);
+    v.extend([r.stability, r.probe_noise, r.probe_threshold, r.probe_slide_clearance].map(f64::to_bits));
+    v.extend([r.probed, r.probes_failed, r.slides, r.refined].map(|n| n as u64));
     v.push(r.icp_iterations as u64);
     v
 }
