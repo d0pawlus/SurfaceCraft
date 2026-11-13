@@ -356,10 +356,89 @@ fn a_shell_that_misses_the_tolerance_does_not_offer_to_fill_the_rim_or_drop_the_
     assert!(codes.contains(&"out_of_tolerance"), "{out}");
     assert!(!codes.contains(&"scan_defects"), "{out}");
     assert_eq!(out["scan_report"]["holes_left"], 1, "the true number stays in the report: {out}");
-    for st in out["next_steps"].as_array().unwrap() {
+    let steps = out["next_steps"].as_array().unwrap();
+    assert!(
+        steps.iter().any(|st| st["command"] == "scan.to_solid"
+            && st["params"]["keep_thickened"] == true
+            && st["params"]["thickness"] == THICKNESS
+            && st["params"]["max_patches"].as_u64().is_some_and(|m| m > 24)),
+        "a larger patch limit with the same thickness: {out}"
+    );
+    for st in steps {
+        assert_ne!(st["command"], "surface.wrap", "that would wrap the open scan, not the shell: {st}");
         assert_ne!(st["command"], "mesh.fill_holes", "{st}");
         if st["command"] == "scan.to_solid" {
             assert!(st["params"]["thickness"].is_number(), "{st}");
         }
     }
+}
+
+/// A flat 40 x 40 mm panel of 1 mm cells with a 10 x 10 mm window.
+fn panel_with_window() -> Mesh {
+    let plate = synth::plane(Point3::origin(), Vec3::x(), Vec3::y(), 40.0, 40.0, 40, 40);
+    let keep: Vec<u32> = (0..plate.triangle_count() as u32)
+        .filter(|&t| {
+            let c = plate.face_centroid(t as usize).unwrap();
+            !((15.0..25.0).contains(&c.x) && (15.0..25.0).contains(&c.y))
+        })
+        .collect();
+    plate.submesh(&keep)
+}
+
+#[test]
+fn a_window_that_was_not_filled_is_reported_not_silenced() {
+    // Arrange: the window is a hole of 40 edges; filling is switched off
+    let mut s = session_with(panel_with_window());
+
+    // Act
+    let out = s.execute("scan.to_solid", json!({"scan": "scan", "thickness": 2.0, "fill_holes_max_edges": 0})).unwrap();
+
+    // Assert
+    let codes: Vec<&str> = out["issues"].as_array().unwrap().iter().map(|i| i["code"].as_str().unwrap()).collect();
+    assert!(codes.contains(&"windows_stitched"), "{out}");
+    assert_ne!(out["verdict"], "pass", "{out}");
+    assert_eq!(out["thickened"]["windows"], 1, "{out}");
+    assert_eq!(out["thickened"]["rim_edges"], 160, "{out}");
+    let fill = out["next_steps"].as_array().unwrap().iter().find(|st| st["params"]["fill_holes_max_edges"] == 159);
+    assert!(fill.is_some(), "a step that fills all but the rim: {out}");
+}
+
+#[test]
+fn the_rim_is_chosen_after_the_cleaning_so_debris_with_a_longer_loop_does_not_win() {
+    // Arrange: a 4 x 4 panel (rim of 16 edges) and a debris fan of 18 triangles (loop of 18 edges)
+    let mut panel = synth::plane(Point3::origin(), Vec3::x(), Vec3::y(), 4.0, 4.0, 4, 4);
+    let centre = panel.positions.len() as u32;
+    panel.positions.push(Point3::new(50.0, 50.0, 0.0));
+    for k in 0..18u32 {
+        let a = std::f64::consts::TAU * f64::from(k) / 18.0;
+        panel.positions.push(Point3::new(50.0 + a.cos(), 50.0 + a.sin(), 0.0));
+    }
+    for k in 0..18u32 {
+        panel.triangles.push([centre, centre + 1 + k, centre + 1 + (k + 1) % 18]);
+    }
+    let mut s = session_with(panel);
+
+    // Act
+    let out = s.execute("scan.to_solid", json!({"scan": "scan", "thickness": 1.0})).unwrap();
+
+    // Assert: the debris is gone, the rim stayed open and was thickened
+    assert_eq!(out["thickened"]["boundary_loops"], 1, "{out}");
+    assert_eq!(out["thickened"]["rim_edges"], 16, "{out}");
+}
+
+#[test]
+fn a_spike_on_the_rim_does_not_make_a_window_or_close_the_scan() {
+    // Arrange
+    let mut cap = noisy_cap();
+    let rim_vertex =
+        (0..cap.vertex_count()).min_by(|&a, &b| cap.positions[a].x.total_cmp(&cap.positions[b].x)).unwrap();
+    cap.positions[rim_vertex].z += 15.0;
+    let mut s = session_with(cap);
+
+    // Act
+    let out = s.execute("scan.to_solid", json!({"scan": "scan", "thickness": THICKNESS})).unwrap();
+
+    // Assert
+    assert!(out["thickened"].is_object(), "{out}");
+    assert_eq!(out["thickened"]["windows"], 0, "{out}");
 }

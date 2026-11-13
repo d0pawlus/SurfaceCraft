@@ -167,8 +167,8 @@ fn self_intersections(m: &Mesh) -> usize {
         let near = bvh
             .candidates(&|b: &surfacecraft_geom::Aabb| (0..3).all(|k| b.min[k] <= bb.max[k] && bb.min[k] <= b.max[k]));
         for b in near.into_iter().map(|b| b as usize).filter(|&b| b > a) {
-            let shares = m.triangles[a].iter().any(|v| m.triangles[b].contains(v));
-            if !shares && (crosses(a, b) || crosses(b, a)) {
+            let shared = m.triangles[a].iter().filter(|v| m.triangles[b].contains(v)).count();
+            if shared < 2 && (crosses(a, b) || crosses(b, a)) {
                 count += 1;
             }
         }
@@ -412,18 +412,17 @@ fn hostile_meshes_and_thicknesses_are_errors_not_panics() {
     assert!(matches!(thicken(&nan_vertex, &params(1.0)), Err(ThickenError::Invalid(_))));
     assert!(matches!(thicken(&out_of_range, &params(1.0)), Err(ThickenError::Invalid(_))));
     assert!(thicken(&flipped, &params(0.1)).is_ok(), "a consistently orientable mesh is repaired");
-    assert_eq!(
-        thicken(&three_on_an_edge, &params(0.1)).unwrap_err(),
-        ThickenError::Empty,
-        "every triangle is on the edge"
-    );
+    let kept = thicken(&three_on_an_edge, &params(0.1)).expect("the fin is removed, the pair is kept");
+    assert_eq!(kept.report.removed_non_manifold, 1);
     for t in [0.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.0] {
         assert!(matches!(thicken(&cap, &params(t)), Err(ThickenError::BadThickness(_))), "{t}");
     }
     for t in [1e300, -1e300, 1e9, 70.0] {
         assert!(matches!(thicken(&cap, &params(t)), Err(ThickenError::TooThick { .. })), "{t}");
     }
-    assert!(thicken(&cap, &params(1e-12)).is_ok() || thicken(&cap, &params(1e-12)).is_err());
+    // below the resolution of the coordinates the two sides would coincide
+    let err = thicken(&cap, &params(1e-12)).unwrap_err();
+    assert!(matches!(err, ThickenError::TooThin { .. }) && err.to_string().contains("resolve"), "{err}");
 }
 
 #[test]
@@ -465,5 +464,64 @@ fn a_fan_of_two_hundred_thousand_triangles_on_one_edge_is_handled_without_hangin
     // Assert: repaired, closed, and no edge with more than two triangles
     let r = r.expect("repaired");
     assert_closed_outward(&r.mesh);
-    assert!(r.report.removed_non_manifold >= 200_000, "{:?}", r.report);
+    assert!(r.report.removed_non_manifold >= 199_999, "{:?}", r.report);
+}
+
+/// A flat 20 x 20 mm panel of 1 mm cells, and the index of an interior edge `(a, b)` shared by two triangles.
+fn flat_panel() -> (Mesh, (u32, u32)) {
+    let m = synth::plane(Point3::origin(), Vec3::x(), Vec3::y(), 20.0, 20.0, 20, 20);
+    let has_reverse = |a: u32, b: u32| m.triangles.iter().any(|t| (0..3).any(|k| t[k] == b && t[(k + 1) % 3] == a));
+    let edge = m
+        .triangles
+        .iter()
+        .skip(m.triangles.len() / 2)
+        .find_map(|t| (0..3).map(|k| (t[k], t[(k + 1) % 3])).find(|&(a, b)| has_reverse(a, b)))
+        .unwrap();
+    (m, edge)
+}
+
+#[test]
+fn a_fin_triangle_is_removed_and_the_surface_under_it_is_kept() {
+    // Arrange
+    let (mut m, (a, b)) = flat_panel();
+    m.positions.push(Point3::new(10.0, 10.0, 5.0));
+    m.triangles.push([a, b, m.positions.len() as u32 - 1]);
+
+    // Act
+    let r = thicken(&m, &params(1.0)).expect("thickens");
+
+    // Assert: no slit, so no extra loop and the exact volume
+    assert_closed_outward(&r.mesh);
+    assert_eq!(r.report.removed_non_manifold, 1);
+    assert_eq!(r.report.boundary_loops, 1);
+    assert!(relative(volume(&r.mesh), 400.0) < 1e-9, "{}", volume(&r.mesh));
+}
+
+#[test]
+fn a_duplicate_triangle_on_the_rim_is_dropped_not_closed_into_a_pillow() {
+    // Arrange
+    let (mut m, _) = flat_panel();
+    m.triangles.push(m.triangles[0]);
+
+    // Act
+    let r = thicken(&m, &params(1.0)).expect("thickens");
+
+    // Assert
+    assert_closed_outward(&r.mesh);
+    assert_eq!(r.report.removed_non_manifold, 1);
+    assert!(relative(volume(&r.mesh), 400.0) < 1e-9);
+}
+
+#[test]
+fn the_wall_is_measured_and_the_folded_vertices_are_told_from_the_tapered_ones() {
+    // Arrange
+    let gentle = thicken(&ridge_panel(2.0, 1.2), &params(2.0)).expect("relaxed");
+
+    // Act
+    let report = gentle.report;
+
+    // Assert
+    assert!(report.min_wall > 0.0 && report.min_wall < 2.0 && report.min_wall >= 0.19, "{report:?}");
+    assert!(report.median_wall > 1.9 && report.median_wall <= 2.01, "{report:?}");
+    assert!(report.folded_vertices > 0 && report.folded_vertices <= report.clamped_vertices);
 }

@@ -8,13 +8,14 @@
 //! normals for `symmetric` (the scan then lies in the middle of the wall, where it has no face).
 use super::freeform::{self, CapRetry};
 use super::{
-    DeviationSummary, Issue, MIN_COVERAGE, Method, Settings, ToSolidIn, ToSolidOut, Verdict, issue, message_of, step,
-    summary,
+    DeviationSummary, Issue, MIN_COVERAGE, Method, NextStep, Settings, ToSolidIn, ToSolidOut, Verdict, issue,
+    message_of, step, summary,
 };
 use crate::Session;
 use crate::cmd::mesh::thicken::command_error;
-use crate::cmd::qa::{CompareIn, QaIn, compare_points, scan_qa};
-use crate::cmd::wrap::{WrapIn, WrapOut, wrap};
+use crate::cmd::mesh_edit::{FillIn, fill};
+use crate::cmd::qa::{CompareIn, compare_points};
+use crate::cmd::wrap::{PATCH_LIMIT, WrapIn, WrapOut, wrap};
 use crate::cmd::{CmdError, CmdResult, ObjRef};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -44,6 +45,22 @@ pub struct ThickenedInfo {
     pub folded_vertices: usize,
     /// Boundary loops of the scan stitched to their offset copies (the rim, windows).
     pub boundary_loops: usize,
+    /// Loops stitched besides the rim: real holes of the scan show as windows through the wall.
+    pub windows: usize,
+    /// Edges of the rim (the longest boundary loop).
+    pub rim_edges: usize,
+    /// Thinnest wall found (mm), sampled as the distance between the two sheets.
+    pub min_wall: f64,
+    /// Median wall found (mm).
+    pub median_wall: f64,
+    /// Vertices that stay folded at the floor of the offset (a tenth of the thickness): sharp creases.
+    pub unresolved_vertices: usize,
+    /// Triangles removed from the scan before the offset (fins on edges of three or more triangles, duplicates).
+    pub removed_non_manifold: usize,
+    /// Triangles of the scan turned around to make the orientation consistent.
+    pub flipped_triangles: usize,
+    /// Always false: only local folds are detected; a part of the offset sheet meeting another part of the shell (a channel narrower than the wall) is not.
+    pub self_intersection_checked: bool,
     /// Triangles of the thickened mesh.
     pub triangles: usize,
     /// The thickened mesh, when `keep_thickened` kept it in the document.
@@ -75,18 +92,24 @@ pub(super) fn check(i: &ToSolidIn) -> CmdResult<()> {
     Ok(())
 }
 
-/// With a `thickness`, the largest boundary loop of the scan is its rim and must stay open: holes
-/// are filled only up to one edge less than it. Without a thickness `i` is returned as it is.
-pub(super) fn keep_rim_open(s: &Session, mut i: ToSolidIn, scan: ObjectId) -> CmdResult<ToSolidIn> {
-    if i.thickness.is_none() {
-        return Ok(i);
+/// Cleans the scan, keeping its rim open, and thickens it. The rim is the largest boundary loop of the
+/// CLEANED mesh (debris is gone by then): holes are filled up to the limit but never the rim.
+pub(super) fn run(s: &mut Session, set: &Settings, i: &ToSolidIn) -> CmdResult<ToSolidOut> {
+    let limit = i.fill_holes_max_edges.unwrap_or(super::FILL_HOLES_MAX_EDGES);
+    let cleaned_only = ToSolidIn { fill_holes_max_edges: Some(0), ..i.clone() };
+    let mut report = super::prepare(s, &cleaned_only, set.scan)?;
+    let rim = s
+        .doc
+        .mesh(set.scan)
+        .map_or(0, |m| surfacecraft_geom::edit::boundary_loops(&m.mesh).iter().map(Vec::len).max().unwrap_or(0));
+    let fill_up_to = limit.min(rim.saturating_sub(1));
+    if rim > 0 && fill_up_to > 0 {
+        let edit = fill(s, FillIn { object: ObjRef::Id(set.scan.0), max_edges: Some(fill_up_to), smooth: Some(true) })?;
+        report.holes_filled += edit.holes_filled.unwrap_or(0);
+        report.holes_left = edit.holes_left.unwrap_or(report.holes_left);
+        report.triangles = edit.triangles;
     }
-    let qa = scan_qa(s, QaIn { object: ObjRef::Id(scan.0) })?;
-    if let Some(rim) = qa.hole_list.first() {
-        let wanted = i.fill_holes_max_edges.unwrap_or(super::FILL_HOLES_MAX_EDGES);
-        i.fill_holes_max_edges = Some(wanted.min(rim.vertices.saturating_sub(1)));
-    }
-    Ok(i)
+    shell_solid(s, set, i, report)
 }
 
 fn info(shell: &Thickened, i: &ToSolidIn, kept: Option<ObjectId>) -> ThickenedInfo {
@@ -98,6 +121,14 @@ fn info(shell: &Thickened, i: &ToSolidIn, kept: Option<ObjectId>) -> ThickenedIn
         median_reduction: shell.report.median_reduction,
         folded_vertices: shell.report.folded_vertices,
         boundary_loops: shell.report.boundary_loops,
+        windows: shell.report.boundary_loops.saturating_sub(1),
+        rim_edges: shell.report.longest_loop_edges,
+        min_wall: shell.report.min_wall,
+        median_wall: shell.report.median_wall,
+        unresolved_vertices: shell.report.unresolved_vertices,
+        removed_non_manifold: shell.report.removed_non_manifold,
+        flipped_triangles: shell.report.flipped_triangles,
+        self_intersection_checked: false,
         triangles: shell.mesh.triangle_count(),
         mesh: kept,
     }
@@ -169,12 +200,22 @@ fn issues_of(
     let mut list = freeform::issues_of(w, d, set, report);
     if t.clamped_vertices as f64 > REDUCED_ISSUE_SHARE * vertices as f64 {
         let msg = format!(
-            "the wall is thinner than {} mm at {} of {vertices} vertices (down by up to {:.2} mm): the surface curves more tightly than the thickness there",
+            "the wall is thinner than {} mm at {} of {vertices} vertices (reduced by {:.2} mm at most, by {:.2} mm at the median; the sampled wall is {:.3} mm at the thinnest, {:.3} mm at the median): the surface curves more tightly than the thickness there",
             t.thickness.abs(),
             t.clamped_vertices,
-            t.largest_reduction
+            t.largest_reduction,
+            t.median_reduction,
+            t.min_wall,
+            t.median_wall
         );
         list.push(issue("thickness_reduced", msg));
+    }
+    if t.windows > 0 {
+        let msg = format!(
+            "{} boundary loops besides the rim ({} edges) were stitched through the wall as windows: a real hole of the scan shows as a window; fill it with a larger `fill_holes_max_edges` unless the part has the window",
+            t.windows, t.rim_edges
+        );
+        list.push(issue("windows_stitched", msg));
     }
     list
 }
@@ -240,7 +281,7 @@ fn wrap_and_judge(
     // the rim stays open on purpose and the shell is closed over it: holes left are not a defect of the solid
     let judged = super::ScanSummary { holes_left: 0, ..report.clone() };
     let issues = issues_of(&w, &d, set, &judged, &t, face.vertex_count());
-    let next = freeform::next_steps(&w, &issues, set, retry.is_some());
+    let next = next_steps(&w, &issues, set, retry.is_some(), i, &t);
     let verdict = if issues.is_empty() {
         Verdict::Pass
     } else if d.coverage >= MIN_COVERAGE {
@@ -249,4 +290,51 @@ fn wrap_and_judge(
         Verdict::Fail
     };
     Ok(freeform::out(set, retry, report, verdict, Some(&w), Some(d), issues, next))
+}
+
+/// The next steps of a thickened run: those of the freeform method that make sense for a shell, and
+/// the ones of the thickness itself. The freeform ones that name the open scan (`surface.wrap` of the
+/// scan, a repeat that drops or re-offers the thickness) are left out.
+fn next_steps(
+    w: &WrapOut,
+    issues: &[Issue],
+    set: &Settings,
+    retried: bool,
+    i: &ToSolidIn,
+    t: &ThickenedInfo,
+) -> Vec<NextStep> {
+    let has = |code: &str| issues.iter().any(|x| x.code == code);
+    let steps: Vec<NextStep> = freeform::next_steps(w, issues, set, retried)
+        .into_iter()
+        .filter(|st| st.command != "surface.wrap" && st.command != "mesh.fill_holes" && st.command != "scan.to_solid")
+        .collect();
+    let again = |extra: serde_json::Value| {
+        let mut p =
+            json!({"scan": set.scan, "thickness": t.thickness, "symmetric": i.symmetric, "tolerance": set.tolerance});
+        if let (Some(base), Some(add)) = (p.as_object_mut(), extra.as_object()) {
+            base.extend(add.clone());
+        }
+        p
+    };
+    let mut front = Vec::new();
+    if has("thickness_reduced") {
+        let carried = t.thickness.abs() - t.median_reduction;
+        let thinner = (if carried > 0.0 { carried } else { 0.5 * t.thickness.abs() } * 100.0).floor() / 100.0;
+        let params = again(json!({"thickness": thinner.copysign(t.thickness)}));
+        front.push(step("scan.to_solid", params, "a thinner wall that the curvature of the surface can carry"));
+    }
+    if has("out_of_tolerance") && w.cap_used < PATCH_LIMIT {
+        let params = again(json!({"max_patches": PATCH_LIMIT, "keep_thickened": true}));
+        front.push(step("scan.to_solid", params, "the thickened shell needs more patches than the limit: wrap it again with the largest limit and keep the thickened mesh"));
+    }
+    if has("windows_stitched") {
+        let params = again(json!({"fill_holes_max_edges": t.rim_edges.saturating_sub(1)}));
+        front.push(step(
+            "scan.to_solid",
+            params,
+            "fills every hole of the scan but the rim, so none is stitched as a window",
+        ));
+    }
+    front.extend(steps);
+    front
 }

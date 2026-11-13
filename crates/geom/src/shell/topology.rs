@@ -18,6 +18,8 @@ pub(super) struct Work {
     pub flipped: usize,
     /// Vertices on a triangle of the offset that folded before it was relaxed.
     pub folded: usize,
+    /// Vertices that stay folded at the floor of the offset.
+    pub unresolved: usize,
 }
 
 /// Compressed rows: `row(i)` lists the items of vertex `i`.
@@ -94,7 +96,7 @@ pub(super) fn compact(mesh: &Mesh) -> Work {
     }
     let triangles =
         kept.iter().map(|t| [0, 1, 2].map(|k| slot.get(t[k] as usize).copied().unwrap_or(0))).collect::<Vec<_>>();
-    Work { positions, triangles, dropped, pinch_splits: 0, removed: 0, flipped: 0, folded: 0 }
+    Work { positions, triangles, dropped, pinch_splits: 0, removed: 0, flipped: 0, folded: 0, unresolved: 0 }
 }
 
 /// Drops the vertices no triangle uses (the order of the others is kept).
@@ -234,8 +236,8 @@ fn merge(parent: &mut [usize], a: usize, b: usize) {
     }
 }
 
-/// Number of closed boundary loops, given the boundary edges (one out-edge per vertex).
-pub(super) fn count_loops(vertices: usize, boundary: &[(u32, u32)]) -> usize {
+/// Edge counts of the closed boundary loops, given the boundary edges (one out-edge per vertex).
+pub(super) fn loop_lengths(vertices: usize, boundary: &[(u32, u32)]) -> Vec<usize> {
     let mut next = vec![u32::MAX; vertices];
     for &(a, b) in boundary {
         if let Some(n) = next.get_mut(a as usize) {
@@ -243,20 +245,22 @@ pub(super) fn count_loops(vertices: usize, boundary: &[(u32, u32)]) -> usize {
         }
     }
     let mut seen = vec![false; vertices];
-    let mut loops = 0;
+    let mut loops = Vec::new();
     for &(start, _) in boundary {
         if seen.get(start as usize).copied().unwrap_or(true) {
             continue;
         }
-        loops += 1;
+        let mut length = 0;
         let mut v = start;
         while let Some(s) = seen.get_mut(v as usize) {
             if *s {
                 break;
             }
             *s = true;
+            length += 1;
             v = next.get(v as usize).copied().unwrap_or(u32::MAX);
         }
+        loops.push(length);
     }
     loops
 }

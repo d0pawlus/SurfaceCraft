@@ -14,7 +14,7 @@ use super::topology::Csr;
 use crate::{Point3, Vec3, par};
 
 /// A triangle whose offset copy keeps less than this share of its area is folded.
-pub(super) const MIN_AREA_RATIO: f64 = 0.05;
+pub(super) const MIN_AREA_RATIO: f64 = 0.15;
 /// A triangle whose offset copy has a normal with a smaller cosine to the original's is folded.
 pub(super) const MIN_NORMAL_COS: f64 = 0.3;
 /// Triangles thinner than this (twice the area over the longest edge squared; 0.87 for an
@@ -23,7 +23,10 @@ const MIN_QUALITY: f64 = 0.05;
 /// Factor a flagged vertex's offset is multiplied by in every round.
 const SHRINK: f64 = 0.8;
 /// Largest change of the offset distance per distance between neighbouring vertices.
-const MAX_OFFSET_SLOPE: f64 = 0.75;
+const MAX_OFFSET_SLOPE: f64 = 0.5;
+/// The offset of a vertex is never reduced below this share of the thickness: a fold that cannot be
+/// resolved above it is refused (below it the two sheets would touch).
+pub(super) const MIN_SCALE: f64 = 0.1;
 /// Rounds at most; `SHRINK^ROUNDS` is the smallest share of the offset a vertex can keep.
 const MAX_ROUNDS: usize = 60;
 
@@ -123,30 +126,84 @@ pub(super) struct Relaxed {
     pub scale: Vec<f64>,
     /// Vertices of triangles that folded in some round (the others were only tapered).
     pub folded: usize,
+    /// Vertices that still lie on a folded triangle at the floor [`MIN_SCALE`] (sharp creases on the
+    /// side of the offset: no wall of that thickness fits there).
+    pub unresolved: usize,
 }
 
 /// Relaxes the offset, or returns the number of vertices that still fold when [`MAX_ROUNDS`] rounds
-/// could not resolve them.
+/// could not resolve the others.
 pub(super) fn relax(field: &Field) -> Result<Relaxed, usize> {
     let n = field.positions.len();
     let mut scale = vec![1.0; n];
     let mut ever = vec![false; n];
+    let mut frozen = vec![false; n];
+    let done = |scale: Vec<f64>, ever: &[bool], frozen: &[bool]| Relaxed {
+        scale,
+        folded: ever.iter().filter(|&&e| e).count(),
+        unresolved: frozen.iter().filter(|&&f| f).count(),
+    };
     let mut dirty: Vec<u32> = (0..n as u32).collect();
     for _ in 0..MAX_ROUNDS {
-        let bad = flagged(field, &scale, &dirty);
-        if bad.is_empty() {
-            return Ok(Relaxed { folded: ever.iter().filter(|&&e| e).count(), scale });
-        }
-        for &v in &bad {
-            if let Some(s) = scale.get_mut(v as usize) {
-                *s *= SHRINK;
-            }
-            if let Some(e) = ever.get_mut(v as usize) {
+        let mut movable = Vec::new();
+        for v in flagged(field, &scale, &dirty) {
+            let at_floor = scale.get(v as usize).is_some_and(|&s| s <= MIN_SCALE * 1.000_001);
+            if let (Some(f), Some(e)) = (frozen.get_mut(v as usize), ever.get_mut(v as usize)) {
                 *e = true;
+                if at_floor {
+                    *f = true;
+                } else {
+                    movable.push(v);
+                }
             }
         }
-        dirty = taper(field, &mut scale, &bad);
+        if movable.is_empty() {
+            return Ok(done(scale, &ever, &frozen));
+        }
+        for &v in &movable {
+            if let Some(s) = scale.get_mut(v as usize) {
+                *s = (*s * SHRINK).max(MIN_SCALE);
+            }
+        }
+        dirty = taper(field, &mut scale, &movable);
     }
-    let left = flagged(field, &scale, &dirty).len();
-    if left == 0 { Ok(Relaxed { folded: ever.iter().filter(|&&e| e).count(), scale }) } else { Err(left) }
+    let left = flagged(field, &scale, &dirty)
+        .into_iter()
+        .filter(|&v| !frozen.get(v as usize).copied().unwrap_or(true))
+        .count();
+    if left == 0 { Ok(done(scale, &ever, &frozen)) } else { Err(left) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_fold_that_survives_the_floor_is_counted_as_unresolved() {
+        // Arrange: a triangle whose normals point up, up and down: with an offset this large it stands
+        // on its edge at every scale down to the floor
+        let positions = [Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 0.0, 0.0), Point3::new(0.0, 1.0, 0.0)];
+        let normals = [Vec3::z(), Vec3::z(), -Vec3::z()];
+        let triangles = [[0u32, 1, 2]];
+        let around = Csr::from_pairs(3, &[(0, 0), (1, 0), (2, 0)]);
+        let adjacent = Csr::from_pairs(3, &[(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)]);
+        let offsets = [-1000.0];
+        let field = Field {
+            positions: &positions,
+            normals: &normals,
+            triangles: &triangles,
+            offsets: &offsets,
+            around: &around,
+            adjacent: &adjacent,
+            thickness: 1000.0,
+        };
+
+        // Act
+        let result = relax(&field);
+
+        // Assert: they stay at the floor and are counted
+        let relaxed = result.expect("relaxed");
+        assert_eq!(relaxed.unresolved, 3);
+        assert!(relaxed.scale.iter().all(|&s| (s - MIN_SCALE).abs() < 1e-9));
+    }
 }

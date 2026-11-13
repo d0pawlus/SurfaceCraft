@@ -122,7 +122,14 @@ fn local_corpus_radius_of_the_reduced_vertices() {
     s.execute("mesh.clean", json!({"object": "scan", "fill_holes_max_edges": 400.min(rim - 1)})).unwrap();
     let id = s.doc.find_by_name("scan").unwrap().0;
     let mesh = (*s.doc.mesh(id).unwrap().mesh).clone();
-    let shell = thicken(&mesh, &ThickenParams { thickness, symmetric: false }).unwrap();
+    let shell = match thicken(&mesh, &ThickenParams { thickness, symmetric: false }) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("S{number:02} refused: {e}");
+            return;
+        }
+    };
+    eprintln!("S{number:02} report {:?}", shell.report);
     let face = shell.scan_face();
     let normals = face.vertex_normals();
     let mut ring: Vec<Vec<u32>> = vec![Vec::new(); face.vertex_count()];

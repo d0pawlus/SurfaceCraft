@@ -143,7 +143,8 @@ patch network over a whole scan.
   constant thickness: every vertex is offset along a smoothed normal, the offset copy is turned
   around and the rim and the windows are stitched. Where the surface curves more tightly than the
   thickness the offset is reduced locally (`clamped_vertices`, `largest_reduction`); a thickness
-  that folds most of the surface is refused. `surface.wrap` of the result is a solid. In one call:
+  that folds most of the surface is refused. Only local folds are detected (`self_intersection_checked`
+  is false): a channel narrower than the wall is not. `surface.wrap` of the result is a solid. In one call:
   `scan.to_solid` with `thickness` (see `scan-to-solid`), which measures the solid against the scan.
 
 ## Check

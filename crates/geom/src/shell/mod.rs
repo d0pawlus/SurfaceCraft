@@ -28,6 +28,11 @@ pub const MAX_CLAMPED_SHARE: f64 = 0.15;
 /// The thickness is at most this share of the diagonal of the mesh's bounding box. (A wall of that
 /// size is not a shell; the limit also keeps every coordinate finite.)
 pub const MAX_THICKNESS_SHARE: f64 = 0.5;
+/// Share of the vertices that may stay folded at the floor of the offset (sharp creases on the offset
+/// side); more is refused.
+pub const MAX_UNRESOLVED_SHARE: f64 = 0.001;
+/// The normals are averaged over this share of the thickness (a distance, at least one edge).
+const SMOOTHING_SHARE: f64 = 0.5;
 /// How to thicken.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ThickenParams {
@@ -77,6 +82,14 @@ pub struct ThickenReport {
     pub median_reduction: f64,
     /// Vertices of triangles that folded before the relaxation (the others reduced were only tapered).
     pub folded_vertices: usize,
+    /// Vertices that stay folded at the floor of the offset (a tenth of the thickness).
+    pub unresolved_vertices: usize,
+    /// Edges of the longest boundary loop (the rim of a panel).
+    pub longest_loop_edges: usize,
+    /// Thinnest wall found (mm): the distance from sampled vertices of one layer to the other layer.
+    pub min_wall: f64,
+    /// Median wall found (mm).
+    pub median_wall: f64,
 }
 
 /// A closed shell.
@@ -128,6 +141,16 @@ pub enum ThickenError {
         /// The most for this mesh.
         limit: f64,
     },
+    /// The thickness is below what the coordinates resolve.
+    #[error(
+        "thickness {thickness} mm is below what the coordinates of this mesh resolve ({limit:e} mm is the least): the two sides would coincide"
+    )]
+    TooThin {
+        /// Requested.
+        thickness: f64,
+        /// The least for this mesh.
+        limit: f64,
+    },
     /// The mesh is not valid.
     #[error("the mesh is not valid: {0}")]
     Invalid(MeshError),
@@ -169,7 +192,9 @@ pub enum ThickenError {
         suggested: f64,
     },
     /// The folds could not be resolved.
-    #[error("the offset folds at {0} vertices that could not be relaxed: use a smaller thickness")]
+    #[error(
+        "the offset folds at {0} vertices that cannot be relaxed to more than a tenth of the thickness: use a smaller thickness"
+    )]
     Unresolved(usize),
     /// The result is not a closed, outward-oriented surface (never expected).
     #[error("the shell could not be closed consistently ({0}): use a smaller thickness or clean the mesh")]
@@ -195,11 +220,19 @@ fn check_params(mesh: &Mesh, p: &ThickenParams) -> Result<(), ThickenError> {
     mesh.validate().map_err(ThickenError::Invalid)
 }
 
-/// The thickness must not exceed [`MAX_THICKNESS_SHARE`] of the size of what is thickened.
+/// Share of the size of the mesh below which the thickness is lost in the coordinates.
+pub const MIN_THICKNESS_SHARE: f64 = 1e-9;
+
+/// The thickness must lie between [`MIN_THICKNESS_SHARE`] and [`MAX_THICKNESS_SHARE`] of the size.
 fn check_size(work: &Work, p: &ThickenParams) -> Result<(), ThickenError> {
-    let limit = MAX_THICKNESS_SHARE * Aabb::from_points(&work.positions).diagonal();
+    let size = Aabb::from_points(&work.positions).diagonal();
+    let limit = MAX_THICKNESS_SHARE * size;
     if !(p.thickness.abs() <= limit) {
         return Err(ThickenError::TooThick { thickness: p.thickness, limit });
+    }
+    let least = MIN_THICKNESS_SHARE * size;
+    if p.thickness.abs() < least {
+        return Err(ThickenError::TooThin { thickness: p.thickness, limit: least });
     }
     Ok(())
 }
@@ -230,12 +263,11 @@ pub fn thicken(mesh: &Mesh, params: &ThickenParams) -> Result<Thickened, Thicken
         return Err(ThickenError::Closed);
     }
     let adjacent = topology::adjacency(work.positions.len(), &sorted);
-    let passes = normals::passes_for(params.thickness, mean_edge(&work));
-    let normals =
-        normals::smoothed(&work.positions, &work.triangles, &adjacent, passes).ok_or(ThickenError::NoNormals)?;
+    let radius = (SMOOTHING_SHARE * params.thickness.abs()).max(mean_edge(&work));
+    let normals = normals::smoothed(&work.positions, &work.triangles, radius).ok_or(ThickenError::NoNormals)?;
     let (a, b) = layer_offsets(params);
-    let (scale, folded) = fold_free_scale(&work, &normals, &adjacent, &[a, b], params.thickness)?;
-    work.folded = folded;
+    let (scale, folded, unresolved) = fold_free_scale(&work, &normals, &adjacent, &[a, b], params.thickness)?;
+    (work.folded, work.unresolved) = (folded, unresolved);
     assemble(&work, &normals, &scale, (a, b), &boundary, params)
 }
 
@@ -260,7 +292,7 @@ fn fold_free_scale(
     adjacent: &Csr,
     offsets: &[f64; 2],
     thickness: f64,
-) -> Result<(Vec<f64>, usize), ThickenError> {
+) -> Result<(Vec<f64>, usize, usize), ThickenError> {
     let pairs: Vec<(u32, u32)> =
         work.triangles.iter().enumerate().flat_map(|(i, t)| t.iter().map(move |&v| (v, i as u32))).collect();
     let around = Csr::from_pairs(work.positions.len(), &pairs);
@@ -275,6 +307,9 @@ fn fold_free_scale(
         thickness: thickness.abs(),
     };
     let relaxed = relax::relax(&field).map_err(ThickenError::Unresolved)?;
+    if relaxed.unresolved as f64 > MAX_UNRESOLVED_SHARE * relaxed.scale.len() as f64 {
+        return Err(ThickenError::Unresolved(relaxed.unresolved));
+    }
     let scale = relaxed.scale;
     let vertices = scale.len();
     if relaxed.folded as f64 > MAX_CLAMPED_SHARE * vertices as f64 {
@@ -288,7 +323,7 @@ fn fold_free_scale(
             suggested: thickness.abs() * quantile_scale(&scale),
         });
     }
-    Ok((scale, relaxed.folded))
+    Ok((scale, relaxed.folded, relaxed.unresolved))
 }
 
 /// The scale below which a share [`MAX_CLAMPED_SHARE`] of the vertices lies (1 when empty).

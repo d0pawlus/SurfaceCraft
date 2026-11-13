@@ -1,10 +1,14 @@
 //! The shell from the offsets: the two layers and the strip along the rim.
 use super::topology::Work;
 use super::{ScanLayer, ThickenError, ThickenParams, ThickenReport, Thickened, topology};
-use crate::{Mesh, Point3, Vec3};
+use crate::{Bvh, Mesh, MeshError, Point3, Vec3};
 
 /// Rows of the strip along the rim at most.
-const MAX_STRIP_ROWS: usize = 12;
+const MAX_STRIP_ROWS: usize = 64;
+/// Triangles of the strip at most (the rows are cut back for a long rim).
+const MAX_STRIP_TRIANGLES: usize = 4_000_000;
+/// Vertices at which the wall is measured at most.
+const MAX_WALL_SAMPLES: usize = 20_000;
 
 /// Mean length of the boundary edges (mm; 0 without any).
 fn mean_rim_edge(positions: &[Point3], boundary: &[(u32, u32)]) -> f64 {
@@ -15,18 +19,18 @@ fn mean_rim_edge(positions: &[Point3], boundary: &[(u32, u32)]) -> f64 {
     if boundary.is_empty() { 0.0 } else { total / boundary.len() as f64 }
 }
 
-/// Rows of the strip: about one edge length each, so no triangle of it is a sliver.
-fn strip_rows(thickness: f64, rim_edge: f64) -> usize {
-    if !(rim_edge > 0.0) {
-        return 1;
-    }
-    ((thickness.abs() / rim_edge).ceil() as usize).clamp(1, MAX_STRIP_ROWS)
+/// Rows of the strip: about one edge length each, so no triangle of it is a sliver, within
+/// [`MAX_STRIP_ROWS`] and [`MAX_STRIP_TRIANGLES`].
+fn strip_rows(thickness: f64, rim_edge: f64, rim_edges: usize) -> usize {
+    let by_size = if rim_edge > 0.0 { (thickness.abs() / rim_edge).ceil() as usize } else { 1 };
+    let by_count = MAX_STRIP_TRIANGLES / (2 * rim_edges.max(1));
+    by_size.clamp(1, MAX_STRIP_ROWS).min(by_count.max(1))
 }
 
 /// Ids of the vertices of the strip: layer `k` of rim vertex `v`, `0` the outer layer and `rows` the
 /// inner one; the layers between come after the two copies of the mesh's vertices.
 struct Rim {
-    vertices: usize,
+    vertices: u32,
     rows: usize,
     slot: Vec<u32>,
     rim_count: usize,
@@ -38,15 +42,15 @@ impl Rim {
             return v;
         }
         if k >= self.rows {
-            return v + self.vertices as u32;
+            return v + self.vertices;
         }
         let slot = self.slot.get(v as usize).copied().unwrap_or(0) as usize;
-        (2 * self.vertices + (k - 1) * self.rim_count + slot) as u32
+        (2 * self.vertices as usize + (k - 1) * self.rim_count + slot) as u32
     }
 }
 
-fn rim_of(vertices: usize, rows: usize, boundary: &[(u32, u32)]) -> (Rim, Vec<u32>) {
-    let mut slot = vec![u32::MAX; vertices];
+fn rim_of(vertices: u32, rows: usize, boundary: &[(u32, u32)]) -> (Rim, Vec<u32>) {
+    let mut slot = vec![u32::MAX; vertices as usize];
     let mut order: Vec<u32> = Vec::new();
     let mut starts: Vec<u32> = boundary.iter().map(|&(a, _)| a).collect();
     starts.sort_unstable();
@@ -59,6 +63,50 @@ fn rim_of(vertices: usize, rows: usize, boundary: &[(u32, u32)]) -> (Rim, Vec<u3
     (Rim { vertices, rows, slot, rim_count: order.len() }, order)
 }
 
+/// The vertices of the layer at `offset` (each moved along its normal by its share of the offset).
+fn layer(work: &Work, normals: &[Vec3], scale: &[f64], offset: f64) -> Vec<Point3> {
+    (0..work.positions.len())
+        .map(|i| match (work.positions.get(i), normals.get(i), scale.get(i)) {
+            (Some(p), Some(nm), Some(s)) => p + nm * (offset * s),
+            _ => Point3::origin(),
+        })
+        .collect()
+}
+
+/// Wall thickness `(minimum, median)` of the shell, sampled: the distance from vertices of one layer
+/// to the surface of the other (mm).
+fn measured_wall(outer: &[Point3], inner: &[Point3], triangles: &[[u32; 3]], thickness: f64) -> (f64, f64) {
+    let sheet = Bvh::build(&Mesh { positions: inner.to_vec(), triangles: triangles.to_vec() });
+    let step = (outer.len() / MAX_WALL_SAMPLES).max(1);
+    let reach = 2.0 * thickness.abs();
+    let mut walls: Vec<f64> =
+        outer.iter().step_by(step).filter_map(|p| sheet.closest(p, reach)).map(|h| h.distance).collect();
+    walls.sort_by(f64::total_cmp);
+    (walls.first().copied().unwrap_or(0.0), walls.get(walls.len() / 2).copied().unwrap_or(0.0))
+}
+
+/// The triangles: the outer layer, the inner layer reversed, the strip.
+fn shell_triangles(work: &Work, rim: &Rim, boundary: &[(u32, u32)]) -> Vec<[u32; 3]> {
+    let n = rim.vertices;
+    let mut triangles = work.triangles.clone();
+    triangles.extend(work.triangles.iter().map(|t| [t[0] + n, t[2] + n, t[1] + n]));
+    for &(u, v) in boundary {
+        for k in 0..rim.rows {
+            let (ou, ov, iu, iv) = (rim.id(u, k), rim.id(v, k), rim.id(u, k + 1), rim.id(v, k + 1));
+            triangles.push([ov, ou, iu]);
+            triangles.push([ov, iu, iv]);
+        }
+    }
+    triangles
+}
+
+/// Median of the reductions of the thickness over the vertices that were reduced (0 when none).
+fn median_reduction(scale: &[f64], thickness: f64) -> f64 {
+    let mut r: Vec<f64> = scale.iter().filter(|&&s| s < 1.0).map(|s| thickness * (1.0 - s)).collect();
+    r.sort_by(f64::total_cmp);
+    r.get(r.len() / 2).copied().unwrap_or(0.0)
+}
+
 pub(super) fn assemble(
     work: &Work,
     normals: &[Vec3],
@@ -68,17 +116,12 @@ pub(super) fn assemble(
     params: &ThickenParams,
 ) -> Result<Thickened, ThickenError> {
     let n = work.positions.len();
-    let layer = |offset: f64| -> Vec<Point3> {
-        (0..n)
-            .map(|i| match (work.positions.get(i), normals.get(i), scale.get(i)) {
-                (Some(p), Some(nm), Some(s)) => p + nm * (offset * s),
-                _ => Point3::origin(),
-            })
-            .collect()
-    };
-    let (outer, inner) = (layer(a), layer(b));
-    let rows = strip_rows(params.thickness, mean_rim_edge(&work.positions, boundary));
-    let (rim, order) = rim_of(n, rows, boundary);
+    let rows = strip_rows(params.thickness, mean_rim_edge(&work.positions, boundary), boundary.len());
+    let total = 2 * n + (rows - 1) * boundary.len();
+    let n32 = u32::try_from(n).ok().filter(|_| u32::try_from(total).is_ok());
+    let Some(n32) = n32 else { return Err(ThickenError::Invalid(MeshError::TooManyVertices(total))) };
+    let (outer, inner) = (layer(work, normals, scale, a), layer(work, normals, scale, b));
+    let (rim, order) = rim_of(n32, rows, boundary);
     let mut positions = outer.clone();
     positions.extend_from_slice(&inner);
     for k in 1..rows {
@@ -88,22 +131,16 @@ pub(super) fn assemble(
             positions.push(Point3::from(o.coords * (1.0 - f) + i.coords * f));
         }
     }
-    let mut triangles = work.triangles.clone();
-    triangles.extend(work.triangles.iter().map(|t| [t[0] + n as u32, t[2] + n as u32, t[1] + n as u32]));
-    for &(u, v) in boundary {
-        for k in 0..rows {
-            let (ou, ov, iu, iv) = (rim.id(u, k), rim.id(v, k), rim.id(u, k + 1), rim.id(v, k + 1));
-            triangles.push([ov, ou, iu]);
-            triangles.push([ov, iu, iv]);
-        }
-    }
-    let mesh = Mesh { positions, triangles };
+    let mesh = Mesh { positions, triangles: shell_triangles(work, &rim, boundary) };
     check_closed(&mesh)?;
-    let reduction = scale.iter().copied().fold(1.0, f64::min);
+    let (min_wall, median_wall) = measured_wall(&outer, &inner, &work.triangles, params.thickness);
+    let loops = topology::loop_lengths(n, boundary);
+    let thickness = params.thickness.abs();
     let report = ThickenReport {
         vertices: mesh.positions.len(),
         triangles: mesh.triangles.len(),
-        boundary_loops: topology::count_loops(n, boundary),
+        boundary_loops: loops.len(),
+        longest_loop_edges: loops.iter().copied().max().unwrap_or(0),
         boundary_edges: boundary.len(),
         strip_rows: rows,
         pinch_splits: work.pinch_splits,
@@ -111,9 +148,12 @@ pub(super) fn assemble(
         removed_non_manifold: work.removed,
         flipped_triangles: work.flipped,
         clamped_vertices: scale.iter().filter(|&&s| s < 1.0).count(),
-        largest_reduction: params.thickness.abs() * (1.0 - reduction),
-        median_reduction: median_reduction(scale, params.thickness.abs()),
+        largest_reduction: thickness * (1.0 - scale.iter().copied().fold(1.0, f64::min)),
+        median_reduction: median_reduction(scale, thickness),
         folded_vertices: work.folded,
+        unresolved_vertices: work.unresolved,
+        min_wall,
+        median_wall,
     };
     let scan_layer = if !params.symmetric && params.thickness < 0.0 { ScanLayer::Inner } else { ScanLayer::Outer };
     Ok(Thickened {
@@ -126,14 +166,7 @@ pub(super) fn assemble(
     })
 }
 
-/// Median of the reductions of the thickness over the vertices that were reduced (0 when none).
-fn median_reduction(scale: &[f64], thickness: f64) -> f64 {
-    let mut r: Vec<f64> = scale.iter().filter(|&&s| s < 1.0).map(|s| thickness * (1.0 - s)).collect();
-    r.sort_by(f64::total_cmp);
-    r.get(r.len() / 2).copied().unwrap_or(0.0)
-}
-
-/// The shell is closed (every edge has its opposite), and encloses a positive volume.
+/// The shell is closed (every edge has its opposite) and encloses a positive volume.
 fn check_closed(mesh: &Mesh) -> Result<(), ThickenError> {
     let sorted = topology::directed_edges(&mesh.triangles);
     if topology::repeated_edges(&sorted) > 0 || !topology::boundary_edges(&sorted).is_empty() {
@@ -150,5 +183,13 @@ fn check_closed(mesh: &Mesh) -> Result<(), ThickenError> {
             Some(a.dot(&b.cross(&c)) / 6.0)
         })
         .sum();
-    if volume.is_finite() && volume > 0.0 { Ok(()) } else { Err(ThickenError::NotClosed("it is turned inside out")) }
+    if !volume.is_finite() {
+        Err(ThickenError::NotClosed("its volume is not a number"))
+    } else if volume < 0.0 {
+        Err(ThickenError::NotClosed("it is turned inside out"))
+    } else if volume == 0.0 {
+        Err(ThickenError::NotClosed("it has no volume: the wall is thinner than the coordinates resolve"))
+    } else {
+        Ok(())
+    }
 }

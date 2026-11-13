@@ -43,6 +43,18 @@ pub struct ThickenMeshOut {
     pub clamped_vertices: usize,
     /// Largest reduction of the thickness at a vertex (mm; 0 when nothing was reduced).
     pub largest_reduction: f64,
+    /// Triangles removed from the mesh before the offset (fins on edges of three or more triangles, duplicates).
+    pub removed_non_manifold: usize,
+    /// Triangles turned around to make the orientation consistent.
+    pub flipped_triangles: usize,
+    /// Vertices that stay folded at the floor of the offset (a tenth of the thickness): sharp creases.
+    pub unresolved_vertices: usize,
+    /// Thinnest wall found (mm), sampled as the distance between the two sheets.
+    pub min_wall: f64,
+    /// Median wall found (mm).
+    pub median_wall: f64,
+    /// Always false: only local folds are detected, not a part of the offset sheet meeting another part of the shell (a channel narrower than the wall).
+    pub self_intersection_checked: bool,
     /// Is the new mesh closed (every edge shared by two triangles)? Always true when the command succeeds.
     pub closed: bool,
 }
@@ -77,6 +89,12 @@ pub(super) fn thicken_cmd(s: &mut Session, i: ThickenMeshIn) -> CmdResult<Thicke
         boundary_loops: shell.report.boundary_loops,
         clamped_vertices: shell.report.clamped_vertices,
         largest_reduction: shell.report.largest_reduction,
+        removed_non_manifold: shell.report.removed_non_manifold,
+        flipped_triangles: shell.report.flipped_triangles,
+        unresolved_vertices: shell.report.unresolved_vertices,
+        min_wall: shell.report.min_wall,
+        median_wall: shell.report.median_wall,
+        self_intersection_checked: false,
         closed: census.boundary == 0 && census.non_manifold == 0,
     })
 }

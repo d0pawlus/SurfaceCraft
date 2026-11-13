@@ -3,6 +3,7 @@
 //! triangles that share an edge (each connected piece keeps the orientation most of its triangles
 //! already had).
 use super::topology::Work;
+use crate::{Vec3, normalize};
 
 /// What the repair changed.
 #[derive(Clone, Copy, Debug, Default)]
@@ -38,25 +39,86 @@ fn users(table: &[(u64, u32)], key: u64) -> impl Iterator<Item = u32> + '_ {
     table.get(start..).unwrap_or(&[]).iter().take_while(move |&&(k, _)| k == key).map(|&(_, t)| t)
 }
 
-/// Removes the triangles on edges with more than two triangles; returns how many. One linear pass
-/// over the runs of equal edges of the sorted table.
+/// Unit normal of triangle `t` (zero when flat).
+fn normal_of(w: &Work, t: usize) -> Vec3 {
+    let Some(tri) = w.triangles.get(t) else { return Vec3::zeros() };
+    let (Some(a), Some(b), Some(c)) =
+        (w.positions.get(tri[0] as usize), w.positions.get(tri[1] as usize), w.positions.get(tri[2] as usize))
+    else {
+        return Vec3::zeros();
+    };
+    normalize((b - a).cross(&(c - a))).unwrap_or_else(Vec3::zeros)
+}
+
+/// How well triangle `t` continues the surface: for each of its edges other than `edge`, the best
+/// agreement of its normal (orientation ignored) with a neighbour across that edge. A fin has no
+/// neighbours on its other edges, the triangles of the surface have them.
+fn continuity(w: &Work, table: &[(u64, u32)], t: usize, edge: u64) -> f64 {
+    let Some(tri) = w.triangles.get(t) else { return 0.0 };
+    let mine = normal_of(w, t);
+    edges_of(tri)
+        .iter()
+        .map(|&(a, b)| undirected(a, b))
+        .filter(|&k| k != edge)
+        .map(|k| {
+            users(table, k)
+                .filter(|&u| u as usize != t)
+                .take(2)
+                .map(|u| mine.dot(&normal_of(w, u as usize)).abs())
+                .fold(0.0, f64::max)
+        })
+        .sum()
+}
+
+/// Of the triangles on an edge that three or more share, keeps the two that continue the surface best
+/// and removes the others (fins, doubled sheets); returns how many were removed. One linear pass
+/// over the runs of equal edges of the sorted table; a run of `k` triangles costs `k` scorings.
 fn remove_non_manifold(w: &mut Work) -> usize {
     let table = edge_table(&w.triangles);
-    let mut bad = vec![false; w.triangles.len()];
+    let mut gone = vec![false; w.triangles.len()];
     let mut start = 0;
     while let Some(&(key, _)) = table.get(start) {
         let run = table.get(start..).map_or(0, |r| r.iter().take_while(|&&(k, _)| k == key).count());
-        if run > 2 {
-            for &(_, t) in table.get(start..start + run).unwrap_or(&[]) {
-                if let Some(b) = bad.get_mut(t as usize) {
-                    *b = true;
-                }
+        let members: Vec<usize> =
+            table.get(start..start + run).unwrap_or(&[]).iter().map(|&(_, t)| t as usize).collect();
+        start += run.max(1);
+        let alive: Vec<usize> = members.into_iter().filter(|&t| !gone.get(t).copied().unwrap_or(true)).collect();
+        if alive.len() <= 2 {
+            continue;
+        }
+        let mut scored: Vec<(f64, usize)> = alive.iter().map(|&t| (continuity(w, &table, t, key), t)).collect();
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        for &(_, t) in scored.iter().skip(2) {
+            if let Some(g) = gone.get_mut(t) {
+                *g = true;
             }
         }
-        start += run.max(1);
     }
     let before = w.triangles.len();
-    let mut flags = bad.iter();
+    let mut flags = gone.iter();
+    w.triangles.retain(|_| !flags.next().copied().unwrap_or(false));
+    before - w.triangles.len()
+}
+
+/// Removes the triangles that repeat an earlier triangle with the same winding (two such triangles
+/// on a boundary edge would close into a flat pillow); returns how many.
+fn remove_duplicates(w: &mut Work) -> usize {
+    let rotated = |t: &[u32; 3]| {
+        let k = (0..3).min_by_key(|&k| t[k]).unwrap_or(0);
+        [t[k], t[(k + 1) % 3], t[(k + 2) % 3]]
+    };
+    let mut keys: Vec<([u32; 3], usize)> = w.triangles.iter().enumerate().map(|(i, t)| (rotated(t), i)).collect();
+    keys.sort_unstable();
+    let mut gone = vec![false; w.triangles.len()];
+    for pair in keys.windows(2) {
+        if pair[0].0 == pair[1].0
+            && let Some(g) = gone.get_mut(pair[1].1)
+        {
+            *g = true;
+        }
+    }
+    let before = w.triangles.len();
+    let mut flags = gone.iter();
     w.triangles.retain(|_| !flags.next().copied().unwrap_or(false));
     before - w.triangles.len()
 }
@@ -122,7 +184,7 @@ fn orient(w: &mut Work) -> usize {
 
 /// Removes non-manifold triangles and orients the rest consistently.
 pub(super) fn repair(w: &mut Work) -> Repairs {
-    let removed = remove_non_manifold(w);
+    let removed = remove_duplicates(w) + remove_non_manifold(w);
     let flipped = orient(w);
     Repairs { removed, flipped }
 }

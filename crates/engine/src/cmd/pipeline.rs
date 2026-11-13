@@ -681,11 +681,10 @@ fn relate(s: &mut Session, modelled: &[Modelled], sigma: Option<f64>) -> usize {
 pub(super) fn to_solid(s: &mut Session, i: ToSolidIn) -> CmdResult<ToSolidOut> {
     shell::check(&i)?;
     let set = settings(s, &i)?;
-    let i = shell::keep_rim_open(s, i, set.scan)?;
-    let scan_report = prepare(s, &i, set.scan)?;
     if i.thickness.is_some() {
-        return shell::shell_solid(s, &set, &i, scan_report);
+        return shell::run(s, &set, &i);
     }
+    let scan_report = prepare(s, &i, set.scan)?;
     if i.method == Method::Freeform {
         return freeform::freeform_solid(s, &set, scan_report);
     }

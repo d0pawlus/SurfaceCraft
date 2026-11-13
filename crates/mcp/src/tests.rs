@@ -641,6 +641,7 @@ mod shortening {
         assert_eq!(first, listing_text(&mut s), "same server, same bytes");
         assert_eq!(first, listing_text(&mut default_server()), "new server, same bytes");
         let size = first.len();
+        eprintln!("default listing: {size} bytes of {MAX_DEFAULT_LISTING}");
         assert!(size <= MAX_DEFAULT_LISTING, "the default listing is {size} bytes");
         assert!(
             MAX_DEFAULT_LISTING - size >= MIN_HEADROOM,

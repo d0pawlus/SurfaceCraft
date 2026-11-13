@@ -67,21 +67,33 @@ kernel refuses sheets of many faces. Give the wall thickness instead:
   thickened mesh. The back face has no scan points and is not counted. With `symmetric` the scan lies
   in the middle of the wall; it is measured against the face moved half the thickness along the
   scan's normals, so a symmetric result is judged on the shape of the face, not on the half wall.
-- The cleaning keeps the largest boundary loop of the scan (its rim) open: holes are filled only up
-  to one edge less than it. Windows smaller than `fill_holes_max_edges` (default 400) are filled like
-  any other hole; pass `fill_holes_max_edges: 0` to keep them as windows (both loops are stitched).
+- The rim is the largest boundary loop of the CLEANED scan (debris and spikes are gone by then) and
+  stays open: holes are filled only up to one edge less than it, and up to `fill_holes_max_edges`
+  (default 400). Every other loop that is left (a hole above the limit, or a window of the part) is
+  stitched through the wall as a window: `thickened.windows` counts them, `rim_edges` is the rim, and
+  the issue `windows_stitched` (verdict at most `review`) tells, with a next step that fills every
+  hole but the rim.
 - `thickened` in the result: `thickness`, `symmetric`, `clamped_vertices`, `largest_reduction`,
   `boundary_loops` and the thickened mesh when kept. A closed scan with `thickness` is an error:
   there is nothing to thicken.
 - Where the surface curves more tightly than the wall is thick (a bead, a tight corner on the side
-  of the offset), the offset is reduced locally and the wall is thinner there: `clamped_vertices` and
-  `largest_reduction` say where, and more than 1 % of the vertices is the issue `thickness_reduced`.
+  of the offset), the offset is reduced locally (never below a tenth of the thickness) and the wall
+  is thinner there: `clamped_vertices`, `folded_vertices` (the others were only tapered),
+  `largest_reduction`, `median_reduction` and the sampled wall `min_wall` / `median_wall` say where
+  and how much; more than 1 % of the vertices is the issue `thickness_reduced`. A sharp crease on the
+  side of the offset cannot carry any wall: up to 0.1 % of the vertices may stay folded at the floor
+  (`unresolved_vertices`), more is refused. The next step offers a thinner wall.
   A thickness whose offset folds triangles at more than 15 % of the vertices is refused (verdict `fail`, issue `no_solid`)
-  with a thickness the surface can carry as the next step. Thin gaps between two sheets of the scan
-  that are narrower than the wall are not detected.
-- Before the offset the mesh is repaired: triangles on edges shared by three or more triangles are
-  removed and the orientation is made consistent per piece; places where boundary loops touch are
-  split. The normals are smoothed over about half the wall, so noise finer than that does not fold it.
+  with a thickness the surface can carry as the next step. Only local folds are detected
+  (`self_intersection_checked` is always false): a part of the offset sheet that meets another part
+  of the shell, such as a channel narrower than the wall or two sheets closer than the wall, is not.
+- Before the offset the mesh is repaired: duplicate triangles are dropped; of the triangles on an
+  edge shared by three or more the two that continue the surface best are kept and the others (fins)
+  removed (`removed_non_manifold`); the orientation is made consistent per piece
+  (`flipped_triangles`); places where boundary loops touch are split. The normals are averaged over a
+  ball of half the wall (at least one edge), so noise finer than that does not fold it; at the rim
+  the average is one-sided. The strip along the rim has rows of about one edge, at most 64 and at
+  most 4 million triangles, so a wall much thicker than the rim edges has needle triangles there.
 - `mesh.thicken` does the first half alone: a new mesh, closed and outward, from `object`,
   `thickness`, `symmetric` and `name`.
 
