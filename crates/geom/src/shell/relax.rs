@@ -11,7 +11,7 @@
 //! the relaxed vertices do not fold their unrelaxed neighbours in turn. Only triangles around the vertices changed are re-tested, so the
 //! cost stays near one pass over the mesh.
 use super::topology::Csr;
-use crate::{Point3, Vec3, par};
+use crate::{Aabb, Bvh, Mesh, Point3, Vec3, nesting, par};
 
 /// A triangle whose offset copy keeps less than this share of its area is folded.
 pub(super) const MIN_AREA_RATIO: f64 = 0.15;
@@ -27,6 +27,14 @@ const MAX_OFFSET_SLOPE: f64 = 0.5;
 /// The offset of a vertex is never reduced below this share of the thickness: a fold that cannot be
 /// resolved above it is refused (below it the two sheets would touch).
 pub(super) const MIN_SCALE: f64 = 0.1;
+/// Crossing triangles whose vertices are within this many thicknesses of each other along the surface
+/// count as a fold of the offset (the flanks of a crease); farther ones are left to the report.
+const LOCAL_REACH: f64 = 2.0;
+/// ...and so do those within this many mean edges (on a coarse mesh two triangles that share no
+/// vertex are already an edge or two apart).
+const LOCAL_RINGS: f64 = 3.0;
+/// Rounds of the exact crossing test around the reduced vertices at most.
+const MAX_CROSSING_ROUNDS: usize = 12;
 /// Rounds at most; `SHRINK^ROUNDS` is the smallest share of the offset a vertex can keep.
 const MAX_ROUNDS: usize = 60;
 
@@ -37,15 +45,44 @@ pub(super) struct Field<'a> {
     pub triangles: &'a [[u32; 3]],
     /// Offsets (mm along the normals) of the layers that move; `[]` entries of zero are left out.
     pub offsets: &'a [f64],
+    /// Offsets of both layers `[a, b]` (one of them may be 0).
+    pub layers: [f64; 2],
     /// Triangles around every vertex.
     pub around: &'a Csr,
     /// Neighbours of every vertex.
     pub adjacent: &'a Csr,
     /// The thickness (mm): the offsets are `scale` times it.
     pub thickness: f64,
+    /// Mean edge length of the mesh (mm).
+    pub edge: f64,
+    /// Boundary edges (the strip along them joins the two layers).
+    pub boundary: &'a [(u32, u32)],
 }
 
 impl Field<'_> {
+    /// Do triangles `x` and `y` of the layers mesh (`n` vertices per layer) lie within [`LOCAL_REACH`]
+    /// thicknesses of each other along the scan? Crossings farther apart along the surface are real
+    /// geometry (a channel narrower than the wall), not a fold of the offset, and are left to the sample
+    /// that reports them; the two flanks of a ridge are close along the surface and count.
+    fn near_along_the_surface(&self, x: &[u32; 3], y: &[u32; 3], n: u32) -> bool {
+        let origin = |v: u32| v % n.max(1);
+        let reach = (LOCAL_REACH * self.thickness).max(LOCAL_RINGS * self.edge);
+        let mut best: std::collections::HashMap<u32, f64> = x.iter().map(|&v| (origin(v), 0.0)).collect();
+        let mut queue: std::collections::VecDeque<u32> = best.keys().copied().collect();
+        while let Some(v) = queue.pop_front() {
+            let (Some(&dv), Some(pv)) = (best.get(&v), self.positions.get(v as usize)) else { continue };
+            for &w in self.adjacent.row(v as usize) {
+                let Some(pw) = self.positions.get(w as usize) else { continue };
+                let d = dv + (pw - pv).norm();
+                if d <= reach && best.get(&w).is_none_or(|&old| d < old - 1e-12) {
+                    best.insert(w, d);
+                    queue.push_back(w);
+                }
+            }
+        }
+        y.iter().any(|&v| best.contains_key(&origin(v)))
+    }
+
     fn corner(&self, v: u32, scale: &[f64], offset: f64) -> Option<Point3> {
         let p = self.positions.get(v as usize)?;
         let n = self.normals.get(v as usize)?;
@@ -124,31 +161,28 @@ fn taper(field: &Field, scale: &mut [f64], changed: &[u32]) -> Vec<u32> {
 pub(super) struct Relaxed {
     /// The share of the offset every vertex keeps (1 where nothing folds and nothing was tapered).
     pub scale: Vec<f64>,
-    /// Vertices of triangles that folded in some round (the others were only tapered).
+    /// Vertices of triangles that folded or crossed another in some round (the others were only tapered).
     pub folded: usize,
-    /// Vertices that still lie on a folded triangle at the floor [`MIN_SCALE`] (sharp creases on the
-    /// side of the offset: no wall of that thickness fits there).
+    /// Vertices that still lie on a folded or crossing triangle at the floor [`MIN_SCALE`] (sharp
+    /// creases on the side of the offset: no wall of that thickness fits there).
     pub unresolved: usize,
 }
 
-/// Relaxes the offset, or returns the number of vertices that still fold when [`MAX_ROUNDS`] rounds
-/// could not resolve the others.
-pub(super) fn relax(field: &Field) -> Result<Relaxed, usize> {
-    let n = field.positions.len();
-    let mut scale = vec![1.0; n];
-    let mut ever = vec![false; n];
-    let mut frozen = vec![false; n];
-    let done = |scale: Vec<f64>, ever: &[bool], frozen: &[bool]| Relaxed {
-        scale,
-        folded: ever.iter().filter(|&&e| e).count(),
-        unresolved: frozen.iter().filter(|&&f| f).count(),
-    };
-    let mut dirty: Vec<u32> = (0..n as u32).collect();
-    for _ in 0..MAX_ROUNDS {
+/// What the rounds change.
+struct State {
+    scale: Vec<f64>,
+    ever: Vec<bool>,
+    frozen: Vec<bool>,
+}
+
+impl State {
+    /// Splits `bad` into the vertices that can still be reduced (returned) and those already at the
+    /// floor (frozen), and records that they all folded.
+    fn partition(&mut self, bad: Vec<u32>) -> Vec<u32> {
         let mut movable = Vec::new();
-        for v in flagged(field, &scale, &dirty) {
-            let at_floor = scale.get(v as usize).is_some_and(|&s| s <= MIN_SCALE * 1.000_001);
-            if let (Some(f), Some(e)) = (frozen.get_mut(v as usize), ever.get_mut(v as usize)) {
+        for v in bad {
+            let at_floor = self.scale.get(v as usize).is_some_and(|&s| s <= MIN_SCALE * 1.000_001);
+            if let (Some(f), Some(e)) = (self.frozen.get_mut(v as usize), self.ever.get_mut(v as usize)) {
                 *e = true;
                 if at_floor {
                     *f = true;
@@ -157,21 +191,121 @@ pub(super) fn relax(field: &Field) -> Result<Relaxed, usize> {
                 }
             }
         }
-        if movable.is_empty() {
-            return Ok(done(scale, &ever, &frozen));
-        }
-        for &v in &movable {
-            if let Some(s) = scale.get_mut(v as usize) {
+        movable
+    }
+
+    /// Reduces `movable` and tapers the reduction; returns the vertices changed.
+    fn shrink(&mut self, field: &Field, movable: &[u32]) -> Vec<u32> {
+        for &v in movable {
+            if let Some(s) = self.scale.get_mut(v as usize) {
                 *s = (*s * SHRINK).max(MIN_SCALE);
             }
         }
-        dirty = taper(field, &mut scale, &movable);
+        taper(field, &mut self.scale, movable)
     }
-    let left = flagged(field, &scale, &dirty)
+}
+
+/// Rounds of the per-triangle test from the vertices `dirty`; the number of vertices that still fold
+/// when [`MAX_ROUNDS`] could not resolve them is the error.
+fn fold_rounds(field: &Field, st: &mut State, mut dirty: Vec<u32>) -> Result<(), usize> {
+    for _ in 0..MAX_ROUNDS {
+        let movable = {
+            let bad = flagged(field, &st.scale, &dirty);
+            st.partition(bad)
+        };
+        if movable.is_empty() {
+            return Ok(());
+        }
+        dirty = st.shrink(field, &movable);
+    }
+    let left = flagged(field, &st.scale, &dirty)
         .into_iter()
-        .filter(|&v| !frozen.get(v as usize).copied().unwrap_or(true))
+        .filter(|&v| !st.frozen.get(v as usize).copied().unwrap_or(true))
         .count();
-    if left == 0 { Ok(done(scale, &ever, &frozen)) } else { Err(left) }
+    if left == 0 { Ok(()) } else { Err(left) }
+}
+
+/// The offset layers `[a, b]` as one mesh (the first `n` vertices and `T` triangles the layer at `a`).
+fn layers_mesh(field: &Field, scale: &[f64]) -> Mesh {
+    let n = field.positions.len() as u32;
+    let mut positions = Vec::with_capacity(2 * field.positions.len());
+    for &o in &field.layers {
+        positions.extend((0..n).map(|v| field.corner(v, scale, o).unwrap_or_else(Point3::origin)));
+    }
+    let mut triangles = field.triangles.to_vec();
+    triangles.extend(field.triangles.iter().map(|t| t.map(|v| v + n)));
+    // the strip along the rim, one row: it can cut through a layer next to a bend of the rim
+    for &(u, v) in field.boundary {
+        triangles.push([u, v, v + n]);
+        triangles.push([u, v + n, u + n]);
+    }
+    Mesh { positions, triangles }
+}
+
+/// The vertices (as vertices of the scan, ascending) of the triangles around a reduced vertex that cross
+/// a triangle of either layer which shares none of their vertices. Exact, but only around the vertices
+/// whose offset was reduced: the per-triangle test cannot see a crossing between triangles that are not
+/// neighbours (two rings apart at a crease).
+fn crossing_vertices(field: &Field, scale: &[f64]) -> Vec<u32> {
+    let n = field.positions.len() as u32;
+    let mesh = layers_mesh(field, scale);
+    let bvh = Bvh::build(&mesh);
+    let reduced: Vec<u32> = (0..n).filter(|&v| scale.get(v as usize).is_some_and(|&s| s < 1.0)).collect();
+    let mut tris: Vec<u32> = reduced.iter().flat_map(|&v| field.around.row(v as usize).iter().copied()).collect();
+    tris.sort_unstable();
+    tris.dedup();
+    let tcount = field.triangles.len() as u32;
+    let strip: Vec<u32> = (0..2 * field.boundary.len() as u32).map(|k| 2 * tcount + k).collect();
+    let origin = |v: u32| v % n.max(1);
+    let hits: Vec<Vec<u32>> = par::map(tris.len() * 2 + strip.len(), |k| {
+        let id = match k {
+            k if k < tris.len() * 2 => tris.get(k / 2).copied().unwrap_or(0) + (k % 2) as u32 * tcount,
+            k => strip.get(k - tris.len() * 2).copied().unwrap_or(0),
+        };
+        let (Some(x), Some(xi)) = (mesh.triangle(id as usize), mesh.triangles.get(id as usize)) else {
+            return Vec::new();
+        };
+        let bx = Aabb::from_points(x.iter());
+        let near = bvh.candidates(&|b: &Aabb| (0..3).all(|a| b.min[a] <= bx.max[a] && bx.min[a] <= b.max[a]));
+        for o in near {
+            let (Some(y), Some(yi)) = (mesh.triangle(o as usize), mesh.triangles.get(o as usize)) else { continue };
+            let shares = xi.iter().any(|v| yi.iter().any(|w| origin(*v) == origin(*w)));
+            if o != id && !shares && nesting::crosses(&x, &y) && field.near_along_the_surface(xi, yi, n) {
+                return xi.iter().chain(yi.iter()).map(|&v| origin(v)).collect();
+            }
+        }
+        Vec::new()
+    });
+    let mut out: Vec<u32> = hits.into_iter().flatten().collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Relaxes the offset, or returns the number of vertices that still fold when [`MAX_ROUNDS`] rounds
+/// could not resolve the others. After the per-triangle rounds, the neighbourhood of every reduced
+/// vertex is tested exactly for triangles that cross; their vertices count as folded and are reduced,
+/// for at most [`MAX_CROSSING_ROUNDS`] rounds.
+pub(super) fn relax(field: &Field) -> Result<Relaxed, usize> {
+    let n = field.positions.len();
+    let mut st = State { scale: vec![1.0; n], ever: vec![false; n], frozen: vec![false; n] };
+    fold_rounds(field, &mut st, (0..n as u32).collect())?;
+    for _ in 0..MAX_CROSSING_ROUNDS {
+        let movable = {
+            let bad = crossing_vertices(field, &st.scale);
+            st.partition(bad)
+        };
+        if movable.is_empty() {
+            break;
+        }
+        let changed = st.shrink(field, &movable);
+        fold_rounds(field, &mut st, changed)?;
+    }
+    Ok(Relaxed {
+        folded: st.ever.iter().filter(|&&e| e).count(),
+        unresolved: st.frozen.iter().filter(|&&f| f).count(),
+        scale: st.scale,
+    })
 }
 
 #[cfg(test)]
@@ -193,9 +327,12 @@ mod tests {
             normals: &normals,
             triangles: &triangles,
             offsets: &offsets,
+            layers: [offsets[0], 0.0],
             around: &around,
             adjacent: &adjacent,
             thickness: 1000.0,
+            edge: 1.0,
+            boundary: &[],
         };
 
         // Act

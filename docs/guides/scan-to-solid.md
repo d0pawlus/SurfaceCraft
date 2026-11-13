@@ -87,7 +87,7 @@ kernel refuses sheets of many faces. Give the wall thickness instead:
   with a thickness the surface can carry as the next step. An even sample of the thickened
   mesh is tested for triangles that cross one they share no vertex with (`self_intersections` of
   `thickened`, `self_intersection_samples` tested); a channel or gap narrower than the wall shows
-  there, as the issue `self_intersection` (verdict at most `review`). Only a sample is tested.
+  there, as the issue `self_intersection` (verdict at most `review`), with the sampled count and an extrapolation to the whole mesh. Only a sample is tested. Crossings near a relaxed vertex (the two flanks of a crease within two thicknesses along the surface) are not reported: they are tested exactly during the relaxation and the offset is reduced there until they are gone; the strip along the rim is not part of that test.
 - Before the offset the mesh is repaired: duplicate triangles are dropped; of the triangles on an
   edge shared by three or more the two that continue the surface best are kept and the others (fins)
   removed (`removed_non_manifold`); the orientation is made consistent per piece
@@ -95,6 +95,9 @@ kernel refuses sheets of many faces. Give the wall thickness instead:
   ball of half the wall (at least one edge), so noise finer than that does not fold it; at the rim
   the average is one-sided. The strip along the rim has rows of about one edge, at most 64 and at
   most 4 million triangles, so a wall much thicker than the rim edges has needle triangles there.
+- The thickened mesh has about twice the triangles of the scan, so the automatic larger-cap retry
+  (never above 1.5 million triangles of the mesh that is wrapped) stops at about 750 000 scan
+  triangles; above that, the next step offers `scan.to_solid` with an explicit `max_patches`.
 - `mesh.thicken` does the first half alone: a new mesh, closed and outward, from `object`,
   `thickness`, `symmetric` and `name`.
 

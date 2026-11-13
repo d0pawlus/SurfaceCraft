@@ -470,16 +470,16 @@ fn thickness_with_parts_or_several_co_equal_pieces_is_refused_and_one_piece_is_u
     assert!(out["thickened"].is_object() && out["prep"]["components"].as_array().is_none_or(Vec::is_empty), "{out}");
 }
 
-/// A U-shaped channel 1 mm wide and 6 mm deep as an open sheet whose normals point out of it.
+/// A U-shaped channel 3 mm wide and 30 mm deep as an open sheet whose normals point out of it.
 fn narrow_channel() -> Mesh {
-    let path = [(-0.5, 6.0), (-0.5, 0.0), (0.5, 0.0), (0.5, 6.0)];
-    let (steps, rows) = (20usize, 67usize);
+    let path = [(-1.5, 30.0), (-1.5, 0.0), (1.5, 0.0), (1.5, 30.0)];
+    let (steps, rows) = (60usize, 67usize);
     let mut positions = Vec::new();
     for j in 0..=rows {
         let y = 20.0 * j as f64 / rows as f64;
         for k in 0..(path.len() - 1) {
             let ((x0, z0), (x1, z1)) = (path[k], path[k + 1]);
-            let n = if k == 1 { 3 } else { steps };
+            let n = if k == 1 { 10 } else { steps };
             for i in 0..=n {
                 if k > 0 && i == 0 {
                     continue;

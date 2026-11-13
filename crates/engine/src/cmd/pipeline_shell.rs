@@ -228,9 +228,10 @@ fn issues_of(
         list.push(issue("thickness_reduced", msg));
     }
     if t.self_intersections > 0 {
+        let whole = t.self_intersections as f64 * t.triangles as f64 / t.self_intersection_samples.max(1) as f64;
         let msg = format!(
-            "the thickened mesh crosses itself: {} of {} sampled triangles cut another one (a channel or gap narrower than the wall): use a thinner wall or model the parts separately",
-            t.self_intersections, t.self_intersection_samples
+            "the thickened mesh crosses itself away from the places the offset was relaxed: {} of {} sampled triangles cut another one (about {:.0} of {} in all): the wall is thicker than a channel or gap of the part; a thinner wall, or splitting the part (`scan.split`), is the way out",
+            t.self_intersections, t.self_intersection_samples, whole, t.triangles
         );
         list.push(issue("self_intersection", msg));
     }

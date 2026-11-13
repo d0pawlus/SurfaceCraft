@@ -270,7 +270,8 @@ pub fn thicken(mesh: &Mesh, params: &ThickenParams) -> Result<Thickened, Thicken
     let radius = (SMOOTHING_SHARE * params.thickness.abs()).max(mean_edge(&work));
     let normals = normals::smoothed(&work.positions, &work.triangles, radius).ok_or(ThickenError::NoNormals)?;
     let (a, b) = layer_offsets(params);
-    let (scale, folded, unresolved) = fold_free_scale(&work, &normals, &adjacent, &[a, b], params.thickness)?;
+    let (scale, folded, unresolved) =
+        fold_free_scale(&work, &normals, &adjacent, &boundary, &[a, b], params.thickness)?;
     (work.folded, work.unresolved) = (folded, unresolved);
     assemble(&work, &normals, &scale, (a, b), &boundary, params)
 }
@@ -294,6 +295,7 @@ fn fold_free_scale(
     work: &Work,
     normals: &[Vec3],
     adjacent: &Csr,
+    boundary: &[(u32, u32)],
     offsets: &[f64; 2],
     thickness: f64,
 ) -> Result<(Vec<f64>, usize, usize), ThickenError> {
@@ -306,9 +308,12 @@ fn fold_free_scale(
         normals,
         triangles: &work.triangles,
         offsets: &moving,
+        layers: *offsets,
         around: &around,
         adjacent,
         thickness: thickness.abs(),
+        edge: mean_edge(work),
+        boundary,
     };
     let relaxed = relax::relax(&field).map_err(ThickenError::Unresolved)?;
     if relaxed.unresolved as f64 > MAX_UNRESOLVED_SHARE * relaxed.scale.len() as f64 {

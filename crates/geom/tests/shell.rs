@@ -526,17 +526,17 @@ fn the_wall_is_measured_and_the_folded_vertices_are_told_from_the_tapered_ones()
     assert!(report.folded_vertices > 0 && report.folded_vertices <= report.clamped_vertices);
 }
 
-/// A U-shaped channel 1 mm wide and 6 mm deep, 20 mm long, as an open sheet whose normals point out
+/// A U-shaped channel 3 mm wide and 30 mm deep, 20 mm long, as an open sheet whose normals point out
 /// of the channel; offset against them (positive thickness) the walls run into each other.
 fn narrow_channel() -> Mesh {
-    let path = [(-0.5, 6.0), (-0.5, 0.0), (0.5, 0.0), (0.5, 6.0)];
-    let (steps, rows) = (20usize, 67usize);
+    let path = [(-1.5, 30.0), (-1.5, 0.0), (1.5, 0.0), (1.5, 30.0)];
+    let (steps, rows) = (60usize, 67usize);
     let mut positions = Vec::new();
     for j in 0..=rows {
         let y = 20.0 * j as f64 / rows as f64;
         for k in 0..(path.len() - 1) {
             let ((x0, z0), (x1, z1)) = (path[k], path[k + 1]);
-            let n = if k == 1 { 3 } else { steps };
+            let n = if k == 1 { 10 } else { steps };
             for i in 0..=n {
                 if k > 0 && i == 0 {
                     continue;
@@ -591,4 +591,19 @@ fn shells_that_do_not_meet_themselves_report_no_crossing() {
     // Assert
     assert!(r.report.crossing_samples > 0);
     assert_eq!(r.report.crossing_triangles, 0, "{:?}", r.report);
+}
+
+#[test]
+fn a_crease_whose_neighbouring_offset_triangles_cross_is_relaxed_until_they_do_not() {
+    // Arrange: a ridge (radius 0.17 mm at the crest) against a 1 mm wall; each offset triangle passes the
+    // area and normal tests, but triangles two rings apart cut through each other
+    let panel = ridge_panel(1.5, 0.5);
+
+    // Act
+    let r = thicken(&panel, &params(1.0)).expect("relaxed");
+
+    // Assert
+    assert_eq!(self_intersections(&r.mesh), 0, "{:?}", r.report);
+    assert_eq!(r.report.crossing_triangles, 0, "{:?}", r.report);
+    assert!(r.report.clamped_vertices > 0);
 }
