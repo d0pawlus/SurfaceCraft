@@ -19,10 +19,12 @@
 //! missed regions first in the adaptive layout (how many of the scan vertices ranked by their
 //! deviation get more detail), the budget in the uniform one — so the whole cap is spent.
 use super::wrap::WrapDeviation;
-use super::wrap_cap::{End, decimate_options, search_cap, trim_to_cap};
+use super::wrap_cap::{End, Trimmed, decimate_options, search_cap, trim_to_cap};
+use super::wrap_cluster::ClusterError;
 use super::{CmdError, CmdResult};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use surfacecraft_fit::mls::ScanSurface;
 use surfacecraft_fit::patch::{PatchSet, tessellate};
@@ -141,6 +143,8 @@ pub(super) struct Round {
     pub(super) deviation: WrapDeviation,
     partial: Option<PartialReason>,
     probes: usize,
+    /// Was the coarse mesh made by grid clustering?
+    pub(super) clustered: bool,
 }
 
 /// The scan, its acceleration structure and the points the patches are measured at.
@@ -155,6 +159,9 @@ pub(super) struct Target<'a> {
     pub(super) min_within: f64,
     max_triangles: usize,
     max_patches: usize,
+    /// The clustered first round (with the triangles of the mesh it was made from): the clustering
+    /// is paid once per call, however many searches ask for the first round.
+    cluster_cache: RefCell<Option<(usize, Mesh)>>,
 }
 
 impl<'a> Target<'a> {
@@ -172,6 +179,7 @@ impl<'a> Target<'a> {
             min_within,
             max_triangles: (max_patches / PATCHES_PER_TRIANGLE).max(4),
             max_patches,
+            cluster_cache: RefCell::new(None),
         }
     }
 }
@@ -217,10 +225,24 @@ struct Laid {
     partial: Option<PartialReason>,
     probes: usize,
     refined_vertices: usize,
+    /// Was the mesh made by grid clustering (edge collapse stalled)?
+    clustered: bool,
+}
+
+fn cap_error(e: ClusterError) -> CmdError {
+    CmdError::Failed(
+        match e {
+            ClusterError::Over => "the scan cannot be represented within max_patches: raise it",
+            ClusterError::Thin => {
+                "the scan is too thin or too fine to be reduced to max_patches without losing its surface: raise it"
+            }
+        }
+        .into(),
+    )
 }
 
 fn over_the_cap() -> CmdError {
-    CmdError::Failed("the scan cannot be represented within max_patches: raise it".into())
+    cap_error(ClusterError::Over)
 }
 
 /// Lays the patches on `coarse` and measures them; also returns the distance of every sample.
@@ -244,6 +266,7 @@ fn build_round(t: &Target, coarse: &Mesh, budget: f64, g1: bool) -> (Round, Vec<
         deviation,
         partial: None,
         probes: 0,
+        clustered: false,
     };
     (round, d)
 }
@@ -281,7 +304,7 @@ impl Run {
     /// sample and whether the round reached `min_within`.
     fn add(&mut self, t: &Target, laid: Laid) -> (Vec<f64>, bool) {
         let (round, d) = build_round(t, &laid.mesh, laid.budget, self.g1);
-        let round = Round { partial: laid.partial, probes: laid.probes, ..round };
+        let round = Round { partial: laid.partial, probes: laid.probes, clustered: laid.clustered, ..round };
         self.log.push(level_of(self.log.len() + 1, &round, laid.refined_vertices));
         self.hit_cap |= round.partial.is_some();
         let met = round.deviation.within >= t.min_within;
@@ -308,15 +331,38 @@ impl Run {
 
 /// The first round, bigger than the cap: cut to it.
 fn first_round_over(t: &Target, raw: Mesh, budget: f64) -> CmdResult<Laid> {
-    let mesh = trim_to_cap(raw, t.max_triangles, true).ok_or_else(over_the_cap)?;
-    Ok(Laid { mesh, budget, partial: Some(PartialReason::FirstRoundOverCap), probes: 0, refined_vertices: 0 })
+    let from = raw.triangle_count();
+    let cached = t.cluster_cache.borrow().as_ref().filter(|(n, _)| *n == from).map(|(_, m)| m.clone());
+    let cut = match cached {
+        Some(mesh) => Trimmed { mesh, clustered: true },
+        None => trim_to_cap(raw, t.max_triangles, true).map_err(cap_error)?,
+    };
+    if cut.clustered {
+        *t.cluster_cache.borrow_mut() = Some((from, cut.mesh.clone()));
+    }
+    let (mesh, clustered) = (cut.mesh, cut.clustered);
+    Ok(Laid {
+        mesh,
+        budget,
+        partial: Some(PartialReason::FirstRoundOverCap),
+        probes: 0,
+        refined_vertices: 0,
+        clustered,
+    })
 }
 
 /// The round the budget asked for, bigger than the cap, cut to it by the decimation: detail stays
 /// where the quadric error is highest. Costs no reduction of the scan.
 fn trimmed(t: &Target, raw: Mesh, budget: f64, refined_vertices: usize) -> Option<Laid> {
-    let mesh = trim_to_cap(raw, t.max_triangles, false)?;
-    Some(Laid { mesh, budget, partial: Some(PartialReason::NextRoundOverCap), probes: 0, refined_vertices })
+    let mesh = trim_to_cap(raw, t.max_triangles, false).ok()?.mesh;
+    Some(Laid {
+        mesh,
+        budget,
+        partial: Some(PartialReason::NextRoundOverCap),
+        probes: 0,
+        refined_vertices,
+        clustered: false,
+    })
 }
 
 /// A uniform round bigger than the cap: the round cut to the cap is built first; when it misses the
@@ -338,6 +384,7 @@ fn uniform_over(t: &Target, run: &mut Run, raw: Mesh, budget: f64, last: usize) 
         partial: Some(PartialReason::NextRoundOverCap),
         probes,
         refined_vertices: 0,
+        clustered: false,
     })
 }
 
@@ -350,7 +397,7 @@ fn uniform_rounds(t: &Target, g1: bool) -> CmdResult<Wrapped> {
     for round in 1..=UNIFORM_ROUNDS {
         let raw = reduce_scan(t.scan, budget, &[]);
         let laid = if raw.triangle_count() <= t.max_triangles {
-            Laid { mesh: raw, budget, partial: None, probes: 0, refined_vertices: 0 }
+            Laid { mesh: raw, budget, partial: None, probes: 0, refined_vertices: 0, clustered: false }
         } else if round == 1 {
             first_round_over(t, raw, budget)?
         } else {
@@ -422,7 +469,14 @@ fn next_round_over(t: &Target, run: &mut Run, a: &Adaptive, raw: Mesh, budget: f
     let (found, probes) = search_cap(t.max_triangles, ends, VERTEX_STEP, probe);
     let f = found?;
     let refined_vertices = refined_count(&levels_of(f.x));
-    Some(Laid { mesh: f.mesh, budget, partial: Some(PartialReason::NextRoundOverCap), probes, refined_vertices })
+    Some(Laid {
+        mesh: f.mesh,
+        budget,
+        partial: Some(PartialReason::NextRoundOverCap),
+        probes,
+        refined_vertices,
+        clustered: false,
+    })
 }
 
 /// The adaptive layout: detail levels are raised around the scan points the patches miss, the
@@ -439,7 +493,14 @@ fn adaptive_rounds(t: &Target, g1: bool) -> CmdResult<Wrapped> {
     for round in 1..=ADAPTIVE_ROUNDS {
         let raw = reduce_scan(t.scan, budget, &scale_of(&levels));
         let laid = if raw.triangle_count() <= t.max_triangles {
-            Laid { mesh: raw, budget, partial: None, probes: 0, refined_vertices: refined_count(&levels) }
+            Laid {
+                mesh: raw,
+                budget,
+                partial: None,
+                probes: 0,
+                refined_vertices: refined_count(&levels),
+                clustered: false,
+            }
         } else if round == 1 {
             first_round_over(t, raw, budget)?
         } else {
@@ -486,7 +547,8 @@ pub(super) fn wrap_rounds(t: &Target, refine: Refine) -> CmdResult<Wrapped> {
     }
     let best = &found.best;
     let (tangent, _) = build_round(t, &best.coarse, best.budget, true);
-    let tangent = Round { capped: best.capped, partial: best.partial, probes: best.probes, ..tangent };
+    let tangent =
+        Round { capped: best.capped, partial: best.partial, probes: best.probes, clustered: best.clustered, ..tangent };
     let kept = tangent.deviation.within >= t.min_within.min(best.deviation.within);
     if !kept {
         return search(t, refine, true);

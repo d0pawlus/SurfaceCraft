@@ -85,12 +85,16 @@ Primitives:
 - `open_surface` (freeform): the network is a sheet because the scan has open boundaries. Fill
   the holes (`mesh.fill_holes`) and run again, or `surface.thicken` the sheet when the part is a
   shell.
-- `out_of_tolerance` (freeform): the part needs more patches than the limit. When the first
-  network stopped at `max_patches` (default 12000) with at least 25 % of the scan within the
-  tolerance and the scan has at most 1.5 million triangles, the command wraps once more with five
-  times the limit (at most 60000) and keeps the better network; `retry` reports both limits, both
-  patch counts and shares and which one was kept. Beyond that, `surface.wrap` with a larger
-  `max_patches` (up to 60000); the STEP file grows with the patch count.
+- `out_of_tolerance` (freeform): the part needs more patches than the limit. When `max_patches` was
+  not given, the first network stopped at the default limit (12000) with at least 25 % of the scan
+  within the tolerance, the scan has at most 1.5 million triangles and `allow_retry` is not false,
+  the command wraps once more with five times the limit (at most 60000). The second network
+  replaces the first only if it is not open where the first is closed and puts at least 0.5
+  percentage points more of the scan within the tolerance (or closes an open network at no loss).
+  `retry` reports both limits, patches and shares, `kept`, a `reason` (`better`, `not_better`,
+  `open_result`, `failed`) and the `error` of a failed second wrap. A `max_patches` you give is
+  never exceeded. Beyond that, `surface.wrap` with a larger `max_patches` (up to 60000); the STEP
+  file grows with the patch count.
 - `non_manifold_edges`: edges shared by three or more triangles are left after cleaning; the
   regions and holes next to them are unreliable. `mesh.reconstruct` builds a new mesh from the
   points of the file.

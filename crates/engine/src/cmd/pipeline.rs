@@ -100,11 +100,17 @@ pub struct ToSolidIn {
     /// coaxial, equal radii (default true).
     #[serde(default = "yes")]
     pub constrain: bool,
-    /// Most patches of the network of method `freeform` (default 12000, at most 60000). A network
-    /// that stops at this limit short of the tolerance is built once more with a larger limit
-    /// when that is likely to help; see `retry` of the result.
+    /// Most patches of the network of method `freeform` (default 12000, at most 60000). An explicit
+    /// value is a promise and is never exceeded; without it, a network that stops at the default limit
+    /// short of the tolerance is built once more with a larger limit when that is likely to help
+    /// (`allow_retry`, `retry` of the result).
     #[serde(default)]
     pub max_patches: Option<usize>,
+    /// Let method `freeform` build the network once more with a larger patch limit when the first
+    /// one stopped at the default limit short of the tolerance (default true; never done when
+    /// `max_patches` is given).
+    #[serde(default = "yes")]
+    pub allow_retry: bool,
     /// Name of the solid (default "solid").
     #[serde(default)]
     pub name: Option<String>,
@@ -273,6 +279,7 @@ struct Settings {
     min_within: f64,
     min_triangles: Option<usize>,
     max_patches: Option<usize>,
+    allow_retry: bool,
     name: String,
 }
 
@@ -357,6 +364,7 @@ fn settings(s: &Session, i: &ToSolidIn) -> CmdResult<Settings> {
         min_within,
         min_triangles: i.min_region_triangles,
         max_patches: i.max_patches,
+        allow_retry: i.allow_retry,
         name: i.name.clone().unwrap_or_else(|| "solid".to_string()),
     })
 }

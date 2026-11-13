@@ -350,6 +350,8 @@
   "target must be at least one triangle": "„Cel” musi wynosić co najmniej jeden trójkąt",
   "target_quads must be 1..={}": "„Liczba czworokątów” musi być w zakresie 1..={}",
   "target_quads must be 8..=20000": "„Liczba czworokątów” musi być w zakresie 8..=20000",
+  "the scan cannot be represented within max_patches: raise it": "skanu nie da się odwzorować w podanym limicie płatów: zwiększ „Maks. płatów”",
+  "the scan is too thin or too fine to be reduced to max_patches without losing its surface: raise it": "skan jest zbyt cienki lub zbyt drobny, by zmieścić go w limicie płatów bez utraty powierzchni: zwiększ „Maks. płatów”",
   "the body could not be meshed to associate the scan to its faces": "nie udało się zamienić bryły w siatkę, aby przypisać skan do jej ścian",
   "the body is gone": "bryła już nie istnieje",
   "the chain has fewer than two distinct samples": "łańcuch ma mniej niż dwa różne punkty",

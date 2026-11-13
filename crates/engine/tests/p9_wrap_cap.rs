@@ -158,22 +158,99 @@ fn the_wrap_is_deterministic_under_a_cap() {
 }
 
 #[test]
-fn to_solid_retries_once_with_a_larger_cap_and_says_so() {
-    // Arrange: the default cap is lowered to 300 patches so that the first attempt cannot pass
-    let mut s = session_with(rippled_scan(0.7, 5.0, 9));
+fn an_explicit_max_patches_is_never_exceeded_by_to_solid() {
+    // Arrange: the cap is given, so it is a promise: no retry with a larger one, whatever the verdict
+    for extra in [json!({"max_patches": 300}), json!({"max_patches": 300, "allow_retry": true})] {
+        let mut s = session_with(rippled_scan(0.7, 5.0, 9));
+        let mut params = json!({"scan": "scan", "method": "freeform"});
+        params.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+
+        // Act
+        let out = s.execute("scan.to_solid", params).unwrap();
+
+        // Assert
+        assert!(out.get("retry").is_none_or(Value::is_null), "{out}");
+        assert!(out["patches"].as_u64().unwrap() <= 300, "{out}");
+        assert_eq!(s.doc.bodies.len(), 1);
+    }
+}
+
+#[test]
+fn to_solid_accepts_allow_retry_false() {
+    // Arrange
+    let mut s = session_with(rippled_scan(0.3, 8.0, 9));
 
     // Act
-    let out = s.execute("scan.to_solid", json!({"scan": "scan", "method": "freeform", "max_patches": 300})).unwrap();
+    let out = s.execute("scan.to_solid", json!({"scan": "scan", "method": "freeform", "allow_retry": false})).unwrap();
 
     // Assert
-    eprintln!("verdict {} retry {} patches {}", out["verdict"], out["retry"], out["patches"]);
-    assert_eq!(out["retry"]["cap_from"], 300, "{out}");
-    let to = out["retry"]["cap_to"].as_u64().unwrap();
-    assert!(to > 300 && to <= 60_000, "{out}");
-    assert!(out["retry"]["within_to"].as_f64().unwrap() > out["retry"]["within_from"].as_f64().unwrap(), "{out}");
-    assert_eq!(out["verdict"], "pass", "{out}");
-    let bodies = s.doc.bodies.len();
-    assert_eq!(bodies, 1, "the body of the first attempt is gone");
+    assert!(out.get("retry").is_none_or(Value::is_null), "{out}");
+}
+
+#[test]
+fn the_smallest_caps_are_hard_bounds_too() {
+    for (cap, refine) in [(12, "adaptive"), (13, "adaptive"), (12, "uniform"), (13, "uniform")] {
+        // Arrange
+        let mut s = session_with(rippled_scan(0.8, 4.0, 3));
+
+        // Act
+        let w = wrap(&mut s, cap, refine, TOLERANCE);
+
+        // Assert
+        assert!(patches(&w) <= cap && patches(&w) >= 3, "{refine} cap {cap}: {} patches", patches(&w));
+        assert_eq!(w["capped"], true, "{w}");
+    }
+    let mut s = session_with(rippled_scan(0.8, 4.0, 3));
+    let refused = s.execute("surface.wrap", json!({"mesh": "scan", "max_patches": 11}));
+    assert!(refused.is_err(), "11 patches is below the minimum");
+}
+
+/// A sphere among a thousand small closed shells (tetrahedra of four triangles): edge collapse cannot
+/// reduce the shells, so the coarse mesh stays far over a small cap until it is clustered.
+fn sphere_with_debris() -> Mesh {
+    let mut m = synth::sphere(Point3::origin(), 10.0, 60, 30);
+    for i in -5..=5 {
+        for j in -5..=5 {
+            for k in -5..=5 {
+                let c = Point3::new(6.0 * f64::from(i), 6.0 * f64::from(j), 6.0 * f64::from(k));
+                if c.coords.norm() < 14.0 {
+                    continue;
+                }
+                let base = m.positions.len() as u32;
+                let corners = [(0.0, 0.0, 0.0), (0.8, 0.0, 0.0), (0.0, 0.8, 0.0), (0.0, 0.0, 0.8)];
+                m.positions.extend(corners.iter().map(|d| Point3::new(c.x + d.0, c.y + d.1, c.z + d.2)));
+                m.triangles.extend([[0, 2, 1], [0, 1, 3], [1, 2, 3], [0, 3, 2]].map(|t| t.map(|v| base + v)));
+            }
+        }
+    }
+    m
+}
+
+#[test]
+fn a_scan_whose_coarse_mesh_decimation_cannot_reduce_still_respects_the_cap_and_says_it_clustered() {
+    // Arrange
+    let mut s = session_with(sphere_with_debris());
+
+    // Act
+    let w = wrap(&mut s, 9000, "adaptive", TOLERANCE);
+
+    // Assert
+    eprintln!("patches {} clustered {} within {}", w["patches"], w["clustered"], within(&w));
+    assert!(patches(&w) <= 9000, "{} patches", patches(&w));
+    assert_eq!(w["clustered"], true, "{w}");
+}
+
+#[test]
+fn a_cap_that_only_clustering_could_meet_by_merging_the_surface_away_is_an_error() {
+    // Arrange: the cap is so small that the cells needed would swallow the sphere as well
+    let mut s = session_with(sphere_with_debris());
+
+    // Act
+    let r = s.execute("surface.wrap", json!({"mesh": "scan", "max_patches": 1500, "tolerance": TOLERANCE}));
+
+    // Assert
+    let message = r.unwrap_err().to_string();
+    assert!(message.contains("too thin or too fine"), "{message}");
 }
 
 #[test]

@@ -5,9 +5,9 @@
 //! handles and thin bridges keeps them, because collapsing one would change the topology (the
 //! reduction of one real scan stopped at 30 000 triangles for a limit of 4 000). Then the mesh is
 //! clustered on a grid, which has no topology to keep: the cell is widened until the count fits.
-use std::collections::BTreeMap;
+use super::wrap_cluster::{ClusterError, cluster_to_cap};
+use surfacecraft_geom::Mesh;
 use surfacecraft_geom::edit::{DecimateOptions, decimate, remove_non_manifold};
-use surfacecraft_geom::{Mesh, Point3};
 
 /// A search ends when a mesh holds at least this share of the triangles the cap allows.
 pub(super) const FILL_SHARE: f64 = 0.9;
@@ -16,10 +16,6 @@ pub(super) const FILL_SHARE: f64 = 0.9;
 const TRIM_SLACK: f64 = 0.1;
 /// Reductions a search runs at most (each is a full reduction of the scan).
 pub(super) const MAX_PROBES: usize = 4;
-/// Bisection steps of the cell size of the clustering.
-const CLUSTER_STEPS: usize = 18;
-/// The widest cell is the diagonal of the box; the finest is this fraction of it.
-const FINEST_CELL: f64 = 1.0 / 4096.0;
 /// The share of a bracket a probe may move from either end (the search always makes progress).
 const MIN_STEP: f64 = 0.1;
 
@@ -27,147 +23,28 @@ pub(super) fn decimate_options() -> DecimateOptions {
     DecimateOptions { target_triangles: 0, max_error: None, feature_angle_deg: 181.0, preserve_boundary: true }
 }
 
+/// A mesh within the cap, and whether clustering made it.
+pub(super) struct Trimmed {
+    pub(super) mesh: Mesh,
+    pub(super) clustered: bool,
+}
+
 /// `mesh` made manifold and cut to at most `cap` triangles: by the quadric decimation, and when that
-/// stops short (`allow_cluster`) by clustering. `None` when no mesh within the cap could be made.
-pub(super) fn trim_to_cap(mut mesh: Mesh, cap: usize, allow_cluster: bool) -> Option<Mesh> {
+/// stops short (`allow_cluster`) by clustering ([`cluster_to_cap`]). The error says why no mesh
+/// within the cap could be made (`Over`: none exists, `Thin`: clustering would lose the surface).
+pub(super) fn trim_to_cap(mut mesh: Mesh, cap: usize, allow_cluster: bool) -> Result<Trimmed, ClusterError> {
     remove_non_manifold(&mut mesh);
+    if mesh.triangle_count() > cap {
+        decimate(&mut mesh, &DecimateOptions { target_triangles: cap, ..decimate_options() });
+        remove_non_manifold(&mut mesh);
+    }
     if mesh.triangle_count() <= cap {
-        return Some(mesh);
+        return Ok(Trimmed { mesh, clustered: false });
     }
-    decimate(&mut mesh, &DecimateOptions { target_triangles: cap, ..decimate_options() });
-    remove_non_manifold(&mut mesh);
-    if mesh.triangle_count() <= cap {
-        return Some(mesh);
+    if !allow_cluster {
+        return Err(ClusterError::Over);
     }
-    if allow_cluster { cluster_to_cap(&mesh, cap) } else { None }
-}
-
-/// The cell of a point: floor of its offset from `origin` in cells of size `cell`.
-fn cell_of(p: &Point3, origin: &Point3, cell: f64) -> [i64; 3] {
-    let k = |a: f64, o: f64| ((a - o) / cell).floor() as i64;
-    [k(p.x, origin.x), k(p.y, origin.y), k(p.z, origin.z)]
-}
-
-/// The mesh with the vertices of every grid cell merged into their mean; triangles that lose a
-/// corner and repeated triangles are dropped, and the rest is made manifold.
-fn cluster(mesh: &Mesh, origin: &Point3, cell: f64) -> Mesh {
-    let keys: Vec<[i64; 3]> = mesh.positions.iter().map(|p| cell_of(p, origin, cell)).collect();
-    let mut index: BTreeMap<[i64; 3], usize> = BTreeMap::new();
-    for k in mesh.triangles.iter().flatten().filter_map(|&v| keys.get(v as usize)) {
-        index.entry(*k).or_insert(0);
-    }
-    for (n, slot) in index.values_mut().enumerate() {
-        *slot = n;
-    }
-    let mut sum = vec![(0.0, 0.0, 0.0, 0usize); index.len()];
-    let used: Vec<bool> = {
-        let mut u = vec![false; mesh.positions.len()];
-        mesh.triangles.iter().flatten().for_each(|&v| u.get_mut(v as usize).map_or((), |x| *x = true));
-        u
-    };
-    for (v, p) in mesh.positions.iter().enumerate() {
-        let slot = used.get(v).copied().unwrap_or(false).then(|| keys.get(v).and_then(|k| index.get(k))).flatten();
-        if let Some(s) = slot.and_then(|&c| sum.get_mut(c)) {
-            *s = (s.0 + p.x, s.1 + p.y, s.2 + p.z, s.3 + 1);
-        }
-    }
-    let positions = sum
-        .iter()
-        .map(|s| Point3::new(s.0 / s.3.max(1) as f64, s.1 / s.3.max(1) as f64, s.2 / s.3.max(1) as f64))
-        .collect();
-    let cell_id = |v: u32| keys.get(v as usize).and_then(|k| index.get(k)).map(|&c| c as u32);
-    let mut seen = std::collections::HashSet::new();
-    let mut triangles = Vec::new();
-    for t in &mesh.triangles {
-        let (Some(a), Some(b), Some(c)) = (cell_id(t[0]), cell_id(t[1]), cell_id(t[2])) else { continue };
-        let mut sorted = [a, b, c];
-        sorted.sort_unstable();
-        if a != b && b != c && a != c && seen.insert(sorted) {
-            triangles.push([a, b, c]);
-        }
-    }
-    let mut out = Mesh { positions, triangles };
-    remove_non_manifold(&mut out);
-    orient_consistently(&mut out);
-    out
-}
-
-/// The three directed edges of a triangle, as stored.
-fn directed(t: &[u32; 3]) -> [(u32, u32); 3] {
-    [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])]
-}
-
-/// Makes triangles that share an edge traverse it in opposite directions: every connected piece is
-/// flipped as a whole from its first triangle, and a triangle that cannot be made consistent (a twist
-/// or a pinch the clustering made) is dropped. The patch network of the mesh must be orientable;
-/// merging the vertices of a grid cell can reverse the sense of a neighbouring triangle.
-fn orient_consistently(mesh: &mut Mesh) {
-    let mut by_edge: std::collections::HashMap<(u32, u32), Vec<usize>> = std::collections::HashMap::new();
-    for (i, t) in mesh.triangles.iter().enumerate() {
-        for (a, b) in directed(t) {
-            by_edge.entry((a.min(b), a.max(b))).or_default().push(i);
-        }
-    }
-    let n = mesh.triangles.len();
-    let (mut flip, mut seen, mut bad) = (vec![false; n], vec![false; n], vec![false; n]);
-    for seed in 0..n {
-        if seen[seed] {
-            continue;
-        }
-        seen[seed] = true;
-        let mut stack = vec![seed];
-        while let Some(t) = stack.pop() {
-            let Some(tri) = mesh.triangles.get(t) else { continue };
-            for (a, b) in directed(tri) {
-                let (from, to) = if flip[t] { (b, a) } else { (a, b) };
-                for &o in by_edge.get(&(a.min(b), a.max(b))).map_or(&[][..], Vec::as_slice) {
-                    let Some(other) = mesh.triangles.get(o).filter(|_| o != t) else { continue };
-                    // `o` must run to -> from; flipped when it is stored from -> to
-                    let want = directed(other).contains(&(from, to));
-                    if !seen[o] {
-                        seen[o] = true;
-                        flip[o] = want;
-                        stack.push(o);
-                    } else if flip[o] != want {
-                        bad[o] = true;
-                    }
-                }
-            }
-        }
-    }
-    let kept: Vec<[u32; 3]> = mesh
-        .triangles
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !bad[*i])
-        .map(|(i, t)| if flip[i] { [t[0], t[2], t[1]] } else { *t })
-        .collect();
-    mesh.triangles = kept;
-}
-
-/// The clustering of `mesh` with the finest cell that leaves at most `cap` triangles (bisection of
-/// the cell size, [`CLUSTER_STEPS`] steps), or `None` when even the widest cell leaves more.
-fn cluster_to_cap(mesh: &Mesh, cap: usize) -> Option<Mesh> {
-    let bbox = mesh.bbox();
-    if bbox.is_empty() {
-        return None;
-    }
-    let diagonal = (bbox.max - bbox.min).norm().max(1e-9);
-    let (mut fine, mut wide) = (diagonal * FINEST_CELL, diagonal);
-    let mut best = Some(cluster(mesh, &bbox.min, wide)).filter(|m| m.triangle_count() <= cap)?;
-    for _ in 0..CLUSTER_STEPS {
-        let mid = (fine * wide).sqrt();
-        let m = cluster(mesh, &bbox.min, mid);
-        if m.triangle_count() <= cap {
-            wide = mid;
-            if m.triangle_count() >= best.triangle_count() {
-                best = m;
-            }
-        } else {
-            fine = mid;
-        }
-    }
-    Some(best)
+    cluster_to_cap(&mesh, cap).map(|mesh| Trimmed { mesh, clustered: true })
 }
 
 /// One end of a bracket: the search parameter and the triangles of the mesh it gives.
@@ -219,7 +96,7 @@ pub(super) fn search_cap(
         let count = mesh.triangle_count();
         let fitted = match count {
             c if c <= cap => Some(mesh),
-            c if c as f64 <= cap as f64 * (1.0 + TRIM_SLACK) => trim_to_cap(mesh, cap, false),
+            c if c as f64 <= cap as f64 * (1.0 + TRIM_SLACK) => trim_to_cap(mesh, cap, false).ok().map(|t| t.mesh),
             _ => {
                 if smallest_over.as_ref().is_none_or(|o| count < o.mesh.triangle_count()) {
                     smallest_over = Some(Found { x, mesh });
@@ -242,61 +119,58 @@ pub(super) fn search_cap(
         }
     }
     // every probe was far over the cap: cut the closest one to it
-    let last_resort = || smallest_over.and_then(|o| trim_to_cap(o.mesh, cap, false).map(|mesh| Found { x: o.x, mesh }));
+    let last_resort =
+        || smallest_over.and_then(|o| trim_to_cap(o.mesh, cap, false).ok().map(|t| Found { x: o.x, mesh: t.mesh }));
     (best.or_else(last_resort), probes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use surfacecraft_geom::synth;
+    use surfacecraft_geom::{Point3, synth};
 
     fn sphere(res: usize) -> Mesh {
         synth::sphere(Point3::origin(), 10.0, res, res / 2)
     }
 
+    /// A sphere (which edge collapse reduces well) among a thousand small closed shells, each a
+    /// tetrahedron of four triangles: no edge of a tetrahedron can be collapsed (link condition), so
+    /// decimation stalls at about four thousand triangles, the way a scan with many small handles and
+    /// loops stalls.
+    fn sphere_with_debris() -> Mesh {
+        let mut m = sphere(40);
+        for i in -5..=5 {
+            for j in -5..=5 {
+                for k in -5..=5 {
+                    let c = Point3::new(6.0 * f64::from(i), 6.0 * f64::from(j), 6.0 * f64::from(k));
+                    if c.coords.norm() < 14.0 {
+                        continue;
+                    }
+                    let base = m.positions.len() as u32;
+                    let corners = [(0.0, 0.0, 0.0), (0.8, 0.0, 0.0), (0.0, 0.8, 0.0), (0.0, 0.0, 0.8)];
+                    m.positions.extend(corners.iter().map(|d| Point3::new(c.x + d.0, c.y + d.1, c.z + d.2)));
+                    m.triangles.extend([[0, 2, 1], [0, 1, 3], [1, 2, 3], [0, 3, 2]].map(|t| t.map(|v| base + v)));
+                }
+            }
+        }
+        m
+    }
+
     #[test]
-    fn clustering_reaches_a_cap_the_mesh_has_many_times_over() {
+    fn a_mesh_decimation_cannot_reduce_is_clustered_under_the_cap() {
         // Arrange
-        let mesh = sphere(120);
-        assert!(mesh.triangle_count() > 10_000);
+        let mesh = sphere_with_debris();
+        let cap = 2000;
+        assert!(mesh.triangle_count() > 2 * cap);
+        let stalled = trim_to_cap(mesh.clone(), cap, false);
+        assert_eq!(stalled.err(), Some(ClusterError::Over), "decimation alone must stall on this mesh");
 
         // Act
-        let out = cluster_to_cap(&mesh, 300).unwrap();
+        let out = trim_to_cap(mesh, cap, true).unwrap();
 
         // Assert
-        assert!(out.triangle_count() <= 300, "{}", out.triangle_count());
-        assert!(out.triangle_count() >= 150, "{}", out.triangle_count());
-        assert!(out.validate().is_ok());
-        assert_eq!(out, cluster_to_cap(&mesh, 300).unwrap());
-    }
-
-    #[test]
-    fn a_clustered_mesh_is_consistently_oriented() {
-        // Arrange: a sphere with every third triangle turned around
-        let mut mesh = sphere(60);
-        for (i, t) in mesh.triangles.iter_mut().enumerate() {
-            if i % 3 == 0 {
-                t.swap(1, 2);
-            }
-        }
-
-        // Act
-        let out = cluster_to_cap(&mesh, 400).unwrap();
-
-        // Assert: no directed edge is used twice
-        let mut used = std::collections::HashSet::new();
-        for t in &out.triangles {
-            for e in directed(t) {
-                assert!(used.insert(e), "edge {e:?} is used in the same direction twice");
-            }
-        }
-        assert!(out.triangle_count() > 50);
-    }
-
-    #[test]
-    fn clustering_has_no_answer_for_an_empty_mesh() {
-        assert!(cluster_to_cap(&Mesh::default(), 10).is_none());
+        assert!(out.clustered);
+        assert!(out.mesh.triangle_count() <= cap && out.mesh.triangle_count() >= 200, "{}", out.mesh.triangle_count());
     }
 
     #[test]
@@ -306,8 +180,8 @@ mod tests {
         let small = sphere(8);
 
         // Act
-        let cut = trim_to_cap(mesh.clone(), 500, false).unwrap();
-        let same = trim_to_cap(small.clone(), 500, false).unwrap();
+        let cut = trim_to_cap(mesh.clone(), 500, false).unwrap().mesh;
+        let same = trim_to_cap(small.clone(), 500, false).unwrap().mesh;
 
         // Assert
         assert!(cut.triangle_count() <= 500 && cut.triangle_count() >= 490, "{}", cut.triangle_count());

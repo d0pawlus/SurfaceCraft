@@ -22,7 +22,9 @@ patch network over a whole scan.
   tolerance (the `within` field of the result's deviation), but that is not guaranteed.
   `capped` is true when the cap cut a round and the tolerance is still missed. A scan whose
   surface carries thousands of tiny handles cannot be reduced by edge collapse; its coarse mesh
-  is then clustered on a grid, which keeps the cap at the price of a coarser network.
+  is then clustered on a grid, which keeps the cap at the price of a coarser network (`clustered` is
+  true in the result). When the clustering would lose more than half of the surface, or leave fewer
+  than a tenth of the cap, the command fails and asks for a larger `max_patches`.
 - The scan tells creases from smooth edges: an edge is a crease when the scan normals on its two
   sides differ by more than `crease_deg` (default 35, at most 60; a thin wall's two faces are two
   sides, never averaged). With `continuity: g0` (the default) the patches meet in position only.
