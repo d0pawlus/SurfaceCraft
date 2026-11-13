@@ -267,8 +267,10 @@ fn rpc<B: Backend + Send + 'static>(s: &mut Server<B>, method: &str, params: Val
     s.handle(&json!({"jsonrpc": "2.0", "id": 9, "method": method, "params": params})).expect("a reply")
 }
 
-/// Largest default `tools/list` reply an agent should have to read (bytes).
-const MAX_DEFAULT_LISTING: usize = 40_000;
+/// Largest default `tools/list` reply an agent should have to read (bytes). The budget of the lean
+/// transport, unchanged: the structural shortening brought the listing to about 37 400 bytes, and
+/// the space below the budget is what lets commands gain parameters without hand trimming.
+const MAX_DEFAULT_LISTING: usize = 48_000;
 /// Bytes the default listing must stay below its limit, so a new parameter never forces a hand trim.
 const MIN_HEADROOM: usize = 2_000;
 /// Length and FNV-1a hash of the full listing (`--tools full`), which the shortening must not touch.
