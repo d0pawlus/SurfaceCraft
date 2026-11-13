@@ -108,7 +108,8 @@ pub(super) fn protects(mesh: &Mesh, seg: &Segment, tolerance: f64, noise: f64, s
     }
     let Some(bow) = region_bow(mesh, &seg.triangles, &seg.primitive) else { return false };
     let slope = if share >= DOMINANT_SHARE { DOMINANT_BOW_SLOPE } else { BOW_SLOPE };
-    bow.bow() <= BOW_TOLERANCE_SHARE * tolerance && bow.bow() <= slope * bow.extent
+    let measured = bow.bow_given(noise);
+    measured <= BOW_TOLERANCE_SHARE * tolerance && measured <= slope * bow.extent
 }
 
 /// [`protects`] for the region `seg` of the scan `mesh`: the tolerance (and the bow) protects it
