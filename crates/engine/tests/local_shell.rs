@@ -51,7 +51,7 @@ fn run_one(number: usize, path: &std::path::Path, thickness: f64) -> Result<Stri
     eprintln!(
         "S{number:02} triangles {} thickness {thickness} verdict {verdict} in {seconds:.1} s; patches {} closed {} volume {}; \
          coverage {} within {} rms {} max {} not_facing {}; clamped {} (largest reduction {}) loops {} thickened triangles {}; \
-         holes left {}; retry {}; issues {:?}",
+         crossing {} of {} sampled; min wall {} median wall {}; holes left {}; retry {}; issues {:?}",
         info["triangles"],
         out["patches"],
         out["body"]["closed"],
@@ -65,6 +65,10 @@ fn run_one(number: usize, path: &std::path::Path, thickness: f64) -> Result<Stri
         out["thickened"]["largest_reduction"],
         out["thickened"]["boundary_loops"],
         out["thickened"]["triangles"],
+        out["thickened"]["self_intersections"],
+        out["thickened"]["self_intersection_samples"],
+        out["thickened"]["min_wall"],
+        out["thickened"]["median_wall"],
         out["scan_report"]["holes_left"],
         out["retry"]["reason"],
         codes(&out),
