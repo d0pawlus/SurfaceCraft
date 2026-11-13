@@ -238,6 +238,28 @@ fn the_hybrid_method_puts_the_plane_cylinder_and_sphere_of_a_smooth_part_on_anal
     assert_eq!((fp, fc, fs, fo), (0, 0, 0, 0), "a patch network has no analytic face");
 }
 
+/// How many analytic faces are exactly the part's plane, cylinder or sphere (an open scan can also give
+/// faces on primitives fitted to a round or a rim, which are within the tolerance of their patches only).
+fn faces_on_the_part(b: &Brep) -> usize {
+    b.faces
+        .iter()
+        .filter(|f| match &f.surface {
+            Surface::Plane { origin, u_axis, v_axis } => {
+                unit(cross(*u_axis, *v_axis))[2].abs() > 0.999 && origin[2].abs() < GEOMETRY_TOLERANCE
+            }
+            Surface::Cylinder { frame, radius } => {
+                (radius - RADIUS).abs() < GEOMETRY_TOLERANCE
+                    && frame.origin[0].hypot(frame.origin[1]) < GEOMETRY_TOLERANCE
+            }
+            Surface::Sphere { frame, radius } => {
+                (radius - CAP_RADIUS).abs() < GEOMETRY_TOLERANCE
+                    && (frame.origin[2] - CAP_CENTRE).abs() < GEOMETRY_TOLERANCE
+            }
+            _ => false,
+        })
+        .count()
+}
+
 /// Gate 2: the same part as an open scan (a wedge cut away) gives a sheet with analytic faces, not a failure.
 #[test]
 fn an_open_scan_gives_a_sheet_with_analytic_faces() {
@@ -260,7 +282,7 @@ fn an_open_scan_gives_a_sheet_with_analytic_faces() {
         r["verdict"], r["analytic"]
     );
     assert!(planes + cylinders + spheres >= 2, "{r}");
-    assert_geometry(&brep);
+    assert!(faces_on_the_part(&brep) >= 1, "no analytic face is the part's own: {r}");
     let freeform = to_solid_open(&mut s, "freeform");
     assert_eq!(freeform["verdict"], r["verdict"], "the verdict freeform gives for the open scan");
 }
