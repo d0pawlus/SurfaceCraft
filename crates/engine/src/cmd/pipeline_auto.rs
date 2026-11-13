@@ -145,7 +145,7 @@ fn analytic_share(r: &ToSolidOut) -> f64 {
 /// [`EXPLAINED_BAND`] being equal; then a closed solid over a sheet over no body; then, when all of
 /// that is a tie, the one with more of its area on analytic faces (a hybrid body is worth more than
 /// a network of patches that explains the scan equally well). Antisymmetric.
-fn compare(a: &ToSolidOut, b: &ToSolidOut) -> std::cmp::Ordering {
+pub(super) fn compare(a: &ToSolidOut, b: &ToSolidOut) -> std::cmp::Ordering {
     let by_verdict = rank(a.verdict).cmp(&rank(b.verdict));
     let (ea, eb) = (explained(a), explained(b));
     let by_share = if (ea - eb).abs() > EXPLAINED_BAND + 1e-9 { ea.total_cmp(&eb) } else { std::cmp::Ordering::Equal };

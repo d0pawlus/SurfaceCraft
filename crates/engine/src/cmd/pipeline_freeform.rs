@@ -348,11 +348,22 @@ pub(super) fn wrap_mesh(
     mesh: ObjectId,
     max_patches: Option<usize>,
 ) -> CmdResult<WrapOut> {
+    wrap_mesh_at(s, set, mesh, max_patches, set.tolerance)
+}
+
+/// [`wrap_mesh`] holding the network to `tolerance` (the judge's tolerance is the settings').
+pub(super) fn wrap_mesh_at(
+    s: &mut Session,
+    set: &Settings,
+    mesh: ObjectId,
+    max_patches: Option<usize>,
+    tolerance: f64,
+) -> CmdResult<WrapOut> {
     wrap(
         s,
         WrapIn {
             mesh: ObjRef::Id(mesh.0),
-            tolerance: Some(set.tolerance),
+            tolerance: Some(tolerance),
             min_within: Some(set.min_within),
             max_patches,
             refine: None,
@@ -396,14 +407,38 @@ fn freeform_with_mesh(
     set: &Settings,
     wrapped: ObjectId,
     report: ScanSummary,
-    mut wrap_fn: impl FnMut(&mut Session, Option<usize>) -> CmdResult<WrapOut>,
+    wrap_fn: impl FnMut(&mut Session, Option<usize>) -> CmdResult<WrapOut>,
 ) -> CmdResult<ToSolidOut> {
+    match wrap_stage(s, set, wrapped, wrap_fn)? {
+        Ok((w, retry)) => judge_stage(s, set, report, &w, retry),
+        Err(why) => Ok(failed(set, report, &why)),
+    }
+}
+
+/// The wrap of `wrapped` with its larger-cap retry: the network and what the retry did, or the
+/// message of a wrap that failed (a cancellation is an error).
+pub(super) fn wrap_stage(
+    s: &mut Session,
+    set: &Settings,
+    wrapped: ObjectId,
+    mut wrap_fn: impl FnMut(&mut Session, Option<usize>) -> CmdResult<WrapOut>,
+) -> CmdResult<Result<(WrapOut, Option<CapRetry>), String>> {
     let first = match wrap_fn(s, set.max_patches) {
         Ok(w) => w,
         Err(e) if crate::cmd::is_cancelled(&e) => return Err(e),
-        Err(e) => return Ok(failed(set, report, message_of(&e))),
+        Err(e) => return Ok(Err(message_of(&e).to_string())),
     };
-    let (w, retry) = retry_larger_on(s, set, wrapped, first, |s, cap| wrap_fn(s, Some(cap)))?;
+    Ok(Ok(retry_larger_on(s, set, wrapped, first, |s, cap| wrap_fn(s, Some(cap)))?))
+}
+
+/// Measures the network `w` (its body as it is in the document) against the scan and judges it.
+pub(super) fn judge_stage(
+    s: &mut Session,
+    set: &Settings,
+    report: ScanSummary,
+    w: &WrapOut,
+    retry: Option<CapRetry>,
+) -> CmdResult<ToSolidOut> {
     super::prepare::check_cancel(s)?;
     let cmp = compare(
         s,
@@ -418,15 +453,15 @@ fn freeform_with_mesh(
     )?;
     let vertices = s.doc.mesh(set.scan).map_or(0, |m| m.mesh.vertex_count());
     let d = summary(&cmp, vertices);
-    let mut issues = issues_of(&w, &d, set, &report);
+    let mut issues = issues_of(w, &d, set, &report);
     let diagonal = s.doc.mesh(set.scan).map_or(f64::NAN, |m| robust_diagonal(&m.mesh));
     if let Some(msg) = scale_warning(set.tolerance, diagonal) {
         issues.insert(0, issue("tolerance_exceeds_part", msg));
     }
     let tried = retry.as_ref().is_some_and(|r| r.reason != RetryReason::BudgetSpent);
-    let next = next_steps(&w, &issues, set, tried);
+    let next = next_steps(w, &issues, set, tried);
     let verdict = verdict_of(&issues, &d);
-    Ok(out(set, retry, report, verdict, Some(&w), Some(d), issues, next))
+    Ok(out(set, retry, report, verdict, Some(w), Some(d), issues, next))
 }
 
 #[cfg(test)]

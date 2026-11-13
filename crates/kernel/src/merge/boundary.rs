@@ -43,14 +43,13 @@ fn outward_loop(body: &Brep, face: usize) -> Result<Vec<LoopEdge>> {
 
 /// The boundary loop of the faces in `group` and the shell they lie in.
 pub(super) struct Boundary {
-    pub loop_edges: Vec<LoopEdge>,
+    /// The closed loops of the boundary (the outer one and the holes, in no order).
+    pub loops: Vec<Vec<LoopEdge>>,
     pub shell: usize,
 }
 
-/// # Errors
-/// An empty or repeated or out-of-range group, faces of several shells, an edge shared with
-/// itself, or a boundary that is not one simple loop (a pinch, a hole, several pieces).
-pub(super) fn boundary(body: &Brep, group: &[usize]) -> Result<Boundary> {
+/// The edges of the boundary of the faces in `group` as the faces walk them, and the shell.
+fn outer_edges(body: &Brep, group: &[usize]) -> Result<(Vec<LoopEdge>, usize)> {
     let members: BTreeSet<usize> = group.iter().copied().collect();
     if members.is_empty() || members.len() != group.len() {
         return Err(refuse("a group needs distinct faces"));
@@ -77,7 +76,33 @@ pub(super) fn boundary(body: &Brep, group: &[usize]) -> Result<Boundary> {
             }
         }
     }
-    Ok(Boundary { loop_edges: chain(body, &outer)?, shell })
+    Ok((outer, shell))
+}
+
+/// # Errors
+/// An empty or repeated or out-of-range group, faces of several shells, an edge shared with
+/// itself, or a boundary that is not made of simple loops (a pinch).
+pub(super) fn boundary(body: &Brep, group: &[usize]) -> Result<Boundary> {
+    let (outer, shell) = outer_edges(body, group)?;
+    if super::samples::connected_groups(body, group).len() != 1 {
+        return Err(refuse("the faces of a group must touch along edges"));
+    }
+    Ok(Boundary { loops: chains(body, &outer)?, shell })
+}
+
+/// The vertices at which the boundary of `group` touches itself (two lobes of the group meet there).
+pub(super) fn pinch_vertices(body: &Brep, group: &[usize]) -> Result<BTreeSet<u32>> {
+    let (outer, _) = outer_edges(body, group)?;
+    let mut seen = BTreeSet::new();
+    let mut pinches = BTreeSet::new();
+    for le in outer {
+        if let Some(v) = start_vertex(body, le)
+            && !seen.insert(v)
+        {
+            pinches.insert(v);
+        }
+    }
+    Ok(pinches)
 }
 
 fn start_vertex(body: &Brep, le: LoopEdge) -> Option<u32> {
@@ -89,8 +114,8 @@ fn end_vertex(body: &Brep, le: LoopEdge) -> Option<u32> {
     start_vertex(body, LoopEdge { forward: !le.forward, ..le })
 }
 
-/// Chains the boundary edges into one closed loop.
-fn chain(body: &Brep, outer: &[LoopEdge]) -> Result<Vec<LoopEdge>> {
+/// Chains the boundary edges into closed loops, the one that holds the lowest edge first.
+fn chains(body: &Brep, outer: &[LoopEdge]) -> Result<Vec<Vec<LoopEdge>>> {
     let mut by_start: BTreeMap<u32, LoopEdge> = BTreeMap::new();
     for &le in outer {
         let s = start_vertex(body, le).ok_or_else(|| refuse("an edge index is out of range"))?;
@@ -98,25 +123,36 @@ fn chain(body: &Brep, outer: &[LoopEdge]) -> Result<Vec<LoopEdge>> {
             return Err(refuse("the group's boundary touches itself (a pinch)"));
         }
     }
-    let first = *outer.first().ok_or_else(|| refuse("the group has no boundary"))?;
-    let mut out = vec![first];
-    let mut at = end_vertex(body, first).ok_or_else(|| refuse("an edge index is out of range"))?;
-    while out.len() <= outer.len() {
-        let Some(&next) = by_start.get(&at) else { return Err(refuse("the group's boundary is not closed")) };
-        if next.edge == first.edge && next.forward == first.forward {
-            break;
+    let mut left: BTreeSet<(u32, bool)> = outer.iter().map(|e| (e.edge, e.forward)).collect();
+    let mut loops = Vec::new();
+    while let Some(&(edge, forward)) = left.first() {
+        let first = LoopEdge { edge, forward };
+        let mut cycle = vec![first];
+        let mut at = end_vertex(body, first).ok_or_else(|| refuse("an edge index is out of range"))?;
+        loop {
+            let Some(&next) = by_start.get(&at) else { return Err(refuse("the group's boundary is not closed")) };
+            if next.edge == first.edge && next.forward == first.forward {
+                break;
+            }
+            if cycle.len() > outer.len() {
+                return Err(refuse("the group's boundary does not close"));
+            }
+            cycle.push(next);
+            at = end_vertex(body, next).ok_or_else(|| refuse("an edge index is out of range"))?;
         }
-        out.push(next);
-        at = end_vertex(body, next).ok_or_else(|| refuse("an edge index is out of range"))?;
+        for e in &cycle {
+            left.remove(&(e.edge, e.forward));
+        }
+        loops.push(cycle);
     }
-    if out.len() != outer.len() {
-        return Err(refuse("the group has a hole or lies in several pieces (more than one boundary loop)"));
+    if loops.is_empty() {
+        return Err(refuse("the group has no boundary"));
     }
-    Ok(out)
+    Ok(loops)
 }
 
 /// A point of a B-spline curve (de Boor), `None` for malformed data.
-fn de_boor(knots: &[f64], points: &[V], t: f64) -> Option<V> {
+pub(super) fn de_boor(knots: &[f64], points: &[V], t: f64) -> Option<V> {
     let count = points.len();
     let degree = knots.len().checked_sub(count + 1)?;
     let lo = *knots.get(degree)?;

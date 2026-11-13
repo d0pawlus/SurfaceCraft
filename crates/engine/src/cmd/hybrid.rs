@@ -144,7 +144,7 @@ pub(super) fn cut_of(p: &Primitive, pts: &[Point3], nrm: &[Vec3]) -> Result<Cut,
 /// its direction, and those within 0.5 mm of its line also sit on it (coaxial). Fitted axes
 /// differ by noise, and the kernel's intersection of two nearly coaxial surfaces is the
 /// general (and fragile) case instead of the analytic one.
-pub(crate) fn snap_axes(cuts: &mut [Cut]) {
+fn snap_axes(cuts: &mut [Cut]) {
     let axis_of = |c: &Cut| match &c.shape {
         Shape::Cylinder { point, axis, .. } => Some((*point, *axis)),
         Shape::Cone { apex, axis, .. } => Some((*apex, *axis)),
@@ -322,7 +322,7 @@ fn describe(c: &CutStatus) -> (String, bool) {
 /// The fitted primitives of `refs` as planner items, all from one mesh, with the scan's points;
 /// `grow` sees the points of every region. Primitives whose cut cannot be made are returned as
 /// skipped.
-pub(crate) fn collect_items(
+fn collect_items(
     s: &Session,
     refs: &[ObjRef],
     cache: &mut HashMap<ObjectId, Arc<Vec<Vec3>>>,
@@ -406,13 +406,7 @@ fn item_outcome(k: usize, plan: &plan::Plan, cuts: &[Cut], built: &hybrid::Built
 }
 
 /// Per planned item: its role, how it was applied (or why not) and its faces in the built solid.
-pub(crate) fn item_faces(
-    items: &[Item],
-    plan: &plan::Plan,
-    cuts: &[Cut],
-    built: &hybrid::Built,
-    tol: f64,
-) -> Vec<FaceOf> {
+fn item_faces(items: &[Item], plan: &plan::Plan, cuts: &[Cut], built: &hybrid::Built, tol: f64) -> Vec<FaceOf> {
     let mut out = Vec::with_capacity(items.len());
     for (k, it) in items.iter().enumerate() {
         let Some(role) = plan.roles.get(k) else { continue };
@@ -508,7 +502,7 @@ pub struct PlanRegionsIn {
     pub square_planes_deg: Option<f64>,
 }
 
-pub(crate) fn square_deg(v: Option<f64>) -> CmdResult<f64> {
+fn square_deg(v: Option<f64>) -> CmdResult<f64> {
     let d = v.unwrap_or(0.3);
     if d.is_finite() && (0.0..=5.0).contains(&d) {
         Ok(d)

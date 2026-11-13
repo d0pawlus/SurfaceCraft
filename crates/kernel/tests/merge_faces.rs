@@ -170,3 +170,41 @@ fn an_open_sphere_sheet_becomes_one_sphere_face() {
     });
     merge_sheet(&net, &Shape::Sphere { center: [0.0; 3], radius: r }, "sphere", 1e-3);
 }
+
+/// A group with a hole (the middle patch left out) becomes a face with an inner loop.
+#[test]
+fn a_ring_of_patches_becomes_a_face_with_a_hole() {
+    let net = sheet(|s, t| [30.0 * s, 30.0 * t, 0.0]);
+    let body = sheet_from_bezier_network(&net.patches, &net.corners).unwrap();
+    let ring: Vec<usize> = (0..9).filter(|&f| f != 4).collect();
+    let shape = Shape::Plane { point: [0.0; 3], normal: [0.0, 0.0, 1.0] };
+    let merged = merge_faces_onto_shape(&body, &ring, &shape, 0.05).unwrap();
+    assert_eq!(merged.brep.faces.len(), 2, "the face and the middle patch");
+    let loops = merged.brep.faces.iter().map(|f| f.loops.len()).max();
+    assert_eq!(loops, Some(2), "an outer loop and the hole");
+    tess::tessellate_all(&merged.brep, None).expect("tessellates");
+    let area: f64 = tess::tessellate_all(&merged.brep, None).unwrap().area();
+    assert!((area - 900.0).abs() < 1e-6, "the face and the patch cover the square: {area}");
+}
+
+/// Faces that touch only at a corner, a repeated face and a gap over the limit are refused, and nothing
+/// is changed.
+#[test]
+fn groups_the_kernel_cannot_merge_are_refused() {
+    let net = sheet(|s, t| [30.0 * s, 30.0 * t, 0.0]);
+    let body = sheet_from_bezier_network(&net.patches, &net.corners).unwrap();
+    let plane = Shape::Plane { point: [0.0; 3], normal: [0.0, 0.0, 1.0] };
+    assert!(merge_faces_onto_shape(&body, &[0, 4], &plane, 0.05).is_err(), "corner to corner");
+    assert!(merge_faces_onto_shape(&body, &[1, 1], &plane, 0.05).is_err(), "a repeated face");
+    assert!(merge_faces_onto_shape(&body, &[], &plane, 0.05).is_err(), "an empty group");
+    assert!(merge_faces_onto_shape(&body, &[0, 99], &plane, 0.05).is_err(), "a face out of range");
+    let tilted = Shape::Plane { point: [0.0, 0.0, 1.0], normal: [0.0, 0.0, 1.0] };
+    assert!(merge_faces_onto_shape(&body, &[0, 1], &tilted, 0.05).is_err(), "a gap of 1 mm over a limit of 0.05");
+    for bad in [0.0, f64::NAN, -1.0, 10.0] {
+        assert!(merge_faces_onto_shape(&body, &[0, 1], &plane, bad).is_err(), "gap {bad}");
+    }
+    let nan = Shape::Plane { point: [f64::NAN; 3], normal: [0.0, 0.0, 1.0] };
+    assert!(merge_faces_onto_shape(&body, &[0, 1], &nan, 0.05).is_err());
+    let torus = Shape::Torus { center: [0.0; 3], axis: [0.0, 0.0, 1.0], major_radius: 20.0, minor_radius: 5.0 };
+    assert!(merge_faces_onto_shape(&body, &[0, 1], &torus, 0.05).is_err(), "a torus is not placed");
+}

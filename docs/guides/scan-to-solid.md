@@ -7,10 +7,12 @@ has three methods and chooses between them itself (`method: auto`):
   prismatic parts. A few analytic faces, exact dimensions.
 - `freeform`: a watertight network of bicubic patches over the whole scan; for castings, body
   panels and organic shapes. Thousands of small faces that follow the scan.
-- `hybrid`: one closed body in which the regions a primitive fits are exact analytic faces (plane,
-  cylinder, cone, sphere, torus) and the rest of the scan is a network of patches; for parts that
-  are partly machined and partly organic. The result reports `analytic` (faces on analytic
-  surfaces, all faces, and their share of the surface area).
+- `hybrid`: the freeform wrap of the scan in which the patches that lie on a primitive (plane,
+  cylinder, cone, sphere) are merged into one exact analytic face each; for parts that are partly
+  machined and partly organic. A closed scan gives a solid, an open one a sheet. The result reports
+  `analytic` (faces on analytic surfaces, all faces, their share of the surface area, each merged
+  face with the largest distance of its boundary edges from its primitive, and the groups of patches
+  that stayed patches with the reason).
 
 Use the step-by-step guides when you need a feature history.
 
@@ -66,24 +68,36 @@ Freeform (`surface.wrap` inside):
   (`surface.wrap` with `continuity: g1`) are experimental: on 13 real scans they reached the
   tolerance on 7 where `g0` did on 9, and needed 56 % more patches and 2 to 3 times the time.
 
-Hybrid (trim a stock; `surface.wrap`, `mesh.remesh` and the kernel inside):
+Hybrid (merge the patches that lie on a primitive; `surface.wrap` and the kernel inside):
 
-- Fits a primitive to every region that qualifies, as the primitives method does, and plans them as
-  `body.from_regions` does: which are global cuts (planes, full revolutions), which local tools
-  (blind holes, pockets, slots), which additions (bosses, domes), which fillets.
-- Makes a copy of the scan whose primitive regions lie a little (0.4 of the tolerance) beyond their
-  primitive on the side the cut removes, or short of it for an addition; rebuilds that copy as a
-  clean closed surface (`mesh.remesh`, voxel 0.75 of the tolerance) and wraps it in patches. This
-  is the stock. At most 4000 patches (`max_patches` can only lower that): the kernel's booleans on
-  a network are slow and fragile beyond it.
-- The kernel trims the stock with the primitives (`hybrid::cut_stock`): the faces on the primitives
-  are exactly the primitives, bounded by their intersections with the patches; the rest stays
-  patches. A cut the kernel refuses, a partial cylinder, cone, sphere or torus (a fillet needs the
-  sharp edge of two planes, which a network of patches has not) and anything else that is not
-  applied stays patches, up to about 1.4 times the tolerance from the scan (the stock's own deviation plus the 0.4 offset; the verdict reports it as `out_of_tolerance` where it is over); `modelled[].skipped` says why.
-- The kernel does at most `4000 / patches` operations (at least one) on the stock, each a boolean on the whole network; the cuts over that bound stay patches and `analytic.left_by_work_bound` counts them. A cancelled call stops between operations.
-- Needs a scan that is closed after cleaning (the rebuild refuses an open one). It is judged
-  against the scan by the same rules as the freeform method.
+- Fits a primitive to every region that qualifies, as the primitives method does. Planes, cylinders,
+  cones and spheres are protected; a torus region is not.
+- Makes a copy of the scan in which the vertices of every protected region that are within the
+  tolerance of their primitive lie exactly on it (projected, never pushed beyond); where regions meet
+  (a sharp edge) a vertex is put on all their primitives. The rest of the scan is untouched. The copy
+  is wrapped as `freeform` wraps a scan, held to half the tolerance (the coarse mesh the patches lie
+  on may leave the scan by a few of it, and along a sharp edge the boundary of a patch is a chord of
+  it, which is what a boundary gap to the primitive is made of). The copy is only used for the wrap:
+  the body is judged against the original scan by the rules of the freeform method.
+- A patch lies on a primitive when the scan triangle nearest its middle is in the primitive's region
+  and every sample on it (a 6 x 6 grid) lies within the tolerance of the primitive and of a
+  triangle of the region. The patches of one primitive that touch along edges form a group. A group
+  of one patch, or with an area under 50 squared tolerances (collapsed and sliver patches lie on any
+  surface), stays patches.
+- The kernel replaces each group by one face on the primitive (`kernel::merge`): the topology of the
+  body is edited (the group's interior edges and vertices go, N faces become one, a hole in the group
+  becomes an inner loop), nothing is cut, so the body is as closed or as open as the wrap was and the
+  band of patches along the border of a region stays patches. The boundary edges stay shared with the
+  neighbours and lie on the primitive within the reported `max_edge_gap` (at most the
+  tolerance); each edge carries that gap, times 1.1, as its tolerance. A group the kernel does not
+  take stays patches: a boundary that touches itself (a pinch), a face that would wrap round the axis
+  of its cylinder or cone or reach a pole of its sphere (a cap of 90 degrees or more), a result whose
+  volume or topology changed, or whose new face the mesher does not tessellate to the area of the
+  patches it replaced; `analytic.left_as_patches` says which and why.
+- The merged body is returned when it is not worse than the wrap it was made from (the comparison of
+  `auto`: verdict, share within the tolerance, closedness, analytic share); otherwise the wrap is, with
+  no analytic face. A scan with no protected primitive gives the freeform body.
+- A cancelled call stops between the steps; the whole run is one undo step.
 
 Primitives:
 
@@ -186,14 +200,10 @@ kernel refuses sheets of many faces. Give the wall thickness instead:
   next step (about 3 times the noise) or a smoother scan.
 - `other_method_tried`: `auto` ran the other method as well and it did not do better; see `attempts`.
 - Hybrid method, no body (verdict `fail`; `auto` then returns the other result, and the document is
-  as it was before the attempt): `hybrid_no_primitives` (no region could be modelled as a
-  primitive; use `freeform`), `hybrid_not_closed` (the scan cannot be rebuilt as a closed surface:
-  an open scan or one with a thin wall; fill the holes with `mesh.fill_holes`, or use `freeform`),
-  `hybrid_stock_failed` (the wrap over the rebuilt scan failed), `hybrid_stock_open` (the patch
-  network is not closed), `hybrid_cut_failed` (the kernel could not apply any primitive to the
-  stock, or the result was not one closed solid), `hybrid_no_analytic_faces` (no face of the body
-  is on a primitive: nothing is gained over `freeform`), `hybrid_failed` (anything else, with the
-  reason). `thickness` has no meaning with `method: hybrid`.
+  as it was before the attempt): `hybrid_stock_failed` (the wrap of the scan failed),
+  `hybrid_merge_failed` (the merging step failed as a whole), `hybrid_failed` (anything else, with
+  the reason). A scan with no primitive, or no group that could be merged, is not a failure: it gives
+  the wrap with `analytic.faces` 0. `thickness` has no meaning with `method: hybrid`.
 - `mostly_freeform` (only with `method: primitives`): less than half of the scan lies in regions
   a primitive fits. Run again with `method: freeform`.
 - `open_surface` (freeform): the network is a sheet because the scan has open boundaries. The

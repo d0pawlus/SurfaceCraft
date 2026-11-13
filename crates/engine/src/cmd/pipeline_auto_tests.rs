@@ -380,7 +380,13 @@ use crate::cmd::pipeline::AnalyticSummary;
 
 fn with_analytic(mut r: ToSolidOut, method: Method, share: f64) -> ToSolidOut {
     r.method = method;
-    r.analytic = Some(AnalyticSummary { faces: 3, total_faces: 200, area_share: share, left_by_work_bound: 0 });
+    r.analytic = Some(AnalyticSummary {
+        faces: 3,
+        total_faces: 200,
+        area_share: share,
+        merged: Vec::new(),
+        left_as_patches: Vec::new(),
+    });
     r
 }
 

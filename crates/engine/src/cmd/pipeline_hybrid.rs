@@ -1,69 +1,76 @@
-//! The hybrid method of `scan.to_solid` (P9-O6): one closed body in which the regions a primitive
-//! fits are exact analytic faces (plane, cylinder, cone, sphere, torus) and the rest of the scan is a
-//! network of freeform patches, judged against the scan like every other method.
+//! The hybrid method of `scan.to_solid` (P9-O6b): the freeform wrap of the scan in which the patches
+//! that lie on a primitive are merged into one analytic face each (plane, cylinder, cone, sphere).
 //!
-//! The construction is the trim-a-stock one of the hybrid model (plan P3), with the freeform wrap as
-//! the stock instead of a box: the primitives are fitted and planned as for `body.from_regions`; a
-//! copy of the scan is prepared whose primitive regions lie a little beyond (or, for an addition,
-//! short of) their primitives (`snap`); the copy is rebuilt as a clean surface (`mesh.remesh`) and
-//! wrapped in patches (`surface.wrap`); and the kernel trims that stock with the primitives
-//! (`hybrid::cut_stock`), so the faces on the primitives are exactly the primitives and the patches
-//! stay where no primitive fits. A cut the kernel refuses leaves its region as patches, at most the
-//! offset from the scan. Anything else that goes wrong ends the attempt with an issue code and no
-//! body; the document is as it was.
-use super::freeform::{self, NetworkFacts, issues_for, verdict_of, wrap_mesh};
+//! The primitives are fitted as for `body.from_regions`. A copy of the scan is prepared in which the
+//! vertices of every protected region lie exactly on their primitive (`snap`), and wrapped exactly as
+//! the freeform method wraps a scan. The groups of patches whose whole footprint lies deep inside a
+//! region are then replaced, by editing the topology of the body, by one face on the primitive
+//! (`pipeline_merge`, `kernel::merge`): nothing is cut, so the body is as closed, or as open, as the
+//! wrap, and the band of patches along the border of a region stays patches. The body is measured by
+//! the unchanged judge against the original scan, and is returned only when it is not worse than the
+//! wrap it came from. A failure ends the attempt with an issue code and the document as it was.
+use super::freeform::{judge_stage, wrap_mesh_at, wrap_stage};
+use super::merging::{Merging, Protected, merge_groups};
 use super::regions::{candidates, fit_regions};
 use super::{
-    DeviationSummary, Issue, LeftOut, MAX_LISTED_FACES, MAX_LISTED_LEFT_OUT, Method, Modelled, NextStep, ScanSummary,
-    Settings, ToSolidIn, ToSolidOut, Verdict, apply_roles, issue, message_of, region_limits, relate, step, summary,
-    triangle_count,
+    LeftOut, MAX_LISTED_LEFT_OUT, Method, Modelled, ScanSummary, Settings, ToSolidIn, ToSolidOut, Verdict, apply_roles,
+    issue, message_of, region_limits, relate, step, triangle_count,
 };
 use crate::Session;
-use crate::cmd::hybrid::{FaceOf, collect_items, item_faces, snap_axes, square_deg};
-use crate::cmd::mesh_remesh::{RemeshIn, remesh_cmd};
-use crate::cmd::plan::{self, Item, RoleKind};
-use crate::cmd::qa::{CompareIn, compare};
-use crate::cmd::{CmdError, ObjRef, cancelled as cancelled_error, is_cancelled};
+use crate::cmd::body::body_out;
+use crate::cmd::hybrid::FaceOf;
+use crate::cmd::wrap::WrapOut;
+use crate::cmd::{CmdError, cancelled as cancelled_error, is_cancelled};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
+use std::cmp::Ordering;
 use std::sync::Arc;
 use surfacecraft_doc::ObjectId;
-use surfacecraft_kernel::hybrid::{self, Built, Cut};
-use surfacecraft_kernel::local::{LocalAdd, LocalTool};
+use surfacecraft_fit::PrimitiveKind;
+use surfacecraft_geom::Mesh;
+use surfacecraft_kernel::hybrid;
 use surfacecraft_kernel::record::brep::Brep;
 use surfacecraft_kernel::tess::tessellate_topo;
 
 #[path = "pipeline_hybrid_snap.rs"]
 mod snap;
-use snap::{SnapRegion, primitive_of, snapped};
+use snap::{projected, shape_of};
 
-/// How far beyond its primitive the prepared scan lies, as a share of the tolerance. The cut only has
-/// to clear the fit error of the stock; a cut that is not made leaves its region this far from the
-/// scan on top of the stock's own deviation (up to about 1.4 x the tolerance in all, which the
-/// judge then reports as `out_of_tolerance` where it exceeds it).
-const OFFSET_SHARE_OF_TOLERANCE: f64 = 0.4;
-/// The voxel of the rebuild, as a share of the tolerance (the default of `mesh.remesh` is 1.5): finer,
-/// because the hybrid body is judged against the scan like a plain wrap, and a coarse voxel rounds
-/// the sharp edges the patches next to the primitives follow.
-const REMESH_VOXEL_SHARE: f64 = 0.75;
-/// The surface of the rebuilt scan has about this many quads at most: the voxel grows with the area.
-const REMESH_QUAD_BUDGET: f64 = 1_500_000.0;
-/// The most patches the stock may have. The kernel's booleans on a network are slow and fragile as
-/// it grows (measured: a few seconds at 400 patches, 15 s at 2 000, refusals above); a network that
-/// would be larger is not cut.
-pub(super) const STOCK_MAX_PATCHES: usize = 4_000;
-/// The work the kernel is given, in patch-operations: every cut, tool or addition is a boolean on
-/// the whole stock, so the number of operations allowed is this divided by the stock's patches (at
-/// least one). Measured on synthetic stocks (ci profile): 366 patches 1.4 s per plane cut, about 800
-/// patches 2-3 s, 2 010 patches 15 s, and refusals (status 1001) or 137 s on some 800-2 200 patch
-/// stocks of noisy scans. 4 000 allows 10 operations at 400 patches (about 15-30 s), 2 at 2 000
-/// (about 30 s) and one at 4 000; the rest of the regions stay patches and are counted in
-/// `AnalyticSummary::left_by_work_bound`.
-const STOCK_WORK_BOUND: usize = 4_000;
+/// The network is held to this share of the tolerance: the coarse mesh the patches are laid on may
+/// leave the scan by a few of these, and along a sharp edge the patch boundary is a chord of it, which
+/// is what a group's boundary gap to its primitive is made of.
+const WRAP_TOLERANCE_SHARE: f64 = 0.5;
 /// Chord of the tessellation the area of the faces is measured on, as a share of the tolerance.
 const AREA_CHORD_SHARE: f64 = 1.0;
+
+/// A face of the body that merged patches of one primitive.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+pub struct MergedFace {
+    /// The primitive.
+    pub primitive: ObjectId,
+    /// Its kind (plane, cylinder, cone, sphere).
+    pub kind: String,
+    /// The face of the body.
+    pub face: usize,
+    /// Patches the face replaced.
+    pub patches: usize,
+    /// The largest distance of the face's boundary edges from the primitive (mm).
+    pub max_edge_gap: f64,
+}
+
+/// Patches of a protected region that stay patches.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+pub struct LeftPatches {
+    /// The primitive.
+    pub primitive: ObjectId,
+    /// Its kind.
+    pub kind: String,
+    /// Patches in the group.
+    pub patches: usize,
+    /// Why they were not merged.
+    pub reason: String,
+}
 
 /// How much of the body is exact geometry.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -74,10 +81,12 @@ pub struct AnalyticSummary {
     pub total_faces: usize,
     /// Share of the body's surface area on those faces (0..1).
     pub area_share: f64,
-    /// Cuts, tools and additions left out because the stock was too large for the kernel's work
-    /// bound (their regions stay patches).
+    /// The merged faces, each with the largest distance of its boundary from its primitive.
     #[serde(default)]
-    pub left_by_work_bound: usize,
+    pub merged: Vec<MergedFace>,
+    /// Groups of patches of a protected region that were not merged, with the reason.
+    #[serde(default)]
+    pub left_as_patches: Vec<LeftPatches>,
 }
 
 /// Why an attempt stopped.
@@ -114,126 +123,63 @@ fn fit_primitives(s: &mut Session, i: &ToSolidIn, set: &Settings, report: &ScanS
     let total = triangle_count(s, set.scan);
     let (min_triangles, rms_limit) = region_limits(set, total, report);
     let (modelled, left) = fit_regions(s, &list, min_triangles, rms_limit);
-    if modelled.is_empty() {
-        return Err(halt("hybrid_no_primitives", "no region of the scan could be modelled as a primitive"));
-    }
     let relations = if i.constrain { relate(s, &modelled, report.noise_sigma) } else { 0 };
     Ok(Fitted { modelled, left, unassigned, relations })
 }
 
-/// What the planner made of the primitives: the cuts, tools and additions for the kernel.
-struct Planned {
-    items: Vec<Item>,
-    plan: plan::Plan,
-    cuts: Vec<Cut>,
-}
-
-fn plan_primitives(s: &Session, modelled: &[Modelled]) -> Step<Planned> {
-    let refs: Vec<ObjRef> = modelled.iter().map(|m| ObjRef::Id(m.primitive.0)).collect();
-    let lift = failed_at("hybrid_failed");
-    let (items, _, scan) = collect_items(s, &refs, &mut HashMap::new(), |_| {}).map_err(&lift)?;
-    let plan = plan::plan(&items, &scan, square_deg(None).map_err(&lift)?);
-    let mut cuts = plan.cuts.clone();
-    snap_axes(&mut cuts);
-    Ok(Planned { items, plan, cuts })
-}
-
-/// The regions that become analytic faces, as the prepared scan sees them.
-fn snap_regions(s: &Session, p: &Planned) -> Vec<SnapRegion> {
+/// The protected primitives, largest region first (the order the regions are given): every fitted
+/// primitive the merge can place. Regions of a torus are not protected.
+fn protect(s: &Session, modelled: &[Modelled]) -> Vec<Protected> {
     let mut out = Vec::new();
-    for (k, item) in p.items.iter().enumerate() {
-        let Some(role) = p.plan.roles.get(k) else { continue };
-        let (shape, is_addition) = match role.kind {
-            RoleKind::Global => {
-                let Some(cut) = p.plan.cut_members.iter().position(|m| m.contains(&k)).and_then(|c| p.cuts.get(c))
-                else {
-                    continue;
-                };
-                (cut.shape.clone(), false)
-            }
-            RoleKind::LocalSubtract => (role.shape.clone(), false),
-            RoleKind::LocalAdd => (role.shape.clone(), true),
-            // a blend is not cut into a patch stock, and a skipped region has no primitive
-            RoleKind::Blend | RoleKind::Skipped => continue,
-        };
-        let triangles =
-            s.doc.primitive(item.id).and_then(|o| o.region).and_then(|r| s.doc.region(r)).map(|r| r.triangles.to_vec());
-        if let Some(triangles) = triangles {
-            out.push(SnapRegion { triangles, primitive: primitive_of(&shape), convex: item.cut.convex, is_addition });
+    for m in modelled {
+        let Some(o) = s.doc.primitive(m.primitive) else { continue };
+        if m.kind == PrimitiveKind::Torus {
+            continue;
         }
+        let Some(region) = o.region.and_then(|r| s.doc.region(r)) else { continue };
+        let kind = match m.kind {
+            PrimitiveKind::Plane => "plane",
+            PrimitiveKind::Cylinder => "cylinder",
+            PrimitiveKind::Cone => "cone",
+            _ => "sphere",
+        };
+        let fit = o.primitive.clone();
+        out.push(Protected {
+            primitive: m.primitive,
+            kind,
+            shape: shape_of(&fit),
+            fit,
+            triangles: region.triangles.to_vec(),
+        });
     }
     out
 }
 
-/// The stock: a body wrapped over the prepared scan.
-struct Stock {
-    body: ObjectId,
-    patches: usize,
-    capped: bool,
-}
-
-/// Rebuilds the prepared scan as a clean closed surface (`mesh.remesh`); a scan the remesh refuses
-/// ends the attempt.
-fn remesh_prepared(s: &mut Session, set: &Settings, prepared: ObjectId) -> Step<ObjectId> {
-    let area = s.doc.mesh(prepared).map_or(0.0, |m| m.mesh.area());
-    let voxel = (REMESH_VOXEL_SHARE * set.tolerance).max((area / REMESH_QUAD_BUDGET).sqrt());
-    let input = RemeshIn {
-        object: ObjRef::Id(prepared.0),
-        tolerance: Some(set.tolerance),
-        voxel: Some(voxel),
-        min_feature: None,
-        max_hole: None,
-        min_component_fraction: None,
-        name: Some(format!("{}-remesh", set.name)),
+/// Wraps the copy of the scan whose protected regions lie on their primitives (the copy is removed
+/// again), or the scan itself when no primitive is protected: then the result is the freeform
+/// method's. A wrap that fails ends the attempt.
+fn wrap_prepared(s: &mut Session, set: &Settings, protected: &[Protected], scan: &Mesh) -> Step<(WrapOut, Retry)> {
+    let staged = if protected.is_empty() {
+        wrap_stage(s, set, set.scan, |s, cap| wrap_mesh_at(s, set, set.scan, cap, set.tolerance))
+    } else {
+        let regions: Vec<(&[u32], &surfacecraft_fit::Primitive)> =
+            protected.iter().map(|p| (p.triangles.as_slice(), &p.fit)).collect();
+        let copy = s.doc.add_mesh(&format!("{}-prepared", set.name), projected(scan, &regions, set.tolerance));
+        let held = WRAP_TOLERANCE_SHARE * set.tolerance;
+        let staged = wrap_stage(s, set, copy, |s, cap| wrap_mesh_at(s, set, copy, cap, held));
+        s.doc.remove(copy);
+        staged
     };
-    match remesh_cmd(s, input) {
-        Ok(r) => Ok(r.id),
-        Err(e) if is_cancelled(&e) => Err(Halt::Cancelled(e)),
-        Err(e) => Err(halt(
-            "hybrid_not_closed",
-            format!("the scan cannot be rebuilt as a closed surface: {}", message_of(&e)),
-        )),
+    match staged.map_err(failed_at("hybrid_stock_failed"))? {
+        Ok(pair) => Ok(pair),
+        Err(why) => Err(halt("hybrid_stock_failed", format!("the scan could not be wrapped in patches: {why}"))),
     }
 }
 
-/// Prepares the scan, rebuilds it as a clean surface and wraps it. The two meshes made on the way
-/// are removed again.
-fn make_stock(s: &mut Session, set: &Settings, planned: &Planned) -> Step<Stock> {
-    let scan = s.doc.mesh(set.scan).map(|m| m.mesh.clone()).ok_or_else(|| halt("hybrid_failed", "the scan is gone"))?;
-    let delta = OFFSET_SHARE_OF_TOLERANCE * set.tolerance;
-    let prepared = snapped(&scan, &snap_regions(s, planned), delta);
-    let prepared_id = s.doc.add_mesh(&format!("{}-prepared", set.name), prepared);
-    let remeshed = remesh_prepared(s, set, prepared_id)?;
-    check_cancel(s)?;
-    let cap = set.max_patches.unwrap_or(STOCK_MAX_PATCHES).min(STOCK_MAX_PATCHES);
-    let wrapped = wrap_mesh(s, set, remeshed, Some(cap)).map_err(failed_at("hybrid_stock_failed"));
-    s.doc.remove(prepared_id);
-    s.doc.remove(remeshed);
-    let w = wrapped?;
-    if !w.closed {
-        return Err(halt(
-            "hybrid_stock_open",
-            "the patch network over the scan is not closed, so it cannot be trimmed",
-        ));
-    }
-    Ok(Stock { body: w.body.id, patches: w.patches, capped: w.capped })
-}
-
-/// Trims the stock with the cuts, tools and additions of the plan.
-fn trim_stock(s: &Session, stock: &Stock, planned: &Planned) -> Step<Built> {
-    let operations = (STOCK_WORK_BOUND / stock.patches.max(1)).max(1);
-    let brep =
-        s.doc.body(stock.body).map(|b| b.brep.clone()).ok_or_else(|| halt("hybrid_failed", "the stock is gone"))?;
-    let tools: Vec<LocalTool> = planned.plan.tools.iter().map(|t| t.tool.clone()).collect();
-    let adds: Vec<LocalAdd> = planned.plan.adds.iter().map(|a| a.add.clone()).collect();
-    let cancelled = || s.cancel.is_cancelled();
-    hybrid::cut_stock(&brep, &planned.cuts, &tools, &adds, operations, &cancelled).map_err(|e| {
-        if cancelled() { Halt::Cancelled(cancelled_error()) } else { halt("hybrid_cut_failed", e.to_string()) }
-    })
-}
+type Retry = Option<super::freeform::CapRetry>;
 
 /// Analytic faces and their share of the surface area, from a tessellation that knows its faces.
-fn analytic_summary(brep: &Brep, tolerance: f64) -> Option<AnalyticSummary> {
+fn analytic_summary(brep: &Brep, tolerance: f64, m: &Merging) -> Option<AnalyticSummary> {
     let analytic = hybrid::analytic_faces(brep);
     let topo = tessellate_topo(brep, Some(AREA_CHORD_SHARE * tolerance)).ok()?;
     if topo.tri_face.len() != topo.mesh.triangle_count() {
@@ -253,100 +199,99 @@ fn analytic_summary(brep: &Brep, tolerance: f64) -> Option<AnalyticSummary> {
         faces: analytic.len(),
         total_faces: brep.faces.len(),
         area_share: share,
-        left_by_work_bound: 0,
+        merged: m.merged.clone(),
+        left_as_patches: m.left.clone(),
     })
 }
 
-/// How many cuts, tools and additions the work bound left out.
-fn left_by_work_bound(built: &Built) -> usize {
-    let over = hybrid::CutStatus::Skipped(hybrid::OVER_WORK_BOUND.into());
-    built.primitives.iter().chain(&built.tools).chain(&built.adds).filter(|s| **s == over).count()
+/// Per fitted primitive: its merged faces (or none) for the result's `modelled` list.
+fn faces_of(modelled: &[Modelled], m: &Merging) -> Vec<FaceOf> {
+    modelled
+        .iter()
+        .map(|p| {
+            let mine: Vec<&MergedFace> = m.merged.iter().filter(|g| g.primitive == p.primitive).collect();
+            let faces = mine.iter().map(|g| g.face).collect();
+            let patches: usize = mine.iter().map(|g| g.patches).sum();
+            let (how, role) = if mine.is_empty() {
+                ("stays patches".to_string(), "patches")
+            } else {
+                (format!("{patches} patches merged into {} face(s)", mine.len()), "merged")
+            };
+            FaceOf { object: p.primitive, faces, how, role: role.to_string() }
+        })
+        .collect()
 }
 
-/// Everything the result is made of once the body is built and measured.
-struct Measured {
-    deviation: DeviationSummary,
-    worst_faces: Vec<surfacecraft_deviation::faces::FaceDeviation>,
-    analytic: AnalyticSummary,
-    faces_of: Vec<FaceOf>,
-    body: crate::cmd::body::BodyOut,
+/// Puts the merged body in the wrap's document body and refreshes what the result reports of it.
+fn install(s: &mut Session, w: &WrapOut, body: Brep) -> Step<WrapOut> {
+    let slot = s.doc.body_mut(w.body.id).ok_or_else(|| halt("hybrid_failed", "the wrapped body is gone"))?;
+    slot.brep = Arc::new(body);
+    let info = body_out(s, w.body.id).map_err(failed_at("hybrid_failed"))?;
+    Ok(WrapOut { body: info, ..w.clone() })
 }
 
-/// Puts the trimmed solid in the stock's body and measures it against the scan.
-fn measure(s: &mut Session, set: &Settings, stock: &Stock, built: Built, planned: &Planned) -> Step<Measured> {
-    let brep = Arc::new(built.brep.clone());
-    let left = left_by_work_bound(&built);
-    let analytic = analytic_summary(&brep, set.tolerance)
-        .map(|a| AnalyticSummary { left_by_work_bound: left, ..a })
-        .ok_or_else(|| halt("hybrid_failed", "the faces could not be measured"))?;
-    if analytic.faces == 0 {
-        return Err(halt(
-            "hybrid_no_analytic_faces",
-            "the trimmed body has no face on a primitive (no cut reached the stock)",
-        ));
-    }
-    let diag = 0.02 * set.tolerance.max(1.0) + 1e-3;
-    let faces_of = item_faces(&planned.items, &planned.plan, &planned.cuts, &built, diag);
-    let slot = s.doc.body_mut(stock.body).ok_or_else(|| halt("hybrid_failed", "the stock is gone"))?;
-    slot.brep = brep;
-    let cmp = compare(
-        s,
-        CompareIn {
-            body: ObjRef::Id(stock.body.0),
-            scan: ObjRef::Id(set.scan.0),
-            tolerance: Some(set.tolerance),
-            max_distance: None,
-            chord: None,
-            facing: true,
-        },
-    )
-    .map_err(failed_at("hybrid_failed"))?;
-    let vertices = s.doc.mesh(set.scan).map_or(0, |m| m.mesh.vertex_count());
-    let deviation = summary(&cmp, vertices);
-    let worst_faces =
-        cmp.per_face.into_iter().filter(|f| f.count > 0 && f.within < 1.0).take(MAX_LISTED_FACES).collect();
-    let body = crate::cmd::body::body_out(s, stock.body).map_err(failed_at("hybrid_failed"))?;
-    Ok(Measured { deviation, worst_faces, analytic, faces_of, body })
+/// Is `merged` worse than the wrap it came from (by the comparison of `auto`)?
+fn is_worse(merged: &ToSolidOut, wrap: &ToSolidOut) -> bool {
+    super::auto::compare(merged, wrap) == Ordering::Less
 }
 
-/// The next steps of a hybrid result.
-fn next_steps(m: &Measured, issues: &[Issue], set: &Settings) -> Vec<NextStep> {
-    if issues.is_empty() {
-        let why = "the solid passed: export it (pass `path` when files are allowed, else read `data`)";
-        return vec![step("export.step", json!({"objects": [m.body.id]}), why)];
+/// The merging step on the wrapped body: the merged result when it is not worse than the wrap (by the
+/// comparison of `auto`), else the wrap as it was. Returns the result, the body's merging and the
+/// analytic summary.
+fn merged_or_wrap(
+    s: &mut Session,
+    set: &Settings,
+    report: &ScanSummary,
+    wrapped: (&WrapOut, Retry),
+    wrap_result: ToSolidOut,
+    protected: &[Protected],
+    scan: &Mesh,
+) -> Step<(ToSolidOut, Merging)> {
+    let (w, retry) = wrapped;
+    let brep =
+        s.doc.body(w.body.id).map(|b| b.brep.clone()).ok_or_else(|| halt("hybrid_failed", "the body is gone"))?;
+    let none = |left: Vec<LeftPatches>| Merging { body: (*brep).clone(), merged: Vec::new(), left };
+    if protected.is_empty() {
+        return Ok((wrap_result, none(Vec::new())));
     }
-    let mut steps = Vec::new();
-    if issues.iter().any(|i| i.code == "out_of_tolerance") {
-        let why = "moves the analytic faces of the solid onto the scan (planes shift, radii change)";
-        steps.push(step("body.refit_faces", json!({"body": m.body.id, "mesh": set.scan}), why));
+    let tried = merge_groups(s, scan, &brep, protected, set.tolerance)
+        .map_err(|e| if is_cancelled(&e) { Halt::Cancelled(e) } else { halt("hybrid_merge_failed", message_of(&e)) })?;
+    if tried.merged.is_empty() {
+        let left = tried.left;
+        return Ok((wrap_result, none(left)));
     }
-    let why = "what each verdict and issue means and how to go on by hand";
-    steps.push(step("guide.read", json!({"topic": "scan-to-solid"}), why));
-    steps
+    // a merged body the mesher cannot take at the display chord or the tolerance's is not returned
+    let meshes = |c| tessellate_topo(&tried.body, c).is_ok();
+    if !(meshes(None) && meshes(Some(AREA_CHORD_SHARE * set.tolerance))) {
+        return Ok((wrap_result, none(tried.left)));
+    }
+    let merged_w = install(s, w, tried.body.clone())?;
+    let merged = judge_stage(s, set, report.clone(), &merged_w, retry).map_err(failed_at("hybrid_failed"))?;
+    if is_worse(&merged, &wrap_result) {
+        install(s, w, (*brep).clone())?;
+        return Ok((wrap_result, none(tried.left)));
+    }
+    Ok((merged, tried))
 }
 
 /// The hybrid attempt without the clean-up of a failure.
 fn build(s: &mut Session, i: &ToSolidIn, set: &Settings, report: &ScanSummary) -> Step<ToSolidOut> {
     let mut fitted = fit_primitives(s, i, set, report)?;
     check_cancel(s)?;
-    let planned = plan_primitives(s, &fitted.modelled)?;
-    let stock = make_stock(s, set, &planned)?;
+    let protected = protect(s, &fitted.modelled);
+    let scan = s.doc.mesh(set.scan).map(|m| m.mesh.clone()).ok_or_else(|| halt("hybrid_failed", "the scan is gone"))?;
+    let (w, retry) = wrap_prepared(s, set, &protected, &scan)?;
     check_cancel(s)?;
-    let built = trim_stock(s, &stock, &planned)?;
-    check_cancel(s)?;
-    let measured = measure(s, set, &stock, built, &planned)?;
-    apply_roles(&mut fitted.modelled, &measured.faces_of);
-    let facts = NetworkFacts { closed: true, patches: stock.patches, capped: stock.capped };
-    let issues = issues_for(&facts, &measured.deviation, set, report);
-    let next = next_steps(&measured, &issues, set);
-    let verdict = verdict_of(&issues, &measured.deviation);
-    let mut out =
-        freeform::out(set, None, report.clone(), verdict, None, Some(measured.deviation.clone()), issues, next);
+    let wrap_result = judge_stage(s, set, report.clone(), &w, retry.clone()).map_err(failed_at("hybrid_failed"))?;
+    let (mut out, merging) = merged_or_wrap(s, set, report, (&w, retry), wrap_result, &protected, &scan)?;
+    let body =
+        s.doc.body(w.body.id).map(|b| b.brep.clone()).ok_or_else(|| halt("hybrid_failed", "the body is gone"))?;
+    let analytic = analytic_summary(&body, set.tolerance, &merging)
+        .ok_or_else(|| halt("hybrid_failed", "the faces could not be measured"))?;
+    let roles = faces_of(&fitted.modelled, &merging);
+    apply_roles(&mut fitted.modelled, &roles);
     out.method = Method::Hybrid;
-    out.body = Some(measured.body);
-    out.patches = Some(stock.patches);
-    out.worst_faces = measured.worst_faces;
-    out.analytic = Some(measured.analytic);
+    out.analytic = Some(analytic);
     out.relations = fitted.relations;
     out.left_out_regions = fitted.left.len();
     out.left_out_triangles = fitted.left.iter().map(|l| l.triangles).sum();
@@ -368,14 +313,14 @@ fn failure(set: &Settings, report: ScanSummary, code: &str, message: &str) -> To
         step("guide.read", json!({"topic": "scan-to-solid"}), why),
     ];
     let issues = vec![issue(code, format!("no hybrid body was built: {message}"))];
-    let mut out = freeform::out(set, None, report, Verdict::Fail, None, None, issues, next);
+    let mut out = super::freeform::out(set, None, report, Verdict::Fail, None, None, issues, next);
     out.method = Method::Hybrid;
     out
 }
 
 /// The hybrid method: the regions of the scan (segmented by the caller) become primitives where they
-/// fit, the rest patches, in one closed body. A failure other than a cancellation is a result with
-/// an issue code and the document as it was.
+/// fit, the patches that lie on them one analytic face each. A failure other than a cancellation is a
+/// result with an issue code and the document as it was.
 pub(super) fn hybrid_solid(
     s: &mut Session,
     i: &ToSolidIn,
@@ -393,55 +338,5 @@ pub(super) fn hybrid_solid(
             s.doc = before;
             Ok(failure(set, report, code, &message))
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::cmd::plan::Scan;
-    use surfacecraft_kernel::hybrid::{CutStatus, Shape};
-    use surfacecraft_kernel::solid::make_box;
-
-    /// A session with a box as the stock and a plan of `cuts` planes through it.
-    fn session_with_stock(cuts: usize) -> (Session, Stock, Planned) {
-        let mut s = Session::new();
-        let body = s.doc.add_body("stock", make_box([0.0; 3], [10.0, 10.0, 10.0]).expect("a box"));
-        let plan = plan::plan(&[], &Scan::from_points(Vec::new(), 1.0), 0.3);
-        let cuts = (0..cuts)
-            .map(|k| Cut {
-                shape: Shape::Plane { point: [8.0 - k as f64, 0.0, 0.0], normal: [1.0, 0.0, 0.0] },
-                convex: true,
-                full: false,
-            })
-            .collect();
-        (s, Stock { body, patches: 1, capped: false }, Planned { items: Vec::new(), plan, cuts })
-    }
-
-    #[test]
-    fn a_call_cancelled_during_the_cuts_ends_as_a_cancellation_and_changes_nothing() {
-        let (s, stock, planned) = session_with_stock(2);
-        let before = s.doc.body(stock.body).map(|b| b.brep.faces.len());
-        s.cancel.cancel();
-        assert!(matches!(trim_stock(&s, &stock, &planned), Err(Halt::Cancelled(_))));
-        assert_eq!(s.doc.body(stock.body).map(|b| b.brep.faces.len()), before, "the stock is untouched");
-    }
-
-    #[test]
-    fn the_cuts_are_made_when_the_call_runs() {
-        let (s, stock, planned) = session_with_stock(2);
-        let Ok(built) = trim_stock(&s, &stock, &planned) else { panic!("the cuts could not be made") };
-        assert!(built.primitives.iter().all(|c| matches!(c, CutStatus::Applied(_))));
-        assert_eq!(left_by_work_bound(&built), 0);
-    }
-
-    #[test]
-    fn a_stock_over_the_work_bound_leaves_the_rest_of_the_cuts_and_counts_them() {
-        // a stock of as many patches as the bound allows one operation for
-        let (s, stock, planned) = session_with_stock(3);
-        let big = Stock { patches: STOCK_WORK_BOUND, ..stock };
-        let Ok(built) = trim_stock(&s, &big, &planned) else { panic!("the first cut could not be made") };
-        assert_eq!(left_by_work_bound(&built), 2, "{:?}", built.primitives);
-        assert!(matches!(built.primitives[0], CutStatus::Applied(_)));
     }
 }
