@@ -158,6 +158,8 @@ pub(super) struct Relaxed {
     pub normals: Vec<Vec3>,
     /// Vertices whose offset the local feature size of the scan bounded before any round.
     pub limited: usize,
+    /// The most triangles an exhaustive pass found crossing a part of the scan far from them along the surface.
+    pub far: usize,
 }
 
 /// What the rounds change.
@@ -166,6 +168,8 @@ struct State {
     ever: Vec<bool>,
     frozen: Vec<bool>,
     uncertain: Vec<bool>,
+    /// The most far crossings (triangles) any pass found.
+    far: usize,
 }
 
 impl State {
@@ -344,6 +348,7 @@ fn crossing_rounds(field: &Field, st: &mut State, surface: &Surface, shell: &mut
     for round in 0..=limit {
         let found = shell.crossing_vertices(field, &st.scale, surface, &[]);
         st.mark_uncertain(&found.uncertain);
+        st.far = st.far.max(found.far);
         let movable = st.partition(found.crossing, false);
         if movable.is_empty() {
             break;
@@ -388,7 +393,8 @@ const MAX_SMOOTHING_ROW: usize = 64;
 /// `unresolved`.
 pub(super) fn relax(field: &Field) -> Result<Relaxed, usize> {
     let n = field.positions.len();
-    let mut st = State { scale: vec![1.0; n], ever: vec![false; n], frozen: vec![false; n], uncertain: vec![false; n] };
+    let mut st =
+        State { scale: vec![1.0; n], ever: vec![false; n], frozen: vec![false; n], uncertain: vec![false; n], far: 0 };
     let surface = Surface::new(field.positions, field.adjacent, field.rim, field.thickness, field.edge, field.size);
     // what would fold at the full offset is counted as folded, whatever the bound does to it
     for v in flagged(field, &st.scale, &(0..n as u32).collect::<Vec<_>>()) {
@@ -431,6 +437,7 @@ pub(super) fn relax(field: &Field) -> Result<Relaxed, usize> {
         folded: st.ever.iter().zip(&st.scale).filter(|&(&e, &s)| e && s < 1.0).count(),
         unresolved,
         limited,
+        far: st.far,
         scale: st.scale,
         normals,
     })
@@ -542,10 +549,12 @@ mod tests {
         let result = super::super::thicken(&panel, &params);
         ROUND_LIMIT.with(|c| c.set(None));
 
-        // Assert: not silently clean
-        match result {
-            Ok(t) => assert!(t.report.unresolved_vertices > 0, "{:?}", t.report),
-            Err(e) => assert!(e.to_string().contains("cross") || e.to_string().contains("fold"), "{e}"),
-        }
+        // Assert: exactly what the freeze gives: crossings counted as unresolved, here more than 0.1 %
+        // of the vertices, hence the refusal (without the freeze the shell came back "clean")
+        assert!(
+            matches!(result, Err(super::super::ThickenError::UnresolvedCrossings { .. })),
+            "{:?}",
+            result.map(|t| t.report)
+        );
     }
 }

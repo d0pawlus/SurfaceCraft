@@ -25,6 +25,8 @@ fn crossing_vertices(mesh: &Mesh, bvh: &Bvh, ids: &[u32]) -> Vec<u32> {
     let hits: Vec<Vec<u32>> = par::map(ids.len(), |k| {
         let id = ids.get(k).copied().unwrap_or(0) as usize;
         let Some(xi) = mesh.triangles.get(id) else { return Vec::new() };
+        // a truncated triangle (it overlaps thousands of others: a pile) is left alone on purpose:
+        // smoothing cannot sort a pile out, and the relaxation reports such triangles as unresolved
         let found = crossing::partners(mesh, bvh, id, Pairs::Exact);
         if found.crossing.is_empty() {
             return Vec::new();
@@ -94,7 +96,6 @@ pub(super) struct Repair {
 pub(super) fn smooth_scan_crossings(work: &mut Work, adjacent: &Csr, median_edge: f64, rim: &[bool]) -> Repair {
     let reach = MAX_SHIFT_EDGES * median_edge;
     let start = work.positions.clone();
-    let mut moved: Vec<u32> = Vec::new();
     let mut ids: Vec<u32> = (0..work.triangles.len() as u32).collect();
     for _ in 0..MAX_PASSES {
         let mesh = Mesh { positions: work.positions.clone(), triangles: work.triangles.clone() };
@@ -105,7 +106,6 @@ pub(super) fn smooth_scan_crossings(work: &mut Work, adjacent: &Csr, median_edge
         }
         let area = region(adjacent, &bad);
         work.positions = smoothed(&work.positions, &start, adjacent, &area, (reach, rim));
-        moved.extend_from_slice(&area);
         let pairs: Vec<(u32, u32)> =
             work.triangles.iter().enumerate().flat_map(|(i, t)| t.iter().map(move |&v| (v, i as u32))).collect();
         let around = Csr::from_pairs(work.positions.len(), &pairs);

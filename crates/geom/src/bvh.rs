@@ -352,10 +352,11 @@ impl Bvh {
         best.map_or(RayCast::Miss, |(t, d)| RayCast::Hit(t, d))
     }
 
-    /// The triangles whose own box overlaps `query` (touching counts), ascending, at most `max` of them;
+    /// The triangles whose own box overlaps `query` (touching counts) and that `keep` accepts (a finer test
+    /// than the box, applied before counting), ascending, at most `max` of them;
     /// the flag says that there were more (the first ones found are returned, in no useful order).
     #[must_use]
-    pub fn overlapping_up_to(&self, query: &Aabb, max: usize) -> (Vec<u32>, bool) {
+    pub fn overlapping_up_to(&self, query: &Aabb, max: usize, keep: &dyn Fn(&[Point3; 3]) -> bool) -> (Vec<u32>, bool) {
         let overlaps = |b: &Aabb| (0..3).all(|k| b.min[k] <= query.max[k] && query.min[k] <= b.max[k]);
         let mut out = Vec::new();
         let mut stack: Vec<u32> = if self.nodes.is_empty() { Vec::new() } else { vec![0] };
@@ -367,7 +368,7 @@ impl Bvh {
             if node.leaf {
                 for &ti in self.order.get(node.start as usize..node.end as usize).unwrap_or(&[]) {
                     let Some(corners) = self.tris.get(ti as usize) else { continue };
-                    if overlaps(&Aabb::from_points(corners.iter())) {
+                    if overlaps(&Aabb::from_points(corners.iter())) && keep(&corners) {
                         if out.len() >= max {
                             out.sort_unstable();
                             return (out, true);

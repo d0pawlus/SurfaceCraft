@@ -44,6 +44,8 @@ pub(super) struct Inputs<'a> {
     pub size: f64,
     /// Vertices whose offset the feature size of the scan bounded.
     pub limited: usize,
+    /// Triangles that cross a far part of the scan, found by the exhaustive test of the relaxation.
+    pub far: usize,
 }
 
 pub(super) fn assemble(work: &Work, inp: &Inputs, params: &ThickenParams) -> Result<Thickened, ThickenError> {
@@ -88,7 +90,8 @@ pub(super) fn assemble(work: &Work, inp: &Inputs, params: &ThickenParams) -> Res
         median_wall,
         crossing_samples: crossings.tested,
         crossing_local: crossings.local,
-        crossing_triangles: crossings.nonlocal,
+        crossing_triangles: crossings.nonlocal.max(inp.far),
+        crossing_far_exhaustive: inp.far,
     };
     let scan_layer = if !params.symmetric && params.thickness < 0.0 { ScanLayer::Inner } else { ScanLayer::Outer };
     Ok(Thickened {

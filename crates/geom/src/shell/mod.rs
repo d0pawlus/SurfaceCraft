@@ -112,6 +112,9 @@ pub struct ThickenReport {
     /// Of them, triangles that cross a triangle far from them along the scan: the offset sheet meets
     /// another part of the shell (a channel or gap narrower than the wall), real geometry.
     pub crossing_triangles: usize,
+    /// Of those, the triangles the exhaustive test of the relaxation found (the count above is the larger of
+    /// this and the sampled one, so a small crossing between the strides of the sample is not lost).
+    pub crossing_far_exhaustive: usize,
 }
 
 /// A closed shell.
@@ -239,13 +242,13 @@ pub enum ThickenError {
         /// The share above which the call is refused (percent).
         limit_percent: f64,
     },
-    /// Hundreds of triangles lie on top of each other: doubled or coincident sheets, not a scan.
+    /// Many layers of triangles lie on top of each other: doubled or coincident sheets, not a scan.
     #[error(
-        "{triangles} triangles lie within a quarter of an edge of each other (more than {limit}): coincident or doubled sheets, not a scan surface; remove the duplicates (mesh.clean) before thickening"
+        "about {layers} layers of triangles lie on top of each other (more than {limit}): coincident or doubled sheets, not a scan surface; keep one sheet (scan.split) before thickening"
     )]
     TrianglePile {
-        /// Triangles in the densest spot.
-        triangles: usize,
+        /// Layers in the densest spot.
+        layers: usize,
         /// The most accepted.
         limit: usize,
     },
@@ -329,21 +332,7 @@ pub fn thicken(mesh: &Mesh, params: &ThickenParams) -> Result<Thickened, Thicken
         return Err(ThickenError::Closed);
     }
     let adjacent = topology::adjacency(work.positions.len(), &sorted);
-    let scan_edge = median_edge(&work);
-    let mut rim = vec![false; work.positions.len()];
-    for &(a, b) in &boundary {
-        for v in [a, b] {
-            if let Some(slot) = rim.get_mut(v as usize) {
-                *slot = true;
-            }
-        }
-    }
-    let original = work.positions.clone();
-    let repair = selfx::smooth_scan_crossings(&mut work, &adjacent, scan_edge, &rim);
-    (work.repaired, work.repair_shift) = (repair.vertices, repair.largest_shift);
-    if repair.vertices > 0 {
-        work.shift = original.iter().zip(&work.positions).map(|(o, p)| o - p).collect();
-    }
+    repair_scan(&mut work, &adjacent, &boundary);
     let radius = (SMOOTHING_SHARE * params.thickness.abs()).max(mean_edge(&work));
     let normals =
         normals::smoothed(&work.positions, &work.triangles, &boundary, radius).ok_or(ThickenError::NoNormals)?;
@@ -362,8 +351,28 @@ pub fn thicken(mesh: &Mesh, params: &ThickenParams) -> Result<Thickened, Thicken
         edge,
         size: Aabb::from_points(&work.positions).diagonal(),
         limited: relaxed.limited,
+        far: relaxed.far,
     };
     assemble(&work, &inputs, params)
+}
+
+/// Smooths the scan where it crosses itself (not at the rim) and keeps where the vertices were.
+fn repair_scan(work: &mut Work, adjacent: &Csr, boundary: &[(u32, u32)]) {
+    let mut rim = vec![false; work.positions.len()];
+    for &(a, b) in boundary {
+        for v in [a, b] {
+            if let Some(slot) = rim.get_mut(v as usize) {
+                *slot = true;
+            }
+        }
+    }
+    let original = work.positions.clone();
+    let scan_edge = median_edge(work);
+    let repair = selfx::smooth_scan_crossings(work, adjacent, scan_edge, &rim);
+    (work.repaired, work.repair_shift) = (repair.vertices, repair.largest_shift);
+    if repair.vertices > 0 {
+        work.shift = original.iter().zip(&work.positions).map(|(o, p)| o - p).collect();
+    }
 }
 
 /// A vertex belongs to at most this many triangles (a scan has a few dozen; a hub of a hundred thousand
@@ -388,17 +397,21 @@ fn check_hubs(work: &Work) -> Result<(), ThickenError> {
     }
 }
 
-/// Triangles whose centres fall in one cell of a quarter of the median edge at most.
-pub const MAX_TRIANGLES_PER_SPOT: usize = 256;
+/// Layers of triangles on top of each other (the summed area of the triangles with their centres in one
+/// cell, in cell areas) above which the mesh is refused. A surface through a cell holds about one layer
+/// (more where it is steep or folded); a pile of coincident or doubled sheets holds as many as there are
+/// sheets. How fine the mesh is does not matter: a triangle counts at most one cell area.
+pub const MAX_LAYERS: f64 = 32.0;
 
-/// Refuses a mesh with more than [`MAX_TRIANGLES_PER_SPOT`] triangle centres in one cell: coincident or
-/// doubled sheets, which no test could sort out (a triangle would overlap thousands of others).
+/// Refuses a mesh with more than [`MAX_LAYERS`] layers of triangles in one cell of a quarter of the
+/// median edge: coincident or doubled sheets, which no test could sort out (a triangle would overlap
+/// thousands of others).
 fn check_piles(work: &Work) -> Result<(), ThickenError> {
     let cell = 0.25 * median_edge(work);
     if !(cell > 0.0) {
         return Ok(());
     }
-    let mut count: std::collections::HashMap<(i64, i64, i64), usize> = std::collections::HashMap::new();
+    let mut layers: std::collections::HashMap<(i64, i64, i64), f64> = std::collections::HashMap::new();
     for t in &work.triangles {
         let (Some(a), Some(b), Some(c)) =
             (work.positions.get(t[0] as usize), work.positions.get(t[1] as usize), work.positions.get(t[2] as usize))
@@ -406,15 +419,15 @@ fn check_piles(work: &Work) -> Result<(), ThickenError> {
             continue;
         };
         let g = (a.coords + b.coords + c.coords) / 3.0;
-        *count
-            .entry(((g.x / cell).floor() as i64, (g.y / cell).floor() as i64, (g.z / cell).floor() as i64))
-            .or_default() += 1;
+        let share = ((b - a).cross(&(c - a)).norm() / 2.0 / (cell * cell)).min(1.0);
+        let key = ((g.x / cell).floor() as i64, (g.y / cell).floor() as i64, (g.z / cell).floor() as i64);
+        *layers.entry(key).or_default() += share;
     }
-    match count.into_values().max() {
-        Some(triangles) if triangles > MAX_TRIANGLES_PER_SPOT => {
-            Err(ThickenError::TrianglePile { triangles, limit: MAX_TRIANGLES_PER_SPOT })
-        }
-        _ => Ok(()),
+    let most = layers.into_values().fold(0.0, f64::max);
+    if most > MAX_LAYERS {
+        Err(ThickenError::TrianglePile { layers: most as usize, limit: MAX_LAYERS as usize })
+    } else {
+        Ok(())
     }
 }
 

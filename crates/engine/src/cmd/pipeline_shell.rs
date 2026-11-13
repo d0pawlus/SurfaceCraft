@@ -73,6 +73,8 @@ pub struct ThickenedInfo {
     pub self_intersections_local: usize,
     /// Of them, triangles that cross a triangle far from them along the scan: the offset sheet meets another part of the shell (a channel or gap narrower than the wall). Only these raise the issue `self_intersection`.
     pub self_intersections: usize,
+    /// Of those, the triangles an exhaustive test of the whole shell found (`self_intersections` is the larger of this and the sampled count).
+    pub self_intersections_exhaustive: usize,
     /// Triangles of the thickened mesh.
     pub triangles: usize,
     /// The thickened mesh, when `keep_thickened` kept it in the document.
@@ -158,6 +160,7 @@ fn info(shell: &Thickened, i: &ToSolidIn, kept: Option<ObjectId>) -> ThickenedIn
         self_intersection_samples: shell.report.crossing_samples,
         self_intersections_local: shell.report.crossing_local,
         self_intersections: shell.report.crossing_triangles,
+        self_intersections_exhaustive: shell.report.crossing_far_exhaustive,
         triangles: shell.mesh.triangle_count(),
         mesh: kept,
     }
@@ -253,6 +256,7 @@ fn issues_of(
     let counts = ShellCounts {
         local: t.self_intersections_local,
         far: t.self_intersections,
+        far_exhaustive: t.self_intersections_exhaustive,
         unresolved: t.unresolved_vertices,
         samples: t.self_intersection_samples,
         triangles: t.triangles,

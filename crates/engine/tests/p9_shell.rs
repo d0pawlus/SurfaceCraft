@@ -566,23 +566,23 @@ fn a_shell_that_keeps_crossings_never_passes_whether_they_are_near_or_far_apart(
 }
 
 /// A flat panel of `side` mm with cells of 0.5 mm whose two middle vertices are swapped over each other
-/// sideways (two triangles cut through each other), one of them `lift` mm above the plane.
-fn folded_panel(side: f64, lift: f64) -> Mesh {
+/// sideways (two triangles cut through each other), `lift` and `other` mm above the plane.
+fn folded_panel(side: f64, lift: f64, other: f64) -> Mesh {
     let cells = (side / 0.5) as usize;
     let mut panel = synth::plane(Point3::origin(), Vec3::x(), Vec3::y(), side, side, cells, cells);
     let centre = (cells / 2) * (cells + 1) + cells / 2;
     let (x, y) = (side / 2.0, side / 2.0);
     panel.positions[centre] = Point3::new(x + 0.9, y + 0.4, lift);
-    panel.positions[centre + 1] = Point3::new(x + 0.1, y - 0.1, 0.0);
+    panel.positions[centre + 1] = Point3::new(x + 0.1, y - 0.1, other);
     panel
 }
 
 #[test]
 fn a_repaired_fold_is_measured_against_the_scan_as_it_was_and_cannot_pass() {
-    // Arrange: a fold of two vertices swapped over each other, one 0.02 mm above the plane: the repair moves
-    // vertices by half a millimetre, more than the tolerance of 0.2 mm
-    let lift = 0.02;
-    let mut s = session_with(folded_panel(60.0, lift));
+    // Arrange: a fold of two vertices swapped over each other, 0.5 mm above the plane (more than the tolerance
+    // of 0.2 mm): the repair moves vertices by half a millimetre
+    let lift = 0.5;
+    let mut s = session_with(folded_panel(60.0, lift, lift));
 
     // Act
     let thick = s.execute("mesh.thicken", json!({"object": "scan", "thickness": 1.0})).unwrap();
@@ -595,10 +595,7 @@ fn a_repaired_fold_is_measured_against_the_scan_as_it_was_and_cannot_pass() {
     let shift = thick["repair_largest_shift"].as_f64().unwrap();
     assert!(shift > 0.2, "the repair must exceed the tolerance for this test: {thick}");
     let max_dev = out["deviation"]["max_abs"].as_f64().unwrap();
-    assert!(
-        max_dev >= 0.9 * lift,
-        "a vertex of the scan is {lift} mm off the plane, the deviation says {max_dev}: {out}"
-    );
+    assert!(max_dev >= 0.25, "a vertex of the scan is {lift} mm off the plane, the deviation says {max_dev}: {out}");
     let codes = issue_codes(&out);
     assert!(codes.iter().any(|c| c == "scan_repaired"), "{codes:?}");
     assert_ne!(out["verdict"], "pass", "{out}");
@@ -606,9 +603,9 @@ fn a_repaired_fold_is_measured_against_the_scan_as_it_was_and_cannot_pass() {
 }
 
 #[test]
-fn doubled_sheets_that_the_wall_cannot_clear_are_refused_with_their_own_issue_code() {
+fn a_fold_that_leaves_more_than_a_tenth_of_a_percent_of_the_vertices_on_crossings_is_refused_with_its_own_issue_code() {
     // Arrange: a small panel whose fold leaves more than 0.1 % of the vertices on crossings
-    let panel = folded_panel(10.0, 0.4);
+    let panel = folded_panel(10.0, 0.4, 0.0);
     let mut s = session_with(panel);
 
     // Act

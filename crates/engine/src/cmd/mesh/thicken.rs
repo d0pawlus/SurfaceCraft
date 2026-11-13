@@ -66,6 +66,8 @@ pub struct ThickenMeshOut {
     pub self_intersections_local: usize,
     /// Of them, triangles that cross a triangle far from them along the scan: the offset sheet meets another part of the shell, e.g. in a channel narrower than the wall (real geometry, not relaxed).
     pub self_intersections: usize,
+    /// Of those, the triangles an exhaustive test of the whole shell found (`self_intersections` is the larger of this and the sampled count).
+    pub self_intersections_exhaustive: usize,
     /// Vertices of the scan moved by the repair (`repaired_vertices`): the largest shift (mm).
     pub repair_largest_shift: f64,
     /// What a caller must not overlook, the same issues `scan.to_solid` raises for the shell: `self_intersection` (any known crossing: `self_intersections`, `self_intersections_local` or `unresolved_vertices` above 0) and `scan_repaired` (the scan was changed by more than the default tolerance of 0.2 mm, or at more than 0.5 % of its vertices).
@@ -97,8 +99,10 @@ pub(crate) const REPAIRED_ISSUE_SHARE: f64 = 0.005;
 pub(crate) struct ShellCounts {
     /// Sampled triangles that cross a neighbouring one.
     pub local: usize,
-    /// Sampled triangles that cross a part far away along the surface.
+    /// Triangles that cross a part far away along the surface (the larger of the sampled and the exhaustive count).
     pub far: usize,
+    /// Of those, found by the exhaustive test.
+    pub far_exhaustive: usize,
     /// Vertices that stay on a crossing.
     pub unresolved: usize,
     /// Triangles sampled.
@@ -116,6 +120,7 @@ fn counts_of(shell: &Thickened) -> ShellCounts {
     ShellCounts {
         local: shell.report.crossing_local,
         far: shell.report.crossing_triangles,
+        far_exhaustive: shell.report.crossing_far_exhaustive,
         unresolved: shell.report.unresolved_vertices,
         samples: shell.report.crossing_samples,
         triangles: shell.mesh.triangle_count(),
@@ -148,7 +153,12 @@ pub(crate) fn crossing_issues(c: &ShellCounts, tolerance: f64) -> Vec<Issue> {
 fn crossing_message(c: &ShellCounts) -> String {
     let whole = |n: usize| n as f64 * c.triangles as f64 / c.samples.max(1) as f64;
     let mut parts = Vec::new();
-    if c.far > 0 {
+    if c.far > 0 && c.far_exhaustive >= c.far {
+        parts.push(format!(
+            "{} of {} triangles cut a part of the scan that is far from them along the surface (exhaustive test): the wall is thicker than a channel or gap of the part",
+            c.far, c.triangles
+        ));
+    } else if c.far > 0 {
         parts.push(format!(
             "{} of {} sampled triangles cut a part of the scan that is far from them along the surface (about {:.0} of {} in all): the wall is thicker than a channel or gap of the part",
             c.far, c.samples, whole(c.far), c.triangles
@@ -201,6 +211,7 @@ pub(super) fn thicken_cmd(s: &mut Session, i: ThickenMeshIn) -> CmdResult<Thicke
         self_intersection_samples: shell.report.crossing_samples,
         self_intersections_local: shell.report.crossing_local,
         self_intersections: shell.report.crossing_triangles,
+        self_intersections_exhaustive: shell.report.crossing_far_exhaustive,
         repair_largest_shift: shell.report.repair_largest_shift,
         issues,
         closed: census.boundary == 0 && census.non_manifold == 0,

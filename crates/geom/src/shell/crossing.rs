@@ -4,8 +4,9 @@
 //! sheets next to it) are a fault of the offset and are relaxed away; NON-LOCAL ones (two different
 //! areas of the part closer than the wall: a channel narrower than the wall) are real geometry and
 //! stay reported. The predicate is that of `nesting::sampled_self_intersections` (two triangles
-//! that share no vertex, an edge of one passes through the other), applied to the shell mesh as it is
-//! returned, so a sheet triangle and the offset copy of its neighbour are tested against each other.
+//! that share no vertex, an edge of one passes through the other) but a touch is no crossing, and
+//! coplanar overlaps and pairs that share a vertex or an edge count too; it is applied to the shell mesh
+//! as it is returned, so a sheet triangle and the offset copy of its neighbour are tested against each other.
 use super::strip::Rim;
 use super::topology::Csr;
 use crate::{Aabb, Bvh, Mesh, Point3, Vec3, par, tri};
@@ -190,8 +191,14 @@ fn coplanar_overlap(x: &[Point3; 3], y: &[Point3; 3]) -> bool {
     if y.iter().any(|p| (p - x[0]).dot(&nx).abs() > eps) || x.iter().any(|p| (p - y[0]).dot(&ny).abs() > eps) {
         return false;
     }
+    footprints_overlap(x, y, &nx, -1e-9 * longest)
+}
+
+/// Do the shadows of `x` and `y` along the unit normal `nx` of `x` overlap? `slack` is added to the
+/// separation test: negative (strict) lets a shared edge or corner count as apart, positive counts touching.
+fn footprints_overlap(x: &[Point3; 3], y: &[Point3; 3], nx: &Vec3, slack: f64) -> bool {
     let u = x[1] - x[0];
-    let Some(u) = (u.norm() > 0.0).then(|| u.normalize()) else { return false };
+    let Some(u) = (u.norm() > 0.0).then(|| u.normalize()) else { return true };
     let v = nx.cross(&u);
     let flat = |t: &[Point3; 3]| t.map(|p| ((p - x[0]).dot(&u), (p - x[0]).dot(&v)));
     let (fx, fy) = (flat(x), flat(y));
@@ -205,11 +212,24 @@ fn coplanar_overlap(x: &[Point3; 3], y: &[Point3; 3]) -> bool {
                 (sa.iter().copied().fold(f64::MAX, f64::min), sa.iter().copied().fold(f64::MIN, f64::max));
             let (bmin, bmax) =
                 (sb.iter().copied().fold(f64::MAX, f64::min), sb.iter().copied().fold(f64::MIN, f64::max));
-            let slack = 1e-9 * longest * (axis.0.hypot(axis.1));
-            bmax <= amin + slack || bmin >= amax - slack
+            let scale = axis.0.hypot(axis.1);
+            bmax <= amin - slack * scale || bmin >= amax + slack * scale
         })
     };
     !(separated(&fx, &fy) || separated(&fy, &fx))
+}
+
+/// Can `y` cross `x` at all? Its box overlaps (checked by the caller), it is not wholly on one side of the
+/// plane of `x`, and the shadows of the two along the normal of `x` overlap. A long thin triangle (a hole
+/// fill) passes this for the few triangles under it, not for every triangle inside its box.
+fn may_cross(x: &[Point3; 3], y: &[Point3; 3]) -> bool {
+    let Some(nx) = tri::normal(&x[0], &x[1], &x[2]) else { return true };
+    let longest = (0..3).map(|k| (x[(k + 1) % 3] - x[k]).norm()).fold(0.0, f64::max);
+    let eps = 1e-9 * longest;
+    let side = y.map(|p| (p - x[0]).dot(&nx));
+    let below = side.iter().all(|&d| d < -eps);
+    let above = side.iter().all(|&d| d > eps);
+    !(below || above) && footprints_overlap(x, y, &nx, eps)
 }
 
 /// Does an edge of `x` other than those that end in `skip` pass through `y`?
@@ -301,7 +321,8 @@ pub(super) fn partners(mesh: &Mesh, bvh: &Bvh, id: usize, pairs: Pairs) -> Partn
     let (Some(x), Some(xi)) = (mesh.triangle(id), mesh.triangles.get(id)) else {
         return Partners { crossing: Vec::new(), truncated: false };
     };
-    let (candidates, truncated) = bvh.overlapping_up_to(&Aabb::from_points(x.iter()), MAX_CANDIDATES);
+    let (candidates, truncated) =
+        bvh.overlapping_up_to(&Aabb::from_points(x.iter()), MAX_CANDIDATES, &|y: &[Point3; 3]| may_cross(&x, y));
     let crossing = candidates
         .into_iter()
         .filter(|&o| {
@@ -319,34 +340,40 @@ pub(super) struct Found {
     pub crossing: Vec<u32>,
     /// On a triangle that overlapped too many others to be tested against all (ascending).
     pub uncertain: Vec<u32>,
+    /// Triangles among the tested ones that cross a part of the scan far from them along the surface.
+    pub far: usize,
 }
 
 /// The vertices of the scan of the local crossings of the triangles `ids` of the shell mesh.
 pub(super) fn local_vertices(mesh: &Mesh, bvh: &Bvh, surface: &Surface, ids: &[u32]) -> Found {
-    let hits: Vec<(Vec<u32>, Vec<u32>)> = par::map(ids.len(), |k| {
+    let hits: Vec<(Vec<u32>, Vec<u32>, bool)> = par::map(ids.len(), |k| {
         let id = ids.get(k).copied().unwrap_or(0) as usize;
-        let Some(xi) = mesh.triangles.get(id) else { return (Vec::new(), Vec::new()) };
+        let Some(xi) = mesh.triangles.get(id) else { return (Vec::new(), Vec::new(), false) };
         let found = partners(mesh, bvh, id, Pairs::Exact);
         let uncertain: Vec<u32> =
             if found.truncated { xi.iter().filter_map(|&v| surface.origin(v)).collect() } else { Vec::new() };
-        let mut out = Vec::new();
+        let (mut out, mut far) = (Vec::new(), false);
         for o in found.crossing {
             let Some(yi) = mesh.triangles.get(o as usize) else { continue };
             if surface.near(xi, yi) {
                 out.extend(xi.iter().chain(yi.iter()).filter_map(|&v| surface.origin(v)));
+            } else {
+                far = true;
             }
         }
-        (out, uncertain)
+        (out, uncertain, far)
     });
     let sorted = |mut v: Vec<u32>| {
         v.sort_unstable();
         v.dedup();
         v
     };
-    let (crossing, uncertain): (Vec<_>, Vec<_>) = hits.into_iter().unzip();
+    let far = hits.iter().filter(|h| h.2).count();
+    let (crossing, uncertain): (Vec<_>, Vec<_>) = hits.into_iter().map(|h| (h.0, h.1)).unzip();
     Found {
         crossing: sorted(crossing.into_iter().flatten().collect()),
         uncertain: sorted(uncertain.into_iter().flatten().collect()),
+        far,
     }
 }
 

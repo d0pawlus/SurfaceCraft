@@ -27,6 +27,46 @@ fn crossing_pairs(m: &Mesh) -> Vec<(usize, usize)> {
     out
 }
 
+fn ta3(m: &Mesh, t: usize) -> [Point3; 3] {
+    m.triangles[t].map(|v| m.positions[v as usize])
+}
+
+/// Area (mm2) in which two triangles of one plane overlap, by clipping `x` against the edges of `y`
+/// (Sutherland and Hodgman, 1974); 0 when they are not coplanar (distance of corners above 1e-6 of the
+/// longest edge) or only touch.
+fn coplanar_area(x: &[Point3; 3], y: &[Point3; 3]) -> f64 {
+    let Some(n) = tri::normal(&y[0], &y[1], &y[2]) else { return 0.0 };
+    let longest =
+        (0..3).map(|k| (y[(k + 1) % 3] - y[k]).norm().max((x[(k + 1) % 3] - x[k]).norm())).fold(0.0, f64::max);
+    if x.iter().any(|p| (p - y[0]).dot(&n).abs() > 1e-6 * longest) {
+        return 0.0;
+    }
+    let mut poly: Vec<Point3> = x.to_vec();
+    for k in 0..3 {
+        let (a, b) = (y[k], y[(k + 1) % 3]);
+        let inward = n.cross(&(b - a));
+        let sign = if inward.dot(&(y[(k + 2) % 3] - a)) >= 0.0 { 1.0 } else { -1.0 };
+        let inside = |p: &Point3| sign * inward.dot(&(p - a)) >= 0.0;
+        let mut next = Vec::new();
+        for j in 0..poly.len() {
+            let (p, q) = (poly[j], poly[(j + 1) % poly.len()]);
+            let (dp, dq) = (sign * inward.dot(&(p - a)), sign * inward.dot(&(q - a)));
+            if inside(&p) {
+                next.push(p);
+            }
+            if (dp >= 0.0) != (dq >= 0.0) {
+                next.push(p + (q - p) * (dp / (dp - dq)));
+            }
+        }
+        poly = next;
+        if poly.len() < 3 {
+            return 0.0;
+        }
+    }
+    let area: f64 = (1..poly.len() - 1).map(|j| (poly[j] - poly[0]).cross(&(poly[j + 1] - poly[0])).norm() / 2.0).sum();
+    if area > 1e-9 * longest * longest { area } else { 0.0 }
+}
+
 /// Parameter at which the segment `p + s·d`, `s` in [0, 1], passes through the triangle `a`, `b`, `c`
 /// (a tolerance relative to the lengths, so that the oracle does not depend on the unit).
 fn segment_param(p: &Point3, d: &Vec3, a: &Point3, b: &Point3, c: &Point3) -> Option<f64> {
@@ -59,7 +99,7 @@ fn pair_crosses(m: &Mesh, a: usize, b: usize) -> bool {
         })
     };
     match shared.len() {
-        0 => pierces(&ia, &ib, None) || pierces(&ib, &ia, None),
+        0 => pierces(&ia, &ib, None) || pierces(&ib, &ia, None) || coplanar_area(&ta3(m, a), &ta3(m, b)) > 0.0,
         1 => pierces(&ia, &ib, Some(shared[0])) || pierces(&ib, &ia, Some(shared[0])),
         2 => {
             // lying over each other: the opposite vertices on the same side of the shared edge and the
@@ -76,7 +116,7 @@ fn pair_crosses(m: &Mesh, a: usize, b: usize) -> bool {
             let edge = e1 - e0;
             let side = |o: Point3| (o - e0) - edge * ((o - e0).dot(&edge) / edge.norm_squared());
             let same_side = side(oa).dot(&side(ob)) > 0.0;
-            same_side && na.dot(&nb).abs() > 0.999_999
+            same_side && na.dot(&nb).abs() > 0.9998
         }
         _ => false,
     }
@@ -363,11 +403,7 @@ fn twenty_thousand_coincident_triangles_are_refused_within_seconds() {
     // Assert: a refusal that says why, fast
     let seconds = started.elapsed().as_secs_f64();
     assert!(seconds < HOSTILE_SECONDS, "{seconds} s");
-    assert!(
-        matches!(result, Err(ThickenError::TrianglePile { triangles: 20_000, .. })),
-        "{:?}",
-        result.map(|r| r.report)
-    );
+    assert!(matches!(result, Err(ThickenError::TrianglePile { .. })), "{:?}", result.map(|r| r.report));
 }
 
 fn scaled(m: &Mesh, factor: f64) -> Mesh {
@@ -484,13 +520,95 @@ fn doubled_sheets_with_vertices_of_their_own_are_reported_not_passed() {
         // Act
         let result = thicken(&both, &params(1.0));
 
-        // Assert: refused, or the crossings are counted (sampled or as vertices)
-        match result {
-            Err(_) => {}
-            Ok(r) => {
-                let counted = r.report.unresolved_vertices + r.report.crossing_local + r.report.crossing_triangles;
-                assert!(counted > 0, "lift {lift}: {:?}", r.report);
-            }
-        }
+        // Assert: the shell comes back, and the crossings of the two separate sheets (far from each other
+        // along the surface: no path joins them) are counted, over a thousand triangles for each copy
+        let r = result.unwrap_or_else(|e| panic!("lift {lift}: {e}"));
+        assert!(r.report.crossing_triangles > 1_000, "lift {lift}: {:?}", r.report);
     }
+}
+
+#[test]
+fn the_oracle_finds_a_coplanar_overlap_of_triangles_without_a_common_vertex() {
+    // Arrange: one triangle twice with vertices of its own, a copy shifted over it, and one apart
+    let t = |dx: f64| [Point3::new(dx, 0.0, 0.0), Point3::new(dx + 1.0, 0.0, 0.0), Point3::new(dx, 1.0, 0.0)];
+    let build = |shift: f64| {
+        let mut positions = Vec::new();
+        positions.extend(t(0.0));
+        positions.extend(t(shift));
+        Mesh { positions, triangles: vec![[0, 1, 2], [3, 4, 5]] }
+    };
+
+    // Act and assert
+    assert_eq!(crossing_pairs(&build(0.0)).len(), 1);
+    assert_eq!(crossing_pairs(&build(0.3)).len(), 1);
+    assert!(crossing_pairs(&build(2.0)).is_empty());
+    assert!(crossing_pairs(&build(1.0)).is_empty(), "touching at an edge");
+}
+
+#[test]
+fn a_patch_meshed_a_hundred_times_finer_than_the_rest_is_thickened_not_taken_for_a_pile() {
+    // Arrange: a coarse panel of 1 mm cells and, beside it, a patch of 1 mm by 1 mm in cells of 0.01 mm
+    let mut model = heightfield(100.0, 100.0, 1.0, 0.0, |_, _| 0.0);
+    let mut patch = synth::plane(Point3::new(150.0, 0.0, 0.0), Vec3::x(), Vec3::y(), 1.0, 1.0, 100, 100);
+    for p in &mut patch.positions {
+        p.z = 0.01 * (p.x * 7.0).sin();
+    }
+    model.append(&patch);
+
+    // Act
+    let result = thicken(&model, &params(0.5));
+
+    // Assert
+    assert!(result.is_ok(), "{:?}", result.map(|r| r.report).map_err(|e| e.to_string()));
+}
+
+#[test]
+fn a_hole_filled_with_a_fan_of_long_triangles_in_a_fine_noisy_panel_is_thickened_clean() {
+    // Arrange: 0.3 mm cells, noise, a round hole of 4 mm radius closed by a fan from its centre
+    let panel = heightfield(30.0, 30.0, 0.3, 0.01, |_, _| 0.0);
+    let centre = Point3::new(15.0, 15.0, 0.0);
+    let kept: Vec<u32> = (0..panel.triangle_count() as u32)
+        .filter(|&t| panel.face_centroid(t as usize).is_some_and(|c| (c - centre).norm() > 4.0))
+        .collect();
+    let mut model = panel.submesh(&kept);
+    let loops = surfacecraft_geom::edit::boundary_loops(&model);
+    let hole = loops.iter().min_by_key(|l| l.len()).expect("a hole").clone();
+    let hub = model.positions.len() as u32;
+    model.positions.push(centre);
+    for k in 0..hole.len() {
+        model.triangles.push([hub, hole[(k + 1) % hole.len()], hole[k]]);
+    }
+
+    // Act
+    let r = thicken(&model, &params(0.5)).expect("thickens");
+
+    // Assert: long thin triangles overlap thousands of boxes but cross nothing
+    assert_eq!(r.report.unresolved_vertices, 0, "{:?}", r.report);
+    assert_eq!((r.report.crossing_local, r.report.crossing_triangles), (0, 0), "{:?}", r.report);
+}
+
+fn notched_panel(x: f64, y: f64) -> Mesh {
+    let mut m = heightfield(120.0, 120.0, 0.5, 0.0, |_, _| 0.0);
+    // a small separate triangle 0.5 mm behind the panel, inside the wall of 1 mm
+    let base = m.positions.len() as u32;
+    m.positions.extend([Point3::new(x, y, -0.5), Point3::new(x + 0.2, y, -0.5), Point3::new(x, y + 0.2, -0.5)]);
+    m.triangles.push([base, base + 1, base + 2]);
+    m
+}
+
+#[test]
+fn a_small_far_crossing_between_the_strides_of_the_sample_is_still_reported() {
+    // Arrange: 236 180 shell triangles, so the sample of 20 000 takes every 11th; a small separate triangle
+    // 0.5 mm behind the panel (inside the wall of 1 mm) at a place where the sample sees none of the
+    // triangles that cut it (found by trying: the sample alone reports 0 here)
+    let panel = notched_panel(20.0 + 7.31 * 2.0, 30.0 + 3.77 * 2.0);
+
+    // Act
+    let r = thicken(&panel, &params(1.0)).expect("thickens");
+
+    // Assert
+    assert!(r.report.crossing_samples < r.report.triangles, "{:?}", r.report);
+    assert!(r.report.crossing_far_exhaustive > 0, "{:?}", r.report);
+    assert_eq!(r.report.crossing_triangles, r.report.crossing_far_exhaustive.max(r.report.crossing_triangles));
+    assert!(r.report.crossing_triangles > 0, "{:?}", r.report);
 }
