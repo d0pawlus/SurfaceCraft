@@ -82,7 +82,10 @@ pub struct ThickenReport {
     /// Vertices whose offset was reduced to avoid a fold.
     pub clamped_vertices: usize,
     /// Vertices of the scan moved (by at most one median edge) to remove crossings of the scan with itself.
+    /// The rim never moves; [`Thickened::scan_face`] gives the scan as it was.
     pub repaired_vertices: usize,
+    /// The largest distance a vertex of the scan was moved by that repair (mm).
+    pub repair_largest_shift: f64,
     /// Vertices whose offset was bounded before any fold was looked for, by the distance along the
     /// offset direction to another part of the scan (the local feature size).
     pub limited_vertices: usize,
@@ -124,10 +127,13 @@ pub struct Thickened {
     pub scale: Vec<f64>,
     layer_vertices: usize,
     layer_triangles: usize,
+    /// For every vertex of the scan, where it was minus where the repair put it (empty: nothing moved).
+    scan_shift: Vec<Vec3>,
 }
 
 impl Thickened {
-    /// The layer the scan lies on as a mesh of its own: the scan's triangles over the vertices of
+    /// The layer the scan lies on as a mesh of its own (with the vertices where the scan had them, also
+    /// where the repair of folds moved them): the scan's triangles over the vertices of
     /// that layer, wound like the shell's outside there (so its normals face the way the shell's do,
     /// which is against the scan's normals for `thickness < 0`).
     #[must_use]
@@ -137,7 +143,11 @@ impl Thickened {
             ScanLayer::Outer => (0, 0),
             ScanLayer::Inner => (n, t),
         };
-        let positions = self.mesh.positions.get(v0..v0 + n).unwrap_or(&[]).to_vec();
+        let mut positions = self.mesh.positions.get(v0..v0 + n).unwrap_or(&[]).to_vec();
+        // the repair of folds of the scan moved vertices: the face is the scan as it was
+        for (p, d) in positions.iter_mut().zip(&self.scan_shift) {
+            *p += d;
+        }
         let triangles =
             self.mesh.triangles.get(t0..t0 + t).unwrap_or(&[]).iter().map(|tri| tri.map(|v| v - v0 as u32)).collect();
         Mesh { positions, triangles }
@@ -229,6 +239,16 @@ pub enum ThickenError {
         /// The share above which the call is refused (percent).
         limit_percent: f64,
     },
+    /// Hundreds of triangles lie on top of each other: doubled or coincident sheets, not a scan.
+    #[error(
+        "{triangles} triangles lie within a quarter of an edge of each other (more than {limit}): coincident or doubled sheets, not a scan surface; remove the duplicates (mesh.clean) before thickening"
+    )]
+    TrianglePile {
+        /// Triangles in the densest spot.
+        triangles: usize,
+        /// The most accepted.
+        limit: usize,
+    },
     /// One vertex belongs to an absurd number of triangles (a fan around a hub): not a scan.
     #[error(
         "a vertex belongs to {triangles} triangles (more than {limit}): this is not a scan surface; clean the mesh (mesh.clean, mesh.remesh) before thickening"
@@ -298,6 +318,9 @@ pub fn thicken(mesh: &Mesh, params: &ThickenParams) -> Result<Thickened, Thicken
     if work.triangles.is_empty() {
         return Err(ThickenError::Empty);
     }
+    // after the repair (fins on one edge are removed there), before anything that looks at the fans
+    check_hubs(&work)?;
+    check_piles(&work)?;
     topology::split_pinches(&mut work);
     let sorted = topology::directed_edges(&work.triangles);
     topology::require_oriented(&sorted)?;
@@ -305,10 +328,22 @@ pub fn thicken(mesh: &Mesh, params: &ThickenParams) -> Result<Thickened, Thicken
     if boundary.is_empty() {
         return Err(ThickenError::Closed);
     }
-    check_hubs(&work)?;
     let adjacent = topology::adjacency(work.positions.len(), &sorted);
     let scan_edge = median_edge(&work);
-    work.repaired = selfx::smooth_scan_crossings(&mut work, &adjacent, scan_edge);
+    let mut rim = vec![false; work.positions.len()];
+    for &(a, b) in &boundary {
+        for v in [a, b] {
+            if let Some(slot) = rim.get_mut(v as usize) {
+                *slot = true;
+            }
+        }
+    }
+    let original = work.positions.clone();
+    let repair = selfx::smooth_scan_crossings(&mut work, &adjacent, scan_edge, &rim);
+    (work.repaired, work.repair_shift) = (repair.vertices, repair.largest_shift);
+    if repair.vertices > 0 {
+        work.shift = original.iter().zip(&work.positions).map(|(o, p)| o - p).collect();
+    }
     let radius = (SMOOTHING_SHARE * params.thickness.abs()).max(mean_edge(&work));
     let normals =
         normals::smoothed(&work.positions, &work.triangles, &boundary, radius).ok_or(ThickenError::NoNormals)?;
@@ -348,6 +383,36 @@ fn check_hubs(work: &Work) -> Result<(), ThickenError> {
     match count.into_iter().max() {
         Some(triangles) if triangles > MAX_VERTEX_TRIANGLES => {
             Err(ThickenError::HubVertex { triangles, limit: MAX_VERTEX_TRIANGLES })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Triangles whose centres fall in one cell of a quarter of the median edge at most.
+pub const MAX_TRIANGLES_PER_SPOT: usize = 256;
+
+/// Refuses a mesh with more than [`MAX_TRIANGLES_PER_SPOT`] triangle centres in one cell: coincident or
+/// doubled sheets, which no test could sort out (a triangle would overlap thousands of others).
+fn check_piles(work: &Work) -> Result<(), ThickenError> {
+    let cell = 0.25 * median_edge(work);
+    if !(cell > 0.0) {
+        return Ok(());
+    }
+    let mut count: std::collections::HashMap<(i64, i64, i64), usize> = std::collections::HashMap::new();
+    for t in &work.triangles {
+        let (Some(a), Some(b), Some(c)) =
+            (work.positions.get(t[0] as usize), work.positions.get(t[1] as usize), work.positions.get(t[2] as usize))
+        else {
+            continue;
+        };
+        let g = (a.coords + b.coords + c.coords) / 3.0;
+        *count
+            .entry(((g.x / cell).floor() as i64, (g.y / cell).floor() as i64, (g.z / cell).floor() as i64))
+            .or_default() += 1;
+    }
+    match count.into_values().max() {
+        Some(triangles) if triangles > MAX_TRIANGLES_PER_SPOT => {
+            Err(ThickenError::TrianglePile { triangles, limit: MAX_TRIANGLES_PER_SPOT })
         }
         _ => Ok(()),
     }

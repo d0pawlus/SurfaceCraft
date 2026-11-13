@@ -79,6 +79,7 @@ pub(super) fn assemble(work: &Work, inp: &Inputs, params: &ThickenParams) -> Res
         clamped_vertices: scale.iter().filter(|&&s| s < 1.0).count(),
         limited_vertices: inp.limited,
         repaired_vertices: work.repaired,
+        repair_largest_shift: work.repair_shift,
         largest_reduction: thickness * (1.0 - scale.iter().copied().fold(1.0, f64::min)),
         median_reduction: median_reduction(scale, thickness),
         folded_vertices: work.folded,
@@ -97,6 +98,7 @@ pub(super) fn assemble(work: &Work, inp: &Inputs, params: &ThickenParams) -> Res
         scale: scale.to_vec(),
         layer_vertices: n,
         layer_triangles: work.triangles.len(),
+        scan_shift: work.shift.clone(),
     })
 }
 

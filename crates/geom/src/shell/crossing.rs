@@ -124,10 +124,6 @@ impl<'a> Surface<'a> {
     }
 }
 
-fn boxes_overlap(a: &Aabb, b: &Aabb) -> bool {
-    (0..3).all(|k| a.min[k] <= b.max[k] && b.min[k] <= a.max[k])
-}
-
 /// Which pairs of triangles count as crossing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Pairs {
@@ -172,16 +168,48 @@ fn segment_hit(p: &Point3, q: &Point3, a: &Point3, b: &Point3, c: &Point3) -> Op
     (0.0..=1.0).contains(&s).then_some(s)
 }
 
-/// Does an edge of one triangle pass through the other (touching counts)? The predicate of
-/// [`nesting::crosses`], with the relative tolerance of [`segment_hit`].
-fn crosses_scaled(x: &[Point3; 3], y: &[Point3; 3]) -> bool {
-    let hit = |s: &[Point3; 3], t: &[Point3; 3]| {
+/// Do two triangles that share no vertex cut each other: an edge of one passes through the other (not
+/// merely touching it at an end), or they are coplanar and overlap?
+fn disjoint_crosses(x: &[Point3; 3], xi: &[u32; 3], y: &[Point3; 3], yi: &[u32; 3]) -> bool {
+    edges_pierce(x, xi, y, None) || edges_pierce(y, yi, x, None) || coplanar_overlap(x, y)
+}
+
+/// Distance from a plane (share of the longest edge) within which a point counts as in it.
+const PLANE_TOLERANCE: f64 = 1e-6;
+
+/// Are `x` and `y` in one plane and do they overlap there (a shared edge or corner only does not count)?
+fn coplanar_overlap(x: &[Point3; 3], y: &[Point3; 3]) -> bool {
+    let (Some(nx), Some(ny)) = (tri::normal(&x[0], &x[1], &x[2]), tri::normal(&y[0], &y[1], &y[2])) else {
+        return false;
+    };
+    if nx.dot(&ny).abs() <= COPLANAR_COS {
+        return false;
+    }
+    let longest = [x, y].iter().flat_map(|t| (0..3).map(move |k| (t[(k + 1) % 3] - t[k]).norm())).fold(0.0, f64::max);
+    let eps = PLANE_TOLERANCE * longest;
+    if y.iter().any(|p| (p - x[0]).dot(&nx).abs() > eps) || x.iter().any(|p| (p - y[0]).dot(&ny).abs() > eps) {
+        return false;
+    }
+    let u = x[1] - x[0];
+    let Some(u) = (u.norm() > 0.0).then(|| u.normalize()) else { return false };
+    let v = nx.cross(&u);
+    let flat = |t: &[Point3; 3]| t.map(|p| ((p - x[0]).dot(&u), (p - x[0]).dot(&v)));
+    let (fx, fy) = (flat(x), flat(y));
+    let separated = |a: &[(f64, f64); 3], b: &[(f64, f64); 3]| {
         (0..3).any(|k| {
-            let (Some(p), Some(q)) = (s.get(k), s.get((k + 1) % 3)) else { return false };
-            segment_hit(p, q, &t[0], &t[1], &t[2]).is_some()
+            let (p, q) = (a[k], a[(k + 1) % 3]);
+            let axis = (q.1 - p.1, p.0 - q.0);
+            let side = |t: &[(f64, f64); 3]| t.map(|r| axis.0 * (r.0 - p.0) + axis.1 * (r.1 - p.1));
+            let (sa, sb) = (side(a), side(b));
+            let (amin, amax) =
+                (sa.iter().copied().fold(f64::MAX, f64::min), sa.iter().copied().fold(f64::MIN, f64::max));
+            let (bmin, bmax) =
+                (sb.iter().copied().fold(f64::MAX, f64::min), sb.iter().copied().fold(f64::MIN, f64::max));
+            let slack = 1e-9 * longest * (axis.0.hypot(axis.1));
+            bmax <= amin + slack || bmin >= amax - slack
         })
     };
-    hit(x, y) || hit(y, x)
+    !(separated(&fx, &fy) || separated(&fy, &fx))
 }
 
 /// Does an edge of `x` other than those that end in `skip` pass through `y`?
@@ -246,8 +274,7 @@ fn wedges_overlap(x: &[Point3; 3], xi: &[u32; 3], y: &[Point3; 3], yi: &[u32; 3]
 fn pair_crosses(x: &[Point3; 3], xi: &[u32; 3], y: &[Point3; 3], yi: &[u32; 3], pairs: Pairs) -> bool {
     let shared: Vec<u32> = xi.iter().copied().filter(|v| yi.contains(v)).collect();
     match (shared.as_slice(), pairs) {
-        ([], Pairs::Disjoint) => crosses_scaled(x, y),
-        ([], Pairs::Exact) => edges_pierce(x, xi, y, None) || edges_pierce(y, yi, x, None),
+        ([], _) => disjoint_crosses(x, xi, y, yi),
         ([s], Pairs::Exact) => {
             edges_pierce(x, xi, y, Some(*s)) || edges_pierce(y, yi, x, Some(*s)) || wedges_overlap(x, xi, y, yi, *s)
         }
@@ -257,41 +284,70 @@ fn pair_crosses(x: &[Point3; 3], xi: &[u32; 3], y: &[Point3; 3], yi: &[u32; 3], 
 }
 
 /// Candidates tested per triangle at most: a pile of coincident triangles would cost the square of its
-/// size. (Such a pile crosses itself everywhere; the first candidates show it.)
-const MAX_CANDIDATES: usize = 1_024;
+/// size. A triangle with more is reported as truncated (see [`Partners`]).
+const MAX_CANDIDATES: usize = 4_096;
 
-/// The triangles of `mesh` that triangle `id` crosses (ascending); `bvh` is built over `mesh`.
-pub(super) fn partners(mesh: &Mesh, bvh: &Bvh, id: usize, pairs: Pairs) -> Vec<u32> {
-    let (Some(x), Some(xi)) = (mesh.triangle(id), mesh.triangles.get(id)) else { return Vec::new() };
-    let bx = Aabb::from_points(x.iter());
-    bvh.candidates_up_to(&|b: &Aabb| boxes_overlap(b, &bx), MAX_CANDIDATES)
+/// The triangles a triangle crosses.
+pub(super) struct Partners {
+    /// Ascending ids.
+    pub crossing: Vec<u32>,
+    /// More than [`MAX_CANDIDATES`] triangles overlapped it: only some were tested, so a crossing may be
+    /// missing. Callers count such a triangle as crossing (unknown is the safe side).
+    pub truncated: bool,
+}
+
+/// The triangles of `mesh` that triangle `id` crosses; `bvh` is built over `mesh`.
+pub(super) fn partners(mesh: &Mesh, bvh: &Bvh, id: usize, pairs: Pairs) -> Partners {
+    let (Some(x), Some(xi)) = (mesh.triangle(id), mesh.triangles.get(id)) else {
+        return Partners { crossing: Vec::new(), truncated: false };
+    };
+    let (candidates, truncated) = bvh.overlapping_up_to(&Aabb::from_points(x.iter()), MAX_CANDIDATES);
+    let crossing = candidates
         .into_iter()
         .filter(|&o| {
             let (Some(y), Some(yi)) = (mesh.triangle(o as usize), mesh.triangles.get(o as usize)) else { return false };
             o as usize != id && pair_crosses(&x, xi, &y, yi, pairs)
         })
-        .collect()
+        .collect();
+    Partners { crossing, truncated }
 }
 
-/// The vertices of the scan (as ids of the scan, ascending) of the local crossings of the triangles
-/// `ids` of the shell mesh: both triangles of every pair.
-pub(super) fn local_vertices(mesh: &Mesh, bvh: &Bvh, surface: &Surface, ids: &[u32]) -> Vec<u32> {
-    let hits: Vec<Vec<u32>> = par::map(ids.len(), |k| {
+/// Vertices of the scan on crossings, and on triangles whose crossings could not all be tested.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct Found {
+    /// On a local crossing (ascending): both triangles of every pair.
+    pub crossing: Vec<u32>,
+    /// On a triangle that overlapped too many others to be tested against all (ascending).
+    pub uncertain: Vec<u32>,
+}
+
+/// The vertices of the scan of the local crossings of the triangles `ids` of the shell mesh.
+pub(super) fn local_vertices(mesh: &Mesh, bvh: &Bvh, surface: &Surface, ids: &[u32]) -> Found {
+    let hits: Vec<(Vec<u32>, Vec<u32>)> = par::map(ids.len(), |k| {
         let id = ids.get(k).copied().unwrap_or(0) as usize;
-        let Some(xi) = mesh.triangles.get(id) else { return Vec::new() };
+        let Some(xi) = mesh.triangles.get(id) else { return (Vec::new(), Vec::new()) };
+        let found = partners(mesh, bvh, id, Pairs::Exact);
+        let uncertain: Vec<u32> =
+            if found.truncated { xi.iter().filter_map(|&v| surface.origin(v)).collect() } else { Vec::new() };
         let mut out = Vec::new();
-        for o in partners(mesh, bvh, id, Pairs::Exact) {
+        for o in found.crossing {
             let Some(yi) = mesh.triangles.get(o as usize) else { continue };
             if surface.near(xi, yi) {
                 out.extend(xi.iter().chain(yi.iter()).filter_map(|&v| surface.origin(v)));
             }
         }
-        out
+        (out, uncertain)
     });
-    let mut out: Vec<u32> = hits.into_iter().flatten().collect();
-    out.sort_unstable();
-    out.dedup();
-    out
+    let sorted = |mut v: Vec<u32>| {
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    let (crossing, uncertain): (Vec<_>, Vec<_>) = hits.into_iter().unzip();
+    Found {
+        crossing: sorted(crossing.into_iter().flatten().collect()),
+        uncertain: sorted(uncertain.into_iter().flatten().collect()),
+    }
 }
 
 /// What an even sample of the shell's triangles found.
@@ -312,9 +368,10 @@ pub(super) fn sample(mesh: &Mesh, bvh: &Bvh, surface: &Surface, max_samples: usi
     let kinds: Vec<(bool, bool)> = par::map(count, |k| {
         let id = crate::even_index(k, n, count);
         let Some(xi) = mesh.triangles.get(id) else { return (false, false) };
-        let partners = partners(mesh, bvh, id, Pairs::Disjoint);
-        let far = partners.iter().any(|&o| mesh.triangles.get(o as usize).is_some_and(|yi| !surface.near(xi, yi)));
-        (!partners.is_empty() && !far, far)
+        let found = partners(mesh, bvh, id, Pairs::Disjoint);
+        let far =
+            found.crossing.iter().any(|&o| mesh.triangles.get(o as usize).is_some_and(|yi| !surface.near(xi, yi)));
+        (found.truncated || (!found.crossing.is_empty() && !far), far)
     });
     Sample {
         tested: count,
@@ -383,5 +440,53 @@ mod tests {
         assert_eq!(reach_for(2.0, 0.1, 1000.0), 4.0);
         assert_eq!(reach_for(0.1, 1.0, 1000.0), 3.0);
         assert_eq!(reach_for(300.0, 1.0, 100.0), REACH_SIZE_SHARE * 100.0, "a wall of 3 diagonals");
+    }
+
+    #[test]
+    fn two_coincident_triangles_without_a_common_vertex_overlap_and_neighbours_do_not() {
+        // Arrange
+        let t = |dx: f64| [p(dx, 0.0, 0.0), p(dx + 1.0, 0.0, 0.0), p(dx, 1.0, 0.0)];
+
+        // Act and assert
+        assert!(coplanar_overlap(&t(0.0), &t(0.0)), "the same place");
+        assert!(coplanar_overlap(&t(0.0), &t(0.3)), "shifted");
+        assert!(
+            !coplanar_overlap(&t(0.0), &[p(1.0, 0.0, 0.0), p(2.0, 0.0, 0.0), p(1.0, 1.0, 0.0)]),
+            "touching at a corner"
+        );
+        assert!(
+            !coplanar_overlap(&t(0.0), &[p(0.0, 0.0, 0.1), p(1.0, 0.0, 0.1), p(0.0, 1.0, 0.1)]),
+            "parallel but apart"
+        );
+        assert!(disjoint_crosses(&t(0.0), &[0, 1, 2], &t(0.0), &[3, 4, 5]));
+    }
+
+    #[test]
+    fn a_triangle_that_overlaps_more_than_the_candidate_limit_is_reported_as_truncated() {
+        // Arrange: one big triangle over 4200 tiny ones
+        let mut positions = vec![p(0.0, 0.0, 0.0), p(100.0, 0.0, 0.0), p(0.0, 100.0, 0.0)];
+        let mut triangles = vec![[0u32, 1, 2]];
+        for i in 0..4200u32 {
+            let (x, y) = (f64::from(i % 64) + 1.0, f64::from(i / 64) + 1.0);
+            let base = positions.len() as u32;
+            positions.extend([p(x, y, 0.0), p(x + 0.1, y, 0.0), p(x, y + 0.1, 0.0)]);
+            triangles.push([base, base + 1, base + 2]);
+        }
+        let mesh = Mesh { positions, triangles };
+        let bvh = Bvh::build(&mesh);
+
+        // Act
+        let found = partners(&mesh, &bvh, 0, Pairs::Exact);
+        let small = partners(&mesh, &bvh, 1, Pairs::Exact);
+
+        // Assert: the big one cannot be sure, the small one can
+        assert!(found.truncated);
+        assert!(!small.truncated);
+        let n = mesh.positions.len() as u32;
+        let adjacent = Csr::from_pairs(mesh.positions.len(), &[]);
+        let rim = Rim::new(n, 1, &[]);
+        let surface = Surface::new(&mesh.positions, &adjacent, &rim, 1.0, 1.0, 100.0);
+        let found = local_vertices(&mesh, &bvh, &surface, &[0]);
+        assert_eq!(found.uncertain, vec![0, 1, 2], "a truncated triangle is uncertain");
     }
 }

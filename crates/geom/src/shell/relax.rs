@@ -16,7 +16,7 @@
 //! offset sheet starts on its own side of the scanned one. After the rounds the exact crossing test
 //! of [`crossing`] runs on the shell mesh as it is returned (both layers and every row of the strip
 //! along the rim), around the reduced vertices and along the whole strip.
-use super::crossing::{self, Surface};
+use super::crossing::{self, Found, Surface};
 use super::feature;
 use super::strip::{self, Rim};
 use super::topology::Csr;
@@ -165,6 +165,7 @@ struct State {
     scale: Vec<f64>,
     ever: Vec<bool>,
     frozen: Vec<bool>,
+    uncertain: Vec<bool>,
 }
 
 impl State {
@@ -184,6 +185,26 @@ impl State {
             }
         }
         movable
+    }
+
+    /// Vertices on a triangle that overlapped too many others to be tested: they are stuck (shrinking
+    /// them cannot tell) and count as unresolved.
+    fn mark_uncertain(&mut self, vertices: &[u32]) {
+        for &v in vertices {
+            if let Some(u) = self.uncertain.get_mut(v as usize) {
+                *u = true;
+            }
+        }
+        self.freeze(vertices);
+    }
+
+    /// Marks `vertices` as stuck: they cannot be relaxed further.
+    fn freeze(&mut self, vertices: &[u32]) {
+        for &v in vertices {
+            if let Some(f) = self.frozen.get_mut(v as usize) {
+                *f = true;
+            }
+        }
     }
 
     /// Reduces `movable` and tapers the reduction; returns the vertices changed.
@@ -268,7 +289,7 @@ impl ShellTest {
 
     /// The vertices of the scan on a local crossing of the shell mesh among the triangles [`Self::ids`]
     /// picks (with `also` always included).
-    fn crossing_vertices(&mut self, field: &Field, scale: &[f64], surface: &Surface, also: &[u32]) -> Vec<u32> {
+    fn crossing_vertices(&mut self, field: &Field, scale: &[f64], surface: &Surface, also: &[u32]) -> Found {
         let (a, b) = (field.layers[0], field.layers[1]);
         let outer = strip::layer(field.positions, field.normals, scale, a);
         let inner = strip::layer(field.positions, field.normals, scale, b);
@@ -276,7 +297,7 @@ impl ShellTest {
         let ids = self.ids(field, scale, also);
         self.tested = Some((scale.to_vec(), field.normals.to_vec()));
         if ids.is_empty() {
-            return Vec::new();
+            return Found::default();
         }
         let bvh = Bvh::build(&self.mesh);
         crossing::local_vertices(&self.mesh, &bvh, surface, &ids)
@@ -295,16 +316,41 @@ fn limit_by_feature_size(field: &Field, surface: &Surface, st: &mut State) -> us
     limited.len()
 }
 
+/// Share of the vertices on triangles that overlap too many others to be tested, above which the
+/// relaxation stops and reports them (the call is refused above 0.1 % anyway).
+const UNCERTAIN_SHARE: f64 = 0.001;
 /// Rounds of normal smoothing around the vertices that stay on a crossing at the floor, at most.
 const MAX_SMOOTHING_PASSES: usize = 8;
+
+#[cfg(test)]
+thread_local! {
+    /// Lowers the number of crossing rounds in a test (the break after the last round is then reached).
+    pub(super) static ROUND_LIMIT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Crossing rounds at most.
+fn round_limit() -> usize {
+    #[cfg(test)]
+    if let Some(n) = ROUND_LIMIT.with(std::cell::Cell::get) {
+        return n;
+    }
+    MAX_CROSSING_ROUNDS
+}
 
 /// Crossing rounds: the vertices of local crossings above the floor are reduced (and the folds this
 /// causes relaxed) until none is left or [`MAX_CROSSING_ROUNDS`] rounds are done.
 fn crossing_rounds(field: &Field, st: &mut State, surface: &Surface, shell: &mut ShellTest) -> Result<(), usize> {
-    for round in 0..=MAX_CROSSING_ROUNDS {
-        let bad = shell.crossing_vertices(field, &st.scale, surface, &[]);
-        let movable = st.partition(bad, false);
-        if movable.is_empty() || round == MAX_CROSSING_ROUNDS {
+    let limit = round_limit();
+    for round in 0..=limit {
+        let found = shell.crossing_vertices(field, &st.scale, surface, &[]);
+        st.mark_uncertain(&found.uncertain);
+        let movable = st.partition(found.crossing, false);
+        if movable.is_empty() {
+            break;
+        }
+        if round == limit {
+            // out of rounds: these vertices still cross, and the final test must see them again
+            st.freeze(&movable);
             break;
         }
         let changed = st.shrink(field, &movable);
@@ -342,7 +388,7 @@ const MAX_SMOOTHING_ROW: usize = 64;
 /// `unresolved`.
 pub(super) fn relax(field: &Field) -> Result<Relaxed, usize> {
     let n = field.positions.len();
-    let mut st = State { scale: vec![1.0; n], ever: vec![false; n], frozen: vec![false; n] };
+    let mut st = State { scale: vec![1.0; n], ever: vec![false; n], frozen: vec![false; n], uncertain: vec![false; n] };
     let surface = Surface::new(field.positions, field.adjacent, field.rim, field.thickness, field.edge, field.size);
     // what would fold at the full offset is counted as folded, whatever the bound does to it
     for v in flagged(field, &st.scale, &(0..n as u32).collect::<Vec<_>>()) {
@@ -355,7 +401,10 @@ pub(super) fn relax(field: &Field) -> Result<Relaxed, usize> {
     let mut shell = ShellTest::new(field);
     let mut normals = field.normals.to_vec();
     crossing_rounds(field, &mut st, &surface, &mut shell)?;
-    for _ in 0..MAX_SMOOTHING_PASSES {
+    // a pile of triangles that cannot be tested (coincident sheets): nothing below can change that
+    let uncertain = st.uncertain.iter().filter(|&&u| u).count();
+    let passes = if uncertain as f64 > UNCERTAIN_SHARE * n as f64 { 0 } else { MAX_SMOOTHING_PASSES };
+    for _ in 0..passes {
         let now = Field { normals: &normals, ..*field };
         let stuck = stuck_vertices(&now, &st, &surface, &mut shell);
         if stuck.is_empty() {
@@ -377,7 +426,7 @@ pub(super) fn relax(field: &Field) -> Result<Relaxed, usize> {
         crossing_rounds(&now, &mut st, &surface, &mut shell)?;
     }
     let now = Field { normals: &normals, ..*field };
-    let unresolved = stuck_vertices(&now, &st, &surface, &mut shell).len();
+    let unresolved = if passes == 0 { uncertain } else { stuck_vertices(&now, &st, &surface, &mut shell).len() };
     Ok(Relaxed {
         folded: st.ever.iter().zip(&st.scale).filter(|&(&e, &s)| e && s < 1.0).count(),
         unresolved,
@@ -393,7 +442,10 @@ pub(super) fn relax(field: &Field) -> Result<Relaxed, usize> {
 /// have been resolved by the movement of the other triangle).
 fn stuck_vertices(field: &Field, st: &State, surface: &Surface, shell: &mut ShellTest) -> Vec<u32> {
     let frozen: Vec<u32> = (0..st.frozen.len() as u32).filter(|&v| st.frozen.get(v as usize) == Some(&true)).collect();
-    let mut stuck = shell.crossing_vertices(field, &st.scale, surface, &frozen);
+    let found = shell.crossing_vertices(field, &st.scale, surface, &frozen);
+    let mut stuck = found.crossing;
+    stuck.extend(found.uncertain);
+    stuck.extend((0..st.uncertain.len() as u32).filter(|&v| st.uncertain.get(v as usize) == Some(&true)));
     let all: Vec<u32> = (0..field.positions.len() as u32).collect();
     let at_floor = |v: &u32| st.scale.get(*v as usize).is_some_and(|&s| s <= MIN_SCALE * 1.000_001);
     stuck.extend(flagged(field, &st.scale, &all).into_iter().filter(at_floor));
@@ -472,5 +524,28 @@ mod tests {
         // Assert
         assert_eq!(relaxed.unresolved, 0);
         assert!(relaxed.normals.iter().all(|n| (n - Vec3::z()).norm() < 1e-9), "{:?}", relaxed.normals);
+    }
+
+    #[test]
+    fn crossings_left_when_the_rounds_run_out_are_counted_as_unresolved() {
+        // Arrange: a sharp ridge that crosses itself at the full offset, and no round to relax it in
+        use crate::{Mesh, synth};
+        let mut panel = synth::plane(Point3::origin(), Vec3::x(), Vec3::y(), 14.0, 8.0, 93, 53);
+        for p in &mut panel.positions {
+            p.z = -5.0 * (p.x - 7.0).abs();
+        }
+        let params = super::super::ThickenParams { thickness: 1.0, symmetric: false };
+        let _: &Mesh = &panel;
+        ROUND_LIMIT.with(|c| c.set(Some(0)));
+
+        // Act
+        let result = super::super::thicken(&panel, &params);
+        ROUND_LIMIT.with(|c| c.set(None));
+
+        // Assert: not silently clean
+        match result {
+            Ok(t) => assert!(t.report.unresolved_vertices > 0, "{:?}", t.report),
+            Err(e) => assert!(e.to_string().contains("cross") || e.to_string().contains("fold"), "{e}"),
+        }
     }
 }

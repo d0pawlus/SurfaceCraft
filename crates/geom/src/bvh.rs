@@ -352,29 +352,36 @@ impl Bvh {
         best.map_or(RayCast::Miss, |(t, d)| RayCast::Hit(t, d))
     }
 
-    /// [`Bvh::candidates`] that stops after `max` triangles (ascending among those found).
+    /// The triangles whose own box overlaps `query` (touching counts), ascending, at most `max` of them;
+    /// the flag says that there were more (the first ones found are returned, in no useful order).
     #[must_use]
-    pub fn candidates_up_to(&self, keep: &dyn Fn(&Aabb) -> bool, max: usize) -> Vec<u32> {
+    pub fn overlapping_up_to(&self, query: &Aabb, max: usize) -> (Vec<u32>, bool) {
+        let overlaps = |b: &Aabb| (0..3).all(|k| b.min[k] <= query.max[k] && query.min[k] <= b.max[k]);
         let mut out = Vec::new();
         let mut stack: Vec<u32> = if self.nodes.is_empty() { Vec::new() } else { vec![0] };
         while let Some(ni) = stack.pop() {
             let Some(node) = self.nodes.get(ni as usize) else { continue };
-            if !keep(&node.bbox) {
+            if !overlaps(&node.bbox) {
                 continue;
             }
             if node.leaf {
-                out.extend_from_slice(self.order.get(node.start as usize..node.end as usize).unwrap_or(&[]));
-                if out.len() >= max {
-                    break;
+                for &ti in self.order.get(node.start as usize..node.end as usize).unwrap_or(&[]) {
+                    let Some(corners) = self.tris.get(ti as usize) else { continue };
+                    if overlaps(&Aabb::from_points(corners.iter())) {
+                        if out.len() >= max {
+                            out.sort_unstable();
+                            return (out, true);
+                        }
+                        out.push(ti);
+                    }
                 }
             } else {
                 stack.push(node.left);
                 stack.push(node.right);
             }
         }
-        out.truncate(max);
         out.sort_unstable();
-        out
+        (out, false)
     }
 
     /// The triangles under every box on their way down that `keep` accepts, ascending. A box that

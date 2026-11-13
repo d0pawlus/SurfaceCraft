@@ -12,7 +12,7 @@ use super::{
     message_of, step, summary,
 };
 use crate::Session;
-use crate::cmd::mesh::thicken::command_error;
+use crate::cmd::mesh::thicken::{ShellCounts, command_error, crossing_issues};
 use crate::cmd::mesh_edit::{FillIn, fill};
 use crate::cmd::qa::{CompareIn, compare_points};
 use crate::cmd::wrap::{PATCH_LIMIT, WrapIn, WrapOut, wrap};
@@ -41,6 +41,8 @@ pub struct ThickenedInfo {
     pub limited_vertices: usize,
     /// Vertices of the scan moved (by at most one median edge) to remove crossings of the scan with itself (a fold of the sheet): the thickened face differs from the scan there by that much.
     pub repaired_vertices: usize,
+    /// The largest distance a vertex of the scan was moved by that repair (mm). Deviation, coverage and the verdict are measured against the scan as it was; a repair larger than the tolerance, or at more than 0.5 % of the vertices, raises the issue `scan_repaired`.
+    pub repair_largest_shift: f64,
     /// Largest reduction of the thickness at a vertex (mm).
     pub largest_reduction: f64,
     /// Median reduction of the thickness over the reduced vertices (mm).
@@ -140,6 +142,7 @@ fn info(shell: &Thickened, i: &ToSolidIn, kept: Option<ObjectId>) -> ThickenedIn
         clamped_vertices: shell.report.clamped_vertices,
         limited_vertices: shell.report.limited_vertices,
         repaired_vertices: shell.report.repaired_vertices,
+        repair_largest_shift: shell.report.repair_largest_shift,
         largest_reduction: shell.report.largest_reduction,
         median_reduction: shell.report.median_reduction,
         folded_vertices: shell.report.folded_vertices,
@@ -225,41 +228,6 @@ fn measure(s: &Session, set: &Settings, face: &Mesh, w: &WrapOut) -> CmdResult<D
     Ok(summary(&cmp, face.vertex_count()))
 }
 
-/// What a shell that still crosses itself says: how many sampled triangles cross far apart along the
-/// surface (the wall is thicker than a channel or gap), how many close to each other, and how many
-/// vertices stay on a crossing the relaxation could not remove.
-fn crossing_message(t: &ThickenedInfo) -> String {
-    let whole = |n: usize| n as f64 * t.triangles as f64 / t.self_intersection_samples.max(1) as f64;
-    let mut parts = Vec::new();
-    if t.self_intersections > 0 {
-        parts.push(format!(
-            "{} of {} sampled triangles cut a part of the scan that is far from them along the surface (about {:.0} of {} in all): the wall is thicker than a channel or gap of the part",
-            t.self_intersections,
-            t.self_intersection_samples,
-            whole(t.self_intersections),
-            t.triangles
-        ));
-    }
-    if t.self_intersections_local > 0 {
-        parts.push(format!(
-            "{} of {} sampled triangles cut a neighbouring one (about {:.0} in all): the offset could not be relaxed there",
-            t.self_intersections_local,
-            t.self_intersection_samples,
-            whole(t.self_intersections_local)
-        ));
-    }
-    if t.unresolved_vertices > 0 {
-        parts.push(format!(
-            "{} vertices stay on a crossing that no wall down to a tenth of the thickness removes (sharp creases, collapsed walls)",
-            t.unresolved_vertices
-        ));
-    }
-    format!(
-        "the thickened mesh still crosses itself: {}; a thinner wall, or splitting the part (`scan.split`), is the way out",
-        parts.join("; ")
-    )
-}
-
 /// Issues of the run: those of the wrapped shell, and a wall that is not what was asked for.
 fn issues_of(
     w: &WrapOut,
@@ -282,9 +250,17 @@ fn issues_of(
         );
         list.push(issue("thickness_reduced", msg));
     }
-    if t.self_intersections > 0 || t.self_intersections_local > 0 || t.unresolved_vertices > 0 {
-        list.push(issue("self_intersection", crossing_message(t)));
-    }
+    let counts = ShellCounts {
+        local: t.self_intersections_local,
+        far: t.self_intersections,
+        unresolved: t.unresolved_vertices,
+        samples: t.self_intersection_samples,
+        triangles: t.triangles,
+        repaired: t.repaired_vertices,
+        largest_shift: t.repair_largest_shift,
+        vertices,
+    };
+    list.extend(crossing_issues(&counts, set.tolerance));
     if t.windows > 0 {
         let msg = format!(
             "{} boundary loops besides the rim ({} edges) were stitched through the wall as windows: a real hole of the scan shows as a window; fill it with a larger `fill_holes_max_edges` unless the part has the window",

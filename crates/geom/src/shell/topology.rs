@@ -16,8 +16,11 @@ pub(super) struct Work {
     pub removed: usize,
     /// Triangles turned around to make the orientation consistent.
     pub flipped: usize,
-    /// Vertices moved to remove crossings of the scan with itself.
+    /// Vertices moved to remove crossings of the scan with itself, and the largest shift (mm).
     pub repaired: usize,
+    pub repair_shift: f64,
+    /// Where each vertex was minus where it is (empty: nothing moved).
+    pub shift: Vec<crate::Vec3>,
     /// Vertices on a triangle of the offset that folded before it was relaxed.
     pub folded: usize,
     /// Vertices that stay folded at the floor of the offset.
@@ -106,6 +109,8 @@ pub(super) fn compact(mesh: &Mesh) -> Work {
         removed: 0,
         flipped: 0,
         repaired: 0,
+        repair_shift: 0.0,
+        shift: Vec::new(),
         folded: 0,
         unresolved: 0,
     }
@@ -200,23 +205,19 @@ fn split_fans(w: &mut Work, around: &Csr, v: u32) -> usize {
             merge(&mut group, pair[0].1, pair[1].1);
         }
     }
-    let mut roots: Vec<usize> = Vec::new();
+    let mut slots: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     let mut ids: Vec<u32> = vec![v];
     for (local, &ti) in tris.iter().enumerate() {
         let root = find(&mut group, local);
-        let slot = match roots.iter().position(|&r| r == root) {
-            Some(s) => s,
-            None => {
-                roots.push(root);
-                if roots.len() > 1
-                    && let Some(p) = w.positions.get(v as usize).copied()
-                {
-                    ids.push(w.positions.len() as u32);
-                    w.positions.push(p);
-                }
-                roots.len() - 1
-            }
-        };
+        let next = slots.len();
+        let slot = *slots.entry(root).or_insert(next);
+        if slot == next
+            && next > 0
+            && let Some(p) = w.positions.get(v as usize).copied()
+        {
+            ids.push(w.positions.len() as u32);
+            w.positions.push(p);
+        }
         let id = ids.get(slot).copied().unwrap_or(v);
         if id != v
             && let Some(t) = w.triangles.get_mut(ti as usize)

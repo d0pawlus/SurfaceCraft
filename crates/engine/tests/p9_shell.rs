@@ -544,9 +544,9 @@ fn issue_codes(out: &Value) -> Vec<String> {
 
 #[test]
 fn a_shell_that_keeps_crossings_never_passes_whether_they_are_near_or_far_apart() {
-    // Arrange: a crease 11 degrees wide (wall 2 mm: the relaxation leaves sampled crossings of
-    // neighbouring triangles) and one 18 degrees wide with a wall of 4 mm (far apart flanks)
-    let cases = [(crease_panel(5.0, 0.4), 2.0), (crease_panel(3.0, 0.4), 4.0)];
+    // Arrange: a channel narrower than the wall, and a crease 18 degrees wide with a wall of 4 mm: the
+    // flanks are narrower than the wall
+    let cases = [(narrow_channel(), 2.0), (crease_panel(3.0, 0.4), 4.0)];
 
     for (k, (panel, thickness)) in cases.into_iter().enumerate() {
         let mut s = session_with(panel);
@@ -563,4 +563,64 @@ fn a_shell_that_keeps_crossings_never_passes_whether_they_are_near_or_far_apart(
         assert!(issue_codes(&out).iter().any(|c| c == "self_intersection"), "case {k}: {out}");
         assert_ne!(out["verdict"], "pass", "case {k}: {out}");
     }
+}
+
+/// A flat panel of `side` mm with cells of 0.5 mm whose two middle vertices are swapped over each other
+/// sideways (two triangles cut through each other), one of them `lift` mm above the plane.
+fn folded_panel(side: f64, lift: f64) -> Mesh {
+    let cells = (side / 0.5) as usize;
+    let mut panel = synth::plane(Point3::origin(), Vec3::x(), Vec3::y(), side, side, cells, cells);
+    let centre = (cells / 2) * (cells + 1) + cells / 2;
+    let (x, y) = (side / 2.0, side / 2.0);
+    panel.positions[centre] = Point3::new(x + 0.9, y + 0.4, lift);
+    panel.positions[centre + 1] = Point3::new(x + 0.1, y - 0.1, 0.0);
+    panel
+}
+
+#[test]
+fn a_repaired_fold_is_measured_against_the_scan_as_it_was_and_cannot_pass() {
+    // Arrange: a fold of two vertices swapped over each other, one 0.02 mm above the plane: the repair moves
+    // vertices by half a millimetre, more than the tolerance of 0.2 mm
+    let lift = 0.02;
+    let mut s = session_with(folded_panel(60.0, lift));
+
+    // Act
+    let thick = s.execute("mesh.thicken", json!({"object": "scan", "thickness": 1.0})).unwrap();
+    let out = s.execute("scan.to_solid", json!({"scan": "scan", "thickness": 1.0})).unwrap();
+
+    // Assert: the repair is reported with its shift, the deviation is against the original points
+    assert!(thick["repaired_vertices"].as_u64().unwrap() > 0, "{thick}");
+    assert!(thick["repair_largest_shift"].as_f64().unwrap() > 0.0, "{thick}");
+    assert!(out["thickened"]["repaired_vertices"].as_u64().unwrap() > 0, "{out}");
+    let shift = thick["repair_largest_shift"].as_f64().unwrap();
+    assert!(shift > 0.2, "the repair must exceed the tolerance for this test: {thick}");
+    let max_dev = out["deviation"]["max_abs"].as_f64().unwrap();
+    assert!(
+        max_dev >= 0.9 * lift,
+        "a vertex of the scan is {lift} mm off the plane, the deviation says {max_dev}: {out}"
+    );
+    let codes = issue_codes(&out);
+    assert!(codes.iter().any(|c| c == "scan_repaired"), "{codes:?}");
+    assert_ne!(out["verdict"], "pass", "{out}");
+    assert!(thick["issues"].as_array().unwrap().iter().any(|i| i["code"] == "scan_repaired"), "{thick}");
+}
+
+#[test]
+fn doubled_sheets_that_the_wall_cannot_clear_are_refused_with_their_own_issue_code() {
+    // Arrange: a small panel whose fold leaves more than 0.1 % of the vertices on crossings
+    let panel = folded_panel(10.0, 0.4);
+    let mut s = session_with(panel);
+
+    // Act
+    let thick = s.execute("mesh.thicken", json!({"object": "scan", "thickness": 1.0}));
+    let out = s.execute("scan.to_solid", json!({"scan": "scan", "thickness": 1.0})).unwrap();
+
+    // Assert: both refuse, the verdict names the reason
+    let message = match thick {
+        Err(EngineError::Failed(m)) => m,
+        other => panic!("{other:?}"),
+    };
+    assert!(message.contains("stay on a crossing of the shell"), "{message}");
+    assert_eq!(out["verdict"], "fail", "{out}");
+    assert_eq!(issue_codes(&out), vec!["unresolved_crossings".to_string()], "{out}");
 }
