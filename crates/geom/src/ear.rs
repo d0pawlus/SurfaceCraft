@@ -69,7 +69,15 @@ fn judge(p2: &[[f64; 2]], idx: &[usize], k: usize, sign: f64) -> Ear {
 }
 
 /// Ear clipping in the loop's mean plane; false when the projected polygon is not simple enough.
+#[cfg(test)]
 pub(crate) fn ear_clip(mesh: &mut Mesh, lp: &[u32]) -> bool {
+    ear_clip_avoiding(mesh, lp, &|_, _| false)
+}
+
+/// [`ear_clip`] that never clips an ear whose new diagonal `(a, b)` (mesh vertices) is one for
+/// which `taken` says an edge exists already: a second pair of triangles on it would make it
+/// non-manifold. False also when only such ears are left.
+pub(crate) fn ear_clip_avoiding(mesh: &mut Mesh, lp: &[u32], taken: &dyn Fn(u32, u32) -> bool) -> bool {
     let (o, x, y, _) = loop_frame(mesh, lp);
     let p2: Vec<[f64; 2]> = lp
         .iter()
@@ -86,7 +94,16 @@ pub(crate) fn ear_clip(mesh: &mut Mesh, lp: &[u32]) -> bool {
         .sum();
     let sign = if area2 >= 0.0 { 1.0 } else { -1.0 };
     let mut idx: Vec<usize> = (0..lp.len()).collect();
-    let mut ears: Vec<Ear> = (0..lp.len()).map(|k| judge(&p2, &idx, k, sign)).collect();
+    let judge_ear = |idx: &[usize], k: usize| {
+        let m = idx.len();
+        let ear = judge(&p2, idx, k, sign);
+        let (ia, ic) = (idx[(k + m - 1) % m], idx[(k + 1) % m]);
+        match ear {
+            Ear::Valid(_) if taken(lp[ia], lp[ic]) => Ear::Flat,
+            other => other,
+        }
+    };
+    let mut ears: Vec<Ear> = (0..lp.len()).map(|k| judge_ear(&idx, k)).collect();
     let mut out: Vec<[u32; 3]> = Vec::with_capacity(lp.len());
     while idx.len() > 3 {
         let m = idx.len();
@@ -108,7 +125,7 @@ pub(crate) fn ear_clip(mesh: &mut Mesh, lp: &[u32]) -> bool {
         for p in 0..m {
             let v = idx[p];
             if near.contains(&p) || matches!(ears[v], Ear::Blocked(j) if j == ib) {
-                ears[v] = judge(&p2, &idx, p, sign);
+                ears[v] = judge_ear(&idx, p);
             }
         }
     }

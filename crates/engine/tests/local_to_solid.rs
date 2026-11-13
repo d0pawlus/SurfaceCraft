@@ -6,12 +6,14 @@
 //! `docs/STATUS.md` keeps only the aggregate figures. Files are reported by number only.
 //!
 //! Run (release, the files are large):
+//! `SURFACECRAFT_LOCAL_CORPUS_NUMBERS=3` (comma-separated file numbers) limits the run.
 //! `SURFACECRAFT_LOCAL_CORPUS=… cargo test --release -p surfacecraft-engine --test local_to_solid -- --ignored --nocapture`
 use serde_json::{Value, json};
 use std::time::Instant;
 use surfacecraft_engine::Session;
 
-fn corpus() -> Vec<std::path::PathBuf> {
+/// The scans with their numbers (sorted order, from 1).
+fn corpus() -> Vec<(usize, std::path::PathBuf)> {
     let Ok(dir) = std::env::var("SURFACECRAFT_LOCAL_CORPUS") else { return Vec::new() };
     let mut files: Vec<_> =
         std::fs::read_dir(dir).map(|rd| rd.filter_map(Result::ok).map(|e| e.path()).collect()).unwrap_or_default();
@@ -24,7 +26,14 @@ fn corpus() -> Vec<std::path::PathBuf> {
         files.retain(|p| p.to_string_lossy().contains(&only));
     }
     files.sort();
-    files
+    let mut numbered: Vec<(usize, std::path::PathBuf)> =
+        files.into_iter().enumerate().map(|(k, p)| (k + 1, p)).collect();
+    // by number instead of by name: the files are reported by number only
+    if let Ok(list) = std::env::var("SURFACECRAFT_LOCAL_CORPUS_NUMBERS") {
+        let wanted: Vec<usize> = list.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        numbered.retain(|(n, _)| wanted.contains(n));
+    }
+    numbered
 }
 
 fn codes(out: &Value) -> Vec<String> {
@@ -75,12 +84,12 @@ fn local_corpus_scan_to_solid() {
     assert!(!files.is_empty(), "set SURFACECRAFT_LOCAL_CORPUS to a directory with STL/OBJ/PLY scans");
     let mut tally = std::collections::BTreeMap::<String, usize>::new();
     let mut errors = Vec::new();
-    for (k, f) in files.iter().enumerate() {
-        match run_one(k + 1, f) {
+    for (number, f) in &files {
+        match run_one(*number, f) {
             Ok(verdict) => *tally.entry(verdict).or_default() += 1,
             Err(e) => {
-                eprintln!("C{:02} ERROR {e}", k + 1);
-                errors.push(k + 1);
+                eprintln!("C{number:02} ERROR {e}");
+                errors.push(*number);
             }
         }
     }

@@ -1,7 +1,7 @@
 //! Hole filling: boundary loops triangulated by ear clipping in the loop's mean plane; the smooth
 //! variant refines the patch (centroid splits and Delaunay flips) and fairs it with the
 //! surrounding ring held fixed (membrane, then thin-plate iterations).
-use crate::ear::{ear_clip, fan_fill};
+use crate::ear::{ear_clip_avoiding, fan_fill};
 use crate::{Mesh, Point3, Vec3, par, tri};
 use std::collections::{HashMap, HashSet};
 
@@ -66,7 +66,8 @@ pub fn boundary_loops(mesh: &Mesh) -> Vec<Vec<u32>> {
 pub struct FillReport {
     /// Holes filled.
     pub filled: usize,
-    /// Holes left (longer than the limit or not triangulable).
+    /// Holes left (longer than the limit, not triangulable, or whose fill would put three triangles
+    /// on one edge).
     pub skipped: usize,
     /// Triangles added.
     pub added_triangles: usize,
@@ -85,6 +86,11 @@ const WORKSPACE_RINGS: usize = 3;
 /// and corners the hole lies over; otherwise the patch is flat (ear clipping only). Every hole is
 /// filled from the mesh as it was before any was filled, so the holes are independent (they run in
 /// parallel) and the result does not depend on the number of threads.
+///
+/// A fill never adds an edge shared by three or more triangles: a loop that touches itself is
+/// filled as the simple loops it is made of, a diagonal that is an edge of the mesh already is
+/// avoided, and a patch that would still overload an edge (with the mesh or with another patch) is
+/// not added; that hole stays open and is counted in `skipped`.
 pub fn fill_holes(mesh: &mut Mesh, max_edges: usize, smooth: bool) -> FillReport {
     fill_holes_with(mesh, max_edges, smooth, smooth)
 }
@@ -95,24 +101,142 @@ pub(crate) fn fill_holes_with(mesh: &mut Mesh, max_edges: usize, smooth: bool, s
     let mut rep = FillReport::default();
     let max_edges = max_edges.clamp(3, MAX_FILL_EDGES);
     let (todo, long): (Vec<Vec<u32>>, Vec<Vec<u32>>) =
-        boundary_loops(mesh).into_iter().partition(|lp| lp.len() <= max_edges);
+        simple_loops(boundary_loops(mesh)).into_iter().partition(|lp| lp.len() <= max_edges);
     rep.skipped = long.len();
     drop(long);
     if todo.is_empty() {
         return rep;
     }
     let faces = VertexFaces::new(mesh);
+    let mut uses = EdgeUses::new(mesh, &todo);
     let source: &Mesh = mesh;
-    let fill = |lp: &Vec<u32>| fill_in_workspace(source, &faces, lp, smooth, sharpen);
+    let fill = |lp: &Vec<u32>| fill_in_workspace(source, &faces, &uses, lp, smooth, sharpen);
     // a single hole stays on this thread (the crease tests read a thread-local reason)
     let patches: Vec<Patch> =
         if todo.len() < 2 { todo.iter().map(fill).collect() } else { par::map_slice(&todo, fill) };
-    for patch in patches {
-        rep.filled += 1;
-        rep.added_triangles += patch.triangles.len();
-        patch.append_to(mesh);
+    for (lp, patch) in todo.iter().zip(patches) {
+        let mut added = append_if_admitted(mesh, &mut uses, patch);
+        if added.is_none() && smooth {
+            // the refined patch overloads an edge: the flat one may not
+            let flat = fill_in_workspace(mesh, &faces, &uses, lp, false, false);
+            added = append_if_admitted(mesh, &mut uses, flat);
+        }
+        match added {
+            Some(n) => {
+                rep.filled += 1;
+                rep.added_triangles += n;
+            }
+            None => rep.skipped += 1,
+        }
     }
     rep
+}
+
+/// Adds the patch to the mesh unless it would put three triangles on an edge (see [`EdgeUses`]);
+/// returns the number of triangles added.
+fn append_if_admitted(mesh: &mut Mesh, uses: &mut EdgeUses, patch: Patch) -> Option<usize> {
+    let triangles = patch.mapped(mesh.positions.len() as u32);
+    if !uses.admits(&triangles) {
+        return None;
+    }
+    uses.add(&triangles);
+    patch.append_to(mesh);
+    Some(triangles.len())
+}
+
+/// Splits every loop that runs through a vertex more than once (a loop pinched at a vertex) into
+/// the simple loops it is made of, each in the direction of the original; loops that visit no
+/// vertex twice are kept as they are.
+fn simple_loops(loops: Vec<Vec<u32>>) -> Vec<Vec<u32>> {
+    let mut out = Vec::with_capacity(loops.len());
+    for lp in loops {
+        let distinct: HashSet<u32> = lp.iter().copied().collect();
+        if distinct.len() == lp.len() {
+            out.push(lp);
+            continue;
+        }
+        let mut stack: Vec<u32> = Vec::with_capacity(lp.len());
+        let mut at: HashMap<u32, usize> = HashMap::new();
+        for v in lp {
+            let Some(&p) = at.get(&v) else {
+                at.insert(v, stack.len());
+                stack.push(v);
+                continue;
+            };
+            // the walk came back to `v`: what lies between the two visits is a loop of its own
+            let cycle = stack.split_off(p + 1);
+            for u in &cycle {
+                at.remove(u);
+            }
+            if cycle.len() >= 2 {
+                out.push(std::iter::once(v).chain(cycle).collect());
+            }
+        }
+        if stack.len() >= 3 {
+            out.push(stack);
+        }
+    }
+    out
+}
+
+/// How many triangles use each undirected edge between the vertices of the loops about to be
+/// filled (the only mesh edges a patch can add to), kept up to date as patches are accepted.
+struct EdgeUses {
+    marked: Vec<bool>,
+    count: HashMap<(u32, u32), u32>,
+}
+
+impl EdgeUses {
+    fn new(mesh: &Mesh, loops: &[Vec<u32>]) -> Self {
+        let mut marked = vec![false; mesh.positions.len()];
+        for &v in loops.iter().flatten() {
+            if let Some(m) = marked.get_mut(v as usize) {
+                *m = true;
+            }
+        }
+        let mut uses = Self { marked, count: HashMap::new() };
+        uses.add(&mesh.triangles);
+        uses
+    }
+
+    fn is_marked(&self, v: u32) -> bool {
+        self.marked.get(v as usize).copied().unwrap_or(false)
+    }
+
+    fn key(a: u32, b: u32) -> (u32, u32) {
+        (a.min(b), a.max(b))
+    }
+
+    /// Whether some triangle uses the edge `a`-`b` already.
+    fn has(&self, a: u32, b: u32) -> bool {
+        self.count.contains_key(&Self::key(a, b))
+    }
+
+    fn add(&mut self, triangles: &[[u32; 3]]) {
+        for t in triangles {
+            for k in 0..3 {
+                let (a, b) = (t[k], t[(k + 1) % 3]);
+                if self.is_marked(a) && self.is_marked(b) {
+                    *self.count.entry(Self::key(a, b)).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    /// Whether the triangles (mesh vertex numbers) can be added without any edge reaching three
+    /// uses, counting the triangles themselves; a triangle with a repeated corner is never added.
+    fn admits(&self, triangles: &[[u32; 3]]) -> bool {
+        let mut own: HashMap<(u32, u32), u32> = HashMap::new();
+        for t in triangles {
+            if t[0] == t[1] || t[1] == t[2] || t[2] == t[0] {
+                return false;
+            }
+            for k in 0..3 {
+                *own.entry(Self::key(t[k], t[(k + 1) % 3])).or_insert(0) += 1;
+            }
+        }
+        own.iter().all(|(e, n)| n + self.count.get(e).copied().unwrap_or(0) <= 2)
+    }
 }
 
 /// The triangles around every vertex of a mesh (compressed rows).
@@ -160,10 +284,19 @@ struct Patch {
 }
 
 impl Patch {
+    /// The triangles in the numbers of a mesh whose next new vertex is `first`.
+    fn mapped(&self, first: u32) -> Vec<[u32; 3]> {
+        let base = self.origin.len() as u32;
+        let map = |v: u32| match self.origin.get(v as usize) {
+            Some(&m) if v < base => m,
+            _ => first + (v - base),
+        };
+        self.triangles.iter().map(|t| t.map(map)).collect()
+    }
+
     fn append_to(self, mesh: &mut Mesh) {
-        let (base, first) = (self.origin.len() as u32, mesh.positions.len() as u32);
-        let map = |v: u32| if v < base { self.origin[v as usize] } else { first + (v - base) };
-        mesh.triangles.extend(self.triangles.iter().map(|t| t.map(map)));
+        let triangles = self.mapped(mesh.positions.len() as u32);
+        mesh.triangles.extend(triangles);
         mesh.positions.extend(self.positions);
     }
 }
@@ -171,7 +304,14 @@ impl Patch {
 /// Fills the loop `lp` in a copy of the triangles around it, which is all the fairing and the
 /// sharpening read; the copy numbers its vertices in the order of the mesh's, so the patch is the
 /// one the whole mesh would give.
-fn fill_in_workspace(mesh: &Mesh, faces: &VertexFaces, lp: &[u32], smooth: bool, sharpen: bool) -> Patch {
+fn fill_in_workspace(
+    mesh: &Mesh,
+    faces: &VertexFaces,
+    uses: &EdgeUses,
+    lp: &[u32],
+    smooth: bool,
+    sharpen: bool,
+) -> Patch {
     let mut tris: Vec<u32> = Vec::new();
     let mut seen: HashSet<u32> = HashSet::new();
     let mut front: Vec<u32> = lp.to_vec();
@@ -202,7 +342,11 @@ fn fill_in_workspace(mesh: &Mesh, faces: &VertexFaces, lp: &[u32], smooth: bool,
     let (first_tri, first_vertex) = (work.triangles.len(), work.positions.len());
     // fill triangles run against the loop direction
     let rev: Vec<u32> = lp.iter().rev().copied().collect();
-    if !ear_clip(&mut work, &rev) {
+    let taken = |a: u32, b: u32| match (origin.get(a as usize), origin.get(b as usize)) {
+        (Some(&a), Some(&b)) => uses.has(a, b),
+        _ => false,
+    };
+    if !ear_clip_avoiding(&mut work, &rev, &taken) {
         fan_fill(&mut work, &rev);
     }
     if smooth {
@@ -259,6 +403,13 @@ fn refine_and_fair(mesh: &mut Mesh, first: usize, lp: &[u32]) {
 
 /// Delaunay-style edge flips among patch triangles (edges shared by two patch triangles).
 fn flip_patch(mesh: &mut Mesh, first: usize) {
+    // edges of the surrounding mesh: a flip must not put a patch edge on one of them
+    let outside: HashSet<(u32, u32)> = mesh
+        .triangles
+        .iter()
+        .take(first)
+        .flat_map(|t| (0..3).map(move |k| (t[k].min(t[(k + 1) % 3]), t[k].max(t[(k + 1) % 3]))))
+        .collect();
     for _pass in 0..8 {
         let mut edge: HashMap<(u32, u32), (usize, usize)> = HashMap::new();
         for ti in first..mesh.triangles.len() {
@@ -269,6 +420,8 @@ fn flip_patch(mesh: &mut Mesh, first: usize) {
         }
         let mut flipped = false;
         let mut done: HashSet<usize> = HashSet::new();
+        // edges this pass has made: `edge` is as the pass found the patch
+        let mut made: HashSet<(u32, u32)> = HashSet::new();
         let mut keys: Vec<(u32, u32)> = edge.keys().copied().collect();
         keys.sort_unstable();
         for (a, b) in keys {
@@ -301,13 +454,18 @@ fn flip_patch(mesh: &mut Mesh, first: usize) {
                 continue;
             }
             // do not create an edge that already exists
-            if edge.contains_key(&(c, d)) || edge.contains_key(&(d, c)) {
+            if edge.contains_key(&(c, d))
+                || edge.contains_key(&(d, c))
+                || outside.contains(&(c.min(d), c.max(d)))
+                || made.contains(&(c.min(d), c.max(d)))
+            {
                 continue;
             }
             mesh.triangles[t0] = [c, d, b];
             mesh.triangles[t1] = [d, c, a];
             done.insert(t0);
             done.insert(t1);
+            made.insert((c.min(d), c.max(d)));
             flipped = true;
         }
         if !flipped {
@@ -517,6 +675,35 @@ mod tests {
             assert!(boundary_loops(&m1).is_empty(), "holes left");
             assert!(m1.validate().is_ok());
         }
+    }
+
+    /// Two quads whose diagonals both flip to the edge between the same two vertices: the flips of
+    /// one pass are decided on the patch as the pass found it, so the second must be refused.
+    #[test]
+    fn a_pass_of_flips_never_makes_one_edge_twice() {
+        let p = |x: f64, y: f64, z: f64| Point3::new(x, y, z);
+        let mesh = |flipped_pairs: &mut Mesh| {
+            // c and d lie close to both segments a-b and a2-b2, so every quad wants its other diagonal
+            flipped_pairs.positions = vec![
+                p(-1.0, 0.0, 0.0),
+                p(1.0, 0.0, 0.0),
+                p(0.0, 0.2, 0.0),
+                p(0.0, -0.2, 0.0),
+                p(-1.0, 0.0, 0.05),
+                p(1.0, 0.0, 0.05),
+            ];
+            flipped_pairs.triangles = vec![[0, 1, 2], [1, 0, 3], [4, 5, 2], [5, 4, 3]];
+        };
+        let mut m = Mesh::default();
+        mesh(&mut m);
+        flip_patch(&mut m, 0);
+        let uses_of_cd = m
+            .triangles
+            .iter()
+            .filter(|t| (0..3).any(|k| (t[k], t[(k + 1) % 3]) == (2, 3) || (t[k], t[(k + 1) % 3]) == (3, 2)))
+            .count();
+        assert!(uses_of_cd <= 2, "the edge between the two apexes has {uses_of_cd} triangles");
+        assert_eq!(crate::quality::edge_census(&m).non_manifold, 0);
     }
 
     /// A disc of 4 500 boundary edges (past the former limit of 4 000) is filled flat.
