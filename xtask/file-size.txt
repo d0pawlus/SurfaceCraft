@@ -2,7 +2,6 @@
 # Each line is `<path> <lines>` with the file's current line count. This list only shrinks:
 # a listed file may not grow, and a listed file that is 800 lines or fewer must be removed.
 crates/engine/src/cmd/primitive.rs 1045
-crates/ui-egui/tests/sketch_editor.rs 952
 crates/io/src/mesh.rs 917
 crates/engine/src/cmd/region.rs 867
 crates/doc/src/object.rs 834
