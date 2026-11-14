@@ -311,4 +311,19 @@ mod tests {
         let (back, _) = rebuild(&canonicalize(sheet)).unwrap();
         assert_eq!(uses(&back), vec![true], "the use of a sheet's face is the same one");
     }
+
+    /// A record whose faces are all used forward (what every caller of `canonicalize` but the merge builds) is
+    /// canonical already, and `canonicalize` leaves it as it is: the walk of a face used backward is the only
+    /// thing it does differently, and no such face is there.
+    #[test]
+    fn a_record_with_forward_faces_only_is_unchanged_by_canonicalize() {
+        let net = |x: f64| vec![vec![[x, 0.0, 0.0], [x, 1.0, 0.0]], vec![[x + 1.0, 0.0, 0.0], [x + 1.0, 1.0, 0.0]]];
+        let b = sheet_from_bezier_network(&[net(0.0), net(1.0)], &[[0, 1, 2, 3], [1, 4, 5, 2]]).unwrap();
+        assert!(b.shells.iter().all(|s| match s {
+            Shell::Faces { faces, .. } => faces.iter().all(|f| f.forward),
+            _ => true,
+        }));
+        b.validate().unwrap();
+        assert_eq!(canonicalize(b.clone()), b);
+    }
 }
