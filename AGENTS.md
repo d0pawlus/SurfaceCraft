@@ -28,9 +28,15 @@ current state and next step: `docs/STATUS.md`.
 - Thresholds of design doc §11.1 are never loosened to make a test pass.
 - Code, comments, commit messages and docs in the code are in English.
 - Before every commit run `cargo xtask quick <changed packages>` (fmt, assets, licences, layers,
-  app-geometry and clippy of those packages, which type-checks them; no local test run); the full
-  `cargo xtask ci` runs on GitHub Actions for every pull request, and a pull request is merged only
-  with all checks green. Checks GitHub cannot run (local corpora, performance, GPU and GUI) are
+  app-geometry and clippy of those packages, which type-checks them; no local test run). GitHub
+  Actions runs at two speeds: a DRAFT pull request gets the fast jobs (static checks, clippy, wasm,
+  and the tests of the crates and test files it changes on Linux, Windows and macOS, about a
+  quarter of an hour); a pull request marked ready gets the full suite on the three systems
+  (`cargo xtask ci`, 40 to 65 minutes). Open a pull request as a draft, iterate until the fast jobs
+  are green on all three systems (results differ between their math libraries: a test that passes
+  locally on macOS has failed on Linux or Windows more than once, so no assertion within 1.5 times
+  of a measured value and no exact count that depends on the platform), then mark it ready; a
+  pull request is merged only with the full suite green. Checks GitHub cannot run (local corpora, performance, GPU and GUI) are
   listed under "Do sprawdzenia lokalnie" in the pull request and run in batched integration passes
   (`docs/integration.md`).
   A commit that touches only documentation (`*.md`, STATUS, plans) or only resolves a merge of
