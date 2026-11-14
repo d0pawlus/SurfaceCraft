@@ -50,6 +50,8 @@ pub enum CoarseMethod {
     PrincipalAxes,
     /// Local descriptor matches and RANSAC.
     Descriptors,
+    /// The pose the caller gave (`PairOptions::given`, used by `align.global` for scans placed by hand).
+    Given,
 }
 
 /// A pose and how well it fits.

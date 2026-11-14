@@ -627,5 +627,17 @@
   "the pose is not finite": "ułożenie nie jest skończone",
   "`choose` picks among alternatives, and this verdict is unique (use 0)": "„choose” wybiera spośród alternatyw, a ten wynik jest jednoznaczny (użyj 0)",
   "`choose` is {} but there are {} alternatives": "„choose” wynosi {}, a alternatyw jest {}",
-  "`choose` names the pose to apply: give `apply` too": "„choose” wskazuje ułożenie do zastosowania: podaj też „apply”"
+  "`choose` names the pose to apply: give `apply` too": "„choose” wskazuje ułożenie do zastosowania: podaj też „apply”",
+  "{} scans given; between 2 and {} are needed": "podano {} skanów, potrzeba od 2 do {}",
+  "the fixed scan {} is not among the {} scans": "nieruchomy skan {} nie należy do {} skanów",
+  "max_pairs must be between 1 and {}": "„max_pairs” musi mieścić się między 1 a {}",
+  "scan {} has {} triangles; at least {} are needed": "skan {} ma {} trójkątów, potrzeba co najmniej {}",
+  "scan {} is invalid: {}": "skan {} jest niepoprawny: {}",
+  "scan {} has no finite surface area": "skan {} nie ma skończonego pola powierzchni",
+  "{} scans given; at most {} are taken at once": "podano {} skanów, naraz przyjmuję najwyżej {}",
+  "mesh {} is listed twice": "siatka {} jest wymieniona dwa razy",
+  "the fixed mesh {} is not in `objects`": "nieruchoma siatka {} nie występuje w „objects”",
+  "the tolerance must be a positive number of mm": "tolerancja musi być dodatnią liczbą mm",
+  "`accept_weak` names mesh {}, which is not in `objects`": "„accept_weak” wskazuje siatkę {}, której nie ma w „objects”",
+  "the relaxation gave a pose that is not finite; nothing was moved": "relaksacja dała ułożenie, które nie jest skończone; nic nie przesunięto"
 }

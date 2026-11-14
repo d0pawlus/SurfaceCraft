@@ -67,6 +67,10 @@ pub struct PairOptions {
     /// How far the probes displace a pose, as a fraction of the extent of the moving scan (default
     /// 0.2). For tests: a start displaced far beyond reach has no pairs and counts as failed.
     pub probe_step: Option<f64>,
+    /// A pose to start from (moving -> fixed): the descriptor stage is skipped and only this pose
+    /// and the 24 principal-axes poses are tried, so a roughly placed pair costs a fraction of a
+    /// search. `None` (the default) is the full search.
+    pub given: Option<Transform>,
 }
 
 /// What [`pair_coarse`] found.
@@ -181,6 +185,17 @@ impl<'a> Scene<'a> {
             sample::sample(fixed, sample::count_for(af, spacing, SAMPLE_CAP), spacing, 2, cancel).ok_or_else(few)?;
         let mov_cloud = Mesh { positions: mov.pts.clone(), triangles: Vec::new() };
         Ok(Scene { moving, mov, fix, fixed: Target::new(fixed, diag), mov_cloud, diag, spacing })
+    }
+
+    /// The given pose and the principal-axes poses (no descriptors).
+    fn given_hypotheses(&self, given: &Transform) -> Vec<Cand> {
+        let mut out = vec![Cand { t: *given, method: CoarseMethod::Given }];
+        out.extend(
+            candidates::principal_candidates(&self.mov.pts, &self.fix.pts)
+                .into_iter()
+                .map(|t| Cand { t, method: CoarseMethod::PrincipalAxes }),
+        );
+        out
     }
 
     fn hypotheses(&self, cancel: &Cancel) -> Result<Vec<Cand>, AlignError> {
@@ -406,7 +421,10 @@ fn alternative(r: &Ranked, overlap_fixed: f64) -> PairCandidate {
 pub fn pair_coarse(moving: &Mesh, fixed: &Mesh, opts: &PairOptions, cancel: &Cancel) -> Result<PairResult, AlignError> {
     let scene = Scene::new(moving, fixed, cancel)?;
     scene.check_tolerance(opts.tolerance)?;
-    let hyps = scene.hypotheses(cancel)?;
+    let hyps = match &opts.given {
+        Some(g) => scene.given_hypotheses(g),
+        None => scene.hypotheses(cancel)?,
+    };
     solve(&scene, hyps, opts, cancel)
 }
 
