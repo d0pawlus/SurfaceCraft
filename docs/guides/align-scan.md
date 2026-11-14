@@ -165,10 +165,59 @@ Normals, colours and per-vertex data go with the coordinates.
   shared region is only flat or a cylinder-like surface is reported `ambiguous`; a scan that
   repeats its vertices per triangle gets the borders of the welded mesh (found by position).
 
+## Many scans of one part
+
+- `align.global`: `objects` (2 to 24 meshes, each once) are brought into the frame of `fixed`
+  (default the first), with no picked points. Every pair is solved as `align.pair_coarse` does
+  (for up to 9 scans all pairs; for more, the pairs of neighbours in the list first, cut at
+  `max_pairs`, default 36: list scans in the order they were taken, or raise the cap). Only a
+  `unique` pair with enough overlap is an edge; `ambiguous` and `no_match` pairs are not.
+  `start: current` skips the search for scans that are already roughly in place: every pair starts
+  from the current poses, and pairs whose boxes do not meet are skipped.
+- The graph: the edges are weighted by overlap over squared residual; the spanning tree from the
+  fixed scan (strongest first) chains the pair poses (`chained_matrix` of every scan); then all
+  poses are relaxed together (Gauss-Newton on virtual point pairs: the points of one scan that lie
+  on the other at the pair pose), so the error around a loop is spread over the loop. A pair pose
+  that disagrees with the best consistent set of the others by more than 2.5 tolerances (a false
+  `unique`) is `rejected` and left out.
+- The report: per scan `placed`, `held_by_loop` and its `matrix`; per pair the verdict, overlaps,
+  residual, the pair's own evidence (`stability`, `probed`, `probes_failed`, `slides`), whether it
+  was used and its misfit before and after (`misfit_before`, `misfit_after`; also for a `rejected`
+  pair, so the size of the contradiction is visible); `used_edges`, `rejected_edges` and
+  `consensus_margin` (inliers of the winning set minus those of the best different one; 0 is a tie);
+  `loop`: over the independent cycles, the largest edge misfit in each, worst and mean, before and
+  after relaxation (before, the whole error sits on the edge that closes the cycle).
+- The verdict is `aligned` only when every scan is placed and held by a closed loop of strong pairs
+  (`held_by_loop`), every used pair agrees with the final poses within its tolerance, the last
+  vote that left pairs out won clearly (by 2 pairs from 6 pairs up, by 1 below), and the left-out
+  pairs are not more than 1.25 per used one. A pair is strong when its residual is below 0.3 % of
+  the scan's diagonal (`rms_per_diagonal`, `strong_evidence`; confidence does not count, it read
+  1.00 on wrong poses); a loop confirms its scans only when all its pairs are strong. A scan that
+  hangs on a single pair (two scans, a chain, a leaf) or only in loops with a weak pair is
+  `weakly_held`: the verdict is `partial`, `weak_pair` names the pair, and the note quotes its
+  confidence, overlap, residual, stability and probe result. Also `partial`: scans not connected to
+  the fixed one (`unplaced`, never moved), a loop that does not close (`loop_error_high`),
+  `many_edges_rejected`, `consensus_unclear`; `failed` when nothing connected.
+- Read `aligned` for what it is. **It means the pair poses agree with each other and with the final
+  poses, not that they are right.** `align.pair_coarse` is known to return a wrong pose as
+  `unique` on parts with a symmetry or a self-similar surface (a half turn onto another region
+  that fits at noise level), and a triangle of scans that are all placed by the same symmetry
+  closes without any misfit: nothing in the data tells it from a right one. The command is only as
+  reliable as `align.pair_coarse`; on a part with a symmetry check the result by eye.
+- It proposes by default. `apply: true` moves the scans held by a loop in one undo step; a weakly
+  held scan moves only when `accept_weak` lists it (after you have read its pair's evidence in
+  `edges`), the way `align.pair_coarse` moves a non-unique pose only when `choose` names it. The
+  result lists `moved` and `left_weakly_held`; with nothing moved there is no undo step and the note
+  says why. `apply` is refused when the verdict is `failed`.
+- Limits: a scan tied by a single wrong pair cannot be told from a right one (no loop checks
+  it); a part with near symmetries gives pairs that are `unique` but wrong, and the consensus can
+  only drop them while enough right pairs exist; the cap on pairs can leave a scan unconnected
+  (`pairs_capped`).
+
 ## Parameters common to all align commands
 
 - `object`: the mesh to move.
-- `apply` (default true; false for `align.auto`, `align.symmetry` and `align.pair_coarse`, which propose first):
+- `apply` (default true; false for `align.auto`, `align.symmetry`, `align.pair_coarse` and `align.global`, which propose first):
   false computes the motion without moving the mesh.
 - `also`: other meshes moved by the same motion.
 
