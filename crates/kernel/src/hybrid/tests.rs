@@ -300,3 +300,112 @@ fn bad_input_is_refused() {
     assert!(extract_face(&b, 99).is_err());
     assert!(replace_face(&b, 99, &wave_surface(0.0, 1.0, 0.0, 1.0)).is_err());
 }
+
+/// A 40 x 30 block with a wavy freeform top: a stock that is not a box.
+fn wavy_block() -> Brep {
+    let mut cuts = vec![];
+    for (p, n) in [
+        ([0.0, 0.0, 0.0], [-1.0, 0.0, 0.0]),
+        ([40.0, 0.0, 0.0], [1.0, 0.0, 0.0]),
+        ([0.0, 0.0, 0.0], [0.0, -1.0, 0.0]),
+        ([0.0, 30.0, 0.0], [0.0, 1.0, 0.0]),
+        ([0.0, 0.0, 0.0], [0.0, 0.0, -1.0]),
+    ] {
+        cuts.push(Cut { shape: Shape::Plane { point: p, normal: n }, convex: true, full: false });
+    }
+    let free = [FreeCut { surface: wave_surface(-3.0, 43.0, -3.0, 33.0), outward: [0.0, 0.0, 1.0] }];
+    solid_from_cuts([-6.0, -6.0, -3.0], [46.0, 36.0, 20.0], &cuts, &free).unwrap().brep
+}
+
+#[test]
+fn cut_stock_trims_a_given_solid_and_skips_what_the_kernel_cannot_do() {
+    let stock = wavy_block();
+    assert_eq!(analytic_faces(&stock).len(), stock.faces.len() - 1, "all faces but the wavy top are analytic");
+    let plane =
+        Cut { shape: Shape::Plane { point: [30.0, 0.0, 0.0], normal: [1.0, 0.0, 0.0] }, convex: true, full: false };
+    let hole = Cut {
+        shape: Shape::Cylinder { point: [12.0, 15.0, 0.0], axis: [0.0, 0.0, 1.0], radius: 3.0 },
+        convex: false,
+        full: true,
+    };
+    let fillet = Cut {
+        shape: Shape::Cylinder { point: [4.0, 4.0, 0.0], axis: [0.0, 0.0, 1.0], radius: 4.0 },
+        convex: true,
+        full: false,
+    };
+    // a plane without a direction cannot be cut with
+    let all_gone =
+        Cut { shape: Shape::Plane { point: [0.0, 0.0, 5.0], normal: [0.0, 0.0, 0.0] }, convex: true, full: false };
+    let built = cut_stock(&stock, &[plane.clone(), hole.clone(), fillet, all_gone], &[], &[], 100, &|| false).unwrap();
+    assert!(matches!(built.primitives[0], CutStatus::Applied("halfspace")), "{:?}", built.primitives[0]);
+    assert!(matches!(built.primitives[1], CutStatus::Applied("subtract")), "{:?}", built.primitives[1]);
+    assert!(
+        matches!(&built.primitives[2], CutStatus::Skipped(why) if why.contains("blend")),
+        "{:?}",
+        built.primitives[2]
+    );
+    assert!(
+        matches!(built.primitives[3], CutStatus::Skipped(_)),
+        "a cut the kernel cannot make is skipped: {:?}",
+        built.primitives[3]
+    );
+    assert!(built.freeform.is_empty());
+    // the plane and the hole are faces of the result, the wavy top is still a spline
+    assert_eq!(faces_on_shape(&built.brep, &plane.shape, 1e-3).len(), 1);
+    assert_eq!(faces_on_shape(&built.brep, &hole.shape, 1e-3).len(), 1);
+    assert_eq!(analytic_faces(&built.brep).len(), built.brep.faces.len() - 1);
+    let v = solid::volume(&built.brep).unwrap();
+    let before = solid::volume(&stock).unwrap();
+    let expected = before * 30.0 / 40.0 - std::f64::consts::PI * 9.0 * 12.0;
+    assert!((v - expected).abs() < 0.03 * expected, "volume {v}, expected about {expected}");
+}
+
+#[test]
+fn cut_stock_with_nothing_applicable_is_an_error_and_bad_input_is_refused() {
+    let stock = wavy_block();
+    let all_gone =
+        Cut { shape: Shape::Plane { point: [0.0, 0.0, 5.0], normal: [0.0, 0.0, 0.0] }, convex: true, full: false };
+    assert!(cut_stock(&stock, &[all_gone], &[], &[], 100, &|| false).is_err());
+    let nan =
+        Cut { shape: Shape::Plane { point: [f64::NAN, 0.0, 0.0], normal: [1.0, 0.0, 0.0] }, convex: true, full: false };
+    assert!(cut_stock(&stock, &[nan], &[], &[], 100, &|| false).is_err());
+    assert!(cut_stock(&stock, &[], &[], &[], 100, &|| false).is_err());
+}
+
+#[test]
+fn cut_stock_leaves_what_is_over_the_work_bound_and_stops_when_cancelled() {
+    let stock = wavy_block();
+    let plane =
+        Cut { shape: Shape::Plane { point: [30.0, 0.0, 0.0], normal: [1.0, 0.0, 0.0] }, convex: true, full: false };
+    let hole = Cut {
+        shape: Shape::Cylinder { point: [12.0, 15.0, 0.0], axis: [0.0, 0.0, 1.0], radius: 3.0 },
+        convex: false,
+        full: true,
+    };
+    // one operation allowed: the plane is cut, the hole is left, with the reason
+    let built = cut_stock(&stock, &[plane.clone(), hole.clone()], &[], &[], 1, &|| false).unwrap();
+    assert!(matches!(built.primitives[0], CutStatus::Applied("halfspace")));
+    assert_eq!(built.primitives[1], CutStatus::Skipped(OVER_WORK_BOUND.into()));
+    assert!(faces_on_shape(&built.brep, &hole.shape, 1e-3).is_empty());
+    // cancelled before the second operation: an error, not a half result
+    let polls = std::cell::Cell::new(0);
+    let cancel_second = || {
+        polls.set(polls.get() + 1);
+        polls.get() > 1
+    };
+    assert!(cut_stock(&stock, &[plane, hole], &[], &[], 100, &cancel_second).is_err());
+    assert!(cut_stock(&stock, &[], &[], &[], 0, &|| true).is_err());
+}
+
+#[test]
+fn a_corner_patch_is_not_an_analytic_face() {
+    let rounded = solid::make_box([0.0; 3], [10.0, 10.0, 10.0]).unwrap();
+    let edges: Vec<usize> = (0..rounded.edges.len()).collect();
+    let r = solid::fillet(&rounded, &edges, 2.0).unwrap();
+    assert!(
+        r.faces.iter().any(|f| matches!(f.surface, Surface::BallPatch { .. })),
+        "the rounds meet in a corner patch"
+    );
+    let ball = r.faces.iter().filter(|f| matches!(f.surface, Surface::BallPatch { .. })).count();
+    assert_eq!(analytic_faces(&r).len() + ball, r.faces.len());
+}
