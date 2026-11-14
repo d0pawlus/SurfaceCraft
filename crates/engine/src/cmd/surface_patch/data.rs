@@ -11,9 +11,12 @@ use surfacecraft_geom::{Cancel, KdTree, Mesh, Point3};
 
 /// Local/global steps of the flattening.
 const ARAP_ITERATIONS: usize = 20;
-/// Most triangles of a region that is flattened: 100 000 take about 3.4 s (20 000: 0.3 s), 400 000
-/// about 47 s (aarch64, `ci` profile). A larger region is fitted on the plane of the outline.
-const MAX_FLATTEN_TRIANGLES: usize = 100_000;
+/// Default of the most triangles of a region that is flattened: 100 000 take about 3.4 s (20 000:
+/// 0.3 s), 400 000 about 47 s (aarch64, `ci` profile). A larger region is fitted on the plane of the
+/// outline.
+pub(super) const DEFAULT_MAX_FLATTEN: usize = 100_000;
+/// Largest value of the limit (the flattening accepts 400 000 triangles).
+pub(super) const MAX_FLATTEN_LIMIT: usize = 400_000;
 
 /// The mesh and the triangles the data come from.
 pub(super) struct Scan {
@@ -125,6 +128,7 @@ fn flattened(
     sides: &[Resolved],
     gap_tol: f64,
     warnings: &mut Vec<String>,
+    limit: usize,
     cancel: &Cancel,
 ) -> Option<(surfacecraft_fit::param::Flattening, Vec<Vec<V2>>)> {
     let boundary = boundary_vertices(scan);
@@ -148,9 +152,9 @@ fn flattened(
         }
         nearest.push(ids);
     }
-    if scan.triangles.len() > MAX_FLATTEN_TRIANGLES {
+    if scan.triangles.len() > limit {
         warnings.push(format!(
-            "the region has {} triangles (at most {MAX_FLATTEN_TRIANGLES} are flattened): the plane of the outline is used",
+            "the region has {} triangles (at most {limit} are flattened, see `max_flatten_triangles`): the plane of the outline is used",
             scan.triangles.len()
         ));
         return None;
@@ -185,12 +189,13 @@ pub(super) fn gather(
     sides: &[Resolved],
     gap_tol: f64,
     max_data: usize,
+    max_flatten: usize,
     warnings: &mut Vec<String>,
     cancel: &Cancel,
 ) -> CmdResult<Gathered> {
     let Some(scan) = scan else { return Ok(Gathered::none()) };
     let ids = vertex_ids(scan);
-    let flat = flattened(scan, sides, gap_tol, warnings, cancel);
+    let flat = flattened(scan, sides, gap_tol, warnings, max_flatten, cancel);
     if cancel.is_cancelled() {
         return Err(crate::cmd::cancelled());
     }

@@ -150,6 +150,9 @@ pub struct PatchIn {
     /// Most control points per direction (4 to 24, default 16).
     #[serde(default)]
     pub max_control: Option<usize>,
+    /// Largest region (triangles) that is flattened to give the data their parameters (default 100000, at most 400000); a larger one is fitted on the plane of the outline.
+    #[serde(default)]
+    pub max_flatten_triangles: Option<usize>,
     /// Largest gap (mm, default 0.01) between the ends of two sides that is closed; a larger one is an error.
     #[serde(default)]
     pub gap_tolerance: Option<f64>,
@@ -223,9 +226,9 @@ pub struct PatchOut {
     pub outside: usize,
     /// The data's largest distance is within `tolerance`.
     pub within_tolerance: bool,
-    /// Every hard side within its targets (gap 1e-3 mm, angle 0.05 degrees, curvature 5 %), interior points and curves on the patch, nothing folded, the hard conditions not contradicting each other, the data within `tolerance` (`within_tolerance`) and no corner relaxed.
+    /// Every hard side within its targets (gap 1e-3 mm, angle 0.05 degrees, curvature 5 %), interior points and curves on the patch, no fold (see `folded`), the hard conditions not contradicting each other, the data within `tolerance` (`within_tolerance`) and no corner relaxed.
     pub within_targets: bool,
-    /// The patch folds: back over a neighbouring face along a side, or over itself inside the outline.
+    /// The surface folds: inside the outline its normal vanishes or turns by more than a right angle between neighbouring samples, or along a g1/g2 side the patch turns back over the neighbouring face. A deep dome or more than half a turn of a cylinder is not a fold (a warning notes that the patch is no graph over the outline's plane).
     pub folded: bool,
     /// The control net stopped growing because the solve of the next net exceeds the cost bound (about 8 s per solve); the result is that of the net reached (a warning says which).
     pub cost_limited: bool,
@@ -255,6 +258,7 @@ struct Settings {
     tolerance: f64,
     max_control: usize,
     gap_tolerance: f64,
+    max_flatten: usize,
 }
 
 fn settings(i: &PatchIn) -> CmdResult<Settings> {
@@ -272,7 +276,11 @@ fn settings(i: &PatchIn) -> CmdResult<Settings> {
     if !(MIN_CONTROL..=MAX_CONTROL).contains(&max_control) {
         return Err(params(format!("max_control must be {MIN_CONTROL} to {MAX_CONTROL}")));
     }
-    Ok(Settings { tolerance, max_control, gap_tolerance })
+    let max_flatten = i.max_flatten_triangles.unwrap_or(data::DEFAULT_MAX_FLATTEN);
+    if max_flatten > data::MAX_FLATTEN_LIMIT {
+        return Err(params(format!("max_flatten_triangles must be at most {}", data::MAX_FLATTEN_LIMIT)));
+    }
+    Ok(Settings { tolerance, max_control, gap_tolerance, max_flatten })
 }
 
 /// The hard and the soft interior points of the request.
@@ -345,6 +353,18 @@ fn side_outs(report: &surfacecraft_kernel::patch_fit::Report, order: &[usize]) -
         .collect()
 }
 
+/// The error of a failed fit; when the data were not flattened (the region was too large or did not
+/// flatten) the note that says so is added, because the plane of the outline may be why it failed.
+fn fit_error(e: KernelError, warnings: &[String]) -> CmdError {
+    if matches!(e, KernelError::Cancelled) {
+        return super::cancelled();
+    }
+    match warnings.iter().find(|w| w.contains("the plane of the outline is used")) {
+        Some(note) => CmdError::Failed(format!("{e}; note: {note}")),
+        None => e.into(),
+    }
+}
+
 fn conflicts(c: Option<ConflictsIn>) -> Conflicts {
     match c.unwrap_or(ConflictsIn::Relax) {
         ConflictsIn::Relax => Conflicts::Relax,
@@ -359,7 +379,8 @@ fn patch_cmd(s: &mut Session, i: PatchIn) -> CmdResult<PatchOut> {
     let (outline, mut warnings) = sides::chain(resolved, st.gap_tolerance)?;
     warnings.extend(ignored_inputs(&i.sides));
     let scan = data::resolve_scan(s, &i)?;
-    let got = data::gather(scan.as_ref(), &outline, st.gap_tolerance, MAX_DATA, &mut warnings, &s.cancel)?;
+    let got =
+        data::gather(scan.as_ref(), &outline, st.gap_tolerance, MAX_DATA, st.max_flatten, &mut warnings, &s.cancel)?;
     let order: Vec<usize> = outline.iter().map(|r| r.index).collect();
     let parameters = if got.side_uv.is_some() { "flattened" } else { "plane" };
     let request = Request {
@@ -376,10 +397,8 @@ fn patch_cmd(s: &mut Session, i: PatchIn) -> CmdResult<PatchOut> {
         conflicts: conflicts(i.conflicts),
         side_ids: order.clone(),
     };
-    let Patch { sheet, report, .. } = fit_patch_cancellable(&request, &s.cancel).map_err(|e| match e {
-        KernelError::Cancelled => super::cancelled(),
-        other => other.into(),
-    })?;
+    let Patch { sheet, report, .. } =
+        fit_patch_cancellable(&request, &s.cancel).map_err(|e| fit_error(e, &warnings))?;
 
     let id = add_patch(s, i.name, scan.as_ref().and_then(|sc| sc.region), sheet, &report)?;
     Ok(patch_out(id, report, parameters, &order, warnings))

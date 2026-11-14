@@ -119,17 +119,19 @@ impl Context<'_> {
     /// round has nothing to fall back on and is an error.
     fn cost_stop(&self, problem: &vpatch::Problem, st: &State) -> Result<Option<CostStop>> {
         let seconds = problem.estimated_seconds();
-        if seconds <= vpatch::MAX_SOLVE_SECONDS {
+        if problem.within_bound() {
             return Ok(None);
         }
         if st.best.is_none() {
             return Err(arg(format!(
-                "the control net {} × {} with {} hard rows is estimated at {seconds:.1} s per solve (limit {:.1} s): \
+                "the control net {} × {} with {} hard rows is estimated at {seconds:.1} s and {:.0} MB per solve (limits {:.1} s and {:.0} MB): \
                  give a smaller `control` or fewer hard points, curves and G1/G2 sides",
                 st.net[0],
                 st.net[1],
                 problem.hard_scalar_rows(),
-                vpatch::MAX_SOLVE_SECONDS
+                problem.estimated_bytes() / 1048576.0,
+                vpatch::MAX_SOLVE_SECONDS,
+                vpatch::MAX_SOLVE_BYTES / 1048576.0
             )));
         }
         Ok(Some(CostStop { net: st.net, seconds }))

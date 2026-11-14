@@ -42,6 +42,7 @@ fn measure_of(sides: Vec<SideReport>) -> Measure {
         data_term: 0.0,
         miss: [0.0, 0.0],
         interior_folded: false,
+        overhangs_plane: false,
     }
 }
 
@@ -112,8 +113,25 @@ fn flat_spline(domain: [[f64; 2]; 2], flip: bool) -> Surface {
     Surface::Spline { u_knots: knots(domain[0]), v_knots: knots(domain[1]), points }
 }
 
+/// A 6 × 6 bicubic in the plane z = 0 whose control rows in u are pushed across each other: the
+/// patch runs forward, back and forward again (a pleat), so its normal vanishes and flips.
+fn pleated_spline(domain: [[f64; 2]; 2]) -> Surface {
+    let Surface::Spline { u_knots, v_knots, points } = flat_spline(domain, false) else { panic!("a spline") };
+    let x = [0.0, 0.2, 0.9, 0.1, 0.8, 1.0];
+    let points = points
+        .iter()
+        .enumerate()
+        .map(|(i, row)| row.iter().map(|p| [domain[0][0] + (domain[0][1] - domain[0][0]) * x[i], p[1], 0.0]).collect())
+        .collect();
+    Surface::Spline { u_knots, v_knots, points }
+}
+
 /// The measurement of `flat_spline` against the square's sides.
 fn measure_square(flip: bool) -> Measure {
+    measure_surface(flip, false)
+}
+
+fn measure_surface(flip: bool, pleat: bool) -> Measure {
     let mut prep = start::prepare(&square_request(), &Cancel::new()).unwrap();
     let net = [6, 6];
     let margin = |d: usize| (prep.lp.bbox[d][1] - prep.lp.bbox[d][0]) / (net[d] as f64 - 1.0);
@@ -123,7 +141,7 @@ fn measure_square(flip: bool) -> Measure {
     ];
     let layout = Layout::new(domain, net);
     let samples = rows::sample_sides(&prep.lp, &layout, &Cancel::new()).unwrap();
-    let surface = flat_spline(domain, flip);
+    let surface = if pleat { pleated_spline(domain) } else { flat_spline(domain, flip) };
     let probe = SurfaceProbe::new(&surface).unwrap();
     let cancel = Cancel::new();
     let goal = Goal { tolerance: 0.2, frozen: &[false; 4], cancel: &cancel };
@@ -141,4 +159,14 @@ fn a_patch_that_runs_back_over_the_reference_face_is_folded() {
     let ok = measure_square(false);
     assert!(!ok.sides[0].folded, "{:?}", ok.sides[0]);
     assert!(ok.targets_met(), "{:?}", ok.sides);
+}
+
+#[test]
+fn a_pleated_surface_folds_and_a_plain_one_does_not() {
+    let pleated = measure_surface(false, true);
+    assert!(pleated.interior_folded, "the normal vanishes and flips across the pleat");
+    assert!(!pleated.targets_met());
+    assert!(pleated.side_miss() > 1.0);
+    let plain = measure_surface(false, false);
+    assert!(!plain.interior_folded && !plain.overhangs_plane);
 }

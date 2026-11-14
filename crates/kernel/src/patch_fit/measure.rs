@@ -1,7 +1,7 @@
 //! Measurement of a fitted patch (design doc §4.3): the gap, angle and curvature error along every
 //! side on the dense samples, the fold test, the deviation of the data, and where the misses lie.
 //! Also re-projects the interior points onto the patch for the next round.
-use super::geom::{V2, add, cross, dot, scale, sub, unit};
+use super::geom::{V2, V3, add, cross, dot, scale, sub, unit};
 use super::reference::RefSample;
 use super::rows::{Layout, MIN_DATA, Sample, SideSamples};
 use super::start::{Interior, Loop, Pt, SideData};
@@ -16,9 +16,9 @@ use surfacecraft_geom::Cancel;
 const FOLD_COS: f64 = 0.1;
 /// Samples (closest-point queries) between two looks at the cancellation flag.
 const POLL_EVERY: usize = 256;
-/// The patch normal at this cosine or less against the outline's plane normal counts as turned over
-/// (the patch is no longer a graph over the plane of the outline: it folds).
-const INTERIOR_FOLD_COS: f64 = 0.0;
+/// A normal `S_u × S_v` shorter than this share of the typical (median) one on the grid is vanishing:
+/// the parameterisation is singular there.
+const VANISH_SHARE: f64 = 1e-3;
 /// Interior check: grid points per direction over the outline's box, at least and at most.
 const INTERIOR_GRID: [usize; 2] = [16, 40];
 
@@ -62,9 +62,13 @@ pub(super) struct Measure {
     pub data_term: f64,
     /// Misses by direction: the largest root-mean-square miss over slabs of the parameter domain.
     pub miss: [f64; 2],
-    /// The patch turns over inside the outline: its normal leaves the half space of the outline's
-    /// plane normal on the interior grid.
+    /// The surface folds inside the outline: on the grid of the trimmed domain its normal
+    /// `S_u × S_v` vanishes, or turns by more than a right angle between neighbouring samples.
     pub interior_folded: bool,
+    /// Information only: the patch is not a graph over the plane of the outline (its normal turns
+    /// past that plane's normal somewhere), as a dome past a hemisphere or more than half a turn of
+    /// a cylinder is. That is not a fold.
+    pub overhangs_plane: bool,
 }
 
 impl Measure {
@@ -365,13 +369,19 @@ fn finish_side(sd: &SideData, ss: &SideSamples, acc: &SideAcc, feet: Vec<V2>) ->
     }
 }
 
-/// Does the patch turn over inside the outline? The unit normal `S_u × S_v` is compared with the
-/// normal of the outline's plane (oriented like the parameters) on a grid of the trimmed domain:
-/// a point where they are at 90° or more apart, or where the patch has no normal, is a fold.
-fn interior_folded(surface: &Surface, lp: &Loop, layout: &Layout, cancel: &Cancel) -> Result<bool> {
-    let Some(n0) = lp.affine.normal() else { return Ok(false) };
+/// The unit normals `S_u × S_v` on a grid of the trimmed domain (`None` outside it), the grid's side,
+/// and the median length of the raw normals.
+struct NormalGrid {
+    n: usize,
+    unit: Vec<Option<V3>>,
+    /// Raw length of the normal at every inside point.
+    len: Vec<Option<f64>>,
+}
+
+fn normal_grid(surface: &Surface, lp: &Loop, layout: &Layout, cancel: &Cancel) -> Result<NormalGrid> {
     let cells = layout.net[0].max(layout.net[1]).saturating_sub(3).max(1);
     let n = (4 * cells).clamp(INTERIOR_GRID[0], INTERIOR_GRID[1]);
+    let (mut unit_n, mut len) = (vec![None; n * n], vec![None; n * n]);
     for i in 0..n {
         poll(cancel)?;
         for j in 0..n {
@@ -384,13 +394,42 @@ fn interior_folded(surface: &Surface, lp: &Loop, layout: &Layout, cancel: &Cance
                 continue;
             }
             let der = derivatives(surface, uv)?;
-            match unit(cross(der[1], der[2])) {
-                Some(nrm) if dot(nrm, n0) > INTERIOR_FOLD_COS => {}
-                _ => return Ok(true),
+            let raw = cross(der[1], der[2]);
+            if let (Some(u), Some(l)) = (unit_n.get_mut(i * n + j), len.get_mut(i * n + j)) {
+                *u = unit(raw);
+                *l = Some(dot(raw, raw).sqrt());
             }
         }
     }
-    Ok(false)
+    Ok(NormalGrid { n, unit: unit_n, len })
+}
+
+/// Does the surface fold inside the outline? A fold is where the normal `S_u × S_v` vanishes (below
+/// [`VANISH_SHARE`] of the median length on the grid) or turns by more than a right angle between
+/// two neighbouring grid points (a negative dot product): the surface has a crease it turns back at.
+/// The second value is information: the normal also leaves the half space of the outline's plane
+/// normal (the patch is not a graph over that plane, which a deep dome or a wrap is not and need
+/// not be).
+fn interior_folded(surface: &Surface, lp: &Loop, layout: &Layout, cancel: &Cancel) -> Result<(bool, bool)> {
+    let g = normal_grid(surface, lp, layout, cancel)?;
+    let mut lens: Vec<f64> = g.len.iter().flatten().copied().collect();
+    lens.sort_by(|a, b| a.total_cmp(b));
+    let median = lens.get(lens.len() / 2).copied().unwrap_or(0.0);
+    let vanishing = g.len.iter().flatten().any(|l| !(*l > VANISH_SHARE * median));
+    let at = |i: usize, j: usize| if i < g.n && j < g.n { g.unit.get(i * g.n + j).copied().flatten() } else { None };
+    let mut turned = false;
+    for i in 0..g.n {
+        for j in 0..g.n {
+            let Some(a) = at(i, j) else { continue };
+            for (di, dj) in [(1, 0), (0, 1)] {
+                if let Some(b) = at(i + di, j + dj) {
+                    turned |= dot(a, b) < 0.0;
+                }
+            }
+        }
+    }
+    let overhang = lp.affine.normal().is_some_and(|n0| g.unit.iter().flatten().any(|n| dot(*n, n0) <= 0.0));
+    Ok((vanishing || turned, overhang))
 }
 
 /// Distance statistics of the data: root-mean-square, 99th percentile and largest.
@@ -425,7 +464,10 @@ fn measure_interior(
     }
     // soft points: re-projected for the next round and reported, they steer no growth
     let mut soft_max: Option<f64> = None;
-    for p in interior.soft.iter_mut() {
+    for (i, p) in interior.soft.iter_mut().enumerate() {
+        if i % POLL_EVERY == 0 {
+            poll(cancel)?;
+        }
         let (d, _, f) = probe.closest_uv(p.xyz)?;
         p.uv = f;
         soft_max = Some(soft_max.map_or(d, |m| m.max(d)));
@@ -459,6 +501,7 @@ pub(super) fn measure(
     let (hard_max, soft_max) = measure_interior(probe, layout, interior, &mut slabs, goal.cancel)?;
     let (mut dists, outside) = reproject_data(probe, lp, &mut interior.data, &mut slabs, goal.tolerance, goal.cancel)?;
     let (points, rms, p99, max) = data_stats(&mut dists);
+    let (interior_folded, overhangs_plane) = interior_folded(surface, lp, layout, goal.cancel)?;
     Ok(Measure {
         sides: reports,
         feet,
@@ -476,6 +519,7 @@ pub(super) fn measure(
         hard_term: hard_max / G0_TARGET,
         data_term: max / goal.tolerance,
         miss: slabs.score(),
-        interior_folded: interior_folded(surface, lp, layout, goal.cancel)?,
+        interior_folded,
+        overhangs_plane,
     })
 }

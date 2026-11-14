@@ -89,7 +89,12 @@ pub(super) fn on_cylinder(s: f64, z: f64) -> [f64; 3] {
 
 /// A five-sided hole of radius 6 in the unrolled cylinder, every side continuing the cylinder.
 pub(super) fn cylinder_hole(continuity: Continuity) -> Request {
-    let corners = regular(5, [0.0, 0.0], 6.0);
+    cylinder_hole_of(6.0, continuity)
+}
+
+/// The same hole with the given radius (mm) in the unrolled cylinder.
+pub(super) fn cylinder_hole_of(radius: f64, continuity: Continuity) -> Request {
+    let corners = regular(5, [0.0, 0.0], radius);
     let sides = polygon(&corners, 40, &|s, z| on_cylinder(s, z))
         .into_iter()
         .map(|mut s| {

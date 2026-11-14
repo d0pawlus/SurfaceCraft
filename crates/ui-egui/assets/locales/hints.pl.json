@@ -535,6 +535,7 @@
   "Split a region that is not a height field (it wraps around) into height-field pieces and\nfit each one (default false: such a region is refused). A split, not a G1 network.": "Dzieli region, który nie jest polem wysokościowym (zawija się), na płaty będące polami wysokościowymi i dopasowuje każdy z nich (domyślnie nie: taki region jest odrzucany). To podział, a nie sieć G1: płaty nie mają ciągłości stycznej.",
   "Split parameters.": "Ustawienia dzielenia.",
   "Stanford PLY (binary little endian on write).": "Plik PLY (zapis w postaci binarnej).",
+  "Largest region (triangles) that is flattened to give the data their parameters (default 100000, at most 400000); a larger one is fitted on the plane of the outline.": "Największy obszar (w trójkątach), który jest spłaszczany, aby nadać danym parametry (domyślnie 100000, najwyżej 400000); większy jest dopasowywany na płaszczyźnie konturu.",
   "Start control net `[u, v]`, 4 to `max_control` per direction; omitted: from the number of data points.": "Początkowa siatka kontrolna [u, v]: od 4 punktów do największej dozwolonej siatki w każdym kierunku; puste pole: z liczby punktów danych.",
   "Start point.": "Punkt początkowy.",
   "Start.": "Początek.",

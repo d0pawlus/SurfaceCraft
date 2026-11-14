@@ -169,7 +169,9 @@ pub struct Report {
     /// corner was relaxed. A side whose gap stopped improving is not excused: it is reported with a
     /// warning instead.
     pub within_targets: bool,
-    /// The patch folds: back over a reference face along a side, or over itself inside the outline.
+    /// The surface folds: its normal vanishes or turns by more than a right angle between neighbouring
+    /// samples inside the outline, or along a G1/G2 side it turns back over the reference face. Not
+    /// merely being no graph over the outline's plane (a deep dome or a wrap).
     pub folded: bool,
     /// One entry per side.
     pub sides: Vec<SideReport>,
@@ -210,9 +212,10 @@ pub const G2_TARGET_REL: f64 = 0.05;
 pub const CORNER_MISMATCH_DEG: f64 = 0.5;
 
 const MAX_ROUNDS: u32 = 6;
-/// A hard row missed by more than this share of [`G0_TARGET`] (as control point motion, mm) means the
-/// hard conditions contradict each other.
-const HARD_RESIDUAL_SHARE: f64 = 0.1;
+/// A hard row missed by more than this share of the loop's diagonal (as control point motion, in the
+/// units of the input) means the hard conditions contradict each other. Relative, so that a part
+/// scaled by any factor gets the same verdict: 1e-5 of a 30 mm outline is 3e-4 mm.
+const HARD_RESIDUAL_REL: f64 = 1e-5;
 /// The default start net of a call with G1/G2 sides (coupled solve) stays at this size; growth goes on
 /// within the cost bound of [`crate::vpatch::MAX_SOLVE_SECONDS`].
 const COUPLED_START_MAX: usize = 16;

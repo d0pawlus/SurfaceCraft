@@ -118,9 +118,22 @@ enum FitFail {
 /// Fits every region as one trimmed patch and adds each as its own surface object. A region that
 /// cannot be fitted is listed in `skipped` with the error text; the others are still made.
 pub(super) fn fit_regions(s: &mut Session, regions: &[NgonRegion], target: &Target<'_>) -> Result<NgonFit, CmdError> {
+    fit_regions_with(s, regions, target, &fit_region)
+}
+
+/// How one region is fitted (a seam for the tests).
+type Fitter<'a> = &'a dyn Fn(&NgonRegion, f64, &Cancel) -> Result<(Patch, surfacecraft_geom::Mesh), FitFail>;
+
+/// [`fit_regions`] with the fitter given.
+fn fit_regions_with(
+    s: &mut Session,
+    regions: &[NgonRegion],
+    target: &Target<'_>,
+    fitter: Fitter<'_>,
+) -> Result<NgonFit, CmdError> {
     let mut out = NgonFit::default();
     for rg in regions {
-        let (patch, display) = match fit_region(rg, target.tolerance, &s.cancel) {
+        let (patch, display) = match fitter(rg, target.tolerance, &s.cancel) {
             Ok(x) => x,
             Err(FitFail::Cancelled) => return Err(cancelled()),
             Err(FitFail::Failed(e)) => {
@@ -177,4 +190,48 @@ pub(super) fn fit_regions(s: &mut Session, regions: &[NgonRegion], target: &Targ
         });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use surfacecraft_fit::features::NgonSide;
+
+    fn pentagon_region() -> NgonRegion {
+        let corners: Vec<[f64; 3]> = (0..5)
+            .map(|k| {
+                let a = std::f64::consts::TAU * k as f64 / 5.0;
+                [15.0 * a.cos(), 15.0 * a.sin(), 0.0]
+            })
+            .collect();
+        let sides = (0..5).map(|k| NgonSide { points: vec![corners[k], corners[(k + 1) % 5]], uv: None }).collect();
+        NgonRegion { corners: vec![0, 1, 2, 3, 4], sides, data: Vec::new(), data_uv: None, triangles: Vec::new() }
+    }
+
+    /// A cancellation after the first patch was added ends the call with the cancellation error; the
+    /// patch stays in the session's document until the engine rolls the undoable command back.
+    #[test]
+    fn a_cancellation_after_the_first_patch_is_the_cancellation_error() {
+        let regions = [pentagon_region(), pentagon_region()];
+        let calls = Cell::new(0);
+        let fitter = |rg: &NgonRegion, tol: f64, cancel: &Cancel| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                return Err(FitFail::Cancelled);
+            }
+            fit_region(rg, tol, cancel)
+        };
+        let mut s = Session::new();
+        let target = Target { name: "n", region: None, tolerance: 0.2 };
+        let r = fit_regions_with(&mut s, &regions, &target, &fitter);
+        assert!(matches!(r, Err(ref e) if crate::cmd::is_cancelled(e)));
+        assert_eq!(s.doc.surfaces.len(), 1, "the first patch was added before the stop");
+    }
+
+    #[test]
+    fn from_curves_is_undoable_so_a_stopped_call_is_rolled_back() {
+        let spec = crate::registry().iter().find(|c| c.id == "surface.from_curves").unwrap();
+        assert!(spec.undoable);
+    }
 }

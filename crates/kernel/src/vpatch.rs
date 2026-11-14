@@ -33,7 +33,7 @@ mod solve;
 
 use assemble::{assemble_soft, control_net, expand_coupled, hard_residual, stiffness};
 use cost::check_cost;
-pub use cost::{MAX_SOLVE_SECONDS, solve_seconds};
+pub use cost::{MAX_SOLVE_BYTES, MAX_SOLVE_SECONDS, solve_bytes, solve_seconds};
 
 /// Fewest control points per direction.
 pub const MIN_CONTROL: usize = 4;

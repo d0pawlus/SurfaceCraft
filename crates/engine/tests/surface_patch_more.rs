@@ -62,15 +62,12 @@ fn g2_through_the_command_reports_curvature_and_what_was_met() {
         assert_eq!(e["continuity"], "g2", "{e}");
         let (angle, curv) = (e["angle_max_deg"].as_f64().unwrap(), e["curvature_error_max"].as_f64().unwrap());
         assert!(angle.is_finite() && curv.is_finite(), "{e}");
-        // `met` says whether the targets held, whatever was asked for
-        let held = e["gap_max_mm"].as_f64().unwrap() <= 1e-3 && angle <= 0.05 && curv <= 0.05 && e["folded"] == false;
-        assert_eq!(e["met"], held, "{e}");
+        // measured on the wavy hole (aarch64): gap 0.02 to 0.33, angle 0.03 to 0.25, curvature 0.11 to
+        // 0.57 of their targets (at least 1.75x to spare): every target is met, not merely reported
+        assert_eq!(e["met"], true, "{e}");
+        assert!(e["gap_max_mm"].as_f64().unwrap() <= 1e-3 && angle <= 0.05 && curv <= 0.05, "{e}");
     }
-    // a side that missed says so in a warning that names it
-    for e in r["sides"].as_array().unwrap().iter().filter(|e| e["met"] == false) {
-        let tag = format!("side {}:", e["side"]);
-        assert!(r["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains(&tag)), "{r}");
-    }
+    assert_eq!(r["within_targets"], true, "{r}");
     assert_eq!(r["folded"], false, "{r}");
     assert!(r["hard_residual_mm"].as_f64().unwrap() < 1e-6, "{r}");
 }
@@ -263,4 +260,73 @@ fn face_on_a_g0_side_is_ignored_with_a_warning() {
     let r = s.execute("surface.patch", json!({"sides": sides})).unwrap();
     let w: Vec<&str> = r["warnings"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
     assert!(w.iter().any(|w| w.contains("side 2") && w.contains("ignored")), "{w:?}");
+}
+
+/// A grid mesh on the surface `p(i / nu, j / nv)` and the four sides of its border, in loop order.
+fn grid_scan(nu: usize, nv: usize, p: &dyn Fn(f64, f64) -> [f64; 3]) -> (Mesh, Vec<Value>) {
+    let at = |i: usize, j: usize| p(i as f64 / nu as f64, j as f64 / nv as f64);
+    let mut positions = Vec::new();
+    for j in 0..=nv {
+        for i in 0..=nu {
+            let q = at(i, j);
+            positions.push(Point3::new(q[0], q[1], q[2]));
+        }
+    }
+    let w = (nu + 1) as u32;
+    let mut triangles = Vec::new();
+    for j in 0..nv as u32 {
+        for i in 0..nu as u32 {
+            let a = j * w + i;
+            triangles.push([a, a + 1, a + w + 1]);
+            triangles.push([a, a + w + 1, a + w]);
+        }
+    }
+    let bottom: Vec<[f64; 3]> = (0..=nu).map(|i| at(i, 0)).collect();
+    let right: Vec<[f64; 3]> = (0..=nv).map(|j| at(nu, j)).collect();
+    let top: Vec<[f64; 3]> = (0..=nu).rev().map(|i| at(i, nv)).collect();
+    let left: Vec<[f64; 3]> = (0..=nv).rev().map(|j| at(0, j)).collect();
+    let sides = [bottom, right, top, left].iter().map(|p| json!({"points": p, "soft": true})).collect();
+    (Mesh { positions, triangles }, sides)
+}
+
+#[test]
+fn a_region_over_the_flatten_limit_is_fitted_on_the_plane_of_the_outline() {
+    let wave = |u: f64, v: f64| {
+        let (x, y) = (60.0 * u, 40.0 * v);
+        [x, y, synth::wave_height(3.0, x, y)]
+    };
+    let (mesh, sides) = grid_scan(40, 30, &wave);
+    let mut s = Session::new();
+    s.doc.add_mesh("scan", mesh);
+    let flattened = s.execute("surface.patch", json!({"sides": sides, "mesh": "scan"})).unwrap();
+    assert_eq!(flattened["parameters"], "flattened", "{flattened}");
+    let r = s.execute("surface.patch", json!({"sides": sides, "mesh": "scan", "max_flatten_triangles": 100})).unwrap();
+    assert_eq!(r["parameters"], "plane", "{r}");
+    let w: Vec<&str> = r["warnings"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    assert!(w.iter().any(|w| w.contains("2400 triangles") && w.contains("at most 100")), "{w:?}");
+    assert!(r["max"].as_f64().unwrap() <= 0.2, "{r}");
+    assert!(
+        s.execute("surface.patch", json!({"sides": sides, "mesh": "scan", "max_flatten_triangles": 400001})).is_err()
+    );
+}
+
+#[test]
+fn when_the_plane_fallback_fails_the_error_says_the_region_was_not_flattened() {
+    // 300 degrees of a cylinder: it flattens by unrolling, but its outline projected on a plane crosses itself
+    let wrap = |u: f64, v: f64| {
+        let t = 300.0_f64.to_radians() * u;
+        [20.0 * t.cos(), 20.0 * t.sin(), 10.0 * v]
+    };
+    let (mesh, sides) = grid_scan(60, 6, &wrap);
+    let mut s = Session::new();
+    s.doc.add_mesh("scan", mesh);
+    let ok = s.execute("surface.patch", json!({"sides": sides, "mesh": "scan"})).unwrap();
+    assert_eq!(ok["parameters"], "flattened", "{ok}");
+    let before = s.doc.surfaces.len();
+    let e = s
+        .execute("surface.patch", json!({"sides": sides, "mesh": "scan", "max_flatten_triangles": 100}))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("height field") && e.contains("at most 100 are flattened"), "{e}");
+    assert_eq!(s.doc.surfaces.len(), before);
 }

@@ -507,6 +507,37 @@ fn rows_that_can_never_hold_together_leave_a_residual() {
 }
 
 #[test]
+fn the_svd_fallback_runs_where_it_is_cheap_and_is_refused_where_it_is_not() {
+    use super::solve::spd_solve;
+    let cancel = Cancel::new();
+    // a singular matrix: Cholesky fails, the pseudo-inverse of a small one is fine (zero solution)
+    let small = spd_solve(&DMatrix::<f64>::zeros(20, 20), &DMatrix::<f64>::zeros(20, 1), &cancel).unwrap();
+    assert!(small.iter().all(|v| *v == 0.0));
+    // 1400 unknowns: the SVD of a 1400 x 1400 matrix is estimated over the bound
+    let started = std::time::Instant::now();
+    let err = spd_solve(&DMatrix::<f64>::zeros(1400, 1400), &DMatrix::<f64>::zeros(1400, 1), &cancel)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("singular beyond what the regularisation covers") && err.contains("limit"), "{err}");
+    assert!(started.elapsed().as_secs_f64() < 10.0);
+}
+
+#[test]
+fn the_memory_estimate_has_a_cap_the_web_build_lowers() {
+    let mb = |b: f64| b / 1048576.0;
+    // the measured peaks of the larger nets (the small ones are the test binary itself) lie under the estimate
+    for (net, rows, measured_mb) in [(16, 455, 72.0), (20, 594, 150.0), (24, 714, 278.0), (24, 1728, 433.0)] {
+        let est = mb(solve_bytes(3 * net * net, rows));
+        assert!(est >= measured_mb && est <= 1.6 * measured_mb, "{net}: estimated {est:.0} MB, measured {measured_mb}");
+    }
+    // the largest net the time bound accepts fits the native cap; 24 x 24 does not fit the web cap,
+    // 20 x 20 does
+    assert!(solve_bytes(3 * 24 * 24, 1728) <= 512.0 * 1048576.0);
+    assert!(solve_bytes(3 * 24 * 24, 714) > 256.0 * 1048576.0);
+    assert!(solve_bytes(3 * 20 * 20, 1200) <= 256.0 * 1048576.0);
+}
+
+#[test]
 fn a_cancelled_solve_returns_the_cancellation() {
     let p = coupled_problem(12, 0);
     let cancel = Cancel::new();

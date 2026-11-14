@@ -138,6 +138,7 @@ fn patch_fills_hole_in_wavy_sheet_g1() {
     assert_eq!(report.len(), 5);
     for e in report {
         assert_eq!(e["continuity"], "g1");
+        assert_eq!(e["met"], true, "{e}");
         assert!(e["angle_max_deg"].as_f64().unwrap() <= 0.05, "{e}");
         assert_eq!(e["folded"], false, "{e}");
     }

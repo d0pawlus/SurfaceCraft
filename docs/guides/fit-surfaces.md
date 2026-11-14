@@ -151,14 +151,29 @@ patch network over a whole scan.
   away from the plane, is refused.
 - Net size: `control` sets the start net `[u, v]`, `max_control` (default 16, at most 24) bounds
   how far it grows.
+- Cost bound. With g1 or g2 sides the solve is dense over three unknowns per control point. Its
+  time and memory are estimated from the net and the number of hard conditions before it runs:
+  one solve may take at most about 8 s (a work estimate, the same on every machine) and 512 MB
+  (256 MB in the web build, which allows a coupled net of 20 x 20 but not 24 x 24). Measured on the
+  development laptop: 16 x 16 takes 1 s and 72 MB, 24 x 24 with 700 hard rows 4 to 5 s and 280 MB,
+  24 x 24 with many hard rows up to 66 s and 430 MB (refused). A start net or a set of hard points
+  over the bound is an error that says so; a net that would have to grow past it stops at the net
+  reached (`cost_limited`, and a warning). A call can be cancelled; it then adds nothing.
+- Regions of more than 100 000 triangles (`max_flatten_triangles`, at most 400 000) are not
+  flattened (about 3 s for 100 000 triangles, 47 s for 400 000): the plane of the outline is used,
+  a warning says so, and if that fails too the error repeats the note.
 
 Reading the report:
 
 - `within_tolerance`: the largest distance of the scan points from the patch (`max`) is within
   `tolerance` (default 0.2 mm). `rms`, `p99` and `max` give the distribution; `points` counts the
   scan points used and `outside` those lying outside the outline (ignored).
-- `within_targets`: every hard side meets its targets, nothing folds back, and no corner had to be
-  relaxed. False is a result to read, not a failure: `sides` and `corners` say which condition
+- `within_targets`: every hard side meets its targets, the surface does not fold, the hard
+  conditions do not contradict each other (`hard_residual_mm`), and no corner had to be relaxed.
+  A fold is where the surface normal vanishes or turns by more than a right angle between
+  neighbouring samples; a deep dome or more than half a turn of a cylinder is not a fold, a warning
+  only notes that the patch is no graph over the outline's plane. Each side's `met` says whether it
+  met its own targets. False is a result to read, not a failure: `sides` and `corners` say which condition
   missed and by how much.
 - `sides`, one per side in loop order: `gap_max_mm` (the largest distance of the side from the
   patch), `angle_max_deg` (G1 and G2), `curvature_error_max` (G2, relative), `samples`, `soft`,

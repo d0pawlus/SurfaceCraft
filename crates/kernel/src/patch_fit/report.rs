@@ -4,7 +4,7 @@ use super::measure::Measure;
 use super::rounds::Outcome;
 use super::start::Loop;
 use super::{
-    CornerReport, G0_TARGET, G1_TARGET_DEG, G2_TARGET_REL, HARD_RESIDUAL_SHARE, Report, SideReport, WARN_FEW_DATA,
+    CornerReport, G0_TARGET, G1_TARGET_DEG, G2_TARGET_REL, HARD_RESIDUAL_REL, Report, SideReport, WARN_FEW_DATA,
     WARN_MAX_CONTROL, WARN_NO_DATA, WARN_TRIM_START,
 };
 use crate::vpatch;
@@ -102,14 +102,22 @@ fn warnings(i: &Inputs, v: &Verdict) -> Vec<String> {
         warnings.push(format!("interior points or curves miss the patch by up to {:.4} mm", m.hard_max));
     }
     if m.interior_folded {
-        warnings
-            .push("the patch folds over inside the outline (its normal turns past the outline's plane)".to_string());
+        warnings.push(
+            "the patch folds inside the outline (its normal vanishes or turns by more than a right angle between neighbouring samples)"
+                .to_string(),
+        );
+    }
+    if m.overhangs_plane && !m.interior_folded {
+        warnings.push(
+            "the patch is not a graph over the plane of the outline (a deep dome or a wrap); that is not a fold"
+                .to_string(),
+        );
     }
     if !residual_ok {
         warnings.push(format!(
             "the hard conditions contradict each other: the solved patch misses one by {:.4} mm (limit {:.4} mm)",
             best.hard_residual,
-            HARD_RESIDUAL_SHARE * G0_TARGET
+            HARD_RESIDUAL_REL * i.lp.diag
         ));
     }
     side_warnings(i.lp, m, &i.outcome.frozen, &mut warnings);
@@ -120,7 +128,7 @@ pub(super) fn build(i: Inputs) -> Report {
     let best = &i.outcome.best;
     let m = &best.measure;
     let within_tolerance = m.points == 0 || m.max <= i.tolerance;
-    let residual_ok = best.hard_residual <= HARD_RESIDUAL_SHARE * G0_TARGET;
+    let residual_ok = best.hard_residual <= HARD_RESIDUAL_REL * i.lp.diag;
     let within_targets = m.targets_met() && within_tolerance && i.corners.is_empty() && residual_ok;
     let warnings = warnings(&i, &Verdict { within_tolerance, residual_ok, within_targets });
     Report {
