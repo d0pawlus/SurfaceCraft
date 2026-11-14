@@ -86,7 +86,7 @@ impl Placement {
 }
 
 /// The kernel's evaluator of the primitive `shape`: distance of a point from it and its closest point.
-pub(super) struct Gauge {
+pub struct Gauge {
     eval: SurfaceEval,
 }
 
@@ -94,17 +94,19 @@ impl Gauge {
     /// # Errors
     /// A shape that is not finite or is degenerate (a zero axis or normal, a radius or half angle
     /// outside its range), and a torus.
-    pub(super) fn new(shape: &Shape) -> Result<Self> {
+    pub fn new(shape: &Shape) -> Result<Self> {
         Ok(Self { eval: evaluator(&surface_of(shape)?)? })
     }
 
     /// The point of the surface closest to `p`.
-    pub(super) fn closest(&self, p: V) -> Option<V> {
+    #[must_use]
+    pub fn closest(&self, p: V) -> Option<V> {
         closest_on(&self.eval, p)
     }
 
     /// Distance of `p` from the surface.
-    pub(super) fn distance(&self, p: V) -> Option<f64> {
+    #[must_use]
+    pub fn distance(&self, p: V) -> Option<f64> {
         self.closest(p).map(|q| norm(sub(q, p))).filter(|d| d.is_finite())
     }
 }

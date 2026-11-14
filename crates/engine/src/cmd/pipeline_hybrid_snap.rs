@@ -1,11 +1,12 @@
 //! The prepared copy of the scan that the hybrid method wraps (P9-O6b): the vertices of every
-//! protected region that lie within a distance of their primitive are put exactly on it (projected,
-//! never pushed beyond), so the patches fitted over the region lie on the primitive and can be
-//! merged into one analytic face. The rest of the scan is untouched. The judge never sees this copy:
+//! protected region that lie within a distance of their primitive are put exactly on it (projected by the
+//! kernel's `put_on_all`, which the merge's snap uses too, never pushed beyond), so the patches fitted over
+//! the region lie on the primitive and can be merged into one analytic face. The rest of the scan is untouched. The judge never sees this copy:
 //! the body is measured against the original scan.
 use surfacecraft_fit::Primitive;
 use surfacecraft_geom::{Mesh, Point3};
 use surfacecraft_kernel::hybrid::Shape;
+use surfacecraft_kernel::merge::{Gauge, put_on_all};
 
 /// The primitive of a kernel shape and back: the same parameters.
 pub(super) fn shape_of(p: &Primitive) -> Shape {
@@ -18,31 +19,6 @@ pub(super) fn shape_of(p: &Primitive) -> Shape {
             Shape::Torus { center: *center, axis: *axis, major_radius: *major_radius, minor_radius: *minor_radius }
         }
     }
-}
-
-/// Alternating projections that put a vertex on every primitive it belongs to.
-const MAX_ALTERNATIONS: usize = 40;
-/// A vertex lies on a primitive when it is this close (mm).
-const ON_SURFACE: f64 = 1e-7;
-
-/// Where `p` goes: onto the primitive of its only region, or, on the border of several regions (a
-/// sharp edge), onto all their primitives by alternating projections (their intersection curve).
-/// `None` when it would move more than `max_move`, or where the primitives have no common point
-/// near it: such a vertex goes onto the first primitive only.
-fn target(p: &Point3, primitives: &[&Primitive], max_move: f64) -> Option<Point3> {
-    let mut q = *p;
-    for _ in 0..MAX_ALTERNATIONS {
-        for prim in primitives {
-            q = prim.project(&q);
-        }
-        if primitives.iter().all(|prim| prim.distance(&q).abs() <= ON_SURFACE) {
-            break;
-        }
-    }
-    let on_all = primitives.iter().all(|prim| prim.distance(&q).abs() <= ON_SURFACE);
-    let q = if on_all || primitives.len() < 2 { q } else { primitives.first()?.project(p) };
-    let moved = (q - p).norm();
-    (moved.is_finite() && moved <= max_move && q.coords.iter().all(|c| c.is_finite())).then_some(q)
 }
 
 /// A copy of `mesh` with the vertices of each region (given as triangle lists with their primitive)
@@ -64,11 +40,13 @@ pub(super) fn projected(mesh: &Mesh, regions: &[(&[u32], &Primitive)], max_move:
             }
         }
     }
+    // the kernel's evaluators of the primitives, and its bounded projection onto all of a vertex's primitives
+    let gauges: Vec<Option<Gauge>> = regions.iter().map(|(_, p)| Gauge::new(&shape_of(p)).ok()).collect();
     let mut positions = mesh.positions.clone();
     for (slot, (list, p)) in positions.iter_mut().zip(owners.iter().zip(&mesh.positions)) {
-        let prims: Vec<&Primitive> = list.iter().filter_map(|&k| regions.get(k).map(|r| r.1)).collect();
-        if let Some(q) = (!prims.is_empty()).then(|| target(p, &prims, max_move)).flatten() {
-            *slot = q;
+        let on: Vec<&Gauge> = list.iter().filter_map(|&k| gauges.get(k).and_then(Option::as_ref)).collect();
+        if let Some(q) = put_on_all(&on, [p.x, p.y, p.z], max_move) {
+            *slot = Point3::new(q[0], q[1], q[2]);
         }
     }
     Mesh { positions, triangles: mesh.triangles.clone() }

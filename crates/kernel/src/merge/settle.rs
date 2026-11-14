@@ -153,8 +153,8 @@ fn face_sheet(body: &Brep, face: usize) -> Result<Brep> {
 }
 
 /// The verdict on the new face of one group (`face` in `brep`): it tessellates, alone and at the
-/// display chord and at `chord`, to the area of the patches it replaced, and the display tessellation
-/// passes the direct checks against them.
+/// display chord and at `chord`, to the area of the patches it replaced, the display tessellation
+/// passes the direct checks against them, and its border is the group's.
 fn face_verdict(
     body: &Brep,
     brep: &Brep,
@@ -169,7 +169,8 @@ fn face_verdict(
     }
     let sheet = face_sheet(brep, face)?;
     // the display chord, the chord of the area check and the chord of the judge (a twentieth of the gap)
-    for c in [None, Some(chord), Some(JUDGE_CHORD_SHARE * (chord / 2.0))] {
+    let judge_chord = JUDGE_CHORD_SHARE * (chord / 2.0);
+    for c in [None, Some(chord), Some(judge_chord)] {
         let at = c.map_or_else(|| "display chord".to_string(), |c| format!("chord {c:.3}"));
         let Ok(topo) = crate::tess::tessellate_topo(&sheet, c) else {
             return Ok(Err(format!("the mesher cannot triangulate the new face at the {at}")));
@@ -179,7 +180,13 @@ fn face_verdict(
             return Ok(Err(format!("the new face tessellates to {ratio:.3} of its patches' area at the {at}")));
         }
         if c.is_none()
-            && let Err(e) = check::check_face(&topo.mesh, p.forward, &p.cloud, body, p.limit)
+            && let Err(e) = check::check_face(&topo.mesh, &topo.edges, p.forward, &p.cloud, (body, &p.gauge), p.limit)
+        {
+            return Ok(Err(e.to_string()));
+        }
+        // the border is compared with the group's on the finest tessellation, whose chord is the stated slack
+        if c == Some(judge_chord)
+            && let Err(e) = check::check_border(&p.cloud, &topo.edges, p.limit, judge_chord)
         {
             return Ok(Err(e.to_string()));
         }
@@ -325,5 +332,109 @@ mod tests {
         }));
         b.validate().unwrap();
         assert_eq!(canonicalize(b.clone()), b);
+    }
+
+    /// A unit cube of six bilinear patches (a closed, canonical record, every face used forward).
+    fn cube() -> Brep {
+        let v = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [0.0, 1.0, 1.0],
+        ];
+        let corners = [[0, 1, 2, 3], [4, 5, 6, 7], [0, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7]];
+        let nets: Vec<Vec<Vec<[f64; 3]>>> =
+            corners.iter().map(|c| vec![vec![v[c[0]], v[c[3]]], vec![v[c[1]], v[c[2]]]]).collect();
+        let ids: Vec<[u32; 4]> = corners.iter().map(|c| c.map(|i| i as u32)).collect();
+        sheet_from_bezier_network(&nets, &ids).unwrap()
+    }
+
+    /// `face` of `b` as its other side: the surface's net transposed (its natural normal now points the other
+    /// way), the loops walked the other way round and the pcurves' parameters swapped, and the shell using it
+    /// backward. The body is the same body.
+    fn face_as_used_backward(b: &Brep, face: usize) -> Brep {
+        use crate::record::brep::{Curve2, Loop, Surface};
+        let mut out = b.clone();
+        let f = &mut out.faces[face];
+        if let Surface::Spline { points, u_knots, v_knots } = &mut f.surface {
+            let t: Vec<Vec<[f64; 3]>> = (0..points[0].len()).map(|j| points.iter().map(|r| r[j]).collect()).collect();
+            *points = t;
+            std::mem::swap(u_knots, v_knots);
+        }
+        for l in &mut f.loops {
+            if let Loop::Edges { edges } = l {
+                edges.reverse();
+                for e in edges.iter_mut() {
+                    e.forward = !e.forward;
+                    if let Curve2::Spline { points, .. } = &mut e.pcurve {
+                        points.iter_mut().for_each(|q| q.swap(0, 1));
+                    }
+                }
+            }
+        }
+        f.domain = [f.domain[1], f.domain[0]];
+        for s in &mut out.shells {
+            if let Shell::Faces { faces, .. } = s {
+                faces.iter_mut().filter(|o| o.face as usize == face).for_each(|o| o.forward = false);
+            }
+        }
+        out
+    }
+
+    fn signed_volume(m: &surfacecraft_geom::Mesh) -> f64 {
+        (0..m.triangle_count())
+            .filter_map(|t| m.triangle(t))
+            .map(|[a, b, c]| a.coords.dot(&b.coords.cross(&c.coords)) / 6.0)
+            .sum()
+    }
+
+    /// `canonicalize` of a record with a face used backward: the record is valid and canonical, the kernel
+    /// builds the unit cube from it (volume 1, positive), every triangle of the tessellation runs outward and
+    /// the STEP round trip keeps the volume.
+    #[test]
+    fn a_face_used_backward_is_walked_from_its_other_side() {
+        let cube = cube();
+        assert!(is_closed(&cube));
+        for face in 0..6 {
+            let backward = face_as_used_backward(&cube, face);
+            let c = canonicalize(backward);
+            c.validate().unwrap_or_else(|e| panic!("face {face}: {e:?}"));
+            assert!(
+                c.shells.iter().any(|s| matches!(s, Shell::Faces { faces, .. } if faces.iter().any(|o| !o.forward)))
+            );
+            let volume = crate::solid::volume(&c).unwrap();
+            assert!((volume - 1.0).abs() < 1e-9, "face {face}: volume {volume}");
+            let mesh = crate::tess::tessellate_all(&c, None).unwrap();
+            assert!((signed_volume(&mesh) - 1.0).abs() < 1e-6, "face {face}: the triangles run outward");
+            let text = crate::step::export_solids(&[("cube", &c)]).unwrap();
+            let back = crate::step::import(text.as_bytes()).unwrap();
+            assert!((crate::solid::volume(&back[0]).unwrap() - 1.0).abs() < 1e-6, "face {face}: STEP");
+        }
+    }
+
+    /// A body with every face forward is canonical: `canonicalize` is the identity on it (the other callers).
+    #[test]
+    fn a_closed_record_with_forward_faces_only_is_unchanged_by_canonicalize() {
+        let cube = cube();
+        assert_eq!(canonicalize(cube.clone()), cube);
+    }
+
+    /// The other callers of `canonicalize` give the records they gave before the backward walk existed: the
+    /// network of the cube above and its extracted faces are canonical, with the counts and the area they have.
+    #[test]
+    fn the_extracted_faces_of_a_cube_are_canonical_with_their_counts_and_area() {
+        let cube = cube();
+        assert_eq!((cube.faces.len(), cube.edges.len(), cube.vertices.len()), (6, 12, 8));
+        for face in 0..6 {
+            let sheet = crate::hybrid::extract_face(&cube, face).unwrap();
+            assert_eq!((sheet.faces.len(), sheet.edges.len(), sheet.vertices.len()), (1, 4, 4), "face {face}");
+            assert_eq!(canonicalize(sheet.clone()), sheet, "face {face}");
+            let area = crate::tess::tessellate_all(&sheet, None).unwrap().area();
+            assert!((area - 1.0).abs() < 1e-9, "face {face}: {area}");
+        }
     }
 }

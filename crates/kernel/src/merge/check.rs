@@ -1,6 +1,7 @@
 //! Direct checks of a new face against the patches it replaced: its normal agrees with theirs, and
 //! its surface lies within the gap of theirs. Neither depends on area or volume, so a flipped face,
 //! a complementary one and a face on a sheet (which has no volume) are caught.
+use super::place::Gauge;
 use super::samples::grid_area;
 use crate::hybrid::{V, cross, dot, norm, sub, unit};
 use crate::record::brep::{Brep, Shell};
@@ -8,7 +9,7 @@ use crate::{KernelError, Result};
 use solidcore::eval::SurfaceEval;
 use solidcore::math::Vec3;
 use std::collections::BTreeMap;
-use surfacecraft_geom::Mesh;
+use surfacecraft_geom::{Mesh, Point3};
 
 /// Cells a side of the grid the replaced patches are sampled on.
 const CLOUD_GRID: usize = 4;
@@ -31,8 +32,10 @@ const MIN_SIN_BETWEEN_TANGENTS: f64 = 0.1;
 const NEAREST_PATCHES: usize = 12;
 /// A point of the new face may be this much farther from the patches than the gap.
 const PROXIMITY_SLACK: f64 = 1.5;
-/// ... except within this many gaps of the border of the group.
-const BORDER_MARGIN: f64 = 2.0;
+/// A corner is on the border of the new face (and the border test, not the proximity test, answers for it)
+/// when it is this close (mm) to the face's own tessellated border: the corners of the mesh that lie on the
+/// boundary edges are vertices of that border, so this is rounding, not a band.
+const ON_BORDER: f64 = 1e-6;
 
 /// Points of the replaced patches with their outward normals.
 pub(super) struct Cloud {
@@ -41,8 +44,8 @@ pub(super) struct Cloud {
     faces: Vec<usize>,
     /// For each patch: `1` when the shell uses it along its natural normal, else `-1`.
     signs: BTreeMap<usize, f64>,
-    /// Points along the border of the group (its boundary edges).
-    border: Vec<V>,
+    /// The points along each boundary edge of the group.
+    border: Vec<Vec<V>>,
 }
 
 /// Does the shell of `body` use `face` along its natural normal?
@@ -68,7 +71,7 @@ fn evaluator(body: &Brep, face: usize) -> Result<SurfaceEval> {
 const MIN_PATCH_AREA_SHARE: f64 = 0.05;
 
 /// Samples the patches `faces` of `body` (points and outward normals), leaving out collapsed ones.
-pub(super) fn cloud(body: &Brep, faces: &[usize], border: Vec<V>) -> Result<Cloud> {
+pub(super) fn cloud(body: &Brep, faces: &[usize], border: Vec<Vec<V>>) -> Result<Cloud> {
     let mut blocks: Vec<(usize, Vec<V>, Vec<V>)> = Vec::new();
     for &f in faces {
         let eval = evaluator(body, f)?;
@@ -113,13 +116,6 @@ pub(super) fn cloud(body: &Brep, faces: &[usize], border: Vec<V>) -> Result<Clou
 }
 
 impl Cloud {
-    /// Is `p` within `reach` of the border of the group? Near it the face and the staircase of patches
-    /// differ sideways (a tiny hole the mesher closes, a patch edge across a corner), which says nothing
-    /// of whether the face leaves the patches.
-    fn near_border(&self, p: V, reach: f64) -> bool {
-        self.border.iter().any(|q| norm(sub(*q, p)) <= reach)
-    }
-
     /// The `n` patches nearest `p` by the box of their samples (a corner over a patch has distance 0 to
     /// its box; of the patches that hold it, the smaller come first). The distance to the centre of a box
     /// would put the small patches round a corner before the large one it lies over.
@@ -197,7 +193,16 @@ fn spread(k: usize, n: usize) -> (usize, usize) {
 /// agrees with the patch's at the nearest point, and the corner (which lies on the surface, unlike the
 /// triangle's centre) lies within `gap` (times a slack) of a patch. A corner the patches cannot be
 /// measured against is a failure, not a pass.
-pub(super) fn check_face(mesh: &Mesh, forward: bool, cloud: &Cloud, body: &Brep, gap: f64) -> Result<()> {
+pub(super) fn check_face(
+    mesh: &Mesh,
+    border: &[Vec<Point3>],
+    forward: bool,
+    cloud: &Cloud,
+    face: (&Brep, &Gauge),
+    gap: f64,
+) -> Result<()> {
+    let (body, gauge) = face;
+    let border: Vec<Vec<V>> = border.iter().map(|l| l.iter().map(|p| [p.x, p.y, p.z]).collect()).collect();
     let n = mesh.triangle_count();
     if n == 0 || cloud.points.is_empty() {
         return Err(KernelError::Argument("the new face has no triangles to check".into()));
@@ -221,24 +226,75 @@ pub(super) fn check_face(mesh: &Mesh, forward: bool, cloud: &Cloud, body: &Brep,
         else {
             continue;
         };
-        let (distance, normal) = nearest_over(cloud, body, &mut evals, *a, reach)?;
-        if distance > PROXIMITY_SLACK * gap + 1e-6 && !cloud.near_border(*a, BORDER_MARGIN * gap) {
-            return Err(KernelError::Argument(format!(
-                "the new face leaves the patches it replaced by {distance:.3} mm (limit {:.3}) at ({:.1}, {:.1}, {:.1})",
-                PROXIMITY_SLACK * gap,
-                a[0],
-                a[1],
-                a[2]
-            )));
-        }
-        if let Some(pn) = normal {
-            checked += 1;
-            agree += usize::from(sign * dot(tn, pn) >= MIN_DOT);
+        // the corner, and the middle of the triangle put on the surface (a flat face is cut into a few large
+        // triangles whose corners are all on its border: its middle is only seen through the centroids)
+        let middle = [(a[0] + b[0] + c[0]) / 3.0, (a[1] + b[1] + c[1]) / 3.0, (a[2] + b[2] + c[2]) / 3.0];
+        for probe in [*a, gauge.closest(middle).unwrap_or(middle)] {
+            let (distance, normal) = nearest_over(cloud, body, &mut evals, probe, reach)?;
+            if distance > PROXIMITY_SLACK * gap + 1e-6 && distance_to_lines(probe, &border) > ON_BORDER {
+                return Err(KernelError::Argument(format!(
+                    "the new face leaves the patches it replaced by {distance:.3} mm (limit {:.3}) at ({:.1}, {:.1}, {:.1})",
+                    PROXIMITY_SLACK * gap,
+                    probe[0],
+                    probe[1],
+                    probe[2]
+                )));
+            }
+            if let Some(pn) = normal {
+                checked += 1;
+                agree += usize::from(sign * dot(tn, pn) >= MIN_DOT);
+            }
         }
     }
     if checked == 0 || ((checked - agree) as f64) > DISAGREE_ALLOWANCE * checked as f64 {
         return Err(KernelError::Argument(format!(
             "the new face's normal disagrees with the patches' ({agree} of {checked} checked)"
+        )));
+    }
+    Ok(())
+}
+
+/// The distance of `p` from the nearest of the polylines `lines` (infinite for none).
+fn distance_to_lines(p: V, lines: &[Vec<V>]) -> f64 {
+    let mut best = f64::INFINITY;
+    for line in lines {
+        if let [only] = line.as_slice() {
+            best = best.min(norm(sub(p, *only)));
+        }
+        for w in line.windows(2) {
+            if let [a, b] = w {
+                let ab = sub(*b, *a);
+                let t = (dot(sub(p, *a), ab) / dot(ab, ab).max(1e-300)).clamp(0.0, 1.0);
+                let q = [a[0] + t * ab[0], a[1] + t * ab[1], a[2] + t * ab[2]];
+                best = best.min(norm(sub(p, q)));
+            }
+        }
+    }
+    best
+}
+
+/// The border of the new face (`tessellated`: its boundary edges as the mesher cut them, `chord` the
+/// mesher's chord) against the border of the group it replaced: every point of each lies within the gap
+/// (`limit`) and the chord of the other. A face whose loop misses an edge, takes a short cut across a corner
+/// or goes round a different way has points farther than that from the group's border.
+///
+/// # Errors
+/// A point of either border that is farther from the other than that.
+pub(super) fn check_border(cloud: &Cloud, tessellated: &[Vec<Point3>], limit: f64, chord: f64) -> Result<()> {
+    let lines: Vec<Vec<V>> = tessellated.iter().map(|l| l.iter().map(|p| [p.x, p.y, p.z]).collect()).collect();
+    let reach = limit + chord + 1e-6;
+    let off =
+        |from: &[Vec<V>], to: &[Vec<V>]| from.iter().flatten().copied().find(|p| distance_to_lines(*p, to) > reach);
+    if let Some(p) = off(&lines, &cloud.border) {
+        return Err(KernelError::Argument(format!(
+            "the new face's border leaves the group's border by more than {reach:.3} mm at ({:.1}, {:.1}, {:.1})",
+            p[0], p[1], p[2]
+        )));
+    }
+    if let Some(p) = off(&cloud.border, &lines) {
+        return Err(KernelError::Argument(format!(
+            "the group's border is farther than {reach:.3} mm from the new face's at ({:.1}, {:.1}, {:.1})",
+            p[0], p[1], p[2]
         )));
     }
     Ok(())
@@ -261,14 +317,18 @@ mod tests {
         (body, mesh)
     }
 
+    fn flat() -> Gauge {
+        Gauge::new(&crate::hybrid::Shape::Plane { point: [0.0; 3], normal: [0.0, 0.0, 1.0] }).unwrap()
+    }
+
     #[test]
     fn a_face_that_lies_on_the_patches_with_their_normal_is_accepted_and_a_flipped_one_is_refused() {
         let (body, mesh) = sheet();
         let c = cloud(&body, &[0], Vec::new()).unwrap();
         let outward = c.normals.first().copied().unwrap();
         let along_mesh = outward[2] > 0.0;
-        assert!(check_face(&mesh, along_mesh, &c, &body, 0.05).is_ok());
-        assert!(check_face(&mesh, !along_mesh, &c, &body, 0.05).is_err(), "a flipped sense");
+        assert!(check_face(&mesh, &[], along_mesh, &c, (&body, &flat()), 0.05).is_ok());
+        assert!(check_face(&mesh, &[], !along_mesh, &c, (&body, &flat()), 0.05).is_err(), "a flipped sense");
     }
 
     #[test]
@@ -279,6 +339,58 @@ mod tests {
             p.z = 1.0;
         }
         let along_mesh = c.normals.first().is_some_and(|n| n[2] > 0.0);
-        assert!(check_face(&mesh, along_mesh, &c, &body, 0.05).is_err());
+        assert!(check_face(&mesh, &[], along_mesh, &c, (&body, &flat()), 0.05).is_err());
+    }
+
+    fn line(a: (f64, f64), b: (f64, f64), n: usize) -> Vec<Point3> {
+        (0..=n)
+            .map(|i| {
+                let t = i as f64 / n as f64;
+                Point3::new(a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t, 0.0)
+            })
+            .collect()
+    }
+
+    fn square_border() -> Vec<Vec<Point3>> {
+        let corners = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)];
+        (0..4).map(|k| line(corners[k], corners[(k + 1) % 4], 10)).collect()
+    }
+
+    fn as_v(border: &[Vec<Point3>]) -> Vec<Vec<V>> {
+        border.iter().map(|l| l.iter().map(|p| [p.x, p.y, p.z]).collect()).collect()
+    }
+
+    /// The border of the new face is the group's: the same border passes, and a loop that misses an edge or cuts a
+    /// corner short (2 mm off the border, the gap being 0.05) does not.
+    #[test]
+    fn a_border_that_misses_an_edge_or_cuts_a_corner_is_refused() {
+        let (body, _) = sheet();
+        let c = cloud(&body, &[0], as_v(&square_border())).unwrap();
+        assert!(check_border(&c, &square_border(), 0.05, 0.01).is_ok());
+        let missing: Vec<Vec<Point3>> = square_border().into_iter().take(3).collect();
+        assert!(check_border(&c, &missing, 0.05, 0.01).is_err(), "an edge of the group is not on the face");
+        let mut cut = square_border();
+        cut[1] = line((10.0, 0.0), (8.0, 10.0), 10);
+        cut[2] = line((8.0, 10.0), (8.0, 10.0), 1);
+        assert!(check_border(&c, &cut, 0.05, 0.01).is_err(), "the face's border leaves the group's");
+        let extra = [square_border(), vec![line((0.0, 0.0), (10.0, 10.0), 10)]].concat();
+        assert!(check_border(&c, &extra, 0.05, 0.01).is_err(), "a border across the group");
+    }
+
+    /// A corner of the face that is not on its border, even 0.08 mm from it, is held to the proximity limit (1.5
+    /// gaps, 0.075): the band of two gaps round the border that was exempt before is gone.
+    #[test]
+    fn a_corner_close_to_the_border_but_off_the_patches_is_refused() {
+        let (body, mut mesh) = sheet();
+        let c = cloud(&body, &[0], as_v(&square_border())).unwrap();
+        let along_mesh = c.normals.first().is_some_and(|n| n[2] > 0.0);
+        let on_patches = check_face(&mesh, &square_border(), along_mesh, &c, (&body, &flat()), 0.05);
+        assert!(on_patches.is_ok(), "{on_patches:?}");
+        mesh.positions[2].z = 0.08;
+        let lifted = check_face(&mesh, &square_border(), along_mesh, &c, (&body, &flat()), 0.05);
+        assert!(lifted.is_err(), "the corner is 0.08 mm off the patches and 0.08 mm from their border");
+        // a corner that IS a point of the face's border is left to the border test
+        let on_border = vec![vec![Point3::new(10.0, 10.0, 0.08)]];
+        assert!(check_face(&mesh, &on_border, along_mesh, &c, (&body, &flat()), 0.05).is_ok());
     }
 }

@@ -3,14 +3,15 @@
 //! closed (or as open) as the wrap was.
 //!
 //! A patch belongs to a primitive when the scan triangle nearest its middle is in the primitive's
-//! region and every sample on it lies within a margin of the primitive and of a triangle of the
-//! region: a patch that straddles the border over a surface that leaves the primitive has a sample
-//! off it, one that follows the border (a crease) is wholly inside. The patches of one primitive that touch along edges form a group, which
+//! region and every sample on it lies within a margin of the primitive and of the scan, where the scan is the
+//! region's or nobody's: a patch that straddles the border over a surface that leaves the primitive has a sample
+//! off it, one that straddles two primitives has a sample over the other's triangles. The patches of one primitive that touch along edges form a group, which
 //! the kernel replaces by one face on the primitive (`merge_faces_onto_shape`); a group the kernel
 //! cannot merge stays patches and is reported with the reason.
 use super::hybrid_method::{LeftPatches, MergedFace};
 use crate::Session;
 use crate::cmd::{CmdError, cancelled};
+use pinholes::pinholes;
 use surfacecraft_doc::ObjectId;
 use surfacecraft_fit::Primitive;
 use surfacecraft_geom::{Bvh, Mesh, Point3, par};
@@ -19,6 +20,10 @@ use surfacecraft_kernel::merge::{
     Batch, GroupSpec, MAX_GAP, face_samples, grid_area, merge_faces_onto_shapes, pinch_free_groups, split_round,
 };
 use surfacecraft_kernel::record::brep::Brep;
+use surfacecraft_kernel::tess::TopoMesh;
+
+#[path = "pipeline_pinholes.rs"]
+mod pinholes;
 
 /// Samples per side of a patch's grid (so `(n + 1)^2` points are tested) at least.
 const SAMPLES_PER_SIDE: usize = 5;
@@ -31,14 +36,13 @@ const MAX_SAMPLES_PER_SIDE: usize = 48;
 const SAMPLE_SHARE_OF_TOLERANCE: f64 = 1.0;
 /// The boundary of a merged group may leave its primitive by this share of the tolerance.
 const GAP_SHARE_OF_TOLERANCE: f64 = 1.0;
-/// A sample must lie within this share of the tolerance of a triangle of the primitive's region ...
-const NEAR_REGION_SHARE_OF_TOLERANCE: f64 = 1.0;
-/// ... except for this share of the samples of a patch: the region is what the scan is there, and the
-/// segmentation leaves pinholes (a few unassigned triangles) in a large flat face, which stopped every large
-/// patch of a plate from joining its plane (measured: a disc of two 2 463 mm2 faces merged 590 mm2 of one and
-/// none of the other with every sample required; the patches that should join had 0.04 to 3.7 % of their
-/// samples in a pinhole).
-const MAX_SHARE_OUTSIDE_REGION: f64 = 0.04;
+/// Every sample must have a triangle of the scan within this share of the tolerance, and the triangle must be the
+/// region's or belong to no region (the pinholes of the region, `pinholes`, are the region's). A share of the
+/// samples outside the region cannot be allowed instead: a patch that lies on a primitive reaches past its
+/// region over a tangent round (the part of a round that stays within the tolerance of the wall is as long as
+/// the root of twice the radius times the tolerance), so 1 to 18 of 324 to 576 samples lie outside the region of
+/// patches that belong to it (measured), and 4 % was a bound that moved with every layout of the patches.
+const NEAR_SCAN_SHARE_OF_TOLERANCE: f64 = 1.0;
 /// How far from a sample the scan is looked for, in tolerances.
 const SEARCH_TOLERANCES: f64 = 4.0;
 /// A group of less area than this many squared tolerances stays patches (collapsed and sliver
@@ -65,6 +69,12 @@ pub(super) struct Merging {
     pub body: Brep,
     pub merged: Vec<MergedFace>,
     pub left: Vec<LeftPatches>,
+    /// Groups that were merged without their border being moved onto the primitive first, with the reason (one
+    /// line each).
+    pub notes: Vec<String>,
+    /// The body tessellated at the chord the areas are measured on, when it has been (the summary of the result
+    /// reads it and does not tessellate again).
+    pub mesh: Option<TopoMesh>,
 }
 
 /// The region each scan triangle belongs to (`NONE` for none).
@@ -80,38 +90,25 @@ fn region_owners(scan: &Mesh, protected: &[Protected]) -> Vec<u32> {
     owner
 }
 
-/// The triangles of one region as a mesh of their own (vertices renumbered).
-fn region_mesh(scan: &Mesh, triangles: &[u32]) -> Mesh {
-    let mut index: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-    let mut out = Mesh::default();
-    for &t in triangles {
-        let Some(tri) = scan.triangles.get(t as usize) else { continue };
-        let mut mapped = [0u32; 3];
-        for (slot, &v) in mapped.iter_mut().zip(tri) {
-            let Some(p) = scan.positions.get(v as usize) else { continue };
-            *slot = *index.entry(v).or_insert_with(|| {
-                out.positions.push(*p);
-                (out.positions.len() - 1) as u32
-            });
-        }
-        out.triangles.push(mapped);
-    }
-    out
-}
-
 /// What the choice of a patch's primitive looks at.
 struct Lookup<'a> {
     all: Bvh,
     owner: Vec<u32>,
-    regions: Vec<Bvh>,
     protected: &'a [Protected],
     tol: f64,
 }
 
 impl<'a> Lookup<'a> {
     fn new(scan: &Mesh, protected: &'a [Protected], tol: f64) -> Self {
-        let regions = protected.iter().map(|p| Bvh::build(&region_mesh(scan, &p.triangles))).collect();
-        Self { all: Bvh::build(scan), owner: region_owners(scan, protected), regions, protected, tol }
+        let mut owner = region_owners(scan, protected);
+        let prims: Vec<&Primitive> = protected.iter().map(|p| &p.fit).collect();
+        let holes = pinholes(scan, &owner, &prims, SAMPLE_SHARE_OF_TOLERANCE * tol, NONE);
+        for (t, k) in holes {
+            if let Some(slot) = owner.get_mut(t as usize) {
+                *slot = k;
+            }
+        }
+        Self { all: Bvh::build(scan), owner, protected, tol }
     }
 
     /// The grid of samples of patch `face` and its cells a side: [`SAMPLES_PER_SIDE`], or more for a patch
@@ -138,23 +135,27 @@ impl<'a> Lookup<'a> {
 
     /// The protected primitive patch `face` lies on and the area of the patch: the primitive whose
     /// region holds the scan triangle nearest the middle of the patch, if every sample of the patch
-    /// lies within a margin of the primitive and of a triangle of its region.
+    /// lies within a margin of the primitive and of the scan, and the scan there is the region's or
+    /// nobody's (a sample over another protected region's triangles is a patch over another primitive).
     fn owner_of(&self, body: &Brep, face: usize) -> Option<(usize, f64)> {
         let (samples, n) = self.samples_of(body, face)?;
         let middle = samples.get(samples.len() / 2)?;
         let mid = Point3::new(middle[0], middle[1], middle[2]);
         let hit = self.all.closest(&mid, SEARCH_TOLERANCES * self.tol)?;
-        let k = usize::try_from(self.owner.get(hit.triangle).copied().filter(|&o| o != NONE)?).ok()?;
-        let (prim, region) = (self.protected.get(k)?, self.regions.get(k)?);
-        let near = NEAR_REGION_SHARE_OF_TOLERANCE * self.tol;
-        let (mut off, mut outside) = (false, 0usize);
+        let owner = self.owner.get(hit.triangle).copied().filter(|&o| o != NONE)?;
+        let k = usize::try_from(owner).ok()?;
+        let prim = self.protected.get(k)?;
+        let near = NEAR_SCAN_SHARE_OF_TOLERANCE * self.tol;
+        let (mut off, mut elsewhere) = (false, false);
         for p in &samples {
             let q = Point3::new(p[0], p[1], p[2]);
             off |= prim.fit.distance(&q).abs() > SAMPLE_SHARE_OF_TOLERANCE * self.tol;
-            outside += usize::from(region.closest(&q, near).is_none());
+            elsewhere |= self
+                .all
+                .closest(&q, near)
+                .is_none_or(|h| self.owner.get(h.triangle).is_none_or(|&o| o != NONE && o != owner));
         }
-        let allowed = (MAX_SHARE_OUTSIDE_REGION * samples.len() as f64) as usize;
-        (!off && outside <= allowed).then(|| (k, grid_area(&samples, n)))
+        (!off && !elsewhere).then(|| (k, grid_area(&samples, n)))
     }
 }
 
@@ -208,7 +209,7 @@ pub(super) fn merge_groups(
 ) -> Result<Merging, CmdError> {
     let lookup = Lookup::new(scan, protected, tol);
     let owners: Vec<Option<(usize, f64)>> = par::map(body.faces.len(), |f| lookup.owner_of(body, f));
-    let mut out = Merging { body: body.clone(), merged: Vec::new(), left: Vec::new() };
+    let mut out = Merging { body: body.clone(), merged: Vec::new(), left: Vec::new(), notes: Vec::new(), mesh: None };
     let candidates = candidate_groups(body, protected, &owners, tol, &mut out);
     if s.cancel.is_cancelled() {
         return Err(cancelled());
@@ -243,15 +244,20 @@ fn record(out: &mut Merging, protected: &[Protected], candidates: &[(usize, Vec<
     for ((k, g), result) in candidates.iter().zip(batch.groups) {
         let Some(p) = protected.get(*k) else { continue };
         match result {
-            Ok(r) => out.merged.push(MergedFace {
-                primitive: p.primitive,
-                kind: p.kind.to_string(),
-                face: r.face,
-                patches: g.len(),
-                max_edge_gap: r.gap,
-                area: 0.0,
-                patch_area: r.patch_area,
-            }),
+            Ok(r) => {
+                if let Some(why) = r.snap_note.as_ref() {
+                    out.notes.push(format!("{} of {} patches: {why}", p.kind, g.len()));
+                }
+                out.merged.push(MergedFace {
+                    primitive: p.primitive,
+                    kind: p.kind.to_string(),
+                    face: r.face,
+                    patches: g.len(),
+                    max_edge_gap: r.gap,
+                    area: 0.0,
+                    patch_area: r.patch_area,
+                });
+            }
             Err(why) => out.left.push(left(p, g.len(), why)),
         }
     }

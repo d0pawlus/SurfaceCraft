@@ -322,10 +322,13 @@ fn a_concave_cylinder_wall_becomes_one_cylinder_face_used_backward() {
 }
 
 /// A 30 x 30 x 10 box whose top face (faces 0..9, 3 x 3 patches) is the saddle
-/// `z = 10 + rise (1 + (x / 30 - 1/2)(y / 30 - 1/2))`, so that its whole border is between 0.75 and 1.25
-/// `rise` off the plane z = 10; the walls follow it.
-fn box_with_saddle_top(rise: f64) -> Network {
-    let z = move |x: f64, y: f64| 10.0 + rise * (1.0 + (x / 30.0 - 0.5) * (y / 30.0 - 0.5));
+/// `z = 10 + rise (1 + (x / 30 - 1/2)(y / 30 - 1/2))` plus a bump `16 bump u (1 - u) v (1 - v)` (zero on the
+/// border), so that its whole border is between 0.75 and 1.25 `rise` off the plane z = 10; the walls follow it.
+fn box_with_bumped_top(rise: f64, bump: f64) -> Network {
+    let z = move |x: f64, y: f64| {
+        let (u, v) = (x / 30.0, y / 30.0);
+        10.0 + rise * (1.0 + (u - 0.5) * (v - 0.5)) + 16.0 * bump * u * (1.0 - u) * v * (1.0 - v)
+    };
     let top = move |u: f64, v: f64| [30.0 * u, 30.0 * v, z(30.0 * u, 30.0 * v)];
     let bottom = |u: f64, v: f64| [30.0 * v, 30.0 * u, 0.0];
     let front = move |u: f64, v: f64| [30.0 * u, 0.0, v * z(30.0 * u, 0.0)];
@@ -340,6 +343,10 @@ fn box_with_saddle_top(rise: f64) -> Network {
     all.extend(split(right, 3));
     let refs: Vec<&dyn Fn(f64, f64) -> [f64; 3]> = all.iter().map(|b| b.as_ref()).collect();
     network_from_fns(&refs, 2)
+}
+
+fn box_with_saddle_top(rise: f64) -> Network {
+    box_with_bumped_top(rise, 0.0)
 }
 
 /// A group whose border is off its plane by up to 0.05 mm gets a border on the plane (the gap is what the
@@ -470,4 +477,177 @@ fn a_part_of_a_concave_wall_is_merged_with_the_right_sense() {
         assert_eq!(used_forward(&merged.brep, merged.face), Some(false), "{group:?}");
         assert_sound(&body, &merged.brep, 2e-3);
     }
+}
+
+/// A row of bilinear patches along x (y from 0 to 10), column `i` at `xs[i]` and height `zs[i]`; patch `k`
+/// lies between columns `k` and `k + 1`, its normal up. Vertex `(i, j)` is `2 i + j`.
+fn row_sheet(xs: &[f64], zs: &[f64]) -> Brep {
+    let pt = |i: usize, j: usize| [xs[i], 10.0 * j as f64, zs[i]];
+    let nets: Vec<Vec<Vec<[f64; 3]>>> =
+        (0..xs.len() - 1).map(|i| vec![vec![pt(i, 0), pt(i, 1)], vec![pt(i + 1, 0), pt(i + 1, 1)]]).collect();
+    let id = |i: usize, j: usize| (2 * i + j) as u32;
+    let corners: Vec<[u32; 4]> = (0..xs.len() - 1).map(|i| [id(i, 0), id(i + 1, 0), id(i + 1, 1), id(i, 1)]).collect();
+    sheet_from_bezier_network(&nets, &corners).unwrap()
+}
+
+fn plane_through(point: [f64; 3], normal: [f64; 3]) -> Shape {
+    Shape::Plane { point, normal }
+}
+
+/// Two planes that meet at about 10 degrees (z = 0 and z = tan(10 deg) (x - 10)) and a fold between two groups of
+/// patches whose vertices are within the gap of both planes but 1.1 mm from their line of intersection: moving
+/// the fold onto that line would drag the patches (and, in a scan, the neighbours' border rows) by several
+/// tolerances. Neither group is snapped, and both are merged as they were, with the reason said.
+#[test]
+fn a_vertex_that_would_move_several_gaps_onto_two_primitives_is_not_moved() {
+    use surfacecraft_kernel::merge::{GroupSpec, merge_faces_onto_shapes};
+    let t = 10.0_f64.to_radians().tan();
+    let zb = |x: f64| t * (x - 10.0);
+    let (xs, zs) = ([0.0, 5.57, 11.14, 16.57, 22.0], [0.0, 0.05, 0.1, zb(16.57), zb(22.0)]);
+    let body = row_sheet(&xs, &zs);
+    let (a, b) = ([0usize, 1], [2usize, 3]);
+    let (pa, pb) = (plane_through([0.0; 3], [0.0, 0.0, 1.0]), plane_through([10.0, 0.0, 0.0], [-t, 0.0, 1.0]));
+    let specs = [GroupSpec { faces: &a, shape: &pa }, GroupSpec { faces: &b, shape: &pb }];
+    let batch = merge_faces_onto_shapes(&body, &specs, 0.15, &|| false).unwrap();
+    for g in &batch.groups {
+        let g = g.as_ref().expect("merged as it was");
+        let note = g.snap_note.as_deref().expect("says why it was not snapped");
+        assert!(note.contains("move more than"), "{note}");
+    }
+    // the fold is where the scan has it
+    let fold: Vec<f64> =
+        batch.brep.vertices.iter().filter(|v| (v.point[0] - 11.14).abs() < 0.5).map(|v| v.point[2]).collect();
+    assert_eq!(fold.len(), 2);
+    assert!(fold.iter().all(|z| (z - 0.1).abs() < 1e-9), "{fold:?}");
+    assert_eq!(kinds(&batch.brep).iter().filter(|k| **k == "plane").count(), 2);
+}
+
+/// The same groups with the fold within reach of the intersection (the planes meet 0.05 mm from it): the
+/// vertices go onto it.
+#[test]
+fn a_vertex_within_reach_of_two_primitives_goes_onto_their_intersection() {
+    use surfacecraft_kernel::merge::{GroupSpec, merge_faces_onto_shapes};
+    let t = 10.0_f64.to_radians().tan();
+    let zb = |x: f64| t * (x - 10.0);
+    // the fold at x = 10.2, z = 0.03: 0.2 mm and 0.03 mm from the planes' line
+    let (xs, zs) = ([0.0, 5.0, 10.2, 16.0, 22.0], [0.0, 0.01, 0.03, zb(16.0), zb(22.0)]);
+    let body = row_sheet(&xs, &zs);
+    let (a, b) = ([0usize, 1], [2usize, 3]);
+    let (pa, pb) = (plane_through([0.0; 3], [0.0, 0.0, 1.0]), plane_through([10.0, 0.0, 0.0], [-t, 0.0, 1.0]));
+    let specs = [GroupSpec { faces: &a, shape: &pa }, GroupSpec { faces: &b, shape: &pb }];
+    let batch = merge_faces_onto_shapes(&body, &specs, 0.15, &|| false).unwrap();
+    assert!(batch.groups.iter().all(|g| g.as_ref().is_ok_and(|g| g.snap_note.is_none())), "{:?}", batch.groups);
+    let fold: Vec<[f64; 3]> =
+        batch.brep.vertices.iter().filter(|v| (v.point[0] - 10.0).abs() < 0.001).map(|v| v.point).collect();
+    assert_eq!(fold.len(), 2, "the fold went to x = 10, z = 0: {:?}", batch.brep.vertices);
+    assert!(fold.iter().all(|p| p[2].abs() < 1e-4), "{fold:?}");
+}
+
+/// One edge that is not a Bézier span (two spans) at the border of one group turns the snap off for that group
+/// only: the other group is snapped, the first is merged as it was and the reason is reported.
+#[test]
+fn an_edge_that_is_not_a_bezier_span_limits_the_failure_to_its_groups() {
+    use surfacecraft_kernel::merge::{GroupSpec, merge_faces_onto_shapes};
+    use surfacecraft_kernel::record::brep::Curve;
+    let xs = [0.0, 5.0, 10.0, 15.0, 20.0, 25.0];
+    let zs = [0.03, -0.02, 0.02, 0.03, -0.03, 0.02];
+    let mut body = row_sheet(&xs, &zs);
+    // the edge between vertices (3, 0) and (3, 1): the left border of the second group, split in two spans
+    let e = body.edges.iter().position(|e| e.vertices == [6, 7] || e.vertices == [7, 6]).unwrap();
+    let (p, q) = (body.vertices[6].point, body.vertices[7].point);
+    let mid = [(p[0] + q[0]) / 2.0, (p[1] + q[1]) / 2.0, (p[2] + q[2]) / 2.0];
+    body.edges[e].curve = Curve::Spline { knots: vec![0.0, 0.0, 0.5, 1.0, 1.0], points: vec![p, mid, q] };
+    let (first, second) = ([0usize, 1], [3usize, 4]);
+    let flat = plane_through([0.0; 3], [0.0, 0.0, 1.0]);
+    let specs = [GroupSpec { faces: &first, shape: &flat }, GroupSpec { faces: &second, shape: &flat }];
+    let batch = merge_faces_onto_shapes(&body, &specs, 0.1, &|| false).unwrap();
+    let notes: Vec<Option<String>> =
+        batch.groups.iter().map(|g| g.as_ref().expect("merged").snap_note.clone()).collect();
+    assert!(notes[0].is_none(), "the group without the edge is snapped: {notes:?}");
+    assert!(notes[1].as_deref().is_some_and(|n| n.contains("Bézier")), "{notes:?}");
+    let z_of = |x: f64| -> Vec<f64> {
+        batch.brep.vertices.iter().filter(|v| (v.point[0] - x).abs() < 1e-9).map(|v| v.point[2]).collect()
+    };
+    assert!(z_of(0.0).iter().all(|z| z.abs() < 1e-9), "the first group's vertices are on the plane: {:?}", z_of(0.0));
+    assert!(z_of(20.0).iter().any(|z| (z + 0.03).abs() < 1e-9), "the second group's stay: {:?}", z_of(20.0));
+}
+
+/// A group whose face the checks refuse after its border was snapped (its middle bulges 0.3 mm over a plane
+/// that its border is 0.075 mm from) leaves the body as the wrap had it: the walls that shared its border
+/// are exactly as they were, and the body is the one the other group alone gives.
+#[test]
+fn a_group_that_is_refused_after_its_snap_leaves_its_neighbours_as_they_were() {
+    use surfacecraft_kernel::merge::{GroupSpec, merge_faces_onto_shapes};
+    let net = box_with_bumped_top(0.06, 0.3);
+    let body = sheet_from_bezier_network(&net.patches, &net.corners).unwrap();
+    assert!(is_closed(&body));
+    let (top, front): (Vec<usize>, Vec<usize>) = ((0..9).collect(), (18..27).collect());
+    let (ptop, pfront) = (plane_through([0.0, 0.0, 10.0], [0.0, 0.0, 1.0]), plane_through([0.0; 3], [0.0, -1.0, 0.0]));
+    let both = [GroupSpec { faces: &top, shape: &ptop }, GroupSpec { faces: &front, shape: &pfront }];
+    let batch = merge_faces_onto_shapes(&body, &both, 0.1, &|| false).unwrap();
+    assert!(batch.groups[0].is_err(), "the bulging top is refused: {:?}", batch.groups[0]);
+    assert!(batch.groups[1].is_ok(), "{:?}", batch.groups[1]);
+    let alone = merge_faces_onto_shapes(&body, &both[1..], 0.1, &|| false).unwrap();
+    assert!(alone.groups[0].is_ok());
+    assert_eq!(batch.brep, alone.brep, "the refused group's snap was taken back");
+    for f in &top {
+        let k = batch.face_map[*f].expect("the top patches stay");
+        let (Surface::Spline { points: now, .. }, Surface::Spline { points: was, .. }) =
+            (&batch.brep.faces[k].surface, &body.faces[*f].surface)
+        else {
+            panic!("patches")
+        };
+        let off = now
+            .iter()
+            .flatten()
+            .zip(was.iter().flatten())
+            .map(|(p, q)| (0..3).map(|d| (p[d] - q[d]).abs()).fold(0.0, f64::max));
+        assert!(off.fold(0.0, f64::max) < 1e-9, "patch {f} is as the wrap had it");
+    }
+}
+
+/// A patch with a collapsed side (a triangle: two of its corners at one point, with their own vertices) next to
+/// a group: when the shared vertex moves onto the plane, the collapsed side moves with it, its interior control
+/// point included, and the body still builds.
+#[test]
+fn a_patch_with_a_collapsed_side_moves_with_its_vertex() {
+    use surfacecraft_kernel::record::brep::Surface;
+    let lerp = |a: [f64; 3], b: [f64; 3], t: f64| {
+        [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
+    };
+    // quadratic nets of the bilinear patch through p00, p01 (along v), p10 (along u), p11
+    let net = |p00: [f64; 3], p01: [f64; 3], p10: [f64; 3], p11: [f64; 3]| -> Vec<Vec<[f64; 3]>> {
+        (0..3)
+            .map(|i| {
+                (0..3)
+                    .map(|j| lerp(lerp(p00, p10, i as f64 / 2.0), lerp(p01, p11, i as f64 / 2.0), j as f64 / 2.0))
+                    .collect()
+            })
+            .collect()
+    };
+    let corner = |i: usize, j: usize| [4.0 * i as f64, 4.0 * j as f64, if (i, j) == (1, 1) { 0.03 } else { 0.0 }];
+    let id = |i: usize, j: usize| (i * 2 + j) as u32;
+    let mut nets = Vec::new();
+    let mut corners = Vec::new();
+    for i in 0..2 {
+        nets.push(net(corner(i, 0), corner(i, 1), corner(i + 1, 0), corner(i + 1, 1)));
+        corners.push([id(i, 0), id(i + 1, 0), id(i + 1, 1), id(i, 1)]);
+    }
+    // the triangle (4, 4), (8, 4), (8, 8) over the top edge of patch 1; its fourth corner d (vertex 6 + 1) is at
+    // (4, 4) too, so its side from d to (1, 1) is collapsed
+    let (p0, p1, p2) = (corner(1, 1), corner(2, 1), [8.0, 8.0, 0.0]);
+    nets.push(net(p0, p0, p1, p2));
+    corners.push([id(1, 1), id(2, 1), 6, 7]);
+    let body = sheet_from_bezier_network(&nets, &corners).unwrap();
+    let flat = plane_through([0.0; 3], [0.0, 0.0, 1.0]);
+    let merged = merge_faces_onto_shape(&body, &[0, 1], &flat, 0.1).expect("merged");
+    let q = merged.face_map[2].expect("the triangle stays");
+    let Surface::Spline { points, .. } = &merged.brep.faces[q].surface else { panic!("a patch") };
+    let heights: Vec<f64> = points.iter().flatten().map(|p| p[2]).collect();
+    assert!(
+        heights.iter().any(|z| z.abs() < 1e-9),
+        "the corner at the group's vertex moved onto the plane: {heights:?}"
+    );
+    assert!(points.iter().flatten().all(|p| p[2] <= 0.03 + 1e-9), "{heights:?}");
+    assert!(tess::tessellate_all(&merged.brep, None).is_ok());
 }

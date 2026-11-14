@@ -32,7 +32,7 @@ use surfacecraft_fit::PrimitiveKind;
 use surfacecraft_geom::Mesh;
 use surfacecraft_kernel::hybrid;
 use surfacecraft_kernel::record::brep::Brep;
-use surfacecraft_kernel::tess::tessellate_topo;
+use surfacecraft_kernel::tess::{TopoMesh, tessellate_topo};
 
 #[path = "pipeline_hybrid_snap.rs"]
 mod snap;
@@ -224,7 +224,14 @@ type Retry = Option<super::freeform::CapRetry>;
 /// Analytic faces and their share of the surface area, from a tessellation that knows its faces.
 fn analytic_summary(brep: &Brep, tolerance: f64, m: &Merging) -> Option<AnalyticSummary> {
     let analytic = hybrid::analytic_faces(brep);
-    let topo = tessellate_topo(brep, Some(AREA_CHORD_SHARE * tolerance)).ok()?;
+    let own;
+    let topo = match &m.mesh {
+        Some(t) => t,
+        None => {
+            own = tessellate_topo(brep, Some(AREA_CHORD_SHARE * tolerance)).ok()?;
+            &own
+        }
+    };
     if topo.tri_face.len() != topo.mesh.triangle_count() {
         return None;
     }
@@ -339,11 +346,11 @@ fn deviations(merged: &ToSolidOut, wrap: &ToSolidOut) -> Option<String> {
     ))
 }
 
-/// Does the mesher take `body` at the display chord and at the tolerance's? A merged body it cannot take
-/// is not returned.
-fn meshes(body: &Brep, tolerance: f64) -> bool {
-    let at = |c| tessellate_topo(body, c).is_ok();
-    at(None) && at(Some(AREA_CHORD_SHARE * tolerance))
+/// The body tessellated at the tolerance's chord, if the mesher takes it there and at the display chord: a
+/// merged body it cannot take is not returned.
+fn meshed(body: &Brep, tolerance: f64) -> Option<TopoMesh> {
+    tessellate_topo(body, None).ok()?;
+    tessellate_topo(body, Some(AREA_CHORD_SHARE * tolerance)).ok()
 }
 
 /// The merging step on the wrapped body: the merged result when it is not worse than the wrap (by the
@@ -360,7 +367,13 @@ fn merged_or_wrap(
     let (w, retry) = wrapped;
     let brep =
         s.doc.body(w.body.id).map(|b| b.brep.clone()).ok_or_else(|| halt("hybrid_failed", "the body is gone"))?;
-    let none = |left: Vec<LeftPatches>| Merging { body: (*brep).clone(), merged: Vec::new(), left };
+    let none = |left: Vec<LeftPatches>| Merging {
+        body: (*brep).clone(),
+        merged: Vec::new(),
+        left,
+        notes: Vec::new(),
+        mesh: None,
+    };
     if protected.is_empty() {
         return Ok((wrap_result, none(Vec::new())));
     }
@@ -369,11 +382,11 @@ fn merged_or_wrap(
         .map_err(|e| if is_cancelled(&e) { Halt::Cancelled(e) } else { halt("hybrid_merge_failed", message_of(&e)) })?;
     stages.push(stage("merge", &watch));
     let watch = Stopwatch::start();
-    let meshed = !tried.merged.is_empty() && meshes(&tried.body, set.tolerance);
+    let mesh = if tried.merged.is_empty() { None } else { meshed(&tried.body, set.tolerance) };
     stages.push(stage("mesh_check", &watch));
-    if !meshed {
+    let Some(mesh) = mesh else {
         return Ok((wrap_result, none(tried.left)));
-    }
+    };
     let watch = Stopwatch::start();
     let merged_w = install(s, w, tried.body.clone())?;
     stages.push(stage("install", &watch));
@@ -392,7 +405,7 @@ fn merged_or_wrap(
     if let Some(how) = deviations(&merged, &wrap_result) {
         merged.issues.push(issue("hybrid_merge_deviation", format!("the merge was kept: {how}")));
     }
-    Ok((merged, tried))
+    Ok((merged, Merging { mesh: Some(mesh), ..tried }))
 }
 
 /// The merged faces in a line: kind, patches and gap of each.
@@ -476,6 +489,14 @@ fn build(s: &mut Session, i: &ToSolidIn, set: &Settings, report: &ScanSummary) -
         .ok_or_else(|| halt("hybrid_failed", "the faces could not be measured"))?;
     stages.push(stage("summary", &watch));
     analytic.stages_ms = stages;
+    if !merging.notes.is_empty() {
+        let msg = format!(
+            "{} merged face(s) were made without moving their border onto the primitive first: {}",
+            merging.notes.len(),
+            merging.notes.join("; ")
+        );
+        out.issues.push(issue("hybrid_snap_skipped", msg));
+    }
     if analytic.max_edge_gap > EDGE_GAP_NOTE_SHARE * set.tolerance {
         let msg = format!(
             "a merged face's boundary is up to {:.3} mm from its primitive (sampled, not certified); its edges carry that as their tolerance, which STEP keeps",
