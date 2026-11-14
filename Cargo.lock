@@ -3484,6 +3484,7 @@ dependencies = [
 name = "surfacecraft-kernel"
 version = "0.2.0"
 dependencies = [
+ "nalgebra",
  "rayon",
  "serde",
  "serde_json",
