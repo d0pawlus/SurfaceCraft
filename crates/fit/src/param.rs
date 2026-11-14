@@ -493,11 +493,16 @@ fn local_step(topo: &Topology, geo: &Geometry, cur: &[[f64; 2]]) -> Vec<[f64; 2]
     rhs
 }
 
-/// Up to `iterations` local/global steps of the rigid-fit relaxation of `uv`. A step is kept only
-/// when its result is finite and has no more reversed triangles than the map before it.
-fn relax_arap(topo: &Topology, geo: &Geometry, uv: &mut [[f64; 2]], iterations: usize, cancel: &Cancel) {
-    let n = uv.len();
-    let scale = geo.area.sqrt();
+/// Global step of the relaxation: one Poisson-type solve per coordinate for the right-hand side
+/// `rhs`, translation left as it was. `None` when a solve does not converge, is cancelled or is not finite.
+fn global_step(
+    topo: &Topology,
+    geo: &Geometry,
+    cur: &[[f64; 2]],
+    rhs: &[[f64; 2]],
+    cancel: &Cancel,
+) -> Option<Vec<[f64; 2]>> {
+    let n = cur.len();
     let apply = |x: &[f64], y: &mut [f64]| {
         for i in 0..n {
             let mut acc = geo.laplacian_diag[i] * x[i];
@@ -509,6 +514,29 @@ fn relax_arap(topo: &Topology, geo: &Geometry, uv: &mut [[f64; 2]], iterations: 
     };
     let inv_diag: Vec<f64> = geo.laplacian_diag.iter().map(|d| 1.0 / d).collect();
     let max_iter = 500 + 10 * (n as f64).sqrt() as usize;
+    let mut next = cur.to_vec();
+    for c in 0..2 {
+        let mut b: Vec<f64> = rhs.iter().map(|r| r[c]).collect();
+        let mean = b.iter().sum::<f64>() / n as f64;
+        for e in &mut b {
+            *e -= mean;
+        }
+        let mut x: Vec<f64> = cur.iter().map(|p| p[c]).collect();
+        let residual = conjugate_gradient(&apply, &inv_diag, &b, &mut x, max_iter, cancel);
+        if !(residual <= ARAP_ACCEPT) || x.iter().any(|e| !e.is_finite()) {
+            return None;
+        }
+        for i in 0..n {
+            next[i][c] = x[i];
+        }
+    }
+    all_finite(&next).then_some(next)
+}
+
+/// Up to `iterations` local/global steps of the rigid-fit relaxation of `uv`. A step is kept only
+/// when its result is finite and has no more reversed triangles than the map before it.
+fn relax_arap(topo: &Topology, geo: &Geometry, uv: &mut [[f64; 2]], iterations: usize, cancel: &Cancel) {
+    let scale = geo.area.sqrt();
     let mut cur: Vec<[f64; 2]> = uv.to_vec();
     let mut cur_flipped = flipped_count(&topo.tris, &cur);
     for _ in 0..iterations.min(MAX_ARAP_ITERATIONS) {
@@ -516,28 +544,7 @@ fn relax_arap(topo: &Topology, geo: &Geometry, uv: &mut [[f64; 2]], iterations: 
             break;
         }
         let rhs = local_step(topo, geo, &cur);
-        // global step: one Poisson-type solve per coordinate, translation left as it was
-        let mut next = cur.clone();
-        let mut ok = true;
-        for c in 0..2 {
-            let mut b: Vec<f64> = rhs.iter().map(|r| r[c]).collect();
-            let mean = b.iter().sum::<f64>() / n as f64;
-            for e in &mut b {
-                *e -= mean;
-            }
-            let mut x: Vec<f64> = cur.iter().map(|p| p[c]).collect();
-            let residual = conjugate_gradient(&apply, &inv_diag, &b, &mut x, max_iter, cancel);
-            if !(residual <= ARAP_ACCEPT) || x.iter().any(|e| !e.is_finite()) {
-                ok = false;
-                break;
-            }
-            for i in 0..n {
-                next[i][c] = x[i];
-            }
-        }
-        if !ok || !all_finite(&next) {
-            break;
-        }
+        let Some(next) = global_step(topo, geo, &cur, &rhs, cancel) else { break };
         let next_flipped = flipped_count(&topo.tris, &next);
         if next_flipped > cur_flipped {
             break;

@@ -172,6 +172,46 @@ impl Context<'_> {
         }
     }
 
+    /// The conditions of the round at the state's net (the samples of the sides are cached per net).
+    fn problem(&self, st: &mut State, interior: &Interior, layout: &Layout) -> Result<vpatch::Problem> {
+        if st.cache.as_ref().is_none_or(|(l, _)| l.net != st.net) {
+            st.cache = Some((*layout, rows::sample_sides(self.lp, layout, self.cancel)?));
+        }
+        let Some((_, samples)) = st.cache.as_ref() else { return Err(arg("the samples of the sides are missing")) };
+        rows::build_problem(&Inputs {
+            lp: self.lp,
+            layout,
+            sides: samples,
+            interior,
+            zones: self.zones,
+            prev: st.prev.as_ref(),
+            smoothing: self.smoothing,
+        })
+    }
+
+    /// Solves the problem and measures the surface; the seconds of the solve go to the test trace.
+    fn solve_and_measure(
+        &self,
+        st: &State,
+        interior: &mut Interior,
+        layout: &Layout,
+        problem: &vpatch::Problem,
+    ) -> Result<(vpatch::Solution, Measure, f64)> {
+        let Some((_, samples)) = st.cache.as_ref() else { return Err(arg("the samples of the sides are missing")) };
+        // a wall clock panics on wasm: only the tests time the solve
+        #[cfg(test)]
+        let started = std::time::Instant::now();
+        let solution = vpatch::solve_cancellable(problem, self.cancel)?;
+        #[cfg(test)]
+        let solve_secs = started.elapsed().as_secs_f64();
+        #[cfg(not(test))]
+        let solve_secs = 0.0;
+        let probe = SurfaceProbe::new(&solution.surface)?;
+        let goal = Goal { tolerance: self.req.tolerance, frozen: &st.frozen, cancel: self.cancel };
+        let m = measure::measure(&solution.surface, &probe, self.lp, layout, samples, interior, &goal)?;
+        Ok((solution, m, solve_secs))
+    }
+
     fn round(
         &self,
         st: &mut State,
@@ -181,31 +221,12 @@ impl Context<'_> {
     ) -> Result<Flow> {
         let had_rows = st.prev.is_some();
         let layout = Layout::new(self.domain, st.net);
-        if st.cache.as_ref().is_none_or(|(l, _)| l.net != st.net) {
-            st.cache = Some((layout, rows::sample_sides(self.lp, &layout, self.cancel)?));
-        }
-        let Some((_, samples)) = st.cache.as_ref() else { return Ok(Flow::Stop) };
-        let problem = rows::build_problem(&Inputs {
-            lp: self.lp,
-            layout: &layout,
-            sides: samples,
-            interior,
-            zones: self.zones,
-            prev: st.prev.as_ref(),
-            smoothing: self.smoothing,
-        })?;
+        let problem = self.problem(st, interior, &layout)?;
         if let Some(stop) = self.cost_stop(&problem, st)? {
             st.stop = Some(stop);
             return Ok(Flow::Stop);
         }
-        #[cfg(test)]
-        let started = std::time::Instant::now();
-        let solution = vpatch::solve_cancellable(&problem, self.cancel)?;
-        #[cfg(test)]
-        let solve_secs = started.elapsed().as_secs_f64();
-        let probe = SurfaceProbe::new(&solution.surface)?;
-        let goal = Goal { tolerance: self.req.tolerance, frozen: &st.frozen, cancel: self.cancel };
-        let m = measure::measure(&solution.surface, &probe, self.lp, &layout, samples, interior, &goal)?;
+        let (solution, m, _solve_secs) = self.solve_and_measure(st, interior, &layout, &problem)?;
         st.rounds = round;
         #[cfg(test)]
         trace.push(RoundTrace {
@@ -213,11 +234,22 @@ impl Context<'_> {
             rms: m.rms,
             max: m.max,
             gap_max: m.sides.iter().filter(|s| !s.soft).map(|s| s.gap_max).fold(0.0, f64::max),
-            solve_secs,
+            solve_secs: _solve_secs,
             hard_rows: problem.hard_scalar_rows(),
         });
-        self.freeze(st, &m, &measure::main_directions(self.lp));
+        Ok(self.keep_and_grow(st, round, had_rows, solution, m))
+    }
 
+    /// Keeps the round when it is the best so far, and decides whether and how the net grows.
+    fn keep_and_grow(
+        &self,
+        st: &mut State,
+        round: u32,
+        had_rows: bool,
+        solution: vpatch::Solution,
+        m: Measure,
+    ) -> Flow {
+        self.freeze(st, &m, &measure::main_directions(self.lp));
         let data_ok = m.points == 0 || m.max <= self.req.tolerance;
         let done = m.sides_ok(&st.frozen) && data_ok;
         let worst = m.worst(&st.frozen);
@@ -243,9 +275,9 @@ impl Context<'_> {
             });
         }
         if done || round == MAX_ROUNDS {
-            return Ok(Flow::Stop);
+            return Flow::Stop;
         }
-        let Some(next) = self.next_net(st, improved, miss, refine) else { return Ok(Flow::Stop) };
+        let Some(next) = self.next_net(st, improved, miss, refine) else { return Flow::Stop };
         st.prev_worst = st.prev_worst.min(worst);
         st.prev = Some(solution.surface);
         st.grew = next != st.net;
@@ -253,6 +285,6 @@ impl Context<'_> {
             st.from = st.net;
         }
         st.net = next;
-        Ok(Flow::Next)
+        Flow::Next
     }
 }

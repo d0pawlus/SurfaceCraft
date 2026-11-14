@@ -57,14 +57,20 @@ fn side_warnings(lp: &Loop, m: &Measure, frozen: &[bool], out: &mut Vec<String>)
     }
 }
 
-pub(super) fn build(i: Inputs) -> Report {
+/// What the verdict was, for the warnings.
+struct Verdict {
+    within_tolerance: bool,
+    residual_ok: bool,
+    within_targets: bool,
+}
+
+/// The warnings of the report: the preparation's notes, then what the kept round says.
+fn warnings(i: &Inputs, v: &Verdict) -> Vec<String> {
     let best = &i.outcome.best;
     let m = &best.measure;
     let max = i.max_control;
-    let within_tolerance = m.points == 0 || m.max <= i.tolerance;
-    let residual_ok = best.hard_residual <= HARD_RESIDUAL_SHARE * G0_TARGET;
-    let within_targets = m.targets_met() && within_tolerance && i.corners.is_empty() && residual_ok;
-    let mut warnings = i.notes;
+    let (within_tolerance, within_targets, residual_ok) = (v.within_tolerance, v.within_targets, v.residual_ok);
+    let mut warnings = i.notes.clone();
     if i.trim_fallback {
         warnings.push(WARN_TRIM_START.to_string());
     }
@@ -107,6 +113,16 @@ pub(super) fn build(i: Inputs) -> Report {
         ));
     }
     side_warnings(i.lp, m, &i.outcome.frozen, &mut warnings);
+    warnings
+}
+
+pub(super) fn build(i: Inputs) -> Report {
+    let best = &i.outcome.best;
+    let m = &best.measure;
+    let within_tolerance = m.points == 0 || m.max <= i.tolerance;
+    let residual_ok = best.hard_residual <= HARD_RESIDUAL_SHARE * G0_TARGET;
+    let within_targets = m.targets_met() && within_tolerance && i.corners.is_empty() && residual_ok;
+    let warnings = warnings(&i, &Verdict { within_tolerance, residual_ok, within_targets });
     Report {
         control: best.net,
         rounds: i.outcome.rounds,

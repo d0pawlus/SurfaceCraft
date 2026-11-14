@@ -315,7 +315,6 @@ fn measure_side(
     let Some(sd) = lp.sides.get(k) else { return Err(crate::KernelError::Argument("a side is missing".into())) };
     let is_frozen = goal.frozen.get(k).copied().unwrap_or(false);
     let g1 = sd.continuity != Continuity::G0;
-    let g2 = sd.continuity == Continuity::G2;
     let cx = SampleCx { surface, lp, floor: 1.0 / (4.0 * lp.diag.max(1e-9)) };
     let mut acc = SideAcc::default();
     let mut feet = Vec::with_capacity(ss.samples.len());
@@ -335,6 +334,13 @@ fn measure_side(
             slabs.add(f, miss);
         }
     }
+    Ok(finish_side(sd, ss, &acc, feet))
+}
+
+/// The report and the terms of one side from the maxima of its samples.
+fn finish_side(sd: &SideData, ss: &SideSamples, acc: &SideAcc, feet: Vec<V2>) -> SideResult {
+    let g1 = sd.continuity != Continuity::G0;
+    let g2 = sd.continuity == Continuity::G2;
     let rest_ok = (!g1 || acc.angle_max <= G1_TARGET_DEG) && (!g2 || acc.curv_max <= G2_TARGET_REL) && !acc.folded;
     let rest_term = (if g1 { acc.angle_max / G1_TARGET_DEG } else { 0.0 })
         .max(if g2 { acc.curv_max / G2_TARGET_REL } else { 0.0 })
@@ -350,13 +356,13 @@ fn measure_side(
         snap_max: sd.snap,
         met: sd.soft || (rest_ok && acc.gap_max <= G0_TARGET),
     };
-    Ok(SideResult {
+    SideResult {
         report,
         feet,
         starts: ss.samples.iter().map(|smp| smp.uv).collect(),
         rest_ok: rest_ok || sd.soft,
         terms: if sd.soft { [0.0, 0.0] } else { [acc.gap_max / G0_TARGET, rest_term] },
-    })
+    }
 }
 
 /// Does the patch turn over inside the outline? The unit normal `S_u × S_v` is compared with the

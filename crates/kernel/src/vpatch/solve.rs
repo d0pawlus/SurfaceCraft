@@ -118,6 +118,8 @@ pub(super) fn constrained_min(
     let (sig, u, vt) = row_space_svd(&cm)?;
     poll(cancel)?;
     let smax = sig.iter().copied().fold(0.0_f64, f64::max);
+    // indices below: `keep` lists indices of `sig`, `u` and `vt` come from the SVD of `cm` (dimensions
+    // established above), `h` is `c × c`
     let keep: Vec<usize> = (0..sig.len()).filter(|&i| sig[i] > RANK_TOL * smax && sig[i] > 0.0).collect();
     let r = keep.len();
     if r == 0 {

@@ -233,8 +233,17 @@ fn result_warning(
     (!notes.is_empty()).then(|| notes.join("; "))
 }
 
-fn from_curves(s: &mut Session, i: FromCurvesIn) -> CmdResult<FromCurvesOut> {
-    let (mesh, region) = source_mesh(s, &i)?;
+/// What the command works on: the mesh, its region (when given), the options and the feature network.
+struct Prepared {
+    mesh: std::sync::Arc<Mesh>,
+    region: Option<ObjectId>,
+    opts: FeatureOptions,
+    tol: f64,
+    net: FeatureNetwork,
+}
+
+fn prepare(s: &Session, i: &FromCurvesIn) -> CmdResult<Prepared> {
+    let (mesh, region) = source_mesh(s, i)?;
     let tol = i.tolerance.unwrap_or(0.2);
     if !(tol.is_finite() && tol > 0.0) {
         return Err(CmdError::Params("tolerance must be positive".into()));
@@ -264,6 +273,11 @@ fn from_curves(s: &mut Session, i: FromCurvesIn) -> CmdResult<FromCurvesOut> {
             net.skipped.first().map_or("none skipped", String::as_str)
         )));
     }
+    Ok(Prepared { mesh: m, region, opts, tol, net })
+}
+
+fn from_curves(s: &mut Session, i: FromCurvesIn) -> CmdResult<FromCurvesOut> {
+    let Prepared { mesh: m, region, opts, tol, net } = prepare(s, &i)?;
     let name = i.name.unwrap_or_else(|| "feature_network".into());
     let bezier = if net.nets.is_empty() {
         None

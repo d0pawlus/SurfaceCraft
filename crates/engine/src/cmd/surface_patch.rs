@@ -345,6 +345,13 @@ fn side_outs(report: &surfacecraft_kernel::patch_fit::Report, order: &[usize]) -
         .collect()
 }
 
+fn conflicts(c: Option<ConflictsIn>) -> Conflicts {
+    match c.unwrap_or(ConflictsIn::Relax) {
+        ConflictsIn::Relax => Conflicts::Relax,
+        ConflictsIn::Fail => Conflicts::Fail,
+    }
+}
+
 fn patch_cmd(s: &mut Session, i: PatchIn) -> CmdResult<PatchOut> {
     let st = settings(&i)?;
     let (hard_points, soft_points) = interior_points(&i.points)?;
@@ -366,10 +373,7 @@ fn patch_cmd(s: &mut Session, i: PatchIn) -> CmdResult<PatchOut> {
         smoothing: i.smoothing,
         control: i.control,
         max_control: st.max_control,
-        conflicts: match i.conflicts.unwrap_or(ConflictsIn::Relax) {
-            ConflictsIn::Relax => Conflicts::Relax,
-            ConflictsIn::Fail => Conflicts::Fail,
-        },
+        conflicts: conflicts(i.conflicts),
         side_ids: order.clone(),
     };
     let Patch { sheet, report, .. } = fit_patch_cancellable(&request, &s.cancel).map_err(|e| match e {
@@ -377,12 +381,24 @@ fn patch_cmd(s: &mut Session, i: PatchIn) -> CmdResult<PatchOut> {
         other => other.into(),
     })?;
 
+    let id = add_patch(s, i.name, scan.as_ref().and_then(|sc| sc.region), sheet, &report)?;
+    Ok(patch_out(id, report, parameters, &order, warnings))
+}
+
+/// Adds the sheet as a surface object.
+fn add_patch(
+    s: &mut Session,
+    name: Option<String>,
+    region: Option<ObjectId>,
+    sheet: surfacecraft_kernel::record::brep::Brep,
+    report: &surfacecraft_kernel::patch_fit::Report,
+) -> CmdResult<ObjectId> {
     let display = tessellate_all(&sheet, None)?;
-    let id = s.doc.add_surface(SurfaceObject {
+    Ok(s.doc.add_surface(SurfaceObject {
         id: ObjectId(0),
-        name: i.name.unwrap_or_else(|| "patch".into()),
+        name: name.unwrap_or_else(|| "patch".into()),
         sheet: Arc::new(sheet),
-        region: scan.as_ref().and_then(|sc| sc.region),
+        region,
         control: report.control,
         degree: DEGREE,
         rms: report.rms,
@@ -390,10 +406,21 @@ fn patch_cmd(s: &mut Session, i: PatchIn) -> CmdResult<PatchOut> {
         display: Arc::new(display),
         parent: None,
         visible: true,
-    });
-    let sides_out = side_outs(&report, &order);
+    }))
+}
+
+/// The command's result: the kernel's report, the caller's side numbers, and the warnings of the
+/// command followed by the kernel's.
+fn patch_out(
+    id: ObjectId,
+    report: surfacecraft_kernel::patch_fit::Report,
+    parameters: &str,
+    order: &[usize],
+    mut warnings: Vec<String>,
+) -> PatchOut {
+    let sides = side_outs(&report, order);
     warnings.extend(report.warnings);
-    Ok(PatchOut {
+    PatchOut {
         surface: id,
         control: report.control,
         degree: DEGREE,
@@ -409,7 +436,7 @@ fn patch_cmd(s: &mut Session, i: PatchIn) -> CmdResult<PatchOut> {
         cost_limited: report.cost_limited,
         hard_residual_mm: report.hard_residual,
         parameters: parameters.into(),
-        sides: sides_out,
+        sides,
         corners: report
             .corners
             .iter()
@@ -418,7 +445,7 @@ fn patch_cmd(s: &mut Session, i: PatchIn) -> CmdResult<PatchOut> {
         soft_points_max_mm: report.soft_points_max,
         dropped: report.dropped,
         warnings,
-    })
+    }
 }
 
 /// The commands of this file.
