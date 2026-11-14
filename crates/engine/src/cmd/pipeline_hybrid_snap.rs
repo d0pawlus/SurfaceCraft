@@ -6,7 +6,7 @@
 use surfacecraft_fit::Primitive;
 use surfacecraft_geom::{Mesh, Point3};
 use surfacecraft_kernel::hybrid::Shape;
-use surfacecraft_kernel::merge::{Gauge, put_on_all};
+use surfacecraft_kernel::merge::put_on_all_with;
 
 /// The primitive of a kernel shape and back: the same parameters.
 pub(super) fn shape_of(p: &Primitive) -> Shape {
@@ -40,12 +40,15 @@ pub(super) fn projected(mesh: &Mesh, regions: &[(&[u32], &Primitive)], max_move:
             }
         }
     }
-    // the kernel's evaluators of the primitives, and its bounded projection onto all of a vertex's primitives
-    let gauges: Vec<Option<Gauge>> = regions.iter().map(|(_, p)| Gauge::new(&shape_of(p)).ok()).collect();
+    // the kernel's bounded projection onto all of a vertex's primitives, with the fit's closest point
     let mut positions = mesh.positions.clone();
     for (slot, (list, p)) in positions.iter_mut().zip(owners.iter().zip(&mesh.positions)) {
-        let on: Vec<&Gauge> = list.iter().filter_map(|&k| gauges.get(k).and_then(Option::as_ref)).collect();
-        if let Some(q) = put_on_all(&on, [p.x, p.y, p.z], max_move) {
+        let prims: Vec<&Primitive> = list.iter().filter_map(|&k| regions.get(k).map(|r| r.1)).collect();
+        let closest = |i: usize, q: [f64; 3]| {
+            let c = prims.get(i)?.project(&Point3::new(q[0], q[1], q[2]));
+            Some([c.x, c.y, c.z])
+        };
+        if let Some(q) = put_on_all_with(&closest, prims.len(), [p.x, p.y, p.z], max_move) {
             *slot = Point3::new(q[0], q[1], q[2]);
         }
     }

@@ -3,9 +3,9 @@
 //! closed (or as open) as the wrap was.
 //!
 //! A patch belongs to a primitive when the scan triangle nearest its middle is in the primitive's
-//! region and every sample on it lies within a margin of the primitive and over scan that lies on it: a patch that
-//! straddles the border over a surface that leaves the primitive has a sample off it or over scan that is not on
-//! it. The patches of one primitive that touch along edges form a group, which
+//! region and every sample on it lies within a margin of the primitive and of the region (or of an unassigned
+//! triangle on the primitive): a patch that straddles the border over a surface that leaves the primitive has a
+//! sample off it, one that follows the border (a crease) is wholly inside. The patches of one primitive that touch along edges form a group, which
 //! the kernel replaces by one face on the primitive (`merge_faces_onto_shape`); a group the kernel
 //! cannot merge stays patches and is reported with the reason.
 use super::hybrid_method::{LeftPatches, MergedFace};
@@ -36,14 +36,14 @@ const MAX_SAMPLES_PER_SIDE: usize = 48;
 const SAMPLE_SHARE_OF_TOLERANCE: f64 = 1.0;
 /// The boundary of a merged group may leave its primitive by this share of the tolerance.
 const GAP_SHARE_OF_TOLERANCE: f64 = 1.0;
-/// Every sample must have scan within this share of the tolerance that lies on the primitive (the region's triangle,
-/// or a triangle whose corners are within the fit's tolerance of it). A share of the samples outside the region
-/// cannot be allowed instead, nor the pinholes alone: the region is what the segmentation made of the scan, and its
-/// border is jagged and, at a tangent round, ends before the patch's surface leaves the primitive (the part of a
-/// round that stays within the tolerance of the wall is as long as the root of twice the radius times the
-/// tolerance). 1 to 18 of 324 to 576 samples of patches that belong to a region lay outside it on a smooth part
-/// (measured), and the share a bound would have to allow moved with every layout of the patches.
-const NEAR_SCAN_SHARE_OF_TOLERANCE: f64 = 1.0;
+/// Every sample must lie within this share of the tolerance of a triangle of the primitive's region, or of an
+/// unassigned triangle that lies on the primitive. The pinholes of the region (a few triangles of no region
+/// inside it) count as the region (`pinholes`). A share of the samples outside the region cannot be allowed
+/// instead, nor the pinholes alone: a patch that lies on a primitive reaches past its region over a tangent round
+/// (the part of a round that stays within the tolerance of the wall is as long as the root of twice the radius
+/// times the tolerance), so 1 to 18 of 324 to 576 samples lie outside the region of patches that belong to it
+/// (measured), and the pinholes were 6 triangles of the 33 018 of that scan.
+const NEAR_REGION_SHARE_OF_TOLERANCE: f64 = 1.0;
 /// How far from a sample the scan is looked for, in tolerances.
 const SEARCH_TOLERANCES: f64 = 4.0;
 /// A group of less area than this many squared tolerances stays patches (collapsed and sliver
@@ -91,11 +91,31 @@ fn region_owners(scan: &Mesh, protected: &[Protected]) -> Vec<u32> {
     owner
 }
 
+/// The triangles of one region as a mesh of their own (vertices renumbered).
+fn region_mesh(scan: &Mesh, triangles: &[u32]) -> Mesh {
+    let mut index: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let mut out = Mesh::default();
+    for &t in triangles {
+        let Some(tri) = scan.triangles.get(t as usize) else { continue };
+        let mut mapped = [0u32; 3];
+        for (slot, &v) in mapped.iter_mut().zip(tri) {
+            let Some(p) = scan.positions.get(v as usize) else { continue };
+            *slot = *index.entry(v).or_insert_with(|| {
+                out.positions.push(*p);
+                (out.positions.len() - 1) as u32
+            });
+        }
+        out.triangles.push(mapped);
+    }
+    out
+}
+
 /// What the choice of a patch's primitive looks at.
 struct Lookup<'a> {
     scan: &'a Mesh,
     all: Bvh,
     owner: Vec<u32>,
+    regions: Vec<Bvh>,
     protected: &'a [Protected],
     tol: f64,
 }
@@ -105,25 +125,27 @@ impl<'a> Lookup<'a> {
         let mut owner = region_owners(scan, protected);
         let prims: Vec<&Primitive> = protected.iter().map(|p| &p.fit).collect();
         let holes = pinholes(scan, &owner, &prims, SAMPLE_SHARE_OF_TOLERANCE * tol, NONE);
+        let mut triangles: Vec<Vec<u32>> = protected.iter().map(|p| p.triangles.clone()).collect();
         for (t, k) in holes {
-            if let Some(slot) = owner.get_mut(t as usize) {
+            if let (Some(slot), Some(list)) = (owner.get_mut(t as usize), triangles.get_mut(k as usize)) {
                 *slot = k;
+                list.push(t);
             }
         }
-        Self { scan, all: Bvh::build(scan), owner, protected, tol }
+        let regions = triangles.iter().map(|list| Bvh::build(&region_mesh(scan, list))).collect();
+        Self { scan, all: Bvh::build(scan), owner, regions, protected, tol }
     }
 
-    /// Does the scan within `near` of `q` lie on the primitive of region `k`? Its nearest triangle is the region's
-    /// (the pinholes of the region are the region's), or its corners all lie within the fit's tolerance of the
-    /// primitive: the segmentation gave it to another region (or none) but the scan there is the primitive's within
-    /// the tolerance, as at a tangent round or a jagged border.
-    fn scan_on(&self, q: &Point3, k: usize, near: f64) -> bool {
+    /// Is the scan within `near` of `q` a triangle of no region whose corners all lie within the fit's tolerance
+    /// of `prim`? (A tangent round that stays within the tolerance of the primitive: the scan there is the
+    /// primitive's within the tolerance, though the segmentation gave it to another region.)
+    fn unassigned_on(&self, q: &Point3, prim: &Protected, near: f64) -> bool {
         let Some(hit) = self.all.closest(q, near) else { return false };
-        let Some(prim) = self.protected.get(k) else { return false };
-        usize::try_from(self.owner.get(hit.triangle).copied().unwrap_or(NONE)).is_ok_and(|o| o == k)
-            || self.scan.triangle(hit.triangle).is_some_and(|tri| {
-                tri.iter().all(|c| prim.fit.distance(c).abs() <= SAMPLE_SHARE_OF_TOLERANCE * self.tol)
-            })
+        let free = self.owner.get(hit.triangle).is_some_and(|&o| o == NONE);
+        free && self
+            .scan
+            .triangle(hit.triangle)
+            .is_some_and(|tri| tri.iter().all(|c| prim.fit.distance(c).abs() <= SAMPLE_SHARE_OF_TOLERANCE * self.tol))
     }
 
     /// The grid of samples of patch `face` and its cells a side: [`SAMPLES_PER_SIDE`], or more for a patch
@@ -150,20 +172,23 @@ impl<'a> Lookup<'a> {
 
     /// The protected primitive patch `face` lies on and the area of the patch: the primitive whose
     /// region holds the scan triangle nearest the middle of the patch, if every sample of the patch
-    /// lies within a margin of the primitive and over scan that lies on it ([`Self::scan_on`]).
+    /// lies within a margin of the primitive, and of a triangle of the region (the pinholes of the region
+    /// are the region's) or of an unassigned triangle that lies on the primitive.
     fn owner_of(&self, body: &Brep, face: usize) -> Option<(usize, f64)> {
         let (samples, n) = self.samples_of(body, face)?;
         let middle = samples.get(samples.len() / 2)?;
         let mid = Point3::new(middle[0], middle[1], middle[2]);
         let hit = self.all.closest(&mid, SEARCH_TOLERANCES * self.tol)?;
         let k = usize::try_from(self.owner.get(hit.triangle).copied().filter(|&o| o != NONE)?).ok()?;
-        let prim = self.protected.get(k)?;
-        let near = NEAR_SCAN_SHARE_OF_TOLERANCE * self.tol;
-        let on = samples.iter().all(|p| {
+        let (prim, region) = (self.protected.get(k)?, self.regions.get(k)?);
+        let near = NEAR_REGION_SHARE_OF_TOLERANCE * self.tol;
+        let (mut off, mut outside) = (false, false);
+        for p in &samples {
             let q = Point3::new(p[0], p[1], p[2]);
-            prim.fit.distance(&q).abs() <= SAMPLE_SHARE_OF_TOLERANCE * self.tol && self.scan_on(&q, k, near)
-        });
-        on.then(|| (k, grid_area(&samples, n)))
+            off |= prim.fit.distance(&q).abs() > SAMPLE_SHARE_OF_TOLERANCE * self.tol;
+            outside |= region.closest(&q, near).is_none() && !self.unassigned_on(&q, prim, near);
+        }
+        (!off && !outside).then(|| (k, grid_area(&samples, n)))
     }
 }
 

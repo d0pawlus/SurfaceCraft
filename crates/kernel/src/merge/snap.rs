@@ -74,29 +74,36 @@ pub(super) struct Target<'a> {
 /// first alone. `None` when that is farther from `p` than `max_move`, or not finite.
 #[must_use]
 pub fn put_on_all(gauges: &[&Gauge], p: V, max_move: f64) -> Option<V> {
-    let q = onto_all(gauges, p)?;
+    put_on_all_with(&|i, q| gauges.get(i).and_then(|g| g.closest(q)), gauges.len(), p, max_move)
+}
+
+/// [`put_on_all`] for `count` surfaces whose closest point to `q` is `closest(i, q)` (the caller's own evaluator:
+/// the scan side of the hybrid method projects onto the fitted primitives with the fit's).
+#[must_use]
+pub fn put_on_all_with(closest: &dyn Fn(usize, V) -> Option<V>, count: usize, p: V, max_move: f64) -> Option<V> {
+    let q = onto_all(closest, count, p).filter(|_| count > 0)?;
     (finite_all(&q) && max_move >= 0.0 && norm(sub(q, p)) <= max_move).then_some(q)
 }
 
-fn onto_all(gauges: &[&Gauge], p: V) -> Option<V> {
-    let first = gauges.first()?;
-    let on_all = |q: V| gauges.iter().all(|g| g.distance(q).is_some_and(|d| d <= ON_SURFACE));
+fn onto_all(closest: &dyn Fn(usize, V) -> Option<V>, count: usize, p: V) -> Option<V> {
+    let distance = |i: usize, q: V| closest(i, q).map(|c| norm(sub(c, q))).filter(|d| d.is_finite());
+    let on_all = |q: V| (0..count).all(|i| distance(i, q).is_some_and(|d| d <= ON_SURFACE));
     let mut q = p;
     for _ in 0..MAX_ALTERNATIONS {
-        for g in gauges {
-            q = g.closest(q)?;
+        for i in 0..count {
+            q = closest(i, q)?;
         }
         if on_all(q) {
             return Some(q);
         }
     }
-    if gauges.len() == 1 {
+    if count == 1 {
         return Some(q);
     }
     // surfaces that meet at a shallow angle converge slowly: the last iterate is taken when it is nearer all of
     // them than the point on the first alone
-    let worst = |q: V| gauges.iter().filter_map(|g| g.distance(q)).fold(0.0_f64, f64::max);
-    let alone = first.closest(p)?;
+    let worst = |q: V| (0..count).filter_map(|i| distance(i, q)).fold(0.0_f64, f64::max);
+    let alone = closest(0, p)?;
     // (by more than rounding: parallel primitives tie, and the first one then decides)
     Some(if worst(q) + 1e-9 < worst(alone) { q } else { alone })
 }
