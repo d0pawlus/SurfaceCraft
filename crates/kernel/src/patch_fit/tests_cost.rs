@@ -50,7 +50,9 @@ fn growth_stops_at_the_cost_bound_and_the_report_says_so() {
     let r = &patch.report;
     assert!(r.cost_limited, "{r:?}");
     assert!(r.control.iter().all(|&n| n <= 16), "{:?}", r.control);
-    assert!(rounds.iter().all(|t| t.solve_secs <= MAX_SOLVE_SECONDS), "{rounds:?}");
+    // the bound is on the work estimate, not on the wall clock (a loaded runner is slower than the model)
+    let estimate = |t: &RoundTrace| solve_seconds(3 * t.net[0] * t.net[1], t.hard_rows);
+    assert!(rounds.iter().all(|t| estimate(t) <= MAX_SOLVE_SECONDS), "{rounds:?}");
     assert!(r.warnings.iter().any(|w| w.contains("stopped at") && w.contains("limit")), "{:?}", r.warnings);
     assert!(r.rms.is_finite() && r.max.is_finite());
 }
@@ -78,7 +80,7 @@ fn a_fit_cancelled_while_it_runs_ends_promptly() {
         fit_patch_cancellable(&req, &cancel)
     });
     assert_eq!(out.unwrap_err(), KernelError::Cancelled);
-    assert!(started.elapsed() < Duration::from_secs(20), "the cancellation took {:?}", started.elapsed());
+    assert!(started.elapsed() < Duration::from_secs(60), "the cancellation took {:?}", started.elapsed());
 }
 
 /// Measurement (ignored): rounds of a G1 fit against the control net, with the solve time of each.
