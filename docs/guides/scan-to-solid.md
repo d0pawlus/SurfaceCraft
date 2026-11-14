@@ -80,33 +80,61 @@ Hybrid (merge the patches that lie on a primitive; `surface.wrap` and the kernel
   it, which is what a boundary gap to the primitive is made of). The copy is only used for the wrap:
   the body is judged against the original scan by the rules of the freeform method.
 - A patch lies on a primitive when the scan triangle nearest its middle is in the primitive's region
-  and every sample on it (a 6 x 6 grid) lies within the tolerance of the primitive and of a
-  triangle of the region. The patches of one primitive that touch along edges form a group. A group
+  and every sample on it lies within the tolerance of the primitive and within 5 tolerances of a
+  triangle of the region (the segmentation leaves pinholes in a large flat face; at 1 tolerance they
+  stopped every large patch of a plate from joining its plane). The samples are a grid of at least 6 x 6
+  and no more than 2 tolerances apart (49 x 49 at most), so a large patch cannot leave the primitive
+  between a few samples. The patches of one primitive that touch along edges form a group. A group
   of one patch, or with an area under 50 squared tolerances (collapsed and sliver patches lie on any
   surface), stays patches.
+- Before a group is merged, the border it shares with the patches round it is put on the primitive:
+  each vertex of the border goes onto the primitive (onto both where two groups meet, which puts it on
+  their intersection), each border edge, a Bézier curve, is re-fitted by least squares through its
+  samples put on the primitive (exact on a plane), and the patches that use a moved edge or vertex take
+  the new control points, so the body stays watertight. The border patches move by the gap the wrap
+  left (at most the tolerance) and no more; the judge then measures the body against the scan as it
+  does any other.
 - The kernel replaces each group by one face on the primitive (`kernel::merge`): the topology of the
   body is edited (the group's interior edges and vertices go, N faces become one, a hole in the group
   becomes an inner loop), nothing is cut, so the body is as closed or as open as the wrap was and the
-  band of patches along the border of a region stays patches. The boundary edges stay shared with the
-  neighbours and lie on the primitive within the reported `max_edge_gap` (at most the
-  tolerance); each edge carries that gap, times 1.1, as its tolerance. A group the kernel does not
-  take stays patches: a boundary that touches itself (a pinch), a face that would wrap round the axis
-  of its cylinder or cone or reach a pole of its sphere (a cap of 90 degrees or more), a result whose
-  volume or topology changed, or whose new face the mesher does not tessellate to the area of the
-  patches it replaced; `analytic.left_as_patches` says which and why.
+  band of patches along the border of a region stays patches. Plane and cylinder faces are built by the
+  kernel's topology builder (the trims of the face in its own parameters, its NURBS form and parameter
+  box are the kernel's); a cone or sphere face is placed here with the kernel's own forms. A concave
+  face (the wall of a bore, a dimple) is merged like a convex one and used by the shell against its
+  surface's natural normal. A group that goes round the axis of a cylinder or cone is cut into three
+  sectors by the angle of the patches (a face round the whole axis would need a seam edge), each one
+  face. The boundary edges stay shared with the neighbours and lie on the primitive within the reported
+  `max_edge_gap`, a few micrometres after the border is moved onto it (a group is refused when it
+  is over a tenth of the gap allowed, 0.1 tolerance, after the move, or over the tolerance before
+  it); each edge carries that gap, times 1.1, as its tolerance.
+- Never merged, and why (each is in `analytic.left_as_patches` with its reason): a group of one patch or of
+  under 50 squared tolerances of area; a group whose border is further than the tolerance from the
+  primitive (the patches only follow it that far, which is no analytic face); a torus (there is no
+  merge for it); a sphere cap of 90 degrees or more (it would reach a pole of the sphere's
+  parameters); a group that goes round its axis and cannot be cut into sectors that are connected; a
+  boundary that touches itself (a pinch); a face whose area or normal does not agree with the patches it
+  replaces; and what the kernel refuses (a result whose volume or topology changed, or that the mesher
+  does not tessellate to the area of the patches it replaced).
 - The merged body replaces the wrap only when it is not worse by the comparison of `auto` (verdict,
   share within the tolerance, closedness, analytic share) and its largest and RMS deviation from the
-  scan are not above the wrap's by more than 1.0 and 0.02 of the tolerance (a merged face's boundary may be a tolerance from its patches, which is what the largest deviation may grow by); otherwise the wrap is the
-  result, with no analytic face and the issue `hybrid_merge_rejected` saying why.
+  scan are not above the wrap's by more than a quarter and a hundredth of the tolerance (on scans 1 and
+  4 the correct merges moved them by a twentieth and a fifth of that); a body that could not be measured
+  is refused. Either way the issue says both pairs of figures (`hybrid_merge_deviation` when the merge
+  is kept, `hybrid_merge_rejected`, with the merged faces, when it is not), with the share of the scan
+  points that do not face the body. A refused merge gives the wrap, with no analytic face.
 - Before anything is wrapped, `method: hybrid` checks that some protected region has at least 50
   squared tolerances of area; if none has, the result is the freeform result (no second wrap) with the
   issue `hybrid_no_analytic_face`, and under `auto` the attempt is a recorded failure with that code.
   Likewise a scan with no protected primitive gives the freeform body.
 - `analytic.max_edge_gap` is the largest distance of the boundary edges of any merged face from its
-  primitive, sampled at 25 points per edge (not a certified maximum). Above half the tolerance the
-  issue `hybrid_edge_gap` is added (it does not change the verdict): the boundary edges of those faces
-  carry that gap, times 1.1, as their tolerance, and STEP keeps it, so a reader that checks edges
-  against faces more strictly than that sees a gap of that size there.
+  primitive, sampled at 25 points per edge (not a certified maximum). What it means for the exported
+  STEP: the edges of a merged face are Bézier curves shared with the patches round it, and STEP
+  keeps each as an edge curve with the face's surface and the edge's tolerance. With the border moved
+  onto the primitive that gap is a few micrometres, and the tolerance written is 1.1 times it, so a
+  reader that heals at 0.001 to 0.01 mm sees edges that lie on their faces. Above half the tolerance
+  (the border could not be moved) the issue `hybrid_edge_gap` is added, and the reader sees a gap of
+  that size; it does not change the verdict. The patches that were moved with the border differ from
+  the scan by up to what they moved, which the judge measures.
 - The merge is checked directly: each new face's normal agrees with the patches it replaced at
   sampled points, it lies within the gap of them, holes wind opposite to the outer loop and inside it,
   and it tessellates to their area. At most 64 groups are merged per call (the largest first; the rest

@@ -127,7 +127,7 @@ fn touches(body: &Brep, face: usize, vertices: &std::collections::BTreeSet<u32>)
 /// its face has room for the seam of its surface).
 const SECTORS: usize = 3;
 /// A group whose patches leave a gap in angle of at least this (radians) does not wrap round its axis.
-const WRAP_GAP: f64 = 1.0;
+const WRAP_GAP: f64 = 1.5;
 
 /// The angle (0 to 2 pi) of `p` about the axis through `point` along `axis`, from a fixed direction.
 fn angle_about(point: V, axis: V, p: V) -> f64 {

@@ -16,22 +16,27 @@
 //!    their net. A patch whose border does not match its edge makes the whole step refuse, and the body
 //!    stays as it was.
 //!
-//! All evaluation and projection is the kernel's (`SurfaceEval`, in [`Gauge`]).
+//! The projection is the kernel's (`SurfaceEval`, in [`Gauge`]); the least-squares fit of a Bézier curve and
+//! the edit of the borders of the patches' control nets are made here.
+//!
+//! APP-GEOMETRY: stands in for a kernel edit of a spline network that moves a shared edge onto a surface
+//! (re-fitting the edge's curve and both neighbouring patches consistently); solidcore has no such entry.
 use super::boundary::{Boundary, boundary, edge_points};
 use super::place::Gauge;
 use crate::hybrid::{V, add, norm, scale, sub};
 use crate::record::brep::{Brep, Curve, Loop, Surface};
 use crate::{KernelError, Result, finite_all};
+use solidcore::math::Vec3;
+use solidcore::nurbs::crv_fit::p1::ParamMethod;
+use solidcore::nurbs::crv_fit::p2::approx_lst_sq;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Alternating projections that put a point on every primitive of its edge or vertex.
-const MAX_ALTERNATIONS: usize = 30;
+const MAX_ALTERNATIONS: usize = 2000;
 /// A point lies on a primitive when it is this close (mm).
-const ON_SURFACE: f64 = 1e-9;
+const ON_SURFACE: f64 = 1e-4;
 /// Control points equal within this (mm) are the same point when a patch's border is matched to its edge.
 const SAME_POINT: f64 = 1e-7;
-/// The pivot of the normal equations below which the fit falls back to moving the control points along.
-const MIN_PIVOT: f64 = 1e-12;
 
 /// A group of patches and the evaluator of the primitive they lie on.
 pub(super) struct Target<'a> {
@@ -43,8 +48,8 @@ fn refuse(what: &str) -> KernelError {
     KernelError::Argument(what.to_string())
 }
 
-/// `p` on every one of `gauges`: by alternating projections, or, where they have no common point
-/// near it, on the first only.
+/// `p` on every one of `gauges`: by alternating projections, or, where they do not meet within
+/// [`MAX_ALTERNATIONS`], the nearer of the last iterate and the point on the first alone.
 fn onto_all(gauges: &[&Gauge], p: V) -> Option<V> {
     let first = gauges.first()?;
     let on_all = |q: V| gauges.iter().all(|g| g.distance(q).is_some_and(|d| d <= ON_SURFACE));
@@ -57,7 +62,14 @@ fn onto_all(gauges: &[&Gauge], p: V) -> Option<V> {
             return Some(q);
         }
     }
-    if gauges.len() == 1 { Some(q) } else { first.closest(p) }
+    if gauges.len() == 1 {
+        return Some(q);
+    }
+    // surfaces that meet at a shallow angle converge slowly: the last iterate is taken when it is nearer all of
+    // them than the point on the first alone
+    let worst = |q: V| gauges.iter().filter_map(|g| g.distance(q)).fold(0.0_f64, f64::max);
+    let alone = first.closest(p)?;
+    Some(if worst(q) < worst(alone) { q } else { alone })
 }
 
 /// The largest distance of the edge samples of a boundary from the primitive (mm).
@@ -107,78 +119,16 @@ fn bezier_of(body: &Brep, edge: u32) -> Option<&Vec<V>> {
     (clamped && e.nurbs.is_none() && e.interval == [lo, hi]).then_some(points)
 }
 
-fn binomial(n: usize, k: usize) -> f64 {
-    (0..k).fold(1.0, |c, i| c * (n - i) as f64 / (i + 1) as f64)
-}
-
-/// The Bernstein basis of degree `n` at `t`.
-fn bernstein(n: usize, t: f64) -> Vec<f64> {
-    (0..=n).map(|j| binomial(n, j) * t.powi(j as i32) * (1.0 - t).powi((n - j) as i32)).collect()
-}
-
-fn cell(a: &[Vec<f64>], i: usize, j: usize) -> f64 {
-    a.get(i).and_then(|r| r.get(j)).copied().unwrap_or(0.0)
-}
-
-/// Gauss-Jordan elimination on the augmented matrix `a` (`k` rows, `k` unknown columns and right-hand
-/// sides after them); the solution rows.
-fn solve(mut a: Vec<Vec<f64>>) -> Option<Vec<Vec<f64>>> {
-    let k = a.len();
-    for c in 0..k {
-        let p = (c..k).max_by(|&i, &j| cell(&a, i, c).abs().total_cmp(&cell(&a, j, c).abs()))?;
-        a.swap(c, p);
-        let pivot = cell(&a, c, c);
-        if !(pivot.abs() > MIN_PIVOT) {
-            return None;
-        }
-        let row = a.get(c)?.clone();
-        for r in (0..k).filter(|&r| r != c) {
-            let f = cell(&a, r, c) / pivot;
-            for (x, y) in a.get_mut(r)?.iter_mut().zip(&row) {
-                *x -= f * y;
-            }
-        }
-    }
-    (0..k)
-        .map(|i| {
-            let pivot = cell(&a, i, i);
-            a.get(i).map(|row| row.iter().skip(k).map(|x| x / pivot).collect())
-        })
-        .collect()
-}
-
-/// The Bézier control points (degree `n`) whose curve is nearest, in the least squares of `targets`
-/// (equally spaced in the parameter), with the given end points. `None` when the system is singular.
-fn least_squares(n: usize, ends: [V; 2], targets: &[V]) -> Option<Vec<V>> {
-    let k = n.checked_sub(1).filter(|&k| k >= 1)?;
-    let m = targets.len();
-    let basis: Vec<Vec<f64>> = (0..m).map(|i| bernstein(n, i as f64 / (m.saturating_sub(1).max(1)) as f64)).collect();
-    let b = |i: usize, j: usize| basis.get(i).and_then(|r| r.get(j)).copied().unwrap_or(0.0);
-    let mut a = vec![vec![0.0; k + 3]; k];
-    for (r, row) in a.iter_mut().enumerate() {
-        for (c, x) in row.iter_mut().take(k).enumerate() {
-            *x = (0..m).map(|i| b(i, r + 1) * b(i, c + 1)).sum();
-        }
-        for d in 0..3 {
-            let rhs: f64 = (0..m)
-                .map(|i| {
-                    let t = targets.get(i).copied().unwrap_or([0.0; 3]);
-                    let fixed = b(i, 0) * ends[0][d] + b(i, n) * ends[1][d];
-                    b(i, r + 1) * (t[d] - fixed)
-                })
-                .sum();
-            if let Some(x) = row.get_mut(k + d) {
-                *x = rhs;
-            }
-        }
-    }
-    let x = solve(a)?;
-    let mut out = vec![ends[0]];
-    out.extend(x.iter().map(|r| {
-        [r.first().copied().unwrap_or(0.0), r.get(1).copied().unwrap_or(0.0), r.get(2).copied().unwrap_or(0.0)]
-    }));
-    out.push(ends[1]);
-    out.iter().all(|p| finite_all(p)).then_some(out)
+/// The Bézier control points (degree `n`) of the curve the kernel fits to `targets` (equally spaced in the
+/// parameter) by least squares, through the first and the last of them (`nurbs::crv_fit::p2::approx_lst_sq`,
+/// Piegl and Tiller A9.7). `None` for a line (the fit needs three control points) or where the kernel
+/// refuses.
+fn least_squares(n: usize, targets: &[V]) -> Option<Vec<V>> {
+    let points: Vec<Vec3> = targets.iter().map(|p| Vec3::new(p[0], p[1], p[2])).collect();
+    let curve = approx_lst_sq(&points, n, n, ParamMethod::Uniform).ok()?;
+    let single_span = curve.knots().len() == 2 * (n + 1);
+    let out: Vec<V> = curve.cpts().iter().map(|c| [c.x, c.y, c.z]).collect();
+    (single_span && out.len() == n + 1 && out.iter().all(|p| finite_all(p))).then_some(out)
 }
 
 /// `old` with the end points replaced by `ends` and the interior points moved along by the blend of
@@ -228,7 +178,15 @@ fn new_ends(body: &Brep, e: u32, vertices: &BTreeMap<u32, V>) -> Option<[V; 2]> 
 fn refit_edge(body: &Brep, e: u32, gauges: &[&Gauge], ends: [V; 2], old: &[V]) -> Result<Vec<V>> {
     let samples = edge_points(body, e)?;
     let targets: Vec<V> = samples.iter().map(|p| onto_all(gauges, *p).unwrap_or(*p)).collect();
-    Ok(least_squares(old.len().saturating_sub(1), ends, &targets).unwrap_or_else(|| follow(old, ends)))
+    let mut fit = least_squares(old.len().saturating_sub(1), &targets).unwrap_or_else(|| follow(old, ends));
+    // the ends are the vertices as they moved
+    if let Some(first) = fit.first_mut() {
+        *first = ends[0];
+    }
+    if let Some(last) = fit.last_mut() {
+        *last = ends[1];
+    }
+    Ok(fit)
 }
 
 fn plan(body: &Brep, touch: &Touch) -> Result<Moves> {
@@ -373,12 +331,12 @@ mod tests {
         let samples: Vec<V> = (0..9)
             .map(|i| {
                 let t = f64::from(i) / 8.0;
-                let w = bernstein(3, t);
+                let w = [(1.0 - t).powi(3), 3.0 * t * (1.0 - t).powi(2), 3.0 * t * t * (1.0 - t), t.powi(3)];
                 (0..3).map(|d| cubic.iter().zip(&w).map(|(q, b)| q[d] * b).sum::<f64>()).collect::<Vec<_>>()
             })
             .map(|v| [v[0], v[1], v[2]])
             .collect();
-        let fit = least_squares(3, [cubic[0], cubic[3]], &samples).unwrap();
+        let fit = least_squares(3, &samples).unwrap();
         for (a, b) in fit.iter().zip(&cubic) {
             assert!(norm(sub(*a, *b)) < 1e-9, "{a:?} {b:?}");
         }
@@ -386,7 +344,7 @@ mod tests {
 
     #[test]
     fn a_line_has_no_interior_unknowns_and_the_fallback_keeps_its_ends() {
-        assert!(least_squares(1, [p(0.0, 0.0, 0.0), p(1.0, 0.0, 0.0)], &[p(0.5, 0.0, 0.0)]).is_none());
+        assert!(least_squares(1, &[p(0.0, 0.0, 0.0), p(0.5, 0.0, 0.0), p(1.0, 0.0, 0.0)]).is_none());
         let moved =
             follow(&[p(0.0, 0.0, 0.0), p(1.0, 0.0, 0.0), p(2.0, 0.0, 0.0)], [p(0.0, 1.0, 0.0), p(2.0, 3.0, 0.0)]);
         assert_eq!(moved.first(), Some(&p(0.0, 1.0, 0.0)));

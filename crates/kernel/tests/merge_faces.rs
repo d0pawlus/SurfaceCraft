@@ -58,9 +58,26 @@ fn kinds(b: &Brep) -> Vec<&'static str> {
 /// The finding: merged body is a valid, closed solid that tessellates, exports and re-imports.
 fn assert_sound(before: &Brep, after: &Brep, volume_tol: f64) {
     assert_eq!(is_closed(before), is_closed(after));
+    // the record is valid, its order canonical (a face used backward is walked from its other side)
+    after.validate().expect("a valid, canonical record");
     let (v0, v1) = (solid::volume(before).unwrap(), solid::volume(after).unwrap());
     assert!((v0 - v1).abs() <= volume_tol * v0, "volume {v0} -> {v1}");
-    tess::tessellate_all(after, None).expect("tessellates");
+    let mesh = tess::tessellate_all(after, None).expect("tessellates");
+    if is_closed(after) {
+        // the triangles of every face run outward: their signed volume is the body's
+        let signed: f64 = (0..mesh.triangle_count())
+            .filter_map(|t| mesh.triangle(t))
+            .map(|[a, b, c]| a.coords.dot(&b.coords.cross(&c.coords)) / 6.0)
+            .sum();
+        assert!((signed - v1).abs() <= 5e-3 * v1, "mesh volume {signed}, body volume {v1}");
+        // and so do those of the display mesh the viewport and the judge use, at a fine chord
+        let display = tess::tessellate(after, Some(0.05)).expect("tessellates");
+        let signed: f64 = (0..display.triangle_count())
+            .filter_map(|t| display.triangle(t))
+            .map(|[a, b, c]| a.coords.dot(&b.coords.cross(&c.coords)) / 6.0)
+            .sum();
+        assert!((signed - v1).abs() <= 5e-3 * v1, "display mesh volume {signed}, body volume {v1}");
+    }
     let text = step::export_solids(&[("merged", after)]).expect("exports");
     let back = step::import(text.as_bytes()).expect("re-imports");
     assert_eq!(back.len(), 1);
@@ -159,29 +176,38 @@ fn an_open_cylinder_sheet_becomes_one_cylinder_face() {
     merge_sheet(&net, &Shape::Cylinder { point: [0.0; 3], axis: [0.0, 0.0, 1.0], radius: r }, "cylinder", 1e-3);
 }
 
-/// The same sheets seen from the axis (their normals point inward) still become one analytic face each
-/// (the kernel keeps a sheet's one use of a face as the `same` one, so no sense is asserted here).
+/// The same sheets seen from the axis (their normals point inward): the kernel keeps only the `same` use of
+/// a sheet's faces, so a merged face that looks against its surface's natural normal would come back
+/// reversed (measured on a real scan: every normal of such faces against the patches' ones). Such a group
+/// is refused, with the reason; the same group in a closed body is merged
+/// (`a_concave_cylinder_wall_becomes_one_cylinder_face_used_backward`).
 #[test]
-fn concave_open_sheets_become_one_face_each() {
+fn a_concave_face_is_not_merged_into_an_open_sheet() {
     let (r, a0, a1) = (10.0_f64, 1.0_f64, 2.2_f64);
     let cyl = sheet(move |s, t| {
         let a = a0 + (a1 - a0) * t;
         [r * a.cos(), r * a.sin(), 20.0 * s]
     });
-    merge_sheet(&cyl, &Shape::Cylinder { point: [0.0; 3], axis: [0.0, 0.0, 1.0], radius: r }, "cylinder", 1e-3);
     let (k, b0, b1) = (0.5_f64, 0.5_f64, 1.7_f64);
     let cone = sheet(move |s, t| {
         let (a, h) = (b0 + (b1 - b0) * t, 10.0 + 10.0 * s);
         [k * h * a.cos(), k * h * a.sin(), h]
     });
-    let shape = Shape::Cone { apex: [0.0; 3], axis: [0.0, 0.0, 1.0], half_angle: k.atan() };
-    merge_sheet(&cone, &shape, "cone", 1e-3);
     let (rs, c0, c1) = (20.0_f64, 0.3_f64, 1.1_f64);
     let ball = sheet(move |s, t| {
         let (a, b) = (c0 + (c1 - c0) * t, -0.4 + 0.8 * s);
         [rs * b.cos() * a.cos(), rs * b.cos() * a.sin(), rs * b.sin()]
     });
-    merge_sheet(&ball, &Shape::Sphere { center: [0.0; 3], radius: rs }, "sphere", 1e-3);
+    let shapes = [
+        (cyl, Shape::Cylinder { point: [0.0; 3], axis: [0.0, 0.0, 1.0], radius: r }),
+        (cone, Shape::Cone { apex: [0.0; 3], axis: [0.0, 0.0, 1.0], half_angle: k.atan() }),
+        (ball, Shape::Sphere { center: [0.0; 3], radius: rs }),
+    ];
+    for (net, shape) in shapes {
+        let body = sheet_from_bezier_network(&net.patches, &net.corners).unwrap();
+        let why = merge_faces_onto_shape(&body, &(0..9).collect::<Vec<_>>(), &shape, 0.05).unwrap_err().to_string();
+        assert!(why.contains("open sheet"), "{why}");
+    }
 }
 
 #[test]
@@ -240,6 +266,14 @@ fn groups_the_kernel_cannot_merge_are_refused() {
     }
     let nan = Shape::Plane { point: [f64::NAN; 3], normal: [0.0, 0.0, 1.0] };
     assert!(merge_faces_onto_shape(&body, &[0, 1], &nan, 0.05).is_err());
+    for radius in [f64::NAN, f64::INFINITY, -1.0, 0.0] {
+        let cylinder = Shape::Cylinder { point: [0.0; 3], axis: [0.0, 0.0, 1.0], radius };
+        assert!(merge_faces_onto_shape(&body, &[0, 1], &cylinder, 0.05).is_err(), "radius {radius}");
+    }
+    let skew = Shape::Cylinder { point: [0.0; 3], axis: [f64::NAN, 0.0, 1.0], radius: 5.0 };
+    assert!(merge_faces_onto_shape(&body, &[0, 1], &skew, 0.05).is_err(), "a NaN axis");
+    let blunt = Shape::Cone { apex: [0.0; 3], axis: [0.0, 0.0, 1.0], half_angle: f64::NAN };
+    assert!(merge_faces_onto_shape(&body, &[0, 1], &blunt, 0.05).is_err(), "a NaN half angle");
     let torus = Shape::Torus { center: [0.0; 3], axis: [0.0, 0.0, 1.0], major_radius: 20.0, minor_radius: 5.0 };
     assert!(merge_faces_onto_shape(&body, &[0, 1], &torus, 0.05).is_err(), "a torus is not placed");
 }
@@ -403,4 +437,37 @@ fn an_arc_and_a_plane_are_not_cut_into_sectors() {
     assert_eq!(split_round(&body, &wall, &plane), vec![wall.clone()]);
     let sphere = Shape::Sphere { center: [0.0; 3], radius: 10.0 };
     assert_eq!(split_round(&body, &wall, &sphere), vec![wall]);
+}
+
+/// The boundary lists its loops by edge number, which says nothing of which is the outer one: with the
+/// hole's patch numbered first the hole's edges come first, and the face still has the hole inside it.
+#[test]
+fn a_hole_numbered_before_the_outer_border_is_still_a_hole() {
+    let mut all = split(|s, t| [30.0 * s, 30.0 * t, 0.0], 3);
+    all.swap(0, 4);
+    let refs: Vec<&dyn Fn(f64, f64) -> [f64; 3]> = all.iter().map(|b| b.as_ref()).collect();
+    let net = network_from_fns(&refs, 2);
+    let body = sheet_from_bezier_network(&net.patches, &net.corners).unwrap();
+    let ring: Vec<usize> = (1..9).collect();
+    let shape = Shape::Plane { point: [0.0; 3], normal: [0.0, 0.0, 1.0] };
+    let merged = merge_faces_onto_shape(&body, &ring, &shape, 0.05).unwrap();
+    let face = &merged.brep.faces[merged.face];
+    assert_eq!(face.loops.len(), 2);
+    let area: f64 = tess::tessellate_all(&merged.brep, None).unwrap().area();
+    assert!((area - 900.0).abs() < 1e-6, "the ring and the middle patch cover the square: {area}");
+}
+
+/// Two patches of a concave wall (a part of it, the rest stays patches) become one face used against
+/// its natural normal; the mesh of the whole body stays outward.
+#[test]
+fn a_part_of_a_concave_wall_is_merged_with_the_right_sense() {
+    let (r, big) = (10.0_f64, 14.0_f64);
+    let net = curved_slab(r, big, 1.0, 2.2);
+    let body = sheet_from_bezier_network(&net.patches, &net.corners).unwrap();
+    let shape = Shape::Cylinder { point: [0.0; 3], axis: [0.0, 0.0, 1.0], radius: r };
+    for group in [vec![9, 10], vec![13, 14, 16], vec![9, 10, 11, 12]] {
+        let merged = merge_faces_onto_shape(&body, &group, &shape, 0.05).unwrap();
+        assert_eq!(used_forward(&merged.brep, merged.face), Some(false), "{group:?}");
+        assert_sound(&body, &merged.brep, 2e-3);
+    }
 }

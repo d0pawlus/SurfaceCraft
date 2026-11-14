@@ -14,13 +14,16 @@ const MAX_VOLUME_CHANGE: f64 = 0.02;
 const VOLUME_ACCURACY: f64 = 1e-4;
 /// The tolerance of a boundary edge as a multiple of its gap.
 const EDGE_TOLERANCE_PER_GAP: f64 = 1.1;
-/// A merged face must tessellate to its patches' area within this share (a face the mesher cannot
-/// triangulate, such as one with a neck narrower than the chord, loses area). Measured on the gates and
-/// on real scans: the faces that are right differ from their patches' area by at most 0.047 (at the
-/// display chord 0.041, at the tolerance's 0.047; on scans 1 and 4 at most 0.027 and 0.013), the faces
-/// the mesher loses area from by 0.84 on the gates and 2.0 to 6.0 on the scans; 0.1 is 2.1 times the
-/// worst right one.
-const AREA_AGREEMENT: f64 = 0.1;
+/// A merged face must tessellate to its patches' area: not more than this share smaller (a face the mesher
+/// cannot triangulate, such as one with a neck narrower than the chord, loses area, and the scan points over
+/// the lost area are then measured against something else: a plane of 159 patches that lost 4.6 % of its
+/// area at the display chord lowered the share of measured points of a scan by 4.25 points) ...
+const MAX_AREA_LOSS: f64 = 0.025;
+/// ... and not more than this share larger (the patches' area is read from a grid of cells, which is
+/// always a little under that of a curved surface; measured at most 0.047 on cylinders and cones).
+const MAX_AREA_EXCESS: f64 = 0.1;
+/// The chord the judge tessellates the body at, as a share of the tolerance (half the chord of the area check).
+const JUDGE_CHORD_SHARE: f64 = 0.05;
 
 /// Per group: `Ok` when its face was taken, else why not.
 pub(super) type Verdicts = Vec<std::result::Result<(), String>>;
@@ -159,17 +162,21 @@ fn face_verdict(
     p: &Prepared,
     chord: f64,
 ) -> Result<std::result::Result<(), String>> {
+    if check::forward_of(brep, face) != p.forward {
+        return Ok(Err(
+            "the kernel changed the use of the new face (it was asked to use it against its natural normal)".into(),
+        ));
+    }
     let sheet = face_sheet(brep, face)?;
-    for c in [None, Some(chord)] {
+    // the display chord, the chord of the area check and the chord of the judge (a twentieth of the gap)
+    for c in [None, Some(chord), Some(JUDGE_CHORD_SHARE * (chord / 2.0))] {
         let at = c.map_or_else(|| "display chord".to_string(), |c| format!("chord {c:.3}"));
         let Ok(topo) = crate::tess::tessellate_topo(&sheet, c) else {
             return Ok(Err(format!("the mesher cannot triangulate the new face at the {at}")));
         };
-        let off = (topo.mesh.area() - p.area).abs() / p.area.max(1e-12);
-        if off > AREA_AGREEMENT {
-            return Ok(Err(format!(
-                "the new face tessellates to an area {off:.3} (share) off its patches' at the {at}"
-            )));
+        let ratio = topo.mesh.area() / p.area.max(1e-12);
+        if ratio < 1.0 - MAX_AREA_LOSS || ratio > 1.0 + MAX_AREA_EXCESS {
+            return Ok(Err(format!("the new face tessellates to {ratio:.3} of its patches' area at the {at}")));
         }
         if c.is_none()
             && let Err(e) = check::check_face(&topo.mesh, p.forward, &p.cloud, body, p.limit)
@@ -273,4 +280,35 @@ fn one_by_one(body: &Brep, volume: Option<f64>, all: &[&Prepared], run: &Run) ->
     }
     let why = verdicts.iter().find_map(|v| v.as_ref().err()).cloned().unwrap_or_default();
     Err(KernelError::Argument(format!("the kernel took no group: {why}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nurbs::sheet_from_bezier_network;
+
+    /// The finding behind the refusal of a face that looks against its natural normal in an open sheet: the
+    /// kernel keeps the `same` use of a sheet's face, whatever the record said, so such a face comes back
+    /// reversed against its neighbours. (In a closed shell the use is kept; see the gates of
+    /// `tests/merge_faces.rs`.)
+    #[test]
+    fn the_kernel_gives_a_sheet_face_used_backward_back_used_forward() {
+        let net = vec![vec![[0.0, 0.0, 0.0], [0.0, 1.0, 0.0]], vec![[1.0, 0.0, 0.0], [1.0, 1.0, 0.0]]];
+        let mut sheet = sheet_from_bezier_network(&[net], &[[0, 1, 2, 3]]).unwrap();
+        let uses = |b: &Brep| {
+            b.shells
+                .iter()
+                .flat_map(|s| match s {
+                    Shell::Faces { faces, .. } => faces.iter().map(|o| o.forward).collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(uses(&sheet), vec![true]);
+        if let Some(Shell::Faces { faces, .. }) = sheet.shells.first_mut() {
+            faces.iter_mut().for_each(|o| o.forward = false);
+        }
+        let (back, _) = rebuild(&canonicalize(sheet)).unwrap();
+        assert_eq!(uses(&back), vec![true], "the use of a sheet's face is the same one");
+    }
 }

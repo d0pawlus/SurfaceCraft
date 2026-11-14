@@ -25,10 +25,14 @@ const MIN_DOT: f64 = 0.5;
 const DISAGREE_ALLOWANCE: f64 = 0.1;
 /// Triangles with less than this share of the mean triangle area are slivers: their normals are noise.
 const MIN_TRIANGLE_AREA_SHARE: f64 = 0.3;
+/// A patch's normal is read only where its tangents are at least this far from parallel (sine).
+const MIN_SIN_BETWEEN_TANGENTS: f64 = 0.1;
 /// The patches nearest a corner that are tried.
 const NEAREST_PATCHES: usize = 12;
 /// A point of the new face may be this much farther from the patches than the gap.
 const PROXIMITY_SLACK: f64 = 1.5;
+/// ... except within this many gaps of the border of the group.
+const BORDER_MARGIN: f64 = 2.0;
 
 /// Points of the replaced patches with their outward normals.
 pub(super) struct Cloud {
@@ -37,9 +41,12 @@ pub(super) struct Cloud {
     faces: Vec<usize>,
     /// For each patch: `1` when the shell uses it along its natural normal, else `-1`.
     signs: BTreeMap<usize, f64>,
+    /// Points along the border of the group (its boundary edges).
+    border: Vec<V>,
 }
 
-fn forward_of(body: &Brep, face: usize) -> bool {
+/// Does the shell of `body` use `face` along its natural normal?
+pub(super) fn forward_of(body: &Brep, face: usize) -> bool {
     body.shells
         .iter()
         .find_map(|s| match s {
@@ -61,7 +68,7 @@ fn evaluator(body: &Brep, face: usize) -> Result<SurfaceEval> {
 const MIN_PATCH_AREA_SHARE: f64 = 0.05;
 
 /// Samples the patches `faces` of `body` (points and outward normals), leaving out collapsed ones.
-pub(super) fn cloud(body: &Brep, faces: &[usize]) -> Result<Cloud> {
+pub(super) fn cloud(body: &Brep, faces: &[usize], border: Vec<V>) -> Result<Cloud> {
     let mut blocks: Vec<(usize, Vec<V>, Vec<V>)> = Vec::new();
     for &f in faces {
         let eval = evaluator(body, f)?;
@@ -86,7 +93,7 @@ pub(super) fn cloud(body: &Brep, faces: &[usize]) -> Result<Cloud> {
         if b.1.len() == (CLOUD_GRID + 1).pow(2) { grid_area(&b.1, CLOUD_GRID) } else { 0.0 }
     };
     let mean = blocks.iter().map(area).sum::<f64>() / blocks.len().max(1) as f64;
-    let mut c = Cloud { points: Vec::new(), normals: Vec::new(), faces: Vec::new(), signs: BTreeMap::new() };
+    let mut c = Cloud { points: Vec::new(), normals: Vec::new(), faces: Vec::new(), signs: BTreeMap::new(), border };
     for b in &blocks {
         c.signs.insert(b.0, if forward_of(body, b.0) { 1.0 } else { -1.0 });
     }
@@ -106,10 +113,17 @@ pub(super) fn cloud(body: &Brep, faces: &[usize]) -> Result<Cloud> {
 }
 
 impl Cloud {
-    /// The patches a corner `p` may lie over: those whose box of samples (grown by a tenth of its
-    /// size and `slack`) holds it, nearest box centre first, at most `n`; when none does, the `n`
-    /// patches with a sample nearest `p`.
-    fn nearest_faces(&self, p: V, n: usize, slack: f64) -> Vec<usize> {
+    /// Is `p` within `reach` of the border of the group? Near it the face and the staircase of patches
+    /// differ sideways (a tiny hole the mesher closes, a patch edge across a corner), which says nothing
+    /// of whether the face leaves the patches.
+    fn near_border(&self, p: V, reach: f64) -> bool {
+        self.border.iter().any(|q| norm(sub(*q, p)) <= reach)
+    }
+
+    /// The `n` patches nearest `p` by the box of their samples (a corner over a patch has distance 0 to
+    /// its box; of the patches that hold it, the smaller come first). The distance to the centre of a box
+    /// would put the small patches round a corner before the large one it lies over.
+    fn nearest_faces(&self, p: V, n: usize) -> Vec<usize> {
         let mut boxes: BTreeMap<usize, (V, V)> = BTreeMap::new();
         for (q, f) in self.points.iter().zip(&self.faces) {
             let b = boxes.entry(*f).or_insert((*q, *q));
@@ -118,24 +132,16 @@ impl Cloud {
                 b.1[k] = b.1[k].max(q[k]);
             }
         }
-        let mut inside: Vec<(f64, usize)> = Vec::new();
-        for (f, (lo, hi)) in &boxes {
-            let grow = slack + 0.1 * norm(sub(*hi, *lo));
-            if (0..3).all(|k| p[k] >= lo[k] - grow && p[k] <= hi[k] + grow) {
-                let centre = [0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1]), 0.5 * (lo[2] + hi[2])];
-                inside.push((norm(sub(centre, p)), *f));
-            }
-        }
-        if inside.is_empty() {
-            inside = boxes
-                .iter()
-                .map(|(f, (lo, hi))| {
-                    (norm(sub([0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1]), 0.5 * (lo[2] + hi[2])], p)), *f)
-                })
-                .collect();
-        }
-        inside.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-        inside.into_iter().take(n).map(|(_, f)| f).collect()
+        let mut ranked: Vec<(f64, f64, usize)> = boxes
+            .iter()
+            .map(|(f, (lo, hi))| {
+                let excess = |k: usize| (lo[k] - p[k]).max(p[k] - hi[k]).max(0.0);
+                let d = (excess(0).powi(2) + excess(1).powi(2) + excess(2).powi(2)).sqrt();
+                (d, norm(sub(*hi, *lo)), *f)
+            })
+            .collect();
+        ranked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)).then(a.2.cmp(&b.2)));
+        ranked.into_iter().take(n).map(|(_, _, f)| f).collect()
     }
 }
 
@@ -146,8 +152,38 @@ fn nearest_on_patch(cloud: &Cloud, eval: &SurfaceEval, face: usize, p: V, reach:
     let uv = eval.project(q, None, reach)?;
     let (c, du, dv) = eval.derivs(uv[0], uv[1])?;
     let sign = cloud.signs.get(&face).copied().unwrap_or(1.0);
-    let normal = unit(cross([du.x, du.y, du.z], [dv.x, dv.y, dv.z])).map(|n| n.map(|x| sign * x));
+    let (a, b) = ([du.x, du.y, du.z], [dv.x, dv.y, dv.z]);
+    // near a collapsed corner the two tangents are nearly parallel and their product is noise
+    let regular = norm(cross(a, b)) >= MIN_SIN_BETWEEN_TANGENTS * norm(a) * norm(b);
+    let normal = unit(cross(a, b)).filter(|_| regular).map(|n| n.map(|x| sign * x));
     Some((norm(sub([c.x, c.y, c.z], p)), normal))
+}
+
+/// The nearest patch point to the corner `a` among the few patches it may lie over, as `(distance,
+/// outward normal)`.
+///
+/// # Errors
+/// No patch point within `reach`: the new face leaves the patches, or cannot be measured against them.
+fn nearest_over(
+    cloud: &Cloud,
+    body: &Brep,
+    evals: &mut BTreeMap<usize, SurfaceEval>,
+    a: V,
+    reach: f64,
+) -> Result<(f64, Option<V>)> {
+    let mut best: Option<(f64, Option<V>)> = None;
+    for f in cloud.nearest_faces(a, NEAREST_PATCHES) {
+        if let std::collections::btree_map::Entry::Vacant(slot) = evals.entry(f) {
+            slot.insert(evaluator(body, f)?);
+        }
+        let found = evals.get(&f).and_then(|e| nearest_on_patch(cloud, e, f, a, reach));
+        if let Some(m) = found.filter(|m| best.is_none_or(|b| m.0 < b.0)) {
+            best = Some(m);
+        }
+    }
+    best.ok_or_else(|| {
+        KernelError::Argument("the new face leaves the patches it replaced, or cannot be measured against them".into())
+    })
 }
 
 /// The corner `k` of the triangle list of `n`: spread over all triangles and all three corners.
@@ -185,23 +221,8 @@ pub(super) fn check_face(mesh: &Mesh, forward: bool, cloud: &Cloud, body: &Brep,
         else {
             continue;
         };
-        // the nearest patch point among the few patches the corner may lie over
-        let mut best: Option<(f64, Option<V>)> = None;
-        for f in cloud.nearest_faces(*a, NEAREST_PATCHES, gap) {
-            if let std::collections::btree_map::Entry::Vacant(slot) = evals.entry(f) {
-                slot.insert(evaluator(body, f)?);
-            }
-            let found = evals.get(&f).and_then(|e| nearest_on_patch(cloud, e, f, *a, reach));
-            if let Some(m) = found.filter(|m| best.is_none_or(|b| m.0 < b.0)) {
-                best = Some(m);
-            }
-        }
-        let (distance, normal) = best.ok_or_else(|| {
-            KernelError::Argument(
-                "the new face leaves the patches it replaced, or cannot be measured against them".into(),
-            )
-        })?;
-        if distance > PROXIMITY_SLACK * gap + 1e-6 {
+        let (distance, normal) = nearest_over(cloud, body, &mut evals, *a, reach)?;
+        if distance > PROXIMITY_SLACK * gap + 1e-6 && !cloud.near_border(*a, BORDER_MARGIN * gap) {
             return Err(KernelError::Argument(format!(
                 "the new face leaves the patches it replaced by {distance:.3} mm (limit {:.3}) at ({:.1}, {:.1}, {:.1})",
                 PROXIMITY_SLACK * gap,
@@ -243,7 +264,7 @@ mod tests {
     #[test]
     fn a_face_that_lies_on_the_patches_with_their_normal_is_accepted_and_a_flipped_one_is_refused() {
         let (body, mesh) = sheet();
-        let c = cloud(&body, &[0]).unwrap();
+        let c = cloud(&body, &[0], Vec::new()).unwrap();
         let outward = c.normals.first().copied().unwrap();
         let along_mesh = outward[2] > 0.0;
         assert!(check_face(&mesh, along_mesh, &c, &body, 0.05).is_ok());
@@ -253,7 +274,7 @@ mod tests {
     #[test]
     fn a_face_off_the_patches_is_refused() {
         let (body, mut mesh) = sheet();
-        let c = cloud(&body, &[0]).unwrap();
+        let c = cloud(&body, &[0], Vec::new()).unwrap();
         for p in &mut mesh.positions {
             p.z = 1.0;
         }

@@ -20,14 +20,25 @@ use surfacecraft_kernel::merge::{
 };
 use surfacecraft_kernel::record::brep::Brep;
 
-/// Samples per side of a patch's grid (so `(n + 1)^2` points are tested).
+/// Samples per side of a patch's grid (so `(n + 1)^2` points are tested) at least.
 const SAMPLES_PER_SIDE: usize = 5;
+/// The samples of a large patch are no farther apart than this many tolerances (a patch that is the size of
+/// a plate can leave the plane between five samples by more than the samples show), up to
+/// [`MAX_SAMPLES_PER_SIDE`] a side.
+const SAMPLE_SPACING_IN_TOLERANCES: f64 = 2.0;
+const MAX_SAMPLES_PER_SIDE: usize = 48;
 /// A sample must lie within this share of the tolerance of its primitive.
 const SAMPLE_SHARE_OF_TOLERANCE: f64 = 1.0;
 /// The boundary of a merged group may leave its primitive by this share of the tolerance.
 const GAP_SHARE_OF_TOLERANCE: f64 = 1.0;
-/// A sample must lie within this share of the tolerance of a triangle of the primitive's region.
+/// A sample must lie within this share of the tolerance of a triangle of the primitive's region ...
 const NEAR_REGION_SHARE_OF_TOLERANCE: f64 = 1.0;
+/// ... except for this share of the samples of a patch: the region is what the scan is there, and the
+/// segmentation leaves pinholes (a few unassigned triangles) in a large flat face, which stopped every large
+/// patch of a plate from joining its plane (measured: a disc of two 2 463 mm2 faces merged 590 mm2 of one and
+/// none of the other with every sample required; the patches that should join had 0.04 to 3.7 % of their
+/// samples in a pinhole).
+const MAX_SHARE_OUTSIDE_REGION: f64 = 0.04;
 /// How far from a sample the scan is looked for, in tolerances.
 const SEARCH_TOLERANCES: f64 = 4.0;
 /// A group of less area than this many squared tolerances stays patches (collapsed and sliver
@@ -103,22 +114,47 @@ impl<'a> Lookup<'a> {
         Self { all: Bvh::build(scan), owner: region_owners(scan, protected), regions, protected, tol }
     }
 
+    /// The grid of samples of patch `face` and its cells a side: [`SAMPLES_PER_SIDE`], or more for a patch
+    /// large against the tolerance.
+    fn samples_of(&self, body: &Brep, face: usize) -> Option<(Vec<[f64; 3]>, usize)> {
+        let coarse = face_samples(body, face, SAMPLES_PER_SIDE)?;
+        let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        for p in &coarse {
+            for (k, c) in p.iter().enumerate() {
+                if let (Some(l), Some(h)) = (lo.get_mut(k), hi.get_mut(k)) {
+                    (*l, *h) = (l.min(*c), h.max(*c));
+                }
+            }
+        }
+        let size = (0..3)
+            .map(|k| (hi.get(k).copied().unwrap_or(0.0) - lo.get(k).copied().unwrap_or(0.0)).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let n = (size / (SAMPLE_SPACING_IN_TOLERANCES * self.tol)).ceil();
+        let n =
+            if n.is_finite() { (n as usize).clamp(SAMPLES_PER_SIDE, MAX_SAMPLES_PER_SIDE) } else { SAMPLES_PER_SIDE };
+        if n == SAMPLES_PER_SIDE { Some((coarse, n)) } else { face_samples(body, face, n).map(|s| (s, n)) }
+    }
+
     /// The protected primitive patch `face` lies on and the area of the patch: the primitive whose
     /// region holds the scan triangle nearest the middle of the patch, if every sample of the patch
     /// lies within a margin of the primitive and of a triangle of its region.
     fn owner_of(&self, body: &Brep, face: usize) -> Option<(usize, f64)> {
-        let samples = face_samples(body, face, SAMPLES_PER_SIDE)?;
+        let (samples, n) = self.samples_of(body, face)?;
         let middle = samples.get(samples.len() / 2)?;
         let mid = Point3::new(middle[0], middle[1], middle[2]);
         let hit = self.all.closest(&mid, SEARCH_TOLERANCES * self.tol)?;
         let k = usize::try_from(self.owner.get(hit.triangle).copied().filter(|&o| o != NONE)?).ok()?;
         let (prim, region) = (self.protected.get(k)?, self.regions.get(k)?);
         let near = NEAR_REGION_SHARE_OF_TOLERANCE * self.tol;
-        let fits = |p: &[f64; 3]| {
+        let (mut off, mut outside) = (false, 0usize);
+        for p in &samples {
             let q = Point3::new(p[0], p[1], p[2]);
-            prim.fit.distance(&q).abs() <= SAMPLE_SHARE_OF_TOLERANCE * self.tol && region.closest(&q, near).is_some()
-        };
-        samples.iter().all(fits).then(|| (k, grid_area(&samples, SAMPLES_PER_SIDE)))
+            off |= prim.fit.distance(&q).abs() > SAMPLE_SHARE_OF_TOLERANCE * self.tol;
+            outside += usize::from(region.closest(&q, near).is_none());
+        }
+        let allowed = (MAX_SHARE_OUTSIDE_REGION * samples.len() as f64) as usize;
+        (!off && outside <= allowed).then(|| (k, grid_area(&samples, n)))
     }
 }
 
@@ -214,6 +250,7 @@ fn record(out: &mut Merging, protected: &[Protected], candidates: &[(usize, Vec<
                 patches: g.len(),
                 max_edge_gap: r.gap,
                 area: 0.0,
+                patch_area: r.patch_area,
             }),
             Err(why) => out.left.push(left(p, g.len(), why)),
         }

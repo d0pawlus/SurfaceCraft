@@ -67,52 +67,90 @@ fn model_surface(s: &Surface) -> Result<m::Surface> {
         }
         Surface::Sphere { frame: f, radius } => m::Surface::Sphere { frame: frame(f), radius: *radius },
         _ => {
-            return Err(refuse("the kernel's builder takes a plane, cylinder, cone (opening along its axis) or sphere"));
+            return Err(refuse(
+                "the kernel's builder takes a plane, cylinder, cone (opening along its axis) or sphere",
+            ));
         }
     })
+}
+
+/// The extent of a loop: the diagonal of the box of its edges' control points (mm).
+fn extent(body: &Brep, l: &[super::boundary::LoopEdge]) -> f64 {
+    let mut lo = [f64::INFINITY; 3];
+    let mut hi = [f64::NEG_INFINITY; 3];
+    for le in l {
+        if let Some(Curve::Spline { points, .. }) = body.edges.get(le.edge as usize).map(|e| &e.curve) {
+            for p in points {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(p[k]);
+                    hi[k] = hi[k].max(p[k]);
+                }
+            }
+        }
+    }
+    crate::hybrid::norm(crate::hybrid::sub(hi, lo))
+}
+
+/// The loops of a boundary, the largest first: it is the outer one, a hole is inside it and smaller (the
+/// boundary lists its loops by edge number, which says nothing of which is outer).
+fn by_size<'a>(body: &Brep, loops: &'a [Vec<super::boundary::LoopEdge>]) -> Vec<&'a Vec<super::boundary::LoopEdge>> {
+    let mut sized: Vec<(f64, &Vec<super::boundary::LoopEdge>)> = loops.iter().map(|l| (extent(body, l), l)).collect();
+    sized.sort_by(|a, b| b.0.total_cmp(&a.0));
+    sized.into_iter().map(|(_, l)| l).collect()
+}
+
+/// The vertices and edges of the model as they are first used, and the body's edge each model edge is.
+#[derive(Default)]
+struct Parts {
+    vertex_of: BTreeMap<u32, usize>,
+    edge_of: BTreeMap<u32, usize>,
+    vertices: Vec<m::Vertex>,
+    edges: Vec<m::Edge>,
+    source: Vec<u32>,
+}
+
+impl Parts {
+    fn vertex(&mut self, body: &Brep, v: u32) -> Result<usize> {
+        if let Some(&i) = self.vertex_of.get(&v) {
+            return Ok(i);
+        }
+        let point = body.vertices.get(v as usize).ok_or_else(|| refuse("vertex index"))?.point;
+        self.vertices.push(m::Vertex { step_id: self.vertices.len() as u64 + 1, point });
+        self.vertex_of.insert(v, self.vertices.len() - 1);
+        Ok(self.vertices.len() - 1)
+    }
+
+    /// The model edge of the body's edge `edge` (made when it is first used).
+    fn edge(&mut self, body: &Brep, edge: u32) -> Result<usize> {
+        if let Some(&i) = self.edge_of.get(&edge) {
+            return Ok(i);
+        }
+        let e = body.edges.get(edge as usize).ok_or_else(|| refuse("edge index"))?;
+        let (start, end) = (self.vertex(body, e.vertices[0])?, self.vertex(body, e.vertices[1])?);
+        self.edges.push(m::Edge {
+            step_id: self.edges.len() as u64 + 1,
+            start,
+            end,
+            curve: model_curve(e)?,
+            same_sense: true,
+            t_start: e.interval[0],
+            t_end: e.interval[1],
+        });
+        self.source.push(edge);
+        self.edge_of.insert(edge, self.edges.len() - 1);
+        Ok(self.edges.len() - 1)
+    }
 }
 
 /// The neutral model of the group's boundary on `surface`: one face, its edges and vertices numbered as
 /// they first appear, and the body's edge each model edge is.
 fn model_of(body: &Brep, b: &Boundary, surface: &Surface, same_sense: bool) -> Result<(m::Body, Vec<u32>)> {
-    let mut vertex_of: BTreeMap<u32, usize> = BTreeMap::new();
-    let mut edge_of: BTreeMap<u32, usize> = BTreeMap::new();
-    let (mut vertices, mut edges, mut source) = (Vec::new(), Vec::new(), Vec::new());
+    let mut parts = Parts::default();
     let mut loops: Vec<m::Loop> = Vec::new();
-    for l in &b.loops {
+    for l in by_size(body, &b.loops) {
         let mut uses = Vec::with_capacity(l.len());
         for le in l {
-            let e = body.edges.get(le.edge as usize).ok_or_else(|| refuse("edge index"))?;
-            let mut ends = [0usize; 2];
-            for (slot, &v) in ends.iter_mut().zip(&e.vertices) {
-                *slot = match vertex_of.get(&v) {
-                    Some(&i) => i,
-                    None => {
-                        let p = body.vertices.get(v as usize).ok_or_else(|| refuse("vertex index"))?.point;
-                        vertices.push(m::Vertex { step_id: vertices.len() as u64 + 1, point: p });
-                        vertex_of.insert(v, vertices.len() - 1);
-                        vertices.len() - 1
-                    }
-                };
-            }
-            let index = match edge_of.get(&le.edge) {
-                Some(&i) => i,
-                None => {
-                    edges.push(m::Edge {
-                        step_id: edges.len() as u64 + 1,
-                        start: ends[0],
-                        end: ends[1],
-                        curve: model_curve(e)?,
-                        same_sense: true,
-                        t_start: e.interval[0],
-                        t_end: e.interval[1],
-                    });
-                    source.push(le.edge);
-                    edge_of.insert(le.edge, edges.len() - 1);
-                    edges.len() - 1
-                }
-            };
-            uses.push(m::OrientedEdge { edge: index, forward: le.forward });
+            uses.push(m::OrientedEdge { edge: parts.edge(body, le.edge)?, forward: le.forward });
         }
         loops.push(m::Loop { outer: loops.is_empty(), orientation: true, bound: m::Bound::Edges(uses) });
     }
@@ -126,10 +164,10 @@ fn model_of(body: &Brep, b: &Boundary, surface: &Surface, same_sense: bool) -> R
         uncertainty_mm: None,
         shells: vec![shell],
         faces: vec![face],
-        edges,
-        vertices,
+        edges: parts.edges,
+        vertices: parts.vertices,
     };
-    Ok((model, source))
+    Ok((model, parts.source))
 }
 
 /// A pcurve of the kernel's edge as it runs along the body's edge: reversed where the two run opposite

@@ -784,3 +784,28 @@ mod network_tests {
         assert!(sheet_from_bezier_network(&bad, &q).is_err());
     }
 }
+
+#[cfg(test)]
+mod canonical_tests {
+    use super::*;
+
+    /// Two bilinear patches side by side sharing an edge, both used forward.
+    fn two_patch_sheet() -> Brep {
+        let net = |x: f64| vec![vec![[x, 0.0, 0.0], [x, 1.0, 0.0]], vec![[x + 1.0, 0.0, 0.0], [x + 1.0, 1.0, 0.0]]];
+        sheet_from_bezier_network(&[net(0.0), net(1.0)], &[[0, 1, 2, 3], [1, 4, 5, 2]]).unwrap()
+    }
+
+    /// A record whose faces are all used forward (what every caller but the merge builds) is canonical
+    /// already, and `canonicalize` leaves it as it is: the walk of a face used backward is the only thing
+    /// the function does differently, and no such face is there.
+    #[test]
+    fn a_record_with_forward_faces_only_is_unchanged() {
+        let b = two_patch_sheet();
+        assert!(b.shells.iter().all(|s| match s {
+            Shell::Faces { faces, .. } => faces.iter().all(|f| f.forward),
+            _ => true,
+        }));
+        b.validate().unwrap();
+        assert_eq!(canonicalize(b.clone()), b);
+    }
+}

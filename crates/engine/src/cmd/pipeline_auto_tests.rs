@@ -587,15 +587,13 @@ fn deviating(max_abs: f64, rms: f64, within: f64) -> ToSolidOut {
 fn a_merged_body_with_a_clearly_larger_deviation_is_not_an_upgrade() {
     use super::super::hybrid_method::rejection;
     let wrap = deviating(0.30, 0.05, 0.995);
-    // the same share within, but the largest deviation is a tolerance (0.2 mm) over the wrap's
     assert!(rejection(&deviating(0.30, 0.05, 0.995), &wrap, 0.2).is_none(), "equal is kept");
     assert!(rejection(&deviating(0.25, 0.04, 0.996), &wrap, 0.2).is_none(), "better is kept");
-    assert!(
-        rejection(&deviating(0.45, 0.05, 0.995), &wrap, 0.2).is_none(),
-        "max 0.15 mm over, inside the band of one tolerance"
-    );
-    assert!(rejection(&deviating(0.55, 0.05, 0.995), &wrap, 0.2).is_some(), "max 0.25 mm over (band 0.2 mm)");
-    assert!(rejection(&deviating(0.30, 0.06, 0.995), &wrap, 0.2).is_some(), "RMS 0.01 mm over (band 0.004 mm)");
+    // the band of the largest deviation is a quarter of the tolerance (0.05 mm), that of the RMS a hundredth
+    assert!(rejection(&deviating(0.34, 0.05, 0.995), &wrap, 0.2).is_none(), "max 0.04 mm over, inside the band");
+    assert!(rejection(&deviating(0.36, 0.05, 0.995), &wrap, 0.2).is_some(), "max 0.06 mm over");
+    assert!(rejection(&deviating(0.30, 0.051, 0.995), &wrap, 0.2).is_none(), "RMS 0.001 mm over, inside the band");
+    assert!(rejection(&deviating(0.30, 0.053, 0.995), &wrap, 0.2).is_some(), "RMS 0.003 mm over (band 0.002 mm)");
     assert!(rejection(&deviating(0.30, 0.05, 0.98), &wrap, 0.2).is_some(), "a clearly smaller share within");
 }
 

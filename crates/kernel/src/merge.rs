@@ -1,27 +1,32 @@
 //! Merging the patches of a freeform body that lie on one primitive into a single analytic face
 //! (P9-O6b), by editing the topology of the record: nothing is cut, no sharp edge is needed.
 //!
-//! The faces of a group go; their interior edges and vertices go with them; the group's
-//! boundary loop (the edges it shares with the patches around it, or the open border of a
-//! sheet) becomes the outer loop of one new face on the primitive's surface, so the boundary
-//! edges stay shared with the neighbours. The result is rebuilt by the kernel
-//! (it builds the trims of the analytic face from the edges) and refused when the kernel does not
-//! take it, when its volume or topology class changed, or when the new face does not tessellate to
-//! the area of the patches it replaced.
+//! The border of a group is first put on its primitive (`snap`: the vertices, the border edges re-fitted,
+//! the neighbouring patches following). Then the faces of the group go; their interior edges and vertices
+//! go with them; the group's boundary loops (the edges it shares with the patches around it, or the open
+//! border of a sheet) become the loops of one new face on the primitive's surface, so the boundary edges
+//! stay shared with the neighbours. A plane or cylinder face is built by the kernel (`trim`: its trims, NURBS
+//! form and parameter box); a cone or sphere face is placed here (`place`). The result is rebuilt by the
+//! kernel and refused, group by group with the reason, when the kernel does not take it, when its volume or
+//! topology class changed, when the kernel changed the use of the new face, or when the new face does not
+//! tessellate to the area of the patches it replaced or does not agree with them (`check`, `settle`).
 //!
-//! Findings (solidcore 4f2da85). The boundary edges are splines that lie on the primitive only
-//! within the fit (`gap`, reported per face). The edge gets the gap, times 1.1, as its tolerance, and
-//! its end vertices keep theirs: the mesher refuses a face whose edge is farther off its surface
-//! than 10 chords plus the edge's tolerance (it names the edge), and with the vertices raised too it
-//! lost area from a plane of 42 patches (40 % at a chord above 0.1 mm) and took minutes (measured).
-//! A wrap of scan-fitted patches already carries gaps of this size on its edges (the kernel's
-//! geometry check finds them in every freeform body). A cylinder, cone or sphere needs its NURBS
-//! form in the record, and that form must be the kernel's own: the full revolution with its arcs,
-//! the face being a sub-box of it; any other parameterisation loses the label. The healer is not
-//! run on the edited record (it changes the topology of such a body and the record order is lost).
+//! Findings (solidcore 4f2da85). A face used against its natural normal (the wall of a bore) is kept as
+//! such by a closed shell, and by nothing else: an open sheet keeps the `same` use of each face whatever the
+//! record says, so the face comes back reversed against its neighbours (measured on a real scan: all the
+//! normals of such faces against those of the patches; the group is refused, `prepare`). `canonicalize`
+//! walks such a face from its other side, as the record's canonical order says. The boundary edges carry
+//! the gap, times 1.1, as their tolerance (the mesher refuses a face whose edge is farther off its surface
+//! than 10 chords plus the edge's tolerance), and their end vertices keep theirs. A cone or sphere needs its
+//! NURBS form in the record, and that form must be the kernel's own (the full revolution with its arcs, the
+//! face being a sub-box of it; any other parameterisation loses the label). The healer is not run on the
+//! edited record (it changes the topology of such a body and the record order is lost).
+//!
 //! APP-GEOMETRY: stands in for the kernel making the pcurves (the face's trims in its own parameters)
-//! of the edges of a face on a curved surface: `through` chains cubic Béziers through the parameters of
-//! the edge's samples, and the plane's pcurve is the projection of the edge's control points.
+//! of the edges of a face on a cone or a sphere: `through` chains cubic Béziers through the parameters
+//! of the edge's samples (the parameters themselves are the kernel's `SurfaceEval::project`). Plane and
+//! cylinder faces are built by the kernel (`trim`); its builder gives a partial cone or sphere as an
+//! unlabelled rational spline, which this application does not take as an analytic face.
 use crate::hybrid::{Shape, V, add, cross, norm, scale, sub, unit};
 use crate::nurbs::{SurfaceProbe, domain, is_closed};
 use crate::record::brep::{Brep, Curve2, Face, Loop, OrientedEdge, Shell, Surface};
@@ -93,6 +98,8 @@ pub struct GroupResult {
     pub face: usize,
     /// The largest distance of its boundary edges from the primitive (mm).
     pub gap: f64,
+    /// The area of the patches it replaced (mm2).
+    pub patch_area: f64,
 }
 
 /// The outward direction of a patch face at the middle of its domain (its natural normal turned
@@ -279,6 +286,13 @@ fn prepare(body: &Brep, spec: &GroupSpec, max_gap: f64, gap_limit: f64) -> Resul
         )));
     }
     let placed = place(spec.shape, &samples, outward)?;
+    if placed.flip && !is_closed(body) {
+        return Err(KernelError::Argument(
+            "a face that looks against the natural normal of its surface (a bore, a dimple) is not merged into an open \
+             sheet: the kernel keeps only the same use of a sheet's faces, so the new face would come back reversed"
+                .into(),
+        ));
+    }
     let face = if matches!(spec.shape, Shape::Plane { .. } | Shape::Cylinder { .. }) {
         trim::built_face(body, &b, &placed.surface, !placed.flip)?
     } else {
@@ -289,7 +303,7 @@ fn prepare(body: &Brep, spec: &GroupSpec, max_gap: f64, gap_limit: f64) -> Resul
     };
     let area = spec.faces.iter().filter_map(|&f| face_area(body, f, AREA_GRID)).sum();
     let edge_list = b.loops.iter().flatten().copied().collect();
-    let cloud = check::cloud(body, spec.faces)?;
+    let cloud = check::cloud(body, spec.faces, samples)?;
     Ok(Prepared {
         faces: spec.faces.to_vec(),
         edge_list,
@@ -325,10 +339,10 @@ pub fn merge_faces_onto_shapes(
 fn prepare_all(
     body: &Brep,
     specs: &[GroupSpec],
-    limits: (f64, f64),
+    limits: (f64, &[bool]),
     cancel: &dyn Fn() -> bool,
 ) -> Result<Vec<std::result::Result<Prepared, String>>> {
-    let (max_gap, gap_limit) = limits;
+    let (max_gap, moved) = limits;
     let mut claimed: BTreeSet<usize> = BTreeSet::new();
     let mut prepared = Vec::with_capacity(specs.len());
     for (k, spec) in specs.iter().enumerate() {
@@ -340,6 +354,7 @@ fn prepare_all(
         } else if spec.faces.iter().any(|f| claimed.contains(f)) {
             Err("a face belongs to another group".to_string())
         } else {
+            let gap_limit = if moved.get(k).copied().unwrap_or(false) { FINAL_GAP_SHARE * max_gap } else { max_gap };
             prepare(body, spec, max_gap, gap_limit).map_err(|e| e.to_string())
         };
         if p.is_ok() {
@@ -359,24 +374,52 @@ fn unchanged(body: &Brep, reasons: Vec<String>) -> Batch {
     }
 }
 
-/// The body with the boundary of each group that lies within `max_gap` of its primitive moved onto
-/// it, and whether that worked (a body the step cannot edit is returned as it was).
-fn snapped(body: &Brep, specs: &[GroupSpec], max_gap: f64) -> (Brep, bool) {
+/// Can the group's face be placed on its primitive at all (its surface reaches no seam or pole, and in an
+/// open sheet it does not look against the natural normal of its surface)? A group that cannot is not moved
+/// onto its primitive: its neighbours would be moved for nothing.
+fn placeable(body: &Brep, spec: &GroupSpec, closed: bool) -> bool {
+    let Ok(b) = boundary(body, spec.faces) else { return false };
+    let mut outward = [0.0; 3];
+    for &f in spec.faces {
+        match patch_outward(body, f) {
+            Ok(n) => outward = add(outward, n),
+            Err(_) => return false,
+        }
+    }
+    let mut samples: Vec<V> = Vec::new();
+    for le in b.loops.iter().flatten() {
+        match edge_points(body, le.edge) {
+            Ok(p) => samples.extend(p),
+            Err(_) => return false,
+        }
+    }
+    place(spec.shape, &samples, outward).is_ok_and(|p| closed || !p.flip)
+}
+
+/// The body with the boundary of each group that lies within `max_gap` of its primitive moved onto it,
+/// and for each spec whether its boundary was moved (a body the step cannot edit is returned as it was,
+/// with no spec moved).
+fn snapped(body: &Brep, specs: &[GroupSpec], max_gap: f64) -> (Brep, Vec<bool>) {
     let gauges: Vec<Option<Gauge>> = specs.iter().take(MAX_GROUPS).map(|s| Gauge::new(s.shape).ok()).collect();
     let mut claimed: BTreeSet<usize> = BTreeSet::new();
-    let mut targets = Vec::new();
-    for (spec, gauge) in specs.iter().zip(&gauges) {
+    let closed = is_closed(body);
+    let (mut targets, mut flags) = (Vec::new(), vec![false; specs.len()]);
+    for (k, (spec, gauge)) in specs.iter().zip(&gauges).enumerate() {
         let Some(gauge) = gauge.as_ref() else { continue };
         if spec.faces.iter().any(|f| claimed.contains(f)) {
             continue;
         }
         let near = boundary(body, spec.faces).and_then(|b| boundary_gap(body, &b, gauge)).is_ok_and(|g| g <= max_gap);
-        if near {
+        if near && placeable(body, spec, closed) {
             claimed.extend(spec.faces.iter().copied());
             targets.push(Target { faces: spec.faces, gauge });
+            if let Some(f) = flags.get_mut(k) {
+                *f = true;
+            }
         }
     }
-    snap_boundaries(body, &targets).map_or_else(|_| (body.clone(), false), |b| (b, true))
+    let result = snap_boundaries(body, &targets);
+    result.map_or_else(|_| (body.clone(), vec![false; specs.len()]), |b| (b, flags))
 }
 
 /// [`merge_faces_onto_shapes`], with `all_at_once` false going straight to the group-by-group path
@@ -391,10 +434,9 @@ fn merge_with(
     if !(max_gap.is_finite() && max_gap > 0.0 && max_gap <= MAX_GAP) {
         return Err(KernelError::Argument(format!("the gap must be in (0, {MAX_GAP}]")));
     }
-    let (body, on_primitive) = snapped(original, specs, max_gap);
+    let (body, moved) = snapped(original, specs, max_gap);
     let body = &body;
-    let gap_limit = if on_primitive { FINAL_GAP_SHARE * max_gap } else { max_gap };
-    let prepared = prepare_all(body, specs, (max_gap, gap_limit), cancel)?;
+    let prepared = prepare_all(body, specs, (max_gap, &moved), cancel)?;
     let volume = is_closed(body).then(|| trusted_volume(body)).transpose()?;
     let all: Vec<&Prepared> = prepared.iter().filter_map(|p| p.as_ref().ok()).collect();
     let own =
@@ -417,7 +459,7 @@ fn merge_with(
             verdicts.pop().unwrap_or_else(|| Err("no verdict".to_string()))?;
             let first = spec.faces.iter().copied().min().unwrap_or(0);
             let face = face_map.get(first).copied().flatten().ok_or("face map")?;
-            Ok(GroupResult { face, gap: p.gap })
+            Ok(GroupResult { face, gap: p.gap, patch_area: p.area })
         })
         .collect();
     Ok(Batch { brep, face_map, groups })

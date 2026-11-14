@@ -68,6 +68,9 @@ pub struct MergedFace {
     /// The area of the face (mm2), from a tessellation at the tolerance's chord.
     #[serde(default)]
     pub area: f64,
+    /// The area of the patches it replaced (mm2).
+    #[serde(default)]
+    pub patch_area: f64,
 }
 
 /// How long one stage of the attempt took.
@@ -281,12 +284,13 @@ fn install(s: &mut Session, w: &WrapOut, body: Brep) -> Step<WrapOut> {
 }
 
 /// The band the merged body's largest and RMS deviation from the scan may exceed the wrap's by, as
-/// shares of the tolerance, before it is refused (the comparison of `auto` alone lets a share within
-/// the tolerance drop by half a point). A merged face's boundary may be a tolerance from its patches
-/// (the gap limit), so the largest deviation may grow by that near it (scan 4: 0.54 to 0.67 mm at a
-/// tolerance of 0.2); the RMS, which a wrong face moves, may grow by 0.02 of the tolerance.
-const MAX_DEVIATION_BAND: f64 = 1.0;
-const RMS_DEVIATION_BAND: f64 = 0.02;
+/// shares of the tolerance, before it is refused. With the border of every merged face put on its primitive a
+/// correct merge changes them by next to nothing (measured on scans 1 and 4 at a tolerance of 0.2: the largest
+/// deviation 0.194 to 0.197 and 0.672 to 0.672 mm, the RMS 0.025 to 0.025 and 0.040 to 0.040 mm), while a face
+/// that is wrong by a feature of the scan (a pocket it covers) moves the largest by millimetres: the bands are
+/// a quarter and a hundredth of the tolerance, 17 and 4 times what the correct merges moved them by.
+const MAX_DEVIATION_BAND: f64 = 0.25;
+const RMS_DEVIATION_BAND: f64 = 0.01;
 
 /// Why `merged` is not an upgrade of the wrap it came from, if it is not: worse by the comparison of
 /// `auto`, or a larger maximum or RMS deviation from the scan than the wrap's by more than a band.
@@ -303,9 +307,10 @@ pub(super) fn rejection(merged: &ToSolidOut, wrap: &ToSolidOut, tol: f64) -> Opt
             )
         };
         return Some(format!(
-            "the merged body is worse than the wrap by verdict, share within the tolerance or closedness (merged: {}; wrap: {})",
+            "the merged body is worse than the wrap by verdict, share within the tolerance or closedness (merged: {}; wrap: {}; {})",
             show(merged),
-            show(wrap)
+            show(wrap),
+            deviations(merged, wrap).unwrap_or_default()
         ));
     }
     let (Some(m), Some(w)) = (merged.deviation.as_ref(), wrap.deviation.as_ref()) else {
@@ -324,9 +329,21 @@ pub(super) fn rejection(merged: &ToSolidOut, wrap: &ToSolidOut, tol: f64) -> Opt
 fn deviations(merged: &ToSolidOut, wrap: &ToSolidOut) -> Option<String> {
     let (m, w) = (merged.deviation.as_ref()?, wrap.deviation.as_ref()?);
     Some(format!(
-        "max {:.3} against {:.3} mm, RMS {:.3} against {:.3} mm, merged against wrap",
-        m.max_abs, w.max_abs, m.rms, w.rms
+        "max {:.3} against {:.3} mm, RMS {:.3} against {:.3} mm, {:.2} against {:.2} % of the points not facing, merged against wrap",
+        m.max_abs,
+        w.max_abs,
+        m.rms,
+        w.rms,
+        100.0 * m.not_facing,
+        100.0 * w.not_facing
     ))
+}
+
+/// Does the mesher take `body` at the display chord and at the tolerance's? A merged body it cannot take
+/// is not returned.
+fn meshes(body: &Brep, tolerance: f64) -> bool {
+    let at = |c| tessellate_topo(body, c).is_ok();
+    at(None) && at(Some(AREA_CHORD_SHARE * tolerance))
 }
 
 /// The merging step on the wrapped body: the merged result when it is not worse than the wrap (by the
@@ -351,13 +368,7 @@ fn merged_or_wrap(
     let tried = merge_groups(s, scan, &brep, protected, set.tolerance)
         .map_err(|e| if is_cancelled(&e) { Halt::Cancelled(e) } else { halt("hybrid_merge_failed", message_of(&e)) })?;
     stages.push(stage("merge", &watch));
-    if tried.merged.is_empty() {
-        let left = tried.left;
-        return Ok((wrap_result, none(left)));
-    }
-    // a merged body the mesher cannot take at the display chord or the tolerance's is not returned
-    let meshes = |c| tessellate_topo(&tried.body, c).is_ok();
-    if !(meshes(None) && meshes(Some(AREA_CHORD_SHARE * set.tolerance))) {
+    if tried.merged.is_empty() || !meshes(&tried.body, set.tolerance) {
         return Ok((wrap_result, none(tried.left)));
     }
     let merged_w = install(s, w, tried.body.clone())?;

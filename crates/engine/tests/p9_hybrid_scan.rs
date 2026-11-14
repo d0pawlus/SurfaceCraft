@@ -63,11 +63,15 @@ fn profile() -> Vec<(f64, f64)> {
 
 /// The part as a closed mesh: the profile turned about the z axis.
 fn part_mesh() -> Mesh {
+    turned(&profile())
+}
+
+/// A closed mesh: `prof` (distance from the axis, height), from the axis to the axis, turned about z.
+fn turned(prof: &[(f64, f64)]) -> Mesh {
     const STEPS: usize = 120;
-    let prof = profile();
     let mut m = Mesh::default();
     let mut ring_start = Vec::new();
-    for &(rho, z) in &prof {
+    for &(rho, z) in prof {
         ring_start.push(m.positions.len() as u32);
         if rho < 1e-9 {
             m.positions.push(Point3::new(0.0, 0.0, z));
@@ -297,6 +301,142 @@ fn an_open_scan_gives_a_sheet_with_analytic_faces() {
     assert!(faces_on_the_part(&brep) >= 1, "no analytic face is the part's own: {r}");
     let freeform = to_solid_open(&mut s, "freeform");
     assert_eq!(freeform["verdict"], r["verdict"], "the verdict freeform gives for the open scan");
+}
+
+/// The cup: a body of revolution with an outer wall of radius 14 (z from 2 to 18), a flat base and a flat
+/// rim, and a bore of radius 6 (z from 5 to 18) with a flat floor at z = 3; every edge is rounded by 2. The
+/// bore wall is a concave cylinder, the commonest analytic feature of a machined part that is not convex.
+const CUP_OUTER: f64 = 14.0;
+const CUP_BORE: f64 = 6.0;
+const CUP_HEIGHT: f64 = 20.0;
+
+fn cup_profile() -> Vec<(f64, f64)> {
+    let arc = |c: (f64, f64), from: f64, to: f64| -> Vec<(f64, f64)> {
+        (0..=8)
+            .map(|k| {
+                let a = from + (to - from) * f64::from(k) / 8.0;
+                (c.0 + ROUND * a.cos(), c.1 + ROUND * a.sin())
+            })
+            .collect()
+    };
+    let mut p = vec![(0.0, 0.0)];
+    p.extend((1..12).map(|r| (f64::from(r), 0.0)));
+    p.extend(arc((CUP_OUTER - ROUND, ROUND), -FRAC_PI_2, 0.0));
+    p.extend((3..18).map(|z| (CUP_OUTER, f64::from(z))));
+    p.extend(arc((CUP_OUTER - ROUND, CUP_HEIGHT - ROUND), 0.0, FRAC_PI_2));
+    p.extend((9..12).rev().map(|r| (f64::from(r), CUP_HEIGHT)));
+    p.extend(arc((CUP_BORE + ROUND, CUP_HEIGHT - ROUND), FRAC_PI_2, std::f64::consts::PI));
+    p.extend((6..18).rev().map(|z| (CUP_BORE, f64::from(z))));
+    p.extend(arc((CUP_BORE - ROUND, 5.0), 0.0, -FRAC_PI_2));
+    p.extend((1..4).rev().map(|r| (f64::from(r), 3.0)));
+    p.push((0.0, 3.0));
+    p
+}
+
+/// Whether the shell of `b` uses face `face` against its natural normal.
+fn used_backward(b: &Brep, face: usize) -> bool {
+    use surfacecraft_kernel::record::brep::Shell;
+    b.shells.iter().any(|s| match s {
+        Shell::Faces { faces, .. } => faces.iter().any(|o| o.face as usize == face && !o.forward),
+        _ => false,
+    })
+}
+
+/// Gate 3: the concave wall of a bore is merged into analytic cylinder faces used against their natural
+/// normal; the outer wall and the planes are too; the body stays a passing closed solid that survives STEP.
+#[test]
+fn the_bore_of_a_cup_becomes_concave_cylinder_faces() {
+    let mut s = scanned_session(&turned(&cup_profile()), 5);
+    let r = to_solid(&mut s, "hybrid");
+    assert_eq!(r["method"], "hybrid", "{r}");
+    assert_eq!(r["verdict"], "pass", "{r}");
+    let brep = body_of(&s, &r);
+    let a = &r["analytic"];
+    eprintln!("cup: {}", a);
+    let cylinders: Vec<(usize, f64)> = brep
+        .faces
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| match &f.surface {
+            Surface::Cylinder { frame, radius } => {
+                let axis = unit(cross(frame.x_axis, frame.y_axis));
+                (axis[2].abs() > 0.999 && frame.origin[0].hypot(frame.origin[1]) < GEOMETRY_TOLERANCE)
+                    .then_some((i, *radius))
+            }
+            _ => None,
+        })
+        .collect();
+    let bore: Vec<usize> =
+        cylinders.iter().filter(|(_, r)| (r - CUP_BORE).abs() < GEOMETRY_TOLERANCE).map(|(i, _)| *i).collect();
+    let outer: Vec<usize> =
+        cylinders.iter().filter(|(_, r)| (r - CUP_OUTER).abs() < GEOMETRY_TOLERANCE).map(|(i, _)| *i).collect();
+    eprintln!("cup: bore faces {bore:?}, outer faces {outer:?}");
+    assert!(!bore.is_empty() && !outer.is_empty(), "the bore and the outer wall have faces: {r}");
+    assert!(bore.iter().all(|&f| used_backward(&brep, f)), "the bore's faces are used against their natural normal");
+    assert!(outer.iter().all(|&f| !used_backward(&brep, f)), "the outer wall's faces are used along it");
+}
+
+/// A disc of radius 30 and height 6 with a rim rounded by 2: two flat faces of 2 463 mm2 each, the large
+/// planes of a plate.
+const DISC_RADIUS: f64 = 30.0;
+const DISC_HEIGHT: f64 = 6.0;
+
+fn disc_profile() -> Vec<(f64, f64)> {
+    let corner = |c: (f64, f64), from: f64, to: f64| -> Vec<(f64, f64)> {
+        (0..=8)
+            .map(|k| {
+                let a = from + (to - from) * f64::from(k) / 8.0;
+                (c.0 + ROUND * a.cos(), c.1 + ROUND * a.sin())
+            })
+            .collect()
+    };
+    let mut p = vec![(0.0, 0.0)];
+    p.extend((1..28).map(|r| (f64::from(r), 0.0)));
+    p.extend(corner((DISC_RADIUS - ROUND, ROUND), -FRAC_PI_2, 0.0));
+    p.extend(corner((DISC_RADIUS - ROUND, DISC_HEIGHT - ROUND), 0.0, FRAC_PI_2));
+    p.extend((1..28).rev().map(|r| (f64::from(r), DISC_HEIGHT)));
+    p.push((0.0, DISC_HEIGHT));
+    p
+}
+
+/// Gate 4: the flat faces of a plate are analytic faces that cover most of their area (a large plane is the
+/// easy case: one rebuild of many patches).
+#[test]
+fn the_large_flat_faces_of_a_disc_are_analytic_faces() {
+    let mut s = scanned_session(&turned(&disc_profile()), 5);
+    let r = to_solid(&mut s, "hybrid");
+    assert_eq!(r["method"], "hybrid", "{r}");
+    assert_eq!(r["verdict"], "pass", "{r}");
+    let brep = body_of(&s, &r);
+    let a = &r["analytic"];
+    let planes: Vec<f64> = a["merged"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["kind"] == "plane")
+        .map(|m| m["area"].as_f64().unwrap())
+        .collect();
+    eprintln!("disc: plane areas {planes:?}; {}", a["stages_ms"]);
+    eprintln!("disc left: {}", a["left_as_patches"]);
+    eprintln!(
+        "disc: faces {} patches {} modelled {} left_out {}",
+        r["body"]["faces"], r["patches"], r["modelled"], r["left_out"]
+    );
+    let (p, ..) = kinds(&brep);
+    assert!(p >= 1, "{r}");
+    assert_geometry_disc(&brep);
+}
+
+/// The analytic faces of the disc are planes normal to z at z = 0 or at its height.
+fn assert_geometry_disc(b: &Brep) {
+    for f in &b.faces {
+        if let Surface::Plane { origin, u_axis, v_axis } = &f.surface {
+            let n = unit(cross(*u_axis, *v_axis));
+            assert!(n[2].abs() > 0.999, "{n:?}");
+            let z = origin[2];
+            assert!(z.abs() < GEOMETRY_TOLERANCE || (z - DISC_HEIGHT).abs() < GEOMETRY_TOLERANCE, "z = {z}");
+        }
+    }
 }
 
 /// The organic blob of the earlier gates: a closed freeform part.

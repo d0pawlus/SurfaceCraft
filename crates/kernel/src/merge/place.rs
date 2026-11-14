@@ -183,12 +183,12 @@ pub(super) fn place(shape: &Shape, points: &[V], outward: V) -> Result<Placement
         Shape::Plane { point, normal } => plane(*point, *normal, outward)?,
         Shape::Cylinder { point, axis, radius } => {
             let a = unit(*axis).ok_or_else(|| invalid("degenerate axis"))?;
-            around(*point, a, c, outward, Round::Cylinder(*radius))?
+            around(*point, a, c, outward, Round::Cylinder(*radius), points)?
         }
         Shape::Cone { apex, axis, half_angle } => {
             let a = unit(*axis).ok_or_else(|| invalid("degenerate axis"))?;
             let t0 = dot(sub(c, *apex), a);
-            around(add(*apex, scale(a, t0)), a, c, outward, Round::Cone { t0, half_angle: *half_angle })?
+            around(add(*apex, scale(a, t0)), a, c, outward, Round::Cone { t0, half_angle: *half_angle }, points)?
         }
         Shape::Sphere { center, radius } => sphere(*center, *radius, c, outward)?,
         Shape::Torus { .. } => return Err(invalid("a torus cannot be placed yet")),
@@ -220,9 +220,33 @@ enum Round {
     },
 }
 
-fn around(origin: V, axis: V, c: V, outward: V, round: Round) -> Result<Placement> {
+/// The direction from the axis into the widest gap in angle between the `points` (where the seam of a
+/// surface of revolution goes so that the face is cut by it least).
+fn seam_direction(points: &[V], origin: V, axis: V) -> Option<V> {
+    let e1 = perpendicular(axis);
+    let e2 = cross(axis, e1);
+    let mut angles: Vec<f64> = points
+        .iter()
+        .filter_map(|p| {
+            let q = sub(*p, origin);
+            let (a, b) = (dot(q, e1), dot(q, e2));
+            (a != 0.0 || b != 0.0).then(|| b.atan2(a))
+        })
+        .collect();
+    angles.sort_by(f64::total_cmp);
+    let first = *angles.first()?;
+    let (mut widest, mut middle) = (0.0_f64, first + PI);
+    for (a, b) in angles.iter().zip(angles.iter().skip(1).chain(std::iter::once(&(first + TAU)))) {
+        if b - a > widest {
+            (widest, middle) = (b - a, 0.5 * (a + b));
+        }
+    }
+    Some(add(scale(e1, middle.cos()), scale(e2, middle.sin())))
+}
+
+fn around(origin: V, axis: V, c: V, outward: V, round: Round, points: &[V]) -> Result<Placement> {
     let d = radial(c, origin, axis).0.ok_or_else(|| invalid("the face lies on the axis"))?;
-    let x = scale(d, -1.0);
+    let x = seam_direction(points, origin, axis).unwrap_or_else(|| scale(d, -1.0));
     let y = cross(axis, x);
     let frame = Frame { origin, x_axis: x, y_axis: y };
     let (surface, lean) = match round {
