@@ -2,7 +2,10 @@
 use super::graph::held_by_loop;
 use super::report::{EdgeStatus, GlobalIssue, GlobalResult, GlobalVerdict, LoopReport, ScanPose, Unplaced};
 use super::solve::{Cand, Solved};
-use super::{GlobalOptions, LOOP_BOUND, MAX_REJECTED_PER_USED, MIN_CONSENSUS_MARGIN};
+use super::{
+    GlobalOptions, LARGE_GRAPH_EDGES, LOOP_BOUND, MAX_REJECTED_PER_USED, MIN_CONSENSUS_MARGIN,
+    MIN_CONSENSUS_MARGIN_SMALL,
+};
 use surfacecraft_geom::Transform;
 
 fn unplaced_reason(k: usize, cands: &[Cand]) -> Unplaced {
@@ -28,7 +31,14 @@ fn scan_poses(n: usize, opts: &GlobalOptions, cands: &[Cand], solved: &Solved) -
             };
             let edges_used = solved.edges.iter().filter(|e| e.i == k || e.j == k).count();
             ScanPose {
-                held_by_loop: held.get(k).copied().unwrap_or(false),
+                held_by_loop: matches!(held.get(k), Some(Some(None))),
+                weak_pair: held
+                    .get(k)
+                    .copied()
+                    .flatten()
+                    .flatten()
+                    .and_then(|e| solved.edges.get(e))
+                    .map(|e| [e.i, e.j]),
                 index: k,
                 fixed: k == opts.fixed,
                 placed,
@@ -41,6 +51,11 @@ fn scan_poses(n: usize, opts: &GlobalOptions, cands: &[Cand], solved: &Solved) -
         .collect()
 }
 
+/// Is a vote on `edges` pairs that won by `margin` too close?
+fn unclear((margin, edges): (usize, usize)) -> bool {
+    margin < if edges >= LARGE_GRAPH_EDGES { MIN_CONSENSUS_MARGIN } else { MIN_CONSENSUS_MARGIN_SMALL }
+}
+
 /// `aligned` only when every scan is placed and held by a closed loop, no used edge disagrees with
 /// the final poses by more than [`LOOP_BOUND`] tolerances, the vote that left pairs out was clear
 /// and the left-out pairs are not the majority.
@@ -49,7 +64,7 @@ fn judge(
     loops: &LoopReport,
     rejected: usize,
     used: usize,
-    margin: Option<usize>,
+    margin: Option<(usize, usize)>,
 ) -> (GlobalVerdict, Vec<GlobalIssue>) {
     let placed_others = scans.iter().filter(|s| s.placed && !s.fixed).count();
     if placed_others == 0 {
@@ -59,7 +74,7 @@ fn judge(
         (scans.iter().any(|s| !s.placed), GlobalIssue::UnplacedScans),
         (scans.iter().any(|s| s.placed && !s.held_by_loop), GlobalIssue::WeaklyHeld),
         (loops.worst_edge_ratio > LOOP_BOUND, GlobalIssue::LoopErrorHigh),
-        (margin.is_some_and(|m| m < MIN_CONSENSUS_MARGIN), GlobalIssue::ConsensusUnclear),
+        (margin.is_some_and(unclear), GlobalIssue::ConsensusUnclear),
         (rejected as f64 > MAX_REJECTED_PER_USED * used as f64, GlobalIssue::ManyEdgesRejected),
     ];
     let issues: Vec<GlobalIssue> = checks.into_iter().filter(|(bad, _)| *bad).map(|(_, i)| i).collect();
@@ -99,6 +114,7 @@ pub(super) fn finish(
         iterations: solved.iterations,
         edges_used: solved.edges.len(),
         edges_rejected: rejected,
-        consensus_margin: solved.margin,
+        consensus_margin: solved.margin.map(|m| m.0),
+        consensus_trials: solved.trials,
     }
 }

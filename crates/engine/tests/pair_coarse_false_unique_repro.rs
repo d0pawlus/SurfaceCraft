@@ -34,6 +34,7 @@ struct Row {
     j: usize,
     truth: (f64, f64),
     error: (f64, f64),
+    rms_per_diagonal: f64,
     out: Value,
 }
 
@@ -61,7 +62,8 @@ fn scan(fixture: &'static str, views: &[Mesh]) -> (Vec<Row>, usize) {
                 let q = truth_pose.inverse().then_after(&found).quaternion();
                 let angle = (2.0 * q.vector().norm().atan2(q.scalar().abs())).to_degrees();
                 let truth = (true_share(&views[j], &views[i], 0.3), true_share(&views[i], &views[j], 0.3));
-                rows.push(Row { fixture, i, j, truth, error: (error, angle), out });
+                let rms_per_diagonal = f(&out["rms"]) / views[i].bbox().diagonal();
+                rows.push(Row { fixture, i, j, truth, error: (error, angle), rms_per_diagonal, out });
             }
         }
     }
@@ -88,12 +90,12 @@ fn known_defect_pair_coarse_returns_wrong_poses_as_unique() {
         rows.extend(found);
     }
     eprintln!(
-        "\nTABLE: unique pairs more than 1 mm off the truth\nfixture | pair (fixed-moving) | true overlap m/f | error mm, deg | confidence | overlap m/f | rms | tol | stability | probed/failed/slides | probe_margin | return_gap | refined | alternatives | candidates | method | icp converged"
+        "\nTABLE: unique pairs more than 1 mm off the truth\nfixture | pair (fixed-moving) | true overlap m/f | error mm, deg | confidence | overlap m/f | rms | rms/diagonal | tol | stability | probed/failed/slides | probe_margin | return_gap | refined | alternatives | candidates | method | icp converged"
     );
     for r in &rows {
         let o = &r.out;
         eprintln!(
-            "{} | {}-{} | {:.2}/{:.2} | {:.1}, {:.2} | {:.2} | {:.2}/{:.2} | {:.3} | {:.3} | {:.4} | {}/{}/{} | {} | {:.3} | {} | {} | {} | {} | {}",
+            "{} | {}-{} | {:.2}/{:.2} | {:.1}, {:.2} | {:.2} | {:.2}/{:.2} | {:.3} | {:.5} | {:.3} | {:.4} | {}/{}/{} | {} | {:.3} | {} | {} | {} | {} | {}",
             r.fixture,
             r.i,
             r.j,
@@ -105,6 +107,7 @@ fn known_defect_pair_coarse_returns_wrong_poses_as_unique() {
             f(&o["overlap_moving"]),
             f(&o["overlap_fixed"]),
             f(&o["rms"]),
+            r.rms_per_diagonal,
             f(&o["tolerance"]),
             f(&o["stability"]),
             o["probed"],

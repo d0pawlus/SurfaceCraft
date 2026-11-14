@@ -37,7 +37,7 @@ fn ring_edges(seed: u64) -> (Vec<Edge>, Mesh) {
         let measured = truth(i).inverse().then_after(&truth(j)).then_after(&error);
         // virtual points: points of scan j, in its own frame
         let points = part.sample_points(150, &mut rng).into_iter().map(|(p, _)| truth(j).inverse().apply(&p)).collect();
-        edges.push(Edge { i, j, measured, weight: 1.0, tolerance: 0.2, points });
+        edges.push(Edge { i, j, measured, weight: 1.0, tolerance: 0.2, points, strong: true });
     }
     (edges, part)
 }

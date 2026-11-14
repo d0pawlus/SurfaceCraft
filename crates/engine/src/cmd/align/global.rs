@@ -21,9 +21,12 @@ pub struct GlobalIn {
     /// The scan that stays where it is (default: the first of `objects`).
     #[serde(default)]
     pub fixed: Option<ObjRef>,
-    /// Move the scans that were placed (default false: the command only proposes the poses). One undo step for all of them; refused when nothing could be connected to the fixed scan.
+    /// Move the scans that were placed (default false: the command only proposes the poses). One undo step for all of them. Only the scans held by a closed loop of strong pairs move; a scan that hangs on a single unconfirmed pair (`held_by_loop` false) moves only when `accept_weak` lists it. Refused when nothing could be connected to the fixed scan.
     #[serde(default)]
     pub apply: bool,
+    /// With `apply`: the scans (members of `objects`) that hang on a single pair that no loop confirms and that you accept moving anyway, after checking the pair's evidence in `edges` (the way `align.pair_coarse` moves a non-unique pose only when `choose` names it). Without them nothing weakly held moves.
+    #[serde(default)]
+    pub accept_weak: Vec<ObjRef>,
     /// `search` (default): the full pair search for every pair, no assumption about where the scans lie. `current`: the scans are already roughly in place, every pair starts from the current poses.
     #[serde(default)]
     pub start: StartMode,
@@ -56,6 +59,9 @@ pub struct GlobalScan {
     pub edges_used: usize,
     /// Is the scan held by a closed loop? False when it hangs on a single pair (two scans, a chain, a leaf) that no other pair confirms: then the pose is only as good as that one pair's own evidence (see its entry in `edges`), and the verdict cannot be `aligned`.
     pub held_by_loop: bool,
+    /// For a placed scan that is not held: the pair `[fixed, moving]` that nothing confirms.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weak_pair: Option<[usize; 2]>,
 }
 
 /// The poses, the pair evidence, the loop closure and the verdict.
@@ -65,8 +71,12 @@ pub struct GlobalOut {
     pub verdict: GlobalVerdict,
     /// Reasons for a verdict other than `aligned`, and notes.
     pub issues: Vec<GlobalIssue>,
-    /// Were the scans moved?
+    /// Were any scans moved? False for a proposal, and for an `apply` where every placed scan was weakly held and not listed in `accept_weak`.
     pub applied: bool,
+    /// Indices (in `objects`) of the scans that were moved.
+    pub moved: Vec<usize>,
+    /// Indices of the placed scans that were left where they are with `apply`, because they hang on one unconfirmed pair and `accept_weak` does not list them.
+    pub left_weakly_held: Vec<usize>,
     /// One entry per scan, in the order of `objects`.
     pub scans: Vec<GlobalScan>,
     /// Every pair that was tried: verdict, overlap, residual, whether it became an edge of the pose graph, and its misfit before and after relaxation.
@@ -84,52 +94,76 @@ pub struct GlobalOut {
     pub used_edges: usize,
     /// Unique pairs left out because they contradicted the others; their misfit at the final poses is in `edges`.
     pub rejected_edges: usize,
-    /// How decisive the vote that left pairs out was (inliers of the winning set minus those of the best different one; 0 is a tie, which makes the verdict `partial`); absent when the vote left nothing out.
+    /// How decisive the vote that left pairs out was (inliers of the winning set minus those of the best different one; 0 is a tie; below 2 with 6 or more pairs, below 1 with fewer, the verdict is `partial`); absent when no vote left anything out.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub consensus_margin: Option<usize>,
+    /// Trees the vote tried (the strongest-first tree from each scan, then seeded random ones): the vote is sampled, not exhaustive.
+    pub consensus_trials: usize,
     /// A sentence about the outcome.
     pub note: String,
 }
 
+/// What `apply` did: the scans moved and the weakly held ones left.
+struct Applied {
+    moved: Vec<usize>,
+    left: Vec<usize>,
+}
+
 /// The sentence about the outcome; for scans held by one pair it quotes that pair's own evidence.
-fn note_of(r: &GlobalResult, applied: bool, refused: bool) -> String {
+fn note_of(r: &GlobalResult, apply: bool, done: &Applied, refused: bool) -> String {
     let unplaced = r.scans.iter().filter(|x| !x.placed).count();
-    let weak = weak_note(r);
     let left = if unplaced > 0 {
         format!(", {unplaced} scan(s) could not be connected and stay where they are")
     } else {
         String::new()
     };
-    let head = match (r.verdict, applied, refused) {
-        (GlobalVerdict::Aligned, true, _) => {
-            "every scan is placed, held by a loop of pairs that agree: applied".to_string()
-        }
-        (GlobalVerdict::Aligned, false, _) => "every scan is placed, held by a loop of pairs that agree".to_string(),
-        (GlobalVerdict::Partial, true, _) => format!("partial: the placed scans were moved{left}"),
-        (GlobalVerdict::Partial, false, _) => format!("partial: nothing was moved (proposal){left}"),
-        (GlobalVerdict::Failed, _, true) => "failed: nothing connects to the fixed scan, nothing was moved".to_string(),
-        (GlobalVerdict::Failed, _, false) => "failed: nothing connects to the fixed scan".to_string(),
+    let head = match (r.verdict, refused) {
+        (_, true) => "failed: nothing connects to the fixed scan, nothing was moved".to_string(),
+        (GlobalVerdict::Failed, _) => "failed: nothing connects to the fixed scan".to_string(),
+        (GlobalVerdict::Aligned, _) => "every scan is held by a loop of strong pairs that agree with each other and with the final poses (this proves consistency, not truth: on a part with a symmetry a loop of wrong pairs can agree as well)".to_string(),
+        (GlobalVerdict::Partial, _) => format!("partial{left}"),
     };
-    format!("{head}{weak}")
+    let moved = match (apply, done.moved.is_empty(), refused) {
+        (true, false, _) => format!("; moved scans {:?}", done.moved),
+        (true, true, false) => "; nothing was moved".to_string(),
+        _ => String::new(),
+    };
+    let held_back = if done.left.is_empty() {
+        String::new()
+    } else {
+        format!("; left in place: {:?} (weakly held: list them in `accept_weak` to move them)", done.left)
+    };
+    format!("{head}{moved}{held_back}{}", weak_note(r))
 }
 
-/// What is known about the scans that hang on a single pair: it is one pair, unconfirmed by any loop.
+/// What is known about the scans that hang on a pair nothing confirms (at most three quoted): the
+/// pair is quoted with its own evidence, and said to be one pair, unconfirmed by any loop.
 fn weak_note(r: &GlobalResult) -> String {
-    let weak: Vec<usize> = r.scans.iter().filter(|x| x.placed && !x.held_by_loop).map(|x| x.index).collect();
-    let Some(&first) = weak.first() else { return String::new() };
-    let pair = r.edges.iter().find(|e| e.status == EdgeStatus::Used && (e.fixed == first || e.moving == first));
-    let evidence = pair.map_or(String::new(), |e| {
-        format!(
-            " (scan {first}: pair {}-{}, confidence {:.2}, overlap {:.2}/{:.2}, stability {:.3}, {} of {} probes failed, {} slides)",
-            e.fixed, e.moving, e.confidence, e.overlap_moving, e.overlap_fixed, e.stability, e.probes_failed, e.probed, e.slides
-        )
-    });
+    let weak: Vec<_> = r.scans.iter().filter(|x| x.placed && !x.held_by_loop).collect();
+    if weak.is_empty() {
+        return String::new();
+    }
+    let quote = |scan: usize, pair: Option<[usize; 2]>| {
+        let e = pair
+            .and_then(|[f, m]| r.edges.iter().find(|e| e.status == EdgeStatus::Used && e.fixed == f && e.moving == m));
+        e.map_or(format!("scan {scan}"), |e| {
+            format!(
+                "scan {scan} (pair {}-{}: confidence {:.2}, overlap {:.2}/{:.2}, residual {:.2} % of the diagonal{}, stability {:.3}, {} of {} probes failed, {} slides)",
+                e.fixed, e.moving, e.confidence, e.overlap_moving, e.overlap_fixed, 100.0 * e.rms_per_diagonal,
+                if e.strong_evidence { "" } else { ", too large to count as evidence" },
+                e.stability, e.probes_failed, e.probed, e.slides
+            )
+        })
+    };
+    let shown: Vec<String> = weak.iter().take(3).map(|x| quote(x.index, x.weak_pair)).collect();
+    let more = if weak.len() > 3 { format!(" and {} more", weak.len() - 3) } else { String::new() };
     format!(
-        "; scan(s) {weak:?} hang on a single pair that no loop confirms{evidence}: check them by eye before relying on the pose"
+        "; weakly held, on one pair no loop of strong pairs confirms: {}{more}: check them by eye before relying on the pose",
+        shown.join("; ")
     )
 }
 
-fn resolve_all(s: &Session, i: &GlobalIn) -> CmdResult<(Vec<ObjectId>, usize)> {
+fn resolve_all(s: &Session, i: &GlobalIn) -> CmdResult<(Vec<ObjectId>, usize, Vec<usize>)> {
     if i.objects.len() > MAX_SCANS {
         return Err(CmdError::Params(format!(
             "{} scans given; at most {MAX_SCANS} are taken at once",
@@ -153,31 +187,46 @@ fn resolve_all(s: &Session, i: &GlobalIn) -> CmdResult<(Vec<ObjectId>, usize)> {
                 .ok_or_else(|| CmdError::Params(format!("the fixed mesh {id} is not in `objects`")))?
         }
     };
-    Ok((ids, fixed))
+    let mut accepted = Vec::new();
+    for a in &i.accept_weak {
+        let id = a.resolve(s, ObjectKind::Mesh)?;
+        let k = ids
+            .iter()
+            .position(|x| *x == id)
+            .ok_or_else(|| CmdError::Params(format!("`accept_weak` names mesh {id}, which is not in `objects`")))?;
+        accepted.push(k);
+    }
+    Ok((ids, fixed, accepted))
 }
 
 fn finite(m: &[[f64; 4]; 4]) -> bool {
     m.iter().flatten().all(|v| v.is_finite())
 }
 
-/// Moves the placed scans (the fixed one stays) by their poses; every pose is checked first, so
-/// nothing moves when one is not finite.
-fn move_placed(s: &mut Session, ids: &[ObjectId], r: &GlobalResult) -> CmdResult<()> {
+/// Moves the scans that may move (placed, not the fixed one, and held by a loop or listed in
+/// `accepted`); every pose is checked first, so nothing moves when one is not finite.
+fn move_placed(s: &mut Session, ids: &[ObjectId], r: &GlobalResult, accepted: &[usize]) -> CmdResult<Applied> {
     if r.scans.iter().any(|x| !finite(&x.pose.to_rows())) {
         return Err(CmdError::Params("the relaxation gave a pose that is not finite; nothing was moved".into()));
     }
-    for (id, scan) in ids.iter().zip(&r.scans).filter(|(_, x)| x.placed && !x.fixed) {
+    let mut done = Applied { moved: Vec::new(), left: Vec::new() };
+    for (k, (id, scan)) in ids.iter().zip(&r.scans).enumerate().filter(|(_, (_, x))| x.placed && !x.fixed) {
+        if !(scan.held_by_loop || accepted.contains(&k)) {
+            done.left.push(k);
+            continue;
+        }
         let m = s.doc.mesh_mut(*id).ok_or_else(|| CmdError::Params(format!("no mesh {id}")))?;
         m.transform_rigid(&scan.pose);
+        done.moved.push(k);
     }
-    Ok(())
+    Ok(done)
 }
 
-fn scan_outs(ids: &[ObjectId], r: &GlobalResult, applied: bool) -> Vec<GlobalScan> {
+fn scan_outs(ids: &[ObjectId], r: &GlobalResult, moved: &[usize]) -> Vec<GlobalScan> {
     ids.iter()
         .zip(&r.scans)
         .map(|(id, x)| GlobalScan {
-            align: out(*id, &x.pose, None, applied && x.placed && !x.fixed),
+            align: out(*id, &x.pose, None, moved.contains(&x.index)),
             index: x.index,
             fixed: x.fixed,
             placed: x.placed,
@@ -185,12 +234,13 @@ fn scan_outs(ids: &[ObjectId], r: &GlobalResult, applied: bool) -> Vec<GlobalSca
             chained_matrix: x.chained.to_rows(),
             edges_used: x.edges_used,
             held_by_loop: x.held_by_loop,
+            weak_pair: x.weak_pair,
         })
         .collect()
 }
 
 pub(super) fn global(s: &mut Session, i: GlobalIn) -> CmdResult<GlobalOut> {
-    let (ids, fixed) = resolve_all(s, &i)?;
+    let (ids, fixed, accepted) = resolve_all(s, &i)?;
     let meshes: Vec<Arc<Mesh>> = ids
         .iter()
         .map(|id| s.doc.mesh(*id).map(|m| m.mesh.clone()).ok_or_else(|| CmdError::Params(format!("no mesh {id}"))))
@@ -204,18 +254,22 @@ pub(super) fn global(s: &mut Session, i: GlobalIn) -> CmdResult<GlobalOut> {
         Err(e) => return Err(e.into()),
     };
     let refused = i.apply && r.verdict == GlobalVerdict::Failed;
-    let applied = i.apply && !refused;
-    if applied {
-        move_placed(s, &ids, &r)?;
+    let done = if i.apply && !refused {
+        move_placed(s, &ids, &r, &accepted)?
     } else {
+        Applied { moved: Vec::new(), left: Vec::new() }
+    };
+    if done.moved.is_empty() {
         s.mark_unchanged();
     }
     Ok(GlobalOut {
-        note: note_of(&r, applied, refused),
-        scans: scan_outs(&ids, &r, applied),
+        note: note_of(&r, i.apply, &done, refused),
+        scans: scan_outs(&ids, &r, &done.moved),
         verdict: r.verdict,
         issues: r.issues,
-        applied,
+        applied: !done.moved.is_empty(),
+        moved: done.moved,
+        left_weakly_held: done.left,
         edges: r.edges,
         loops: r.loops,
         pairs_tried: r.pairs_tried,
@@ -224,5 +278,6 @@ pub(super) fn global(s: &mut Session, i: GlobalIn) -> CmdResult<GlobalOut> {
         used_edges: r.edges_used,
         rejected_edges: r.edges_rejected,
         consensus_margin: r.consensus_margin,
+        consensus_trials: r.consensus_trials,
     })
 }

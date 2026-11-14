@@ -37,7 +37,7 @@ pub enum GlobalIssue {
     WeaklyHeld,
     /// More pairs contradicted the others than agreed with them (over 1.5 rejected per used edge): most of the pair stage was wrong, and so may be the part that survived.
     ManyEdgesRejected,
-    /// The vote that left pairs out was a tie: the best consistent set of pairs and the best different one agree with the same number of edges (see `consensus_margin`); which pairs are wrong is a coin toss.
+    /// The vote that left pairs out was too close: the best consistent set of pairs beat the best different one by less than 2 edges (1 with fewer than 6 pairs), see `consensus_margin`; which pairs are wrong is nearly a coin toss, and the vote is sampled.
     ConsensusUnclear,
 }
 
@@ -97,6 +97,9 @@ pub struct ScanPose {
     pub edges_used: usize,
     /// Is the scan held by a closed loop: every pair on its path to the fixed scan lies on a cycle of used pairs? False for a scan that hangs on a single pair (two scans, a chain, a leaf): that pair is unconfirmed. The fixed scan counts as held; an unplaced scan is not.
     pub held_by_loop: bool,
+    /// For a placed scan that is not held: the pair on its path to the fixed scan that nothing confirms (the one nearest the scan), as `[fixed, moving]` scan indices; it is a bridge, or lies only in loops with a pair of weak evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weak_pair: Option<[usize; 2]>,
 }
 
 /// One pair of scans.
@@ -132,6 +135,10 @@ pub struct EdgeReport {
     /// Disagreement of the pair pose with the relaxed poses; only for used edges.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub misfit_after: Option<Misfit>,
+    /// RMS residual of the pair as a share of the diagonal of the fixed scan.
+    pub rms_per_diagonal: f64,
+    /// Does the pair carry strong evidence of its own: the residual below 0.3 % of the diagonal (see `rms_per_diagonal`)? Confidence does not count (it read 1.00 on wrong poses). A loop confirms its scans only when all its pairs are strong.
+    pub strong_evidence: bool,
     /// How firmly the matched part pins the pair pose (see `align.pair_coarse`).
     pub stability: f64,
     /// Displaced starts the pair pose was pushed from.
@@ -203,6 +210,8 @@ pub struct GlobalResult {
     pub edges_used: usize,
     /// Unique pairs left out because they contradicted the others (their misfit at the final poses is in `edges`).
     pub edges_rejected: usize,
-    /// How decisive the vote that left pairs out was: inliers of the winning set minus those of the best different set (0 a tie, which makes the verdict `partial`); `None` when no pair was left out by the vote.
+    /// How decisive the last vote that left pairs out was: inliers of the winning set minus those of the best different set (0 a tie; a margin below 2 with 6 or more pairs, below 1 with fewer, makes the verdict `partial`); `None` when no pair was left out by a vote.
     pub consensus_margin: Option<usize>,
+    /// Trees the vote tried: the strongest-first tree from each scan and seeded random ones. The vote is sampled, not exhaustive.
+    pub consensus_trials: usize,
 }

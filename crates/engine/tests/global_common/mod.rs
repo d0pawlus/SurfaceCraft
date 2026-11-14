@@ -124,14 +124,16 @@ pub fn count(out: &Value, status: &str) -> usize {
 pub fn print_edges(out: &Value) {
     for e in out["edges"].as_array().unwrap() {
         eprintln!(
-            "  {}-{}: {} {} confidence {:.2}, overlap {:.2}/{:.2}",
+            "  {}-{}: {} {} confidence {:.2}, overlap {:.2}/{:.2}, rms {:.5} of the diagonal (strong {})",
             e["fixed"],
             e["moving"],
             e["verdict"],
             e["status"],
             e["confidence"].as_f64().unwrap(),
             e["overlap_moving"].as_f64().unwrap(),
-            e["overlap_fixed"].as_f64().unwrap()
+            e["overlap_fixed"].as_f64().unwrap(),
+            e["rms_per_diagonal"].as_f64().unwrap(),
+            e["strong_evidence"]
         );
     }
 }

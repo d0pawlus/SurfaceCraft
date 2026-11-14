@@ -49,6 +49,9 @@ pub struct Edge {
     pub tolerance: f64,
     /// Virtual correspondences: points of scan `j` that lie on scan `i` at the measured pose.
     pub points: Vec<Point3>,
+    /// Does the pair carry strong evidence of its own (its residual is small against the size of
+    /// the scan)? A loop confirms its scans only when all its pairs do.
+    pub strong: bool,
 }
 
 /// How far an edge disagrees with a set of poses.

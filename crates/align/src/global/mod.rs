@@ -45,14 +45,24 @@ pub const REJECT_FACTOR: f64 = 2.5;
 /// `aligned` needs every used edge to agree with the final poses within this many tolerances.
 pub const LOOP_BOUND: f64 = 1.0;
 /// The vote that leaves pairs out must beat the best different set of pairs by at least this many
-/// edges, or the verdict is `partial` (`consensus_unclear`). 1 means: a tie carries no information
-/// and is not accepted; any win is (a discrete rule, no measured value can sit near it). A single
-/// forged pair among six in a graph of four scans wins by exactly 1: the alternative must call two
-/// right pairs wrong to keep it.
-pub const MIN_CONSENSUS_MARGIN: usize = 1;
+/// edges (`consensus_unclear` otherwise): 2 from [`LARGE_GRAPH_EDGES`] pairs up, where a coherent
+/// minority is likelier and the vote only samples the spanning trees; 1 for a smaller graph (a
+/// single forged pair among six edges in a graph of four scans wins by exactly 1: the alternative
+/// must call two right pairs wrong to keep it, and no vote on fewer edges can do better).
+pub const MIN_CONSENSUS_MARGIN: usize = 2;
+/// Margin required in a graph with fewer than [`LARGE_GRAPH_EDGES`] pairs.
+pub const MIN_CONSENSUS_MARGIN_SMALL: usize = 1;
+/// Pairs from which [`MIN_CONSENSUS_MARGIN`] applies.
+pub const LARGE_GRAPH_EDGES: usize = 6;
 /// More left-out pairs than this many per used pair make the verdict `partial`
-/// (`many_edges_rejected`).
-pub const MAX_REJECTED_PER_USED: f64 = 1.5;
+/// (`many_edges_rejected`). Measured worst on a correct result: 0.63 (the ring, whose pairs of
+/// non-neighbours are all false), 2 times below.
+pub const MAX_REJECTED_PER_USED: f64 = 1.25;
+/// A pair carries strong evidence of its own when its residual is below this share of the
+/// diagonal of the fixed scan. Measured on right pairs 0.0004 to 0.0008 (3.6 times below); on the
+/// wrong pairs of the blob 0.0076 to 0.0103 (2.5 times above). The wrong pairs of the bracket and
+/// the ring fit at noise level (0.0007 to 0.0008) and are not caught by it.
+pub const MAX_RMS_PER_DIAGONAL: f64 = 0.003;
 /// Fewest triangles a scan may have.
 const MIN_TRIANGLES: usize = 4;
 
@@ -140,6 +150,7 @@ pub fn align_global(scans: &[&Mesh], opts: &GlobalOptions, cancel: &Cancel) -> R
 ///
 /// # Errors
 /// As [`align_global`].
+#[doc(hidden)]
 pub fn align_global_with<S>(
     scans: &[&Mesh],
     opts: &GlobalOptions,

@@ -4,7 +4,7 @@ use super::graph::{Tree, chain, consensus, spanning_tree};
 use super::pairs::Tried;
 use super::relax::{Edge, MIN_VIRTUAL, misfit, relax, virtual_points};
 use super::report::{EdgeReport, EdgeStatus, GlobalResult, LoopReport};
-use super::{GlobalOptions, REJECT_FACTOR, loops, verdict};
+use super::{GlobalOptions, MAX_RMS_PER_DIAGONAL, REJECT_FACTOR, loops, verdict};
 use crate::pair::{MIN_OVERLAP, PairVerdict};
 use crate::{AlignError, PairResult};
 use surfacecraft_geom::{Bvh, Cancel, Mesh, Transform, par};
@@ -41,6 +41,8 @@ fn report_of(t: &Tried, status: EdgeStatus, note: Option<String>) -> EdgeReport 
         probes_failed: 0,
         slides: 0,
         probe_margin: None,
+        rms_per_diagonal: 0.0,
+        strong_evidence: false,
         probe_return_gap: 0.0,
         refined: 0,
         note,
@@ -60,6 +62,8 @@ fn report_of(t: &Tried, status: EdgeStatus, note: Option<String>) -> EdgeReport 
         probes_failed: r.probes_failed,
         slides: r.slides,
         probe_margin: r.probe_margin,
+        rms_per_diagonal: 0.0,
+        strong_evidence: false,
         probe_return_gap: r.probe_return_gap,
         refined: r.refined,
         ..base
@@ -88,9 +92,21 @@ fn candidate(k: usize, t: &Tried, scans: &[&Mesh], bvhs: &[Option<Bvh>]) -> Cand
     if points.len() < MIN_VIRTUAL {
         return Cand { report: report_of(t, EdgeStatus::TooLittleOverlap, None), edge: None };
     }
-    let edge =
-        Edge { i: t.fixed, j: t.moving, measured: r.transform, weight: weight_of(r), tolerance: r.tolerance, points };
-    Cand { report: report_of(t, EdgeStatus::Used, None), edge: Some(edge) }
+    let diagonal = scans.get(t.fixed).map_or(f64::INFINITY, |m| m.bbox().diagonal());
+    let share = r.rms / diagonal;
+    let strong = share.is_finite() && share <= MAX_RMS_PER_DIAGONAL;
+    let edge = Edge {
+        i: t.fixed,
+        j: t.moving,
+        measured: r.transform,
+        weight: weight_of(r),
+        tolerance: r.tolerance,
+        points,
+        strong,
+    };
+    let mut report = report_of(t, EdgeStatus::Used, None);
+    (report.rms_per_diagonal, report.strong_evidence) = (share, strong);
+    Cand { report, edge: Some(edge) }
 }
 
 /// The pair results as candidates for edges; builds the BVH of every scan some unique pair is solved in.
@@ -119,7 +135,9 @@ pub(super) struct Solved {
     pub iterations: usize,
     pub converged: bool,
     /// Margin of the first vote that left pairs out.
-    pub margin: Option<usize>,
+    pub margin: Option<(usize, usize)>,
+    /// Trees the last vote tried.
+    pub trials: usize,
 }
 
 /// Misfit of the worst edge in tolerances: its position and value.
@@ -142,12 +160,13 @@ fn graph_of(cands: &[Cand]) -> (Vec<usize>, Vec<Edge>) {
 /// Spanning tree, chain and relaxation over the used edges; an edge that disagrees with the final
 /// poses by more than [`REJECT_FACTOR`] tolerances is marked rejected and the graph is solved again.
 pub(super) fn solve_graph(n: usize, root: usize, cands: &mut [Cand], cancel: &Cancel) -> Result<Solved, AlignError> {
-    let mut margin = None;
+    let (mut margin, mut trials) = (None, 0);
     loop {
         let (members, edges) = graph_of(cands);
         let vote = consensus(n, root, &edges, REJECT_FACTOR);
         if vote.inlier.iter().any(|x| !*x) {
-            margin = margin.or(vote.margin);
+            margin = vote.margin.map(|m| (m, edges.len()));
+            trials = vote.trials;
             for (&k, _) in members.iter().zip(&vote.inlier).filter(|(_, ok)| !**ok) {
                 if let Some(c) = cands.get_mut(k) {
                     c.report.status = EdgeStatus::Rejected;
@@ -178,6 +197,7 @@ pub(super) fn solve_graph(n: usize, root: usize, cands: &mut [Cand], cancel: &Ca
                 iterations: relaxed.iterations,
                 converged: relaxed.converged,
                 margin,
+                trials,
             });
         };
         if let Some(c) = members.get(worst).and_then(|&k| cands.get_mut(k)) {

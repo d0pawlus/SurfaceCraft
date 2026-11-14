@@ -637,5 +637,7 @@
   "{} scans given; at most {} are taken at once": "podano {} skanów, naraz przyjmuję najwyżej {}",
   "mesh {} is listed twice": "siatka {} jest wymieniona dwa razy",
   "the fixed mesh {} is not in `objects`": "nieruchoma siatka {} nie występuje w „objects”",
-  "the tolerance must be a positive number of mm": "tolerancja musi być dodatnią liczbą mm"
+  "the tolerance must be a positive number of mm": "tolerancja musi być dodatnią liczbą mm",
+  "`accept_weak` names mesh {}, which is not in `objects`": "„accept_weak” wskazuje siatkę {}, której nie ma w „objects”",
+  "the relaxation gave a pose that is not finite; nothing was moved": "relaksacja dała ułożenie, które nie jest skończone; nic nie przesunięto"
 }

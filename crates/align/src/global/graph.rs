@@ -107,7 +107,8 @@ pub(super) fn cycles(tree: &Tree, edges: &[Edge]) -> Vec<Vec<usize>> {
     out
 }
 
-/// Trials of the consensus search.
+/// Random trials per edge of the consensus search, and their cap (the deterministic trials, one per
+/// scan, come on top).
 const TRIALS_PER_EDGE: usize = 40;
 const MAX_TRIALS: usize = 1500;
 
@@ -127,57 +128,77 @@ pub(super) struct Consensus {
     /// Inliers of the winning tree minus those of the best tree that disagrees with it on which
     /// edges are inliers (`None`: every trial agreed, there was nothing to vote on). 0 is a tie.
     pub margin: Option<usize>,
+    /// Trees tried. The vote is sampled, not exhaustive: the number of spanning trees of a graph
+    /// of a dozen scans is far beyond this.
+    pub trials: usize,
 }
 
-/// The edges to trust: random spanning trees from `root` (the strongest-first tree is the first
-/// trial) are chained and every edge is checked against the chain; the tree that agrees with the
-/// most edges wins, and the edges that disagree with it are the outliers. A pair pose that is
-/// wrong in a way the pair alignment could not tell (a false `unique`) agrees with no consistent
-/// set of the others, however many tree edges it sits next to, so it is found where dropping
-/// the worst misfit after a relaxation would blame the right poses beside it. Deterministic (the
-/// trials are seeded); a tie keeps the first of the best (the strongest-first tree comes first),
-/// and `margin` says how decisive the vote was.
+/// The edges to trust: spanning trees are chained and every edge is checked against the chain; the
+/// tree that agrees with the most edges wins, and the edges that disagree with it are the outliers.
+/// A pair pose that is wrong in a way the pair alignment could not tell (a false `unique`) agrees
+/// with no consistent set of the others, however many tree edges it sits next to, so it is found
+/// where dropping the worst misfit after a relaxation would blame the right poses beside it.
+/// The trees: the strongest-first tree from every scan the root reaches (so that a coherent
+/// cluster of pairs is a trial of its own wherever it sits), then seeded random trees. Deterministic;
+/// a tie keeps the first of the best, and `margin` says how decisive the vote was.
 pub(super) fn consensus(n: usize, root: usize, edges: &[Edge], bound: f64) -> Consensus {
     let first = spanning_tree(n, root, edges);
-    let mut best = inliers(&first, edges, n, bound);
     let reached: Vec<bool> = edges.iter().map(|e| first.reaches(e.i) && first.reaches(e.j)).collect();
+    let mut best = inliers(&first, edges, n, bound);
     let score = |v: &[bool]| v.iter().filter(|x| **x).count();
-    let mut best_score = score(&best);
-    let mut runner_up: Option<usize> = None;
-    let mut rng = Rng::new(0x51ED_270B);
-    for _ in 0..(TRIALS_PER_EDGE * edges.len()).min(MAX_TRIALS) {
-        let weights: Vec<f64> = edges.iter().map(|_| rng.uniform()).collect();
-        let found = inliers(&spanning_tree_by(n, root, edges, &weights), edges, n, bound);
-        if found == best {
-            continue;
+    let (mut best_score, mut runner_up, mut trials) = (score(&best), None::<usize>, 1);
+    let mut consider = |found: Vec<bool>, best: &mut Vec<bool>, best_score: &mut usize| {
+        trials += 1;
+        if found == *best {
+            return;
         }
         let s = score(&found);
-        if s > best_score {
-            runner_up = Some(runner_up.map_or(best_score, |r| r.max(best_score)));
-            (best, best_score) = (found, s);
+        if s > *best_score {
+            runner_up = Some(runner_up.map_or(*best_score, |r| r.max(*best_score)));
+            (*best, *best_score) = (found, s);
         } else {
             runner_up = Some(runner_up.map_or(s, |r| r.max(s)));
         }
+    };
+    for &seed in first.order.iter().skip(1) {
+        consider(inliers(&spanning_tree(n, seed, edges), edges, n, bound), &mut best, &mut best_score);
+    }
+    let mut rng = Rng::new(0x51ED_270B);
+    for _ in 0..(TRIALS_PER_EDGE * edges.len()).min(MAX_TRIALS) {
+        let weights: Vec<f64> = edges.iter().map(|_| rng.uniform()).collect();
+        consider(inliers(&spanning_tree_by(n, root, edges, &weights), edges, n, bound), &mut best, &mut best_score);
     }
     let inlier = best.iter().zip(&reached).map(|(inlier, reached)| *inlier || !*reached).collect();
-    Consensus { inlier, margin: runner_up.map(|r| best_score - r.min(best_score)) }
+    Consensus { inlier, margin: runner_up.map(|r| best_score - r.min(best_score)), trials }
 }
 
-/// Which scans are held by a closed loop: the root, and every scan whose path to it along the tree
-/// uses only edges that lie on a cycle (the union of the independent cycles). A scan whose path
-/// crosses a bridge hangs on one pair that nothing else confirms.
-pub(super) fn held_by_loop(tree: &Tree, edges: &[Edge], n: usize) -> Vec<bool> {
-    let mut on_cycle = vec![false; edges.len()];
+/// Which scans are held by a closed loop of strong pairs, and for those that are not, the pair on
+/// their path to the root that nothing confirms (the one nearest the scan). An edge is confirmed
+/// when it lies on a cycle (of the independent cycles) all of whose pairs are strong; a scan is
+/// held when it is the root or every edge on its path to the root is confirmed. A loop of pairs
+/// that are consistent with each other proves nothing when its pairs are weak, and a scan that
+/// hangs on a bridge hangs on one pair that nothing else confirms.
+pub(super) fn held_by_loop(tree: &Tree, edges: &[Edge], n: usize) -> Vec<Option<Option<usize>>> {
+    let mut confirmed = vec![false; edges.len()];
     for c in cycles(tree, edges) {
-        for k in c {
-            if let Some(x) = on_cycle.get_mut(k) {
-                *x = true;
+        if c.iter().all(|&k| edges.get(k).is_some_and(|e| e.strong)) {
+            for k in c {
+                if let Some(x) = confirmed.get_mut(k) {
+                    *x = true;
+                }
             }
         }
     }
     (0..n)
         .map(|k| {
-            tree.reaches(k) && path_to_root(tree, k).iter().all(|&(_, e)| on_cycle.get(e).copied().unwrap_or(false))
+            if !tree.reaches(k) {
+                return None;
+            }
+            let open = path_to_root(tree, k)
+                .into_iter()
+                .map(|(_, e)| e)
+                .find(|e| !confirmed.get(*e).copied().unwrap_or(false));
+            Some(open)
         })
         .collect()
 }
@@ -187,7 +208,7 @@ mod tests {
     use super::*;
 
     fn edge(i: usize, j: usize, weight: f64) -> Edge {
-        Edge { i, j, measured: Transform::identity(), weight, tolerance: 1.0, points: Vec::new() }
+        Edge { i, j, measured: Transform::identity(), weight, tolerance: 1.0, points: Vec::new(), strong: true }
     }
 
     #[test]
