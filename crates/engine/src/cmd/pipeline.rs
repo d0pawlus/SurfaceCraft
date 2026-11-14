@@ -149,6 +149,9 @@ pub struct ToSolidIn {
     /// Keep the thickened mesh in the document (default false: it is removed; needs `thickness`).
     #[serde(default)]
     pub keep_thickened: bool,
+    /// Remove folds of the scan before it is thickened (default false; needs `thickness`): small groups of triangles that face against the surface around them and pass through the sheet (often a hole-fill patch crossing its surroundings) block a wall however thin. A removal taller than `tolerance` keeps the verdict at `review` with the issue `scan_folds_removed`. Without it nothing changes; a shell result with crossings offers it as a next step when folds that could be removed exist.
+    #[serde(default)]
+    pub remove_folds: bool,
     /// Name of the solid (default "solid").
     #[serde(default)]
     pub name: Option<String>,

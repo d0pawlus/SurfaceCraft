@@ -77,7 +77,8 @@ fn without_the_fold_removal_the_wall_is_refused_with_it_the_solid_is_built() {
 
     // Act
     let refused = kept.execute("scan.to_solid", json!({"scan": "scan", "thickness": WALL_MM, "clean": false})).unwrap();
-    let out = repaired.execute("scan.to_solid", json!({"scan": "scan", "thickness": WALL_MM})).unwrap();
+    let out =
+        repaired.execute("scan.to_solid", json!({"scan": "scan", "thickness": WALL_MM, "remove_folds": true})).unwrap();
 
     // Assert
     assert_eq!(refused["verdict"], "fail", "{refused}");
@@ -107,7 +108,7 @@ fn a_scan_without_a_fold_is_cleaned_exactly_as_before() {
 
 fn thickened(extra: Value) -> (Session, Value) {
     let mut s = session_with(knotted_panel());
-    let mut p = json!({"scan": "scan", "thickness": WALL_MM});
+    let mut p = json!({"scan": "scan", "thickness": WALL_MM, "remove_folds": true});
     p.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
     let out = s.execute("scan.to_solid", p).unwrap();
     (s, out)
@@ -164,7 +165,7 @@ fn the_fold_removal_is_part_of_the_one_undo_step_and_undo_restores_the_fold() {
     let steps = s.history.undo_labels().len();
 
     // Act
-    let out = s.execute("scan.to_solid", json!({"scan": "scan", "thickness": WALL_MM})).unwrap();
+    let out = s.execute("scan.to_solid", json!({"scan": "scan", "thickness": WALL_MM, "remove_folds": true})).unwrap();
     let repaired = mesh_of(&s);
     s.execute("edit.undo", Value::Null).unwrap();
 
@@ -183,7 +184,7 @@ fn a_fold_deeper_in_the_wall_than_its_middle_is_not_flattered_by_the_back_face()
     let mut s = session_with(knotted_panel_standing(-0.5));
 
     // Act
-    let out = s.execute("scan.to_solid", json!({"scan": "scan", "thickness": 0.8})).unwrap();
+    let out = s.execute("scan.to_solid", json!({"scan": "scan", "thickness": 0.8, "remove_folds": true})).unwrap();
 
     // Assert: the tip is measured against the scan layer only, so it is not measured (it faces the other face), is
     // counted as such, and the true depth is reported and raises the issue
@@ -212,4 +213,80 @@ fn removed_points_on_the_surface_land_on_the_outer_face_of_a_symmetric_wall() {
     assert!(folds["removed_points_within"].as_f64().unwrap() > 0.5, "{out}");
     let (_, one_sided) = thickened(json!({}));
     assert!(one_sided["thickened"]["folds"]["removed_points_within"].as_f64().unwrap() > 0.5, "{one_sided}");
+}
+
+fn offered(out: &Value) -> Option<&Value> {
+    out["next_steps"].as_array()?.iter().find(|n| n["params"]["remove_folds"] == json!(true))
+}
+
+#[test]
+fn without_the_option_a_refused_shell_offers_the_removal_and_says_what_it_would_do() {
+    // Arrange and act: the knot, `remove_folds` absent
+    let mut s = session_with(knotted_panel());
+    let out = s.execute("scan.to_solid", json!({"scan": "scan", "thickness": WALL_MM})).unwrap();
+
+    // Assert: nothing was removed, the shell is refused, and the next step names the call with its numbers
+    assert_eq!(out["verdict"], "fail", "{out}");
+    assert!(codes(&out).contains(&"unresolved_crossings".to_string()), "{out}");
+    assert!(out["thickened"].is_null(), "{out}");
+    let step = offered(&out).expect("the removal is offered");
+    assert_eq!(step["command"], "scan.to_solid");
+    let why = step["why"].as_str().unwrap();
+    assert!(why.contains("would remove up to 1 folds") && why.contains("scan_folds_removed"), "{why}");
+    assert_eq!(mesh_of(&s).triangle_count(), knotted_panel().triangle_count(), "no triangle was removed or added");
+}
+
+#[test]
+fn the_offered_step_is_the_call_that_builds_the_solid_and_stays_a_review() {
+    // Arrange
+    let mut s = session_with(knotted_panel());
+    let first = s.execute("scan.to_solid", json!({"scan": "scan", "thickness": WALL_MM})).unwrap();
+    let params = offered(&first).expect("offered")["params"].clone();
+
+    // Act
+    let out = s.execute("scan.to_solid", params).unwrap();
+
+    // Assert
+    assert_eq!(out["verdict"], "review", "{out}");
+    assert!(codes(&out).contains(&"scan_folds_removed".to_string()), "{out}");
+    assert_eq!(out["thickened"]["unresolved_vertices"], 0, "{out}");
+}
+
+#[test]
+fn the_option_absent_or_false_is_the_pipeline_of_main_and_offers_nothing_without_folds() {
+    // Arrange: a scan without a fold
+    let run = |extra: Value| {
+        let mut s = session_with(panel());
+        let mut p = json!({"scan": "scan", "thickness": WALL_MM});
+        p.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        s.execute("scan.to_solid", p).unwrap()
+    };
+
+    // Act
+    let (absent, off) = (run(json!({})), run(json!({"remove_folds": false})));
+
+    // Assert: same verdict, issues, counts; no folds report; no offer
+    assert_eq!(absent["verdict"], off["verdict"]);
+    assert_eq!(codes(&absent), codes(&off));
+    assert_eq!(absent["deviation"], off["deviation"]);
+    let counts = |o: &Value| {
+        let t = &o["thickened"];
+        [
+            &t["clamped_vertices"],
+            &t["unresolved_vertices"],
+            &t["self_intersections"],
+            &t["triangles"],
+            &t["boundary_loops"],
+        ]
+        .map(Value::clone)
+    };
+    assert_eq!(counts(&absent), counts(&off));
+    assert!(absent["thickened"]["folds"].is_null() && offered(&absent).is_none(), "{absent}");
+}
+
+#[test]
+fn remove_folds_needs_a_thickness() {
+    let mut s = session_with(panel());
+    let err = s.execute("scan.to_solid", json!({"scan": "scan", "remove_folds": true})).unwrap_err();
+    assert!(err.to_string().contains("remove_folds"), "{err}");
 }

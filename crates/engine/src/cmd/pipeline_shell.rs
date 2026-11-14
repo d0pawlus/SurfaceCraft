@@ -7,7 +7,7 @@
 //! scan itself for `thickness` of either sign and the scan moved half the thickness along its
 //! normals for `symmetric` (the scan then lies in the middle of the wall, where it has no face).
 use super::freeform::{self, CapRetry};
-use super::shell_folds::{FoldRun, fold_issue, judged as judged_against_the_original};
+use super::shell_folds::{FoldRun, fold_issue, fold_offer, judged as judged_against_the_original};
 use super::{
     DeviationSummary, Issue, MIN_COVERAGE, Method, NextStep, Settings, ToSolidIn, ToSolidOut, Verdict, issue,
     message_of, step, summary,
@@ -91,8 +91,8 @@ pub struct ThickenedInfo {
 /// Rejects the combinations of `thickness` with other parameters that mean nothing.
 pub(super) fn check(i: &ToSolidIn) -> CmdResult<()> {
     let Some(t) = i.thickness else {
-        if i.symmetric || i.keep_thickened {
-            return Err(CmdError::Params("`symmetric` and `keep_thickened` need `thickness`".into()));
+        if i.symmetric || i.keep_thickened || i.remove_folds {
+            return Err(CmdError::Params("`symmetric`, `keep_thickened` and `remove_folds` need `thickness`".into()));
         }
         return Ok(());
     };
@@ -142,7 +142,7 @@ pub(super) fn run(s: &mut Session, set: &Settings, i: &ToSolidIn) -> CmdResult<T
         report.triangles = edit.triangles;
     }
     // after the holes are filled: a patch can cross the sheet around it, and folds block a wall
-    let folds = if i.clean {
+    let folds = if i.clean && i.remove_folds {
         let (edit, removed) = remove_folds(s, &ObjRef::Id(set.scan.0), set.tolerance, scan_triangles)?;
         report.triangles = edit.triangles;
         FoldRun::new(edit.folds, removed)
@@ -233,6 +233,7 @@ fn refused(
     e: &ThickenError,
     i: &ToSolidIn,
     folds: Option<&FoldsOut>,
+    repaired: &Mesh,
 ) -> ToSolidOut {
     let issues = vec![issue(refusal_code(e), format!("the scan could not be thickened: {e}{}", fold_note(e, folds)))];
     let mut next = Vec::new();
@@ -244,6 +245,9 @@ fn refused(
             let params = json!({"scan": set.scan, "thickness": smaller, "symmetric": i.symmetric});
             next.push(step("scan.to_solid", params, "a wall the surface can carry (a thinner one folds less)"));
         }
+    }
+    if matches!(e, ThickenError::UnresolvedCrossings { .. }) {
+        next.extend(fold_offer(repaired, set, i));
     }
     next.push(step(
         "guide.read",
@@ -334,7 +338,7 @@ pub(super) fn shell_solid(
             ));
         }
         Err(e @ (ThickenError::BadThickness(_) | ThickenError::TooThick { .. })) => return Err(command_error(&e)),
-        Err(e) => return Ok(refused(set, report, &e, i, folds.out.as_ref())),
+        Err(e) => return Ok(refused(set, report, &e, i, folds.out.as_ref(), &mesh)),
     };
     let thick_id = s.doc.add_mesh(&format!("{name} thickened"), shell.mesh.clone());
     let result = wrap_and_judge(s, set, i, report, (&shell, &mesh, &folds), thick_id);
@@ -381,7 +385,10 @@ fn wrap_and_judge(
     let mut issues = issues_of(&w, &d, set, &judged, &t, face.vertex_count());
     issues.extend(folds.out.as_ref().and_then(|f| fold_issue(f, set.tolerance, folds.stats.get())));
     let tried = retry.as_ref().is_some_and(|r| r.reason != freeform::RetryReason::BudgetSpent);
-    let next = next_steps(&w, &issues, set, tried, i, &t);
+    let mut next = next_steps(&w, &issues, set, tried, i, &t);
+    if issues.iter().any(|x| x.code == "self_intersection") {
+        next.splice(0..0, fold_offer(repaired, set, i));
+    }
     let verdict = if issues.is_empty() {
         Verdict::Pass
     } else if d.coverage >= MIN_COVERAGE {

@@ -5,13 +5,14 @@
 //! fold taller than the tolerance, material that stands further than it from the body, a fill that differs
 //! from the clean surface by more than it, or more than [`MAX_REMOVED_AREA_SHARE`] of the area) raises the
 //! issue `scan_folds_removed`, so such a result is never a `pass`.
-use super::{DeviationSummary, Issue, Settings};
+use super::{DeviationSummary, Issue, NextStep, Settings, ToSolidIn, step};
 use crate::Session;
 use crate::cmd::mesh_folds::FoldsOut;
 use crate::cmd::qa::{CompareIn, compare_points_with};
 use crate::cmd::{CmdResult, ObjRef};
+use serde_json::json;
 use std::cell::Cell;
-use surfacecraft_geom::{Bvh, Mesh, Point3, Vec3};
+use surfacecraft_geom::{Bvh, Mesh, Point3, Vec3, folds};
 
 /// A removal of more than this share of the area of the scan (0.2 %) raises `scan_folds_removed`. (Measured
 /// on the real scans of the corpus: 0.001 % to 0.03 %.)
@@ -78,6 +79,44 @@ pub(super) fn fold_issue(f: &FoldsOut, tolerance: f64, stats: Option<RemovedStat
         f.largest_fill_deviation
     );
     Some(Issue { code: "scan_folds_removed".to_string(), message })
+}
+
+/// The next step that offers the fold removal, with what it would remove, when the scan has folds that could be
+/// removed (detection only: it finds and measures the groups, about as long as it takes to read the mesh a few
+/// times, seconds on a million triangles, a fraction of the shell). `None` when the option is on already or the
+/// scan was not cleaned, or there is nothing to remove. The removal itself may refuse some of them (beside a
+/// crease, a patch that would stray), so the numbers are an upper bound.
+pub(super) fn fold_offer(repaired: &Mesh, set: &Settings, i: &ToSolidIn) -> Option<NextStep> {
+    if i.remove_folds || !i.clean {
+        return None;
+    }
+    let found = folds::find_folds(repaired);
+    let removable: Vec<_> = found.iter().filter(|f| f.small).collect();
+    if removable.is_empty() {
+        return None;
+    }
+    let tallest = removable.iter().map(|f| f.height).fold(0.0, f64::max);
+    let triangles: usize = removable.iter().map(|f| f.triangles).sum();
+    let outcome = if tallest > set.tolerance {
+        format!(
+            "the tallest stands {tallest:.2} mm above the surface around it, more than the tolerance of {} mm: the result will be a `review` with `scan_folds_removed`",
+            set.tolerance
+        )
+    } else {
+        format!(
+            "the tallest stands {tallest:.2} mm above the surface around it, within the tolerance of {} mm",
+            set.tolerance
+        )
+    };
+    let why = format!(
+        "would remove up to {} folds of the scan ({triangles} triangles, with a margin around each) that cross the sheet and may be what the shell cannot clear; {outcome}. Some may be refused (beside a crease, a patch that would stray)",
+        removable.len()
+    );
+    let params = json!({
+        "scan": set.scan, "thickness": i.thickness, "symmetric": i.symmetric,
+        "tolerance": set.tolerance, "remove_folds": true
+    });
+    Some(step("scan.to_solid", params, &why))
 }
 
 /// The vertices of the removed triangles as the scan layer of the shell has them, with the normals of that

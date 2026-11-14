@@ -211,21 +211,22 @@ fn local_corpus_which_fill_makes_the_fold() {
 fn local_corpus_fold_removal_a_b() {
     for number in wanted("5,6,4,9") {
         let path = files()[number - 1].clone();
-        for (label, with_folds) in [("A without", false), ("B with   ", true)] {
+        for (label, with_folds) in [("A absent ", false), ("B on     ", true)] {
             let mut s = Session::new();
             s.execute("mesh.import", json!({"path": path.to_string_lossy(), "name": "scan"})).unwrap();
             let mut p = json!({"scan": "scan", "thickness": 1.0});
-            if !with_folds {
-                s.execute("mesh.clean", json!({"object": "scan", "fill_holes_max_edges": 0})).unwrap();
-                let id = s.doc.find_by_name("scan").unwrap().0;
-                let rim = edit::boundary_loops(&s.doc.mesh(id).unwrap().mesh).iter().map(Vec::len).max().unwrap_or(0);
-                s.execute("mesh.fill_holes", json!({"object": "scan", "max_edges": 400.min(rim - 1)})).unwrap();
-                p["clean"] = json!(false);
+            if with_folds {
+                p["remove_folds"] = json!(true);
             }
             let out = s.execute("scan.to_solid", p).unwrap();
             let codes: Vec<&str> =
                 out["issues"].as_array().into_iter().flatten().filter_map(|i| i["code"].as_str()).collect();
             let f = &out["thickened"]["folds"];
+            let offer =
+                out["next_steps"].as_array().into_iter().flatten().find(|n| n["params"]["remove_folds"] == json!(true));
+            if let Some(o) = offer {
+                eprintln!("S{number:02} {label}: offers {}", o["why"]);
+            }
             eprintln!(
                 "S{number:02} {label}: verdict {} within {:.4} coverage {:.4} max {:.3} unresolved {} issues {codes:?}; folds removed {} triangles {} share {:.5} height {:.3} fill {:.3} refused {:?} left {}; removed points {} (not facing {}) within {:.3} max {:.3}",
                 out["verdict"],

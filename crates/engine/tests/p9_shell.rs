@@ -586,8 +586,7 @@ fn a_repaired_fold_is_measured_against_the_scan_as_it_was_and_cannot_pass() {
 
     // Act
     let thick = s.execute("mesh.thicken", json!({"object": "scan", "thickness": 1.0})).unwrap();
-    // (not cleaned: cleaning with a thickness removes such a fold from the scan before the shell sees it, see p9_folds)
-    let out = s.execute("scan.to_solid", json!({"scan": "scan", "thickness": 1.0, "clean": false})).unwrap();
+    let out = s.execute("scan.to_solid", json!({"scan": "scan", "thickness": 1.0})).unwrap();
 
     // Assert: the repair is reported with its shift, the deviation is against the original points
     assert!(thick["repaired_vertices"].as_u64().unwrap() > 0, "{thick}");
