@@ -190,7 +190,13 @@ pub struct CleanIn {
     /// Remove folds (default false; `scan.to_solid` with `thickness` turns it on): small groups of triangles that face against the surface around them, where the scan passes through itself; the hole is filled. Larger groups are left and reported in `folds`.
     #[serde(default)]
     pub remove_folds: Option<bool>,
+    /// Tolerance of the fold removal (mm, default 0.2): a patch that would replace clean surface by more than three quarters of it is not made and the fold stays.
+    #[serde(default)]
+    pub fold_tolerance: Option<f64>,
 }
+
+/// Default tolerance of the fold removal (mm): the one of `scan.to_solid`.
+const FOLD_TOLERANCE_MM: f64 = 0.2;
 
 pub(crate) fn clean(s: &mut Session, i: CleanIn) -> CmdResult<EditOut> {
     let frac = fraction(i.min_component_fraction, "min_component_fraction", 0.01)?;
@@ -198,6 +204,8 @@ pub(crate) fn clean(s: &mut Session, i: CleanIn) -> CmdResult<EditOut> {
     if !(ratio.is_finite() && ratio >= 0.0) {
         return Err(CmdError::Params("outlier_ratio must be ≥ 0".into()));
     }
+    let fold_tolerance = positive(i.fold_tolerance, "fold_tolerance", FOLD_TOLERANCE_MM)?;
+    let cancel = s.cancel.clone();
     edit_mesh(s, &i.object, |m, o| {
         let mut removed = m.remove_degenerate(0.0);
         if ratio > 0.0 {
@@ -205,6 +213,8 @@ pub(crate) fn clean(s: &mut Session, i: CleanIn) -> CmdResult<EditOut> {
         }
         removed += edit::remove_small_components(m, frac, i.min_component_triangles.unwrap_or(20));
         o.removed_triangles = removed;
+        // what the scan recorded: the triangles after this are patches of the hole filling
+        let scan_triangles = m.triangle_count();
         if let Some(n) = i.fill_holes_max_edges {
             let before = m.triangle_count();
             let r = edit::fill_holes(m, n, true);
@@ -214,28 +224,47 @@ pub(crate) fn clean(s: &mut Session, i: CleanIn) -> CmdResult<EditOut> {
         }
         // after the holes are filled: a patch can cross the sheet around it
         if i.remove_folds.unwrap_or(false) {
-            fold_step(m, o);
+            fold_step(m, o, (fold_tolerance, scan_triangles), &cancel)?;
         }
         edit::compact(m);
         Ok(())
     })
 }
 
-/// Removes the folds of `m` (see `surfacecraft_geom::folds`) and reports them in `o`.
-fn fold_step(m: &mut Mesh, o: &mut EditOut) {
+/// Removes the folds of `m` (see `surfacecraft_geom::folds`) and reports them in `o`; the scan as it was where
+/// they were taken out is returned for a judge that measures against the original.
+fn fold_step(
+    m: &mut Mesh,
+    o: &mut EditOut,
+    (tolerance, scan_triangles): (f64, usize),
+    cancel: &surfacecraft_geom::Cancel,
+) -> CmdResult<Mesh> {
     let before = m.triangle_count();
-    let report = folds::remove_folds(m);
+    let report = folds::remove_folds(m, tolerance, cancel, scan_triangles);
+    if report.cancelled {
+        return Err(super::cancelled());
+    }
     o.removed_triangles += report.removed_triangles;
     o.added_triangles += (m.triangle_count() + report.removed_triangles).saturating_sub(before);
     o.folds = Some(FoldsOut::from(&report));
+    Ok(report.removed_mesh)
 }
 
-/// The fold removal of `mesh.clean` on its own, for a pipeline that fills the holes itself.
-pub(crate) fn remove_folds(s: &mut Session, object: &ObjRef) -> CmdResult<EditOut> {
-    edit_mesh(s, object, |m, o| {
-        fold_step(m, o);
+/// The fold removal of `mesh.clean` on its own, for a pipeline that fills the holes itself; also returns the
+/// scan as it was where folds were taken out.
+pub(crate) fn remove_folds(
+    s: &mut Session,
+    object: &ObjRef,
+    tolerance: f64,
+    scan_triangles: usize,
+) -> CmdResult<(EditOut, Mesh)> {
+    let cancel = s.cancel.clone();
+    let mut removed = Mesh::default();
+    let out = edit_mesh(s, object, |m, o| {
+        removed = fold_step(m, o, (tolerance, scan_triangles), &cancel)?;
         Ok(())
-    })
+    })?;
+    Ok((out, removed))
 }
 
 /// Outlier removal parameters.

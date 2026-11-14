@@ -868,6 +868,7 @@
   "param.min_component_triangles": "Najmniejszy fragment (trójkąty)",
   "param.outlier_ratio": "Granica kolców",
   "param.remove_folds": "Usuń załamania skanu",
+  "param.fold_tolerance": "Tolerancja załamań (mm)",
   "param.max_error": "Maks. błąd",
   "param.preserve_boundary": "Zachowaj brzeg",
   "param.share": "Udział w tolerancji",

@@ -31,6 +31,8 @@ mod judge;
 mod prepare;
 #[path = "pipeline_shell.rs"]
 mod shell;
+#[path = "pipeline_shell_folds.rs"]
+mod shell_folds;
 pub use prepare::{ComponentOut, PrepOut, PrepStep};
 #[path = "pipeline_rebuild.rs"]
 mod rebuild;
@@ -312,6 +314,7 @@ fn prepare(s: &mut Session, i: &ToSolidIn, scan: ObjectId) -> CmdResult<ScanSumm
                 outlier_ratio: None,
                 fill_holes_max_edges: Some(i.fill_holes_max_edges.unwrap_or(FILL_HOLES_MAX_EDGES)),
                 remove_folds: None,
+                fold_tolerance: None,
             },
         )?;
         filled = edit.holes_filled.unwrap_or(0);

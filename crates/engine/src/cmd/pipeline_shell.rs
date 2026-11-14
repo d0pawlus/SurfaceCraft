@@ -7,6 +7,7 @@
 //! scan itself for `thickness` of either sign and the scan moved half the thickness along its
 //! normals for `symmetric` (the scan then lies in the middle of the wall, where it has no face).
 use super::freeform::{self, CapRetry};
+use super::shell_folds::{FoldRun, fold_issue, judged as judged_against_the_original};
 use super::{
     DeviationSummary, Issue, MIN_COVERAGE, Method, NextStep, Settings, ToSolidIn, ToSolidOut, Verdict, issue,
     message_of, step, summary,
@@ -132,6 +133,7 @@ pub(super) fn run(s: &mut Session, set: &Settings, i: &ToSolidIn) -> CmdResult<T
         .doc
         .mesh(set.scan)
         .map_or(0, |m| surfacecraft_geom::edit::boundary_loops(&m.mesh).iter().map(Vec::len).max().unwrap_or(0));
+    let scan_triangles = s.doc.mesh(set.scan).map_or(0, |m| m.mesh.triangle_count());
     let fill_up_to = limit.min(rim.saturating_sub(1));
     if rim > 0 && fill_up_to > 0 {
         let edit = fill(s, FillIn { object: ObjRef::Id(set.scan.0), max_edges: Some(fill_up_to), smooth: Some(true) })?;
@@ -141,11 +143,11 @@ pub(super) fn run(s: &mut Session, set: &Settings, i: &ToSolidIn) -> CmdResult<T
     }
     // after the holes are filled: a patch can cross the sheet around it, and folds block a wall
     let folds = if i.clean {
-        let edit = remove_folds(s, &ObjRef::Id(set.scan.0))?;
+        let (edit, removed) = remove_folds(s, &ObjRef::Id(set.scan.0), set.tolerance, scan_triangles)?;
         report.triangles = edit.triangles;
-        edit.folds
+        FoldRun { out: edit.folds, removed }
     } else {
-        None
+        FoldRun { out: None, removed: Mesh::default() }
     };
     shell_solid(s, set, i, (report, folds))
 }
@@ -311,7 +313,7 @@ pub(super) fn shell_solid(
     s: &mut Session,
     set: &Settings,
     i: &ToSolidIn,
-    (report, folds): (super::ScanSummary, Option<FoldsOut>),
+    (report, folds): (super::ScanSummary, FoldRun),
 ) -> CmdResult<ToSolidOut> {
     let (thickness, symmetric) = (i.thickness.unwrap_or(0.0), i.symmetric);
     let scan = s.doc.mesh(set.scan).ok_or_else(|| CmdError::Params(format!("no mesh {}", set.scan)))?;
@@ -324,16 +326,16 @@ pub(super) fn shell_solid(
             ));
         }
         Err(e @ (ThickenError::BadThickness(_) | ThickenError::TooThick { .. })) => return Err(command_error(&e)),
-        Err(e) => return Ok(refused(set, report, &e, i, folds.as_ref())),
+        Err(e) => return Ok(refused(set, report, &e, i, folds.out.as_ref())),
     };
     let thick_id = s.doc.add_mesh(&format!("{name} thickened"), shell.mesh.clone());
-    let result = wrap_and_judge(s, set, i, report, &shell, thick_id);
+    let result = wrap_and_judge(s, set, i, report, (&shell, &mesh, &folds), thick_id);
     let kept = i.keep_thickened.then_some(thick_id);
     if kept.is_none() {
         s.doc.remove(thick_id);
     }
     result.map(|mut out| {
-        out.thickened = Some(ThickenedInfo { folds, ..info(&shell, i, kept) });
+        out.thickened = Some(ThickenedInfo { folds: folds.out, ..info(&shell, i, kept) });
         out
     })
 }
@@ -343,7 +345,7 @@ fn wrap_and_judge(
     set: &Settings,
     i: &ToSolidIn,
     report: super::ScanSummary,
-    shell: &Thickened,
+    (shell, repaired, folds): (&Thickened, &Mesh, &FoldRun),
     thick_id: ObjectId,
 ) -> CmdResult<ToSolidOut> {
     let first = match wrap_shell(s, set, thick_id, set.max_patches) {
@@ -362,11 +364,14 @@ fn wrap_and_judge(
     let (w, retry): (WrapOut, Option<CapRetry>) =
         freeform::retry_larger_on(s, set, thick_id, first, |s, cap| wrap_shell(s, set, thick_id, Some(cap)))?;
     let face = shell.scan_face();
-    let d = measure(s, set, &face, &w)?;
+    let main = (measure(s, set, &face, &w)?, face.vertex_count());
+    let shell_layer = (repaired, i.thickness.unwrap_or(0.0), i.symmetric);
+    let d = judged_against_the_original(s, set, w.body.id, main, folds, shell_layer)?;
     let t = info(shell, i, None);
     // the rim stays open on purpose and the shell is closed over it: holes left are not a defect of the solid
     let judged = super::ScanSummary { holes_left: 0, ..report.clone() };
-    let issues = issues_of(&w, &d, set, &judged, &t, face.vertex_count());
+    let mut issues = issues_of(&w, &d, set, &judged, &t, face.vertex_count());
+    issues.extend(folds.out.as_ref().and_then(|f| fold_issue(f, set.tolerance)));
     let tried = retry.as_ref().is_some_and(|r| r.reason != freeform::RetryReason::BudgetSpent);
     let next = next_steps(&w, &issues, set, tried, i, &t);
     let verdict = if issues.is_empty() {

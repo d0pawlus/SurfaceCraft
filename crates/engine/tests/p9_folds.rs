@@ -99,3 +99,74 @@ fn a_scan_without_a_fold_is_cleaned_exactly_as_before() {
         assert!(a.positions == b.positions && a.triangles == b.triangles);
     }
 }
+
+fn thickened(extra: Value) -> (Session, Value) {
+    let mut s = session_with(knotted_panel());
+    let mut p = json!({"scan": "scan", "thickness": WALL_MM});
+    p.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+    let out = s.execute("scan.to_solid", p).unwrap();
+    (s, out)
+}
+
+#[test]
+fn a_fold_taller_than_the_tolerance_makes_the_verdict_a_review_that_names_it() {
+    // Arrange and act: the fold stands 0.3 mm and more out of the panel, the tolerance is 0.2 mm
+    let (_, out) = thickened(json!({}));
+
+    // Assert: the solid is built, the removal is reported with its numbers and the verdict is not a pass
+    let folds = &out["thickened"]["folds"];
+    assert!(folds["removed"].as_u64().unwrap() >= 1, "{out}");
+    assert!(folds["largest_removed_height"].as_f64().unwrap() > 0.2, "{out}");
+    assert!(
+        folds["largest_fill_deviation"].as_f64().unwrap() >= folds["largest_removed_height"].as_f64().unwrap(),
+        "{out}"
+    );
+    assert!(folds["removed_area_share"].as_f64().unwrap() > 0.0, "{out}");
+    assert!(out["body"].is_object(), "{out}");
+    assert_eq!(out["verdict"], "review", "{out}");
+    assert!(codes(&out).contains(&"scan_folds_removed".to_string()), "{out}");
+}
+
+#[test]
+fn the_deviation_is_measured_against_the_scan_as_it_was() {
+    // Arrange and act
+    let (_, out) = thickened(json!({}));
+
+    // Assert: the removed vertex stands at least as far from the body as the fold stood out of the surface
+    let height = out["thickened"]["folds"]["largest_removed_height"].as_f64().unwrap();
+    let max = out["deviation"]["max_abs"].as_f64().unwrap();
+    assert!(max >= 0.7 * height && max > 0.2, "max |deviation| {max} against a fold of {height} mm: {out}");
+}
+
+#[test]
+fn the_symmetric_layer_judges_the_removed_points_where_the_wall_has_its_middle() {
+    // Arrange and act
+    let (_, out) = thickened(json!({"symmetric": true}));
+
+    // Assert
+    let height = out["thickened"]["folds"]["largest_removed_height"].as_f64().unwrap();
+    let max = out["deviation"]["max_abs"].as_f64().unwrap();
+    assert!(max >= 0.7 * height && max > 0.2, "max |deviation| {max} against a fold of {height} mm: {out}");
+    assert!(codes(&out).contains(&"scan_folds_removed".to_string()), "{out}");
+}
+
+#[test]
+fn the_fold_removal_is_part_of_the_one_undo_step_and_undo_restores_the_fold() {
+    // Arrange
+    let scan = knotted_panel();
+    let (triangles, positions) = (scan.triangles.clone(), scan.positions.clone());
+    let mut s = session_with(scan);
+    let steps = s.history.undo_labels().len();
+
+    // Act
+    let out = s.execute("scan.to_solid", json!({"scan": "scan", "thickness": WALL_MM})).unwrap();
+    let repaired = mesh_of(&s);
+    s.execute("edit.undo", Value::Null).unwrap();
+
+    // Assert
+    assert!(out["thickened"]["folds"]["removed"].as_u64().unwrap() >= 1, "{out}");
+    assert_ne!(repaired.triangles, triangles, "the scan object is repaired in place, like the hole filling");
+    assert_eq!(s.history.undo_labels().len(), steps, "one step");
+    let restored = mesh_of(&s);
+    assert!(restored.triangles == triangles && restored.positions == positions, "undo restores the fold");
+}

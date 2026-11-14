@@ -12,15 +12,25 @@
 //!
 //! What is removed. A fold at most [`MAX_EXTENT_EDGES`] median edges across, of at most
 //! [`MAX_TRIANGLES`] triangles, within [`MAX_HEIGHT_EDGES`] median edges of the surface around it is
-//! taken out together with [`MARGIN_RINGS`] rings of triangles around it (the vertices of the fold
-//! are tangled with the sheet it crosses; the hole must be bounded by clean surface) and the hole is
-//! filled with the existing smooth hole fill. A group on the rim has no margin and only trims the
-//! rim; a margin never reaches the rim. A group whose hole cannot be filled (pinched, not a disk, a
-//! patch with a flat triangle) is put back and counted. Larger folds are left and reported.
+//! taken out together with the rings of triangles around it (see `remove`) and the hole is filled with the
+//! existing smooth hole fill. The fill is accepted only when the clean surface it replaced stays within
+//! [`FILL_ACCEPT_SHARE`] of the tolerance (a crease or the foot of a boss that the smooth patch would round
+//! off is not a fold to remove); otherwise the group is put back and counted. A group on the rim has no
+//! margin and only trims the rim; a margin never reaches the rim, and a group at a hub vertex or with a
+//! margin of more than four times [`MAX_TRIANGLES`] triangles is left, and so is a group beside a crease or a
+//! corner (neighbouring triangles more than 30 degrees apart in the two rings around it: a smooth patch would
+//! round it off). Larger folds are left and reported.
+//!
+//! What is reported: the folds found, removed and left; the area removed and its share of the scan; the
+//! height of the removed folds above the new surface and the deviation of the fill from the clean surface
+//! it replaced; and the scan as it was where it was removed (`removed_mesh`), so that a judge can measure
+//! against the original.
 mod detect;
+mod remove;
 
-use crate::{Mesh, edit};
+use crate::{Cancel, Mesh, edit};
 use detect::{Incidence, Site, facets, flipped, median_edge, sites};
+use remove::{Attempt, near_a_feature, try_remove, with_margin};
 
 /// A triangle faces against its surroundings at more than this cosine past a right angle
 /// (a cosine of -0.3: 107 degrees from the surface around it; a thin plate standing on a panel is at
@@ -37,17 +47,15 @@ pub const MAX_EXTENT_EDGES: f64 = 8.0;
 pub const MAX_TRIANGLES: usize = 200;
 /// A removed group lies within this many median edges of the surface around it.
 pub const MAX_HEIGHT_EDGES: f64 = 1.5;
-/// Rounds of finding, removing and filling (removing a fold can show one behind it).
 /// Side of the cells that say which way the surface faces around a triangle, in median edges.
 pub const CELL_EDGES: f64 = 8.0;
-/// Rings of triangles removed around a group, so that the hole is bounded by clean surface.
-const MARGIN_RINGS: usize = 2;
+/// A fill is accepted when the clean surface it replaced stays within this share of the tolerance.
+pub const FILL_ACCEPT_SHARE: f64 = 0.75;
+/// Rounds of finding, removing and filling (removing a fold can show one behind it).
 const MAX_ROUNDS: usize = 3;
-/// Attempts to remove a set of groups whose holes can all be filled.
+/// Attempts to remove a set of groups whose holes can all be filled and whose patches stay close.
 const MAX_ATTEMPTS: usize = 4;
-/// Longest hole filled after removing a group (boundary edges).
-const FILL_MAX_EDGES: usize = 2 * MAX_TRIANGLES;
-/// Groups left that are listed in the report (the largest first).
+/// Folds left that are listed in the report (the widest first).
 const MAX_LISTED: usize = 10;
 
 /// One group of triangles facing against their surroundings.
@@ -76,20 +84,35 @@ pub struct FoldReport {
     pub found: usize,
     /// Groups removed.
     pub removed: usize,
-    /// Triangles removed with them.
+    /// Triangles of the scan taken out with them (margins included).
     pub removed_triangles: usize,
-    /// Their area (mm²).
+    /// The area of the scan's own triangles among them (mm²).
     pub removed_area: f64,
-    /// The largest distance of a removed group from the surface around it (mm).
+    /// That area over the area of the scan before.
+    pub removed_area_share: f64,
+    /// The largest distance of a vertex of a removed fold from the surface that replaced it (mm): how much of
+    /// the scan stood out from the surface there.
     pub largest_removed_height: f64,
+    /// The largest distance of any vertex or triangle centre of the scan that was taken out from the patch that
+    /// replaced it (mm): how far the repaired scan differs from the scan as it was.
+    pub largest_fill_deviation: f64,
+    /// The same for the clean surface that went with the margins (not what touches a fold): a fill that would
+    /// exceed [`FILL_ACCEPT_SHARE`] of the tolerance there is not made.
+    pub largest_clean_deviation: f64,
     /// Triangles added by filling the holes.
     pub added_triangles: usize,
-    /// Groups that were small enough but whose hole could not be filled: put back.
+    /// Small folds that were not removed because the hole could not be filled, the patch strayed from the
+    /// clean surface, or the margin was too large (put back; counted once, at the end).
     pub unfillable: usize,
-    /// Folds (groups that cross the sheet) remaining after the repair (too large, too far from the surface, or not filled), widest first, at most ten.
+    /// Folds (groups that cross the sheet) remaining after the repair (too large, too far from the surface, or not removed), widest first, at most ten.
     pub left: Vec<FoldInfo>,
     /// All folds remaining.
     pub left_total: usize,
+    /// The scan as it was where the folds were taken out: the triangles of the original mesh, as a soup of
+    /// triangles with their own vertices and winding (empty when nothing was removed).
+    pub removed_mesh: Mesh,
+    /// The call was cancelled; what was done before stays (every round is complete or not applied).
+    pub cancelled: bool,
 }
 
 fn small(site: &Site, edge: f64) -> bool {
@@ -99,104 +122,7 @@ fn small(site: &Site, edge: f64) -> bool {
         && site.height <= MAX_HEIGHT_EDGES * edge
 }
 
-/// The triangles of `site` and the rings of triangles around them ([`MARGIN_RINGS`]), so that the
-/// hole's edge lies on clean surface and not on the vertices the fold is tangled with. The margin stops
-/// short of the rim (a hole that reaches it would notch the rim), and a group on the rim has none.
-fn with_margin(mesh: &Mesh, inc: &Incidence, rim_tris: &[bool], site: &Site) -> Vec<u32> {
-    let mut set: std::collections::BTreeSet<u32> = site.triangles.iter().copied().collect();
-    if site.on_rim {
-        return set.into_iter().collect();
-    }
-    for _ in 0..MARGIN_RINGS {
-        let ring: std::collections::BTreeSet<u32> = set
-            .iter()
-            .filter_map(|&t| mesh.triangles.get(t as usize))
-            .flatten()
-            .flat_map(|&v| inc.row(v).iter().copied())
-            .collect();
-        if ring.iter().any(|&t| rim_tris.get(t as usize).copied().unwrap_or(true)) {
-            break;
-        }
-        set.extend(ring);
-    }
-    set.into_iter().collect()
-}
-
-/// What one attempt to take groups out made.
-struct Attempt {
-    mesh: Mesh,
-    /// Groups (indices into the list given) whose hole stayed open.
-    failed: Vec<usize>,
-    added: usize,
-    /// Triangles and area taken out, per group.
-    taken: Vec<(usize, f64)>,
-}
-
-/// Vertices on a boundary loop of `mesh`.
-fn rim_vertices(mesh: &Mesh) -> Vec<bool> {
-    let mut r = vec![false; mesh.positions.len()];
-    for &v in edit::boundary_loops(mesh).iter().flatten() {
-        if let Some(x) = r.get_mut(v as usize) {
-            *x = true;
-        }
-    }
-    r
-}
-
-/// The mesh with the triangles of `remove` (and their margin) taken out and the holes they leave filled.
-fn try_remove(mesh: &Mesh, remove: &[&Site], skip: &[bool]) -> Attempt {
-    let inc = Incidence::new(mesh);
-    let rim_tris: Vec<bool> = mesh.triangle_neighbours().iter().map(|n| n.contains(&u32::MAX)).collect();
-    let mut vertex_group = vec![u32::MAX; mesh.positions.len()];
-    let mut dead = vec![false; mesh.triangles.len()];
-    let mut taken = vec![(0usize, 0.0f64); remove.len()];
-    for (g, site) in remove.iter().enumerate().filter(|(g, _)| !skip.get(*g).copied().unwrap_or(false)) {
-        for t in with_margin(mesh, &inc, &rim_tris, site) {
-            let (Some(d), Some(c)) = (dead.get_mut(t as usize), mesh.triangles.get(t as usize)) else { continue };
-            if !*d && let Some(x) = taken.get_mut(g) {
-                *x = (x.0 + 1, x.1 + mesh.face_area(t as usize));
-            }
-            *d = true;
-            for &v in c {
-                if let Some(s) = vertex_group.get_mut(v as usize) {
-                    *s = g as u32;
-                }
-            }
-        }
-    }
-    let rim = rim_vertices(mesh);
-    let mut out = mesh.clone();
-    let mut k = dead.iter();
-    out.triangles.retain(|_| !k.next().copied().unwrap_or(false));
-    // only the hole a group left (never the rim of the scan, nor a window that was already there)
-    let on_rim = |v: &u32| rim.get(*v as usize).copied().unwrap_or(false);
-    let touches = |_: &Mesh, lp: &[u32]| {
-        !lp.iter().any(on_rim) && lp.iter().any(|&v| vertex_group.get(v as usize).is_some_and(|&g| g != u32::MAX))
-    };
-    let before = out.triangles.len();
-    crate::holes::fill_holes_filtered(&mut out, FILL_MAX_EDGES, true, true, &touches);
-    let added = out.triangles.len() - before;
-    // a short loop of the new boundary that does not run along the old rim is a hole that stayed open
-    let mut failed: Vec<usize> = edit::boundary_loops(&out)
-        .iter()
-        .filter(|lp| lp.len() <= FILL_MAX_EDGES && !lp.iter().any(|&v| rim.get(v as usize).copied().unwrap_or(false)))
-        .flat_map(|lp| lp.iter().filter_map(|&v| vertex_group.get(v as usize).copied().filter(|&g| g != u32::MAX)))
-        .map(|g| g as usize)
-        .collect();
-    // a patch with a triangle without a normal would leave a vertex that no wall can be built on
-    let flat = (before..out.triangles.len()).filter(|&i| out.face_normal(i).is_none());
-    failed.extend(
-        flat.filter_map(|i| out.triangles.get(i))
-            .flatten()
-            .filter_map(|&v| vertex_group.get(v as usize).copied().filter(|&g| g != u32::MAX))
-            .map(|g| g as usize),
-    );
-    failed.sort_unstable();
-    failed.dedup();
-    Attempt { mesh: out, failed, added, taken }
-}
-
-/// Finds the groups of `mesh`, small ones first.
+/// Finds the groups of `mesh`.
 fn survey(mesh: &Mesh, edge: f64) -> (Vec<Site>, Vec<bool>) {
     let inc = Incidence::new(mesh);
     let f = facets(mesh);
@@ -204,34 +130,6 @@ fn survey(mesh: &Mesh, edge: f64) -> (Vec<Site>, Vec<bool>) {
     let all = sites(mesh, &inc, &f, &mask);
     let small_ones = all.iter().map(|s| small(s, edge)).collect();
     (all, small_ones)
-}
-
-/// Removes the small folds of `mesh` and fills their holes; see the module documentation. An invalid
-/// or empty mesh is left alone.
-pub fn remove_folds(mesh: &mut Mesh) -> FoldReport {
-    let mut report = FoldReport::default();
-    if mesh.triangles.is_empty() || mesh.validate().is_err() {
-        return report;
-    }
-    let edge = median_edge(mesh);
-    let mut all_left: Vec<FoldInfo> = Vec::new();
-    for round in 0..=MAX_ROUNDS {
-        let (all, is_small) = survey(mesh, edge);
-        if round == 0 {
-            report.found = all.len();
-        }
-        let take: Vec<&Site> = all.iter().zip(&is_small).filter(|(_, s)| **s).map(|(a, _)| a).collect();
-        let done = round == MAX_ROUNDS || take.is_empty() || remove_checked(mesh, &take, &mut report).is_none();
-        if done {
-            all_left = all.iter().filter(|s| s.crossing).map(|s| info_of(s, edge)).collect();
-            break;
-        }
-    }
-    all_left.sort_by(|a, b| b.extent.total_cmp(&a.extent));
-    report.left_total = all_left.len();
-    all_left.truncate(MAX_LISTED);
-    report.left = all_left;
-    report
 }
 
 fn info_of(s: &Site, edge: f64) -> FoldInfo {
@@ -256,29 +154,90 @@ pub fn find_folds(mesh: &Mesh) -> Vec<FoldInfo> {
     survey(mesh, edge).0.iter().map(|s| info_of(s, edge)).collect()
 }
 
-/// Removes `take`, retrying without the groups whose hole stays open; `None` when nothing was removed.
-fn remove_checked(mesh: &mut Mesh, take: &[&Site], report: &mut FoldReport) -> Option<()> {
-    let mut skip = vec![false; take.len()];
+/// The scan being repaired: which of its triangles are the scan as it was, and the tolerance.
+struct State {
+    origin: Vec<bool>,
+    tolerance: f64,
+}
+
+/// Removes the small folds of `mesh` and fills their holes; see the module documentation. `tolerance` (mm)
+/// bounds how far a patch may stray from the surface it replaces. The first `scan_triangles` triangles are
+/// the scan as it was recorded, the rest are patches (hole filling): only the scan's own triangles and
+/// vertices count as points of the scan in the heights, deviations, area and `removed_mesh` (a fold in a patch
+/// is a defect of the fill, not of the scan, and there is no scan point there to be measured against). An invalid or empty mesh, or a
+/// tolerance that is not a positive number, leaves the mesh alone.
+pub fn remove_folds(mesh: &mut Mesh, tolerance: f64, cancel: &Cancel, scan_triangles: usize) -> FoldReport {
+    let mut report = FoldReport::default();
+    if mesh.triangles.is_empty() || mesh.validate().is_err() || !(tolerance.is_finite() && tolerance > 0.0) {
+        return report;
+    }
+    let (edge, area_before) = (median_edge(mesh), mesh.area());
+    let origin = (0..mesh.triangles.len()).map(|t| t < scan_triangles).collect();
+    let mut state = State { origin, tolerance };
+    let mut all_left: Vec<FoldInfo> = Vec::new();
+    for round in 0..=MAX_ROUNDS {
+        if cancel.is_cancelled() {
+            report.cancelled = true;
+            break;
+        }
+        let (all, is_small) = survey(mesh, edge);
+        if round == 0 {
+            report.found = all.len();
+        }
+        let take: Vec<&Site> = all.iter().zip(&is_small).filter(|(_, s)| **s).map(|(a, _)| a).collect();
+        let progress =
+            round < MAX_ROUNDS && !take.is_empty() && remove_checked(mesh, &mut state, &take, &mut report, cancel);
+        if !progress {
+            all_left = all.iter().filter(|s| s.crossing).map(|s| info_of(s, edge)).collect();
+            report.unfillable = take.len();
+            break;
+        }
+    }
+    report.removed_area_share = if area_before > 0.0 { report.removed_area / area_before } else { 0.0 };
+    all_left.sort_by(|a, b| b.extent.total_cmp(&a.extent));
+    report.left_total = all_left.len();
+    all_left.truncate(MAX_LISTED);
+    report.left = all_left;
+    report
+}
+
+/// The triangles `ids` of the original mesh, appended to `into` as a soup.
+fn record_removed(mesh: &Mesh, ids: &[u32], into: &mut Mesh) {
+    for corners in ids.iter().filter_map(|&t| mesh.triangle(t as usize)) {
+        let base = into.positions.len() as u32;
+        into.positions.extend(corners);
+        into.triangles.push([base, base + 1, base + 2]);
+    }
+}
+
+/// Removes `take`, retrying without the groups whose hole stays open or whose patch strays; false when
+/// nothing was removed (or the call was cancelled).
+fn remove_checked(
+    mesh: &mut Mesh,
+    state: &mut State,
+    take: &[&Site],
+    report: &mut FoldReport,
+    cancel: &Cancel,
+) -> bool {
+    let inc = Incidence::new(mesh);
+    let neighbours = mesh.triangle_neighbours();
+    let rim_tris: Vec<bool> = neighbours.iter().map(|n| n.contains(&u32::MAX)).collect();
+    // a group at a hub, with a margin that is too large, or beside a crease or a boss is left
+    let plans: Vec<Option<Vec<u32>>> = take
+        .iter()
+        .map(|s| with_margin(mesh, &inc, &rim_tris, s))
+        .map(|p| p.filter(|plan| !near_a_feature(mesh, &inc, &neighbours, plan)))
+        .collect();
+    let mut skip: Vec<bool> = plans.iter().map(Option::is_none).collect();
+    let tris: Vec<Vec<u32>> = plans.into_iter().map(Option::unwrap_or_default).collect();
     for _ in 0..MAX_ATTEMPTS {
-        let attempt = try_remove(mesh, take, &skip);
+        if cancel.is_cancelled() {
+            report.cancelled = true;
+            return false;
+        }
+        let attempt = try_remove(mesh, &state.origin, take, &tris, &skip, FILL_ACCEPT_SHARE * state.tolerance);
         if attempt.failed.is_empty() {
-            let gone: Vec<usize> = (0..take.len()).filter(|&g| !skip.get(g).copied().unwrap_or(true)).collect();
-            if gone.is_empty() {
-                return None;
-            }
-            report.removed += gone.len();
-            for &g in &gone {
-                let (n, area) = attempt.taken.get(g).copied().unwrap_or((0, 0.0));
-                report.removed_triangles += n;
-                report.removed_area += area;
-                report.largest_removed_height =
-                    report.largest_removed_height.max(take.get(g).map_or(0.0, |s| s.height));
-            }
-            report.added_triangles += attempt.added;
-            report.unfillable += skip.iter().filter(|s| **s).count();
-            *mesh = attempt.mesh;
-            edit::compact(mesh);
-            return Some(());
+            return commit(mesh, state, &skip, attempt, report);
         }
         for g in attempt.failed {
             if let Some(s) = skip.get_mut(g) {
@@ -286,8 +245,29 @@ fn remove_checked(mesh: &mut Mesh, take: &[&Site], report: &mut FoldReport) -> O
             }
         }
     }
-    report.unfillable += take.len();
-    None
+    false
+}
+
+/// Applies an attempt in which every group that was not skipped came out clean.
+fn commit(mesh: &mut Mesh, state: &mut State, skip: &[bool], attempt: Attempt, report: &mut FoldReport) -> bool {
+    let gone: Vec<usize> = (0..skip.len()).filter(|&g| !skip.get(g).copied().unwrap_or(true)).collect();
+    if gone.is_empty() {
+        return false;
+    }
+    report.removed += gone.len();
+    for t in gone.iter().filter_map(|&g| attempt.taken.get(g)) {
+        report.removed_triangles += t.triangles;
+        report.removed_area += t.area;
+        report.largest_removed_height = report.largest_removed_height.max(t.height);
+        report.largest_fill_deviation = report.largest_fill_deviation.max(t.fill_deviation);
+        report.largest_clean_deviation = report.largest_clean_deviation.max(t.clean_deviation);
+    }
+    report.added_triangles += attempt.added;
+    record_removed(mesh, &attempt.removed_original, &mut report.removed_mesh);
+    state.origin = attempt.origin;
+    *mesh = attempt.mesh;
+    edit::compact(mesh);
+    true
 }
 
 #[cfg(test)]

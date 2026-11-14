@@ -28,18 +28,19 @@ fn wanted(default: &str) -> Vec<usize> {
 }
 
 /// The scan as `scan.to_solid` hands it to the shell before the fold step existed: cleaned, holes up to 400 edges filled, rim kept.
-fn prepared(number: usize) -> Option<(Mesh, f64)> {
+fn prepared(number: usize) -> Option<(Mesh, f64, usize)> {
     let path = files().get(number.checked_sub(1)?)?.clone();
     let mut s = Session::new();
     s.execute("mesh.import", json!({"path": path.to_string_lossy(), "name": "scan"})).ok()?;
     let sigma = s.execute("scan.qa", json!({"object": "scan"})).ok()?["noise_sigma"].as_f64().unwrap_or(f64::NAN);
     s.execute("mesh.clean", json!({"object": "scan", "fill_holes_max_edges": 0, "remove_folds": false})).ok()?;
     let id = s.doc.find_by_name("scan")?.0;
+    let scan_triangles = s.doc.mesh(id)?.mesh.triangle_count();
     let rim = edit::boundary_loops(&s.doc.mesh(id)?.mesh).iter().map(Vec::len).max().unwrap_or(0);
     if rim > 0 {
         s.execute("mesh.fill_holes", json!({"object": "scan", "max_edges": 400.min(rim.saturating_sub(1))})).ok()?;
     }
-    Some(((*s.doc.mesh(id)?.mesh).clone(), sigma))
+    Some(((*s.doc.mesh(id)?.mesh).clone(), sigma, scan_triangles))
 }
 
 fn shell_line(m: &Mesh, wall: f64) -> String {
@@ -60,7 +61,7 @@ fn shell_line(m: &Mesh, wall: f64) -> String {
 fn local_corpus_fold_repair_makes_the_shell_resolve() {
     let wall: f64 = std::env::var("SURFACECRAFT_LOCAL_THICKNESS").ok().and_then(|t| t.parse().ok()).unwrap_or(1.0);
     for number in wanted("4,5,6,9") {
-        let Some((mut m, sigma)) = prepared(number) else { continue };
+        let Some((mut m, sigma, scan_triangles)) = prepared(number) else { continue };
         let found = folds::find_folds(&m);
         eprintln!(
             "S{number:02} sigma {sigma:.4} triangles {} folds found {} (small {})",
@@ -78,7 +79,7 @@ fn local_corpus_fold_repair_makes_the_shell_resolve() {
         }
         eprintln!("S{number:02} before: {}", shell_line(&m, wall));
         let t = std::time::Instant::now();
-        let r = folds::remove_folds(&mut m);
+        let r = folds::remove_folds(&mut m, 0.2, &surfacecraft_geom::Cancel::new(), scan_triangles);
         eprintln!(
             "S{number:02} removed {} groups ({} triangles, {:.3} mm2, tallest {:.3} mm), added {}, unfillable {}, left {} in {:.1} s; largest left {:?}",
             r.removed,
@@ -105,10 +106,10 @@ fn local_corpus_fold_repair_makes_the_shell_resolve() {
 #[ignore = "needs SURFACECRAFT_LOCAL_CORPUS (third-party scans, never committed)"]
 fn local_corpus_fold_census() {
     for number in wanted("1,2,3,4,5,6,7,8,9,10,11,12,13") {
-        let Some((mut m, _)) = prepared(number) else { continue };
+        let Some((mut m, _, scan_triangles)) = prepared(number) else { continue };
         let (before, area) = (m.triangle_count(), m.area());
         let t = std::time::Instant::now();
-        let r = folds::remove_folds(&mut m);
+        let r = folds::remove_folds(&mut m, 0.2, &surfacecraft_geom::Cancel::new(), scan_triangles);
         eprintln!(
             "S{number:02} triangles {before}: folds found {}, removed {} ({} triangles, {:.4} % of the area), unfillable {}, left {}, {:.1} s",
             r.found,
@@ -126,7 +127,7 @@ fn local_corpus_fold_census() {
 #[ignore = "needs SURFACECRAFT_LOCAL_CORPUS (third-party scans, never committed)"]
 fn local_corpus_small_folds_in_numbers() {
     for number in wanted("3") {
-        let Some((m, _)) = prepared(number) else { continue };
+        let Some((m, _, _)) = prepared(number) else { continue };
         let removable: Vec<_> = folds::find_folds(&m).into_iter().filter(|f| f.small).collect();
         let q = |mut v: Vec<f64>| {
             v.sort_by(f64::total_cmp);
@@ -176,5 +177,70 @@ fn local_corpus_clean_with_folds_then_fill() {
         let m = (*s.doc.mesh(id).unwrap().mesh).clone();
         eprintln!("S{number:02} folds after: {:?}", folds::find_folds(&m).iter().filter(|f| f.crossing).count());
         eprintln!("S{number:02} {}", shell_line(&m, 1.0));
+    }
+}
+
+#[test]
+#[ignore = "needs SURFACECRAFT_LOCAL_CORPUS (third-party scans, never committed)"]
+fn local_corpus_which_fill_makes_the_fold() {
+    for number in wanted("5") {
+        let path = files()[number - 1].clone();
+        for (label, fill) in [("no fill", None), ("flat fill", Some(false)), ("smooth fill", Some(true))] {
+            let mut s = Session::new();
+            s.execute("mesh.import", json!({"path": path.to_string_lossy(), "name": "scan"})).unwrap();
+            s.execute("mesh.clean", json!({"object": "scan", "fill_holes_max_edges": 0})).unwrap();
+            let id = s.doc.find_by_name("scan").unwrap().0;
+            let rim = edit::boundary_loops(&s.doc.mesh(id).unwrap().mesh).iter().map(Vec::len).max().unwrap_or(0);
+            if let Some(smooth) = fill {
+                s.execute(
+                    "mesh.fill_holes",
+                    json!({"object": "scan", "max_edges": 400.min(rim - 1), "smooth": smooth}),
+                )
+                .unwrap();
+            }
+            let m = (*s.doc.mesh(id).unwrap().mesh).clone();
+            let crossing = folds::find_folds(&m).iter().filter(|f| f.crossing).count();
+            eprintln!("S{number:02} {label}: crossing groups {crossing}; {}", shell_line(&m, 1.0));
+        }
+    }
+}
+
+/// A: the scan cleaned and filled as the pipeline does, no fold removal; B: `scan.to_solid` as it is.
+#[test]
+#[ignore = "needs SURFACECRAFT_LOCAL_CORPUS (third-party scans, never committed)"]
+fn local_corpus_fold_removal_a_b() {
+    for number in wanted("5,6,4,9") {
+        let path = files()[number - 1].clone();
+        for (label, with_folds) in [("A without", false), ("B with   ", true)] {
+            let mut s = Session::new();
+            s.execute("mesh.import", json!({"path": path.to_string_lossy(), "name": "scan"})).unwrap();
+            let mut p = json!({"scan": "scan", "thickness": 1.0});
+            if !with_folds {
+                s.execute("mesh.clean", json!({"object": "scan", "fill_holes_max_edges": 0})).unwrap();
+                let id = s.doc.find_by_name("scan").unwrap().0;
+                let rim = edit::boundary_loops(&s.doc.mesh(id).unwrap().mesh).iter().map(Vec::len).max().unwrap_or(0);
+                s.execute("mesh.fill_holes", json!({"object": "scan", "max_edges": 400.min(rim - 1)})).unwrap();
+                p["clean"] = json!(false);
+            }
+            let out = s.execute("scan.to_solid", p).unwrap();
+            let codes: Vec<&str> =
+                out["issues"].as_array().into_iter().flatten().filter_map(|i| i["code"].as_str()).collect();
+            let f = &out["thickened"]["folds"];
+            eprintln!(
+                "S{number:02} {label}: verdict {} within {:.4} coverage {:.4} max {:.3} unresolved {} issues {codes:?}; folds removed {} triangles {} share {:.5} height {:.3} fill {:.3} unfillable {} left {}",
+                out["verdict"],
+                out["deviation"]["within"].as_f64().unwrap_or(f64::NAN),
+                out["deviation"]["coverage"].as_f64().unwrap_or(f64::NAN),
+                out["deviation"]["max_abs"].as_f64().unwrap_or(f64::NAN),
+                out["thickened"]["unresolved_vertices"],
+                f["removed"],
+                f["removed_triangles"],
+                f["removed_area_share"].as_f64().unwrap_or(0.0),
+                f["largest_removed_height"].as_f64().unwrap_or(0.0),
+                f["largest_fill_deviation"].as_f64().unwrap_or(0.0),
+                f["unfillable"],
+                f["left"]
+            );
+        }
     }
 }

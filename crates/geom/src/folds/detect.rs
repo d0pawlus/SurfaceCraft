@@ -3,13 +3,17 @@ use crate::{Aabb, Bvh, Mesh, Point3, Vec3, par, tri};
 use std::collections::HashMap;
 
 /// A vertex is read for at most this many incident triangles (a hub of a fan).
-const MAX_ROW: usize = 64;
-/// Edges sampled for the median edge length.
+pub(super) const MAX_ROW: usize = 64;
 /// Triangles read as candidates for a crossing of one triangle (a pile of coincident sheets stops there).
 const MAX_CANDIDATES: usize = 256;
-/// Two triangles on an edge are folded flat onto each other when their normals are this close to opposite.
+/// Two triangles on an edge are folded flat onto each other when their normals are this close to opposite
+/// and their third corners lie on the same side of the edge.
 const FOLDED_FLAT_COS: f64 = 0.9;
+/// Edges sampled for the median edge length.
 const EDGE_SAMPLE_TRIANGLES: usize = 50_000;
+/// A cell index stays within this magnitude (the coordinates over the cell side): far inside `i64`, so
+/// that the neighbours of a cell can be addressed without overflow. A mesh beyond it is left alone.
+const MAX_CELL_INDEX: f64 = 1.0e12;
 
 /// Triangles around each vertex (compressed rows).
 pub(super) struct Incidence {
@@ -65,8 +69,10 @@ pub(super) fn facets(mesh: &Mesh) -> Vec<(Vec3, f64)> {
 
 type Cell = (i64, i64, i64);
 
-fn cell_of(p: &Point3, inv: f64) -> Cell {
-    ((p.x * inv).floor() as i64, (p.y * inv).floor() as i64, (p.z * inv).floor() as i64)
+/// The cell of `p`; `None` when its index would leave [`MAX_CELL_INDEX`] (or is not a number).
+fn cell_of(p: &Point3, inv: f64) -> Option<Cell> {
+    let index = |x: f64| Some((x * inv).floor()).filter(|c| c.abs() <= MAX_CELL_INDEX).map(|c| c as i64);
+    Some((index(p.x)?, index(p.y)?, index(p.z)?))
 }
 
 /// Which triangles face against their surroundings: the angle to the area-weighted normal of the
@@ -78,7 +84,11 @@ fn cell_of(p: &Point3, inv: f64) -> Cell {
 pub(super) fn flipped(mesh: &Mesh, facets: &[(Vec3, f64)], cell: f64, flip_cos: f64, coherence: f64) -> Vec<bool> {
     let inv = if cell.is_finite() && cell > 0.0 { 1.0 / cell } else { return vec![false; mesh.triangles.len()] };
     let centroids: Vec<Option<Cell>> =
-        (0..mesh.triangles.len()).map(|t| mesh.face_centroid(t).map(|c| cell_of(&c, inv))).collect();
+        (0..mesh.triangles.len()).map(|t| mesh.face_centroid(t).and_then(|c| cell_of(&c, inv))).collect();
+    if centroids.iter().any(Option::is_none) {
+        // a coordinate far beyond the cell side: nothing is told apart rather than risk the arithmetic
+        return vec![false; mesh.triangles.len()];
+    }
     let mut sums: HashMap<Cell, (Vec3, f64)> = HashMap::new();
     for (c, f) in centroids.iter().zip(facets) {
         if let Some(c) = c {
@@ -235,18 +245,34 @@ fn edge_pierces(edge: Option<(Point3, Point3)>, b: &[Point3; 3]) -> bool {
     edge.is_some_and(|(p, q)| tri::ray_hit(&p, &(q - p), &b[0], &b[1], &b[2]).is_some_and(|u| u <= 1.0))
 }
 
+/// Are `x` and `y`, which share the edge `(a, b)`, folded flat onto each other: normals opposite and the
+/// third corners on the same side of the edge? (A triangle that is only wound the wrong way lies on the
+/// other side of the edge and is no fold.)
+fn folded_flat(x: (&[Point3; 3], &[u32; 3]), y: (&[Point3; 3], &[u32; 3]), (a, b): (u32, u32)) -> bool {
+    let apex =
+        |t: (&[Point3; 3], &[u32; 3])| t.1.iter().position(|v| *v != a && *v != b).and_then(|k| t.0.get(k).copied());
+    let edge =
+        |t: (&[Point3; 3], &[u32; 3]), v: u32| t.1.iter().position(|w| *w == v).and_then(|k| t.0.get(k).copied());
+    let (Some(pa), Some(pb), Some(e0), Some(e1)) = (apex(x), apex(y), edge(x, a), edge(x, b)) else { return false };
+    let along = e1 - e0;
+    let same_side = along.cross(&(pa - e0)).dot(&along.cross(&(pb - e0))) > 0.0;
+    let opposite = match (tri::normal(&x.0[0], &x.0[1], &x.0[2]), tri::normal(&y.0[0], &y.0[1], &y.0[2])) {
+        (Some(n), Some(m)) => n.dot(&m) < -FOLDED_FLAT_COS,
+        _ => false,
+    };
+    same_side && opposite
+}
+
 /// Do the triangles `x` and `y` (corners, vertex ids) pass through each other? Triangles that share
 /// nothing: an edge of one pierces the other. That share a vertex: the edge opposite that vertex pierces
-/// the other. That share an edge: folded flat onto each other (normals opposite).
+/// the other (an edge from the shared vertex cannot, unless the two lie in one plane). That share an edge:
+/// folded flat onto each other.
 fn cross(x: (&[Point3; 3], &[u32; 3]), y: (&[Point3; 3], &[u32; 3])) -> bool {
     let shared: Vec<u32> = x.1.iter().copied().filter(|v| y.1.contains(v)).collect();
     match shared.as_slice() {
         [] => pierces(x.0, y.0) || pierces(y.0, x.0),
         [v] => edge_pierces(opposite_edge(x.0, x.1, *v), y.0) || edge_pierces(opposite_edge(y.0, y.1, *v), x.0),
-        [_, _] => match (tri::normal(&x.0[0], &x.0[1], &x.0[2]), tri::normal(&y.0[0], &y.0[1], &y.0[2])) {
-            (Some(a), Some(b)) => a.dot(&b) < -FOLDED_FLAT_COS,
-            _ => false,
-        },
+        [a, b] => folded_flat(x, y, (*a, *b)),
         _ => false,
     }
 }

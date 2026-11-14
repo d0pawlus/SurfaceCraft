@@ -30,7 +30,7 @@ impl From<&FoldInfo> for FoldOut {
     }
 }
 
-/// What the removal of folds did: small groups of triangles that face against the surface around them (a flap turned over, a knot, a sliver on the rim), where the scan passes through itself and no wall can be built over it. A group is a fold when its triangles pass through other triangles of the scan; it is removed when it is at most 8 median edges across, has at most 200 triangles and lies within 1.5 median edges of the surface around it (with two rings of triangles around it, so that the hole is bounded by clean surface); its hole is filled (a hole that cannot be filled puts the group back). The rim is never closed. Larger folds stay and are listed.
+/// What the removal of folds did: small groups of triangles that face against the surface around them (a flap turned over, a knot, a sliver on the rim), where the scan passes through itself and no wall can be built over it. A group is a fold when its triangles pass through other triangles of the scan; it is removed when it is at most 8 median edges across, has at most 200 triangles and lies within 1.5 median edges of the surface around it (with one or two rings of triangles around it, so that the hole is bounded by clean surface) and the smooth patch stays within three quarters of the tolerance of the clean surface it replaces; a group at a hub, beside a crease or a corner (neighbouring triangles more than 30 degrees apart around it) or with a patch that would stray is left; its hole is filled (a hole that cannot be filled puts the group back). The rim is never closed. Larger folds stay and are listed. The scan object is changed in place, like the hole filling of the same call, and by the same undo step.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct FoldsOut {
     /// Groups of triangles facing against the surface around them found before anything was removed (whether the scan crosses itself there or not; only those that do are folds).
@@ -41,8 +41,12 @@ pub struct FoldsOut {
     pub removed_triangles: usize,
     /// Their area (mm²).
     pub removed_area: f64,
-    /// The largest distance of a removed group from the surface around it (mm).
+    /// That area over the area of the scan before.
+    pub removed_area_share: f64,
+    /// The largest distance of a vertex of a removed fold from the surface that replaced it (mm): how far the scan stood out of the surface there. The scan is judged as it was, so this is part of the deviation of the verdict.
     pub largest_removed_height: f64,
+    /// The largest distance of any vertex or triangle centre of the scan that was taken out from the patch that replaced it (mm): how far the repaired scan differs from the scan as it was. A fill that would move the clean surface around a fold (not what touches it) by more than three quarters of the tolerance is not made.
+    pub largest_fill_deviation: f64,
     /// Triangles added by filling the holes they left.
     pub added_triangles: usize,
     /// Small groups whose hole could not be filled: put back.
@@ -60,7 +64,9 @@ impl From<&FoldReport> for FoldsOut {
             removed: r.removed,
             removed_triangles: r.removed_triangles,
             removed_area: r.removed_area,
+            removed_area_share: r.removed_area_share,
             largest_removed_height: r.largest_removed_height,
+            largest_fill_deviation: r.largest_fill_deviation,
             added_triangles: r.added_triangles,
             unfillable: r.unfillable,
             left: r.left_total,
