@@ -179,10 +179,27 @@ fn restore_name(s: &mut Session, set: &Settings, out: &ToSolidOut) {
     }
 }
 
-/// The freeform method with its preparation: the scan is wrapped as it is; when that does not pass
-/// and the scan is closed, it is rebuilt and wrapped again. A scan with strong evidence (many
-/// handles or non-manifold edges) is rebuilt first. With `rebuild` off, only the plain wrap.
+/// The freeform method with its preparation. With `close_handles` the small handles are closed on a
+/// copy that is wrapped (`pipeline_handles`); when none could be closed, or without it, the scan is
+/// wrapped as it is; when that does not pass and the scan is closed, it is rebuilt and wrapped again. A
+/// scan with strong evidence (many handles or non-manifold edges) is rebuilt first. With `rebuild` off,
+/// only the plain wrap.
 pub(super) fn freeform_prepared(s: &mut Session, set: &Settings, report: ScanSummary) -> CmdResult<ToSolidOut> {
+    if !set.close_handles {
+        return freeform_plain(s, set, report);
+    }
+    match super::handles::wrap_closed(s, set, &report)? {
+        Ok(out) => Ok(out),
+        Err(step) => {
+            let mut out = freeform_plain(s, set, report)?;
+            out.prep.preparation.insert(0, step);
+            Ok(out)
+        }
+    }
+}
+
+/// [`freeform_prepared`] without the closing of handles.
+fn freeform_plain(s: &mut Session, set: &Settings, report: ScanSummary) -> CmdResult<ToSolidOut> {
     let found = if set.rebuild { mesh_of(s, set.scan).and_then(|m| evidence(&m)) } else { None };
     let Some((strong, soft, figures)) = found else { return freeform_on(s, set, set.scan, report) };
     // the larger-cap retry belongs to the first attempt only: a second attempt never makes a third wrap
@@ -276,6 +293,8 @@ mod tests {
             allow_retry: true,
             budget: super::super::budget::CallBudget::default(),
             rebuild: true,
+            close_handles: false,
+            handle_size: None,
             name: "solid".into(),
         };
         let mut o = super::super::prepare::failure_for_tests(&set, body.id);
@@ -305,6 +324,8 @@ mod tests {
             allow_retry: true,
             budget: super::super::budget::CallBudget::default(),
             rebuild: true,
+            close_handles: false,
+            handle_size: None,
             name: "solid".into(),
         }
     }

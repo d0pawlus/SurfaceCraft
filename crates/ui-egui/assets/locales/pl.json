@@ -651,6 +651,8 @@
   "cmd.import.step": "Importuj STEP",
   "cmd.mesh.clean": "Oczyść skan",
   "cmd.mesh.clean.hint": "Usuwa za jednym razem zdublowane punkty, błędne trójkąty i drobne luźne okruchy.",
+  "cmd.mesh.close_handles": "Zamknij małe uchwyty",
+  "cmd.mesh.close_handles.hint": "Zamyka drobne tunele i mostki skanu (np. tam, gdzie dwie strony cienkiej ścianki zlewają się w skanie) jako nową siatkę; brzeg i reszta powierzchni zostają.",
   "cmd.mesh.decimate": "Uprość",
   "cmd.mesh.decimate.hint": "Zmniejsza liczbę trójkątów, żeby skan był lżejszy w pracy.",
   "cmd.mesh.export": "Eksportuj siatkę",

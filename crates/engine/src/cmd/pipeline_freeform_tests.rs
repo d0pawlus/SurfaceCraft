@@ -29,6 +29,8 @@ fn session() -> (Session, Settings) {
         allow_retry: true,
         budget: super::super::budget::CallBudget::default(),
         rebuild: true,
+        close_handles: false,
+        handle_size: None,
         name: "w".into(),
     };
     (s, set)

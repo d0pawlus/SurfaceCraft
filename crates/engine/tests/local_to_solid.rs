@@ -6,7 +6,8 @@
 //! `docs/STATUS.md` keeps only the aggregate figures. Files are reported by number only.
 //!
 //! Run (release, the files are large):
-//! `SURFACECRAFT_LOCAL_CORPUS_NUMBERS=3` (comma-separated file numbers) limits the run.
+//! `SURFACECRAFT_LOCAL_CORPUS_NUMBERS=3` (comma-separated file numbers) limits the run;
+//! `SURFACECRAFT_LOCAL_TO_SOLID_PARAMS='{"close_handles": true}'` adds parameters to every call.
 //! `SURFACECRAFT_LOCAL_CORPUS=… cargo test --release -p surfacecraft-engine --test local_to_solid -- --ignored --nocapture`
 use serde_json::{Value, json};
 use std::time::Instant;
@@ -46,7 +47,15 @@ fn run_one(number: usize, path: &std::path::Path) -> Result<String, String> {
     let e = |x: surfacecraft_engine::EngineError| x.to_string();
     let info = s.execute("mesh.import", json!({"path": path.to_string_lossy(), "name": "scan"})).map_err(e)?;
     let started = Instant::now();
-    let out = s.execute("scan.to_solid", json!({"scan": "scan"})).map_err(e)?;
+    let mut params = json!({"scan": "scan"});
+    // extra parameters of every call, e.g. `{"close_handles": true}`
+    if let Some(extra) =
+        std::env::var("SURFACECRAFT_LOCAL_TO_SOLID_PARAMS").ok().and_then(|x| serde_json::from_str::<Value>(&x).ok())
+        && let (Some(p), Some(x)) = (params.as_object_mut(), extra.as_object())
+    {
+        p.extend(x.clone());
+    }
+    let out = s.execute("scan.to_solid", params).map_err(e)?;
     let seconds = started.elapsed().as_secs_f64();
     let verdict = out["verdict"].as_str().unwrap_or("?").to_string();
     eprintln!(
@@ -74,6 +83,9 @@ fn run_one(number: usize, path: &std::path::Path) -> Result<String, String> {
         "C{number:02} within {} patches {} retry {} attempts {}",
         out["deviation"]["within"], out["patches"], out["retry"], out["attempts"]
     );
+    for p in out["preparation"].as_array().into_iter().flatten() {
+        eprintln!("C{number:02} preparation {}: {}", p["step"], p["numbers"]);
+    }
     // whatever the verdict, the answer must be usable: a non-pass names its issues and next steps
     if verdict != "pass" && (codes(&out).is_empty() || out["next_steps"].as_array().is_none_or(Vec::is_empty)) {
         return Err(format!("verdict {verdict} without issues or next steps"));

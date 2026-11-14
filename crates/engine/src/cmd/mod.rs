@@ -24,6 +24,7 @@ pub mod hybrid;
 pub mod mesh;
 pub mod mesh_edit;
 pub mod mesh_folds;
+pub mod mesh_handles;
 pub mod mesh_remesh;
 pub mod param;
 pub mod pipeline;
@@ -179,6 +180,7 @@ static REGISTRY: LazyLock<Vec<CommandSpec>> = LazyLock::new(|| {
     v.extend_from_slice(deviation::COMMANDS);
     v.extend_from_slice(mesh::COMMANDS);
     v.extend_from_slice(mesh_edit::COMMANDS);
+    v.extend_from_slice(mesh_handles::COMMANDS);
     v.extend_from_slice(mesh_remesh::COMMANDS);
     v.extend_from_slice(param::COMMANDS);
     v.extend_from_slice(pipeline::COMMANDS);
@@ -234,6 +236,7 @@ const HEAVY: &[&str] = &[
     "feature.replay",
     "import.step",
     "mesh.clean",
+    "mesh.close_handles",
     "mesh.decimate",
     "mesh.export",
     "mesh.fill_holes",

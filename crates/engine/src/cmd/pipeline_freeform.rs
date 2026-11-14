@@ -388,7 +388,10 @@ fn freeform_with_mesh(
         issues.insert(0, issue("tolerance_exceeds_part", msg));
     }
     let tried = retry.as_ref().is_some_and(|r| r.reason != RetryReason::BudgetSpent);
-    let next = next_steps(&w, &issues, set, tried);
+    let mut next = next_steps(&w, &issues, set, tried);
+    if let Some(offer) = super::handles::offer(s, set, &issues) {
+        next.insert(next.len().saturating_sub(1), offer);
+    }
     let verdict = if issues.is_empty() {
         Verdict::Pass
     } else if d.coverage >= MIN_COVERAGE {
