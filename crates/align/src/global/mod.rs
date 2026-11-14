@@ -44,6 +44,15 @@ pub const MAX_PAIRS_LIMIT: usize = MAX_SCANS * (MAX_SCANS - 1) / 2;
 pub const REJECT_FACTOR: f64 = 2.5;
 /// `aligned` needs every used edge to agree with the final poses within this many tolerances.
 pub const LOOP_BOUND: f64 = 1.0;
+/// The vote that leaves pairs out must beat the best different set of pairs by at least this many
+/// edges, or the verdict is `partial` (`consensus_unclear`). 1 means: a tie carries no information
+/// and is not accepted; any win is (a discrete rule, no measured value can sit near it). A single
+/// forged pair among six in a graph of four scans wins by exactly 1: the alternative must call two
+/// right pairs wrong to keep it.
+pub const MIN_CONSENSUS_MARGIN: usize = 1;
+/// More left-out pairs than this many per used pair make the verdict `partial`
+/// (`many_edges_rejected`).
+pub const MAX_REJECTED_PER_USED: f64 = 1.5;
 /// Fewest triangles a scan may have.
 const MIN_TRIANGLES: usize = 4;
 
@@ -122,9 +131,27 @@ fn check_input(scans: &[&Mesh], opts: &GlobalOptions) -> Result<(), AlignError> 
 /// Input that cannot be tried (fewer than two or more than [`MAX_SCANS`] scans, a scan that is
 /// empty or not finite, a bad `fixed` or `max_pairs`), or [`AlignError::Cancelled`].
 pub fn align_global(scans: &[&Mesh], opts: &GlobalOptions, cancel: &Cancel) -> Result<GlobalResult, AlignError> {
+    align_global_with(scans, opts, cancel, &|_, _, moving, fixed, o, c| crate::pair_coarse(moving, fixed, o, c))
+}
+
+/// [`align_global`] with the pair solver given (fixed index, moving index, moving mesh, fixed mesh,
+/// options, cancellation flag): a seam for tests, which hand the graph pair poses
+/// they chose (a wrong pose with full confidence, a pair that fails).
+///
+/// # Errors
+/// As [`align_global`].
+pub fn align_global_with<S>(
+    scans: &[&Mesh],
+    opts: &GlobalOptions,
+    cancel: &Cancel,
+    solver: &S,
+) -> Result<GlobalResult, AlignError>
+where
+    S: Fn(usize, usize, &Mesh, &Mesh, &crate::PairOptions, &Cancel) -> Result<crate::PairResult, AlignError> + Sync,
+{
     check_input(scans, opts)?;
     let (list, possible) = pairs::pair_list(scans, opts);
-    let tried = pairs::run_pairs(scans, &list, opts, cancel)?;
+    let tried = pairs::run_pairs(scans, &list, opts, cancel, solver)?;
     let cands = solve::candidates(scans, &tried, cancel)?;
     solve::solve(scans.len(), opts, cands, possible, tried.len(), cancel)
 }

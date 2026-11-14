@@ -180,15 +180,24 @@ Normals, colours and per-vertex data go with the coordinates.
   on the other at the pair pose), so the error around a loop is spread over the loop. A pair pose
   that disagrees with the best consistent set of the others by more than 2.5 tolerances (a false
   `unique`) is `rejected` and left out.
-- The report: per scan `placed` and its `matrix`; per pair the verdict, overlaps, residual, whether
-  it was used and its misfit before and after (`misfit_before`, `misfit_after`); `loop`: over the
-  independent cycles, the largest edge misfit in each, worst and mean, before and after
-  relaxation (before, the whole error sits on the edge that closes the cycle); the verdict:
-  `aligned` (all scans placed, every used pair agrees with the final poses within its tolerance),
-  `partial` (scans not connected to the fixed one, which are listed with `unplaced` and never
-  moved, or a loop that does not close: `loop_error_high`), `failed` (nothing connected).
-- It proposes by default; `apply: true` moves every placed scan in one undo step, and refuses
-  when the verdict is `failed`.
+- The report: per scan `placed`, `held_by_loop` and its `matrix`; per pair the verdict, overlaps,
+  residual, the pair's own evidence (`stability`, `probed`, `probes_failed`, `slides`), whether it
+  was used and its misfit before and after (`misfit_before`, `misfit_after`; also for a `rejected`
+  pair, so the size of the contradiction is visible); `used_edges`, `rejected_edges` and
+  `consensus_margin` (inliers of the winning set minus those of the best different one; 0 is a tie);
+  `loop`: over the independent cycles, the largest edge misfit in each, worst and mean, before and
+  after relaxation (before, the whole error sits on the edge that closes the cycle).
+- The verdict is `aligned` only when every scan is placed and held by a closed loop of pairs
+  (`held_by_loop`), every used pair agrees with the final poses within its tolerance, the vote that
+  left pairs out was not a tie, and the left-out pairs are not more than 1.5 per used one. A scan
+  that hangs on a single pair (two scans, a chain, a leaf) is `weakly_held`: the pair was `unique`,
+  but `pair_coarse` is known to return a wrong pose as `unique` on near-symmetric or self-similar
+  parts, and nothing else confirms this one. The verdict is then `partial`, and the note quotes the
+  pair's confidence, overlap, stability and probe result: check such a scan by eye. `partial` also
+  for scans not connected to the fixed one (`unplaced`, never moved), a loop that does not close
+  (`loop_error_high`), `many_edges_rejected` and `consensus_unclear`; `failed` when nothing connected.
+- It proposes by default; `apply: true` moves every placed scan in one undo step (also for a
+  `partial` result: the note then names the weakly held scans), and refuses when the verdict is `failed`.
 - Limits: a scan tied by a single wrong pair cannot be told from a right one (no loop checks
   it); a part with near symmetries gives pairs that are `unique` but wrong, and the consensus can
   only drop them while enough right pairs exist; the cap on pairs can leave a scan unconnected

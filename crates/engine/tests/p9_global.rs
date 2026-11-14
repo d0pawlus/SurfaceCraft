@@ -6,149 +6,17 @@
 //! Bounds, fixed before the first run: a pair gate of M2 is 0.1 degrees and 0.1 mm (partial overlap
 //! measured 0.083 degrees / 0.073 mm). A view in the common frame is reached through up to five
 //! pair poses (the chain along a ring of six views), and relaxation only averages them, so the
-//! bound is 5 times the pair gate: 0.5 degrees and 0.5 mm. No assertion sits within 1.5 times of a
-//! measured value; the measured values and their ratios are printed (run with `--nocapture`).
+//! bound is 5 times the pair gate: 0.5 degrees and 0.5 mm. The measured values and their ratios to
+//! the assertion bounds are printed (run with `--nocapture`); the smallest ratio of any assertion
+//! is 1.8 (the ring: the relaxed far view must be at least 2 times better than the chain, measured
+//! 3.6 times), every other one is 4 or more. Discrete outcomes (which pairs are rejected, whether a
+//! pair of non-neighbours is `unique`) are never asserted exactly.
+mod global_common;
 mod pair_common;
+use global_common::*;
 use pair_common::*;
-use serde_json::{Value, json};
-use surfacecraft_engine::Session;
+use serde_json::json;
 use surfacecraft_geom::{Mesh, Point3, Transform, Vec3, synth};
-
-const BOUND_DEGREES: f64 = 0.5;
-const BOUND_MM: f64 = 0.5;
-
-/// A view of the bracket: its own tessellation and noise, the triangles whose centroid lies on the
-/// side of `dir` of the part centre or at most `reach` mm beyond it.
-fn bracket_view(k: usize, dir: Vec3, reach: f64) -> Mesh {
-    let whole = noisy(bracket_at(10 + 2 * k, 40 + 6 * k, 14 + k), 100 + k as u64);
-    let c = Point3::new(30.0, 20.0, 15.0);
-    cut(&whole, |p| (p - c).dot(&dir) >= -reach)
-}
-
-const SIDES: [([f64; 3], f64); 6] = [
-    ([1.0, 0.0, 0.0], 6.0),
-    ([-1.0, 0.0, 0.0], 6.0),
-    ([0.0, 1.0, 0.0], 4.0),
-    ([0.0, -1.0, 0.0], 4.0),
-    ([0.0, 0.0, 1.0], 6.0),
-    ([0.577_35, 0.577_35, 0.577_35], 7.0),
-];
-
-fn bracket_views(n: usize) -> Vec<Mesh> {
-    SIDES.iter().take(n).enumerate().map(|(k, (d, r))| bracket_view(k, Vec3::new(d[0], d[1], d[2]), *r)).collect()
-}
-
-/// Six views of the blob, as the bracket's: the triangles on the side of a direction of the centre
-/// or at most `reach` mm beyond it.
-fn blob_views() -> Vec<Mesh> {
-    let sides: [([f64; 3], f64); 6] = [
-        ([1.0, 0.0, 0.0], 8.0),
-        ([-1.0, 0.0, 0.0], 8.0),
-        ([0.0, 1.0, 0.0], 5.0),
-        ([0.0, -1.0, 0.0], 5.0),
-        ([0.0, 0.0, 1.0], 3.5),
-        ([0.0, 0.0, -1.0], 3.5),
-    ];
-    sides
-        .iter()
-        .enumerate()
-        .map(|(k, (d, reach))| {
-            let dir = Vec3::new(d[0], d[1], d[2]);
-            cut(&noisy(blob_at(48 + 4 * k), 200 + k as u64), |p| p.coords.dot(&dir) >= -reach)
-        })
-        .collect()
-}
-
-/// A part with the rotational symmetry broken by twelve bumps of different sizes at irregular
-/// azimuths: a ring (torus) with lumps, seen in arcs.
-fn lumpy_ring(k: usize) -> Mesh {
-    let mut m = synth::torus(Point3::origin(), Vec3::z(), 40.0, 9.0, 72 + 4 * k, 20 + k);
-    let azimuths = [8.0, 31.0, 62.0, 80.0, 118.0, 139.0, 171.0, 203.0, 236.0, 262.0, 291.0, 330.0];
-    for (i, a) in azimuths.iter().enumerate() {
-        let (s, c) = f64::to_radians(*a).sin_cos();
-        let radius = 3.5 + 0.9 * ((i * 7) % 5) as f64;
-        let z = 1.8 * (((i * 5) % 7) as f64 - 3.0);
-        let out = 44.0 + 0.7 * ((i * 3) % 4) as f64;
-        m.append(&synth::sphere(Point3::new(out * c, out * s, z), radius, 20, 10));
-    }
-    noisy(m, 600 + k as u64)
-}
-
-/// A view of the lumpy ring: the arc of `half` degrees either side of azimuth `centre`.
-fn ring_arc(k: usize, centre: f64, half: f64) -> Mesh {
-    cut(&lumpy_ring(k), |p| {
-        let d = (p.y.atan2(p.x).to_degrees() - centre + 540.0).rem_euclid(360.0) - 180.0;
-        d.abs() <= half
-    })
-}
-
-fn poses(n: usize) -> Vec<Transform> {
-    (0..n as u64).map(random_motion).collect()
-}
-
-fn session_of(views: &[Mesh], poses: &[Transform]) -> Session {
-    session_with_ids(views, poses).0
-}
-
-fn session_with_ids(views: &[Mesh], poses: &[Transform]) -> (Session, Vec<surfacecraft_doc::ObjectId>) {
-    let mut s = Session::new();
-    let ids = views
-        .iter()
-        .zip(poses)
-        .enumerate()
-        .map(|(k, (v, p))| s.doc.add_mesh(&format!("v{k}"), v.transformed(p)))
-        .collect();
-    (s, ids)
-}
-
-fn global(s: &mut Session, n: usize, extra: Value) -> Value {
-    let names: Vec<String> = (0..n).map(|k| format!("v{k}")).collect();
-    let mut p = json!({ "objects": names });
-    p.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-    s.execute("align.global", p).unwrap()
-}
-
-fn rows(v: &Value) -> Transform {
-    Transform::from_rows(&serde_json::from_value(v.clone()).unwrap()).unwrap()
-}
-
-/// (angle in degrees, largest displacement in mm) of the motion found for view `k` against the
-/// truth: the motion that carries it back into the frame of view 0.
-fn error_of(found: &Transform, views: &[Mesh], poses: &[Transform], k: usize) -> (f64, f64) {
-    let truth = poses[0].then_after(&poses[k].inverse());
-    let on = views[k].transformed(&poses[k]);
-    let q = truth.inverse().then_after(found).quaternion();
-    let angle = 2.0 * q.vector().norm().atan2(q.scalar().abs());
-    (angle.to_degrees(), found.max_displacement(&truth, &on.positions))
-}
-
-fn scan_error(out: &Value, views: &[Mesh], poses: &[Transform], k: usize, key: &str) -> (f64, f64) {
-    error_of(&rows(&out["scans"][k][key]), views, poses, k)
-}
-
-fn count(out: &Value, status: &str) -> usize {
-    out["edges"].as_array().unwrap().iter().filter(|e| e["status"] == status).count()
-}
-
-fn print_edges(out: &Value) {
-    for e in out["edges"].as_array().unwrap() {
-        eprintln!(
-            "  {}-{}: {} {} confidence {:.2}, overlap {:.2}/{:.2}",
-            e["fixed"],
-            e["moving"],
-            e["verdict"],
-            e["status"],
-            e["confidence"].as_f64().unwrap(),
-            e["overlap_moving"].as_f64().unwrap(),
-            e["overlap_fixed"].as_f64().unwrap()
-        );
-    }
-}
-
-fn loop_figures(out: &Value) -> (f64, f64, u64) {
-    let l = &out["loop"];
-    (l["before"]["worst_mm"].as_f64().unwrap(), l["after"]["worst_mm"].as_f64().unwrap(), l["cycles"].as_u64().unwrap())
-}
 
 /// Gate 1: six overlapping views of a part, each re-meshed and in a pose of its own: every view
 /// within the bound of the truth relative to the fixed view, verdict `aligned`, and the loop
@@ -181,6 +49,14 @@ fn gate_one(part: &str, views: Vec<Mesh>) {
         assert!(angle <= BOUND_DEGREES && disp <= BOUND_MM, "{part} view {k}: {angle} deg {disp} mm");
     }
     assert_eq!(out["verdict"], "aligned", "{part}: {out}");
+    assert!(
+        out["scans"].as_array().unwrap().iter().all(|s| s["held_by_loop"] == true),
+        "{part}: a view hangs on one pair"
+    );
+    eprintln!(
+        "  {} pairs used, {} rejected, consensus margin {}",
+        out["used_edges"], out["rejected_edges"], out["consensus_margin"]
+    );
     assert!(cycles >= 1, "{part}: the pose graph has no cycle");
     assert!(after < before, "{part}: loop closure {before} -> {after}");
 }
@@ -292,4 +168,97 @@ fn gate_m3_symmetric_views_make_no_edge_and_are_not_aligned() {
     assert_ne!(out["verdict"], "aligned");
     assert_eq!(count(&out, "used"), 0, "{out}");
     assert_eq!(count(&out, "ambiguous"), 3, "{out}");
+}
+
+/// Two whole copies of a part are one pair: a unique pose, but no loop confirms it. The verdict is
+/// `partial` with `weakly_held`, the note says what it is and quotes the pair's own evidence, and
+/// `apply` still moves the scan (as for any `partial`).
+#[test]
+fn gate_m3_two_scans_are_one_unconfirmed_pair() {
+    let (fixed, moving) = pair_of("bracket");
+    let pose = random_motion(4);
+    let mut s = session(&fixed, &moving, &pose);
+    let out = s.execute("align.global", json!({"objects": ["fixed", "moving"], "apply": true})).unwrap();
+    eprintln!("{} {}\n{}", out["verdict"], out["issues"], out["note"]);
+    assert_eq!(out["verdict"], "partial");
+    assert_eq!(out["issues"], json!(["weakly_held"]));
+    assert_eq!(out["scans"][1]["held_by_loop"], false);
+    assert_eq!(out["applied"], true);
+    let note = out["note"].as_str().unwrap();
+    assert!(note.contains("single pair") && note.contains("no loop confirms") && note.contains("confidence"), "{note}");
+}
+
+/// `start: current`: three whole scans placed by hand within about 2 degrees and 3 mm of each
+/// other are brought together; the pairs start from the current poses.
+#[test]
+fn gate_m3_scans_placed_by_hand_are_refined_from_where_they_are() {
+    let views: Vec<Mesh> = (0..3).map(|k| noisy(bracket_at(10 + 2 * k, 40 + 6 * k, 14 + k), 700 + k as u64)).collect();
+    let axes = [Vec3::new(0.3, 0.8, 0.5), Vec3::new(-0.6, 0.1, 0.9)];
+    let poses = vec![
+        Transform::identity(),
+        Transform::rotation_axis_angle(&axes[0], 2.0_f64.to_radians())
+            .then_after(&Transform::translation(Vec3::new(2.0, -3.0, 1.0))),
+        Transform::rotation_axis_angle(&axes[1], -1.5_f64.to_radians())
+            .then_after(&Transform::translation(Vec3::new(-2.5, 1.0, 2.0))),
+    ];
+    let mut s = session_of(&views, &poses);
+    let out = global(&mut s, 3, json!({"start": "current"}));
+    print_edges(&out);
+    eprintln!(
+        "verdict {}, issues {}, methods {:?}",
+        out["verdict"],
+        out["issues"],
+        out["edges"].as_array().unwrap().iter().map(|e| e["method"].clone()).collect::<Vec<_>>()
+    );
+    for k in 0..3 {
+        let (angle, disp) = scan_error(&out, &views, &poses, k, "matrix");
+        eprintln!("  view {k}: {angle:.4} deg {disp:.4} mm");
+        assert!(angle <= BOUND_DEGREES && disp <= BOUND_MM, "view {k}");
+    }
+    assert_eq!(out["verdict"], "aligned", "{out}");
+}
+
+/// A part with a twofold symmetry (a box, which a half turn maps onto itself) and one small
+/// off-centre bump: views of it fit the flipped way too, except for the bump. Whatever the verdict,
+/// it is never `aligned` at a flipped pose: a result that claims `aligned` is within the bound.
+#[test]
+fn gate_m3_a_symmetric_part_is_never_aligned_at_the_flipped_pose() {
+    let part = |k: usize| {
+        let mut m = synth::cuboid(Point3::origin(), Vec3::new(40.0, 30.0, 20.0), 8 + 2 * k);
+        m.append(&synth::sphere(Point3::new(28.0, 10.0, 20.0), 3.0, 20 + 2 * k, 10 + k));
+        noisy(m, 800 + k as u64)
+    };
+    let centre = Point3::new(20.0, 15.0, 10.0);
+    let sides: [([f64; 3], f64); 6] = [
+        ([1.0, 0.0, 0.0], 5.0),
+        ([-1.0, 0.0, 0.0], 5.0),
+        ([0.0, 1.0, 0.0], 4.0),
+        ([0.0, -1.0, 0.0], 4.0),
+        ([0.0, 0.0, 1.0], 3.0),
+        ([0.577_35, 0.577_35, 0.577_35], 6.0),
+    ];
+    let views: Vec<Mesh> = sides
+        .iter()
+        .enumerate()
+        .map(|(k, (d, r))| cut(&part(k), |p| (p - centre).dot(&Vec3::new(d[0], d[1], d[2])) >= -r))
+        .collect();
+    let poses = poses(6);
+    let mut s = session_of(&views, &poses);
+    let out = global(&mut s, 6, json!({}));
+    print_edges(&out);
+    eprintln!(
+        "verdict {}, issues {}, used {}, rejected {}, margin {}",
+        out["verdict"], out["issues"], out["used_edges"], out["rejected_edges"], out["consensus_margin"]
+    );
+    let errors: Vec<(f64, f64)> = (0..6)
+        .filter(|k| out["scans"][*k]["placed"] == true)
+        .map(|k| scan_error(&out, &views, &poses, k, "matrix"))
+        .collect();
+    eprintln!("errors of the placed views: {errors:?}");
+    if out["verdict"] == "aligned" {
+        assert!(
+            errors.iter().all(|(a, d)| *a <= BOUND_DEGREES && *d <= BOUND_MM),
+            "aligned at a wrong pose: {errors:?}"
+        );
+    }
 }

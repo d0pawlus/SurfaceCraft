@@ -1,6 +1,6 @@
 //! The pair stage: which pairs of scans are tried, and their poses from [`crate::pair_coarse`].
 use super::{GlobalOptions, StartMode};
-use crate::{AlignError, PairOptions, PairResult, pair_coarse};
+use crate::{AlignError, PairOptions, PairResult};
 use std::collections::BTreeSet;
 use surfacecraft_geom::{Aabb, Cancel, Mesh, Transform, par};
 
@@ -53,19 +53,26 @@ pub(super) fn pair_list(scans: &[&Mesh], opts: &GlobalOptions) -> (Vec<(usize, u
 
 /// Solves every pair in `list` (in parallel; each result is independent of the others and of the
 /// thread count). Only a cancellation is an error of the whole stage.
-pub(super) fn run_pairs(
+pub(super) fn run_pairs<S>(
     scans: &[&Mesh],
     list: &[(usize, usize)],
     opts: &GlobalOptions,
     cancel: &Cancel,
-) -> Result<Vec<Tried>, AlignError> {
+    solver: &S,
+) -> Result<Vec<Tried>, AlignError>
+where
+    S: Fn(usize, usize, &Mesh, &Mesh, &PairOptions, &Cancel) -> Result<PairResult, AlignError> + Sync,
+{
     let given = (opts.start == StartMode::Current).then(Transform::identity);
     let options = PairOptions { tolerance: opts.tolerance, given, ..PairOptions::default() };
     let tried = par::map(list.len(), |k| {
         let &(fixed, moving) = list.get(k)?;
         let (f, m) = (scans.get(fixed)?, scans.get(moving)?);
-        let outcome =
-            if cancel.is_cancelled() { Err(AlignError::Cancelled) } else { pair_coarse(m, f, &options, cancel) };
+        let outcome = if cancel.is_cancelled() {
+            Err(AlignError::Cancelled)
+        } else {
+            solver(fixed, moving, m, f, &options, cancel)
+        };
         Some(Tried { fixed, moving, outcome })
     });
     let tried: Vec<Tried> = tried.into_iter().flatten().collect();

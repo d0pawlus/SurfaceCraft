@@ -31,8 +31,14 @@ pub enum GlobalIssue {
     EdgeRejected,
     /// Not every pair was tried (the cap `max_pairs` was reached): a scan left unplaced may fit one that was not tried.
     PairsCapped,
-    /// The relaxation stopped on its iteration limit.
+    /// The relaxation stopped on its iteration limit, or could not take a first step.
     NotConverged,
+    /// Some placed scans hang on a single pair that no loop confirms (`held_by_loop` false in `scans`): the pair was `unique`, but a wrong pose of that kind (see `edges` for its confidence, overlap, stability and probes) cannot be told from a right one by the other scans. Check them by eye.
+    WeaklyHeld,
+    /// More pairs contradicted the others than agreed with them (over 1.5 rejected per used edge): most of the pair stage was wrong, and so may be the part that survived.
+    ManyEdgesRejected,
+    /// The vote that left pairs out was a tie: the best consistent set of pairs and the best different one agree with the same number of edges (see `consensus_margin`); which pairs are wrong is a coin toss.
+    ConsensusUnclear,
 }
 
 /// Why a pair did or did not become an edge of the pose graph.
@@ -89,6 +95,8 @@ pub struct ScanPose {
     pub chained: Transform,
     /// Pair poses that tie the scan to the graph (used edges).
     pub edges_used: usize,
+    /// Is the scan held by a closed loop: every pair on its path to the fixed scan lies on a cycle of used pairs? False for a scan that hangs on a single pair (two scans, a chain, a leaf): that pair is unconfirmed. The fixed scan counts as held; an unplaced scan is not.
+    pub held_by_loop: bool,
 }
 
 /// One pair of scans.
@@ -124,6 +132,21 @@ pub struct EdgeReport {
     /// Disagreement of the pair pose with the relaxed poses; only for used edges.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub misfit_after: Option<Misfit>,
+    /// How firmly the matched part pins the pair pose (see `align.pair_coarse`).
+    pub stability: f64,
+    /// Displaced starts the pair pose was pushed from.
+    pub probed: usize,
+    /// Of those, the starts whose ICP found no pairs.
+    pub probes_failed: usize,
+    /// Of those, the starts that settled in a different, equally good pose.
+    pub slides: usize,
+    /// Smallest clearance of the pair pose over the starts that ended elsewhere (absent when all came back).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe_margin: Option<f64>,
+    /// Largest distance (mm) a displaced start ended from the pair pose.
+    pub probe_return_gap: f64,
+    /// Candidate poses that were refined and compared.
+    pub refined: usize,
     /// Why the pair failed (for `failed`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -176,4 +199,10 @@ pub struct GlobalResult {
     pub pairs_possible: usize,
     /// Relaxation iterations.
     pub iterations: usize,
+    /// Pairs used as edges.
+    pub edges_used: usize,
+    /// Unique pairs left out because they contradicted the others (their misfit at the final poses is in `edges`).
+    pub edges_rejected: usize,
+    /// How decisive the vote that left pairs out was: inliers of the winning set minus those of the best different set (0 a tie, which makes the verdict `partial`); `None` when no pair was left out by the vote.
+    pub consensus_margin: Option<usize>,
 }

@@ -36,6 +36,13 @@ fn report_of(t: &Tried, status: EdgeStatus, note: Option<String>) -> EdgeReport 
         method: None,
         misfit_before: None,
         misfit_after: None,
+        stability: 0.0,
+        probed: 0,
+        probes_failed: 0,
+        slides: 0,
+        probe_margin: None,
+        probe_return_gap: 0.0,
+        refined: 0,
         note,
     };
     let Ok(r) = &t.outcome else { return base };
@@ -48,6 +55,13 @@ fn report_of(t: &Tried, status: EdgeStatus, note: Option<String>) -> EdgeReport 
         tolerance: r.tolerance,
         confidence: r.confidence,
         method: Some(r.method),
+        stability: r.stability,
+        probed: r.probed,
+        probes_failed: r.probes_failed,
+        slides: r.slides,
+        probe_margin: r.probe_margin,
+        probe_return_gap: r.probe_return_gap,
+        refined: r.refined,
         ..base
     }
 }
@@ -104,6 +118,8 @@ pub(super) struct Solved {
     pub poses: Vec<Transform>,
     pub iterations: usize,
     pub converged: bool,
+    /// Margin of the first vote that left pairs out.
+    pub margin: Option<usize>,
 }
 
 /// Misfit of the worst edge in tolerances: its position and value.
@@ -126,11 +142,13 @@ fn graph_of(cands: &[Cand]) -> (Vec<usize>, Vec<Edge>) {
 /// Spanning tree, chain and relaxation over the used edges; an edge that disagrees with the final
 /// poses by more than [`REJECT_FACTOR`] tolerances is marked rejected and the graph is solved again.
 pub(super) fn solve_graph(n: usize, root: usize, cands: &mut [Cand], cancel: &Cancel) -> Result<Solved, AlignError> {
+    let mut margin = None;
     loop {
         let (members, edges) = graph_of(cands);
-        let inlier = consensus(n, root, &edges, REJECT_FACTOR);
-        if inlier.iter().any(|x| !*x) {
-            for (&k, _) in members.iter().zip(&inlier).filter(|(_, ok)| !**ok) {
+        let vote = consensus(n, root, &edges, REJECT_FACTOR);
+        if vote.inlier.iter().any(|x| !*x) {
+            margin = margin.or(vote.margin);
+            for (&k, _) in members.iter().zip(&vote.inlier).filter(|(_, ok)| !**ok) {
                 if let Some(c) = cands.get_mut(k) {
                     c.report.status = EdgeStatus::Rejected;
                 }
@@ -159,6 +177,7 @@ pub(super) fn solve_graph(n: usize, root: usize, cands: &mut [Cand], cancel: &Ca
                 poses: relaxed.poses,
                 iterations: relaxed.iterations,
                 converged: relaxed.converged,
+                margin,
             });
         };
         if let Some(c) = members.get(worst).and_then(|&k| cands.get_mut(k)) {
@@ -180,6 +199,15 @@ pub(super) fn solve(
     let loops: LoopReport = loops::report(&solved.tree, &solved.edges, &solved.chained, &solved.poses);
     for (e, &k) in solved.edges.iter().zip(&solved.members) {
         if let Some(c) = cands.get_mut(k) {
+            c.report.misfit_before = Some(misfit(e, &solved.chained));
+            c.report.misfit_after = Some(misfit(e, &solved.poses));
+        }
+    }
+    // a pair that was left out still gets its misfit at the final poses, where both ends are placed:
+    // the size of the contradiction must be visible
+    for c in cands.iter_mut().filter(|c| c.report.status == EdgeStatus::Rejected) {
+        let Some(e) = &c.edge else { continue };
+        if solved.tree.reaches(e.i) && solved.tree.reaches(e.j) {
             c.report.misfit_before = Some(misfit(e, &solved.chained));
             c.report.misfit_after = Some(misfit(e, &solved.poses));
         }

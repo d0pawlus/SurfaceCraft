@@ -289,8 +289,10 @@ pub fn relax(
         }
         iterations += 1;
         let Some((next, after, before, step)) = improve(edges, &poses, &slot, size, reach) else {
-            converged = true;
-            continue;
+            // no damping lowered the cost: after a first step that is the minimum, but on the
+            // first iteration the poses are still those it was given
+            converged = iterations > 1;
+            break;
         };
         poses = next;
         converged =
