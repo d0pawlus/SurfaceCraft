@@ -180,13 +180,13 @@ fn face_verdict(
             return Ok(Err(format!("the new face tessellates to {ratio:.3} of its patches' area at the {at}")));
         }
         if c.is_none()
-            && let Err(e) = check::check_face(&topo.mesh, &topo.edges, p.forward, &p.cloud, (body, &p.gauge), p.limit)
+            && let Err(e) = check::check_face(&topo.mesh, p.forward, &p.cloud, (body, &p.gauge), p.limit)
         {
             return Ok(Err(e.to_string()));
         }
         // the border is compared with the group's on the finest tessellation, whose chord is the stated slack
         if c == Some(judge_chord)
-            && let Err(e) = check::check_border(&p.cloud, &topo.edges, p.limit, judge_chord)
+            && let Err(e) = check::check_border(&p.cloud, &topo.mesh, p.limit, judge_chord)
         {
             return Ok(Err(e.to_string()));
         }

@@ -2,7 +2,8 @@
 //! (P9-O6b), by editing the topology of the record: nothing is cut, no sharp edge is needed.
 //!
 //! The border of a group is first put on its primitive (`snap`: the vertices, the border edges re-fitted,
-//! the neighbouring patches following). Then the faces of the group go; their interior edges and vertices
+//! the neighbouring patches following; per group and bounded, a group it cannot snap is merged as it is or
+//! refused, and the snap of a group that is refused after it is taken back: `rounds`). Then the faces of the group go; their interior edges and vertices
 //! go with them; the group's boundary loops (the edges it shares with the patches around it, or the open
 //! border of a sheet) become the loops of one new face on the primitive's surface, so the boundary edges
 //! stay shared with the neighbours. A plane or cylinder face is built by the kernel (`trim`: its trims, NURBS
@@ -497,5 +498,25 @@ mod tests {
         let (ok, refused) =
             (r.groups.iter().filter(|g| g.is_ok()).count(), r.groups.iter().filter(|g| g.is_err()).count());
         assert_eq!((ok, refused), (MAX_GROUPS, many.len() - MAX_GROUPS));
+    }
+
+    /// The prepared face of the block of patches `faces` of a flat sheet, and the settled outcome of it with its
+    /// loop as it is and with a wrong one (an edge of the outer loop dropped: a trim that leaves a corner out).
+    #[test]
+    fn a_face_whose_trim_is_wrong_is_refused_and_the_right_one_is_taken() {
+        let body = flat_sheet(4);
+        let faces = [0, 1, 4, 5];
+        let shape = plane();
+        let spec = GroupSpec { faces: &faces, shape: &shape };
+        let group = geometry::group_of(&body, &faces).unwrap();
+        let run = Run { cancel: &|| false, all_at_once: true, chord: 0.1 };
+        let right = prepare(&body, &spec, &group, (0.05, 0.05)).unwrap();
+        assert!(settle::settle(&body, None, &[&right], &run).is_ok(), "the right face is taken");
+        let mut wrong = prepare(&body, &spec, &group, (0.05, 0.05)).unwrap();
+        if let Some(Loop::Edges { edges }) = wrong.face.loops.first_mut() {
+            edges.remove(1);
+        }
+        let settled = settle::settle(&body, None, &[&wrong], &run);
+        assert!(settled.as_ref().map_or(true, |s| s.2.iter().all(|v| v.is_err())), "the wrong trim is refused");
     }
 }

@@ -215,9 +215,12 @@ fn the_hybrid_method_puts_the_plane_cylinder_and_sphere_of_a_smooth_part_on_anal
         a["merged"].as_array().unwrap().iter().filter(|m| m["kind"] == kind).map(|m| m["area"].as_f64().unwrap()).sum()
     };
     // true areas of the part: the cap 2 pi R^2 (1 - cos 36.87 deg) = 181 mm2, the wall 2 pi 8 x 12 = 603 mm2.
-    // Measured on the part (platform and seed move them by a few percent): the cap 183 mm2 in one face, the wall
-    // 401 mm2 in six, the share 0.53. The bounds below are at least 1.5 times from those on the low side, and
-    // the true area (and 5 %) on the high one, so a face that covers 5 % of its wall does not pass.
+    // A merged face may reach past its part's face over a tangent round, where the surface stays within the
+    // tolerance of the primitive: by the root of twice the round's radius times the tolerance, 0.89 mm, along the
+    // face's border (the cap's circle of radius 7.2, 45 mm long; the wall's two circles of 50 mm). So the faces
+    // cannot be larger than the true area plus that strip: the cap 181 + 40 = 221, the wall 603 + 90 = 693 mm2.
+    // Measured on the part (platform and seed move them by a few percent): the cap 180 mm2 in one face, the wall
+    // 398 in its faces. The lower bounds are at least 1.5 times from those.
     let wall_own: f64 = a["merged"]
         .as_array()
         .unwrap()
@@ -231,8 +234,9 @@ fn the_hybrid_method_puts_the_plane_cylinder_and_sphere_of_a_smooth_part_on_anal
         .map(|m| m["area"].as_f64().unwrap())
         .sum();
     let (cap, wall) = (area_of("sphere"), wall_own);
-    assert!((120.0..=190.0).contains(&cap), "the cap's analytic area {cap} mm2 (181 in all)");
-    assert!((260.0..=633.0).contains(&wall), "the wall's analytic area {wall} mm2 (603 in all)");
+    eprintln!("smooth part: cap {cap:.1} mm2, wall {wall:.1} mm2");
+    assert!((120.0..=225.0).contains(&cap), "the cap's analytic area {cap} mm2 (181 in all)");
+    assert!((200.0..=700.0).contains(&wall), "the wall's analytic area {wall} mm2 (603 in all)");
     let share = a["area_share"].as_f64().unwrap();
     assert!((0.33..0.95).contains(&share), "analytic area share {share}");
     for m in a["merged"].as_array().unwrap() {
@@ -255,28 +259,6 @@ fn the_hybrid_method_puts_the_plane_cylinder_and_sphere_of_a_smooth_part_on_anal
     assert!(f["analytic"].is_null());
     let (fp, fc, fs, fo, _) = kinds(&body_of(&s, &f));
     assert_eq!((fp, fc, fs, fo), (0, 0, 0, 0), "a patch network has no analytic face");
-}
-
-/// How many analytic faces are exactly the part's plane, cylinder or sphere (an open scan can also give
-/// faces on primitives fitted to a round or a rim, which are within the tolerance of their patches only).
-fn faces_on_the_part(b: &Brep) -> usize {
-    b.faces
-        .iter()
-        .filter(|f| match &f.surface {
-            Surface::Plane { origin, u_axis, v_axis } => {
-                unit(cross(*u_axis, *v_axis))[2].abs() > 0.999 && origin[2].abs() < GEOMETRY_TOLERANCE
-            }
-            Surface::Cylinder { frame, radius } => {
-                (radius - RADIUS).abs() < GEOMETRY_TOLERANCE
-                    && frame.origin[0].hypot(frame.origin[1]) < GEOMETRY_TOLERANCE
-            }
-            Surface::Sphere { frame, radius } => {
-                (radius - CAP_RADIUS).abs() < GEOMETRY_TOLERANCE
-                    && (frame.origin[2] - CAP_CENTRE).abs() < GEOMETRY_TOLERANCE
-            }
-            _ => false,
-        })
-        .count()
 }
 
 /// Gate 2: the same part as an open scan (a wedge cut away) gives a sheet with analytic faces, not a failure.
@@ -304,17 +286,35 @@ fn an_open_scan_gives_a_sheet_with_analytic_faces() {
         r["verdict"], r["analytic"]
     );
     assert!(planes + cylinders + spheres >= 2, "{r}");
-    // measured: six faces are the part's own (the plane of the base and five cylinders of the wall) and the wall's
-    // cylinders cover 171 mm2 of its 603; the bounds are 1.5 times from those
-    assert!(faces_on_the_part(&brep) >= 4, "too few analytic faces are the part's own: {r}");
-    let wall: f64 = r["analytic"]["merged"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|m| m["kind"] == "cylinder")
-        .map(|m| m["area"].as_f64().unwrap())
-        .sum();
-    assert!((110.0..=633.0).contains(&wall), "the wall's analytic area {wall} mm2 (603 in all)");
+    // measured: four faces are the part's own: the plane of the base (58 mm2 of its half disc) and three cylinders
+    // of the wall (201 mm2 of 603 in all). The bounds are at least 1.5 times from those, by the geometry of each.
+    let own = |pred: &dyn Fn(&Surface) -> bool| -> usize { brep.faces.iter().filter(|f| pred(&f.surface)).count() };
+    let base = own(&|s| {
+        matches!(s, Surface::Plane { origin, u_axis, v_axis }
+        if unit(cross(*u_axis, *v_axis))[2].abs() > 0.999 && origin[2].abs() < GEOMETRY_TOLERANCE)
+    });
+    let walls = own(&|s| {
+        matches!(s, Surface::Cylinder { frame, radius }
+        if (radius - RADIUS).abs() < GEOMETRY_TOLERANCE && frame.origin[0].hypot(frame.origin[1]) < GEOMETRY_TOLERANCE)
+    });
+    assert!(base >= 1, "the base plane is an analytic face: {r}");
+    assert!(walls >= 2, "the wall has analytic faces of its own cylinder: {walls}: {r}");
+    let area_of = |kind: &str, on: &dyn Fn(&Surface) -> bool| -> f64 {
+        r["analytic"]["merged"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["kind"] == kind && on(&brep.faces[m["face"].as_u64().unwrap() as usize].surface))
+            .map(|m| m["area"].as_f64().unwrap())
+            .sum()
+    };
+    let wall = area_of(
+        "cylinder",
+        &|s| matches!(s, Surface::Cylinder { radius, .. } if (radius - RADIUS).abs() < GEOMETRY_TOLERANCE),
+    );
+    let base_area = area_of("plane", &|_| true);
+    assert!((110.0..=700.0).contains(&wall), "the wall's analytic area {wall} mm2 (603 in all)");
+    assert!(base_area >= 35.0, "the base's analytic area {base_area} mm2 (57 in all: half of the disc of radius 6)");
     let freeform = to_solid_open(&mut s, "freeform");
     assert_eq!(freeform["verdict"], r["verdict"], "the verdict freeform gives for the open scan");
 }

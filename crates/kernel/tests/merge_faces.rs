@@ -607,8 +607,9 @@ fn a_group_that_is_refused_after_its_snap_leaves_its_neighbours_as_they_were() {
 }
 
 /// A patch with a collapsed side (a triangle: two of its corners at one point, with their own vertices) next to
-/// a group: when the shared vertex moves onto the plane, the collapsed side moves with it, its interior control
-/// point included, and the body still builds.
+/// a group: when the shared vertex moves onto the plane, the collapsed side moves with it, all three control points
+/// of it: from the moved corner (on the plane) to the corner that stays (0.03 mm up), the middle point between
+/// them. The vertex numbers decide which way the loop walks the side's edge, so both orders are tried.
 #[test]
 fn a_patch_with_a_collapsed_side_moves_with_its_vertex() {
     use surfacecraft_kernel::record::brep::Surface;
@@ -626,28 +627,39 @@ fn a_patch_with_a_collapsed_side_moves_with_its_vertex() {
             .collect()
     };
     let corner = |i: usize, j: usize| [4.0 * i as f64, 4.0 * j as f64, if (i, j) == (1, 1) { 0.03 } else { 0.0 }];
-    let id = |i: usize, j: usize| (i * 2 + j) as u32;
-    let mut nets = Vec::new();
-    let mut corners = Vec::new();
-    for i in 0..2 {
-        nets.push(net(corner(i, 0), corner(i, 1), corner(i + 1, 0), corner(i + 1, 1)));
-        corners.push([id(i, 0), id(i + 1, 0), id(i + 1, 1), id(i, 1)]);
+    for lower in [false, true] {
+        // the sheet's vertices are 0..6 (or 2..8), the triangle's two extra ones the others
+        let (shift, c, d) = if lower { (2, 0, 1) } else { (0, 6, 7) };
+        let id = |i: usize, j: usize| (i * 2 + j + shift) as u32;
+        let (mut nets, mut corners) = (Vec::new(), Vec::new());
+        for i in 0..2 {
+            nets.push(net(corner(i, 0), corner(i, 1), corner(i + 1, 0), corner(i + 1, 1)));
+            corners.push([id(i, 0), id(i + 1, 0), id(i + 1, 1), id(i, 1)]);
+        }
+        // the triangle (4, 4), (8, 4), (8, 8) over the top edge of patch 1; its fourth corner d is at (4, 4)
+        // too, so its side from d to the sheet's vertex (1, 1) is collapsed
+        let (p0, p1, p2) = (corner(1, 1), corner(2, 1), [8.0, 8.0, 0.0]);
+        nets.push(net(p0, p0, p1, p2));
+        corners.push([id(1, 1), id(2, 1), c, d]);
+        let body = sheet_from_bezier_network(&nets, &corners).unwrap();
+        let flat = plane_through([0.0; 3], [0.0, 0.0, 1.0]);
+        let merged = merge_faces_onto_shape(&body, &[0, 1], &flat, 0.1).expect("merged");
+        let q = merged.face_map[2].expect("the triangle stays");
+        let Surface::Spline { points, .. } = &merged.brep.faces[q].surface else { panic!("a patch") };
+        // the collapsed border is a row or a column of the net (the builder may transpose it): its three control
+        // points are the moved corner, the middle point and the corner that stayed, whichever way it runs
+        let rows = || points.iter().cloned();
+        let cols = || (0..3).map(|j| points.iter().map(|r| r[j]).collect::<Vec<_>>());
+        let heights = |border: Vec<[f64; 3]>| -> Vec<f64> {
+            let mut z: Vec<f64> = border.iter().map(|p| p[2]).collect();
+            z.sort_by(f64::total_cmp);
+            z
+        };
+        let found = rows()
+            .chain(cols())
+            .map(heights)
+            .any(|z| z.iter().zip([0.0, 0.015, 0.03]).all(|(a, b)| (a - b).abs() < 1e-9));
+        assert!(found, "lower {lower}: no border of the triangle has the control points 0, 0.015 and 0.03: {points:?}");
+        assert!(tess::tessellate_all(&merged.brep, None).is_ok());
     }
-    // the triangle (4, 4), (8, 4), (8, 8) over the top edge of patch 1; its fourth corner d (vertex 6 + 1) is at
-    // (4, 4) too, so its side from d to (1, 1) is collapsed
-    let (p0, p1, p2) = (corner(1, 1), corner(2, 1), [8.0, 8.0, 0.0]);
-    nets.push(net(p0, p0, p1, p2));
-    corners.push([id(1, 1), id(2, 1), 6, 7]);
-    let body = sheet_from_bezier_network(&nets, &corners).unwrap();
-    let flat = plane_through([0.0; 3], [0.0, 0.0, 1.0]);
-    let merged = merge_faces_onto_shape(&body, &[0, 1], &flat, 0.1).expect("merged");
-    let q = merged.face_map[2].expect("the triangle stays");
-    let Surface::Spline { points, .. } = &merged.brep.faces[q].surface else { panic!("a patch") };
-    let heights: Vec<f64> = points.iter().flatten().map(|p| p[2]).collect();
-    assert!(
-        heights.iter().any(|z| z.abs() < 1e-9),
-        "the corner at the group's vertex moved onto the plane: {heights:?}"
-    );
-    assert!(points.iter().flatten().all(|p| p[2] <= 0.03 + 1e-9), "{heights:?}");
-    assert!(tess::tessellate_all(&merged.brep, None).is_ok());
 }

@@ -6,7 +6,12 @@ use surfacecraft_doc::ObjectId;
 
 /// A result for the comparison: `body` is `Some(Some(volume))` for a closed solid, `Some(None)`
 /// for a sheet, `None` for no body; `within` of the measured points, `coverage` measured.
-fn result(verdict: Verdict, body: Option<Option<f64>>, within: f64, coverage: f64) -> ToSolidOut {
+pub(in crate::cmd::pipeline) fn result(
+    verdict: Verdict,
+    body: Option<Option<f64>>,
+    within: f64,
+    coverage: f64,
+) -> ToSolidOut {
     ToSolidOut {
         verdict,
         method: Method::Primitives,

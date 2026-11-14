@@ -143,10 +143,19 @@ Hybrid (merge the patches that lie on a primitive; `surface.wrap` and the kernel
   reader that heals at 0.001 to 0.01 mm sees edges that lie on their faces. Above half the tolerance
   (the border could not be moved) the issue `hybrid_edge_gap` is added, and the reader sees a gap of
   that size; it does not change the verdict. The patches that were moved with the border differ from
-  the scan by up to what they moved, which the judge measures.
+  the scan by up to what they moved, which the judge measures. The border of a group is moved or not
+  group by group: no vertex or edge sample moves farther than 1.5 times the gap onto its primitive(s)
+  (two primitives that meet at a shallow angle ask for more), an edge that is not a single Bézier span
+  or a neighbouring patch that would fold, turn over or come off its border stops the move for the
+  groups concerned only. Such a group is merged as it was (its border may then be as far from the
+  primitive as the gap allows, not a tenth of it) and the issue `hybrid_snap_skipped` says why, or it
+  stays patches with the reason in `left_as_patches`. A group that is snapped and then refused is
+  put back: its neighbours are as the wrap had them.
 - The merge is checked directly: each new face's normal agrees with the patches it replaced at
-  sampled points, it lies within the gap of them, holes wind opposite to the outer loop and inside it,
-  and it tessellates to their area. At most 64 groups are merged per call (the largest first; the rest
+  sampled points (corners and middles of its triangles), it lies within the gap of them (a corner on
+  the face's own boundary is left to the border test), the boundary of the face is the border of the
+  group (every point of one within the gap and the chord of the other), holes wind opposite to the outer
+  loop and inside it, and it tessellates to their area. At most 64 groups are merged per call (the largest first; the rest
   are in `left_as_patches`), and a cancelled call stops between groups.
 - A cancelled call stops between the steps; the whole run is one undo step.
 
@@ -286,7 +295,8 @@ kernel refuses sheets of many faces. Give the wall thickness instead:
   only: no region is large enough for a group), `hybrid_failed` (anything else, with the reason). A scan
   with no primitive, or no group that could be merged, is not a failure under `method: hybrid`: it gives
   the wrap with `analytic.faces` 0. Informational issues of a returned body: `hybrid_edge_gap`,
-  `hybrid_merge_rejected`, `hybrid_no_analytic_face`. `thickness` has no meaning with `method: hybrid`.
+  `hybrid_merge_rejected`, `hybrid_no_analytic_face`, `hybrid_snap_skipped`. `thickness` has no meaning
+  with `method: hybrid`.
 - `mostly_freeform` (only with `method: primitives`): less than half of the scan lies in regions
   a primitive fits. Run again with `method: freeform`.
 - `open_surface` (freeform): the network is a sheet because the scan has open boundaries. The

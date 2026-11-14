@@ -282,10 +282,16 @@ fn faces_of(modelled: &[Modelled], merged: &[MergedFace]) -> Vec<FaceOf> {
         .collect()
 }
 
+/// Puts `body` in the document body `id`.
+fn set_body(s: &mut Session, id: ObjectId, body: Brep) -> Step<()> {
+    let slot = s.doc.body_mut(id).ok_or_else(|| halt("hybrid_failed", "the wrapped body is gone"))?;
+    slot.brep = Arc::new(body);
+    Ok(())
+}
+
 /// Puts the merged body in the wrap's document body and refreshes what the result reports of it.
 fn install(s: &mut Session, w: &WrapOut, body: Brep) -> Step<WrapOut> {
-    let slot = s.doc.body_mut(w.body.id).ok_or_else(|| halt("hybrid_failed", "the wrapped body is gone"))?;
-    slot.brep = Arc::new(body);
+    set_body(s, w.body.id, body)?;
     let info = body_out(s, w.body.id).map_err(failed_at("hybrid_failed"))?;
     Ok(WrapOut { body: info, ..w.clone() })
 }
@@ -361,7 +367,7 @@ fn merged_or_wrap(
     set: &Settings,
     report: &ScanSummary,
     wrapped: (&WrapOut, Retry),
-    mut wrap_result: ToSolidOut,
+    wrap_result: ToSolidOut,
     (protected, scan, stages): (&[Protected], &Mesh, &mut Vec<StageTime>),
 ) -> Step<(ToSolidOut, Merging)> {
     let (w, retry) = wrapped;
@@ -393,19 +399,33 @@ fn merged_or_wrap(
     let watch = Stopwatch::start();
     let merged = judge_stage(s, set, report.clone(), &merged_w, retry).map_err(failed_at("hybrid_failed"))?;
     stages.push(stage("judge_merged", &watch));
-    if let Some(why) = rejection(&merged, &wrap_result, set.tolerance) {
-        install(s, w, (*brep).clone())?;
-        let faces = merged_list(&tried.merged);
+    let (out, kept) = keep_or_wrap(s, w.body.id, &brep, (wrap_result, merged), (set.tolerance, &tried.merged))?;
+    Ok((out, if kept { Merging { mesh: Some(mesh), ..tried } } else { none(tried.left) }))
+}
+
+/// The judged merged result when it is not worse than the wrap (with a note of how it deviates), else the wrap's
+/// result with the issue `hybrid_merge_rejected`, and the wrap body `wrap` put back in the document body `id`
+/// (as the wrap had it: the merged one is gone). Says which it kept.
+fn keep_or_wrap(
+    s: &mut Session,
+    id: ObjectId,
+    wrap: &Brep,
+    results: (ToSolidOut, ToSolidOut),
+    (tolerance, faces): (f64, &[MergedFace]),
+) -> Step<(ToSolidOut, bool)> {
+    let (mut wrap_result, mut merged) = results;
+    if let Some(why) = rejection(&merged, &wrap_result, tolerance) {
+        set_body(s, id, wrap.clone())?;
+        let list = merged_list(faces);
         wrap_result
             .issues
-            .push(issue("hybrid_merge_rejected", format!("the merge was not kept: {why} (merged: {faces})")));
-        return Ok((wrap_result, none(tried.left)));
+            .push(issue("hybrid_merge_rejected", format!("the merge was not kept: {why} (merged: {list})")));
+        return Ok((wrap_result, false));
     }
-    let mut merged = merged;
     if let Some(how) = deviations(&merged, &wrap_result) {
         merged.issues.push(issue("hybrid_merge_deviation", format!("the merge was kept: {how}")));
     }
-    Ok((merged, Merging { mesh: Some(mesh), ..tried }))
+    Ok((merged, true))
 }
 
 /// The merged faces in a line: kind, patches and gap of each.
@@ -544,5 +564,58 @@ pub(super) fn hybrid_solid(
             s.doc = before;
             Ok(failure(set, report, code, &message))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::auto::tests::result;
+    use super::*;
+    use surfacecraft_kernel::nurbs::sheet_from_bezier_network;
+
+    fn sheet(z: f64) -> Brep {
+        let net = vec![vec![[0.0, 0.0, z], [0.0, 1.0, z]], vec![[1.0, 0.0, z], [1.0, 1.0, z]]];
+        sheet_from_bezier_network(&[net], &[[0, 1, 2, 3]]).unwrap()
+    }
+
+    const SOLID: Option<Option<f64>> = Some(Some(1000.0));
+
+    /// A merge that is worse than the wrap (the largest deviation 0.5 mm against 0.1, the band being a quarter of
+    /// the tolerance) is not kept: the result is the wrap's, to the last digit, with the issue; the document body is
+    /// the wrap's record again, not the merged one. The same merge with the wrap's own figures is kept.
+    #[test]
+    fn a_merge_that_is_worse_than_the_wrap_is_rejected_and_the_wrap_returned_unchanged() {
+        let mut s = Session::new();
+        let (wrap_brep, merged_brep) = (sheet(0.0), sheet(0.5));
+        let id = s.doc.add_body("wrap", merged_brep.clone());
+        let figures = |max_abs: f64| {
+            let mut r = result(Verdict::Pass, SOLID, 1.0, 1.0);
+            if let Some(d) = r.deviation.as_mut() {
+                (d.max_abs, d.rms) = (max_abs, 0.02);
+            }
+            r
+        };
+        let (wrap_result, worse) = (figures(0.1), figures(0.5));
+        let before = serde_json::to_value(&wrap_result).unwrap();
+        let faces = [];
+        let (out, kept) = keep_or_wrap(&mut s, id, &wrap_brep, (wrap_result.clone(), worse), (0.2, &faces))
+            .unwrap_or_else(|_| panic!("the decision failed"));
+        assert!(!kept);
+        assert_eq!(*s.doc.body(id).unwrap().brep, wrap_brep, "the document holds the wrap's record");
+        let mut after = serde_json::to_value(&out).unwrap();
+        let issues = after["issues"].as_array_mut().unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0]["code"], "hybrid_merge_rejected");
+        after.as_object_mut().unwrap().remove("issues");
+        let mut expected = before;
+        expected.as_object_mut().unwrap().remove("issues");
+        assert_eq!(after, expected, "counts, volume and deviation are the wrap's, bit for bit");
+        // not worse: kept, with the note, and the document body untouched
+        let id2 = s.doc.add_body("merged", merged_brep.clone());
+        let (out, kept) = keep_or_wrap(&mut s, id2, &wrap_brep, (wrap_result, figures(0.1)), (0.2, &faces))
+            .unwrap_or_else(|_| panic!("the decision failed"));
+        assert!(kept);
+        assert_eq!(*s.doc.body(id2).unwrap().brep, merged_brep);
+        assert!(out.issues.iter().any(|i| i.code == "hybrid_merge_deviation"));
     }
 }

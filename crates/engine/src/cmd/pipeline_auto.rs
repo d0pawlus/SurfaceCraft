@@ -546,4 +546,4 @@ fn attempt(
 
 #[cfg(test)]
 #[path = "pipeline_auto_tests.rs"]
-mod tests;
+pub(in crate::cmd::pipeline) mod tests;

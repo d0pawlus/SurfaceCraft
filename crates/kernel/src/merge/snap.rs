@@ -31,9 +31,9 @@
 //! (re-fitting the edge's curve and both neighbouring patches consistently); solidcore has no such entry.
 use super::boundary::edge_points;
 use super::geometry::Group;
-use super::patch_outward;
 use super::place::Gauge;
-use crate::hybrid::{V, add, dot, norm, scale, sub};
+use crate::hybrid::{V, add, cross, dot, norm, scale, sub, unit};
+use crate::nurbs::{SurfaceProbe, domain};
 use crate::record::brep::{Brep, Curve, Loop, Surface};
 use crate::{Result, finite_all};
 use solidcore::math::Vec3;
@@ -50,8 +50,15 @@ const MAX_ALTERNATIONS: usize = 200;
 const ON_SURFACE: f64 = 1e-6;
 /// Control points equal within this (mm) are the same point when a patch's border is matched to its edge.
 const SAME_POINT: f64 = 1e-7;
-/// The least dot product of the outward directions of a moved patch before and after.
-const MIN_TURN_DOT: f64 = 0.5;
+/// The least dot product of the normals of a moved patch before and after, at the points of the grid where both are
+/// well defined: below it the patch has turned over. (A patch that is only tilted by a border that moved keeps
+/// the sign of its normal everywhere; the measured tilt of the small patches next to a moved group reached 60
+/// degrees at one corner of a patch.)
+const MIN_TURN_DOT: f64 = 0.0;
+/// A patch's normal is read only where its tangents are at least this far from parallel (sine): a sliver or a
+/// collapsed side has a normal that flips for a displacement of hundredths of a millimetre (measured: dot -0.98
+/// after a move of 0.013 mm at a sine of 0.1).
+const MIN_SIN_BETWEEN_TANGENTS: f64 = 0.4;
 /// Cells a side of the grid a moved patch is compared with itself on.
 const MOVED_GRID: usize = 4;
 
@@ -319,23 +326,55 @@ fn border_points(net: &[Vec<V>], border: &[(usize, usize)]) -> Option<Vec<V>> {
     border.iter().map(|&c| at(net, c)).collect()
 }
 
-/// The net of a face with the borders that run along its changed edges replaced. A border that has
-/// collapsed to a point (all its control points equal) runs along any edge that has collapsed to the same
-/// point, so it is moved with that edge, whichever it is: no other border can match a collapsed edge. `None`
-/// when an edge of the face is changed and no border of the net runs along it.
-fn moved_net(net: &[Vec<V>], used: &[&(Vec<V>, Vec<V>)]) -> Option<Vec<Vec<V>>> {
+/// A changed edge as the net of its face has it: the control points before and after, and, from the face's loop
+/// (`side_of`), the border of the net it is the side of and whether the border runs the way the edge does. The loop
+/// settles a collapsed side, whose border (all control points equal) runs along its edge either way round.
+struct Edit<'a> {
+    old: &'a [V],
+    new: &'a [V],
+    side: Option<(usize, bool)>,
+}
+
+/// The border (index into [`borders`]) of the net that side `s` of a four-sided loop is, and whether the border
+/// runs the way the side does: the borders are net[0][..] (the fourth side, backwards), net[n][..] (the second),
+/// net[..][0] (the first) and net[..][n] (the third, backwards). `forward` is whether the loop walks the edge
+/// from its first vertex to its last.
+fn side_of(s: usize, forward: bool) -> Option<(usize, bool)> {
+    Some(match s {
+        0 => (2, forward),
+        1 => (1, forward),
+        2 => (3, !forward),
+        3 => (0, !forward),
+        _ => return None,
+    })
+}
+
+fn is_collapsed(points: &[V]) -> bool {
+    points.first().is_some_and(|f| points.iter().all(|p| same(*p, *f)))
+}
+
+/// The net of a face with the borders that run along its changed edges replaced. A border that has collapsed to a
+/// point (all its control points equal) runs along any collapsed edge at that point either way round, so it is
+/// moved by the side the loop says it is. `None` when an edge of the face is changed and no border of the net runs
+/// along it.
+fn moved_net(net: &[Vec<V>], edits: &[Edit]) -> Option<Vec<Vec<V>>> {
     let mut out = net.to_vec();
     let mut taken: BTreeSet<usize> = BTreeSet::new();
-    for (old, new) in used {
-        let candidates = borders(net);
-        let found = candidates.iter().enumerate().find_map(|(k, border)| {
-            let same_way = border_points(net, border).and_then(|p| runs_along(&p, old))?;
-            (!taken.contains(&k)).then_some((k, same_way))
+    let candidates = borders(net);
+    for e in edits {
+        let by_loop = e.side.filter(|_| is_collapsed(e.old)).filter(|(k, _)| {
+            candidates.get(*k).and_then(|b| border_points(net, b)).is_some_and(|p| runs_along(&p, e.old).is_some())
+        });
+        let found = by_loop.or_else(|| {
+            candidates.iter().enumerate().find_map(|(k, border)| {
+                let same_way = border_points(net, border).and_then(|p| runs_along(&p, e.old))?;
+                (!taken.contains(&k)).then_some((k, same_way))
+            })
         });
         let (k, same_way) = found?;
         taken.insert(k);
-        let order: Vec<&V> = if same_way { new.iter().collect() } else { new.iter().rev().collect() };
-        for (&(i, j), p) in candidates[k].iter().zip(order) {
+        let order: Vec<&V> = if same_way { e.new.iter().collect() } else { e.new.iter().rev().collect() };
+        for (&(i, j), p) in candidates.get(k)?.iter().zip(order) {
             if let Some(slot) = out.get_mut(i).and_then(|r| r.get_mut(j)) {
                 *slot = *p;
             }
@@ -350,6 +389,22 @@ fn edges_of(face: &crate::record::brep::Face) -> BTreeSet<u32> {
         .flat_map(|l| match l {
             Loop::Edges { edges } => edges.iter().map(|u| u.edge).collect::<Vec<_>>(),
             Loop::Vertex { .. } => Vec::new(),
+        })
+        .collect()
+}
+
+/// The changed edges `used` of `face` as edits of its net (with the side of its loop each is, when the face has one
+/// four-sided loop).
+fn edits_of<'a>(face: &crate::record::brep::Face, used: &[u32], moves: &'a Moves) -> Vec<Edit<'a>> {
+    let sides: Vec<(u32, bool)> = match face.loops.as_slice() {
+        [Loop::Edges { edges }] if edges.len() == 4 => edges.iter().map(|u| (u.edge, u.forward)).collect(),
+        _ => Vec::new(),
+    };
+    used.iter()
+        .filter_map(|e| {
+            let (old, new) = moves.edges.get(e)?;
+            let side = sides.iter().position(|(id, _)| id == e).and_then(|s| side_of(s, sides.get(s)?.1));
+            Some(Edit { old, new, side })
         })
         .collect()
 }
@@ -385,7 +440,7 @@ fn applied(body: &Brep, moves: &Moves) -> std::result::Result<(Brep, Vec<Changed
             blame(&mut refused, asked, "a patch at a moved edge is not a spline");
             continue;
         };
-        let edits: Vec<&(Vec<V>, Vec<V>)> = used.iter().filter_map(|e| moves.edges.get(e)).collect();
+        let edits = edits_of(face, &used, moves);
         let Some(net) = moved_net(points, &edits) else {
             blame(&mut refused, asked, "a patch's border does not match its edge");
             continue;
@@ -413,6 +468,27 @@ fn borders_follow_edges(after: &Brep, face: usize, edges: &[u32]) -> bool {
     })
 }
 
+/// The unit normals of patch `face` at the `(n + 1) x (n + 1)` grid of its domain, `None` where the patch is
+/// degenerate (a collapsed side, a fold).
+fn normals_at_grid(body: &Brep, face: usize, n: usize) -> Option<Vec<Option<V>>> {
+    let f = body.faces.get(face)?;
+    let [[u0, u1], [v0, v1]] = domain(&f.surface).ok()?;
+    let probe = SurfaceProbe::new(&f.surface).ok()?;
+    let (du, dv) = (1e-3 * (u1 - u0), 1e-3 * (v1 - v0));
+    let mut out = Vec::with_capacity((n + 1) * (n + 1));
+    for i in 0..=n {
+        for j in 0..=n {
+            let u = (u0 + (u1 - u0) * i as f64 / n as f64).clamp(u0 + du, u1 - du);
+            let v = (v0 + (v1 - v0) * j as f64 / n as f64).clamp(v0 + dv, v1 - dv);
+            let a = sub(probe.eval(u + du, v).ok()?, probe.eval(u - du, v).ok()?);
+            let b = sub(probe.eval(u, v + dv).ok()?, probe.eval(u, v - dv).ok()?);
+            let c = cross(a, b);
+            out.push((norm(c) >= MIN_SIN_BETWEEN_TANGENTS * norm(a) * norm(b)).then(|| unit(c)).flatten());
+        }
+    }
+    Some(out)
+}
+
 /// A patch that moved: no point of it farther than `max_move` from where it was, still facing the way it did,
 /// and its borders along its changed edges.
 fn moved_patch_ok(before: &Brep, after: &Brep, changed: &Changed, max_move: f64) -> bool {
@@ -422,8 +498,11 @@ fn moved_patch_ok(before: &Brep, after: &Brep, changed: &Changed, max_move: f64)
         return false;
     };
     let near = a.len() == b.len() && a.iter().zip(&b).all(|(p, q)| norm(sub(*p, *q)) <= max_move * (1.0 + 1e-9));
-    let facing = match (patch_outward(before, face), patch_outward(after, face)) {
-        (Ok(n0), Ok(n1)) => dot(n0, n1) >= MIN_TURN_DOT,
+    let facing = match (normals_at_grid(before, face, MOVED_GRID), normals_at_grid(after, face, MOVED_GRID)) {
+        (Some(n0), Some(n1)) => {
+            let pairs: Vec<(V, V)> = n0.iter().zip(&n1).filter_map(|(a, b)| Some(((*a)?, (*b)?))).collect();
+            pairs.iter().all(|(a, b)| dot(*a, *b) >= MIN_TURN_DOT)
+        }
         _ => false,
     };
     near && facing && borders_follow_edges(after, face, &changed.edges)
@@ -553,11 +632,15 @@ mod tests {
         let net = vec![vec![p(0.0, 0.0, 0.0), p(0.0, 1.0, 0.0)], vec![p(1.0, 0.0, 0.0), p(1.0, 1.0, 0.0)]];
         let old = vec![p(0.0, 0.0, 0.0), p(0.0, 1.0, 0.0)];
         let new = vec![p(0.0, 0.0, 0.1), p(0.0, 1.0, 0.1)];
-        let moved = moved_net(&net, &[&(old.clone(), new.clone())]).unwrap();
+        fn edit<'a>(old: &'a [V], new: &'a [V]) -> Edit<'a> {
+            Edit { old, new, side: None }
+        }
+        let moved = moved_net(&net, &[edit(&old, &new)]).unwrap();
         assert_eq!((moved[0][0][2], moved[0][1][2], moved[1][0][2]), (0.1, 0.1, 0.0));
         let backwards = vec![p(0.0, 1.0, 0.0), p(0.0, 0.0, 0.0)];
-        assert!(moved_net(&net, &[&(backwards, new.iter().rev().copied().collect())]).is_some());
-        assert!(moved_net(&net, &[&(vec![p(5.0, 5.0, 5.0), p(6.0, 5.0, 5.0)], new)]).is_none());
+        let reversed: Vec<V> = new.iter().rev().copied().collect();
+        assert!(moved_net(&net, &[edit(&backwards, &reversed)]).is_some());
+        assert!(moved_net(&net, &[edit(&[p(5.0, 5.0, 5.0), p(6.0, 5.0, 5.0)], &new)]).is_none());
     }
 
     fn plane_gauge(normal: V, d: f64) -> Gauge {
@@ -619,5 +702,23 @@ mod tests {
             points[1][1] = a;
         }
         assert!(!changed(&turned), "folded over");
+    }
+
+    /// A border collapsed to a point runs along a collapsed edge either way round: the side the loop says it is
+    /// decides which end of the new edge is which.
+    #[test]
+    fn a_collapsed_border_is_moved_by_the_side_of_the_loop_it_is() {
+        let at = p(1.0, 1.0, 0.0);
+        let net = vec![vec![at, at, at], vec![p(2.0, 0.0, 0.0), p(2.0, 1.0, 0.0), p(2.0, 2.0, 0.0)]];
+        let old = vec![at, at, at];
+        let new = vec![p(1.0, 1.0, 0.5), p(1.0, 1.0, 0.25), p(1.0, 1.0, 0.0)];
+        // the border net[0][..] is the fourth side backwards: a loop that walks the edge forward on it runs the
+        // border against the edge
+        let moved = |forward: bool| {
+            let edit = Edit { old: &old, new: &new, side: side_of(3, forward) };
+            moved_net(&net, &[edit]).unwrap()[0].iter().map(|q| q[2]).collect::<Vec<f64>>()
+        };
+        assert_eq!(moved(true), vec![0.0, 0.25, 0.5]);
+        assert_eq!(moved(false), vec![0.5, 0.25, 0.0]);
     }
 }

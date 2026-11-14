@@ -17,7 +17,8 @@ use std::collections::BTreeSet;
 /// 1.414 gaps from their intersection; planes at a shallower angle ask for more and are refused.
 const MOVE_PER_GAP: f64 = 1.5;
 /// The most rounds: each takes back the snap of at least one refused group, so a merge ends in at most this
-/// many, and a body whose refusals do not settle is returned as it was.
+/// many. The last one snaps nothing (the groups are merged as they are, under the rules that apply to a boundary
+/// that was not moved), which ends it whatever the earlier rounds refused.
 const MAX_ROUNDS: usize = 4;
 
 type Reasons = Vec<Option<String>>;
@@ -79,10 +80,16 @@ fn round(
     specs: &[GroupSpec],
     before: &[std::result::Result<Group, String>],
     max_gap: f64,
-    refused: &Reasons,
+    refused: Option<&Reasons>,
     run: &Run,
 ) -> Result<Round> {
-    let snap = snap_round(original, specs, before, max_gap, refused);
+    let snap = match refused {
+        // the last round: nothing is snapped and nothing is excluded
+        None => Snap { body: original.clone(), moved: vec![false; specs.len()], why_not: vec![None; specs.len()] },
+        Some(refused) => snap_round(original, specs, before, max_gap, refused),
+    };
+    let none_refused: Reasons = vec![None; specs.len()];
+    let refused = refused.unwrap_or(&none_refused);
     let any_moved = snap.moved.iter().any(|m| *m);
     let after = if any_moved { groups_in(&snap.body, specs) } else { Vec::new() };
     let groups = if any_moved { &after[..] } else { before };
@@ -142,8 +149,9 @@ fn round(
 pub(super) fn merge_rounds(original: &Brep, specs: &[GroupSpec], max_gap: f64, run: &Run) -> Result<Batch> {
     let before = groups_in(original, specs);
     let mut refused: Reasons = vec![None; specs.len()];
-    for _ in 0..MAX_ROUNDS {
-        let Round { batch, undo } = round(original, specs, &before, max_gap, &refused, run)?;
+    for r in 0..MAX_ROUNDS {
+        let last = r + 1 == MAX_ROUNDS;
+        let Round { batch, undo } = round(original, specs, &before, max_gap, (!last).then_some(&refused), run)?;
         if undo.is_empty() {
             return Ok(batch);
         }
@@ -153,6 +161,6 @@ pub(super) fn merge_rounds(original: &Brep, specs: &[GroupSpec], max_gap: f64, r
             }
         }
     }
-    let why = "the snap of a refused group could not be taken back consistently";
-    Ok(unchanged(original, refused.into_iter().map(|r| r.unwrap_or_else(|| why.to_string())).collect()))
+    // the last round has nothing to undo, so the loop ends in it
+    Err(KernelError::Argument("the rounds of a merge did not end".into()))
 }
