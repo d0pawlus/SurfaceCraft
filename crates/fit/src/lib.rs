@@ -20,6 +20,7 @@ pub mod lm;
 pub mod mls;
 pub mod orient;
 pub mod outline;
+pub mod param;
 pub mod patch;
 pub mod patch_g1;
 mod patch_jumps;

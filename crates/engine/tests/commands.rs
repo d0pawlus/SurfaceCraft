@@ -124,6 +124,97 @@ fn hostile_params_never_panic() {
     }
 }
 
+/// `surface.patch` on parameters that are well formed JSON but hostile as geometry: empty, degenerate,
+/// huge or out of range, with valid sides and with broken ones. An error or a patch, never a panic.
+#[test]
+fn surface_patch_hostile_params_never_panic() {
+    let tri = |s: f64| {
+        json!([
+            {"points": [[0.0, 0.0, 0.0], [s, 0.0, 0.0]]},
+            {"points": [[s, 0.0, 0.0], [0.0, s, 0.0]]},
+            {"points": [[0.0, s, 0.0], [0.0, 0.0, 0.0]]},
+        ])
+    };
+    let with = |extra: Value| {
+        let mut p = json!({"sides": tri(10.0)});
+        for (k, v) in extra.as_object().unwrap() {
+            p[k] = v.clone();
+        }
+        p
+    };
+    let hostile = vec![
+        json!({}),
+        json!({"sides": []}),
+        json!({"sides": [{}]}),
+        json!({"sides": [{"points": []}]}),
+        json!({"sides": [{"points": [[0, 0, 0]]}]}),
+        json!({"sides": [{"points": [[0, 0, 0], [0, 0, 0]]}]}),
+        json!({"sides": [{"points": [[1e308, 0, 0], [-1e308, 0, 0]]}]}),
+        json!({"sides": [{"points": [[0, 0, 0], [1, 0, 0]], "body": 1, "edge": 0}]}),
+        json!({"sides": [{"body": 1}]}),
+        json!({"sides": [{"body": 1, "edge": 0}]}),
+        json!({"sides": [{"body": 2, "edge": 18446744073709551615u64}]}),
+        json!({"sides": [{"body": 2, "edge": 0, "continuity": "g2"}]}),
+        json!({"sides": [{"body": 2, "edge": 0, "continuity": "g1", "face": {"body": 2, "face": 99}}]}),
+        json!({"sides": [{"points": [[0, 0, 0], [1, 0, 0]], "continuity": "g3"}]}),
+        json!({"sides": [{"points": [[0, 0, 0], [1, 0, 0]], "soft": "yes"}]}),
+        json!({"sides": [{"points": [[0, 0, 0], [1, 0, 0]], "soft": 1}]}),
+        json!({"sides": [{"points": [[0, 0, 0], [1, 0, 0]], "soft": true}]}),
+        json!({"sides": [{"points": [[0, 0, 0], [1, 0, 0]], "side_tolerance": 0.001}]}),
+        json!({"sides": [{"body": 2, "edge": 0, "continuity": "g1", "soft": true}]}),
+        json!({"sides": [
+            {"points": [[0, 0, 0], [5, 0, 1e-3], [10, 0, 0]], "soft": true},
+            {"points": [[10, 0, 0], [0, 10, 0]], "soft": true},
+            {"points": [[0, 10, 0], [0, 0, 0]]}]}),
+        json!({"sides": [{"points": [[0, 0, 0], [1, 0, 0], [1, 1, 0]], "face": {"body": "nope", "face": 0}}]}),
+        json!({"sides": (0..70).map(|k| json!({"points": [[k, 0, 0], [k + 1, 0, 0]]})).collect::<Vec<_>>()}),
+        json!({"sides": [{"points": [[0, 0, 0], [1e300, 0, 0]]}, {"points": [[1e300, 0, 0], [0, 1e300, 0]]},
+                         {"points": [[0, 1e300, 0], [0, 0, 0]]}]}),
+        json!({"sides": [{"points": [[0, 0, 0], [1, 0, 0]]}, {"points": [[1, 0, 0], [2, 0, 0]]},
+                         {"points": [[2, 0, 0], [0, 0, 0]]}]}),
+        json!({"sides": [{"points": [[0, 0, 0], [1e-300, 0, 0]]}, {"points": [[1e-300, 0, 0], [0, 1e-300, 0]]},
+                         {"points": [[0, 1e-300, 0], [0, 0, 0]]}]}),
+        with(json!({"tolerance": 0})),
+        with(json!({"tolerance": -1.0})),
+        with(json!({"tolerance": 1e308})),
+        with(json!({"smoothing": 0})),
+        with(json!({"smoothing": 1e308})),
+        with(json!({"control": [3, 9]})),
+        with(json!({"control": [25, 4]})),
+        with(json!({"control": [0, 0]})),
+        with(json!({"control": [100000, 100000]})),
+        with(json!({"max_control": 3})),
+        with(json!({"max_control": 99})),
+        with(json!({"max_control": 18446744073709551615u64})),
+        with(json!({"gap_tolerance": 0})),
+        with(json!({"gap_tolerance": 1e308})),
+        with(json!({"conflicts": "nope"})),
+        with(json!({"points": [{"at": [1e308, 0, 0], "hard": true}]})),
+        with(json!({"points": [{"at": [1, 1, 0], "weight": -1}]})),
+        with(json!({"points": [{"at": [1, 1, 0], "weight": 1e308}]})),
+        with(json!({"points": [{"at": [1000, 1000, 1000], "hard": true}]})),
+        with(json!({"curves": [[[0, 0, 0]]]})),
+        with(json!({"curves": [[[1, 1, 0], [1, 1, 0]]]})),
+        with(json!({"curves": [[[1e308, 0, 0], [-1e308, 0, 0]]]})),
+        with(json!({"region": 1})),
+        with(json!({"region": "nope"})),
+        with(json!({"mesh": 1, "triangles": [4294967295u64]})),
+        with(json!({"mesh": 1, "triangles": []})),
+        with(json!({"mesh": 1, "region": 1})),
+        with(json!({"triangles": [0]})),
+        with(json!({"mesh": "nope"})),
+        with(json!({"name": ""})),
+    ];
+    for v in hostile {
+        let mut s = Session::new();
+        s.allow_files = false;
+        s.execute("mesh.synth", json!({"shape": "box", "resolution": 8})).unwrap();
+        s.execute("body.box", json!({"size": [1.0, 1.0, 1.0]})).unwrap();
+        let r = s.execute("surface.patch", v.clone());
+        assert!(!matches!(r, Err(EngineError::Internal(_))), "surface.patch panicked on {v}");
+    }
+}
+
 /// Coarse voxels, huge tolerances and absurd limits of the remesh are refusals or results, never a panic.
 #[test]
 fn remesh_with_coarse_or_absurd_resolutions_never_panics() {

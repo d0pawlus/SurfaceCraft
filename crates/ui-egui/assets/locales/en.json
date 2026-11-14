@@ -728,6 +728,8 @@
   "cmd.surface.from_curves": "Patches from curves",
   "cmd.surface.from_curves.hint": "Builds surface patches between feature curves.",
   "cmd.surface.info": "Surface info",
+  "cmd.surface.patch": "Constrained patch",
+  "cmd.surface.patch.hint": "Fills a closed outline with one smooth surface that meets the neighbouring faces, points and the scan.",
   "cmd.surface.thicken": "Thicken",
   "cmd.surface.thicken.hint": "Gives a surface a thickness, turning it into a solid.",
   "cmd.surface.trim_to_region": "Trim to region",

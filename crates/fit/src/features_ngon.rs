@@ -14,10 +14,56 @@
 //! side midpoint`. The network stays watertight by construction. The region's scan points are
 //! partitioned by the angle around the centre between neighbouring spokes before the interior
 //! of each patch is fitted.
-use crate::features::{NetN, eval_net, fit_curve, fit_interior, split_bezier};
+//!
+//! With [`NgonMode::Patch`] nothing is split: the four-sided regions stay Bézier patches and every
+//! other region with one outline is handed over as an [`NgonRegion`] (its sides are the same shared
+//! feature curves, sampled densely, plus start parameters from a flattening of the region), for
+//! the caller to cover with one trimmed patch.
+use crate::features::{NetN, bezier_point, eval_net, fit_curve, fit_interior, split_bezier};
 use crate::mls::ScanSurface;
+use crate::param::flatten;
+use std::collections::BTreeSet;
 use std::f64::consts::TAU;
-use surfacecraft_geom::{KdTree, Point3, Vec3, any_perpendicular};
+use surfacecraft_geom::{KdTree, Mesh, Point3, Vec3, any_perpendicular};
+
+/// What `feature_network_with` does with regions that are not four-sided.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NgonMode {
+    /// Every region is split into four-sided patches when any region is not four-sided.
+    #[default]
+    Split,
+    /// Four-sided regions are Bézier patches; the other regions are returned as [`NgonRegion`].
+    Patch,
+}
+
+/// One side of an [`NgonRegion`]: a shared feature curve, evaluated densely.
+#[derive(Clone, Debug)]
+pub struct NgonSide {
+    /// Points along the curve from the side's first corner to the next corner (both ends exact).
+    pub points: Vec<[f64; 3]>,
+    /// Parameters of `points` in the flattening of the region (`None` when there is none).
+    pub uv: Option<Vec<[f64; 2]>>,
+}
+
+/// A region that is not four-sided, to be covered by one patch.
+#[derive(Clone, Debug)]
+pub struct NgonRegion {
+    /// Corner ids (indices into the network's `corner_points`) in loop order.
+    pub corners: Vec<u32>,
+    /// Side `k` runs from corner `k` to corner `k + 1`.
+    pub sides: Vec<NgonSide>,
+    /// The vertices of the region.
+    pub data: Vec<[f64; 3]>,
+    /// Parameters of `data` in the flattening; `Some` exactly when every side has `uv`.
+    pub data_uv: Option<Vec<[f64; 2]>>,
+    /// Triangles of the region (ids into the input mesh).
+    pub triangles: Vec<u32>,
+}
+
+/// Points per side of an [`NgonRegion`].
+const SIDE_SAMPLES: usize = 320;
+/// Relaxation steps of the flattening.
+const ARAP_ITERATIONS: usize = 10;
 
 /// A smooth region bounded by feature curves.
 pub(crate) struct RegionRec {
@@ -33,6 +79,13 @@ pub(crate) struct RegionRec {
     pub mean_normal: Vec3,
     /// Triangles of the region (ids into the input mesh).
     pub triangles: Vec<u32>,
+    /// Vertices (ids into the input mesh) of the boundary run that is corner `k`.
+    pub corner_verts: Vec<Vec<u32>>,
+    /// Boundary vertices (ids into the input mesh) strictly between corner `k` and corner `k + 1`,
+    /// in loop order.
+    pub side_verts: Vec<Vec<u32>>,
+    /// Ids (into the input mesh) of `points`, one each.
+    pub point_ids: Vec<u32>,
 }
 
 impl RegionRec {
@@ -119,6 +172,136 @@ pub(crate) fn quad_patches(recs: &[RegionRec], curves: &[Vec<Vec3>]) -> Patches 
         out.region_triangles.push(rec.triangles.clone());
     }
     out
+}
+
+/// `n + 1` points of the Bézier curve `c` at equal parameter steps, the end points exact.
+fn sample_curve(c: &[Vec3], n: usize) -> Vec<Vec3> {
+    let (Some(first), Some(last)) = (c.first(), c.last()) else { return Vec::new() };
+    if c.len() < 2 || n == 0 {
+        return Vec::new();
+    }
+    (0..=n)
+        .map(|j| match j {
+            0 => *first,
+            _ if j == n => *last,
+            _ => bezier_point(c, j as f64 / n as f64),
+        })
+        .collect()
+}
+
+/// Share of the total chord length reached at each point (`0` at the first, `1` at the last);
+/// `None` when the polyline has no length.
+fn fractions(pts: &[Vec3]) -> Option<Vec<f64>> {
+    let mut acc = vec![0.0];
+    for w in pts.windows(2) {
+        acc.push(acc.last().copied()? + (w[1] - w[0]).norm());
+    }
+    let total = acc.last().copied()?;
+    if !(total.is_finite() && total > 1e-12) {
+        return None;
+    }
+    Some(acc.into_iter().map(|a| a / total).collect())
+}
+
+/// The value at fraction `g` of the polyline `values` whose points sit at the fractions `frac`.
+fn interpolate(frac: &[f64], values: &[[f64; 2]], g: f64) -> Option<[f64; 2]> {
+    let last = frac.len().checked_sub(1).filter(|&l| l >= 1)?;
+    let i = frac.partition_point(|&f| f <= g).clamp(1, last);
+    let (f0, f1) = (*frac.get(i - 1)?, *frac.get(i)?);
+    let (a, b) = (values.get(i - 1)?, values.get(i)?);
+    let t = if f1 - f0 > 1e-12 { ((g - f0) / (f1 - f0)).clamp(0.0, 1.0) } else { 0.0 };
+    Some([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t])
+}
+
+/// Parameters of every side and of the vertices of a region.
+type RegionUv = (Vec<Vec<[f64; 2]>>, Vec<[f64; 2]>);
+
+/// Parameters of the dense sides and of the region's vertices from a flattening of the region, or
+/// `None` when the flattening fails, folds, or the boundary does not match the loop of the
+/// feature network. A corner is a cluster of vertices, not one vertex: its parameters are the mean
+/// of the cluster's boundary vertices, and the samples of a side are assigned to the boundary
+/// vertices between its corners in proportion to arc length.
+fn region_uv(mesh: &Mesh, rec: &RegionRec, dense: &[Vec<Vec3>]) -> Option<RegionUv> {
+    let n = rec.corners.len();
+    if rec.corner_verts.len() != n || rec.side_verts.len() != n || dense.len() != n {
+        return None;
+    }
+    let flat = flatten(mesh, &rec.triangles, ARAP_ITERATIONS).ok()?;
+    if flat.flipped > 0 {
+        return None;
+    }
+    let on_boundary: BTreeSet<u32> = flat.boundary.iter().copied().collect();
+    let uv_of = |id: u32| flat.uv.get(id as usize).copied().flatten();
+    let mut corner_uv: Vec<[f64; 2]> = Vec::with_capacity(n);
+    for run in &rec.corner_verts {
+        if run.is_empty() {
+            return None;
+        }
+        let mut sum = [0.0; 2];
+        for v in run {
+            let q = if on_boundary.contains(v) { uv_of(*v)? } else { return None };
+            sum[0] += q[0];
+            sum[1] += q[1];
+        }
+        corner_uv.push([sum[0] / run.len() as f64, sum[1] / run.len() as f64]);
+    }
+    let mut sides = Vec::with_capacity(n);
+    for (k, d) in dense.iter().enumerate() {
+        let mut xyz = vec![*d.first()?];
+        let mut uv = vec![*corner_uv.get(k)?];
+        for &v in rec.side_verts.get(k)? {
+            if !on_boundary.contains(&v) {
+                return None;
+            }
+            xyz.push(mesh.positions.get(v as usize)?.coords);
+            uv.push(uv_of(v)?);
+        }
+        xyz.push(*d.last()?);
+        uv.push(*corner_uv.get((k + 1) % n)?);
+        let frac_boundary = fractions(&xyz)?;
+        let mut out: Vec<[f64; 2]> =
+            fractions(d)?.iter().map(|&g| interpolate(&frac_boundary, &uv, g)).collect::<Option<_>>()?;
+        // both corners exactly, so that consecutive sides meet
+        *out.first_mut()? = *uv.first()?;
+        *out.last_mut()? = *uv.last()?;
+        sides.push(out);
+    }
+    let data: Vec<[f64; 2]> = rec.point_ids.iter().map(|&v| uv_of(v)).collect::<Option<_>>()?;
+    if data.len() != rec.points.len() {
+        return None;
+    }
+    Some((sides, data))
+}
+
+/// The regions that are not four-sided, with their sides sampled and, when the flattening of the
+/// region is reliable, their parameters (for every side and the data, or for none).
+pub(crate) fn ngon_regions(mesh: &Mesh, recs: &[RegionRec], curves: &[Vec<Vec3>]) -> Vec<NgonRegion> {
+    recs.iter()
+        .filter(|r| r.corners.len() != 4 && r.is_consistent(curves.len()))
+        .map(|rec| {
+            let dense: Vec<Vec<Vec3>> =
+                (0..rec.corners.len()).map(|k| sample_curve(&side_from_start(rec, k, curves), SIDE_SAMPLES)).collect();
+            let (side_uv, data_uv) = match region_uv(mesh, rec, &dense) {
+                Some((s, d)) => (Some(s), Some(d)),
+                None => (None, None),
+            };
+            let sides = dense
+                .iter()
+                .enumerate()
+                .map(|(k, d)| NgonSide {
+                    points: d.iter().map(|p| a3(*p)).collect(),
+                    uv: side_uv.as_ref().and_then(|s| s.get(k)).cloned(),
+                })
+                .collect();
+            NgonRegion {
+                corners: rec.corners.clone(),
+                sides,
+                data: rec.points.iter().map(|p| a3(*p)).collect(),
+                data_uv,
+                triangles: rec.triangles.clone(),
+            }
+        })
+        .collect()
 }
 
 /// The region's points as a surface: a moving-least-squares quadric over about `SUPPORT_SPACINGS`
