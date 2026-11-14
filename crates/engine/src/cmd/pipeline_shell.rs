@@ -145,9 +145,9 @@ pub(super) fn run(s: &mut Session, set: &Settings, i: &ToSolidIn) -> CmdResult<T
     let folds = if i.clean {
         let (edit, removed) = remove_folds(s, &ObjRef::Id(set.scan.0), set.tolerance, scan_triangles)?;
         report.triangles = edit.triangles;
-        FoldRun { out: edit.folds, removed }
+        FoldRun::new(edit.folds, removed)
     } else {
-        FoldRun { out: None, removed: Mesh::default() }
+        FoldRun::new(None, Mesh::default())
     };
     shell_solid(s, set, i, (report, folds))
 }
@@ -212,9 +212,17 @@ fn refusal_code(e: &ThickenError) -> &'static str {
 fn fold_note(e: &ThickenError, folds: Option<&FoldsOut>) -> String {
     let (ThickenError::UnresolvedCrossings { .. }, Some(f)) = (e, folds) else { return String::new() };
     let widest = f.left_largest.first().map_or(0.0, |l| l.extent);
+    let r = &f.refused;
     format!(
-        " (cleaning removed {} folds of the scan ({} triangles); {} folds are still there, the widest {widest:.1} mm across: too large to be removed safely; `mesh.clean` lists them)",
-        f.removed, f.removed_triangles, f.left
+        " (cleaning removed {} folds of the scan ({} triangles); {} folds are still there, the widest {widest:.1} mm across, left because {} are too large, {} at a hub or with a margin that is too large, {} beside a crease or corner, {} would need a patch that strays from the surface, {} could not be filled; `mesh.clean` lists them)",
+        f.removed,
+        f.removed_triangles,
+        f.left,
+        r.too_large,
+        r.hub_or_margin,
+        r.beside_feature,
+        r.fill_refused,
+        r.unfillable
     )
 }
 
@@ -335,7 +343,7 @@ pub(super) fn shell_solid(
         s.doc.remove(thick_id);
     }
     result.map(|mut out| {
-        out.thickened = Some(ThickenedInfo { folds: folds.out, ..info(&shell, i, kept) });
+        out.thickened = Some(ThickenedInfo { folds: folds.report(), ..info(&shell, i, kept) });
         out
     })
 }
@@ -371,7 +379,7 @@ fn wrap_and_judge(
     // the rim stays open on purpose and the shell is closed over it: holes left are not a defect of the solid
     let judged = super::ScanSummary { holes_left: 0, ..report.clone() };
     let mut issues = issues_of(&w, &d, set, &judged, &t, face.vertex_count());
-    issues.extend(folds.out.as_ref().and_then(|f| fold_issue(f, set.tolerance)));
+    issues.extend(folds.out.as_ref().and_then(|f| fold_issue(f, set.tolerance, folds.stats.get())));
     let tried = retry.as_ref().is_some_and(|r| r.reason != freeform::RetryReason::BudgetSpent);
     let next = next_steps(&w, &issues, set, tried, i, &t);
     let verdict = if issues.is_empty() {

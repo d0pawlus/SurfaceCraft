@@ -81,13 +81,13 @@ fn local_corpus_fold_repair_makes_the_shell_resolve() {
         let t = std::time::Instant::now();
         let r = folds::remove_folds(&mut m, 0.2, &surfacecraft_geom::Cancel::new(), scan_triangles);
         eprintln!(
-            "S{number:02} removed {} groups ({} triangles, {:.3} mm2, tallest {:.3} mm), added {}, unfillable {}, left {} in {:.1} s; largest left {:?}",
+            "S{number:02} removed {} groups ({} triangles, {:.3} mm2, tallest {:.3} mm), added {}, refused {:?}, left {} in {:.1} s; largest left {:?}",
             r.removed,
             r.removed_triangles,
             r.removed_area,
             r.largest_removed_height,
             r.added_triangles,
-            r.unfillable,
+            r.refused,
             r.left_total,
             t.elapsed().as_secs_f64(),
             r.left.first().map(|l| (l.triangles, (l.extent * 100.0).round() / 100.0))
@@ -111,12 +111,12 @@ fn local_corpus_fold_census() {
         let t = std::time::Instant::now();
         let r = folds::remove_folds(&mut m, 0.2, &surfacecraft_geom::Cancel::new(), scan_triangles);
         eprintln!(
-            "S{number:02} triangles {before}: folds found {}, removed {} ({} triangles, {:.4} % of the area), unfillable {}, left {}, {:.1} s",
+            "S{number:02} triangles {before}: folds found {}, removed {} ({} triangles, {:.4} % of the area), refused {:?}, left {}, {:.1} s",
             r.found,
             r.removed,
             r.removed_triangles,
             100.0 * r.removed_area / area,
-            r.unfillable,
+            r.refused,
             r.left_total,
             t.elapsed().as_secs_f64()
         );
@@ -227,7 +227,7 @@ fn local_corpus_fold_removal_a_b() {
                 out["issues"].as_array().into_iter().flatten().filter_map(|i| i["code"].as_str()).collect();
             let f = &out["thickened"]["folds"];
             eprintln!(
-                "S{number:02} {label}: verdict {} within {:.4} coverage {:.4} max {:.3} unresolved {} issues {codes:?}; folds removed {} triangles {} share {:.5} height {:.3} fill {:.3} unfillable {} left {}",
+                "S{number:02} {label}: verdict {} within {:.4} coverage {:.4} max {:.3} unresolved {} issues {codes:?}; folds removed {} triangles {} share {:.5} height {:.3} fill {:.3} refused {:?} left {}; removed points {} (not facing {}) within {:.3} max {:.3}",
                 out["verdict"],
                 out["deviation"]["within"].as_f64().unwrap_or(f64::NAN),
                 out["deviation"]["coverage"].as_f64().unwrap_or(f64::NAN),
@@ -238,8 +238,12 @@ fn local_corpus_fold_removal_a_b() {
                 f["removed_area_share"].as_f64().unwrap_or(0.0),
                 f["largest_removed_height"].as_f64().unwrap_or(0.0),
                 f["largest_fill_deviation"].as_f64().unwrap_or(0.0),
-                f["unfillable"],
-                f["left"]
+                f["refused"],
+                f["left"],
+                f["removed_points"],
+                f["removed_points_not_facing"],
+                f["removed_points_within"].as_f64().unwrap_or(0.0),
+                f["removed_points_max_deviation"].as_f64().unwrap_or(0.0)
             );
         }
     }

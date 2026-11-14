@@ -68,10 +68,9 @@ fn a_knot_in_a_panel_is_removed_and_the_hole_is_filled() {
     // Act
     let report = run(&mut m);
     // Assert: gone, no hole, rim and the rest of the surface untouched, the shell is built
-    assert!(report.removed >= 1 && report.unfillable == 0, "{report:?}");
+    assert!(report.removed >= 1 && report.refused == Refused::default(), "{report:?}");
     assert!(report.largest_removed_height > 0.1, "the fold stood out of the surface: {report:?}");
     assert!(report.largest_fill_deviation >= report.largest_removed_height, "it covers the fold too: {report:?}");
-    assert!(report.largest_clean_deviation <= FILL_ACCEPT_SHARE * TOL, "{report:?}");
     assert!(report.removed_area_share > 0.0 && report.removed_area_share < 0.05, "{report:?}");
     assert!(report.removed_mesh.triangle_count() >= report.removed, "the scan as it was is kept: {report:?}");
     assert!(find_folds(&m).iter().all(|f| !f.small), "{:?}", find_folds(&m));
@@ -240,7 +239,7 @@ fn a_sharp_crease_with_an_inverted_sliver_is_put_back_not_rounded_off() {
     let report = run(&mut m);
 
     // Assert: a smooth patch would round the crease off by more than the feature test allows, so nothing is taken out
-    assert_eq!((report.removed, report.unfillable), (0, 1), "{report:?}");
+    assert_eq!((report.removed, report.refused.beside_feature), (0, 1), "{report:?}");
     assert!(same_mesh(&m, &before));
 }
 
@@ -258,7 +257,7 @@ fn a_fold_away_from_a_crease_is_removed_and_the_crease_is_not_touched() {
     // Assert
     assert!(report.removed >= 1, "{report:?}");
     assert!(reach(&m, &crease) <= 1e-9, "the crease moved");
-    assert!(report.largest_clean_deviation <= FILL_ACCEPT_SHARE * TOL, "{report:?}");
+    assert_eq!(report.refused.fill_refused, 0, "{report:?}");
 }
 
 #[test]
@@ -278,7 +277,7 @@ fn a_small_boss_with_one_flipped_triangle_at_its_foot_stays() {
 
     // Assert
     assert!(reach(&m, &[apex]) <= 0.5 * TOL, "the boss lost its top: {report:?}");
-    assert!(report.largest_clean_deviation <= FILL_ACCEPT_SHARE * TOL, "{report:?}");
+    assert_eq!(report.refused.fill_refused, 0, "{report:?}");
 }
 
 #[test]
@@ -362,4 +361,97 @@ fn a_fold_in_a_patch_is_removed_but_is_no_point_of_the_scan() {
     assert_eq!((report.largest_removed_height, report.largest_fill_deviation, report.removed_area), (0.0, 0.0, 0.0));
     assert!(report.removed_mesh.triangles.is_empty());
     assert_eq!(unresolved(&m).unwrap(), 0);
+}
+
+#[test]
+fn a_fold_on_a_noisy_smooth_panel_is_removed_although_noise_makes_sharp_pairs() {
+    // Arrange: small triangles (0.5 mm) with noise (0.06 mm): about 5 % of the neighbouring pairs meet at 30
+    // degrees or more, but no crease runs anywhere
+    let mut m = synth::plane(Point3::origin(), Vec3::x(), Vec3::y(), 20.0, 20.0, 40, 40);
+    m.positions.iter_mut().for_each(|p| p.z = (p.x / 6.0).sin() * (p.y / 5.0).cos());
+    synth::add_noise(&mut m, 0.06, &mut Rng::new(5));
+    let v = vertex_at(&m, 10.0, 10.0);
+    m.positions[v] += Vec3::new(1.5, 0.2, 0.3);
+    let n = m.triangle_count();
+    let neighbours = m.triangle_neighbours();
+    let sharp = (0..n)
+        .flat_map(|t| {
+            neighbours[t].iter().filter(move |&&o| o != u32::MAX && o as usize > t).map(move |&o| (t, o as usize))
+        })
+        .filter(|&(a, b)| m.face_normal(a).zip(m.face_normal(b)).is_some_and(|(x, y)| x.dot(&y) < 0.866))
+        .count();
+
+    // Act
+    let report = remove_folds(&mut m, 0.5, &Cancel::new(), n);
+
+    // Assert
+    assert!(sharp > 100, "the noise must make sharp pairs: {sharp}");
+    assert!(report.removed >= 1, "{report:?}");
+    assert_eq!(report.refused.beside_feature, 0, "{report:?}");
+}
+
+#[test]
+fn one_far_vertex_blinds_only_its_own_triangle() {
+    // Arrange: a knot, and a triangle with a vertex at 1e300 whose cell index is out of range
+    let mut m = knotted(15.0, 15.0);
+    let n = m.positions.len() as u32;
+    m.positions.extend([Point3::new(1e300, 0.0, 0.0), Point3::new(1e300, 1.0, 0.0), Point3::new(1e300, 0.0, 1.0)]);
+    m.triangles.push([n, n + 1, n + 2]);
+
+    // Act
+    let report = run(&mut m);
+
+    // Assert
+    assert_eq!(report.skipped_triangles, 1, "{report:?}");
+    assert!(report.removed >= 1, "the knot is still found: {report:?}");
+}
+
+#[test]
+fn hole_filling_appends_its_triangles_and_does_not_reorder_the_scan() {
+    // Arrange: a panel with a hole (the triangles around one vertex taken out)
+    let full = panel();
+    let hub = vertex_at(&full, 15.0, 15.0) as u32;
+    let mut m = full.clone();
+    m.triangles.retain(|t| !t.contains(&hub));
+    let before = m.triangles.clone();
+
+    // Act
+    let filled = edit::fill_holes(&mut m, 20, true);
+    edit::compact(&mut m);
+
+    // Assert: the scan's triangles come first, in their order (the tag `t < scan_triangles` depends on it)
+    assert!(filled.filled == 1 && m.triangles.len() > before.len());
+    let remap: Vec<[Point3; 3]> = before.iter().map(|t| t.map(|v| full.positions[v as usize])).collect();
+    let after: Vec<[Point3; 3]> =
+        m.triangles.iter().take(before.len()).map(|t| t.map(|v| m.positions[v as usize])).collect();
+    assert_eq!(remap, after);
+}
+
+#[test]
+fn a_fill_is_judged_by_the_ring_for_a_tiny_group_allowing_a_third_of_the_fold() {
+    use super::measure::Taken;
+    // a group with no clean surface (one ring): what is left of the ring against a third of the fold's height
+    let strays = |ring: f64, height: f64| Taken { ring_deviation: ring, height, ..Taken::default() }.strays(0.15);
+    assert!(strays(0.30, 0.10));
+    assert!(!strays(0.30, 0.90));
+    // with clean surface around, that alone decides
+    let clean = |dev: f64| Taken { clean_deviation: dev, clean_samples: 5, ring_deviation: 9.0, ..Taken::default() };
+    assert!(clean(0.2).strays(0.15) && !clean(0.1).strays(0.15));
+}
+
+#[test]
+fn the_final_surface_decides_how_far_the_removed_material_stood() {
+    use super::measure::against_final;
+    // Arrange: what is left is the plane z = 0; the removed soup has a triangle at 0.6 mm and a fold vertex at 0.9
+    let left = synth::plane(Point3::origin(), Vec3::x(), Vec3::y(), 10.0, 10.0, 4, 4);
+    let removed = Mesh {
+        positions: vec![Point3::new(5.0, 5.0, 0.6), Point3::new(5.5, 5.0, 0.6), Point3::new(5.0, 5.5, 0.6)],
+        triangles: vec![[0, 1, 2]],
+    };
+
+    // Act
+    let (height, deviation) = against_final(&left, &removed, &[Point3::new(2.0, 2.0, 0.9)]);
+
+    // Assert
+    assert!((height - 0.9).abs() < 1e-9 && (deviation - 0.9).abs() < 1e-9);
 }

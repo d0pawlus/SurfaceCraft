@@ -21,10 +21,15 @@ fn panel() -> Mesh {
 }
 
 fn knotted_panel() -> Mesh {
+    knotted_panel_standing(KNOT.2)
+}
+
+/// The knot, with the pushed vertex `up` mm above the panel.
+fn knotted_panel_standing(up: f64) -> Mesh {
     let mut m = panel();
     let centre = |i: &usize| (m.positions[*i].x - 15.0).hypot(m.positions[*i].y - 15.0);
     let v = (0..m.positions.len()).min_by(|a, b| centre(a).total_cmp(&centre(b))).unwrap();
-    m.positions[v] += Vec3::new(KNOT.0, KNOT.1, KNOT.2);
+    m.positions[v] += Vec3::new(KNOT.0, KNOT.1, up);
     m
 }
 
@@ -169,4 +174,42 @@ fn the_fold_removal_is_part_of_the_one_undo_step_and_undo_restores_the_fold() {
     assert_eq!(s.history.undo_labels().len(), steps, "one step");
     let restored = mesh_of(&s);
     assert!(restored.triangles == triangles && restored.positions == positions, "undo restores the fold");
+}
+
+#[test]
+fn a_fold_deeper_in_the_wall_than_its_middle_is_not_flattered_by_the_back_face() {
+    // Arrange: a fold 0.5 mm into a wall of 0.8 mm: its tip is 0.3 mm from the inner face (the whole body would
+    // measure 0.3 mm) and 0.5 mm from the scan layer
+    let mut s = session_with(knotted_panel_standing(-0.5));
+
+    // Act
+    let out = s.execute("scan.to_solid", json!({"scan": "scan", "thickness": 0.8})).unwrap();
+
+    // Assert: the tip is measured against the scan layer only, so it is not measured (it faces the other face), is
+    // counted as such, and the true depth is reported and raises the issue
+    let folds = &out["thickened"]["folds"];
+    assert!(folds["removed"].as_u64().unwrap() >= 1, "{out}");
+    assert!(folds["removed_points_not_facing"].as_u64().unwrap() >= 1, "{out}");
+    assert!(folds["largest_removed_height"].as_f64().unwrap() > 0.4, "{out}");
+    assert!(
+        folds["removed_points_max_deviation"].as_f64().unwrap() < 0.1,
+        "nothing flatters the removed margin: {out}"
+    );
+    assert_eq!(out["verdict"], "review", "{out}");
+    assert!(codes(&out).contains(&"scan_folds_removed".to_string()), "{out}");
+}
+
+#[test]
+fn removed_points_on_the_surface_land_on_the_outer_face_of_a_symmetric_wall() {
+    // Arrange and act
+    let (_, out) = thickened(json!({"symmetric": true}));
+
+    // Assert: the margin of the fold lay on the scan, so with the half-wall shift it lies on the scan layer (the
+    // outer face); without the shift (or against the other face) it would be 0.5 mm off or not face the body
+    let folds = &out["thickened"]["folds"];
+    let (count, vertices) = (folds["removed_points"].as_u64().unwrap(), 16 * 3);
+    assert!(count * 2 >= vertices, "the points face the scan layer: {out}");
+    assert!(folds["removed_points_within"].as_f64().unwrap() > 0.5, "{out}");
+    let (_, one_sided) = thickened(json!({}));
+    assert!(one_sided["thickened"]["folds"]["removed_points_within"].as_f64().unwrap() > 0.5, "{one_sided}");
 }

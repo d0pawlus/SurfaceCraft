@@ -81,14 +81,19 @@ fn cell_of(p: &Point3, inv: f64) -> Option<Cell> {
 /// normals over the summed areas), so that the two faces of a thin plate, or a sharp edge, are not told
 /// apart by chance. The cell is several edges across: a fold is a minority among them, which a ring
 /// or two of triangles would not make it.
-pub(super) fn flipped(mesh: &Mesh, facets: &[(Vec3, f64)], cell: f64, flip_cos: f64, coherence: f64) -> Vec<bool> {
-    let inv = if cell.is_finite() && cell > 0.0 { 1.0 / cell } else { return vec![false; mesh.triangles.len()] };
+pub(super) fn flipped(
+    mesh: &Mesh,
+    facets: &[(Vec3, f64)],
+    cell: f64,
+    (flip_cos, coherence): (f64, f64),
+) -> (Vec<bool>, usize) {
+    let none = (vec![false; mesh.triangles.len()], mesh.triangles.len());
+    let inv = if cell.is_finite() && cell > 0.0 { 1.0 / cell } else { return none };
     let centroids: Vec<Option<Cell>> =
         (0..mesh.triangles.len()).map(|t| mesh.face_centroid(t).and_then(|c| cell_of(&c, inv))).collect();
-    if centroids.iter().any(Option::is_none) {
-        // a coordinate far beyond the cell side: nothing is told apart rather than risk the arithmetic
-        return vec![false; mesh.triangles.len()];
-    }
+    // a triangle whose cell index would leave the safe range is not looked at (and counted): one far vertex
+    // must not blind the detector for the whole scan
+    let skipped = centroids.iter().filter(|c| c.is_none()).count();
     let mut sums: HashMap<Cell, (Vec3, f64)> = HashMap::new();
     for (c, f) in centroids.iter().zip(facets) {
         if let Some(c) = c {
@@ -97,7 +102,7 @@ pub(super) fn flipped(mesh: &Mesh, facets: &[(Vec3, f64)], cell: f64, flip_cos: 
             e.1 += f.1;
         }
     }
-    par::map(mesh.triangles.len(), |t| {
+    let mask = par::map(mesh.triangles.len(), |t| {
         let (Some(&(n, area)), Some(Some(c))) = (facets.get(t), centroids.get(t)) else { return false };
         if area <= 0.0 {
             return false;
@@ -111,7 +116,8 @@ pub(super) fn flipped(mesh: &Mesh, facets: &[(Vec3, f64)], cell: f64, flip_cos: 
         }
         let len = sum.norm();
         total > 0.0 && len >= coherence * total && n.dot(&sum) < -flip_cos * len
-    })
+    });
+    (mask, skipped)
 }
 
 /// A group of flipped triangles that touch each other, and what it measures.
