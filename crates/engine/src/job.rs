@@ -129,7 +129,7 @@ impl Job {
     }
 
     /// Asks the command to stop. The commands whose long loops look at the flag
-    /// (`region.auto_segment`, `region.resegment`, `align.icp`, `align.pair_coarse`, `mesh.smooth`) end within a
+    /// (`region.auto_segment`, `region.resegment`, `align.icp`, `align.pair_coarse`, `align.global`, `mesh.smooth`) end within a
     /// moment with the error [`crate::cmd::CANCELLED`]; any other runs to its end, but writes no
     /// file once cancelled (`cmd::write_file`). The caller's own session is the state from
     /// before the command either way; it keeps the job to know when its thread is free again

@@ -18,6 +18,7 @@ pub mod features;
 mod features_ngon;
 pub mod lm;
 pub mod mls;
+pub mod noise;
 pub mod orient;
 pub mod outline;
 pub mod param;

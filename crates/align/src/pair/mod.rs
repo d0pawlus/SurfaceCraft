@@ -7,8 +7,8 @@
 //!    from FPFH descriptor matches and RANSAC (partial overlap, ambiguous axes).
 //! 2. A shortlist of the best distinct candidates by a truncated distance score on a subsample
 //!    through the BVH of the fixed scan; each is refined by two short ICP passes.
-//! 3. A tolerance from the best candidate's residual; every refined candidate is re-scored under
-//!    it, equal poses merged. The best one is polished by a full ICP.
+//! 3. A tolerance from the best candidate's residual, capped by the noise of the two scans; every
+//!    refined candidate is re-scored under it, equal poses merged. The best one is polished by a full ICP.
 //! 4. Verdict: no match when too little of either scan lies on the other; ambiguous when a
 //!    different pose explains the moving scan about as well; otherwise unique.
 //!
@@ -16,6 +16,7 @@
 //! coarse stage (descriptors and matching: a few hundred milliseconds), at most 20 000 vertices in
 //! the final ICP. It stays usable on scans of a million triangles.
 mod candidates;
+mod evaluate;
 mod fpfh;
 mod probe;
 mod ransac;
@@ -26,9 +27,13 @@ mod verdict;
 use crate::{AlignError, IcpOptions, IcpReport, icp_with_normals};
 use sample::Samples;
 use score::{Fit, Target, clearance, corners, fit_of, median, pose_gap};
+use surfacecraft_fit::noise::estimate_noise;
 use surfacecraft_geom::{Cancel, Mesh, Point3, SurfaceHit, Transform};
 
-pub use verdict::{AMBIGUITY_MARGIN, CONFIDENCE_THRESHOLD, CoarseMethod, MIN_OVERLAP, PairCandidate, PairVerdict};
+pub use evaluate::{PoseFit, pose_fit};
+pub use verdict::{
+    AMBIGUITY_MARGIN, CONFIDENCE_THRESHOLD, CoarseMethod, MAX_MUTUAL_CONFLICT, MIN_OVERLAP, PairCandidate, PairVerdict,
+};
 
 /// A triangle and a fixed sample are on the same face when their normals agree to this cosine (30 degrees).
 const SAME_FACE_COS: f64 = 0.866;
@@ -49,10 +54,15 @@ const MAX_ALTERNATIVES: usize = 7;
 const COARSE_TAU: f64 = 0.06;
 /// Cut distances of the two refinement passes, as fractions of the diagonal.
 const REFINE_CUTS: [f64; 2] = [0.05, 0.015];
-/// Search range for the tolerance (fractions of the diagonal) and its factor over the median
-/// residual.
+/// Range of the tolerance (fractions of the diagonal).
 const TAU_RANGE: (f64, f64) = (0.0015, 0.02);
+/// The pose's own tolerance: this many times the median distance of its matched points.
 const TAU_FACTOR: f64 = 5.0;
+/// The tolerance never exceeds this many times the noise of the pair (the noise estimates of the two
+/// scans combined): a tolerance made of the residual of the pose alone is passed by that pose by
+/// construction (a pose on other regions of a lumpy surface has a residual of 0.6 mm among scans
+/// of noise 0.05 mm, and a tolerance five times that).
+const TAU_SIGMAS: f64 = 4.0;
 /// Poses closer than this fraction of the diagonal (largest displacement of the corners of the
 /// moving scan's box) are one pose.
 const SAME_POSE_BEFORE: f64 = 0.03;
@@ -62,11 +72,15 @@ const SAME_POSE_AFTER: f64 = 0.02;
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PairOptions {
     /// Distance (mm) within which a point of one scan counts as lying on the other; `None` takes
-    /// it from the residual of the best pose (between 0.15 % and 2 % of the diagonal).
+    /// it from the residual of the best pose, at most four times the noise of the two scans (between 0.15 % and 2 % of the diagonal).
     pub tolerance: Option<f64>,
     /// How far the probes displace a pose, as a fraction of the extent of the moving scan (default
     /// 0.2). For tests: a start displaced far beyond reach has no pairs and counts as failed.
     pub probe_step: Option<f64>,
+    /// A pose to start from (moving -> fixed): the descriptor stage is skipped and only this pose
+    /// and the 24 principal-axes poses are tried, so a roughly placed pair costs a fraction of a
+    /// search. `None` (the default) is the full search.
+    pub given: Option<Transform>,
 }
 
 /// What [`pair_coarse`] found.
@@ -82,10 +96,17 @@ pub struct PairResult {
     pub confidence: f64,
     /// Tolerance (mm) used.
     pub tolerance: f64,
+    /// Noise (mm) of the pair: the noise estimates of the two scans combined; the default tolerance
+    /// is at most four times it.
+    pub noise: f64,
     /// Share (0..1) of the moving scan's area on the fixed scan.
     pub overlap_moving: f64,
     /// Share (0..1) of the fixed scan's area on the moving scan.
     pub overlap_fixed: f64,
+    /// Share (0..1) of the moving scan's area that lies where the fixed scan is, but off it.
+    pub conflict_moving: f64,
+    /// Share (0..1) of the fixed scan's area that lies where the moving scan is, but off it.
+    pub conflict_fixed: f64,
     /// RMS distance (mm) of the matched part of the moving scan (0 when nothing matched).
     pub rms: f64,
     /// Stage that proposed the best pose.
@@ -143,6 +164,8 @@ struct Scene<'a> {
     mov_cloud: Mesh,
     diag: f64,
     spacing: f64,
+    /// Noise (mm) of the pair: the estimates of the two scans combined as a root of squares.
+    noise: f64,
 }
 
 fn check_scan(m: &Mesh, what: &str) -> Result<f64, AlignError> {
@@ -180,7 +203,19 @@ impl<'a> Scene<'a> {
         let fix =
             sample::sample(fixed, sample::count_for(af, spacing, SAMPLE_CAP), spacing, 2, cancel).ok_or_else(few)?;
         let mov_cloud = Mesh { positions: mov.pts.clone(), triangles: Vec::new() };
-        Ok(Scene { moving, mov, fix, fixed: Target::new(fixed, diag), mov_cloud, diag, spacing })
+        let noise = estimate_noise(moving).hypot(estimate_noise(fixed));
+        Ok(Scene { moving, mov, fix, fixed: Target::new(fixed, diag), mov_cloud, diag, spacing, noise })
+    }
+
+    /// The given pose and the principal-axes poses (no descriptors).
+    fn given_hypotheses(&self, given: &Transform) -> Vec<Cand> {
+        let mut out = vec![Cand { t: *given, method: CoarseMethod::Given }];
+        out.extend(
+            candidates::principal_candidates(&self.mov.pts, &self.fix.pts)
+                .into_iter()
+                .map(|t| Cand { t, method: CoarseMethod::PrincipalAxes }),
+        );
+        out
     }
 
     fn hypotheses(&self, cancel: &Cancel) -> Result<Vec<Cand>, AlignError> {
@@ -288,22 +323,30 @@ impl<'a> Scene<'a> {
         fit_of(&self.fixed, &self.mov.pts, t, tau, false).msac
     }
 
-    /// The tolerance: the user's, or five times the median residual of the best refined pose.
-    fn tolerance(&self, refined: &[Cand], user: Option<f64>) -> f64 {
+    /// The tolerance of pose `t`: the user's, or the smaller of five times the median residual of
+    /// the pose and `TAU_SIGMAS` times the noise of the pair (the pose may tighten the tolerance but
+    /// never loosen it past what the data allow), within the range.
+    fn tolerance_at(&self, t: &Transform, user: Option<f64>) -> f64 {
         let (lo, hi) = (TAU_RANGE.0 * self.diag, TAU_RANGE.1 * self.diag);
         if let Some(u) = user {
             return u;
         }
-        let tau0 = hi;
-        let Some(best) = refined.iter().min_by(|a, b| self.msac_at(&a.t, tau0).total_cmp(&self.msac_at(&b.t, tau0)))
-        else {
-            return lo;
-        };
         let dist: Vec<f64> = surfacecraft_geom::par::map_slice(&self.mov.pts, |p| {
-            self.fixed.bvh.closest(&best.t.apply(p), tau0).map_or(f64::NAN, |h| h.distance)
+            self.fixed.bvh.closest(&t.apply(p), hi).map_or(f64::NAN, |h| h.distance)
         });
         let inside: Vec<f64> = dist.into_iter().filter(|d| d.is_finite()).collect();
-        (TAU_FACTOR * median(inside)).clamp(lo, hi)
+        let from_pose = TAU_FACTOR * median(inside);
+        from_pose.min(TAU_SIGMAS * self.noise).clamp(lo, hi)
+    }
+
+    /// The tolerance of the best refined candidate (see [`Scene::tolerance_at`]).
+    fn tolerance(&self, refined: &[Cand], user: Option<f64>) -> f64 {
+        let tau0 = TAU_RANGE.1 * self.diag;
+        let best = refined.iter().min_by(|a, b| self.msac_at(&a.t, tau0).total_cmp(&self.msac_at(&b.t, tau0)));
+        match best {
+            Some(b) => self.tolerance_at(&b.t, user),
+            None => user.unwrap_or(TAU_RANGE.0 * self.diag),
+        }
     }
 
     /// Refined candidates scored under `tau`, best first, equal poses merged.
@@ -376,10 +419,11 @@ impl<'a> Scene<'a> {
         }
     }
 
-    /// Per pose, the share of the fixed scan's samples within `tau` of the moving scan placed there.
-    fn overlaps_fixed(&self, poses: &[Transform], tau: f64) -> Vec<f64> {
-        let moving = Target::plain(self.moving);
-        poses.iter().map(|t| fit_of(&moving, &self.fix.pts, &t.inverse(), tau, false).share).collect()
+    /// Per pose, how the fixed scan's samples fit the moving scan placed there (the other side of
+    /// [`fit_of`] on the moving samples): the share within `tau` and the conflicts.
+    fn fits_fixed(&self, poses: &[Transform], tau: f64) -> Vec<Fit> {
+        let moving = Target::new(self.moving, self.moving.bbox().diagonal());
+        poses.iter().map(|t| fit_of(&moving, &self.fix.pts, &t.inverse(), tau, true)).collect()
     }
 }
 
@@ -387,11 +431,11 @@ fn finite_or_zero(x: f64) -> f64 {
     if x.is_finite() { x } else { 0.0 }
 }
 
-fn alternative(r: &Ranked, overlap_fixed: f64) -> PairCandidate {
+fn alternative(r: &Ranked, other: &Fit) -> PairCandidate {
     PairCandidate {
         transform: r.cand.t,
         overlap_moving: r.fit.share,
-        overlap_fixed,
+        overlap_fixed: other.share,
         confidence: 0.0,
         rms: finite_or_zero(r.fit.rms),
         score: r.fit.score(),
@@ -406,7 +450,10 @@ fn alternative(r: &Ranked, overlap_fixed: f64) -> PairCandidate {
 pub fn pair_coarse(moving: &Mesh, fixed: &Mesh, opts: &PairOptions, cancel: &Cancel) -> Result<PairResult, AlignError> {
     let scene = Scene::new(moving, fixed, cancel)?;
     scene.check_tolerance(opts.tolerance)?;
-    let hyps = scene.hypotheses(cancel)?;
+    let hyps = match &opts.given {
+        Some(g) => scene.given_hypotheses(g),
+        None => scene.hypotheses(cancel)?,
+    };
     solve(&scene, hyps, opts, cancel)
 }
 
@@ -438,7 +485,7 @@ fn solve(scene: &Scene, hyps: Vec<Cand>, opts: &PairOptions, cancel: &Cancel) ->
         }
     }
     let poses: Vec<Transform> = std::iter::once(best.cand.t).chain(ranked.iter().map(|r| r.cand.t)).collect();
-    let shares = scene.overlaps_fixed(&poses, tau);
+    let shares = scene.fits_fixed(&poses, tau);
     let checks =
         verdict::ProbeFacts { attempted: probe.attempted, completed: probe.completed, slides: probe.slides.len() };
     let mut result = conclude(&best, &ranked, tau, &shares, refined_count, probe.stability, checks)?;
@@ -451,18 +498,19 @@ fn solve(scene: &Scene, hyps: Vec<Cand>, opts: &PairOptions, cancel: &Cancel) ->
     result.probe_margin = probe.margin;
     result.probe_return_gap = probe.returned_gap;
     result.candidates = candidates;
+    result.noise = scene.noise;
     result.icp_iterations = icp_iterations;
     result.icp_converged = icp_converged;
     Ok(result)
 }
 
-/// The verdict and the result from the best pose and the other distinct ones; `shares[0]` is the
-/// best pose's share of the fixed scan on the moving one, `shares[k]` that of `others[k - 1]`.
+/// The verdict and the result from the best pose and the other distinct ones; `fixed[0]` is how the
+/// fixed scan fits the moving one at the best pose, `fixed[k]` the same at `others[k - 1]`.
 fn conclude(
     best: &Ranked,
     others: &[Ranked],
     tau: f64,
-    shares: &[f64],
+    fixed: &[Fit],
     refined: usize,
     stable: f64,
     probes: verdict::ProbeFacts,
@@ -470,29 +518,43 @@ fn conclude(
     if !best.cand.t.to_rows().iter().flatten().all(|v| v.is_finite()) {
         return Err(AlignError::Degenerate("the pose is not finite".into()));
     }
-    let overlap_fixed = shares.first().copied().unwrap_or(0.0);
+    let fixed_fit = fixed.first().copied().unwrap_or(Fit { share: 0.0, conflict: 0.0, rms: f64::INFINITY, msac: 0.0 });
+    let overlap_fixed = fixed_fit.share;
     let overlap = best.fit.share.max(overlap_fixed);
     let nearest = others
         .iter()
         .map(|r| clearance(&best.fit, &r.fit))
         .fold(None, |m: Option<f64>, c| Some(m.map_or(c, |x| x.min(c))));
-    let (verdict, confidence) = verdict::judge(&best.fit, overlap, tau, nearest, refined, stable, probes);
+    let facts = verdict::Facts {
+        best: &best.fit,
+        overlap,
+        tau,
+        clearance: nearest,
+        refined,
+        stable,
+        mutual_conflict: best.fit.conflict.min(fixed_fit.conflict),
+        probes,
+    };
+    let (verdict, confidence) = verdict::judge(&facts);
     let alternatives: Vec<PairCandidate> = others
         .iter()
-        .zip(shares.iter().skip(1))
+        .zip(fixed.iter().skip(1))
         .filter(|(r, _)| {
             verdict == PairVerdict::Ambiguous && (r.slide || clearance(&best.fit, &r.fit) < AMBIGUITY_MARGIN)
         })
         .take(MAX_ALTERNATIVES)
-        .map(|(r, s)| alternative(r, *s))
+        .map(|(r, s)| alternative(r, s))
         .collect();
     Ok(PairResult {
         transform: best.cand.t,
         verdict,
         confidence,
         tolerance: tau,
+        noise: 0.0,
         overlap_moving: best.fit.share,
         overlap_fixed,
+        conflict_moving: best.fit.conflict,
+        conflict_fixed: fixed_fit.conflict,
         rms: finite_or_zero(best.fit.rms),
         method: best.cand.method,
         alternatives,
@@ -574,6 +636,24 @@ mod tests {
             .map(|c| c.t.max_displacement(&pose.inverse(), &moved.positions))
             .fold(f64::INFINITY, f64::min);
         assert!(near < 3.0, "{near}");
+    }
+
+    /// A pose whose own residual is large (it lies on other regions of the surface) does not loosen
+    /// the tolerance: it never exceeds `TAU_SIGMAS` times the noise of the pair, which is the noise
+    /// of the scans (0.05 mm each), not of the pose.
+    #[test]
+    fn the_tolerance_is_capped_by_the_noise_of_the_pair() {
+        let (fixed, moving) = (bracket(12, 1), bracket(15, 2));
+        let scene = Scene::new(&moving, &fixed, &Cancel::new()).unwrap();
+        let cap = TAU_SIGMAS * scene.noise;
+        eprintln!("noise of the pair {:.4}, cap {cap:.3}, range {:?}", scene.noise, TAU_RANGE);
+        assert!((0.05..0.12).contains(&scene.noise), "two scans of sigma 0.05 give 0.07: {}", scene.noise);
+        let off = Transform::translation(Vec3::new(4.0, 2.0, 0.0));
+        let (right, wrong) = (scene.tolerance_at(&Transform::identity(), None), scene.tolerance_at(&off, None));
+        eprintln!("tolerance at the right pose {right:.3}, at a pose 4.5 mm off {wrong:.3}");
+        assert!(right <= cap && wrong <= cap);
+        assert!(wrong >= TAU_RANGE.0 * scene.diag);
+        assert_eq!(scene.tolerance_at(&off, Some(2.0)), 2.0, "the caller's tolerance is not capped");
     }
 
     /// Finding 6: the count of refined candidates is produced by `solve`; with a single candidate
