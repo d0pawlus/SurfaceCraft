@@ -387,6 +387,7 @@ fn with_analytic(mut r: ToSolidOut, method: Method, share: f64) -> ToSolidOut {
         max_edge_gap: 0.0,
         merged: Vec::new(),
         left_as_patches: Vec::new(),
+        stages_ms: Vec::new(),
     });
     r
 }
@@ -596,4 +597,16 @@ fn a_merged_body_with_a_clearly_larger_deviation_is_not_an_upgrade() {
     assert!(rejection(&deviating(0.55, 0.05, 0.995), &wrap, 0.2).is_some(), "max 0.25 mm over (band 0.2 mm)");
     assert!(rejection(&deviating(0.30, 0.06, 0.995), &wrap, 0.2).is_some(), "RMS 0.01 mm over (band 0.004 mm)");
     assert!(rejection(&deviating(0.30, 0.05, 0.98), &wrap, 0.2).is_some(), "a clearly smaller share within");
+}
+
+/// A body that could not be measured cannot be shown not to be worse: it is no upgrade, whichever of the
+/// two it is.
+#[test]
+fn a_merged_body_or_wrap_with_no_deviation_is_a_rejection() {
+    use super::super::hybrid_method::rejection;
+    let wrap = deviating(0.30, 0.05, 0.995);
+    let mut blind = deviating(0.30, 0.05, 0.995);
+    blind.deviation = None;
+    assert!(rejection(&blind, &wrap, 0.2).is_some(), "the merged body was not measured");
+    assert!(rejection(&wrap, &blind, 0.2).is_some(), "the wrap was not measured");
 }

@@ -16,7 +16,7 @@ use surfacecraft_fit::Primitive;
 use surfacecraft_geom::{Bvh, Mesh, Point3, par};
 use surfacecraft_kernel::hybrid::Shape;
 use surfacecraft_kernel::merge::{
-    Batch, GroupSpec, face_samples, grid_area, merge_faces_onto_shapes, pinch_free_groups,
+    Batch, GroupSpec, MAX_GAP, face_samples, grid_area, merge_faces_onto_shapes, pinch_free_groups, split_round,
 };
 use surfacecraft_kernel::record::brep::Brep;
 
@@ -139,7 +139,13 @@ fn candidate_groups(
     for (k, p) in protected.iter().enumerate() {
         let faces: Vec<usize> =
             (0..body.faces.len()).filter(|&f| owners.get(f).copied().flatten().is_some_and(|o| o.0 == k)).collect();
-        for group in pinch_free_groups(body, &faces) {
+        // a group that goes round its axis is cut into sectors (one face would need a seam)
+        let groups: Vec<Vec<usize>> = pinch_free_groups(body, &faces)
+            .iter()
+            .flat_map(|g| split_round(body, g, &p.shape))
+            .flat_map(|g| pinch_free_groups(body, &g))
+            .collect();
+        for group in groups {
             let area: f64 = group.iter().filter_map(|&f| owners.get(f).copied().flatten().map(|o| o.1)).sum();
             if group.len() < MIN_GROUP {
                 out.left.push(left(p, group.len(), "a single patch"));
@@ -178,7 +184,9 @@ pub(super) fn merge_groups(
     if specs.is_empty() {
         return Ok(out);
     }
-    match merge_faces_onto_shapes(body, &specs, GAP_SHARE_OF_TOLERANCE * tol, &|| s.cancel.is_cancelled()) {
+    // a tolerance above MAX_GAP / GAP_SHARE still merges, with the gap the kernel allows at most
+    let allowed = (GAP_SHARE_OF_TOLERANCE * tol).min(MAX_GAP);
+    match merge_faces_onto_shapes(body, &specs, allowed, &|| s.cancel.is_cancelled()) {
         Ok(batch) => record(&mut out, protected, &candidates, batch),
         Err(e) => {
             if s.cancel.is_cancelled() {

@@ -1,13 +1,12 @@
 //! The analytic surface a merged face lies on: its record form (label and NURBS form), parameter
-//! box and side, the parameters of a point on it, and the distance of a point from it.
+//! box and side, and the kernel's evaluator of the surface (the parameters of a point on it, its
+//! closest point and the distance of a point from it: `SurfaceEval`).
 //!
-//! APP-GEOMETRY: stands in for the kernel's parameter inversion of an analytic surface (the closest-point
-//! parameters `SurfaceEval::project` gives on a spline only; the angle and height of a point on a
-//! cylinder, cone or sphere frame are computed here) and for the point-to-primitive distance of a shape.
 use crate::hybrid::{Shape, V, add, cross, dot, norm, perpendicular, scale, sub, unit};
 use crate::record::brep::{Frame, Surface};
-use crate::{KernelError, Result};
-use solidcore::eval::form;
+use crate::{KernelError, Result, finite_all};
+use solidcore::eval::{SurfaceEval, form};
+use solidcore::math::Vec3;
 use std::f64::consts::{PI, TAU};
 
 /// How far (radians) a face may come to the seam of a periodic surface, or to a pole.
@@ -23,61 +22,47 @@ pub(super) struct Placement {
     pub domain: [[f64; 2]; 2],
     /// The surface's natural normal points against the side the patches face.
     pub flip: bool,
-    map: Map,
+    kind: Kind,
+    /// The kernel's evaluator of the label: the angle and height (or latitude, or plane u and v) of
+    /// the closest point of the surface to a point.
+    eval: SurfaceEval,
     /// The parameters of the NURBS form are the kernel's quarter-grid ones ([`form::param`]).
     on_form: bool,
 }
 
-/// The geometry of the placed surface.
-enum Map {
-    Plane {
-        origin: V,
-        u: V,
-        v: V,
-    },
-    /// Cylinder or cone: `origin`, `x` towards the angle zero, `y`, axis `z`.
-    Around {
-        origin: V,
-        x: V,
-        y: V,
-        z: V,
-    },
-    Sphere {
-        center: V,
-        x: V,
-        y: V,
-        z: V,
-    },
+/// Which kind of surface a placement is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Plane,
+    /// Cylinder or cone.
+    Round,
+    Sphere,
 }
 
-fn angle(q: V, x: V, y: V) -> f64 {
-    let a = dot(q, y).atan2(dot(q, x));
-    if a < 0.0 { a + TAU } else { a }
+/// The kernel's evaluator of a record surface.
+fn evaluator(surface: &Surface) -> Result<SurfaceEval> {
+    let s = solidcore_convert::surface(surface).map_err(|e| invalid(&e.to_string()))?;
+    SurfaceEval::new(&s).map_err(|e| invalid(&format!("{e}")))
+}
+
+/// The closest point of the evaluated surface to `p`, found in closed form for the analytic kinds.
+fn closest_on(eval: &SurfaceEval, p: V) -> Option<V> {
+    let q = Vec3::new(p[0], p[1], p[2]);
+    let uv = eval.project(q, None, f64::INFINITY)?;
+    let c = eval.point(uv)?;
+    Some([c.x, c.y, c.z])
 }
 
 impl Placement {
-    /// The geometric (angle or plane u, height or latitude or plane v) of `p`.
+    /// The geometric (angle or plane u, height or latitude or plane v) of the closest point of the
+    /// surface to `p`; not finite where the kernel cannot tell.
     fn geo(&self, p: V) -> [f64; 2] {
-        match &self.map {
-            Map::Plane { origin, u, v } => {
-                let q = sub(p, *origin);
-                [dot(q, *u), dot(q, *v)]
-            }
-            Map::Around { origin, x, y, z } => {
-                let q = sub(p, *origin);
-                [angle(q, *x, *y), dot(q, *z)]
-            }
-            Map::Sphere { center, x, y, z } => {
-                let q = sub(p, *center);
-                let r = norm(q).max(1e-300);
-                [angle(q, *x, *y), (dot(q, *z) / r).clamp(-1.0, 1.0).asin()]
-            }
-        }
+        self.eval.project(Vec3::new(p[0], p[1], p[2]), None, f64::INFINITY).unwrap_or([f64::NAN; 2])
     }
 
     /// Is it the plane (whose pcurves are the edges' own projections)?
     pub(super) fn is_plane(&self) -> bool {
-        matches!(self.map, Map::Plane { .. })
+        self.kind == Kind::Plane
     }
 
     /// The parameters of `p` in the face's surface (the NURBS form's, or the plane's).
@@ -86,27 +71,76 @@ impl Placement {
     }
 
     fn params_of_geo(&self, g: [f64; 2]) -> [f64; 2] {
-        match (&self.map, self.on_form) {
-            (Map::Sphere { .. }, true) => [form::param(g[0]), form::param(g[1])],
+        match (self.kind, self.on_form) {
+            (Kind::Sphere, true) => [form::param(g[0]), form::param(g[1])],
             (_, true) => [form::param(g[0]), g[1]],
             _ => g,
         }
     }
 }
 
-/// Distance of `p` from the shape's surface (`None` for a shape the merge does not place).
-pub(super) fn distance(shape: &Shape, p: V) -> Option<f64> {
-    match shape {
-        Shape::Plane { point, normal } => Some(dot(sub(p, *point), unit(*normal)?).abs()),
-        Shape::Cylinder { point, axis, radius } => Some((radial(p, *point, unit(*axis)?).1 - radius).abs()),
-        Shape::Cone { apex, axis, half_angle } => {
-            let a = unit(*axis)?;
-            let (t, rho) = (dot(sub(p, *apex), a), radial(p, *apex, a).1);
-            Some((rho * half_angle.cos() - t * half_angle.sin()).abs())
-        }
-        Shape::Sphere { center, radius } => Some((norm(sub(p, *center)) - radius).abs()),
-        Shape::Torus { .. } => None,
+/// The kernel's evaluator of the primitive `shape`: distance of a point from it and its closest point.
+pub(super) struct Gauge {
+    eval: SurfaceEval,
+}
+
+impl Gauge {
+    /// # Errors
+    /// A shape that is not finite or is degenerate (a zero axis or normal, a radius or half angle
+    /// outside its range), and a torus.
+    pub(super) fn new(shape: &Shape) -> Result<Self> {
+        Ok(Self { eval: evaluator(&surface_of(shape)?)? })
     }
+
+    /// The point of the surface closest to `p`.
+    pub(super) fn closest(&self, p: V) -> Option<V> {
+        closest_on(&self.eval, p)
+    }
+
+    /// Distance of `p` from the surface.
+    pub(super) fn distance(&self, p: V) -> Option<f64> {
+        self.closest(p).map(|q| norm(sub(q, p))).filter(|d| d.is_finite())
+    }
+}
+
+/// A record surface of the shape, in a frame of no importance (for evaluation only).
+fn surface_of(shape: &Shape) -> Result<Surface> {
+    let frame = |origin: V, z: V| {
+        let x = perpendicular(z);
+        Frame { origin, x_axis: x, y_axis: cross(z, x) }
+    };
+    let unit_axis = |a: V| unit(a).ok_or_else(|| invalid("degenerate axis"));
+    let positive = |r: f64| if r.is_finite() && r > 0.0 { Ok(r) } else { Err(invalid("the radius must be positive")) };
+    let ok = match shape {
+        Shape::Plane { point, normal } => {
+            let n = unit_axis(*normal)?;
+            let u = perpendicular(n);
+            Surface::Plane { origin: *point, u_axis: u, v_axis: cross(n, u) }
+        }
+        Shape::Cylinder { point, axis, radius } => {
+            Surface::Cylinder { frame: frame(*point, unit_axis(*axis)?), radius: positive(*radius)? }
+        }
+        Shape::Cone { apex, axis, half_angle } => {
+            if !(half_angle.is_finite() && half_angle.abs() > 0.0 && half_angle.abs() < PI / 2.0) {
+                return Err(invalid("the half angle of a cone must be in (0, 90 degrees)"));
+            }
+            Surface::Cone { frame: frame(*apex, unit_axis(*axis)?), radius_at_origin: 0.0, half_angle: *half_angle }
+        }
+        Shape::Sphere { center, radius } => {
+            Surface::Sphere { frame: frame(*center, [0.0, 0.0, 1.0]), radius: positive(*radius)? }
+        }
+        Shape::Torus { .. } => return Err(invalid("a torus cannot be placed yet")),
+    };
+    let points: &[V] = match shape {
+        Shape::Plane { point, .. } | Shape::Cylinder { point, .. } => &[*point],
+        Shape::Cone { apex, .. } => &[*apex],
+        Shape::Sphere { center, .. } => &[*center],
+        Shape::Torus { .. } => &[],
+    };
+    if points.iter().any(|p| !finite_all(p)) {
+        return Err(invalid("the shape is not finite"));
+    }
+    Ok(ok)
 }
 
 /// The unit direction from the axis to `p` (None on the axis) and the distance from the axis.
@@ -170,14 +204,9 @@ fn plane(point: V, normal: V, outward: V) -> Result<Placement> {
     let n = if dot(n, outward) < 0.0 { scale(n, -1.0) } else { n };
     let u = perpendicular(n);
     let v = cross(n, u);
-    Ok(Placement {
-        surface: Surface::Plane { origin: point, u_axis: u, v_axis: v },
-        nurbs: None,
-        domain: [[0.0; 2]; 2],
-        flip: false,
-        map: Map::Plane { origin: point, u, v },
-        on_form: false,
-    })
+    let surface = Surface::Plane { origin: point, u_axis: u, v_axis: v };
+    let eval = evaluator(&surface)?;
+    Ok(Placement { surface, nurbs: None, domain: [[0.0; 2]; 2], flip: false, kind: Kind::Plane, eval, on_form: false })
 }
 
 /// Which surface of revolution about an axis.
@@ -202,26 +231,24 @@ fn around(origin: V, axis: V, c: V, outward: V, round: Round) -> Result<Placemen
             (Surface::Cone { frame, radius_at_origin: t0 * half_angle.tan(), half_angle }, -half_angle.tan())
         }
     };
-    Ok(Placement {
-        surface,
-        nurbs: None,
-        domain: [[0.0; 2]; 2],
-        flip: dot(add(d, scale(axis, lean)), outward) < 0.0,
-        map: Map::Around { origin, x, y, z: axis },
-        on_form: false,
-    })
+    let flip = dot(add(d, scale(axis, lean)), outward) < 0.0;
+    let eval = evaluator(&surface)?;
+    Ok(Placement { surface, nurbs: None, domain: [[0.0; 2]; 2], flip, kind: Kind::Round, eval, on_form: false })
 }
 
 fn sphere(center: V, radius: f64, c: V, outward: V) -> Result<Placement> {
     let d = unit(sub(c, center)).ok_or_else(|| invalid("the face is at the sphere's centre"))?;
     let (x, z) = (scale(d, -1.0), perpendicular(d));
     let y = cross(z, x);
+    let surface = Surface::Sphere { frame: Frame { origin: center, x_axis: x, y_axis: y }, radius };
+    let eval = evaluator(&surface)?;
     Ok(Placement {
-        surface: Surface::Sphere { frame: Frame { origin: center, x_axis: x, y_axis: y }, radius },
+        surface,
         nurbs: None,
         domain: [[0.0; 2]; 2],
         flip: dot(d, outward) < 0.0,
-        map: Map::Sphere { center, x, y, z },
+        kind: Kind::Sphere,
+        eval,
         on_form: false,
     })
 }
@@ -235,7 +262,7 @@ fn check_reach(p: &Placement, geo: [[f64; 2]; 2]) -> Result<()> {
     if !p.is_plane() && (u0 < SEAM_MARGIN || u1 > TAU - SEAM_MARGIN) {
         return Err(invalid("the face wraps round the axis of its surface (it would need a seam)"));
     }
-    if matches!(p.map, Map::Sphere { .. }) && (v0 < -PI / 2.0 + SEAM_MARGIN || v1 > PI / 2.0 - SEAM_MARGIN) {
+    if p.kind == Kind::Sphere && (v0 < -PI / 2.0 + SEAM_MARGIN || v1 > PI / 2.0 - SEAM_MARGIN) {
         return Err(invalid("the face is a sphere cap of 90 degrees or more (it would reach a pole)"));
     }
     Ok(())
@@ -249,7 +276,7 @@ fn finish(p: &mut Placement, geo: [[f64; 2]; 2]) -> Result<()> {
         p.domain = geo;
         return Ok(());
     }
-    let sphere = matches!(p.map, Map::Sphere { .. });
+    let sphere = p.kind == Kind::Sphere;
     let v_range = if sphere { [-PI / 2.0, PI / 2.0] } else { geo[1] };
     let label = solidcore_convert::surface(&p.surface).map_err(|e| invalid(&format!("{e}")))?;
     let (nurbs, _) =

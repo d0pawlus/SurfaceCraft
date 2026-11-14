@@ -11,6 +11,7 @@
 //! wrap it came from. A failure ends the attempt with an issue code and the document as it was.
 use super::freeform::{judge_stage, wrap_mesh_at, wrap_stage};
 use super::merging::{MIN_AREA_IN_TOLERANCES_SQUARED, Merging, Protected, merge_groups};
+use super::rebuild::Stopwatch;
 use super::regions::{candidates, fit_regions};
 use super::{
     LeftOut, MAX_LISTED_LEFT_OUT, Method, Modelled, ScanSummary, Settings, ToSolidIn, ToSolidOut, Verdict, apply_roles,
@@ -69,6 +70,19 @@ pub struct MergedFace {
     pub area: f64,
 }
 
+/// How long one stage of the attempt took.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+pub struct StageTime {
+    /// The stage: `segmentation`, `wrap`, `judge_wrap`, `merge`, `judge_merged`.
+    pub stage: String,
+    /// Wall-clock milliseconds (0 where the clock is not available).
+    pub ms: u64,
+}
+
+fn stage(name: &str, watch: &Stopwatch) -> StageTime {
+    StageTime { stage: name.to_string(), ms: watch.ms() }
+}
+
 /// Patches of a protected region that stay patches.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 pub struct LeftPatches {
@@ -101,6 +115,9 @@ pub struct AnalyticSummary {
     /// Groups of patches of a protected region that were not merged, with the reason.
     #[serde(default)]
     pub left_as_patches: Vec<LeftPatches>,
+    /// Where the time of the attempt went.
+    #[serde(default)]
+    pub stages_ms: Vec<StageTime>,
 }
 
 /// Why an attempt stopped.
@@ -233,6 +250,7 @@ fn analytic_summary(brep: &Brep, tolerance: f64, m: &Merging) -> Option<Analytic
             .map(|g| MergedFace { area: per_face.get(g.face).copied().unwrap_or(0.0), ..g.clone() })
             .collect(),
         left_as_patches: m.left.clone(),
+        stages_ms: Vec::new(),
     })
 }
 
@@ -290,15 +308,25 @@ pub(super) fn rejection(merged: &ToSolidOut, wrap: &ToSolidOut, tol: f64) -> Opt
             show(wrap)
         ));
     }
-    let (m, w) = (merged.deviation.as_ref()?, wrap.deviation.as_ref()?);
+    let (Some(m), Some(w)) = (merged.deviation.as_ref(), wrap.deviation.as_ref()) else {
+        return Some(
+            "a body could not be measured against the scan, so the merge cannot be shown not to be worse".into(),
+        );
+    };
     let worse = |a: f64, b: f64, band: f64| a > b + band * tol;
     if worse(m.max_abs, w.max_abs, MAX_DEVIATION_BAND) || worse(m.rms, w.rms, RMS_DEVIATION_BAND) {
-        return Some(format!(
-            "the merged body deviates more from the scan (max {:.3} against {:.3} mm, RMS {:.3} against {:.3} mm)",
-            m.max_abs, w.max_abs, m.rms, w.rms
-        ));
+        return Some(format!("the merged body deviates more from the scan ({})", deviations(merged, wrap)?));
     }
     None
+}
+
+/// The largest and RMS deviation of the merged body and of the wrap, in a line.
+fn deviations(merged: &ToSolidOut, wrap: &ToSolidOut) -> Option<String> {
+    let (m, w) = (merged.deviation.as_ref()?, wrap.deviation.as_ref()?);
+    Some(format!(
+        "max {:.3} against {:.3} mm, RMS {:.3} against {:.3} mm, merged against wrap",
+        m.max_abs, w.max_abs, m.rms, w.rms
+    ))
 }
 
 /// The merging step on the wrapped body: the merged result when it is not worse than the wrap (by the
@@ -310,8 +338,7 @@ fn merged_or_wrap(
     report: &ScanSummary,
     wrapped: (&WrapOut, Retry),
     mut wrap_result: ToSolidOut,
-    protected: &[Protected],
-    scan: &Mesh,
+    (protected, scan, stages): (&[Protected], &Mesh, &mut Vec<StageTime>),
 ) -> Step<(ToSolidOut, Merging)> {
     let (w, retry) = wrapped;
     let brep =
@@ -320,8 +347,10 @@ fn merged_or_wrap(
     if protected.is_empty() {
         return Ok((wrap_result, none(Vec::new())));
     }
+    let watch = Stopwatch::start();
     let tried = merge_groups(s, scan, &brep, protected, set.tolerance)
         .map_err(|e| if is_cancelled(&e) { Halt::Cancelled(e) } else { halt("hybrid_merge_failed", message_of(&e)) })?;
+    stages.push(stage("merge", &watch));
     if tried.merged.is_empty() {
         let left = tried.left;
         return Ok((wrap_result, none(left)));
@@ -332,13 +361,29 @@ fn merged_or_wrap(
         return Ok((wrap_result, none(tried.left)));
     }
     let merged_w = install(s, w, tried.body.clone())?;
+    let watch = Stopwatch::start();
     let merged = judge_stage(s, set, report.clone(), &merged_w, retry).map_err(failed_at("hybrid_failed"))?;
+    stages.push(stage("judge_merged", &watch));
     if let Some(why) = rejection(&merged, &wrap_result, set.tolerance) {
         install(s, w, (*brep).clone())?;
-        wrap_result.issues.push(issue("hybrid_merge_rejected", format!("the merge was not kept: {why}")));
+        let faces = merged_list(&tried.merged);
+        wrap_result
+            .issues
+            .push(issue("hybrid_merge_rejected", format!("the merge was not kept: {why} (merged: {faces})")));
         return Ok((wrap_result, none(tried.left)));
     }
+    let mut merged = merged;
+    if let Some(how) = deviations(&merged, &wrap_result) {
+        merged.issues.push(issue("hybrid_merge_deviation", format!("the merge was kept: {how}")));
+    }
     Ok((merged, tried))
+}
+
+/// The merged faces in a line: kind, patches and gap of each.
+fn merged_list(merged: &[MergedFace]) -> String {
+    let each: Vec<String> =
+        merged.iter().map(|g| format!("{} of {} patches, gap {:.3} mm", g.kind, g.patches, g.max_edge_gap)).collect();
+    each.join("; ")
 }
 
 /// Fills in what the fits of the call contribute to the result.
@@ -380,13 +425,17 @@ fn without_merge(
         max_edge_gap: 0.0,
         merged: Vec::new(),
         left_as_patches: Vec::new(),
+        stages_ms: Vec::new(),
     };
     Ok(conclude(out, fitted, &[], analytic))
 }
 
 /// The hybrid attempt without the clean-up of a failure.
 fn build(s: &mut Session, i: &ToSolidIn, set: &Settings, report: &ScanSummary) -> Step<ToSolidOut> {
+    let mut stages: Vec<StageTime> = Vec::new();
+    let watch = Stopwatch::start();
     let fitted = fit_primitives(s, i, set, report)?;
+    stages.push(stage("segmentation", &watch));
     check_cancel(s)?;
     let scan = s.doc.mesh(set.scan).map(|m| m.mesh.clone()).ok_or_else(|| halt("hybrid_failed", "the scan is gone"))?;
     let protected = protect(s, &fitted.modelled, &scan);
@@ -395,14 +444,20 @@ fn build(s: &mut Session, i: &ToSolidIn, set: &Settings, report: &ScanSummary) -
         let why = format!("no region a primitive fits (plane, cylinder, cone, sphere) has {least:.1} mm2 or more");
         return without_merge(s, i, set, report, fitted, &why);
     }
+    let watch = Stopwatch::start();
     let (w, retry) = wrap_prepared(s, set, &protected, &scan)?;
+    stages.push(stage("wrap", &watch));
     check_cancel(s)?;
+    let watch = Stopwatch::start();
     let wrap_result = judge_stage(s, set, report.clone(), &w, retry.clone()).map_err(failed_at("hybrid_failed"))?;
-    let (mut out, merging) = merged_or_wrap(s, set, report, (&w, retry), wrap_result, &protected, &scan)?;
+    stages.push(stage("judge_wrap", &watch));
+    let (mut out, merging) =
+        merged_or_wrap(s, set, report, (&w, retry), wrap_result, (&protected, &scan, &mut stages))?;
     let body =
         s.doc.body(w.body.id).map(|b| b.brep.clone()).ok_or_else(|| halt("hybrid_failed", "the body is gone"))?;
-    let analytic = analytic_summary(&body, set.tolerance, &merging)
+    let mut analytic = analytic_summary(&body, set.tolerance, &merging)
         .ok_or_else(|| halt("hybrid_failed", "the faces could not be measured"))?;
+    analytic.stages_ms = stages;
     if analytic.max_edge_gap > EDGE_GAP_NOTE_SHARE * set.tolerance {
         let msg = format!(
             "a merged face's boundary is up to {:.3} mm from its primitive (sampled, not certified); its edges carry that as their tolerance, which STEP keeps",

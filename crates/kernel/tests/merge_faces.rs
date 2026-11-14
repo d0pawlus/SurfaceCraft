@@ -121,6 +121,16 @@ fn sheet(f: impl Fn(f64, f64) -> [f64; 3] + Copy + 'static) -> Network {
     network_from_fns(&refs, 2)
 }
 
+/// Whether the shell uses `face` along its natural normal.
+fn used_forward(b: &Brep, face: usize) -> Option<bool> {
+    b.shells.iter().find_map(|s| match s {
+        surfacecraft_kernel::record::brep::Shell::Faces { faces, .. } => {
+            faces.iter().find(|o| o.face as usize == face).map(|o| o.forward)
+        }
+        _ => None,
+    })
+}
+
 /// A patch of an open sheet becomes one analytic face of the right kind: the open scan of gate 2.
 fn merge_sheet(net: &Network, shape: &Shape, kind: &str, gap: f64) {
     let body = sheet_from_bezier_network(&net.patches, &net.corners).unwrap();
@@ -147,6 +157,31 @@ fn an_open_cylinder_sheet_becomes_one_cylinder_face() {
         [r * a.cos(), r * a.sin(), 20.0 * t]
     });
     merge_sheet(&net, &Shape::Cylinder { point: [0.0; 3], axis: [0.0, 0.0, 1.0], radius: r }, "cylinder", 1e-3);
+}
+
+/// The same sheets seen from the axis (their normals point inward) still become one analytic face each
+/// (the kernel keeps a sheet's one use of a face as the `same` one, so no sense is asserted here).
+#[test]
+fn concave_open_sheets_become_one_face_each() {
+    let (r, a0, a1) = (10.0_f64, 1.0_f64, 2.2_f64);
+    let cyl = sheet(move |s, t| {
+        let a = a0 + (a1 - a0) * t;
+        [r * a.cos(), r * a.sin(), 20.0 * s]
+    });
+    merge_sheet(&cyl, &Shape::Cylinder { point: [0.0; 3], axis: [0.0, 0.0, 1.0], radius: r }, "cylinder", 1e-3);
+    let (k, b0, b1) = (0.5_f64, 0.5_f64, 1.7_f64);
+    let cone = sheet(move |s, t| {
+        let (a, h) = (b0 + (b1 - b0) * t, 10.0 + 10.0 * s);
+        [k * h * a.cos(), k * h * a.sin(), h]
+    });
+    let shape = Shape::Cone { apex: [0.0; 3], axis: [0.0, 0.0, 1.0], half_angle: k.atan() };
+    merge_sheet(&cone, &shape, "cone", 1e-3);
+    let (rs, c0, c1) = (20.0_f64, 0.3_f64, 1.1_f64);
+    let ball = sheet(move |s, t| {
+        let (a, b) = (c0 + (c1 - c0) * t, -0.4 + 0.8 * s);
+        [rs * b.cos() * a.cos(), rs * b.cos() * a.sin(), rs * b.sin()]
+    });
+    merge_sheet(&ball, &Shape::Sphere { center: [0.0; 3], radius: rs }, "sphere", 1e-3);
 }
 
 #[test]
@@ -207,4 +242,165 @@ fn groups_the_kernel_cannot_merge_are_refused() {
     assert!(merge_faces_onto_shape(&body, &[0, 1], &nan, 0.05).is_err());
     let torus = Shape::Torus { center: [0.0; 3], axis: [0.0, 0.0, 1.0], major_radius: 20.0, minor_radius: 5.0 };
     assert!(merge_faces_onto_shape(&body, &[0, 1], &torus, 0.05).is_err(), "a torus is not placed");
+}
+
+/// A curved slab: the part of the annulus `r..big` over the angles `a0..a1`, height 20, every face a
+/// 3 x 3 patch network. Faces 0..9 are the outer wall (convex), 9..18 the inner wall (concave: the
+/// body's outside is the axis side), then the two radial walls, the top and the bottom.
+fn curved_slab(r: f64, big: f64, a0: f64, a1: f64) -> Network {
+    let h = 20.0;
+    let ang = move |s: f64| a0 + (a1 - a0) * s;
+    let rho = move |t: f64| r + (big - r) * t;
+    let outer = move |s: f64, t: f64| [big * ang(s).cos(), big * ang(s).sin(), h * t];
+    let inner = move |s: f64, t: f64| [r * ang(s).cos(), r * ang(s).sin(), h * t];
+    let wall0 = move |s: f64, t: f64| [rho(s) * a0.cos(), rho(s) * a0.sin(), h * t];
+    let wall1 = move |s: f64, t: f64| [rho(s) * a1.cos(), rho(s) * a1.sin(), h * t];
+    let top = move |s: f64, t: f64| [rho(t) * ang(s).cos(), rho(t) * ang(s).sin(), h];
+    let bottom = move |s: f64, t: f64| [rho(t) * ang(s).cos(), rho(t) * ang(s).sin(), 0.0];
+    let mut all: Vec<Fun> = split(outer, 3);
+    all.extend(split(inner, 3));
+    all.extend(split(wall0, 3));
+    all.extend(split(wall1, 3));
+    all.extend(split(top, 3));
+    all.extend(split(bottom, 3));
+    let refs: Vec<&dyn Fn(f64, f64) -> [f64; 3]> = all.iter().map(|b| b.as_ref()).collect();
+    network_from_fns(&refs, 2)
+}
+
+/// The concave wall of a bore: its shell use runs against the surface's natural normal, the volume and
+/// the STEP round trip are those of the patches.
+#[test]
+fn a_concave_cylinder_wall_becomes_one_cylinder_face_used_backward() {
+    let (r, big) = (10.0_f64, 14.0_f64);
+    let net = curved_slab(r, big, 1.0, 2.2);
+    let body = sheet_from_bezier_network(&net.patches, &net.corners).unwrap();
+    assert!(is_closed(&body));
+    let shape = Shape::Cylinder { point: [0.0; 3], axis: [0.0, 0.0, 1.0], radius: r };
+    let merged = merge_faces_onto_shape(&body, &(9..18).collect::<Vec<_>>(), &shape, 0.05).unwrap();
+    assert_eq!(merged.brep.faces.len(), body.faces.len() - 8);
+    assert_eq!(kinds(&merged.brep).iter().filter(|k| **k == "cylinder").count(), 1);
+    assert_sound(&body, &merged.brep, 2e-3);
+    assert_eq!(
+        used_forward(&merged.brep, merged.face),
+        Some(false),
+        "the bore's wall is used against its natural normal"
+    );
+}
+
+/// A 30 x 30 x 10 box whose top face (faces 0..9, 3 x 3 patches) is the saddle
+/// `z = 10 + rise (1 + (x / 30 - 1/2)(y / 30 - 1/2))`, so that its whole border is between 0.75 and 1.25
+/// `rise` off the plane z = 10; the walls follow it.
+fn box_with_saddle_top(rise: f64) -> Network {
+    let z = move |x: f64, y: f64| 10.0 + rise * (1.0 + (x / 30.0 - 0.5) * (y / 30.0 - 0.5));
+    let top = move |u: f64, v: f64| [30.0 * u, 30.0 * v, z(30.0 * u, 30.0 * v)];
+    let bottom = |u: f64, v: f64| [30.0 * v, 30.0 * u, 0.0];
+    let front = move |u: f64, v: f64| [30.0 * u, 0.0, v * z(30.0 * u, 0.0)];
+    let back = move |u: f64, v: f64| [30.0 * v, 30.0, u * z(30.0 * v, 30.0)];
+    let left = move |u: f64, v: f64| [0.0, 30.0 * v, u * z(0.0, 30.0 * v)];
+    let right = move |u: f64, v: f64| [30.0, 30.0 * u, v * z(30.0, 30.0 * u)];
+    let mut all: Vec<Fun> = split(top, 3);
+    all.extend(split(bottom, 3));
+    all.extend(split(front, 3));
+    all.extend(split(back, 3));
+    all.extend(split(left, 3));
+    all.extend(split(right, 3));
+    let refs: Vec<&dyn Fn(f64, f64) -> [f64; 3]> = all.iter().map(|b| b.as_ref()).collect();
+    network_from_fns(&refs, 2)
+}
+
+/// A group whose border is off its plane by up to 0.05 mm gets a border on the plane (the gap is what the
+/// least-squares fit of a cubic leaves, nothing here), and the walls that share the border move with it:
+/// the body stays a watertight solid of nearly the volume it had.
+#[test]
+fn the_border_of_a_group_is_put_on_its_primitive_and_its_neighbours_follow() {
+    let net = box_with_saddle_top(0.04);
+    let body = sheet_from_bezier_network(&net.patches, &net.corners).unwrap();
+    assert!(is_closed(&body));
+    let shape = Shape::Plane { point: [0.0, 0.0, 10.0], normal: [0.0, 0.0, 1.0] };
+    let merged = merge_faces_onto_shape(&body, &(0..9).collect::<Vec<_>>(), &shape, 0.1).unwrap();
+    assert!(merged.gap < 1e-6, "the border is on the plane: {}", merged.gap);
+    assert_eq!(merged.brep.faces.len(), body.faces.len() - 8);
+    assert_sound(&body, &merged.brep, 0.01);
+    // the 12 vertices on the border of the top moved onto the plane (the walls' top corners with them)
+    let on_plane = merged.brep.vertices.iter().filter(|v| (v.point[2] - 10.0).abs() < 1e-9).count();
+    assert_eq!(on_plane, 12, "the vertices of the border");
+}
+
+/// The same on a curved primitive: a cylinder wall whose border is 0.04 mm off the cylinder.
+#[test]
+fn the_border_of_a_cylinder_group_is_put_on_the_cylinder() {
+    let (r, big) = (10.0_f64, 14.0_f64);
+    let net = curved_slab(r + 0.04, big, 1.0, 2.2);
+    let body = sheet_from_bezier_network(&net.patches, &net.corners).unwrap();
+    let shape = Shape::Cylinder { point: [0.0; 3], axis: [0.0, 0.0, 1.0], radius: r };
+    let merged = merge_faces_onto_shape(&body, &(9..18).collect::<Vec<_>>(), &shape, 0.1).unwrap();
+    assert!(merged.gap < 0.1 * 0.1, "{}", merged.gap);
+    assert_sound(&body, &merged.brep, 0.01);
+}
+
+/// A ring: the annulus `r..big` over the whole turn, height 20, in `n` angular steps. Faces `0..n` are the
+/// outer wall (convex), `n..2n` the inner wall (a bore: concave), then the top and the bottom annulus.
+fn ring_body(r: f64, big: f64, n: usize) -> Network {
+    let da = std::f64::consts::TAU / n as f64;
+    let mut all: Vec<Fun> = Vec::new();
+    let wall = |radius: f64, i: usize| -> Fun {
+        Box::new(move |u, v| {
+            let a = (i as f64 + u) * da;
+            [radius * a.cos(), radius * a.sin(), 20.0 * v]
+        })
+    };
+    let annulus = |z: f64, i: usize| -> Fun {
+        Box::new(move |u, v| {
+            let (a, rho) = ((i as f64 + u) * da, r + (big - r) * v);
+            [rho * a.cos(), rho * a.sin(), z]
+        })
+    };
+    all.extend((0..n).map(|i| wall(big, i)));
+    all.extend((0..n).map(|i| wall(r, i)));
+    all.extend((0..n).map(|i| annulus(20.0, i)));
+    all.extend((0..n).map(|i| annulus(0.0, i)));
+    let refs: Vec<&dyn Fn(f64, f64) -> [f64; 3]> = all.iter().map(|b| b.as_ref()).collect();
+    network_from_fns(&refs, 2)
+}
+
+/// A wall that goes all the way round (a boss or a bore) is cut into sectors, each one face on the
+/// cylinder; the bore's faces are used against their natural normal. The body stays a sound solid.
+#[test]
+fn walls_that_go_round_the_axis_become_a_face_per_sector() {
+    use surfacecraft_kernel::merge::{GroupSpec, merge_faces_onto_shapes, split_round};
+    let (r, big, n) = (10.0_f64, 14.0_f64, 24);
+    let net = ring_body(r, big, n);
+    let body = sheet_from_bezier_network(&net.patches, &net.corners).unwrap();
+    assert!(is_closed(&body));
+    for (first, radius, concave) in [(0, big, false), (n, r, true)] {
+        let shape = Shape::Cylinder { point: [0.0; 3], axis: [0.0, 0.0, 1.0], radius };
+        let wall: Vec<usize> = (first..first + n).collect();
+        let sectors = split_round(&body, &wall, &shape);
+        assert_eq!(sectors.len(), 3, "a turn is cut in three");
+        assert!(sectors.iter().all(|g| g.len() == n / 3));
+        let specs: Vec<GroupSpec> = sectors.iter().map(|g| GroupSpec { faces: g, shape: &shape }).collect();
+        let batch = merge_faces_onto_shapes(&body, &specs, 0.05, &|| false).unwrap();
+        let why: Vec<String> = batch.groups.iter().filter_map(|g| g.as_ref().err().cloned()).collect();
+        assert!(why.is_empty(), "{why:?}");
+        assert_eq!(kinds(&batch.brep).iter().filter(|k| **k == "cylinder").count(), 3);
+        assert_sound(&body, &batch.brep, 2e-3);
+        let backward =
+            batch.groups.iter().flatten().filter(|g| used_forward(&batch.brep, g.face) == Some(false)).count();
+        assert_eq!(backward, if concave { 3 } else { 0 });
+    }
+}
+
+/// A group that leaves a gap in angle is not cut, and planes and spheres are never cut.
+#[test]
+fn an_arc_and_a_plane_are_not_cut_into_sectors() {
+    use surfacecraft_kernel::merge::split_round;
+    let net = curved_slab(10.0, 14.0, 1.0, 2.2);
+    let body = sheet_from_bezier_network(&net.patches, &net.corners).unwrap();
+    let wall: Vec<usize> = (9..18).collect();
+    let cyl = Shape::Cylinder { point: [0.0; 3], axis: [0.0, 0.0, 1.0], radius: 10.0 };
+    assert_eq!(split_round(&body, &wall, &cyl), vec![wall.clone()]);
+    let plane = Shape::Plane { point: [0.0; 3], normal: [0.0, 0.0, 1.0] };
+    assert_eq!(split_round(&body, &wall, &plane), vec![wall.clone()]);
+    let sphere = Shape::Sphere { center: [0.0; 3], radius: 10.0 };
+    assert_eq!(split_round(&body, &wall, &sphere), vec![wall]);
 }

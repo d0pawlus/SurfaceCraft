@@ -1,6 +1,6 @@
 //! Where the patches of a body are: points on them, and which of them touch.
 use super::boundary::pinch_vertices;
-use crate::hybrid::{V, cross, norm, sub};
+use crate::hybrid::{Shape, V, cross, dot, norm, perpendicular, sub};
 use crate::record::brep::{Brep, Surface};
 use std::collections::BTreeMap;
 
@@ -121,4 +121,58 @@ fn touches(body: &Brep, face: usize, vertices: &std::collections::BTreeSet<u32>)
         }),
         crate::record::brep::Loop::Vertex { vertex } => vertices.contains(vertex),
     })
+}
+
+/// Sectors a group that wraps round its axis is cut into (each stays well clear of a half turn, so
+/// its face has room for the seam of its surface).
+const SECTORS: usize = 3;
+/// A group whose patches leave a gap in angle of at least this (radians) does not wrap round its axis.
+const WRAP_GAP: f64 = 1.0;
+
+/// The angle (0 to 2 pi) of `p` about the axis through `point` along `axis`, from a fixed direction.
+fn angle_about(point: V, axis: V, p: V) -> f64 {
+    let x = perpendicular(axis);
+    let y = cross(axis, x);
+    let q = sub(p, point);
+    let a = dot(q, y).atan2(dot(q, x));
+    if a < 0.0 { a + std::f64::consts::TAU } else { a }
+}
+
+/// A group of patches that goes all the way round the axis of a cylinder or cone cannot be one face
+/// (it would need a seam edge, which the merge does not make): it is cut into [`SECTORS`] groups by the
+/// angle of the middle of each patch, each as connected as the patches allow. Any other group (one that
+/// leaves a gap in angle, a plane, a sphere) is returned as it is.
+#[must_use]
+pub fn split_round(body: &Brep, faces: &[usize], shape: &Shape) -> Vec<Vec<usize>> {
+    let (point, axis) = match shape {
+        Shape::Cylinder { point, axis, .. } => (*point, *axis),
+        Shape::Cone { apex, axis, .. } => (*apex, *axis),
+        _ => return vec![faces.to_vec()],
+    };
+    let Some(axis) = crate::hybrid::unit(axis) else { return vec![faces.to_vec()] };
+    let angles: Vec<(f64, usize)> = faces
+        .iter()
+        .filter_map(|&f| {
+            let mid = face_samples(body, f, 2).and_then(|s| s.get(4).copied())?;
+            Some((angle_about(point, axis, mid), f))
+        })
+        .collect();
+    let mut sorted: Vec<f64> = angles.iter().map(|a| a.0).collect();
+    sorted.sort_by(f64::total_cmp);
+    let tau = std::f64::consts::TAU;
+    let widest =
+        sorted.iter().zip(sorted.iter().cycle().skip(1)).map(|(a, b)| (b - a).rem_euclid(tau)).fold(0.0_f64, f64::max);
+    if angles.len() != faces.len() || widest >= WRAP_GAP {
+        return vec![faces.to_vec()];
+    }
+    let mut sectors: Vec<Vec<usize>> = vec![Vec::new(); SECTORS];
+    for (a, f) in &angles {
+        let k = ((a / tau) * SECTORS as f64) as usize;
+        if let Some(sector) = sectors.get_mut(k.min(SECTORS - 1)) {
+            sector.push(*f);
+        }
+    }
+    let mut out: Vec<Vec<usize>> = sectors.iter().flat_map(|g| connected_groups(body, g)).collect();
+    out.sort_by_key(|g| g.first().copied().unwrap_or(usize::MAX));
+    out
 }

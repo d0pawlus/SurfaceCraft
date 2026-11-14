@@ -12,14 +12,17 @@ use surfacecraft_geom::Mesh;
 
 /// Cells a side of the grid the replaced patches are sampled on.
 const CLOUD_GRID: usize = 4;
-/// Triangles of the new face that are checked.
-const CHECKS: usize = 64;
-/// The least dot product of the new face's normal with the nearest patch normal.
+/// Corners of the new face's triangles that are checked, spread over all of them by the golden ratio
+/// (a stride over the triangle list can alias with the tessellation's rows).
+const CHECKS: usize = 256;
+/// The golden ratio's fractional part: the step of the sequence that spreads the checked corners.
+const GOLDEN: f64 = 0.618_033_988_749_894_9;
+/// The least dot product of the new face's normal with the patch normal at the nearest point.
 const MIN_DOT: f64 = 0.5;
-/// The share of the checked triangles that must agree in normal. A face turned the wrong way agrees at
-/// almost none of them and a right one at most (measured 0.4 to 1.0 on real scans: the tessellation of
-/// a face and the normals of a collapsed patch are noisy at corners), so this is a vote, not a bound.
-const AGREE_SHARE: f64 = 0.6;
+/// The share of the checked corners that may disagree in normal (a face turned the wrong way disagrees
+/// at nearly all of them; the allowance is for the corners of the group, where a patch is folded or
+/// collapsed and its normal means nothing).
+const DISAGREE_ALLOWANCE: f64 = 0.1;
 /// Triangles with less than this share of the mean triangle area are slivers: their normals are noise.
 const MIN_TRIANGLE_AREA_SHARE: f64 = 0.3;
 /// The patches nearest a corner that are tried.
@@ -32,6 +35,8 @@ pub(super) struct Cloud {
     points: Vec<V>,
     normals: Vec<V>,
     faces: Vec<usize>,
+    /// For each patch: `1` when the shell uses it along its natural normal, else `-1`.
+    signs: BTreeMap<usize, f64>,
 }
 
 fn forward_of(body: &Brep, face: usize) -> bool {
@@ -81,7 +86,10 @@ pub(super) fn cloud(body: &Brep, faces: &[usize]) -> Result<Cloud> {
         if b.1.len() == (CLOUD_GRID + 1).pow(2) { grid_area(&b.1, CLOUD_GRID) } else { 0.0 }
     };
     let mean = blocks.iter().map(area).sum::<f64>() / blocks.len().max(1) as f64;
-    let mut c = Cloud { points: Vec::new(), normals: Vec::new(), faces: Vec::new() };
+    let mut c = Cloud { points: Vec::new(), normals: Vec::new(), faces: Vec::new(), signs: BTreeMap::new() };
+    for b in &blocks {
+        c.signs.insert(b.0, if forward_of(body, b.0) { 1.0 } else { -1.0 });
+    }
     for b in &blocks {
         if area(b) < MIN_PATCH_AREA_SHARE * mean {
             continue;
@@ -129,61 +137,85 @@ impl Cloud {
         inside.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
         inside.into_iter().take(n).map(|(_, f)| f).collect()
     }
-
-    fn nearest(&self, p: V) -> Option<usize> {
-        let d = |q: &V| norm(sub(*q, p));
-        (0..self.points.len()).min_by(|&a, &b| {
-            let (da, db) = (self.points.get(a).map_or(f64::MAX, d), self.points.get(b).map_or(f64::MAX, d));
-            da.total_cmp(&db)
-        })
-    }
 }
 
-/// Checks the triangles of the new face (`mesh`, whose normals are the face's natural ones; `forward`
-/// says whether that is outward) against the cloud of the replaced patches `body`: normals agree and
-/// the corners of the triangles (which lie on the surface, unlike their centres) lie within `gap`
-/// (times a slack) of the patch nearest to them.
+/// The point of a patch nearest `p`, as `(distance, outward normal there)`; the normal is `None` where the
+/// patch is collapsed.
+fn nearest_on_patch(cloud: &Cloud, eval: &SurfaceEval, face: usize, p: V, reach: f64) -> Option<(f64, Option<V>)> {
+    let q = Vec3::new(p[0], p[1], p[2]);
+    let uv = eval.project(q, None, reach)?;
+    let (c, du, dv) = eval.derivs(uv[0], uv[1])?;
+    let sign = cloud.signs.get(&face).copied().unwrap_or(1.0);
+    let normal = unit(cross([du.x, du.y, du.z], [dv.x, dv.y, dv.z])).map(|n| n.map(|x| sign * x));
+    Some((norm(sub([c.x, c.y, c.z], p)), normal))
+}
+
+/// The corner `k` of the triangle list of `n`: spread over all triangles and all three corners.
+fn spread(k: usize, n: usize) -> (usize, usize) {
+    let t = ((k as f64 * GOLDEN).fract() * n as f64) as usize;
+    (t.min(n.saturating_sub(1)), k % 3)
+}
+
+/// Checks the corners of the triangles of the new face (`mesh`, whose normals are the face's natural
+/// ones; `forward` says whether that is outward) against the replaced patches `body`: the face's normal
+/// agrees with the patch's at the nearest point, and the corner (which lies on the surface, unlike the
+/// triangle's centre) lies within `gap` (times a slack) of a patch. A corner the patches cannot be
+/// measured against is a failure, not a pass.
 pub(super) fn check_face(mesh: &Mesh, forward: bool, cloud: &Cloud, body: &Brep, gap: f64) -> Result<()> {
     let n = mesh.triangle_count();
     if n == 0 || cloud.points.is_empty() {
         return Err(KernelError::Argument("the new face has no triangles to check".into()));
     }
     let mean_area = mesh.area() / n as f64;
-    let step = (n / CHECKS).max(1);
+    let sign = if forward { 1.0 } else { -1.0 };
+    let reach = 10.0 * gap + 1.0;
     let (mut checked, mut agree) = (0usize, 0usize);
     let mut evals: BTreeMap<usize, SurfaceEval> = BTreeMap::new();
-    for t in (0..n).step_by(step) {
-        let Some([a, b, c]) = mesh.triangle(t) else { continue };
-        let (a, b, c) = ([a.x, a.y, a.z], [b.x, b.y, b.z], [c.x, c.y, c.z]);
-        let Some(k) = cloud.nearest(a) else { continue };
-        let Some(pn) = cloud.normals.get(k) else { continue };
-        let twice = norm(cross(sub(b, a), sub(c, a)));
-        if twice < MIN_TRIANGLE_AREA_SHARE * 2.0 * mean_area {
+    for k in 0..CHECKS.min(3 * n) {
+        let (t, corner) = spread(k, n);
+        let Some(tri) = mesh.triangle(t) else { continue };
+        let pts = tri.map(|a| [a.x, a.y, a.z]);
+        let (Some(a), Some(b), Some(c)) = (pts.get(corner), pts.get((corner + 1) % 3), pts.get((corner + 2) % 3))
+        else {
             continue;
-        }
-        let Some(tn) = unit(cross(sub(b, a), sub(c, a))) else { continue };
-        let sign = if forward { 1.0 } else { -1.0 };
-        checked += 1;
-        agree += usize::from(sign * dot(tn, *pn) >= MIN_DOT);
-        // the nearest sample may belong to a neighbour of the patch the corner is over: the best of the
-        // few nearest patches counts
-        let mut best = f64::INFINITY;
-        for f in cloud.nearest_faces(a, NEAREST_PATCHES, gap) {
+        };
+        let twice = norm(cross(sub(*b, *a), sub(*c, *a)));
+        let Some(tn) =
+            unit(cross(sub(*b, *a), sub(*c, *a))).filter(|_| twice >= MIN_TRIANGLE_AREA_SHARE * 2.0 * mean_area)
+        else {
+            continue;
+        };
+        // the nearest patch point among the few patches the corner may lie over
+        let mut best: Option<(f64, Option<V>)> = None;
+        for f in cloud.nearest_faces(*a, NEAREST_PATCHES, gap) {
             if let std::collections::btree_map::Entry::Vacant(slot) = evals.entry(f) {
                 slot.insert(evaluator(body, f)?);
             }
-            let reach = evals.get(&f).and_then(|e| {
-                let p = Vec3::new(a[0], a[1], a[2]);
-                let q = e.point(e.project(p, None, 10.0 * gap + 1.0)?)?;
-                Some(norm(sub([q.x, q.y, q.z], a)))
-            });
-            best = best.min(reach.unwrap_or(f64::INFINITY));
+            let found = evals.get(&f).and_then(|e| nearest_on_patch(cloud, e, f, *a, reach));
+            if let Some(m) = found.filter(|m| best.is_none_or(|b| m.0 < b.0)) {
+                best = Some(m);
+            }
         }
-        if best.is_finite() && best > PROXIMITY_SLACK * gap + 1e-6 {
-            return Err(KernelError::Argument("the new face leaves the patches it replaced".into()));
+        let (distance, normal) = best.ok_or_else(|| {
+            KernelError::Argument(
+                "the new face leaves the patches it replaced, or cannot be measured against them".into(),
+            )
+        })?;
+        if distance > PROXIMITY_SLACK * gap + 1e-6 {
+            return Err(KernelError::Argument(format!(
+                "the new face leaves the patches it replaced by {distance:.3} mm (limit {:.3}) at ({:.1}, {:.1}, {:.1})",
+                PROXIMITY_SLACK * gap,
+                a[0],
+                a[1],
+                a[2]
+            )));
+        }
+        if let Some(pn) = normal {
+            checked += 1;
+            agree += usize::from(sign * dot(tn, pn) >= MIN_DOT);
         }
     }
-    if checked == 0 || (agree as f64) < AGREE_SHARE * checked as f64 {
+    if checked == 0 || ((checked - agree) as f64) > DISAGREE_ALLOWANCE * checked as f64 {
         return Err(KernelError::Argument(format!(
             "the new face's normal disagrees with the patches' ({agree} of {checked} checked)"
         )));
