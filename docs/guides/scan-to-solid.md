@@ -75,10 +75,13 @@ Hybrid (merge the patches that lie on a primitive; `surface.wrap` and the kernel
 - Makes a copy of the scan in which the vertices of every protected region that are within the
   tolerance of their primitive lie exactly on it (projected, never pushed beyond); where regions meet
   (a sharp edge) a vertex is put on all their primitives. The rest of the scan is untouched. The copy
-  is wrapped as `freeform` wraps a scan, held to half the tolerance (the coarse mesh the patches lie
-  on may leave the scan by a few of it, and along a sharp edge the boundary of a patch is a chord of
-  it, which is what a boundary gap to the primitive is made of). The copy is only used for the wrap:
-  the body is judged against the original scan by the rules of the freeform method.
+  is wrapped as `freeform` wraps a scan, held to half the tolerance (measured on scan 4 of the local
+  corpus: 99.97 % of the points within 0.2 mm against 99.46 % for the freeform wrap at the tolerance, and
+  the 20 % plane merged; with the wrap held to the full tolerance it was 99.32 % and 3 % of the area on
+  analytic faces). The copy is only used for the wrap: the body is judged against the original scan by the
+  rules of the freeform method. The finer wrap is where the time goes: 3 to 4 times the freeform call on
+  scans 1 and 4 (the wrap is two thirds to four fifths of the hybrid stages, `analytic.stages_ms`; the
+  segmentation, the two judgements and the merge are seconds each).
 - A patch lies on a primitive when the scan triangle nearest its middle is in the primitive's region
   and every sample on it lies within the tolerance of the primitive and within 5 tolerances of a
   triangle of the region (the segmentation leaves pinholes in a large flat face; at 1 tolerance they
@@ -100,8 +103,8 @@ Hybrid (merge the patches that lie on a primitive; `surface.wrap` and the kernel
   band of patches along the border of a region stays patches. Plane and cylinder faces are built by the
   kernel's topology builder (the trims of the face in its own parameters, its NURBS form and parameter
   box are the kernel's); a cone or sphere face is placed here with the kernel's own forms. A concave
-  face (the wall of a bore, a dimple) is merged like a convex one and used by the shell against its
-  surface's natural normal. A group that goes round the axis of a cylinder or cone is cut into three
+  face (the wall of a bore, a dimple) of a closed body is merged like a convex one and used by the shell
+  against its surface's natural normal; in an open sheet it is not merged (see below). A group that goes round the axis of a cylinder or cone is cut into three
   sectors by the angle of the patches (a face round the whole axis would need a seam edge), each one
   face. The boundary edges stay shared with the neighbours and lie on the primitive within the reported
   `max_edge_gap`, a few micrometres after the border is moved onto it (a group is refused when it
@@ -109,8 +112,11 @@ Hybrid (merge the patches that lie on a primitive; `surface.wrap` and the kernel
   it); each edge carries that gap, times 1.1, as its tolerance.
 - Never merged, and why (each is in `analytic.left_as_patches` with its reason): a group of one patch or of
   under 50 squared tolerances of area; a group whose border is further than the tolerance from the
-  primitive (the patches only follow it that far, which is no analytic face); a torus (there is no
-  merge for it); a sphere cap of 90 degrees or more (it would reach a pole of the sphere's
+  primitive (the patches only follow it that far, which is no analytic face); a face that looks
+  against the natural normal of its surface (a bore, a dimple) in an open sheet (the kernel keeps only the
+  same use of a sheet's faces, so the new face would come back reversed: measured on scan 4, where the
+  merged bore faces had every normal against the patches' and 3 % of the scan points did not face the body);
+  a torus (there is no merge for it); a sphere cap of 90 degrees or more (it would reach a pole of the sphere's
   parameters); a group that goes round its axis and cannot be cut into sectors that are connected; a
   boundary that touches itself (a pinch); a face whose area or normal does not agree with the patches it
   replaces; and what the kernel refuses (a result whose volume or topology changed, or that the mesher
