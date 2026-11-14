@@ -8,14 +8,40 @@ use surfacecraft_geom::{Mesh, Point3, Transform, Vec3, synth};
 pub const BOUND_DEGREES: f64 = 0.5;
 pub const BOUND_MM: f64 = 0.5;
 
+/// The bracket without the faces that no scanner sees: the lower half of the sphere and the base
+/// of the cylinder lie inside the box (`bracket_at` keeps them: the union of three closed shells, not
+/// one surface). A scan has one surface, and where each scan has such a piece
+/// the other lacks it, the pair contradicts itself at the right pose.
+pub fn visible_bracket_at(block: usize, segments: usize, rings: usize) -> Mesh {
+    // the faces of the box under the boss and under the sphere are inside the part too
+    let under = |c: &Point3| {
+        c.z >= 20.0 - 1e-6 && ((c.x - 45.0).hypot(c.y - 12.0) < 6.0 || (c.x - 15.0).hypot(c.y - 28.0) < 5.0)
+    };
+    let mut m = cut(&synth::cuboid(Point3::origin(), Vec3::new(60.0, 40.0, 20.0), block), |c| !under(c));
+    let boss = synth::cylinder(Point3::new(45.0, 12.0, 20.0), Vec3::z(), 6.0, 10.0, segments, 6);
+    m.append(&cut(&boss, |c| c.z > 20.0 + 1e-6));
+    let ball = synth::sphere(Point3::new(15.0, 28.0, 20.0), 5.0, 2 * rings, rings);
+    m.append(&cut(&ball, |c| c.z >= 20.0));
+    m
+}
+
 /// A view of the bracket: its own tessellation and noise, the triangles whose centroid lies on the
-/// side of `dir` of the part centre or at most `reach` mm beyond it.
+/// side of `dir` of the part centre or at most `reach` mm beyond it. The visible bracket (see
+/// [`visible_bracket_at`]); [`shelled_bracket_view_s`] is the one with the shells inside.
 pub fn bracket_view(k: usize, dir: Vec3, reach: f64) -> Mesh {
     bracket_view_s(k, dir, reach, 0)
 }
 
 /// [`bracket_view`] with the noise of series `series` (series 0 is the default one).
 pub fn bracket_view_s(k: usize, dir: Vec3, reach: f64, series: u64) -> Mesh {
+    let whole = noisy(visible_bracket_at(10 + 2 * k, 40 + 6 * k, 14 + k), 100 + k as u64 + 1000 * series);
+    let c = Point3::new(30.0, 20.0, 15.0);
+    cut(&whole, |p| (p - c).dot(&dir) >= -reach)
+}
+
+/// [`bracket_view_s`] of the bracket with the sphere and the boss inside the box, as the views were
+/// before the fixtures were made visible (for comparison).
+pub fn shelled_bracket_view_s(k: usize, dir: Vec3, reach: f64, series: u64) -> Mesh {
     let whole = noisy(bracket_at(10 + 2 * k, 40 + 6 * k, 14 + k), 100 + k as u64 + 1000 * series);
     let c = Point3::new(30.0, 20.0, 15.0);
     cut(&whole, |p| (p - c).dot(&dir) >= -reach)
@@ -32,6 +58,18 @@ pub const SIDES: [([f64; 3], f64); 6] = [
 
 pub fn bracket_views(n: usize) -> Vec<Mesh> {
     bracket_views_s(n, 0)
+}
+
+/// Views of the bracket that reach 6 mm further past the centre than [`bracket_views`]: the views share
+/// more, with the boss and the sphere in them, which the visible bracket needs (its box faces fit each
+/// other at half turns, and a view that shares little of its features is ambiguous).
+pub fn bracket_views_wide(n: usize) -> Vec<Mesh> {
+    SIDES
+        .iter()
+        .take(n)
+        .enumerate()
+        .map(|(k, (d, r))| bracket_view_s(k, Vec3::new(d[0], d[1], d[2]), *r + 6.0, 0))
+        .collect()
 }
 
 pub fn bracket_views_s(n: usize, series: u64) -> Vec<Mesh> {

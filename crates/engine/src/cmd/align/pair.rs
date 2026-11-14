@@ -5,7 +5,7 @@ use crate::Session;
 use crate::cmd::{CmdError, CmdResult, ObjRef};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use surfacecraft_align::pair::{CoarseMethod, MAX_MUTUAL_CONFLICT};
+use surfacecraft_align::pair::CoarseMethod;
 use surfacecraft_align::{AlignError, PairCandidate, PairOptions, PairResult, PairVerdict, pair_coarse};
 use surfacecraft_doc::ObjectKind;
 use surfacecraft_geom::Transform;
@@ -48,13 +48,13 @@ pub struct PairOut {
     pub overlap_moving: f64,
     /// Share (0..1) of the target's area that lies on the moving scan within the tolerance.
     pub overlap_fixed: f64,
-    /// Share (0..1) of the moving scan's area that lies where the target is, but off it (beyond twice the tolerance, and not at the end of the target): evidence against the best pose. A pose where both this and `conflict_fixed` exceed 0.025 is never `unique`.
+    /// Share (0..1) of the moving scan's area that lies where the target is, but off it (beyond twice the tolerance, and not at the end of the target): evidence against the best pose (surface of the moving scan in front of the target, away from it, where the target is: measured on 3000 samples, free space only). A pose where either this or `conflict_fixed` exceeds the bound (0.01) is never `unique`.
     pub conflict_moving: f64,
     /// Share (0..1) of the target's area that lies where the moving scan is, but off it: the same evidence from the other side (of the best pose).
     pub conflict_fixed: f64,
     /// Tolerance used, mm.
     pub tolerance: f64,
-    /// Noise of the two scans combined, mm (each scan's own estimate, as `deviation.noise`): the default tolerance is at most 4 times it.
+    /// Noise of the two scans combined, mm (each scan's own estimate, as `deviation.noise`; 0 when an estimate is not trustworthy, a coarse mesh): the default tolerance is at most 4 times it.
     pub noise: f64,
     /// Which stage proposed the best pose.
     pub method: CoarseMethod,
@@ -93,19 +93,15 @@ pub struct PairOut {
     pub note: String,
 }
 
-/// Do both scans contradict the best pose (see [`MAX_MUTUAL_CONFLICT`])?
-fn contradicted(r: &PairResult) -> bool {
-    !(r.conflict_moving.min(r.conflict_fixed) <= MAX_MUTUAL_CONFLICT)
-}
-
 fn note_of(r: &PairResult, applied: bool, refused: bool) -> String {
     if r.refined < 2 && r.verdict == PairVerdict::Ambiguous {
         return "only one candidate pose could be refined, so nothing was compared: check the pose by eye".into();
     }
-    if r.verdict == PairVerdict::Ambiguous && r.alternatives.is_empty() && contradicted(r) {
+    if r.verdict == PairVerdict::Ambiguous && r.contradicted {
         let tail = if refused { ", nothing was moved" } else { "" };
+        let others = if r.alternatives.is_empty() { "" } else { " (see also the alternatives)" };
         return format!(
-            "ambiguous: both scans have surface where the other is but off it, so the overlap may be a coincidence of similar regions: check the pose by eye{tail}"
+            "ambiguous: one scan has surface where the other is but off it, so the overlap may be a coincidence of similar regions: check the pose by eye{others}{tail}"
         );
     }
     if r.verdict == PairVerdict::Ambiguous && r.alternatives.is_empty() {

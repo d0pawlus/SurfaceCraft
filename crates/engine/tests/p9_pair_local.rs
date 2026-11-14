@@ -11,7 +11,7 @@ mod pair_common;
 use pair_common::*;
 use serde_json::json;
 use surfacecraft_engine::Session;
-use surfacecraft_geom::Mesh;
+use surfacecraft_geom::{Mesh, synth};
 
 fn corpus() -> Vec<std::path::PathBuf> {
     let Ok(dir) = std::env::var("SURFACECRAFT_LOCAL_CORPUS") else { return Vec::new() };
@@ -143,4 +143,23 @@ fn local_corpus_pair_confusion() {
         .map(|r| format!("scan {} {}: unique, error {:.2} mm", r.scan, r.kind, r.error_mm))
         .collect();
     assert!(bad.is_empty(), "a wrong pose called unique: {bad:?}");
+}
+
+/// What caching the noise estimate per scan saves in `align.global`: one estimate of a view of a few
+/// hundred thousand triangles, and the 12-view case (66 pairs: two estimates each before, one per
+/// scan now).
+#[test]
+#[ignore = "timing; run locally"]
+fn local_noise_estimate_cost() {
+    let view = synth::refine(&noisy(bracket_at(12, 48, 16), 5), |_| 0.4);
+    let t = std::time::Instant::now();
+    let e = surfacecraft_align::pair::ScanNoise::of(&view);
+    let one = t.elapsed().as_secs_f64();
+    eprintln!(
+        "{} triangles: one estimate {one:.2} s (sigma {:.3}); 12 views: {:.1} s before (132 estimates), {:.1} s now (12)",
+        view.triangle_count(),
+        e.sigma,
+        132.0 * one,
+        12.0 * one
+    );
 }

@@ -14,14 +14,16 @@ pub const AMBIGUITY_MARGIN: f64 = 0.03;
 pub const CONFIDENCE_THRESHOLD: f64 = 0.5;
 /// Largest share of the moving scan that may lie where the fixed scan is but off it.
 pub(super) const MAX_CONFLICT: f64 = 0.25;
-/// Largest share (0..1) of each scan's area that may lie where the other scan is, but off it, in a
-/// pose that is called `unique`: the smaller of the two shares (a conflict of both scans at once).
-/// Where two scans really coincide, one side may have surface the other lacks (a hidden face, a
-/// part only one scan saw), never both; where the pose merely lays a lumpy or box-like surface on
-/// other regions of itself, each scan's features stand where the other has bare surface.
-/// Measured on the fixtures of `pair_coarse_wrong_unique` (the confusion table of the pull request):
-/// the smaller share is at most 0.008 in every right pose and at least 0.050 in every wrong one.
-pub const MAX_MUTUAL_CONFLICT: f64 = 0.025;
+/// Largest share (0..1) of either scan's area that may lie in the free space of the other (see
+/// [`super::Scene::conflicts_at`]) in a pose that is called `unique`. A point of one scan in front of
+/// the other scan's surface, away from it by more than twice the tolerance, where that scan has
+/// surface to be hit, is a contradiction; at the right pose two scans of one part have none. Measured
+/// on 3 series of 4 fixtures (219 pairs): the larger share at the TRUE pose is at most 0.001 (3 of
+/// 3000 samples: 10 times below the bound), and the larger share of every wrong pose the command
+/// returned (95 of them) is at least 0.038 (3.8 times above). The fixtures of `global_common` hold
+/// the parts of a lump inside the tube of a ring and the sphere and the boss of the bracket inside the
+/// box, surfaces no scan has; there a right pose reads up to 0.031 and the wrong ones 0.059 and up.
+pub const UNIQUE_MAX_CONFLICT: f64 = 0.01;
 /// Stability ([`super::score::stability`]) below which a pose is called `ambiguous` whatever the
 /// probes found: the matched part can slide or turn freely. A safeguard, not the decision (every
 /// pose is probed). Measured on ambiguous parts: 0.00001 to 0.0004 (cylinder sector, long cylinder,
@@ -110,8 +112,8 @@ pub(super) struct Facts<'a> {
     pub refined: usize,
     /// Stability of the pose; below [`STABILITY_FLOOR`] the part leaves the pose free to slide.
     pub stable: f64,
-    /// The smaller of the two scans' conflicts (see [`MAX_MUTUAL_CONFLICT`]).
-    pub mutual_conflict: f64,
+    /// The larger of the two scans' conflicts (see [`UNIQUE_MAX_CONFLICT`]).
+    pub conflict: f64,
     /// What the probes found.
     pub probes: ProbeFacts,
 }
@@ -133,7 +135,7 @@ pub(super) fn judge(f: &Facts) -> (PairVerdict, f64) {
     if probes.slides > 0 || probes.attempted == 0 || probes.completed < probes.attempted {
         return (PairVerdict::Ambiguous, confidence.min(0.25));
     }
-    if !(f.stable >= STABILITY_FLOOR) || !(f.mutual_conflict <= MAX_MUTUAL_CONFLICT) {
+    if !(f.stable >= STABILITY_FLOOR) || !(f.conflict <= UNIQUE_MAX_CONFLICT) {
         return (PairVerdict::Ambiguous, confidence.min(0.25));
     }
     let verdict = if confidence >= CONFIDENCE_THRESHOLD { PairVerdict::Unique } else { PairVerdict::Ambiguous };
@@ -159,7 +161,7 @@ mod tests {
         stable: f64,
         probes: ProbeFacts,
     ) -> (PairVerdict, f64) {
-        judge(&Facts { best, overlap, tau: 0.3, clearance, refined, stable, mutual_conflict: 0.0, probes })
+        judge(&Facts { best, overlap, tau: 0.3, clearance, refined, stable, conflict: 0.0, probes })
     }
 
     #[test]
@@ -208,26 +210,29 @@ mod tests {
         assert_eq!(judged(&best, 0.99, None, 8, 0.1, OK).0, PairVerdict::Unique);
     }
 
-    /// A pose both scans contradict is never certain, however clear it stands among the others; a
-    /// conflict of one scan alone does not count.
+    /// A pose that either scan contradicts is never certain, however clear it stands among the
+    /// others.
     #[test]
-    fn a_pose_that_both_scans_contradict_is_never_unique() {
+    fn a_pose_that_either_scan_contradicts_is_never_unique() {
         let best = fit(0.8, 0.1, 0.05);
-        let facts = |mutual_conflict| Facts {
+        let facts = |conflict| Facts {
             best: &best,
             overlap: 0.8,
             tau: 0.3,
             clearance: Some(0.5),
             refined: 8,
             stable: 0.1,
-            mutual_conflict,
+            conflict,
             probes: OK,
         };
         assert_eq!(judge(&facts(0.0)).0, PairVerdict::Unique);
-        assert_eq!(judge(&facts(MAX_MUTUAL_CONFLICT)).0, PairVerdict::Unique);
-        let (verdict, confidence) = judge(&facts(2.0 * MAX_MUTUAL_CONFLICT));
+        assert_eq!(judge(&facts(UNIQUE_MAX_CONFLICT)).0, PairVerdict::Unique);
+        let (verdict, confidence) = judge(&facts(2.0 * UNIQUE_MAX_CONFLICT));
         assert_eq!(verdict, PairVerdict::Ambiguous);
         assert!(confidence <= 0.25);
-        assert_eq!(judge(&facts(f64::NAN)).0, PairVerdict::Ambiguous);
+        // a heavy contradiction is ambiguous too: no_match is for too little overlap, a poor fit or
+        // conflicts of the moving scan (a weak patch stays ambiguous whatever pose it lands on)
+        assert_eq!(judge(&facts(0.5)).0, PairVerdict::Ambiguous);
+        assert_ne!(judge(&facts(f64::NAN)).0, PairVerdict::Unique);
     }
 }

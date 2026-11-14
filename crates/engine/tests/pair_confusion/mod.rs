@@ -6,7 +6,7 @@ use crate::global_common::*;
 use crate::pair_common::*;
 use serde_json::{Value, json};
 use surfacecraft_align::{PairOptions, PoseFit, pair_coarse, pose_fit};
-use surfacecraft_geom::{Cancel, Mesh, Transform};
+use surfacecraft_geom::{Cancel, Mesh, Point3, Transform, Vec3, synth};
 
 /// A pose is right when it is within this many mm (largest displacement of a vertex of the moving
 /// scan) and degrees of the truth: the bound of the `align.global` gates, which hold views of a part.
@@ -66,12 +66,37 @@ fn wedge(k: usize, series: u64) -> Mesh {
 
 /// The four fixtures of series `series`: views of the bracket, of the blob, wedges of the blob, arcs
 /// of the lumpy ring (all with sigma 0.05 and their own tessellation and noise).
+/// The lumpy ring of `global_common` without the parts of the lumps inside the tube.
+fn visible_ring(k: usize, series: u64) -> Mesh {
+    let mut m = synth::torus(Point3::origin(), Vec3::z(), 40.0, 9.0, 72 + 4 * k, 20 + k);
+    let azimuths = [8.0, 31.0, 62.0, 80.0, 118.0, 139.0, 171.0, 203.0, 236.0, 262.0, 291.0, 330.0];
+    for (i, a) in azimuths.iter().enumerate() {
+        let (s, c) = f64::to_radians(*a).sin_cos();
+        let radius = 3.5 + 0.9 * ((i * 7) % 5) as f64;
+        let z = 1.8 * (((i * 5) % 7) as f64 - 3.0);
+        let out = 44.0 + 0.7 * ((i * 3) % 4) as f64;
+        let lump = synth::sphere(Point3::new(out * c, out * s, z), radius, 20, 10);
+        m.append(&cut(&lump, |p| (p.x.hypot(p.y) - 40.0).hypot(p.z) >= 9.0));
+    }
+    noisy(m, 600 + k as u64 + 1000 * series)
+}
+
+fn visible_ring_arc(k: usize, centre: f64, half: f64, series: u64) -> Mesh {
+    cut(&visible_ring(k, series), |p| {
+        let d = (p.y.atan2(p.x).to_degrees() - centre + 540.0).rem_euclid(360.0) - 180.0;
+        d.abs() <= half
+    })
+}
+
 pub fn fixtures(series: u64) -> Vec<(&'static str, Vec<Mesh>)> {
+    if std::env::var("PAIR_ORIGINAL").is_ok() {
+        return original_fixtures(series);
+    }
     vec![
         ("bracket", bracket_views_s(6, series)),
         ("blob", blob_views_s(series)),
         ("wedges", (0..6).map(|k| wedge(k, series)).collect()),
-        ("ring", (0..8).map(|k| ring_arc_s(k, 45.0 * k as f64, 58.0, series)).collect()),
+        ("ring", (0..8).map(|k| visible_ring_arc(k, 45.0 * k as f64, 58.0, series)).collect()),
     ]
 }
 
@@ -132,9 +157,10 @@ pub fn error_against_truth(out: &Value, views: &[Mesh], poses: &[Transform], i: 
 
 /// The cases of series `series_list` of every fixture.
 pub fn all_cases(series_list: &[u64]) -> Vec<Case> {
+    let only = std::env::var("PAIR_FIXTURES").unwrap_or_default();
     let mut all = Vec::new();
     for &series in series_list {
-        for (name, views) in fixtures(series) {
+        for (name, views) in fixtures(series).into_iter().filter(|(n, _)| only.is_empty() || only.contains(n)) {
             all.extend(run(name, &views, series));
         }
     }
@@ -254,4 +280,22 @@ fn with_truth_given(moving: &Mesh, fixed: &Mesh, truth: &Transform) -> String {
         ),
         Err(e) => format!("error {e}"),
     }
+}
+
+/// The fixtures of `global_common` as they are (the bracket and the ring with the shells of the
+/// parts inside each other); `PAIR_ORIGINAL=1` runs them in the printed table.
+fn original_fixtures(series: u64) -> Vec<(&'static str, Vec<Mesh>)> {
+    vec![
+        (
+            "bracket",
+            SIDES
+                .iter()
+                .enumerate()
+                .map(|(k, (d, r))| shelled_bracket_view_s(k, Vec3::new(d[0], d[1], d[2]), *r, series))
+                .collect(),
+        ),
+        ("blob", blob_views_s(series)),
+        ("wedges", (0..6).map(|k| wedge(k, series)).collect()),
+        ("ring", (0..8).map(|k| ring_arc_s(k, 45.0 * k as f64, 58.0, series)).collect()),
+    ]
 }

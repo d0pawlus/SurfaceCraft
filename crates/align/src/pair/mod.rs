@@ -18,6 +18,7 @@
 mod candidates;
 mod evaluate;
 mod fpfh;
+mod noise;
 mod probe;
 mod ransac;
 mod sample;
@@ -26,13 +27,13 @@ mod verdict;
 
 use crate::{AlignError, IcpOptions, IcpReport, icp_with_normals};
 use sample::Samples;
-use score::{Fit, Target, clearance, corners, fit_of, median, pose_gap};
-use surfacecraft_fit::noise::estimate_noise;
-use surfacecraft_geom::{Cancel, Mesh, Point3, SurfaceHit, Transform};
+use score::{Fit, Target, clearance, corners, fit_of, free_space_conflicts, median, pose_gap};
+use surfacecraft_geom::{Cancel, Mesh, Point3, Rng, SurfaceHit, Transform};
 
 pub use evaluate::{PoseFit, pose_fit};
+pub use noise::ScanNoise;
 pub use verdict::{
-    AMBIGUITY_MARGIN, CONFIDENCE_THRESHOLD, CoarseMethod, MAX_MUTUAL_CONFLICT, MIN_OVERLAP, PairCandidate, PairVerdict,
+    AMBIGUITY_MARGIN, CONFIDENCE_THRESHOLD, CoarseMethod, MIN_OVERLAP, PairCandidate, PairVerdict, UNIQUE_MAX_CONFLICT,
 };
 
 /// A triangle and a fixed sample are on the same face when their normals agree to this cosine (30 degrees).
@@ -41,6 +42,9 @@ const SAME_FACE_COS: f64 = 0.866;
 const MIN_TRIANGLES: usize = 4;
 /// Most samples per scan in the coarse stage.
 const SAMPLE_CAP: usize = 3000;
+/// Samples of each scan for the conflict test, and the seed of their stream.
+const CONFLICT_SAMPLES: usize = 3000;
+const CONFLICT_SEED: u64 = 0xC0F1_1C75;
 /// Moving samples used to score the unrefined candidates.
 const SHORTLIST_SAMPLES: usize = 1500;
 /// Candidates refined by ICP: the best 8 distinct ones, and up to 16 when more score within
@@ -81,6 +85,9 @@ pub struct PairOptions {
     /// and the 24 principal-axes poses are tried, so a roughly placed pair costs a fraction of a
     /// search. `None` (the default) is the full search.
     pub given: Option<Transform>,
+    /// The noise estimates of the moving and of the fixed scan, when the caller has them already
+    /// (`align.global` estimates each scan once, not once per pair); `None` estimates them.
+    pub noises: Option<(ScanNoise, ScanNoise)>,
 }
 
 /// What [`pair_coarse`] found.
@@ -96,8 +103,9 @@ pub struct PairResult {
     pub confidence: f64,
     /// Tolerance (mm) used.
     pub tolerance: f64,
-    /// Noise (mm) of the pair: the noise estimates of the two scans combined; the default tolerance
-    /// is at most four times it.
+    /// Noise (mm) of the pair: the noise estimates of the two scans combined, 0 when either is not
+    /// trustworthy (see [`ScanNoise`]: the default tolerance then has no noise cap); otherwise the
+    /// default tolerance is at most four times it.
     pub noise: f64,
     /// Share (0..1) of the moving scan's area on the fixed scan.
     pub overlap_moving: f64,
@@ -107,6 +115,8 @@ pub struct PairResult {
     pub conflict_moving: f64,
     /// Share (0..1) of the fixed scan's area that lies where the moving scan is, but off it.
     pub conflict_fixed: f64,
+    /// Does either scan contradict the best pose by more than [`UNIQUE_MAX_CONFLICT`]?
+    pub contradicted: bool,
     /// RMS distance (mm) of the matched part of the moving scan (0 when nothing matched).
     pub rms: f64,
     /// Stage that proposed the best pose.
@@ -160,12 +170,20 @@ struct Scene<'a> {
     mov: Samples,
     fix: Samples,
     fixed: Target<'a>,
+    /// The moving scan as a target (border-aware), for the fixed scan's side of every measure.
+    moving_target: Target<'a>,
+    /// Area-uniform samples of each scan for the conflict test: as many for a small scan as for a
+    /// large one (the coarse samples are as dense as the larger scan allows, a small patch gets a few
+    /// hundred of them and a share of them is a few samples).
+    conflict_mov: Vec<Point3>,
+    conflict_fix: Vec<Point3>,
     /// The moving samples as a point-only mesh, the source of the short ICP passes.
     mov_cloud: Mesh,
     diag: f64,
     spacing: f64,
-    /// Noise (mm) of the pair: the estimates of the two scans combined as a root of squares.
-    noise: f64,
+    /// Noise (mm) of the pair: the estimates of the two scans combined as a root of squares; `None`
+    /// when an estimate is not trustworthy (the tolerance then has no noise cap).
+    noise: Option<f64>,
 }
 
 fn check_scan(m: &Mesh, what: &str) -> Result<f64, AlignError> {
@@ -184,7 +202,12 @@ fn check_scan(m: &Mesh, what: &str) -> Result<f64, AlignError> {
 }
 
 impl<'a> Scene<'a> {
-    fn new(moving: &'a Mesh, fixed: &'a Mesh, cancel: &Cancel) -> Result<Self, AlignError> {
+    fn new(
+        moving: &'a Mesh,
+        fixed: &'a Mesh,
+        noises: Option<(ScanNoise, ScanNoise)>,
+        cancel: &Cancel,
+    ) -> Result<Self, AlignError> {
         let (am, af) = (check_scan(moving, "moving")?, check_scan(fixed, "fixed")?);
         let diag = fixed.bbox().diagonal();
         if !(diag.is_finite() && diag > 0.0) {
@@ -203,8 +226,27 @@ impl<'a> Scene<'a> {
         let fix =
             sample::sample(fixed, sample::count_for(af, spacing, SAMPLE_CAP), spacing, 2, cancel).ok_or_else(few)?;
         let mov_cloud = Mesh { positions: mov.pts.clone(), triangles: Vec::new() };
-        let noise = estimate_noise(moving).hypot(estimate_noise(fixed));
-        Ok(Scene { moving, mov, fix, fixed: Target::new(fixed, diag), mov_cloud, diag, spacing, noise })
+        let (nm, nf) = noises.unwrap_or_else(|| (ScanNoise::of(moving), ScanNoise::of(fixed)));
+        let noise = noise::pair_noise(&nm, &nf);
+        let conflict_samples = |m: &Mesh, stream: u64| -> Vec<Point3> {
+            m.sample_points(CONFLICT_SAMPLES, &mut Rng::new(CONFLICT_SEED ^ stream))
+                .into_iter()
+                .map(|(p, _)| p)
+                .collect()
+        };
+        Ok(Scene {
+            moving,
+            mov,
+            fix,
+            fixed: Target::new(fixed, diag),
+            moving_target: Target::new(moving, moving.bbox().diagonal()),
+            conflict_mov: conflict_samples(moving, 3),
+            conflict_fix: conflict_samples(fixed, 4),
+            mov_cloud,
+            diag,
+            spacing,
+            noise,
+        })
     }
 
     /// The given pose and the principal-axes poses (no descriptors).
@@ -336,7 +378,7 @@ impl<'a> Scene<'a> {
         });
         let inside: Vec<f64> = dist.into_iter().filter(|d| d.is_finite()).collect();
         let from_pose = TAU_FACTOR * median(inside);
-        from_pose.min(TAU_SIGMAS * self.noise).clamp(lo, hi)
+        from_pose.min(self.noise.map_or(f64::INFINITY, |n| TAU_SIGMAS * n)).clamp(lo, hi)
     }
 
     /// The tolerance of the best refined candidate (see [`Scene::tolerance_at`]).
@@ -422,8 +464,18 @@ impl<'a> Scene<'a> {
     /// Per pose, how the fixed scan's samples fit the moving scan placed there (the other side of
     /// [`fit_of`] on the moving samples): the share within `tau` and the conflicts.
     fn fits_fixed(&self, poses: &[Transform], tau: f64) -> Vec<Fit> {
-        let moving = Target::new(self.moving, self.moving.bbox().diagonal());
-        poses.iter().map(|t| fit_of(&moving, &self.fix.pts, &t.inverse(), tau, true)).collect()
+        poses.iter().map(|t| fit_of(&self.moving_target, &self.fix.pts, &t.inverse(), tau, true)).collect()
+    }
+
+    /// The conflicts of both scans at pose `t` on the dedicated samples: (moving, fixed). A point
+    /// of one scan is in conflict when it lies in the free space of the other scan: the other scan
+    /// is there (the closest point of it is not at its border) but more than twice `tau` away and
+    /// the point is in front of it. Surface beyond the border of the other scan, and surface behind
+    /// it, is neutral: both numbers are measured inside the footprint of the other scan.
+    fn conflicts_at(&self, t: &Transform, tau: f64) -> (f64, f64) {
+        let moving = free_space_conflicts(&self.fixed, &self.conflict_mov, t, tau);
+        let fixed = free_space_conflicts(&self.moving_target, &self.conflict_fix, &t.inverse(), tau);
+        (moving, fixed)
     }
 }
 
@@ -448,7 +500,7 @@ fn alternative(r: &Ranked, other: &Fit) -> PairCandidate {
 /// method. Input is checked (finite, with area); an error means no pose could be tried, a
 /// [`PairVerdict::NoMatch`] means the best one found is not a match.
 pub fn pair_coarse(moving: &Mesh, fixed: &Mesh, opts: &PairOptions, cancel: &Cancel) -> Result<PairResult, AlignError> {
-    let scene = Scene::new(moving, fixed, cancel)?;
+    let scene = Scene::new(moving, fixed, opts.noises, cancel)?;
     scene.check_tolerance(opts.tolerance)?;
     let hyps = match &opts.given {
         Some(g) => scene.given_hypotheses(g),
@@ -488,7 +540,8 @@ fn solve(scene: &Scene, hyps: Vec<Cand>, opts: &PairOptions, cancel: &Cancel) ->
     let shares = scene.fits_fixed(&poses, tau);
     let checks =
         verdict::ProbeFacts { attempted: probe.attempted, completed: probe.completed, slides: probe.slides.len() };
-    let mut result = conclude(&best, &ranked, tau, &shares, refined_count, probe.stability, checks)?;
+    let conflicts = scene.conflicts_at(&best.cand.t, tau);
+    let mut result = conclude(&best, &ranked, tau, &shares, conflicts, refined_count, probe.stability, checks)?;
     result.probed = probe.attempted;
     result.probes_failed = probe.attempted - probe.completed;
     result.slides = probe.slides.len();
@@ -498,7 +551,7 @@ fn solve(scene: &Scene, hyps: Vec<Cand>, opts: &PairOptions, cancel: &Cancel) ->
     result.probe_margin = probe.margin;
     result.probe_return_gap = probe.returned_gap;
     result.candidates = candidates;
-    result.noise = scene.noise;
+    result.noise = scene.noise.unwrap_or(0.0);
     result.icp_iterations = icp_iterations;
     result.icp_converged = icp_converged;
     Ok(result)
@@ -511,6 +564,7 @@ fn conclude(
     others: &[Ranked],
     tau: f64,
     fixed: &[Fit],
+    conflicts: (f64, f64),
     refined: usize,
     stable: f64,
     probes: verdict::ProbeFacts,
@@ -532,7 +586,7 @@ fn conclude(
         clearance: nearest,
         refined,
         stable,
-        mutual_conflict: best.fit.conflict.min(fixed_fit.conflict),
+        conflict: conflicts.0.max(conflicts.1),
         probes,
     };
     let (verdict, confidence) = verdict::judge(&facts);
@@ -553,8 +607,9 @@ fn conclude(
         noise: 0.0,
         overlap_moving: best.fit.share,
         overlap_fixed,
-        conflict_moving: best.fit.conflict,
-        conflict_fixed: fixed_fit.conflict,
+        conflict_moving: conflicts.0,
+        conflict_fixed: conflicts.1,
+        contradicted: !(conflicts.0.max(conflicts.1) <= UNIQUE_MAX_CONFLICT),
         rms: finite_or_zero(best.fit.rms),
         method: best.cand.method,
         alternatives,
@@ -604,7 +659,7 @@ mod tests {
         let pose = Transform::rotation_axis_angle(&Vec3::new(0.2, 0.7, -0.4), 2.0)
             .then_after(&Transform::translation(Vec3::new(60.0, 10.0, -30.0)));
         let moved = moving.transformed(&pose);
-        let scene = Scene::new(&moved, &fixed, &Cancel::new()).unwrap();
+        let scene = Scene::new(&moved, &fixed, None, &Cancel::new()).unwrap();
         let hyps = scene.hypotheses(&Cancel::new()).unwrap();
         let truth = pose.inverse();
         let miss = |method: CoarseMethod| {
@@ -628,7 +683,7 @@ mod tests {
         let pose = Transform::rotation_axis_angle(&Vec3::new(1.0, 0.1, 0.3), 2.8)
             .then_after(&Transform::translation(Vec3::new(-50.0, 20.0, 90.0)));
         let moved = moving.transformed(&pose);
-        let scene = Scene::new(&moved, &fixed, &Cancel::new()).unwrap();
+        let scene = Scene::new(&moved, &fixed, None, &Cancel::new()).unwrap();
         let hyps = scene.hypotheses(&Cancel::new()).unwrap();
         let near = hyps
             .iter()
@@ -644,16 +699,32 @@ mod tests {
     #[test]
     fn the_tolerance_is_capped_by_the_noise_of_the_pair() {
         let (fixed, moving) = (bracket(12, 1), bracket(15, 2));
-        let scene = Scene::new(&moving, &fixed, &Cancel::new()).unwrap();
-        let cap = TAU_SIGMAS * scene.noise;
-        eprintln!("noise of the pair {:.4}, cap {cap:.3}, range {:?}", scene.noise, TAU_RANGE);
-        assert!((0.05..0.12).contains(&scene.noise), "two scans of sigma 0.05 give 0.07: {}", scene.noise);
+        let scene = Scene::new(&moving, &fixed, None, &Cancel::new()).unwrap();
+        let noise = scene.noise.unwrap();
+        let cap = TAU_SIGMAS * noise;
+        eprintln!("noise of the pair {noise:.4}, cap {cap:.3}, range {:?}", TAU_RANGE);
+        assert!((0.05..0.12).contains(&noise), "two scans of sigma 0.05 give 0.07: {noise}");
         let off = Transform::translation(Vec3::new(4.0, 2.0, 0.0));
         let (right, wrong) = (scene.tolerance_at(&Transform::identity(), None), scene.tolerance_at(&off, None));
         eprintln!("tolerance at the right pose {right:.3}, at a pose 4.5 mm off {wrong:.3}");
         assert!(right <= cap && wrong <= cap);
         assert!(wrong >= TAU_RANGE.0 * scene.diag);
         assert_eq!(scene.tolerance_at(&off, Some(2.0)), 2.0, "the caller's tolerance is not capped");
+    }
+
+    /// The noise estimates handed in (as `align.global` does, once per scan) give the very answer
+    /// the pair gives when it estimates them itself.
+    #[test]
+    fn noise_estimates_handed_in_change_nothing() {
+        let (fixed, moving) = (bracket(12, 1), bracket(15, 2));
+        let moved = moving.transformed(&Transform::translation(Vec3::new(30.0, -20.0, 10.0)));
+        let own = pair_coarse(&moved, &fixed, &PairOptions::default(), &Cancel::new()).unwrap();
+        let noises = Some((ScanNoise::of(&moved), ScanNoise::of(&fixed)));
+        let given =
+            pair_coarse(&moved, &fixed, &PairOptions { noises, ..PairOptions::default() }, &Cancel::new()).unwrap();
+        assert_eq!(own.transform, given.transform);
+        assert_eq!((own.tolerance, own.noise, own.verdict), (given.tolerance, given.noise, given.verdict));
+        assert!(own.noise > 0.0);
     }
 
     /// Finding 6: the count of refined candidates is produced by `solve`; with a single candidate
@@ -664,7 +735,7 @@ mod tests {
         let pose = Transform::rotation_axis_angle(&Vec3::new(1.0, 0.1, 0.3), 2.8)
             .then_after(&Transform::translation(Vec3::new(-50.0, 20.0, 90.0)));
         let moved = bracket(15, 2).transformed(&pose);
-        let scene = Scene::new(&moved, &fixed, &Cancel::new()).unwrap();
+        let scene = Scene::new(&moved, &fixed, None, &Cancel::new()).unwrap();
         let hyps = scene.hypotheses(&Cancel::new()).unwrap();
         let truth = pose.inverse();
         let best = hyps

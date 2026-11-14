@@ -32,26 +32,27 @@ pub fn pose_fit(
     tolerance: Option<f64>,
     cancel: &Cancel,
 ) -> Result<PoseFit, AlignError> {
-    let scene = Scene::new(moving, fixed, cancel)?;
+    let scene = Scene::new(moving, fixed, None, cancel)?;
     scene.check_tolerance(tolerance)?;
     let tau = scene.tolerance_at(pose, tolerance);
     let on_fixed = fit_of(&scene.fixed, &scene.mov.pts, pose, tau, true);
     let on_moving = scene.fits_fixed(std::slice::from_ref(pose), tau);
     let other = on_moving.first();
+    let (conflict_moving, conflict_fixed) = scene.conflicts_at(pose, tau);
     Ok(PoseFit {
         tolerance: tau,
-        noise: scene.noise,
+        noise: scene.noise.unwrap_or(0.0),
         overlap_moving: on_fixed.share,
         overlap_fixed: other.map_or(0.0, |f| f.share),
-        conflict_moving: on_fixed.conflict,
-        conflict_fixed: other.map_or(0.0, |f| f.conflict),
+        conflict_moving,
+        conflict_fixed,
         rms: on_fixed.rms,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::verdict::MAX_MUTUAL_CONFLICT;
+    use super::super::verdict::UNIQUE_MAX_CONFLICT;
     use super::*;
     use surfacecraft_geom::{Point3, Rng, Vec3, synth};
 
@@ -75,9 +76,9 @@ mod tests {
         let wrong = pose_fit(&moving, &fixed, &half_turn, None, &Cancel::new()).unwrap();
         eprintln!("right {right:?}\nwrong {wrong:?}");
         assert!(right.overlap_moving > 0.9 && right.overlap_fixed > 0.9);
-        assert!(right.conflict_moving.min(right.conflict_fixed) <= MAX_MUTUAL_CONFLICT / 2.0);
+        assert!(right.conflict_moving.max(right.conflict_fixed) <= UNIQUE_MAX_CONFLICT / 2.0);
         assert!(wrong.overlap_moving > 0.5, "the faces fit: {}", wrong.overlap_moving);
-        assert!(wrong.conflict_moving.min(wrong.conflict_fixed) >= 2.0 * MAX_MUTUAL_CONFLICT);
+        assert!(wrong.conflict_moving.min(wrong.conflict_fixed) >= 2.0 * UNIQUE_MAX_CONFLICT);
     }
 
     #[test]

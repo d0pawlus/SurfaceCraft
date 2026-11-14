@@ -2,6 +2,7 @@
 //! tightly. Truncated, so surface that has no counterpart (partial overlap) costs a fixed amount
 //! and does not drag a good pose down the way a mean or a median distance would.
 use super::sample::Samples;
+use std::collections::HashSet;
 use surfacecraft_geom::{Bvh, Mat3, Mesh, Point3, Transform, Vec3};
 
 /// Weight of a conflict against a match in [`Fit::score`].
@@ -51,23 +52,48 @@ pub(super) struct Target<'a> {
     pub bvh: Bvh,
     /// Per triangle, bit `k` set when edge `k` (corner `k` to `k + 1`) has no neighbour.
     open: Vec<u8>,
+    /// The corners (by position) of the open edges: a closest point at such a corner is on the border
+    /// even when the triangle hit has no open edge of its own there (the corner of a ragged border).
+    rim: HashSet<[i64; 3]>,
+    /// Scale of the position cells of `rim`.
+    cell_scale: f64,
     /// Closest points within this of an open edge count as lying on the scan's border.
     border: f64,
+}
+
+fn cell_of(p: &Point3, scale: f64) -> [i64; 3] {
+    [(p.x * scale).round() as i64, (p.y * scale).round() as i64, (p.z * scale).round() as i64]
 }
 
 impl<'a> Target<'a> {
     pub(super) fn new(mesh: &'a Mesh, diag: f64) -> Self {
         let open = open_edges(mesh, diag);
-        Target { mesh, bvh: Bvh::build(mesh), open, border: 1e-7 * diag }
+        let cell_scale = 1.0 / (1e-6 * diag).max(1e-300);
+        let mut rim = HashSet::new();
+        for (i, &bits) in open.iter().enumerate() {
+            let Some(c) = mesh.triangle(i) else { continue };
+            for k in 0..3 {
+                if bits >> k & 1 == 1 {
+                    rim.insert(cell_of(&c[k], cell_scale));
+                    rim.insert(cell_of(&c[(k + 1) % 3], cell_scale));
+                }
+            }
+        }
+        Target { mesh, bvh: Bvh::build(mesh), open, rim, cell_scale, border: 1e-7 * diag }
     }
 
-    /// Does the closest point `q` of triangle `tri` lie on an open edge of the scan?
-    fn on_border(&self, tri: usize, q: &Point3) -> bool {
+    /// Does the closest point `q` of triangle `tri` lie on an open edge of the scan? With `corners`,
+    /// also at a corner of the border that the triangle hit has no open edge at (the corner of a
+    /// ragged border, where the neighbouring triangle's edge is the open one).
+    fn on_border(&self, tri: usize, q: &Point3, corners: bool) -> bool {
         let (Some(&bits), Some(c)) = (self.open.get(tri), self.mesh.triangle(tri)) else { return false };
-        (0..3).any(|k| {
+        let on_open_edge = (0..3).any(|k| {
             let (a, b) = (c[k], c[(k + 1) % 3]);
             bits >> k & 1 == 1 && dist_to_segment(q, &a, &b) <= self.border
-        })
+        });
+        on_open_edge
+            || (corners
+                && c.iter().any(|v| (q - v).norm() <= self.border && self.rim.contains(&cell_of(v, self.cell_scale))))
     }
 }
 
@@ -113,7 +139,7 @@ pub(super) fn fit_of(target: &Target, pts: &[Point3], t: &Transform, tau: f64, c
     let reach = if conflicts { f64::INFINITY } else { tau };
     let dist: Vec<Option<(f64, bool)>> = surfacecraft_geom::par::map_slice(pts, |p| {
         let h = target.bvh.closest(&t.apply(p), reach)?;
-        let conflict = conflicts && h.distance > CONFLICT_TAUS * tau && !target.on_border(h.triangle, &h.point);
+        let conflict = conflicts && h.distance > CONFLICT_TAUS * tau && !target.on_border(h.triangle, &h.point, false);
         Some((h.distance, conflict))
     });
     let n = dist.len();
@@ -135,6 +161,26 @@ pub(super) fn fit_of(target: &Target, pts: &[Point3], t: &Transform, tau: f64, c
         rms: if inliers > 0 { (sq / inliers as f64).sqrt() } else { f64::INFINITY },
         msac: (sq + outliers * tau * tau) / n as f64,
     }
+}
+
+/// The share of `pts` (moved by `t`) that lie in the free space of `target`: where the target is
+/// (the closest point of it is not at its border) but more than twice `tau` away and in front of its
+/// surface (on the side its triangle normal points to). A point behind the surface is unobservable by
+/// the target (its other side: the underside of a box seen from the top) and says nothing. Needs
+/// triangles oriented consistently, outward, as the descriptors of `pair_coarse` do.
+pub(super) fn free_space_conflicts(target: &Target, pts: &[Point3], t: &Transform, tau: f64) -> f64 {
+    if pts.is_empty() {
+        return 0.0;
+    }
+    let bad: Vec<bool> = surfacecraft_geom::par::map_slice(pts, |p| {
+        let q = t.apply(p);
+        let Some(h) = target.bvh.closest(&q, f64::INFINITY) else { return false };
+        if h.distance <= CONFLICT_TAUS * tau || target.on_border(h.triangle, &h.point, true) {
+            return false;
+        }
+        target.bvh.triangle_normal(h.triangle).is_some_and(|n| (q - h.point).dot(&n) > 0.0)
+    });
+    bad.iter().filter(|b| **b).count() as f64 / pts.len() as f64
 }
 
 /// A direction in which the matched part may be loose: a small rigid motion (rotation vector
@@ -370,6 +416,27 @@ mod tests {
         let f = fit_of(&target, &beyond, &Transform::identity(), 0.5, true);
         assert_eq!(f.conflict, 0.0);
         assert_eq!(f.share, 0.0);
+    }
+
+    /// The corner of a ragged border: a point whose closest point is the centre of a fan lying on the
+    /// border is at the end of the scan whichever triangle of the fan the search returns, also the
+    /// middle one, which has no open edge of its own.
+    #[test]
+    fn a_closest_point_at_a_corner_of_the_border_is_on_the_border_in_every_triangle() {
+        let ring = |deg: f64| Point3::new(deg.to_radians().cos(), deg.to_radians().sin(), 0.0);
+        let mesh = Mesh {
+            positions: vec![Point3::origin(), ring(0.0), ring(60.0), ring(120.0), ring(180.0)],
+            triangles: vec![[0, 1, 2], [0, 2, 3], [0, 3, 4]],
+        };
+        let target = Target::new(&mesh, 2.0);
+        for tri in 0..3 {
+            assert!(target.on_border(tri, &Point3::origin(), true), "triangle {tri}");
+        }
+        // an interior point of the middle triangle is not on the border
+        assert!(!target.on_border(1, &Point3::new(0.0, 0.5, 0.0), true));
+        // the far point below the centre: a point beyond the end of the scan, no conflict
+        let f = fit_of(&target, &[Point3::new(0.0, -2.0, 0.0)], &Transform::identity(), 0.1, true);
+        assert_eq!(f.conflict, 0.0);
     }
 
     /// Finding 4: a matrix that is not finite has no eigenvalue to report (and must not be handed to

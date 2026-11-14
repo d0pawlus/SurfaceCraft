@@ -145,16 +145,20 @@ Normals, colours and per-vertex data go with the coordinates.
 - The `tolerance` (default) is five times the median distance of the best pose's points, but never
   more than four times the `noise` of the pair (each scan's own estimate, combined): a tolerance made
   of the pose's own residual lets a pose that merely lies on other regions of a lumpy surface pass
-  as a fit.
-- `conflict_moving` and `conflict_fixed`: the share of each scan's area that lies where the other
-  scan is but off it (more than twice the tolerance away, and not at the end of the other scan).
-  A pose that both scans contradict (both shares above 0.025) is never `unique`: where two scans
-  really coincide, one may have a face the other lacks, never both; where a pose lays the features
-  of both on bare surface of the other (the faces of a box, the tube of a ring) each contradicts the
-  other. Such a pose is `ambiguous` with a confidence of at most 0.25, and the note says why.
+  as a fit. A coarse mesh makes the estimate unreliable (`noise` 0): the tolerance then has no noise
+  cap and the conflicts below carry the verdict.
+- `conflict_moving` and `conflict_fixed`: the share of each scan's area (3000 samples of each, however
+  small the scan) that lies in the free space of the other: the other scan is there, but the point
+  is in front of its surface and more than twice the tolerance away. Surface beyond the end of the
+  other scan, or behind its surface (the underside of a box seen from the top), says nothing. At the
+  right pose both are near 0 (at most 0.001 on the test fixtures); a pose where either exceeds 0.01
+  is never `unique`: it is `ambiguous` with a confidence of at most 0.25 and the note says why
+  (`no_match` stays for too little overlap, a poor fit or conflicts of the moving scan: a weak patch
+  that lands anywhere is `ambiguous`, not `no_match`). A patch laid flat on a large scan where that has a boss over its
+  footprint reads 0 on its own side and the boss shows on the other. Needs triangles oriented outward.
 - `verdict`: `unique` (one pose clearly fits better than any other: every other pose has at least
-  3 % of the moving scan's area more in conflict or less on the target, the scans do not
-  contradict each other, and the pose survives being pushed), `ambiguous` (a symmetric part: the near-tied poses are in `alternatives`; or a part that
+  3 % of the moving scan's area more in conflict or less on the target, neither scan contradicts
+  the other, and the pose survives being pushed), `ambiguous` (a symmetric part: the near-tied poses are in `alternatives`; or a part that
   can slide or turn freely, such as a flat or cylindrical patch) or `no_match` (too little overlap,
   or different parts).
 - The push: every pose is displaced by 0.2 of the moving scan's extent along each of its three
@@ -170,6 +174,11 @@ Normals, colours and per-vertex data go with the coordinates.
 - It proposes by default (`apply` false); a pose that is not `unique` is applied only when
   `choose` names it (0 the best, 1 and up the alternatives; `choose` needs `apply`). The result then
   carries the numbers of the pose chosen. When `apply` was given and nothing moved, `refused` is true.
+- Limit, in plain words: two pieces of a part that has a symmetry cannot be told from the same piece
+  scanned twice, so such a pair can come back `unique` at a wrong pose (the pieces are congruent and
+  every surface fits). Give a rough start (place the scans by hand: `align.global` with `start`
+  `current` takes it), or scan more views, so that `align.global` finds the pose contradicted by the
+  other scans.
 - Limits: the triangles of both scans must be consistently oriented (the descriptors use the
   normals); surface that ends at the border of the other scan is no conflict, but a part whose
   shared region is only flat or a cylinder-like surface is reported `ambiguous`; a scan that
