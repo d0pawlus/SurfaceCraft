@@ -23,6 +23,7 @@ mod crease;
 mod decimate;
 mod ear;
 pub mod edit;
+pub mod folds;
 mod holes;
 pub mod kdtree;
 pub mod lod;

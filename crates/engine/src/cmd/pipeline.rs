@@ -35,6 +35,8 @@ mod merging;
 mod prepare;
 #[path = "pipeline_shell.rs"]
 mod shell;
+#[path = "pipeline_shell_folds.rs"]
+mod shell_folds;
 pub use prepare::{ComponentOut, PrepOut, PrepStep};
 #[path = "pipeline_rebuild.rs"]
 mod rebuild;
@@ -158,6 +160,9 @@ pub struct ToSolidIn {
     /// Keep the thickened mesh in the document (default false: it is removed; needs `thickness`).
     #[serde(default)]
     pub keep_thickened: bool,
+    /// Remove folds of the scan before it is thickened (default false; needs `thickness`): small groups of triangles that face against the surface around them and pass through the sheet (often a hole-fill patch crossing its surroundings) block a wall however thin. A removal taller than `tolerance` keeps the verdict at `review` with the issue `scan_folds_removed`. Without it nothing changes; a shell result with crossings offers it as a next step when folds that could be removed exist.
+    #[serde(default)]
+    pub remove_folds: bool,
     /// Name of the solid (default "solid").
     #[serde(default)]
     pub name: Option<String>,
@@ -327,6 +332,8 @@ fn prepare(s: &mut Session, i: &ToSolidIn, scan: ObjectId) -> CmdResult<ScanSumm
                 min_component_triangles: None,
                 outlier_ratio: None,
                 fill_holes_max_edges: Some(i.fill_holes_max_edges.unwrap_or(FILL_HOLES_MAX_EDGES)),
+                remove_folds: None,
+                fold_tolerance: None,
             },
         )?;
         filled = edit.holes_filled.unwrap_or(0);

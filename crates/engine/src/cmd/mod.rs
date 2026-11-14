@@ -23,6 +23,7 @@ pub mod feature;
 pub mod hybrid;
 pub mod mesh;
 pub mod mesh_edit;
+pub mod mesh_folds;
 pub mod mesh_remesh;
 pub mod param;
 pub mod pipeline;

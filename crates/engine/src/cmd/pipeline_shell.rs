@@ -7,13 +7,16 @@
 //! scan itself for `thickness` of either sign and the scan moved half the thickness along its
 //! normals for `symmetric` (the scan then lies in the middle of the wall, where it has no face).
 use super::freeform::{self, CapRetry};
+use super::shell_folds::{FoldRun, fold_issue, fold_offer, judged as judged_against_the_original};
 use super::{
     DeviationSummary, Issue, MIN_COVERAGE, Method, NextStep, Settings, ToSolidIn, ToSolidOut, Verdict, issue,
     message_of, step, summary,
 };
 use crate::Session;
 use crate::cmd::mesh::thicken::{ShellCounts, command_error, crossing_issues};
+use crate::cmd::mesh_edit::remove_folds;
 use crate::cmd::mesh_edit::{FillIn, fill};
+use crate::cmd::mesh_folds::FoldsOut;
 use crate::cmd::qa::{CompareIn, compare_points};
 use crate::cmd::wrap::{PATCH_LIMIT, WrapIn, WrapOut, wrap};
 use crate::cmd::{CmdError, CmdResult, ObjRef};
@@ -77,6 +80,9 @@ pub struct ThickenedInfo {
     pub self_intersections_exhaustive: usize,
     /// Triangles of the thickened mesh.
     pub triangles: usize,
+    /// What cleaning did about folds of the scan (small groups of triangles facing against the surface around them where the scan crosses itself): removed, left, and how large.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folds: Option<FoldsOut>,
     /// The thickened mesh, when `keep_thickened` kept it in the document.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<ObjectId>,
@@ -85,8 +91,8 @@ pub struct ThickenedInfo {
 /// Rejects the combinations of `thickness` with other parameters that mean nothing.
 pub(super) fn check(i: &ToSolidIn) -> CmdResult<()> {
     let Some(t) = i.thickness else {
-        if i.symmetric || i.keep_thickened {
-            return Err(CmdError::Params("`symmetric` and `keep_thickened` need `thickness`".into()));
+        if i.symmetric || i.keep_thickened || i.remove_folds {
+            return Err(CmdError::Params("`symmetric`, `keep_thickened` and `remove_folds` need `thickness`".into()));
         }
         return Ok(());
     };
@@ -127,6 +133,7 @@ pub(super) fn run(s: &mut Session, set: &Settings, i: &ToSolidIn) -> CmdResult<T
         .doc
         .mesh(set.scan)
         .map_or(0, |m| surfacecraft_geom::edit::boundary_loops(&m.mesh).iter().map(Vec::len).max().unwrap_or(0));
+    let scan_triangles = s.doc.mesh(set.scan).map_or(0, |m| m.mesh.triangle_count());
     let fill_up_to = limit.min(rim.saturating_sub(1));
     if rim > 0 && fill_up_to > 0 {
         let edit = fill(s, FillIn { object: ObjRef::Id(set.scan.0), max_edges: Some(fill_up_to), smooth: Some(true) })?;
@@ -134,7 +141,15 @@ pub(super) fn run(s: &mut Session, set: &Settings, i: &ToSolidIn) -> CmdResult<T
         report.holes_left = edit.holes_left.unwrap_or(report.holes_left);
         report.triangles = edit.triangles;
     }
-    shell_solid(s, set, i, report)
+    // after the holes are filled: a patch can cross the sheet around it, and folds block a wall
+    let folds = if i.clean && i.remove_folds {
+        let (edit, removed) = remove_folds(s, &ObjRef::Id(set.scan.0), set.tolerance, scan_triangles)?;
+        report.triangles = edit.triangles;
+        FoldRun::new(edit.folds, removed)
+    } else {
+        FoldRun::new(None, Mesh::default())
+    };
+    shell_solid(s, set, i, (report, folds))
 }
 
 fn info(shell: &Thickened, i: &ToSolidIn, kept: Option<ObjectId>) -> ThickenedInfo {
@@ -162,6 +177,7 @@ fn info(shell: &Thickened, i: &ToSolidIn, kept: Option<ObjectId>) -> ThickenedIn
         self_intersections: shell.report.crossing_triangles,
         self_intersections_exhaustive: shell.report.crossing_far_exhaustive,
         triangles: shell.mesh.triangle_count(),
+        folds: None,
         mesh: kept,
     }
 }
@@ -191,9 +207,35 @@ fn refusal_code(e: &ThickenError) -> &'static str {
     }
 }
 
+/// What cleaning did about folds, said with a refusal for crossings that stay: the user learns which folds
+/// were removed and which are still there (count, widest), so that the refusal is not a mystery.
+fn fold_note(e: &ThickenError, folds: Option<&FoldsOut>) -> String {
+    let (ThickenError::UnresolvedCrossings { .. }, Some(f)) = (e, folds) else { return String::new() };
+    let widest = f.left_largest.first().map_or(0.0, |l| l.extent);
+    let r = &f.refused;
+    format!(
+        " (cleaning removed {} folds of the scan ({} triangles); {} folds are still there, the widest {widest:.1} mm across, left because {} are too large, {} at a hub or with a margin that is too large, {} beside a crease or corner, {} would need a patch that strays from the surface, {} could not be filled; `mesh.clean` lists them)",
+        f.removed,
+        f.removed_triangles,
+        f.left,
+        r.too_large,
+        r.hub_or_margin,
+        r.beside_feature,
+        r.fill_refused,
+        r.unfillable
+    )
+}
+
 /// The result of a run whose scan could not be thickened: a verdict, not an error.
-fn refused(set: &Settings, report: super::ScanSummary, e: &ThickenError, i: &ToSolidIn) -> ToSolidOut {
-    let issues = vec![issue(refusal_code(e), format!("the scan could not be thickened: {e}"))];
+fn refused(
+    set: &Settings,
+    report: super::ScanSummary,
+    e: &ThickenError,
+    i: &ToSolidIn,
+    folds: Option<&FoldsOut>,
+    repaired: &Mesh,
+) -> ToSolidOut {
+    let issues = vec![issue(refusal_code(e), format!("the scan could not be thickened: {e}{}", fold_note(e, folds)))];
     let mut next = Vec::new();
     if let ThickenError::Folds { suggested, .. } = e {
         // the sign of the thickness says where the material is: the suggestion keeps it
@@ -203,6 +245,9 @@ fn refused(set: &Settings, report: super::ScanSummary, e: &ThickenError, i: &ToS
             let params = json!({"scan": set.scan, "thickness": smaller, "symmetric": i.symmetric});
             next.push(step("scan.to_solid", params, "a wall the surface can carry (a thinner one folds less)"));
         }
+    }
+    if matches!(e, ThickenError::UnresolvedCrossings { .. }) {
+        next.extend(fold_offer(repaired, set, i));
     }
     next.push(step(
         "guide.read",
@@ -280,7 +325,7 @@ pub(super) fn shell_solid(
     s: &mut Session,
     set: &Settings,
     i: &ToSolidIn,
-    report: super::ScanSummary,
+    (report, folds): (super::ScanSummary, FoldRun),
 ) -> CmdResult<ToSolidOut> {
     let (thickness, symmetric) = (i.thickness.unwrap_or(0.0), i.symmetric);
     let scan = s.doc.mesh(set.scan).ok_or_else(|| CmdError::Params(format!("no mesh {}", set.scan)))?;
@@ -293,16 +338,16 @@ pub(super) fn shell_solid(
             ));
         }
         Err(e @ (ThickenError::BadThickness(_) | ThickenError::TooThick { .. })) => return Err(command_error(&e)),
-        Err(e) => return Ok(refused(set, report, &e, i)),
+        Err(e) => return Ok(refused(set, report, &e, i, folds.out.as_ref(), &mesh)),
     };
     let thick_id = s.doc.add_mesh(&format!("{name} thickened"), shell.mesh.clone());
-    let result = wrap_and_judge(s, set, i, report, &shell, thick_id);
+    let result = wrap_and_judge(s, set, i, report, (&shell, &mesh, &folds), thick_id);
     let kept = i.keep_thickened.then_some(thick_id);
     if kept.is_none() {
         s.doc.remove(thick_id);
     }
     result.map(|mut out| {
-        out.thickened = Some(info(&shell, i, kept));
+        out.thickened = Some(ThickenedInfo { folds: folds.report(), ..info(&shell, i, kept) });
         out
     })
 }
@@ -312,7 +357,7 @@ fn wrap_and_judge(
     set: &Settings,
     i: &ToSolidIn,
     report: super::ScanSummary,
-    shell: &Thickened,
+    (shell, repaired, folds): (&Thickened, &Mesh, &FoldRun),
     thick_id: ObjectId,
 ) -> CmdResult<ToSolidOut> {
     let first = match wrap_shell(s, set, thick_id, set.max_patches) {
@@ -331,13 +376,19 @@ fn wrap_and_judge(
     let (w, retry): (WrapOut, Option<CapRetry>) =
         freeform::retry_larger_on(s, set, thick_id, first, |s, cap| wrap_shell(s, set, thick_id, Some(cap)))?;
     let face = shell.scan_face();
-    let d = measure(s, set, &face, &w)?;
+    let main = (measure(s, set, &face, &w)?, face.vertex_count());
+    let shell_layer = (repaired, i.thickness.unwrap_or(0.0), i.symmetric);
+    let d = judged_against_the_original(s, set, w.body.id, main, folds, shell_layer)?;
     let t = info(shell, i, None);
     // the rim stays open on purpose and the shell is closed over it: holes left are not a defect of the solid
     let judged = super::ScanSummary { holes_left: 0, ..report.clone() };
-    let issues = issues_of(&w, &d, set, &judged, &t, face.vertex_count());
+    let mut issues = issues_of(&w, &d, set, &judged, &t, face.vertex_count());
+    issues.extend(folds.out.as_ref().and_then(|f| fold_issue(f, set.tolerance, folds.stats.get())));
     let tried = retry.as_ref().is_some_and(|r| r.reason != freeform::RetryReason::BudgetSpent);
-    let next = next_steps(&w, &issues, set, tried, i, &t);
+    let mut next = next_steps(&w, &issues, set, tried, i, &t);
+    if issues.iter().any(|x| x.code == "self_intersection") {
+        next.splice(0..0, fold_offer(repaired, set, i));
+    }
     let verdict = if issues.is_empty() {
         Verdict::Pass
     } else if d.coverage >= MIN_COVERAGE {
