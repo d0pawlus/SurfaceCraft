@@ -208,8 +208,8 @@ fn the_hybrid_method_puts_the_plane_cylinder_and_sphere_of_a_smooth_part_on_anal
         r["analytic"]
     );
     // the cap and the wall are merged (the base is one flat disc whose patches all touch the round, so
-    // it may stay patches: the border band of a region is never merged); every analytic face is the
-    // part's own (`assert_geometry`), and the areas are asserted below
+    // it may stay patches: the border band of a region is never merged, and planes are not asserted); every
+    // analytic face is the part's own (`assert_geometry`), and the areas are asserted below
     assert!(spheres >= 1 && cylinders >= 1, "the cap and the wall have analytic faces: {r}");
     assert_geometry(&brep);
     assert!(splines >= 10, "the rounds and the border bands are still patches: {splines}");
@@ -220,15 +220,14 @@ fn the_hybrid_method_puts_the_plane_cylinder_and_sphere_of_a_smooth_part_on_anal
         a["merged"].as_array().unwrap().iter().filter(|m| m["kind"] == kind).map(|m| m["area"].as_f64().unwrap()).sum()
     };
     // true areas of the part: the cap 2 pi R^2 (1 - cos 36.87 deg) = 181 mm2, the wall 2 pi 8 x 12 = 603 mm2.
-    // Measured on three runs of the part (cap about 170, wall pieces about 160): the bands are at least
-    // 2.4 times from those figures on the low side, and the true area on the high one.
+    // Measured on the part (platform and seed move them by a few percent): the cap 183 mm2 in one face, the wall
+    // 401 mm2 in six, the share 0.53. The bounds below are at least 1.5 times from those on the low side, and
+    // the true area (and 5 %) on the high one, so a face that covers 5 % of its wall does not pass.
     let (cap, wall) = (area_of("sphere"), area_of("cylinder"));
-    assert!((72.0..=190.0).contains(&cap), "the cap's analytic area {cap} mm2 (181 in all)");
-    assert!((30.0..=620.0).contains(&wall), "the wall's analytic area {wall} mm2 (603 in all)");
+    assert!((120.0..=190.0).contains(&cap), "the cap's analytic area {cap} mm2 (181 in all)");
+    assert!((260.0..=633.0).contains(&wall), "the wall's analytic area {wall} mm2 (603 in all)");
     let share = a["area_share"].as_f64().unwrap();
-    // the base, the wall and the cap are about 1 000 of the part's 1 200 mm2; the rounds and the border
-    // bands of patches are not merged
-    assert!((0.1..0.95).contains(&share), "analytic area share {share}");
+    assert!((0.33..0.95).contains(&share), "analytic area share {share}");
     for m in a["merged"].as_array().unwrap() {
         assert!(m["max_edge_gap"].as_f64().unwrap() <= 0.2 + 1e-9, "{m}");
     }
@@ -298,7 +297,17 @@ fn an_open_scan_gives_a_sheet_with_analytic_faces() {
         r["verdict"], r["analytic"]
     );
     assert!(planes + cylinders + spheres >= 2, "{r}");
-    assert!(faces_on_the_part(&brep) >= 1, "no analytic face is the part's own: {r}");
+    // measured: six faces are the part's own (the plane of the base and five cylinders of the wall) and the wall's
+    // cylinders cover 171 mm2 of its 603; the bounds are 1.5 times from those
+    assert!(faces_on_the_part(&brep) >= 4, "too few analytic faces are the part's own: {r}");
+    let wall: f64 = r["analytic"]["merged"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["kind"] == "cylinder")
+        .map(|m| m["area"].as_f64().unwrap())
+        .sum();
+    assert!((110.0..=633.0).contains(&wall), "the wall's analytic area {wall} mm2 (603 in all)");
     let freeform = to_solid_open(&mut s, "freeform");
     assert_eq!(freeform["verdict"], r["verdict"], "the verdict freeform gives for the open scan");
 }
@@ -370,8 +379,22 @@ fn the_bore_of_a_cup_becomes_concave_cylinder_faces() {
         cylinders.iter().filter(|(_, r)| (r - CUP_BORE).abs() < GEOMETRY_TOLERANCE).map(|(i, _)| *i).collect();
     let outer: Vec<usize> =
         cylinders.iter().filter(|(_, r)| (r - CUP_OUTER).abs() < GEOMETRY_TOLERANCE).map(|(i, _)| *i).collect();
-    eprintln!("cup: bore faces {bore:?}, outer faces {outer:?}");
+    let area_of_faces = |faces: &[usize]| -> f64 {
+        a["merged"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| faces.contains(&(m["face"].as_u64().unwrap() as usize)))
+            .map(|m| m["area"].as_f64().unwrap())
+            .sum()
+    };
+    let (bore_area, outer_area) = (area_of_faces(&bore), area_of_faces(&outer));
+    eprintln!("cup: bore faces {bore:?} {bore_area}, outer faces {outer:?} {outer_area}");
     assert!(!bore.is_empty() && !outer.is_empty(), "the bore and the outer wall have faces: {r}");
+    // true areas: the bore wall 2 pi 6 x 13 = 490 mm2, the outer wall 2 pi 14 x 16 = 1 407 mm2; measured 160 and
+    // 848; the bounds are 1.5 times from those on the low side and the true area (and 5 %) on the high one
+    assert!((100.0..=515.0).contains(&bore_area), "the bore's analytic area {bore_area} mm2 (490 in all)");
+    assert!((550.0..=1478.0).contains(&outer_area), "the outer wall's analytic area {outer_area} mm2 (1 407 in all)");
     assert!(bore.iter().all(|&f| used_backward(&brep, f)), "the bore's faces are used against their natural normal");
     assert!(outer.iter().all(|&f| !used_backward(&brep, f)), "the outer wall's faces are used along it");
 }
@@ -417,13 +440,18 @@ fn the_large_flat_faces_of_a_disc_are_analytic_faces() {
         .map(|m| m["area"].as_f64().unwrap())
         .collect();
     eprintln!("disc: plane areas {planes:?}; {}", a["stages_ms"]);
-    eprintln!("disc left: {}", a["left_as_patches"]);
-    eprintln!(
-        "disc: faces {} patches {} modelled {} left_out {}",
-        r["body"]["faces"], r["patches"], r["modelled"], r["left_out"]
-    );
-    let (p, ..) = kinds(&brep);
-    assert!(p >= 1, "{r}");
+    // measured: 2 407 and 2 078 mm2 of the 2 463 of each flat face; the bounds are 1.5 times from those
+    let mut sorted = planes.clone();
+    sorted.sort_by(|a, b| b.total_cmp(a));
+    assert!(sorted.len() >= 2, "both flat faces have an analytic face: {r}");
+    assert!(sorted[0] >= 1600.0 && sorted[0] <= 2586.0, "the largest plane's area {} (2 463 in all)", sorted[0]);
+    assert!(sorted[1] >= 1350.0 && sorted[1] <= 2586.0, "the second plane's area {} (2 463 in all)", sorted[1]);
+    let at = |z: f64| {
+        brep.faces
+            .iter()
+            .any(|f| matches!(&f.surface, Surface::Plane { origin, .. } if (origin[2] - z).abs() < GEOMETRY_TOLERANCE))
+    };
+    assert!(at(0.0) && at(DISC_HEIGHT), "a plane at the bottom and one at the top");
     assert_geometry_disc(&brep);
 }
 
