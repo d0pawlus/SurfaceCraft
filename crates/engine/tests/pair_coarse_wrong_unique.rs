@@ -21,8 +21,8 @@ const MIN_RECALL: f64 = 0.6;
 /// is wrong, whatever the verdict; measured at least 1.8 times the bound.
 const WRONG_CONFLICT_RATIO: f64 = 1.5;
 
-fn gate(salt: u64) {
-    let cases = all_cases(&[salt]);
+fn gate(series: u64) {
+    let cases = all_cases(&[series]);
     eprintln!("{}", table(&cases));
     let unique: Vec<&Case> = cases.iter().filter(|c| c.is_unique()).collect();
     let wrong = wrong_unique_lines(&cases);
@@ -34,7 +34,7 @@ fn gate(salt: u64) {
     let worst_right = unique.iter().map(|c| mutual_conflict(c)).fold(0.0, f64::max);
     let best_wrong = cases.iter().filter(|c| c.is_wrong()).map(mutual_conflict).fold(f64::INFINITY, f64::min);
     eprintln!(
-        "series {salt}: {} unique, all right; smallest conflict of both scans: right poses at most {worst_right:.4} \
+        "series {series}: {} unique, all right; smallest conflict of both scans: right poses at most {worst_right:.4} \
          (bound {MAX_MUTUAL_CONFLICT}, {:.1} times above), wrong poses at least {best_wrong:.4} ({:.1} times the bound)",
         unique.len(),
         MAX_MUTUAL_CONFLICT / worst_right.max(1e-9),
@@ -44,7 +44,7 @@ fn gate(salt: u64) {
     assert!(best_wrong >= WRONG_CONFLICT_RATIO * MAX_MUTUAL_CONFLICT, "a wrong pose is near the bound: {best_wrong}");
     let sharing: Vec<&Case> = cases.iter().filter(|c| c.overlap() >= SHARING).collect();
     let found = sharing.iter().filter(|c| c.is_unique()).count() as f64 / sharing.len() as f64;
-    eprintln!("series {salt}: {:.2} of the {} pairs that share at least {SHARING} are found", found, sharing.len());
+    eprintln!("series {series}: {:.2} of the {} pairs that share at least {SHARING} are found", found, sharing.len());
     assert!(found >= MIN_RECALL, "recall {found}");
 }
 

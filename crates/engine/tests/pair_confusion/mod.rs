@@ -22,7 +22,7 @@ pub const NOTHING: f64 = 0.05;
 
 pub struct Case {
     pub fixture: &'static str,
-    pub salt: u64,
+    pub series: u64,
     pub i: usize,
     pub j: usize,
     /// True shares of the moving and the fixed scan that lie on the other (tolerance 0.3 mm).
@@ -56,28 +56,28 @@ impl Case {
     }
 }
 
-fn wedge(k: usize, salt: u64) -> Mesh {
-    let whole = noisy(blob_at(48 + 4 * k), 900 + k as u64 + 1000 * salt);
+fn wedge(k: usize, series: u64) -> Mesh {
+    let whole = noisy(blob_at(48 + 4 * k), 900 + k as u64 + 1000 * series);
     cut(&whole, |p| {
         let d = (p.y.atan2(p.x).to_degrees() - 60.0 * k as f64 + 540.0).rem_euclid(360.0) - 180.0;
         d.abs() <= 70.0
     })
 }
 
-/// The four fixtures of series `salt`: views of the bracket, of the blob, wedges of the blob, arcs
+/// The four fixtures of series `series`: views of the bracket, of the blob, wedges of the blob, arcs
 /// of the lumpy ring (all with sigma 0.05 and their own tessellation and noise).
-pub fn fixtures(salt: u64) -> Vec<(&'static str, Vec<Mesh>)> {
+pub fn fixtures(series: u64) -> Vec<(&'static str, Vec<Mesh>)> {
     vec![
-        ("bracket", bracket_views_s(6, salt)),
-        ("blob", blob_views_s(salt)),
-        ("wedges", (0..6).map(|k| wedge(k, salt)).collect()),
-        ("ring", (0..8).map(|k| ring_arc_s(k, 45.0 * k as f64, 58.0, salt)).collect()),
+        ("bracket", bracket_views_s(6, series)),
+        ("blob", blob_views_s(series)),
+        ("wedges", (0..6).map(|k| wedge(k, series)).collect()),
+        ("ring", (0..8).map(|k| ring_arc_s(k, 45.0 * k as f64, 58.0, series)).collect()),
     ]
 }
 
 /// Every pair of the views through the command.
-pub fn run(fixture: &'static str, views: &[Mesh], salt: u64) -> Vec<Case> {
-    let poses = poses_s(views.len(), salt);
+pub fn run(fixture: &'static str, views: &[Mesh], series: u64) -> Vec<Case> {
+    let poses = poses_s(views.len(), series);
     let mut s = session_of(views, &poses);
     let mut cases = Vec::new();
     for i in 0..views.len() {
@@ -88,7 +88,7 @@ pub fn run(fixture: &'static str, views: &[Mesh], salt: u64) -> Vec<Case> {
                 let verdict = "error".to_string();
                 cases.push(Case {
                     fixture,
-                    salt,
+                    series,
                     i,
                     j,
                     truth,
@@ -115,7 +115,7 @@ pub fn run(fixture: &'static str, views: &[Mesh], salt: u64) -> Vec<Case> {
             let given = (verdict == "unique" && error_mm > RIGHT_MM).then(|| {
                 with_truth_given(&views[j].transformed(&poses[j]), &views[i].transformed(&poses[i]), &truth_pose)
             });
-            cases.push(Case { fixture, salt, i, j, truth, verdict, error_mm, angle_deg, out, at_truth, given });
+            cases.push(Case { fixture, series, i, j, truth, verdict, error_mm, angle_deg, out, at_truth, given });
         }
     }
     cases
@@ -130,12 +130,12 @@ pub fn error_against_truth(out: &Value, views: &[Mesh], poses: &[Transform], i: 
     (found.max_displacement(&truth, &on.positions), angle)
 }
 
-/// The cases of series `salts` of every fixture.
-pub fn all_cases(salts: &[u64]) -> Vec<Case> {
+/// The cases of series `series_list` of every fixture.
+pub fn all_cases(series_list: &[u64]) -> Vec<Case> {
     let mut all = Vec::new();
-    for &salt in salts {
-        for (name, views) in fixtures(salt) {
-            all.extend(run(name, &views, salt));
+    for &series in series_list {
+        for (name, views) in fixtures(series) {
+            all.extend(run(name, &views, series));
         }
     }
     all
@@ -180,7 +180,7 @@ pub fn wrong_unique_lines(cases: &[Case]) -> Vec<String> {
             format!(
                 "{} s{} {}-{}: true overlap {:.2}/{:.2}, error {:.1} mm {:.2} deg, confidence {:.2}, overlap {:.2}/{:.2}, rms {:.3}, tol {:.3}, stability {:.3}, alternatives {}",
                 c.fixture,
-                c.salt,
+                c.series,
                 c.i,
                 c.j,
                 c.truth.0,
@@ -217,7 +217,7 @@ pub fn evidence_lines(cases: &[Case]) -> Vec<String> {
         lines.push(format!(
             "{} s{} {}-{} | {:.2}/{:.2} | {} {:.2} | {:.1} {:.2} | {:.3} {:.3} | {:.1} | {:.2}/{:.2} {:.3}/{:.3} | {}",
             c.fixture,
-            c.salt,
+            c.series,
             c.i,
             c.j,
             c.truth.0,

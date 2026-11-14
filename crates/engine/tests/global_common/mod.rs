@@ -14,9 +14,9 @@ pub fn bracket_view(k: usize, dir: Vec3, reach: f64) -> Mesh {
     bracket_view_s(k, dir, reach, 0)
 }
 
-/// [`bracket_view`] with the noise of series `salt` (series 0 is the default one).
-pub fn bracket_view_s(k: usize, dir: Vec3, reach: f64, salt: u64) -> Mesh {
-    let whole = noisy(bracket_at(10 + 2 * k, 40 + 6 * k, 14 + k), 100 + k as u64 + 1000 * salt);
+/// [`bracket_view`] with the noise of series `series` (series 0 is the default one).
+pub fn bracket_view_s(k: usize, dir: Vec3, reach: f64, series: u64) -> Mesh {
+    let whole = noisy(bracket_at(10 + 2 * k, 40 + 6 * k, 14 + k), 100 + k as u64 + 1000 * series);
     let c = Point3::new(30.0, 20.0, 15.0);
     cut(&whole, |p| (p - c).dot(&dir) >= -reach)
 }
@@ -34,12 +34,12 @@ pub fn bracket_views(n: usize) -> Vec<Mesh> {
     bracket_views_s(n, 0)
 }
 
-pub fn bracket_views_s(n: usize, salt: u64) -> Vec<Mesh> {
+pub fn bracket_views_s(n: usize, series: u64) -> Vec<Mesh> {
     SIDES
         .iter()
         .take(n)
         .enumerate()
-        .map(|(k, (d, r))| bracket_view_s(k, Vec3::new(d[0], d[1], d[2]), *r, salt))
+        .map(|(k, (d, r))| bracket_view_s(k, Vec3::new(d[0], d[1], d[2]), *r, series))
         .collect()
 }
 
@@ -49,7 +49,7 @@ pub fn blob_views() -> Vec<Mesh> {
     blob_views_s(0)
 }
 
-pub fn blob_views_s(salt: u64) -> Vec<Mesh> {
+pub fn blob_views_s(series: u64) -> Vec<Mesh> {
     let sides: [([f64; 3], f64); 6] = [
         ([1.0, 0.0, 0.0], 8.0),
         ([-1.0, 0.0, 0.0], 8.0),
@@ -63,7 +63,7 @@ pub fn blob_views_s(salt: u64) -> Vec<Mesh> {
         .enumerate()
         .map(|(k, (d, reach))| {
             let dir = Vec3::new(d[0], d[1], d[2]);
-            cut(&noisy(blob_at(48 + 4 * k), 200 + k as u64 + 1000 * salt), |p| p.coords.dot(&dir) >= -reach)
+            cut(&noisy(blob_at(48 + 4 * k), 200 + k as u64 + 1000 * series), |p| p.coords.dot(&dir) >= -reach)
         })
         .collect()
 }
@@ -74,7 +74,7 @@ pub fn lumpy_ring(k: usize) -> Mesh {
     lumpy_ring_s(k, 0)
 }
 
-pub fn lumpy_ring_s(k: usize, salt: u64) -> Mesh {
+pub fn lumpy_ring_s(k: usize, series: u64) -> Mesh {
     let mut m = synth::torus(Point3::origin(), Vec3::z(), 40.0, 9.0, 72 + 4 * k, 20 + k);
     let azimuths = [8.0, 31.0, 62.0, 80.0, 118.0, 139.0, 171.0, 203.0, 236.0, 262.0, 291.0, 330.0];
     for (i, a) in azimuths.iter().enumerate() {
@@ -84,7 +84,7 @@ pub fn lumpy_ring_s(k: usize, salt: u64) -> Mesh {
         let out = 44.0 + 0.7 * ((i * 3) % 4) as f64;
         m.append(&synth::sphere(Point3::new(out * c, out * s, z), radius, 20, 10));
     }
-    noisy(m, 600 + k as u64 + 1000 * salt)
+    noisy(m, 600 + k as u64 + 1000 * series)
 }
 
 /// A view of the lumpy ring: the arc of `half` degrees either side of azimuth `centre`.
@@ -92,8 +92,8 @@ pub fn ring_arc(k: usize, centre: f64, half: f64) -> Mesh {
     ring_arc_s(k, centre, half, 0)
 }
 
-pub fn ring_arc_s(k: usize, centre: f64, half: f64, salt: u64) -> Mesh {
-    cut(&lumpy_ring_s(k, salt), |p| {
+pub fn ring_arc_s(k: usize, centre: f64, half: f64, series: u64) -> Mesh {
+    cut(&lumpy_ring_s(k, series), |p| {
         let d = (p.y.atan2(p.x).to_degrees() - centre + 540.0).rem_euclid(360.0) - 180.0;
         d.abs() <= half
     })
@@ -103,9 +103,9 @@ pub fn poses(n: usize) -> Vec<Transform> {
     poses_s(n, 0)
 }
 
-/// Random motions of series `salt`.
-pub fn poses_s(n: usize, salt: u64) -> Vec<Transform> {
-    (0..n as u64).map(|k| random_motion(k + 100 * salt)).collect()
+/// Random motions of series `series`.
+pub fn poses_s(n: usize, series: u64) -> Vec<Transform> {
+    (0..n as u64).map(|k| random_motion(k + 100 * series)).collect()
 }
 
 pub fn session_of(views: &[Mesh], poses: &[Transform]) -> Session {
