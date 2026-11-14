@@ -5,3 +5,5 @@
 # boundary/tangent constraints are not in solidcore yet; to be proposed upstream (with consent), then removed.
 crates/fit/src/patch.rs
 crates/fit/src/features.rs
+# surface.patch (exception accepted by the owner 2026-11-12): constrained variational B-spline fit is not in solidcore; tangency-labs/solidcraft#759.
+crates/kernel/src/vpatch.rs
