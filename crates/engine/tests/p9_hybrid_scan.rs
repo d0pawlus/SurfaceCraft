@@ -467,6 +467,25 @@ fn assert_geometry_disc(b: &Brep) {
     }
 }
 
+/// A tolerance above what the kernel allows a boundary to be from its primitive (0.5 mm) does not make every
+/// group fail with a message about the range: the merge takes the gap the kernel allows at most, and a group
+/// that is farther off says how far (measured at a tolerance of 0.8: 0.71 and 0.77 mm against the limit 0.5).
+#[test]
+fn a_tolerance_above_the_gap_the_kernel_allows_is_explained_by_the_distance() {
+    let mut s = scanned_session(&turned(&disc_profile()), 5);
+    let p = json!({"scan": "scan", "method": "hybrid", "tolerance": 0.8, "name": "wide"});
+    let r = s.execute("scan.to_solid", p).unwrap();
+    assert_eq!(r["method"], "hybrid", "{r}");
+    let why: Vec<String> = r["analytic"]["left_as_patches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["reason"].as_str().unwrap().to_string())
+        .collect();
+    assert!(why.iter().all(|w| !w.contains("the gap must be in")), "{why:?}");
+    assert!(why.iter().any(|w| w.contains("mm from the surface (limit 0.5000)")), "{why:?}");
+}
+
 /// The organic blob of the earlier gates: a closed freeform part.
 fn blob_mesh() -> Mesh {
     let mut m = synth::sphere(Point3::origin(), 1.0, 200, 100);
