@@ -56,11 +56,6 @@ pub(super) struct Target<'a> {
 }
 
 impl<'a> Target<'a> {
-    /// A target without borders (conflicts are not judged against it).
-    pub(super) fn plain(mesh: &'a Mesh) -> Self {
-        Target { mesh, bvh: Bvh::build(mesh), open: Vec::new(), border: 0.0 }
-    }
-
     pub(super) fn new(mesh: &'a Mesh, diag: f64) -> Self {
         let open = open_edges(mesh, diag);
         Target { mesh, bvh: Bvh::build(mesh), open, border: 1e-7 * diag }

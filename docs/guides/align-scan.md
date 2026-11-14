@@ -142,9 +142,19 @@ Normals, colours and per-vertex data go with the coordinates.
   overlap, down to about half shared), scores them on a subsample, refines the best few and reports
   the pose, `overlap_moving` and `overlap_fixed` (shares of each scan's area that lie on the other
   within `tolerance`), a `verdict` and a `confidence`.
+- The `tolerance` (default) is five times the median distance of the best pose's points, but never
+  more than four times the `noise` of the pair (each scan's own estimate, combined): a tolerance made
+  of the pose's own residual lets a pose that merely lies on other regions of a lumpy surface pass
+  as a fit.
+- `conflict_moving` and `conflict_fixed`: the share of each scan's area that lies where the other
+  scan is but off it (more than twice the tolerance away, and not at the end of the other scan).
+  A pose that both scans contradict (both shares above 0.025) is never `unique`: where two scans
+  really coincide, one may have a face the other lacks, never both; where a pose lays the features
+  of both on bare surface of the other (the faces of a box, the tube of a ring) each contradicts the
+  other. Such a pose is `ambiguous` with a confidence of at most 0.25, and the note says why.
 - `verdict`: `unique` (one pose clearly fits better than any other: every other pose has at least
-  3 % of the moving scan's area more in conflict or less on the target, and the pose survives being
-  pushed), `ambiguous` (a symmetric part: the near-tied poses are in `alternatives`; or a part that
+  3 % of the moving scan's area more in conflict or less on the target, the scans do not
+  contradict each other, and the pose survives being pushed), `ambiguous` (a symmetric part: the near-tied poses are in `alternatives`; or a part that
   can slide or turn freely, such as a flat or cylindrical patch) or `no_match` (too little overlap,
   or different parts).
 - The push: every pose is displaced by 0.2 of the moving scan's extent along each of its three
@@ -191,8 +201,8 @@ Normals, colours and per-vertex data go with the coordinates.
   (`held_by_loop`), every used pair agrees with the final poses within its tolerance, the vote that
   left pairs out was not a tie, and the left-out pairs are not more than 1.5 per used one. A scan
   that hangs on a single pair (two scans, a chain, a leaf) is `weakly_held`: the pair was `unique`,
-  but `pair_coarse` is known to return a wrong pose as `unique` on near-symmetric or self-similar
-  parts, and nothing else confirms this one. The verdict is then `partial`, and the note quotes the
+  but a pair can still be a coincidence of similar regions that only one scan contradicts, and
+  nothing else confirms this one. The verdict is then `partial`, and the note quotes the
   pair's confidence, overlap, stability and probe result: check such a scan by eye. `partial` also
   for scans not connected to the fixed one (`unplaced`, never moved), a loop that does not close
   (`loop_error_high`), `many_edges_rejected` and `consensus_unclear`; `failed` when nothing connected.

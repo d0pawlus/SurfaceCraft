@@ -1,6 +1,6 @@
 //! Noise of a scan: the median-based estimate of its standard deviation from the mesh.
 
-use super::*;
+use surfacecraft_geom::{KdTree, Mesh, Point3};
 
 /// Noise estimate of a scan (σ, mm); see [`noise_estimate`].
 #[must_use]
@@ -40,7 +40,7 @@ pub fn noise_estimate(mesh: &Mesh) -> NoiseEstimate {
         // neighbours without the point itself (leave-one-out), local quadric height field
         let nb: Vec<Point3> =
             near.iter().filter(|(_, d2)| *d2 > 0.0).filter_map(|(i, _)| mesh.positions.get(*i).copied()).collect();
-        let Some(f) = surfacecraft_fit::plane::fit_plane(&nb, None) else { continue };
+        let Some(f) = crate::plane::fit_plane(&nb, None) else { continue };
         let z = f.normal;
         let sharp =
             near.iter().filter_map(|(i, _)| normals.get(*i)).any(|nn| nn.norm() > 0.5 && nn.dot(&z).abs() < cos_sharp);
