@@ -185,3 +185,25 @@ pub fn faces_on_spline(body: &Brep, surface: &Surface, tol: f64) -> Result<Vec<u
     }
     Ok(out)
 }
+
+/// The record faces that lie on an analytic surface (plane, cylinder, cone, sphere, torus), as
+/// opposed to a spline. The corner patch of three equal rounds is not one (as in `refit`).
+#[must_use]
+pub fn analytic_faces(body: &Brep) -> Vec<usize> {
+    body.faces
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| {
+            matches!(
+                f.surface,
+                Surface::Plane { .. }
+                    | Surface::PlaneThrough { .. }
+                    | Surface::Cylinder { .. }
+                    | Surface::Cone { .. }
+                    | Surface::Sphere { .. }
+                    | Surface::Torus { .. }
+            )
+        })
+        .map(|(i, _)| i)
+        .collect()
+}

@@ -1,12 +1,18 @@
 # Scan to solid in one call
 
 `scan.to_solid` takes a raw scan to a closed solid and measures the solid against the scan. It
-has two methods and chooses between them itself (`method: auto`):
+has three methods and chooses between them itself (`method: auto`):
 
 - `primitives`: planes, cylinders, cones, spheres and tori fitted to regions; for machined and
   prismatic parts. A few analytic faces, exact dimensions.
 - `freeform`: a watertight network of bicubic patches over the whole scan; for castings, body
   panels and organic shapes. Thousands of small faces that follow the scan.
+- `hybrid`: the freeform wrap of the scan in which the patches that lie on a primitive (plane,
+  cylinder, cone, sphere) are merged into one exact analytic face each; for parts that are partly
+  machined and partly organic. A closed scan gives a solid, an open one a sheet. The result reports
+  `analytic` (faces on analytic surfaces, all faces, their share of the surface area, each merged
+  face with the largest distance of its boundary edges from its primitive, and the groups of patches
+  that stayed patches with the reason).
 
 Use the step-by-step guides when you need a feature history.
 
@@ -28,12 +34,20 @@ returned: pass, then review, then fail; at the same verdict the larger share of 
 within the tolerance, then a closed solid over a sheet. `attempts` lists what was tried (method,
 verdict, issue codes, seconds, `returned`); the attempt that lost leaves nothing in the document and
 one `edit.undo` takes the whole run back. A winner that is no pass carries `other_method_tried`.
+When the primitives cover at least a quarter of the scan (the same share as for the primitives
+attempt after a freeform one) and the best result is no pass, `auto` also tries the hybrid method as
+a further attempt. After a pass it does not (the hybrid attempt is slower and was not better on real
+scans): the result carries a next step with the `scan.to_solid` call with `method: hybrid` and what
+it would add. The hybrid body is returned when it is not worse: the verdict and the share of the scan within the tolerance
+(shares within 0.5 percentage points are equal) decide first, then a closed solid over a sheet,
+and only at a tie the larger share of the area on analytic faces; a hybrid body that explains the
+scan less well is listed in `attempts` and not returned.
 Pass `method` to choose yourself (one attempt), or `retry: false` to forbid the second one. It is
 skipped on its own, by counts and never by a clock, when the cleaned mesh of the call (or of the
 part) has more than 600 000 triangles or the first result has 30 000 patches or more: `attempts`
 then holds an entry with `skipped.reason` and `skipped.call`, the call that runs that method. A
-second method that is freeform is also an extra attempt of the call's budget (see "Extra attempts
-of one call"); the primitives method makes no wrap and costs none.
+second method that is freeform, and the hybrid attempt, are also extra attempts of the call's
+budget (see "Extra attempts of one call"); the primitives method makes no wrap and costs none.
 
 The scan noise (`scan_report.noise_used`, `noise_source`, `noise_spread`) is what the segmentation
 judges fits by. When it is above the tolerance, nothing is merged into freeform regions and a
@@ -53,6 +67,88 @@ Freeform (`surface.wrap` inside):
 - Patches meet in position (`continuity: g0`, what `scan.to_solid` uses). Tangent patches
   (`surface.wrap` with `continuity: g1`) are experimental: on 13 real scans they reached the
   tolerance on 7 where `g0` did on 9, and needed 56 % more patches and 2 to 3 times the time.
+
+Hybrid (merge the patches that lie on a primitive; `surface.wrap` and the kernel inside):
+
+- Fits a primitive to every region that qualifies, as the primitives method does. Planes, cylinders,
+  cones and spheres are protected; a torus region is not.
+- Makes a copy of the scan in which the vertices of every protected region that are within the
+  tolerance of their primitive lie exactly on it (projected, never pushed beyond); where regions meet
+  (a sharp edge) a vertex is put on all their primitives. The rest of the scan is untouched. The copy
+  is wrapped as `freeform` wraps a scan, held to half the tolerance (measured on scan 4 of the local
+  corpus: 99.97 % of the points within 0.2 mm against 99.46 % for the freeform wrap at the tolerance, and
+  the 20 % plane merged; with the wrap held to the full tolerance it was 99.32 % and 3 % of the area on
+  analytic faces). The copy is only used for the wrap: the body is judged against the original scan by the
+  rules of the freeform method. The finer wrap is where the time goes: the hybrid call takes 3.5 to 3.8
+  times the freeform call on scans 1, 4 and 10 (measured one after the other in one process), the wrap being
+  59 to 87 % of the stages that `analytic.stages_ms` lists (scan 10: 44 %, the merge 34 %); the
+  segmentation, the two judgements, the check that the mesher takes the body and the summary are seconds
+  each, and installing the merged body (the kernel measures its volume) is 8 % on scan 1. About 40 % of the
+  call lies outside those stages (the preparation the freeform call also makes, and what was not attributed).
+- A patch lies on a primitive when the scan triangle nearest its middle is in the primitive's region
+  and every sample on it lies within the tolerance of the primitive and within 5 tolerances of a
+  triangle of the region (the segmentation leaves pinholes in a large flat face; at 1 tolerance they
+  stopped every large patch of a plate from joining its plane). The samples are a grid of at least 6 x 6
+  and no more than 2 tolerances apart (49 x 49 at most), so a large patch cannot leave the primitive
+  between a few samples. The patches of one primitive that touch along edges form a group. A group
+  of one patch, or with an area under 50 squared tolerances (collapsed and sliver patches lie on any
+  surface), stays patches.
+- Before a group is merged, the border it shares with the patches round it is put on the primitive:
+  each vertex of the border goes onto the primitive (onto both where two groups meet, which puts it on
+  their intersection), each border edge, a Bézier curve, is re-fitted by least squares through its
+  samples put on the primitive (exact on a plane), and the patches that use a moved edge or vertex take
+  the new control points, so the body stays watertight. The border patches move by the gap the wrap
+  left (at most the tolerance) and no more; the judge then measures the body against the scan as it
+  does any other.
+- The kernel replaces each group by one face on the primitive (`kernel::merge`): the topology of the
+  body is edited (the group's interior edges and vertices go, N faces become one, a hole in the group
+  becomes an inner loop), nothing is cut, so the body is as closed or as open as the wrap was and the
+  band of patches along the border of a region stays patches. Plane and cylinder faces are built by the
+  kernel's topology builder (the trims of the face in its own parameters, its NURBS form and parameter
+  box are the kernel's); a cone or sphere face is placed here with the kernel's own forms. A concave
+  face (the wall of a bore, a dimple) of a closed body is merged like a convex one and used by the shell
+  against its surface's natural normal; in an open sheet it is not merged (see below). A group that goes round the axis of a cylinder or cone is cut into three
+  sectors by the angle of the patches (a face round the whole axis would need a seam edge), each one
+  face. The boundary edges stay shared with the neighbours and lie on the primitive within the reported
+  `max_edge_gap`, a few micrometres after the border is moved onto it (a group is refused when it
+  is over a tenth of the gap allowed, 0.1 tolerance, after the move, or over the tolerance before
+  it); each edge carries that gap, times 1.1, as its tolerance.
+- Never merged, and why (each is in `analytic.left_as_patches` with its reason): a group of one patch or of
+  under 50 squared tolerances of area; a group whose border is further than the tolerance from the
+  primitive (the patches only follow it that far, which is no analytic face); a face that looks
+  against the natural normal of its surface (a bore, a dimple) in an open sheet (the kernel keeps only the
+  same use of a sheet's faces, so the new face would come back reversed: measured on scan 4, where the
+  merged bore faces had every normal against the patches' and 3 % of the scan points did not face the body);
+  a torus (there is no merge for it); a sphere cap of 90 degrees or more (it would reach a pole of the sphere's
+  parameters); a group that goes round its axis and cannot be cut into sectors that are connected; a
+  boundary that touches itself (a pinch); a face whose area or normal does not agree with the patches it
+  replaces; and what the kernel refuses (a result whose volume or topology changed, or that the mesher
+  does not tessellate to the area of the patches it replaced).
+- The merged body replaces the wrap only when it is not worse by the comparison of `auto` (verdict,
+  share within the tolerance, closedness, analytic share) and its largest and RMS deviation from the
+  scan are not above the wrap's by more than a quarter and a hundredth of the tolerance (on scans 1 and
+  4 the correct merges moved them by a twentieth and a fifth of that); a body that could not be measured
+  is refused. Either way the issue says both pairs of figures (`hybrid_merge_deviation` when the merge
+  is kept, `hybrid_merge_rejected`, with the merged faces, when it is not), with the share of the scan
+  points that do not face the body. A refused merge gives the wrap, with no analytic face.
+- Before anything is wrapped, `method: hybrid` checks that some protected region has at least 50
+  squared tolerances of area; if none has, the result is the freeform result (no second wrap) with the
+  issue `hybrid_no_analytic_face`, and under `auto` the attempt is a recorded failure with that code.
+  Likewise a scan with no protected primitive gives the freeform body.
+- `analytic.max_edge_gap` is the largest distance of the boundary edges of any merged face from its
+  primitive, sampled at 25 points per edge (not a certified maximum). What it means for the exported
+  STEP: the edges of a merged face are Bézier curves shared with the patches round it, and STEP
+  keeps each as an edge curve with the face's surface and the edge's tolerance. With the border moved
+  onto the primitive that gap is a few micrometres, and the tolerance written is 1.1 times it, so a
+  reader that heals at 0.001 to 0.01 mm sees edges that lie on their faces. Above half the tolerance
+  (the border could not be moved) the issue `hybrid_edge_gap` is added, and the reader sees a gap of
+  that size; it does not change the verdict. The patches that were moved with the border differ from
+  the scan by up to what they moved, which the judge measures.
+- The merge is checked directly: each new face's normal agrees with the patches it replaced at
+  sampled points, it lies within the gap of them, holes wind opposite to the outer loop and inside it,
+  and it tessellates to their area. At most 64 groups are merged per call (the largest first; the rest
+  are in `left_as_patches`), and a cancelled call stops between groups.
+- A cancelled call stops between the steps; the whole run is one undo step.
 
 Primitives:
 
@@ -184,6 +280,13 @@ kernel refuses sheets of many faces. Give the wall thickness instead:
 - `noise_above_tolerance`: the scan is rougher than the tolerance; use the tolerance of the first
   next step (about 3 times the noise) or a smoother scan.
 - `other_method_tried`: `auto` ran the other method as well and it did not do better; see `attempts`.
+- Hybrid method, no body (verdict `fail`; `auto` then returns the other result, and the document is
+  as it was before the attempt): `hybrid_wrap_failed` (the wrap of the scan failed),
+  `hybrid_merge_failed` (the merging step failed as a whole), `hybrid_no_analytic_face` (under `auto`
+  only: no region is large enough for a group), `hybrid_failed` (anything else, with the reason). A scan
+  with no primitive, or no group that could be merged, is not a failure under `method: hybrid`: it gives
+  the wrap with `analytic.faces` 0. Informational issues of a returned body: `hybrid_edge_gap`,
+  `hybrid_merge_rejected`, `hybrid_no_analytic_face`. `thickness` has no meaning with `method: hybrid`.
 - `mostly_freeform` (only with `method: primitives`): less than half of the scan lies in regions
   a primitive fits. Run again with `method: freeform`.
 - `open_surface` (freeform): the network is a sheet because the scan has open boundaries. The

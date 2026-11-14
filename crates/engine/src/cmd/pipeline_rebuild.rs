@@ -74,10 +74,10 @@ fn evidence(mesh: &Mesh) -> Option<(bool, bool, Value)> {
 }
 
 /// What a remesh attempt came to: the new mesh and the step, or the step saying why it was not done.
-type Rebuilt = Result<(ObjectId, PrepStep), PrepStep>;
+pub(super) type Rebuilt = Result<(ObjectId, PrepStep), PrepStep>;
 
 /// Remeshes the scan. A cancellation is an error; any other refusal is the `Err` step.
-fn remesh_scan(s: &mut Session, set: &Settings, reason: &str, figures: Value) -> CmdResult<Rebuilt> {
+pub(super) fn remesh_scan(s: &mut Session, set: &Settings, reason: &str, figures: Value) -> CmdResult<Rebuilt> {
     check_cancel(s)?;
     let watch = Stopwatch::start();
     let Some(mesh) = mesh_of(s, set.scan) else { return Ok(Err(refused(reason, "no mesh", figures, 0))) };

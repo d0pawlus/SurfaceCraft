@@ -18,6 +18,7 @@ mod blends;
 pub mod feature;
 pub mod hybrid;
 pub mod local;
+pub mod merge;
 pub mod naming;
 pub mod nurbs;
 pub mod patch_fit;
