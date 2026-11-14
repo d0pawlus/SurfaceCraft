@@ -639,5 +639,7 @@
   "the fixed mesh {} is not in `objects`": "nieruchoma siatka {} nie występuje w „objects”",
   "the tolerance must be a positive number of mm": "tolerancja musi być dodatnią liczbą mm",
   "`accept_weak` names mesh {}, which is not in `objects`": "„accept_weak” wskazuje siatkę {}, której nie ma w „objects”",
-  "the relaxation gave a pose that is not finite; nothing was moved": "relaksacja dała ułożenie, które nie jest skończone; nic nie przesunięto"
+  "the relaxation gave a pose that is not finite; nothing was moved": "relaksacja dała ułożenie, które nie jest skończone; nic nie przesunięto",
+  "`accept_weak` names mesh {}, the fixed scan, which never moves": "„accept_weak” wskazuje siatkę {}, nieruchomy skan, który nigdy się nie przesuwa",
+  "`accept_weak` names mesh {} twice": "„accept_weak” wskazuje siatkę {} dwa razy"
 }

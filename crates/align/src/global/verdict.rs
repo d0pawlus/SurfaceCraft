@@ -32,6 +32,7 @@ fn scan_poses(n: usize, opts: &GlobalOptions, cands: &[Cand], solved: &Solved) -
             let edges_used = solved.edges.iter().filter(|e| e.i == k || e.j == k).count();
             ScanPose {
                 held_by_loop: matches!(held.get(k), Some(Some(None))),
+                parent: solved.tree.parent.get(k).copied().flatten().map(|(p, _)| p),
                 weak_pair: held
                     .get(k)
                     .copied()

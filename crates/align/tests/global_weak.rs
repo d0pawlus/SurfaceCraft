@@ -49,19 +49,27 @@ enum Pair {
 /// The real pair alignments, computed once per pair for all the tests of this file (the scans
 /// depend only on their index).
 fn real_pair(i: usize, j: usize, meshes: &[Mesh], o: &PairOptions, c: &Cancel) -> Result<PairResult, AlignError> {
-    static MEMO: OnceLock<Mutex<HashMap<(usize, usize), PairResult>>> = OnceLock::new();
+    // keyed by the pair and the options it was solved with (Debug text: the options have no Hash)
+    static MEMO: OnceLock<Mutex<HashMap<(usize, usize, String), PairResult>>> = OnceLock::new();
+    let key = (i, j, format!("{o:?}"));
     let memo = MEMO.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(r) = memo.lock().ok().and_then(|m| m.get(&(i, j)).cloned()) {
+    if let Some(r) = memo.lock().ok().and_then(|m| m.get(&key).cloned()) {
         return Ok(r);
     }
     let r = pair_coarse(&meshes[j], &meshes[i], o, c)?;
     if let Ok(mut m) = memo.lock() {
-        m.insert((i, j), r.clone());
+        m.insert(key, r.clone());
     }
     Ok(r)
 }
 
 fn run(n: usize, how: impl Fn(usize, usize) -> Pair + Sync) -> GlobalResult {
+    run_with(n, GlobalOptions::default(), how)
+}
+
+/// [`run`] with the options of the global call given (the pair solver always uses the default pair
+/// options: only the global tolerance, which the strength of a pair is judged against, changes).
+fn run_with(n: usize, opts: GlobalOptions, how: impl Fn(usize, usize) -> Pair + Sync) -> GlobalResult {
     let poses = poses();
     let meshes: Vec<Mesh> = (0..n).map(|k| scan(12 + 3 * k, 1 + k as u64).transformed(&poses[k])).collect();
     let refs: Vec<&Mesh> = meshes.iter().collect();
@@ -77,7 +85,8 @@ fn run(n: usize, how: impl Fn(usize, usize) -> Pair + Sync) -> GlobalResult {
         })
     };
     let solver =
-        |i: usize, j: usize, _: &Mesh, _: &Mesh, o: &PairOptions, c: &Cancel| -> Result<PairResult, AlignError> {
+        |i: usize, j: usize, _: &Mesh, _: &Mesh, _: &PairOptions, c: &Cancel| -> Result<PairResult, AlignError> {
+            let o = &PairOptions::default();
             match how(i, j) {
                 Pair::Fails => Err(AlignError::NotEnough("forbidden by the test".into())),
                 Pair::Real => real_pair(i, j, &meshes, o, c),
@@ -91,7 +100,7 @@ fn run(n: usize, how: impl Fn(usize, usize) -> Pair + Sync) -> GlobalResult {
                 }
             }
         };
-    align_global_with(&refs, &GlobalOptions::default(), &Cancel::new(), &solver).unwrap()
+    align_global_with(&refs, &opts, &Cancel::new(), &solver).unwrap()
 }
 
 fn issues(r: &GlobalResult) -> String {
@@ -208,4 +217,24 @@ fn two_consistently_wrong_pairs_close_a_loop_and_are_aligned_a_documented_limit(
     eprintln!("verdict {:?}, issues {}, C held {}", r.verdict, issues(&r), r.scans[2].held_by_loop);
     assert_eq!(r.verdict, GlobalVerdict::Aligned, "if this changes, a rule now catches the limit: update the guide");
     assert!(r.scans[2].held_by_loop);
+}
+
+/// The strength of a pair is also judged against the tolerance the caller gives: a residual of
+/// 0.05 mm is evidence against a tolerance of 0.5 mm (0.1 of it, 5 times inside the limit of one
+/// half) and none against one of 0.04 mm (1.2 of it, 2.4 times outside), however small it is
+/// against the size of the part.
+#[test]
+fn a_user_tolerance_decides_whether_a_pair_residual_counts_as_evidence() {
+    let with = |tolerance: f64| {
+        run_with(3, GlobalOptions { tolerance: Some(tolerance), ..GlobalOptions::default() }, |_, _| Pair::Real)
+    };
+    let (tight, loose) = (with(0.04), with(0.5));
+    for e in &tight.edges {
+        eprintln!("  tolerance 0.04: {}-{} rms {:.4} strong {}", e.fixed, e.moving, e.rms, e.strong_evidence);
+    }
+    assert!(tight.edges.iter().all(|e| !e.strong_evidence));
+    assert_eq!(tight.verdict, GlobalVerdict::Partial);
+    assert!(tight.issues.contains(&GlobalIssue::WeaklyHeld));
+    assert!(loose.edges.iter().all(|e| e.strong_evidence));
+    assert_eq!(loose.verdict, GlobalVerdict::Aligned, "{:?}", loose.issues);
 }

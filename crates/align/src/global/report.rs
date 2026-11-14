@@ -100,6 +100,9 @@ pub struct ScanPose {
     /// For a placed scan that is not held: the pair on its path to the fixed scan that nothing confirms (the one nearest the scan), as `[fixed, moving]` scan indices; it is a bridge, or lies only in loops with a pair of weak evidence.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub weak_pair: Option<[usize; 2]>,
+    /// The scan this one hangs from in the spanning tree; absent for the fixed scan and for unplaced scans.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<usize>,
 }
 
 /// One pair of scans.

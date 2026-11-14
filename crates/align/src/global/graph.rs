@@ -177,7 +177,9 @@ pub(super) fn consensus(n: usize, root: usize, edges: &[Edge], bound: f64) -> Co
 /// when it lies on a cycle (of the independent cycles) all of whose pairs are strong; a scan is
 /// held when it is the root or every edge on its path to the root is confirmed. A loop of pairs
 /// that are consistent with each other proves nothing when its pairs are weak, and a scan that
-/// hangs on a bridge hangs on one pair that nothing else confirms.
+/// hangs on a bridge hangs on one pair that nothing else confirms. Only the fundamental cycles of
+/// the final tree are looked at, so a strong loop that is not one of them (made of non-tree edges
+/// and tree edges beyond a weak pair) is missed: the result errs toward `partial`.
 pub(super) fn held_by_loop(tree: &Tree, edges: &[Edge], n: usize) -> Vec<Option<Option<usize>>> {
     let mut confirmed = vec![false; edges.len()];
     for c in cycles(tree, edges) {

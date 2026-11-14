@@ -24,7 +24,7 @@ pub struct GlobalIn {
     /// Move the scans that were placed (default false: the command only proposes the poses). One undo step for all of them. Only the scans held by a closed loop of strong pairs move; a scan that hangs on a single unconfirmed pair (`held_by_loop` false) moves only when `accept_weak` lists it. Refused when nothing could be connected to the fixed scan.
     #[serde(default)]
     pub apply: bool,
-    /// With `apply`: the scans (members of `objects`) that hang on a single pair that no loop confirms and that you accept moving anyway, after checking the pair's evidence in `edges` (the way `align.pair_coarse` moves a non-unique pose only when `choose` names it). Without them nothing weakly held moves.
+    /// With `apply`: the scans (members of `objects`) that hang on a single pair that no loop confirms and that you accept moving anyway, after checking the pair's evidence in `edges` (the way `align.pair_coarse` moves a non-unique pose only when `choose` names it). Without them nothing weakly held moves. A weakly held scan between a named scan and the fixed one moves with it (`moved_as_dependency` in `accept_weak_report`). The fixed scan, a scan listed twice and a scan outside `objects` are errors; a named scan that is unplaced or already held by a loop is reported in `accept_weak_report`.
     #[serde(default)]
     pub accept_weak: Vec<ObjRef>,
     /// `search` (default): the full pair search for every pair, no assumption about where the scans lie. `current`: the scans are already roughly in place, every pair starts from the current poses.
@@ -36,6 +36,31 @@ pub struct GlobalIn {
     /// Most pairs tried (default 36; with `n` scans there are `n (n - 1) / 2`, and when the cap cuts the list the pairs of neighbours in `objects` come first). Raise it when scans are listed in no particular order and the result is `partial`.
     #[serde(default)]
     pub max_pairs: Option<usize>,
+}
+
+/// What became of a scan named in `accept_weak` (or pulled in by one).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AcceptOutcome {
+    /// It hung on one pair that no loop confirms, and moved because it was named.
+    Moved,
+    /// It was not named, but it lies between a named scan and the fixed one, and the named scan's pose depends on its pose: it moved too (moving one without the other would break the fit between them).
+    MovedAsDependency,
+    /// It is held by a loop and moves with `apply` anyway: naming it was not needed.
+    HeldByLoop,
+    /// It could not be connected to the fixed scan and was not moved.
+    Unplaced,
+    /// `apply` was false: nothing moves.
+    NotApplied,
+}
+
+/// A scan of `accept_weak` and what became of it.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct AcceptedScan {
+    /// Position in `objects`.
+    pub index: usize,
+    /// What became of it.
+    pub outcome: AcceptOutcome,
 }
 
 /// One scan's pose.
@@ -71,6 +96,8 @@ pub struct GlobalOut {
     pub verdict: GlobalVerdict,
     /// Reasons for a verdict other than `aligned`, and notes.
     pub issues: Vec<GlobalIssue>,
+    /// What became of every scan named in `accept_weak`, and of the weakly held scans that had to move with them.
+    pub accept_weak_report: Vec<AcceptedScan>,
     /// Were any scans moved? False for a proposal, and for an `apply` where every placed scan was weakly held and not listed in `accept_weak`.
     pub applied: bool,
     /// Indices (in `objects`) of the scans that were moved.
@@ -194,6 +221,12 @@ fn resolve_all(s: &Session, i: &GlobalIn) -> CmdResult<(Vec<ObjectId>, usize, Ve
             .iter()
             .position(|x| *x == id)
             .ok_or_else(|| CmdError::Params(format!("`accept_weak` names mesh {id}, which is not in `objects`")))?;
+        if k == fixed {
+            return Err(CmdError::Params(format!("`accept_weak` names mesh {id}, the fixed scan, which never moves")));
+        }
+        if accepted.contains(&k) {
+            return Err(CmdError::Params(format!("`accept_weak` names mesh {id} twice")));
+        }
         accepted.push(k);
     }
     Ok((ids, fixed, accepted))
@@ -203,15 +236,55 @@ fn finite(m: &[[f64; 4]; 4]) -> bool {
     m.iter().flatten().all(|v| v.is_finite())
 }
 
-/// Moves the scans that may move (placed, not the fixed one, and held by a loop or listed in
-/// `accepted`); every pose is checked first, so nothing moves when one is not finite.
-fn move_placed(s: &mut Session, ids: &[ObjectId], r: &GlobalResult, accepted: &[usize]) -> CmdResult<Applied> {
+/// Which scans move: the placed ones held by a loop, the accepted ones, and the weakly held scans
+/// between an accepted scan and the fixed one (an accepted scan's pose is chained through them:
+/// moved alone it would no longer fit the scan it hangs from). Also the outcome of every accepted
+/// scan and of the scans pulled in.
+fn plan(r: &GlobalResult, accepted: &[usize]) -> (Vec<usize>, Vec<AcceptedScan>) {
+    let mut moving: Vec<usize> =
+        r.scans.iter().filter(|x| x.placed && !x.fixed && x.held_by_loop).map(|x| x.index).collect();
+    let mut report = Vec::new();
+    let mut pulled = Vec::new();
+    for &k in accepted {
+        let Some(scan) = r.scans.get(k).filter(|x| x.placed) else {
+            report.push(AcceptedScan { index: k, outcome: AcceptOutcome::Unplaced });
+            continue;
+        };
+        if scan.held_by_loop {
+            report.push(AcceptedScan { index: k, outcome: AcceptOutcome::HeldByLoop });
+            continue;
+        }
+        moving.push(k);
+        report.push(AcceptedScan { index: k, outcome: AcceptOutcome::Moved });
+        let mut up = scan.parent.and_then(|p| r.scans.get(p));
+        while let Some(p) = up.filter(|p| !p.fixed && !p.held_by_loop) {
+            if !accepted.contains(&p.index) && !pulled.contains(&p.index) {
+                pulled.push(p.index);
+                moving.push(p.index);
+                report.push(AcceptedScan { index: p.index, outcome: AcceptOutcome::MovedAsDependency });
+            }
+            up = p.parent.and_then(|q| r.scans.get(q));
+        }
+    }
+    moving.sort_unstable();
+    moving.dedup();
+    (moving, report)
+}
+
+/// Moves the scans of the plan; every pose is checked first, so nothing moves when one is not finite.
+fn move_placed(
+    s: &mut Session,
+    ids: &[ObjectId],
+    r: &GlobalResult,
+    accepted: &[usize],
+) -> CmdResult<(Applied, Vec<AcceptedScan>)> {
     if r.scans.iter().any(|x| !finite(&x.pose.to_rows())) {
         return Err(CmdError::Params("the relaxation gave a pose that is not finite; nothing was moved".into()));
     }
+    let (moving, report) = plan(r, accepted);
     let mut done = Applied { moved: Vec::new(), left: Vec::new() };
     for (k, (id, scan)) in ids.iter().zip(&r.scans).enumerate().filter(|(_, (_, x))| x.placed && !x.fixed) {
-        if !(scan.held_by_loop || accepted.contains(&k)) {
+        if !moving.contains(&k) {
             done.left.push(k);
             continue;
         }
@@ -219,7 +292,7 @@ fn move_placed(s: &mut Session, ids: &[ObjectId], r: &GlobalResult, accepted: &[
         m.transform_rigid(&scan.pose);
         done.moved.push(k);
     }
-    Ok(done)
+    Ok((done, report))
 }
 
 fn scan_outs(ids: &[ObjectId], r: &GlobalResult, moved: &[usize]) -> Vec<GlobalScan> {
@@ -254,10 +327,12 @@ pub(super) fn global(s: &mut Session, i: GlobalIn) -> CmdResult<GlobalOut> {
         Err(e) => return Err(e.into()),
     };
     let refused = i.apply && r.verdict == GlobalVerdict::Failed;
-    let done = if i.apply && !refused {
+    let (done, report) = if i.apply && !refused {
         move_placed(s, &ids, &r, &accepted)?
     } else {
-        Applied { moved: Vec::new(), left: Vec::new() }
+        let outcome = AcceptOutcome::NotApplied;
+        let report = accepted.iter().map(|&index| AcceptedScan { index, outcome }).collect();
+        (Applied { moved: Vec::new(), left: Vec::new() }, report)
     };
     if done.moved.is_empty() {
         s.mark_unchanged();
@@ -267,6 +342,7 @@ pub(super) fn global(s: &mut Session, i: GlobalIn) -> CmdResult<GlobalOut> {
         scans: scan_outs(&ids, &r, &done.moved),
         verdict: r.verdict,
         issues: r.issues,
+        accept_weak_report: report,
         applied: !done.moved.is_empty(),
         moved: done.moved,
         left_weakly_held: done.left,

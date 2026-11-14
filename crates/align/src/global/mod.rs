@@ -47,8 +47,9 @@ pub const LOOP_BOUND: f64 = 1.0;
 /// The vote that leaves pairs out must beat the best different set of pairs by at least this many
 /// edges (`consensus_unclear` otherwise): 2 from [`LARGE_GRAPH_EDGES`] pairs up, where a coherent
 /// minority is likelier and the vote only samples the spanning trees; 1 for a smaller graph (a
-/// single forged pair among six edges in a graph of four scans wins by exactly 1: the alternative
-/// must call two right pairs wrong to keep it, and no vote on fewer edges can do better).
+/// triangle and one more pair: the counts are too small for more, and 1 is the least that is not a
+/// tie). A graph of exactly six pairs needs 2: the forged pair among six in the tests wins by 1 and
+/// the verdict is `partial`.
 pub const MIN_CONSENSUS_MARGIN: usize = 2;
 /// Margin required in a graph with fewer than [`LARGE_GRAPH_EDGES`] pairs.
 pub const MIN_CONSENSUS_MARGIN_SMALL: usize = 1;
@@ -63,6 +64,10 @@ pub const MAX_REJECTED_PER_USED: f64 = 1.25;
 /// wrong pairs of the blob 0.0076 to 0.0103 (2.5 times above). The wrong pairs of the bracket and
 /// the ring fit at noise level (0.0007 to 0.0008) and are not caught by it.
 pub const MAX_RMS_PER_DIAGONAL: f64 = 0.003;
+/// When the caller gives `tolerance`, a strong pair also has a residual of at most this share of it
+/// (the share `align.pair_coarse` itself requires of a pose it calls `unique`). Right pairs of the
+/// tests read 0.1 of a tolerance of 0.5 mm; 1.2 of one of 0.04 mm.
+pub const MAX_RMS_PER_TOLERANCE: f64 = 0.5;
 /// Fewest triangles a scan may have.
 const MIN_TRIANGLES: usize = 4;
 
@@ -163,6 +168,6 @@ where
     check_input(scans, opts)?;
     let (list, possible) = pairs::pair_list(scans, opts);
     let tried = pairs::run_pairs(scans, &list, opts, cancel, solver)?;
-    let cands = solve::candidates(scans, &tried, cancel)?;
+    let cands = solve::candidates(scans, &tried, opts.tolerance, cancel)?;
     solve::solve(scans.len(), opts, cands, possible, tried.len(), cancel)
 }
