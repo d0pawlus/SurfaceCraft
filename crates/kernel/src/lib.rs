@@ -20,11 +20,13 @@ pub mod hybrid;
 pub mod local;
 pub mod naming;
 pub mod nurbs;
+pub mod patch_fit;
 pub mod pcurve;
 pub mod refit;
 pub mod solid;
 pub mod step;
 pub mod tess;
+pub mod vpatch;
 
 pub use solid::{BodyInfo, Counts};
 /// The neutral B-rep record (solidcore-record), re-exported so higher layers never name solidcore.
@@ -44,6 +46,9 @@ pub enum KernelError {
         /// The kernel's message.
         message: String,
     },
+    /// The caller's cancellation flag was set while the operation ran; nothing was produced.
+    #[error("cancelled")]
+    Cancelled,
 }
 
 /// Result alias.
@@ -51,6 +56,11 @@ pub type Result<T> = std::result::Result<T, KernelError>;
 
 pub(crate) fn op_err(op: &'static str, e: impl std::fmt::Display) -> KernelError {
     KernelError::Op { op, message: e.to_string() }
+}
+
+/// `Err(Cancelled)` once the caller's flag is set (checked between steps of long computations).
+pub(crate) fn poll(cancel: &surfacecraft_geom::Cancel) -> Result<()> {
+    if cancel.is_cancelled() { Err(KernelError::Cancelled) } else { Ok(()) }
 }
 
 pub(crate) fn finite_all(vals: &[f64]) -> bool {
