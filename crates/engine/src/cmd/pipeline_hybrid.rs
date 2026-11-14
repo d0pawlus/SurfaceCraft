@@ -76,7 +76,7 @@ pub struct MergedFace {
 /// How long one stage of the attempt took.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 pub struct StageTime {
-    /// The stage: `segmentation`, `wrap`, `judge_wrap`, `merge`, `judge_merged`.
+    /// The stage: `segmentation`, `wrap`, `judge_wrap`, `merge`, `mesh_check`, `install`, `judge_merged`, `summary`.
     pub stage: String,
     /// Wall-clock milliseconds (0 where the clock is not available).
     pub ms: u64,
@@ -368,10 +368,15 @@ fn merged_or_wrap(
     let tried = merge_groups(s, scan, &brep, protected, set.tolerance)
         .map_err(|e| if is_cancelled(&e) { Halt::Cancelled(e) } else { halt("hybrid_merge_failed", message_of(&e)) })?;
     stages.push(stage("merge", &watch));
-    if tried.merged.is_empty() || !meshes(&tried.body, set.tolerance) {
+    let watch = Stopwatch::start();
+    let meshed = !tried.merged.is_empty() && meshes(&tried.body, set.tolerance);
+    stages.push(stage("mesh_check", &watch));
+    if !meshed {
         return Ok((wrap_result, none(tried.left)));
     }
+    let watch = Stopwatch::start();
     let merged_w = install(s, w, tried.body.clone())?;
+    stages.push(stage("install", &watch));
     let watch = Stopwatch::start();
     let merged = judge_stage(s, set, report.clone(), &merged_w, retry).map_err(failed_at("hybrid_failed"))?;
     stages.push(stage("judge_merged", &watch));
@@ -466,8 +471,10 @@ fn build(s: &mut Session, i: &ToSolidIn, set: &Settings, report: &ScanSummary) -
         merged_or_wrap(s, set, report, (&w, retry), wrap_result, (&protected, &scan, &mut stages))?;
     let body =
         s.doc.body(w.body.id).map(|b| b.brep.clone()).ok_or_else(|| halt("hybrid_failed", "the body is gone"))?;
+    let watch = Stopwatch::start();
     let mut analytic = analytic_summary(&body, set.tolerance, &merging)
         .ok_or_else(|| halt("hybrid_failed", "the faces could not be measured"))?;
+    stages.push(stage("summary", &watch));
     analytic.stages_ms = stages;
     if analytic.max_edge_gap > EDGE_GAP_NOTE_SHARE * set.tolerance {
         let msg = format!(

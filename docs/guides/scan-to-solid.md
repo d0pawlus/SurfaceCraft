@@ -79,9 +79,12 @@ Hybrid (merge the patches that lie on a primitive; `surface.wrap` and the kernel
   corpus: 99.97 % of the points within 0.2 mm against 99.46 % for the freeform wrap at the tolerance, and
   the 20 % plane merged; with the wrap held to the full tolerance it was 99.32 % and 3 % of the area on
   analytic faces). The copy is only used for the wrap: the body is judged against the original scan by the
-  rules of the freeform method. The finer wrap is where the time goes: 3 to 4 times the freeform call on
-  scans 1 and 4 (the wrap is two thirds to four fifths of the hybrid stages, `analytic.stages_ms`; the
-  segmentation, the two judgements and the merge are seconds each).
+  rules of the freeform method. The finer wrap is where the time goes: the hybrid call takes 3.5 to 3.8
+  times the freeform call on scans 1, 4 and 10 (measured one after the other in one process), the wrap being
+  59 to 87 % of the stages that `analytic.stages_ms` lists (scan 10: 44 %, the merge 34 %); the
+  segmentation, the two judgements, the check that the mesher takes the body and the summary are seconds
+  each, and installing the merged body (the kernel measures its volume) is 8 % on scan 1. About 40 % of the
+  call lies outside those stages (the preparation the freeform call also makes, and what was not attributed).
 - A patch lies on a primitive when the scan triangle nearest its middle is in the primitive's region
   and every sample on it lies within the tolerance of the primitive and within 5 tolerances of a
   triangle of the region (the segmentation leaves pinholes in a large flat face; at 1 tolerance they

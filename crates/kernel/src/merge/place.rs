@@ -2,6 +2,12 @@
 //! box and side, and the kernel's evaluator of the surface (the parameters of a point on it, its
 //! closest point and the distance of a point from it: `SurfaceEval`).
 //!
+//! APP-GEOMETRY: stands in for the kernel placing a face of a partial cone or sphere: the frame whose
+//! seam is where the face is cut least (`seam_direction`, by the angles of the boundary samples), the
+//! parameter box of the face (`padded_box`, `check_reach`) and its domain in the kernel's NURBS form
+//! (`finish`, with `form::surface`); the side of the surface the patches face (`flip`) is chosen here for
+//! every kind. The evaluation itself (closest point, parameters, distance) is the kernel's `SurfaceEval`.
+//!
 use crate::hybrid::{Shape, V, add, cross, dot, norm, perpendicular, scale, sub, unit};
 use crate::record::brep::{Frame, Surface};
 use crate::{KernelError, Result, finite_all};
