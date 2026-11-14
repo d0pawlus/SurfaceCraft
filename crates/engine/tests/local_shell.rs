@@ -50,8 +50,8 @@ fn run_one(number: usize, path: &std::path::Path, thickness: f64) -> Result<Stri
     let verdict = out["verdict"].as_str().unwrap_or("?").to_string();
     eprintln!(
         "S{number:02} triangles {} thickness {thickness} verdict {verdict} in {seconds:.1} s; patches {} closed {} volume {}; \
-         coverage {} within {} rms {} max {} not_facing {}; clamped {} (largest reduction {}) loops {} thickened triangles {}; \
-         crossing {} of {} sampled; min wall {} median wall {}; holes left {}; retry {}; issues {:?}",
+         coverage {} within {} rms {} max {} not_facing {}; clamped {} limited {} unresolved {} (largest reduction {}) loops {} thickened triangles {}; \
+         crossing local {} non-local {} of {} sampled; min wall {} median wall {}; holes left {}; retry {}; issues {:?}",
         info["triangles"],
         out["patches"],
         out["body"]["closed"],
@@ -62,9 +62,12 @@ fn run_one(number: usize, path: &std::path::Path, thickness: f64) -> Result<Stri
         out["deviation"]["max_abs"],
         out["deviation"]["not_facing"],
         out["thickened"]["clamped_vertices"],
+        out["thickened"]["limited_vertices"],
+        out["thickened"]["unresolved_vertices"],
         out["thickened"]["largest_reduction"],
         out["thickened"]["boundary_loops"],
         out["thickened"]["triangles"],
+        out["thickened"]["self_intersections_local"],
         out["thickened"]["self_intersections"],
         out["thickened"]["self_intersection_samples"],
         out["thickened"]["min_wall"],
@@ -294,4 +297,230 @@ fn local_corpus_crossing_classes() {
             100.0 * floor as f64 / involved as f64
         );
     }
+}
+
+/// Diagnostic: the crossing pairs of the whole thickened mesh of one scan, with the geometry of the
+/// scan triangles they stem from (numbers only).
+#[test]
+#[ignore = "needs SURFACECRAFT_LOCAL_CORPUS (third-party scans, never committed)"]
+fn local_corpus_crossing_pairs() {
+    use surfacecraft_geom::shell::{ThickenParams, thicken};
+    use surfacecraft_geom::{Aabb, Bvh};
+    let files = corpus();
+    let number = wanted().first().copied().unwrap_or(5);
+    let thickness: f64 = std::env::var("SURFACECRAFT_LOCAL_THICKNESS").ok().and_then(|t| t.parse().ok()).unwrap_or(1.0);
+    let mut s = Session::new();
+    s.execute("mesh.import", json!({"path": files.get(number - 1).unwrap().to_string_lossy(), "name": "scan"}))
+        .unwrap();
+    s.execute("mesh.clean", json!({"object": "scan", "fill_holes_max_edges": 0})).unwrap();
+    let id = s.doc.find_by_name("scan").unwrap().0;
+    let rim =
+        surfacecraft_geom::edit::boundary_loops(&s.doc.mesh(id).unwrap().mesh).iter().map(Vec::len).max().unwrap_or(0);
+    s.execute("mesh.fill_holes", json!({"object": "scan", "max_edges": 400.min(rim - 1)})).unwrap();
+    let mesh = (*s.doc.mesh(id).unwrap().mesh).clone();
+    let started = Instant::now();
+    let shell = thicken(&mesh, &ThickenParams { thickness, symmetric: false }).unwrap();
+    eprintln!("S{number:02} thicken {:.1} s, report {:?}", started.elapsed().as_secs_f64(), shell.report);
+    let m = &shell.mesh;
+    let face = shell.scan_face();
+    let (n, t_layer) = (face.vertex_count() as u32, face.triangle_count());
+    let bvh = Bvh::build(m);
+    let mut pairs = 0usize;
+    let mut kinds = std::collections::BTreeMap::new();
+    let mut origins = std::collections::BTreeSet::new();
+    for ti in 0..m.triangle_count() {
+        let (x, xi) = (m.triangle(ti).unwrap(), m.triangles[ti]);
+        let bx = Aabb::from_points(x.iter());
+        for o in bvh.candidates(&|b: &Aabb| (0..3).all(|a| b.min[a] <= bx.max[a] && bx.min[a] <= b.max[a])) {
+            let o = o as usize;
+            if o <= ti {
+                continue;
+            }
+            let (y, yi) = (m.triangle(o).unwrap(), m.triangles[o]);
+            if xi.iter().any(|v| yi.contains(v)) || !(edge_hits(&x, &y) || edge_hits(&y, &x)) {
+                continue;
+            }
+            pairs += 1;
+            for v in xi.iter().chain(yi.iter()) {
+                if *v < 2 * n {
+                    origins.insert(*v % n);
+                }
+            }
+            {
+                let part = |t: usize| {
+                    if t < t_layer {
+                        'a'
+                    } else if t < 2 * t_layer {
+                        'b'
+                    } else {
+                        's'
+                    }
+                };
+                let key = format!("{}{}", part(ti).min(part(o)), part(ti).max(part(o)));
+                *kinds.entry(key).or_insert(0usize) += 1;
+            }
+            if pairs <= 2 {
+                let (ta, tb) = if ti < t_layer { (xi, yi) } else { (yi, xi) };
+                let c0 = m.positions[ta[0] as usize];
+                for (name, t) in [("A", ta), ("B", tb)] {
+                    for v in t {
+                        let q = m.positions[v as usize] - c0;
+                        let o = (v % n) as usize;
+                        let off = m.positions[(o as u32 + n) as usize] - m.positions[o];
+                        eprintln!(
+                            "S{number:02} GEO {name} v{} at ({:.3},{:.3},{:.3}) offset ({:.3},{:.3},{:.3}) |{:.3}|",
+                            v % n,
+                            q.x,
+                            q.y,
+                            q.z,
+                            off.x,
+                            off.y,
+                            off.z,
+                            off.norm()
+                        );
+                    }
+                }
+            }
+            if pairs <= 8 {
+                let part = |t: usize| {
+                    if t < t_layer {
+                        "a"
+                    } else if t < 2 * t_layer {
+                        "b"
+                    } else {
+                        "strip"
+                    }
+                };
+                let scan_tri =
+                    |t: usize| -> Option<[u32; 3]> { (t < 2 * t_layer).then(|| m.triangles[t].map(|v| v % n)) };
+                let describe = |t: usize| {
+                    let Some(st) = scan_tri(t) else { return "strip".to_string() };
+                    let p: Vec<_> = st.iter().map(|&v| face.positions[v as usize]).collect();
+                    let e = [(p[1] - p[0]).norm(), (p[2] - p[1]).norm(), (p[0] - p[2]).norm()];
+                    let sc: Vec<f64> = st.iter().map(|&v| (shell.scale[v as usize] * 100.0).round() / 100.0).collect();
+                    format!("{} edges {:.3?} scale {:?}", part(t), e, sc)
+                };
+                eprintln!("S{number:02} PAIR {} || {}", describe(ti), describe(o));
+            }
+        }
+    }
+    eprintln!("S{number:02} crossing pairs in the whole mesh: {pairs} {kinds:?}");
+    let pts: Vec<_> = origins.iter().map(|&v| face.positions[v as usize]).collect();
+    let mut clusters: Vec<Vec<usize>> = Vec::new();
+    for (i, p) in pts.iter().enumerate() {
+        match clusters.iter_mut().find(|c| c.iter().any(|&j| (pts[j] - p).norm() < 3.0)) {
+            Some(c) => c.push(i),
+            None => clusters.push(vec![i]),
+        }
+    }
+    {
+        let tris_of = |vs: &std::collections::BTreeSet<u32>| -> Vec<usize> {
+            (0..face.triangle_count()).filter(|&t| face.triangles[t].iter().any(|v| vs.contains(v))).collect()
+        };
+        for &v in origins.iter().take(15) {
+            let ring1: std::collections::BTreeSet<u32> =
+                tris_of(&[v].into_iter().collect()).iter().flat_map(|&t| face.triangles[t]).collect();
+            let ring2: std::collections::BTreeSet<u32> =
+                tris_of(&ring1).iter().flat_map(|&t| face.triangles[t]).collect();
+            let p = face.positions[v as usize];
+            let mut best = (f64::MAX, 0usize);
+            for t in 0..face.triangle_count() {
+                if face.triangles[t].iter().any(|w| ring2.contains(w)) {
+                    continue;
+                }
+                let [a, b, c] = face.triangles[t].map(|w| face.positions[w as usize]);
+                let d = (surfacecraft_geom::tri::closest_point(&p, &a, &b, &c) - p).norm();
+                if d < best.0 {
+                    best = (d, t);
+                }
+            }
+            let e = face.triangles[best.1].map(|w| (face.positions[w as usize] - p).norm());
+            eprintln!(
+                "S{number:02} DIST v{v} nearest other sheet {:.4} mm (triangle vertex distances {:.3?}), scale {:.2}",
+                best.0, e, shell.scale[v as usize]
+            );
+        }
+    }
+    eprintln!(
+        "S{number:02} {} scan vertices on crossings in {} clusters of sizes {:?}",
+        pts.len(),
+        clusters.len(),
+        clusters.iter().map(Vec::len).collect::<Vec<_>>()
+    );
+}
+
+/// Diagnostic: where the scan points outside the tolerance lie (numbers only): near the rim (within 3
+/// mean edges of a boundary vertex), at vertices whose offset was reduced, elsewhere; and on which side
+/// of the scan the nearest point of the body lies.
+#[test]
+#[ignore = "needs SURFACECRAFT_LOCAL_CORPUS (third-party scans, never committed)"]
+fn local_corpus_where_the_points_outside_the_tolerance_lie() {
+    use surfacecraft_geom::shell::{ThickenParams, thicken};
+    use surfacecraft_geom::{Bvh, Mesh};
+    let files = corpus();
+    let number = wanted().first().copied().unwrap_or(5);
+    let thickness: f64 = std::env::var("SURFACECRAFT_LOCAL_THICKNESS").ok().and_then(|t| t.parse().ok()).unwrap_or(1.0);
+    let mut s = Session::new();
+    s.execute("mesh.import", json!({"path": files.get(number - 1).unwrap().to_string_lossy(), "name": "scan"}))
+        .unwrap();
+    let out = s.execute("scan.to_solid", json!({"scan": "scan", "thickness": thickness})).unwrap();
+    eprintln!(
+        "S{number:02} verdict {} within {} coverage {}",
+        out["verdict"], out["deviation"]["within"], out["deviation"]["coverage"]
+    );
+    let body = out["body"]["id"].as_u64().unwrap();
+    let mesh_out = s.execute("body.to_mesh", json!({"object": body, "chord": 0.02, "name": "body_mesh"})).unwrap();
+    eprintln!("S{number:02} body mesh {}", mesh_out["triangles"]);
+    let id = s.doc.find_by_name("scan").unwrap().0;
+    let scan: Mesh = (*s.doc.mesh(id).unwrap().mesh).clone();
+    let body_id = s.doc.find_by_name("body_mesh").unwrap().0;
+    let body_mesh: Mesh = (*s.doc.mesh(body_id).unwrap().mesh).clone();
+    let bvh = Bvh::build(&body_mesh);
+    let scale = thicken(&scan, &ThickenParams { thickness, symmetric: false }).map(|t| t.scale).unwrap_or_default();
+    let boundary: Vec<_> = surfacecraft_geom::edit::boundary_loops(&scan).into_iter().flatten().collect();
+    let rim_pts: Vec<_> = boundary.iter().map(|&v| scan.positions[v as usize]).collect();
+    let rim_tree = surfacecraft_geom::KdTree::build(&rim_pts);
+    let edge = {
+        let mut sum = 0.0;
+        let mut n = 0usize;
+        for t in scan.triangles.iter().take(200_000) {
+            sum += (scan.positions[t[0] as usize] - scan.positions[t[1] as usize]).norm();
+            n += 1;
+        }
+        sum / n.max(1) as f64
+    };
+    let normals = scan.vertex_normals();
+    // (total, near the rim, at reduced vertices, elsewhere), and the sides
+    let (mut total, mut out_rim, mut out_reduced, mut out_else, mut front, mut back) = (0usize, 0, 0, 0, 0, 0);
+    let (mut all_rim, mut all_reduced) = (0usize, 0usize);
+    for (i, p) in scan.positions.iter().enumerate() {
+        total += 1;
+        let near_rim = rim_tree.nearest(p).is_some_and(|(_, d)| d <= 3.0 * edge);
+        let reduced = scale.get(i).is_some_and(|&x| x < 1.0);
+        all_rim += usize::from(near_rim);
+        all_reduced += usize::from(reduced);
+        let Some(h) = bvh.closest(p, 5.0) else { continue };
+        if h.distance <= 0.2 {
+            continue;
+        }
+        if near_rim {
+            out_rim += 1;
+        } else if reduced {
+            out_reduced += 1;
+        } else {
+            out_else += 1;
+        }
+        if (h.point - p).dot(&normals[i]) >= 0.0 {
+            front += 1;
+        } else {
+            back += 1;
+        }
+    }
+    let outside = out_rim + out_reduced + out_else;
+    eprintln!(
+        "S{number:02} WHERE points {total}, rim zone {all_rim} ({:.2} %), reduced {all_reduced} ({:.2} %); outside 0.2 mm {outside} ({:.3} %): near rim {out_rim}, at reduced {out_reduced}, elsewhere {out_else}; nearest body point in front of the scan {front}, behind {back}",
+        100.0 * all_rim as f64 / total as f64,
+        100.0 * all_reduced as f64 / total as f64,
+        100.0 * outside as f64 / total as f64
+    );
 }

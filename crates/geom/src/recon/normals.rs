@@ -2,12 +2,13 @@
 
 use super::*;
 
-/// Drops exact duplicate points (keeping the first); normals follow when every one of them is
+/// Rounds the points to the canonical lattice ([`super::snap`]) and drops duplicates (keeping the first); normals follow when every one of them is
 /// non-zero (otherwise they are ignored and re-estimated).
 pub(super) fn dedupe(cloud: &PointCloud) -> (Vec<Point3>, Option<Vec<Vec3>>) {
+    let positions = super::snap::snapped(&cloud.positions);
     let mut order: Vec<u32> = (0..cloud.len() as u32).collect();
     order.sort_unstable_by(|&a, &b| {
-        let (pa, pb) = (cloud.positions.get(a as usize), cloud.positions.get(b as usize));
+        let (pa, pb) = (positions.get(a as usize), positions.get(b as usize));
         match (pa, pb) {
             (Some(pa), Some(pb)) => {
                 pa.x.total_cmp(&pb.x).then(pa.y.total_cmp(&pb.y)).then(pa.z.total_cmp(&pb.z)).then(a.cmp(&b))
@@ -18,7 +19,7 @@ pub(super) fn dedupe(cloud: &PointCloud) -> (Vec<Point3>, Option<Vec<Vec3>>) {
     let mut keep = vec![true; cloud.len()];
     let mut prev: Option<&Point3> = None;
     for &i in &order {
-        let Some(p) = cloud.positions.get(i as usize) else { continue };
+        let Some(p) = positions.get(i as usize) else { continue };
         if prev.is_some_and(|q| q == p) {
             if let Some(f) = keep.get_mut(i as usize) {
                 *f = false;
@@ -27,7 +28,7 @@ pub(super) fn dedupe(cloud: &PointCloud) -> (Vec<Point3>, Option<Vec<Vec3>>) {
             prev = Some(p);
         }
     }
-    let pts: Vec<Point3> = cloud.positions.iter().zip(&keep).filter_map(|(p, &k)| k.then_some(*p)).collect();
+    let pts: Vec<Point3> = positions.iter().zip(&keep).filter_map(|(p, &k)| k.then_some(*p)).collect();
     let normals = cloud.normals.as_ref().and_then(|ns| {
         let unit: Vec<Vec3> = ns.iter().zip(&keep).filter_map(|(n, &k)| k.then_some(*n)).collect();
         let out: Vec<Vec3> = unit.iter().filter_map(|n| crate::normalize(*n)).collect();

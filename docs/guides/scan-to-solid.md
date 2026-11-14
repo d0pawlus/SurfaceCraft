@@ -156,21 +156,49 @@ kernel refuses sheets of many faces. Give the wall thickness instead:
 - Where the surface curves more tightly than the wall is thick (a bead, a tight corner on the side
   of the offset), the offset is reduced locally (never below a tenth of the thickness) and the wall
   is thinner there: `clamped_vertices`, `folded_vertices` (the others were only tapered),
-  `largest_reduction`, `median_reduction` and the sampled wall `min_wall` / `median_wall` say where
-  and how much; more than 1 % of the vertices is the issue `thickness_reduced`. A sharp crease on the
-  side of the offset cannot carry any wall: up to 0.1 % of the vertices may stay folded at the floor
-  (`unresolved_vertices`), more is refused. The next step offers a thinner wall.
-  A thickness whose offset folds triangles at more than 15 % of the vertices is refused (verdict `fail`, issue `no_solid`)
-  with a thickness the surface can carry as the next step. An even sample of the thickened
-  mesh is tested for triangles that cross one they share no vertex with (`self_intersections` of
-  `thickened`, `self_intersection_samples` tested); a channel or gap narrower than the wall shows
-  there, as the issue `self_intersection` (verdict at most `review`), with the sampled count and an extrapolation to the whole mesh. Only a sample is tested. Crossings near a relaxed vertex (the two flanks of a crease within two thicknesses along the surface) are not reported: they are tested exactly during the relaxation and the offset is reduced there until they are gone; the strip along the rim is not part of that test.
+  `limited_vertices` (see below), `largest_reduction`, `median_reduction` and the sampled wall
+  `min_wall` / `median_wall` say where and how much; more than 1 % of the vertices is the issue
+  `thickness_reduced`. A sharp crease on the side of the offset cannot carry any wall.
+  A thickness whose offset folds triangles at more than 15 % of the vertices (counted before any
+  relaxation: what folds at the full offset) is refused (verdict `fail`, issue `no_solid`) with a
+  thickness the surface can carry as the next step.
+- Crossings of the shell with itself are removed by construction and checked exactly. First the
+  offset of every vertex is bounded by the local feature size of the scan: the distance along the
+  direction of the offset to another part of the scan that lies close to the vertex along the
+  surface (the other flank of a bead, the other wall of a crease; the safe-offset bound of the reach
+  of a surface), so the offset sheet starts on its own side of the scanned sheet (`limited_vertices`).
+  Then folded triangles are relaxed, and then the shell as it is returned, both layers and every row
+  of the strip along the rim, is tested exactly (every triangle against all others, including
+  triangles that share one vertex or an edge; after the first round only triangles next to a vertex
+  whose offset changed). Vertices on a crossing between triangles that are close to each other
+  along the scan (neighbouring offset triangles, the flanks of a crease, the two sheets of a wall
+  that collapsed, the strip and the sheets next to the rim) are reduced further, up to 40 rounds
+  (close: within two thicknesses or three median edges along the surface, at most half the size of
+  the part, or within ten times their distance in space, which covers the flanks of an acute
+  crease). Where a vertex is at the floor (a tenth of the thickness) and still crosses, the normals
+  of the vertices around it are smoothed so that the offset layer moves as a whole there, and the
+  rounds run again.
+- `unresolved_vertices` is the number of vertices of the scan that, after all this, lie on a
+  triangle of the final shell mesh that crosses another triangle (both triangles of a pair count)
+  or on a folded triangle at the floor. More than 0.1 % of the vertices is refused (verdict `fail`,
+  issue `unresolved_crossings`, with this guide as the next step: what remains are sheets of the scan that fold or lie closer than a tenth of the wall, and a thinner wall does not clear them); fewer are returned and raise
+  the issue `self_intersection`.
+- An even sample of the thickened mesh is tested for triangles that cross one they share no vertex
+  with and told apart by where the other triangle lies: `self_intersections_local` of `thickened`
+  (close along the surface: a fold of the offset that the relaxation did not remove) and
+  `self_intersections` (far along the surface: two different areas of the part closer than the
+  wall, a channel or gap narrower than the wall; real geometry that is not relaxed away),
+  `self_intersection_samples` tested. ANY known crossing (`self_intersections`,
+  `self_intersections_local` or `unresolved_vertices` above 0) raises the issue `self_intersection`
+  (verdict at most `review`), which says how many are far apart and how many close, with the
+  sampled count and an extrapolation to the whole mesh. Only a sample is tested.
 - Before the offset the mesh is repaired: duplicate triangles are dropped; of the triangles on an
   edge shared by three or more the two that continue the surface best are kept and the others (fins)
   removed (`removed_non_manifold`); the orientation is made consistent per piece
   (`flipped_triangles`); places where boundary loops touch are split. The normals are averaged over a
-  ball of half the wall (at least one edge), so noise finer than that does not fold it; at the rim
-  the average is one-sided. The strip along the rim has rows of about one edge, at most 64 and at
+  ball of half the wall (at least one edge), so noise finer than that does not fold it; at a straight
+  rim the normal field is extrapolated to the rim by a plane fit, so the normals there are not tilted
+  towards the sheet (at a sharp corner of the rim the one-sided average is kept). The strip along the rim has rows of about one edge, at most 64 and at
   most 4 million triangles, so a wall much thicker than the rim edges has needle triangles there.
 - The thickened mesh has about twice the triangles of the scan, so the automatic larger-cap retry
   (never above 1.5 million triangles of the mesh that is wrapped) stops at about 750 000 scan
@@ -228,6 +256,12 @@ kernel refuses sheets of many faces. Give the wall thickness instead:
   (`mesh.fill_holes`) and run again.
 - `thickness_reduced` (with `thickness`): the wall is thinner than asked at more than 1 % of the
   vertices because the surface curves more tightly than the thickness there.
+- `self_intersection` (with `thickness`): the thickened mesh still crosses itself: between parts of
+  the scan that are far apart along the surface (a channel or gap narrower than the wall) or where
+  the relaxation could not remove a crossing of neighbouring parts; a thinner wall, or `scan.split`,
+  is the way out. Never a `pass`.
+- `unresolved_crossings` (with `thickness`, verdict `fail`): more than 0.1 % of the vertices stay on a
+  crossing that no wall down to a tenth of the thickness removes (folded or doubled sheets of the scan); repair the scan (`mesh.clean`, `scan.split`) before thickening.
 - `out_of_tolerance` (freeform): the part needs more patches than the limit. When `max_patches` was
   not given, the first network stopped at the default limit (12000) with at least 25 % of the scan
   within the tolerance, the scan has at most 1.5 million triangles and `allow_retry` is not false,

@@ -12,7 +12,7 @@ use super::{
     message_of, step, summary,
 };
 use crate::Session;
-use crate::cmd::mesh::thicken::command_error;
+use crate::cmd::mesh::thicken::{ShellCounts, command_error, crossing_issues};
 use crate::cmd::mesh_edit::{FillIn, fill};
 use crate::cmd::qa::{CompareIn, compare_points};
 use crate::cmd::wrap::{PATCH_LIMIT, WrapIn, WrapOut, wrap};
@@ -37,6 +37,12 @@ pub struct ThickenedInfo {
     pub symmetric: bool,
     /// Vertices whose offset was reduced because the surface curves more tightly than the thickness.
     pub clamped_vertices: usize,
+    /// Vertices whose offset was bounded up front by the distance to another part of the scan close to them along the surface (a bead, a crease): the offset sheet then stays on its side of the scanned sheet.
+    pub limited_vertices: usize,
+    /// Vertices of the scan moved (by at most one median edge) to remove crossings of the scan with itself (a fold of the sheet): the thickened face differs from the scan there by that much.
+    pub repaired_vertices: usize,
+    /// The largest distance a vertex of the scan was moved by that repair (mm). Deviation, coverage and the verdict are measured against the scan as it was; a repair larger than the tolerance, or at more than 0.5 % of the vertices, raises the issue `scan_repaired`.
+    pub repair_largest_shift: f64,
     /// Largest reduction of the thickness at a vertex (mm).
     pub largest_reduction: f64,
     /// Median reduction of the thickness over the reduced vertices (mm).
@@ -53,7 +59,7 @@ pub struct ThickenedInfo {
     pub min_wall: f64,
     /// Median wall found (mm).
     pub median_wall: f64,
-    /// Vertices that stay folded at the floor of the offset (a tenth of the thickness): sharp creases.
+    /// Vertices on a local crossing (neighbouring offset triangles, the flanks of a crease, the two sheets of a wall, the strip along the rim) that the relaxation could not remove even at the floor of the offset (a tenth of the thickness): sharp creases. More than 0.1 % of the vertices is refused.
     pub unresolved_vertices: usize,
     /// Triangles removed from the scan before the offset (fins on edges of three or more triangles, duplicates).
     pub removed_non_manifold: usize,
@@ -63,8 +69,12 @@ pub struct ThickenedInfo {
     pub self_intersection_checked: bool,
     /// Triangles of the sample tested.
     pub self_intersection_samples: usize,
-    /// Of them, triangles that cross another one: the offset sheet meets another part of the shell (a channel or gap narrower than the wall).
+    /// Of them, triangles that cross only triangles close to them along the scan (a fold of the offset; the relaxation removes these, so 0 unless `unresolved_vertices` is not).
+    pub self_intersections_local: usize,
+    /// Of them, triangles that cross a triangle far from them along the scan: the offset sheet meets another part of the shell (a channel or gap narrower than the wall). Only these raise the issue `self_intersection`.
     pub self_intersections: usize,
+    /// Of those, the triangles an exhaustive test of the whole shell found (`self_intersections` is the larger of this and the sampled count).
+    pub self_intersections_exhaustive: usize,
     /// Triangles of the thickened mesh.
     pub triangles: usize,
     /// The thickened mesh, when `keep_thickened` kept it in the document.
@@ -132,6 +142,9 @@ fn info(shell: &Thickened, i: &ToSolidIn, kept: Option<ObjectId>) -> ThickenedIn
         thickness: i.thickness.unwrap_or(0.0),
         symmetric: i.symmetric,
         clamped_vertices: shell.report.clamped_vertices,
+        limited_vertices: shell.report.limited_vertices,
+        repaired_vertices: shell.report.repaired_vertices,
+        repair_largest_shift: shell.report.repair_largest_shift,
         largest_reduction: shell.report.largest_reduction,
         median_reduction: shell.report.median_reduction,
         folded_vertices: shell.report.folded_vertices,
@@ -145,7 +158,9 @@ fn info(shell: &Thickened, i: &ToSolidIn, kept: Option<ObjectId>) -> ThickenedIn
         flipped_triangles: shell.report.flipped_triangles,
         self_intersection_checked: true,
         self_intersection_samples: shell.report.crossing_samples,
+        self_intersections_local: shell.report.crossing_local,
         self_intersections: shell.report.crossing_triangles,
+        self_intersections_exhaustive: shell.report.crossing_far_exhaustive,
         triangles: shell.mesh.triangle_count(),
         mesh: kept,
     }
@@ -167,13 +182,24 @@ fn wrap_shell(s: &mut Session, set: &Settings, mesh: ObjectId, max_patches: Opti
     )
 }
 
+/// The issue code of a refusal: crossings that stay at the floor of the offset have their own, so that
+/// the reason is told from a scan that folds or cannot be wrapped.
+fn refusal_code(e: &ThickenError) -> &'static str {
+    match e {
+        ThickenError::UnresolvedCrossings { .. } => "unresolved_crossings",
+        _ => "no_solid",
+    }
+}
+
 /// The result of a run whose scan could not be thickened: a verdict, not an error.
 fn refused(set: &Settings, report: super::ScanSummary, e: &ThickenError, i: &ToSolidIn) -> ToSolidOut {
-    let issues = vec![issue("no_solid", format!("the scan could not be thickened: {e}"))];
+    let issues = vec![issue(refusal_code(e), format!("the scan could not be thickened: {e}"))];
     let mut next = Vec::new();
     if let ThickenError::Folds { suggested, .. } = e {
-        let smaller = (suggested * 100.0).floor() / 100.0;
-        if smaller > 0.0 {
+        // the sign of the thickness says where the material is: the suggestion keeps it
+        let sign = if i.thickness.is_some_and(|t| t < 0.0) { -1.0 } else { 1.0 };
+        let smaller = sign * (suggested * 100.0).floor() / 100.0;
+        if smaller != 0.0 {
             let params = json!({"scan": set.scan, "thickness": smaller, "symmetric": i.symmetric});
             next.push(step("scan.to_solid", params, "a wall the surface can carry (a thinner one folds less)"));
         }
@@ -227,14 +253,18 @@ fn issues_of(
         );
         list.push(issue("thickness_reduced", msg));
     }
-    if t.self_intersections > 0 {
-        let whole = t.self_intersections as f64 * t.triangles as f64 / t.self_intersection_samples.max(1) as f64;
-        let msg = format!(
-            "the thickened mesh crosses itself away from the places the offset was relaxed: {} of {} sampled triangles cut another one (about {:.0} of {} in all): the wall is thicker than a channel or gap of the part; a thinner wall, or splitting the part (`scan.split`), is the way out",
-            t.self_intersections, t.self_intersection_samples, whole, t.triangles
-        );
-        list.push(issue("self_intersection", msg));
-    }
+    let counts = ShellCounts {
+        local: t.self_intersections_local,
+        far: t.self_intersections,
+        far_exhaustive: t.self_intersections_exhaustive,
+        unresolved: t.unresolved_vertices,
+        samples: t.self_intersection_samples,
+        triangles: t.triangles,
+        repaired: t.repaired_vertices,
+        largest_shift: t.repair_largest_shift,
+        vertices,
+    };
+    list.extend(crossing_issues(&counts, set.tolerance));
     if t.windows > 0 {
         let msg = format!(
             "{} boundary loops besides the rim ({} edges) were stitched through the wall as windows: a real hole of the scan shows as a window; fill it with a larger `fill_holes_max_edges` unless the part has the window",
@@ -363,4 +393,26 @@ fn next_steps(
     }
     front.extend(steps);
     front
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crossings_that_stay_at_the_floor_are_refused_with_a_code_of_their_own() {
+        // Arrange
+        let crossings = ThickenError::UnresolvedCrossings {
+            vertices: 380,
+            total: 170_000,
+            share_percent: 0.22,
+            limit_percent: 0.1,
+        };
+
+        // Act and assert
+        assert_eq!(refusal_code(&crossings), "unresolved_crossings");
+        assert_eq!(refusal_code(&ThickenError::Unresolved(5)), "no_solid");
+        let text = crossings.to_string();
+        assert!(text.contains("380 of 170000") && text.contains("mesh.clean") && text.contains("0.1 %"), "{text}");
+    }
 }

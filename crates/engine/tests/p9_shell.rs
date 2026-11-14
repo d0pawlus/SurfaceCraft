@@ -114,6 +114,8 @@ fn gate_a_noisy_open_cap_becomes_a_solid_of_the_exact_shell_volume() {
     // Assert
     assert_solid_of(&out, shell_volume(RADIUS - THICKNESS, RADIUS));
     assert_eq!(out["thickened"]["self_intersections"], 0, "{out}");
+    assert_eq!(out["thickened"]["self_intersections_local"], 0, "{out}");
+    assert_eq!(out["thickened"]["unresolved_vertices"], 0, "{out}");
     assert_eq!(out["thickened"]["thickness"], THICKNESS, "{out}");
     assert_eq!(out["thickened"]["clamped_vertices"], 0, "{out}");
     assert!(out["thickened"]["boundary_loops"].as_u64().unwrap() >= 1, "{out}");
@@ -520,7 +522,102 @@ fn a_channel_narrower_than_the_wall_is_reported_as_crossing_itself_and_caps_the_
     // Assert
     assert_eq!(thick["self_intersection_checked"], true, "{thick}");
     assert!(thick["self_intersections"].as_u64().unwrap() > 0, "{thick}");
+    assert_eq!(thick["self_intersections_local"], 0, "a channel is real geometry, not a fold: {thick}");
     assert_eq!(out["thickened"]["self_intersection_checked"], true);
     let codes: Vec<&str> = out["issues"].as_array().unwrap().iter().map(|i| i["code"].as_str().unwrap()).collect();
     assert!(codes.contains(&"self_intersection") && out["verdict"] != "pass", "{out}");
+}
+
+/// A ridge panel `x` mm by 8 mm whose crest has the slope `k`, upward normals.
+fn crease_panel(k: f64, cell: f64) -> Mesh {
+    let mut panel =
+        synth::plane(Point3::origin(), Vec3::x(), Vec3::y(), 14.0, 8.0, (14.0 / cell) as usize, (8.0 / cell) as usize);
+    for p in &mut panel.positions {
+        p.z = -k * (p.x - 7.0).abs();
+    }
+    panel
+}
+
+fn issue_codes(out: &Value) -> Vec<String> {
+    out["issues"].as_array().unwrap().iter().map(|i| i["code"].as_str().unwrap().to_string()).collect()
+}
+
+#[test]
+fn a_shell_that_keeps_crossings_never_passes_whether_they_are_near_or_far_apart() {
+    // Arrange: a channel narrower than the wall, and a crease 18 degrees wide with a wall of 4 mm: the
+    // flanks are narrower than the wall
+    let cases = [(narrow_channel(), 2.0), (crease_panel(3.0, 0.4), 4.0)];
+
+    for (k, (panel, thickness)) in cases.into_iter().enumerate() {
+        let mut s = session_with(panel);
+
+        // Act
+        let thick = s.execute("mesh.thicken", json!({"object": "scan", "thickness": thickness})).unwrap();
+        let out = s.execute("scan.to_solid", json!({"scan": "scan", "thickness": thickness})).unwrap();
+
+        // Assert: crossings are known (counted), so the verdict is capped and the issue is raised
+        let known = thick["self_intersections_local"].as_u64().unwrap()
+            + thick["self_intersections"].as_u64().unwrap()
+            + thick["unresolved_vertices"].as_u64().unwrap();
+        assert!(known > 0, "case {k} must keep crossings: {thick}");
+        assert!(issue_codes(&out).iter().any(|c| c == "self_intersection"), "case {k}: {out}");
+        assert_ne!(out["verdict"], "pass", "case {k}: {out}");
+    }
+}
+
+/// A flat panel of `side` mm with cells of 0.5 mm whose two middle vertices are swapped over each other
+/// sideways (two triangles cut through each other), `lift` and `other` mm above the plane.
+fn folded_panel(side: f64, lift: f64, other: f64) -> Mesh {
+    let cells = (side / 0.5) as usize;
+    let mut panel = synth::plane(Point3::origin(), Vec3::x(), Vec3::y(), side, side, cells, cells);
+    let centre = (cells / 2) * (cells + 1) + cells / 2;
+    let (x, y) = (side / 2.0, side / 2.0);
+    panel.positions[centre] = Point3::new(x + 0.9, y + 0.4, lift);
+    panel.positions[centre + 1] = Point3::new(x + 0.1, y - 0.1, other);
+    panel
+}
+
+#[test]
+fn a_repaired_fold_is_measured_against_the_scan_as_it_was_and_cannot_pass() {
+    // Arrange: a fold of two vertices swapped over each other, 0.5 mm above the plane (more than the tolerance
+    // of 0.2 mm): the repair moves vertices by half a millimetre
+    let lift = 0.5;
+    let mut s = session_with(folded_panel(60.0, lift, lift));
+
+    // Act
+    let thick = s.execute("mesh.thicken", json!({"object": "scan", "thickness": 1.0})).unwrap();
+    let out = s.execute("scan.to_solid", json!({"scan": "scan", "thickness": 1.0})).unwrap();
+
+    // Assert: the repair is reported with its shift, the deviation is against the original points
+    assert!(thick["repaired_vertices"].as_u64().unwrap() > 0, "{thick}");
+    assert!(thick["repair_largest_shift"].as_f64().unwrap() > 0.0, "{thick}");
+    assert!(out["thickened"]["repaired_vertices"].as_u64().unwrap() > 0, "{out}");
+    let shift = thick["repair_largest_shift"].as_f64().unwrap();
+    assert!(shift > 0.2, "the repair must exceed the tolerance for this test: {thick}");
+    let max_dev = out["deviation"]["max_abs"].as_f64().unwrap();
+    assert!(max_dev >= 0.25, "a vertex of the scan is {lift} mm off the plane, the deviation says {max_dev}: {out}");
+    let codes = issue_codes(&out);
+    assert!(codes.iter().any(|c| c == "scan_repaired"), "{codes:?}");
+    assert_ne!(out["verdict"], "pass", "{out}");
+    assert!(thick["issues"].as_array().unwrap().iter().any(|i| i["code"] == "scan_repaired"), "{thick}");
+}
+
+#[test]
+fn a_fold_that_leaves_more_than_a_tenth_of_a_percent_of_the_vertices_on_crossings_is_refused_with_its_own_issue_code() {
+    // Arrange: a small panel whose fold leaves more than 0.1 % of the vertices on crossings
+    let panel = folded_panel(10.0, 0.4, 0.0);
+    let mut s = session_with(panel);
+
+    // Act
+    let thick = s.execute("mesh.thicken", json!({"object": "scan", "thickness": 1.0}));
+    let out = s.execute("scan.to_solid", json!({"scan": "scan", "thickness": 1.0})).unwrap();
+
+    // Assert: both refuse, the verdict names the reason
+    let message = match thick {
+        Err(EngineError::Failed(m)) => m,
+        other => panic!("{other:?}"),
+    };
+    assert!(message.contains("stay on a crossing of the shell"), "{message}");
+    assert_eq!(out["verdict"], "fail", "{out}");
+    assert_eq!(issue_codes(&out), vec!["unresolved_crossings".to_string()], "{out}");
 }

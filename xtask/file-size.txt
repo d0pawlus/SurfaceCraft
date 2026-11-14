@@ -1,5 +1,3 @@
 # Rust files over 800 lines that cannot be split in this change (other open pull requests are changing them).
 # Each line is `<path> <lines>` with the file's current line count. This list only shrinks:
 # a listed file may not grow, and a listed file that is 800 lines or fewer must be removed.
-crates/engine/src/cmd/primitive.rs 1045
-crates/doc/src/object.rs 809
