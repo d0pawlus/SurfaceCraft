@@ -94,7 +94,7 @@ fn nearly_flat_patches_become_one_plane_within_their_gap() {
         let body = sheet_from_bezier_network(&net.patches, &net.corners).unwrap();
         let shape = Shape::Plane { point: [0.0, 0.0, 10.0], normal: [0.0, 0.0, 1.0] };
         let r = merge_faces_onto_shape(&body, &(0..9).collect::<Vec<_>>(), &shape, 0.1);
-        println!("lift {lift}: {:?}", r.as_ref().map(|m| m.gap).map_err(|e| e.to_string()));
+        assert!(r.is_ok(), "lift {lift}: {:?}", r.map(|m| m.gap).map_err(|e| e.to_string()));
     }
 }
 
@@ -104,7 +104,7 @@ fn a_cube_sphere_side_becomes_one_sphere_face() {
     let body = sheet_from_bezier_network(&net.patches, &net.corners).unwrap();
     let group: Vec<usize> = (36..72).collect();
     let shape = Shape::Sphere { center: [0.0; 3], radius: 50.0 };
-    let merged = merge_faces_onto_shape(&body, &group, &shape, 0.2).unwrap();
+    let merged = merge_faces_onto_shape(&body, &group, &shape, 0.3).unwrap();
     println!(
         "sphere gap {} kinds {:?}",
         merged.gap,

@@ -56,6 +56,11 @@ fn line(number: usize, method: &str, out: &Value, seconds: f64) {
         out["analytic"],
         codes(out),
     );
+    for i in out["issues"].as_array().into_iter().flatten() {
+        if i["code"].as_str().is_some_and(|c| c.starts_with("hybrid_")) {
+            eprintln!("C{number:02}   {method} issue {}: {}", i["code"], i["message"]);
+        }
+    }
     for m in out["modelled"].as_array().into_iter().flatten() {
         eprintln!(
             "C{number:02}   {method} primitive {} {} triangles, role {}, faces {}, skipped {}",

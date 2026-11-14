@@ -1,6 +1,6 @@
 //! The boundary of a group of faces: its one outer loop, and the edges that go.
 use crate::hybrid::V;
-use crate::record::brep::{Brep, Curve, Loop, OrientedEdge, Shell};
+use crate::record::brep::{Brep, Loop, OrientedEdge, Shell};
 use crate::{KernelError, Result};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -151,37 +151,14 @@ fn chains(body: &Brep, outer: &[LoopEdge]) -> Result<Vec<Vec<LoopEdge>>> {
     Ok(loops)
 }
 
-/// A point of a B-spline curve (de Boor), `None` for malformed data.
-pub(super) fn de_boor(knots: &[f64], points: &[V], t: f64) -> Option<V> {
-    let count = points.len();
-    let degree = knots.len().checked_sub(count + 1)?;
-    let lo = *knots.get(degree)?;
-    let hi = *knots.get(count)?;
-    let t = t.clamp(lo, hi);
-    let k = (degree..count).rev().find(|&i| knots.get(i).is_some_and(|&x| x <= t)).unwrap_or(degree);
-    let mut d: Vec<V> = (0..=degree).map(|j| points.get(j + k - degree).copied()).collect::<Option<_>>()?;
-    for r in 1..=degree {
-        for j in (r..=degree).rev() {
-            let (a, b) = (*knots.get(j + k - degree)?, *knots.get(j + 1 + k - r)?);
-            let w = if b > a { (t - a) / (b - a) } else { 0.0 };
-            let (p, q) = (*d.get(j - 1)?, *d.get(j)?);
-            *d.get_mut(j)? = std::array::from_fn(|i| (1.0 - w) * p[i] + w * q[i]);
-        }
-    }
-    d.get(degree).copied()
-}
-
-/// Points along an edge (its end vertices included); only lines and splines are sampled.
+/// Points along an edge (its end vertices included), evaluated by the kernel.
 pub(super) fn edge_points(body: &Brep, edge: u32) -> Result<Vec<V>> {
     let e = body.edges.get(edge as usize).ok_or_else(|| refuse("an edge index is out of range"))?;
+    let curve = solidcore_convert::curve(e.nurbs.as_ref().unwrap_or(&e.curve)).map_err(|e| refuse(&e.to_string()))?;
+    let eval = solidcore::eval::CurveEval::new(&curve).map_err(|e| refuse(&format!("{e:?}")))?;
     let [lo, hi] = e.interval;
-    let at = |t: f64| match &e.curve {
-        Curve::Line { start, end } => Some(std::array::from_fn(|i| start[i] + t * (end[i] - start[i]))),
-        Curve::Spline { knots, points } => de_boor(knots, points, t),
-        _ => None,
-    };
     (0..=EDGE_SAMPLES)
-        .map(|i| at(lo + (hi - lo) * i as f64 / EDGE_SAMPLES as f64))
+        .map(|i| eval.point(lo + (hi - lo) * i as f64 / EDGE_SAMPLES as f64).map(|p| [p.x, p.y, p.z]))
         .collect::<Option<Vec<V>>>()
-        .ok_or_else(|| refuse("a boundary edge is neither a line nor a spline"))
+        .ok_or_else(|| refuse("a boundary edge cannot be evaluated"))
 }

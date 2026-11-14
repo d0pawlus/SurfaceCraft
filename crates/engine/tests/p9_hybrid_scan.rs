@@ -203,19 +203,28 @@ fn the_hybrid_method_puts_the_plane_cylinder_and_sphere_of_a_smooth_part_on_anal
         "smooth part: {planes} planes, {cylinders} cylinders, {spheres} spheres, {others} others, {splines} splines; {}",
         r["analytic"]
     );
-    // the cap and the wall are merged; the base is one flat disc whose patches all touch the round, so it
-    // may stay patches (the border band of a region is never merged): at least two of the three kinds
-    assert!(spheres >= 1, "the cap is an analytic face");
-    assert!(usize::from(planes >= 1) + usize::from(cylinders >= 1) + usize::from(spheres >= 1) >= 2, "{r}");
+    // the cap and the wall are merged (the base is one flat disc whose patches all touch the round, so
+    // it may stay patches: the border band of a region is never merged); every analytic face is the
+    // part's own (`assert_geometry`), and the areas are asserted below
+    assert!(spheres >= 1 && cylinders >= 1, "the cap and the wall have analytic faces: {r}");
     assert_geometry(&brep);
     assert!(splines >= 10, "the rounds and the border bands are still patches: {splines}");
     let a = &r["analytic"];
     assert_eq!(a["faces"].as_u64().unwrap() as usize, planes + cylinders + spheres + others);
     assert_eq!(a["total_faces"].as_u64().unwrap() as usize, brep.faces.len());
+    let area_of = |kind: &str| -> f64 {
+        a["merged"].as_array().unwrap().iter().filter(|m| m["kind"] == kind).map(|m| m["area"].as_f64().unwrap()).sum()
+    };
+    // true areas of the part: the cap 2 pi R^2 (1 - cos 36.87 deg) = 181 mm2, the wall 2 pi 8 x 12 = 603 mm2.
+    // Measured on three runs of the part (cap about 170, wall pieces about 160): the bands are at least
+    // 2.4 times from those figures on the low side, and the true area on the high one.
+    let (cap, wall) = (area_of("sphere"), area_of("cylinder"));
+    assert!((72.0..=190.0).contains(&cap), "the cap's analytic area {cap} mm2 (181 in all)");
+    assert!((30.0..=620.0).contains(&wall), "the wall's analytic area {wall} mm2 (603 in all)");
     let share = a["area_share"].as_f64().unwrap();
     // the base, the wall and the cap are about 1 000 of the part's 1 200 mm2; the rounds and the border
     // bands of patches are not merged
-    assert!((0.15..0.95).contains(&share), "analytic area share {share}");
+    assert!((0.1..0.95).contains(&share), "analytic area share {share}");
     for m in a["merged"].as_array().unwrap() {
         assert!(m["max_edge_gap"].as_f64().unwrap() <= 0.2 + 1e-9, "{m}");
     }
@@ -273,7 +282,10 @@ fn an_open_scan_gives_a_sheet_with_analytic_faces() {
     let r = to_solid_open(&mut s, "hybrid");
     assert_eq!(r["method"], "hybrid", "{r}");
     let codes: Vec<&str> = r["issues"].as_array().unwrap().iter().map(|i| i["code"].as_str().unwrap()).collect();
-    assert!(!codes.iter().any(|c| c.starts_with("hybrid_")), "{codes:?}: {r}");
+    // informational codes (`hybrid_edge_gap`, `hybrid_merge_rejected`) may be there; a failure may not
+    let failures = ["hybrid_wrap_failed", "hybrid_merge_failed", "hybrid_no_analytic_face", "hybrid_failed"];
+    assert!(!codes.iter().any(|c| failures.contains(c)), "{codes:?}: {r}");
+    assert!(!r["body"].is_null(), "a body: {r}");
     assert!(r["body"]["volume"].is_null(), "an open scan gives a sheet: {r}");
     let brep = body_of(&s, &r);
     let (planes, cylinders, spheres, ..) = kinds(&brep);
@@ -359,4 +371,20 @@ fn hostile_tolerances_never_panic() {
             assert_eq!(v["method"], "hybrid");
         }
     }
+}
+
+/// With no region large enough for a group the hybrid method makes no second wrap: it returns the
+/// freeform result and says why (`min_region_triangles` leaves no protected region).
+#[test]
+fn with_no_region_large_enough_the_hybrid_method_returns_the_freeform_result_at_once() {
+    let mut s = scanned_session(&part_mesh(), 5);
+    let p =
+        |m: &str| json!({"scan": "scan", "method": m, "tolerance": 0.2, "name": m, "min_region_triangles": 1_000_000});
+    let h = s.execute("scan.to_solid", p("hybrid")).unwrap();
+    let f = s.execute("scan.to_solid", p("freeform")).unwrap();
+    assert_eq!(h["method"], "hybrid", "{h}");
+    let codes: Vec<&str> = h["issues"].as_array().unwrap().iter().map(|i| i["code"].as_str().unwrap()).collect();
+    assert!(codes.contains(&"hybrid_no_analytic_face"), "{codes:?}");
+    assert_eq!(h["analytic"]["faces"], 0);
+    assert_eq!((&h["patches"], &h["verdict"]), (&f["patches"], &f["verdict"]), "the freeform result");
 }

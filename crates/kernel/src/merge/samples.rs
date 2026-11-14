@@ -1,31 +1,26 @@
 //! Where the patches of a body are: points on them, and which of them touch.
-use super::boundary::{de_boor, pinch_vertices};
+use super::boundary::pinch_vertices;
 use crate::hybrid::{V, cross, norm, sub};
 use crate::record::brep::{Brep, Surface};
 use std::collections::BTreeMap;
 
-/// The parameter range of a spline's direction, `None` for malformed knots.
-fn range(knots: &[f64], count: usize) -> Option<[f64; 2]> {
-    let degree = knots.len().checked_sub(count + 1)?;
-    Some([*knots.get(degree)?, *knots.get(count)?])
-}
-
-/// A grid of `(n + 1) x (n + 1)` points over the whole of patch `face` (its borders included),
-/// row by row; `None` when the face is not a spline patch or its data is malformed.
+/// A grid of `(n + 1) x (n + 1)` points over the whole of patch `face` (its borders included), row by
+/// row, evaluated by the kernel; `None` when the face is not a spline patch or cannot be evaluated.
 #[must_use]
 pub fn face_samples(body: &Brep, face: usize, n: usize) -> Option<Vec<V>> {
-    let Surface::Spline { u_knots, v_knots, points } = &body.faces.get(face)?.surface else { return None };
-    let cols = points.first()?.len();
-    let [u0, u1] = range(u_knots, points.len())?;
-    let [v0, v1] = range(v_knots, cols)?;
+    let f = body.faces.get(face)?;
+    if !matches!(f.surface, Surface::Spline { .. } | Surface::RationalSpline { .. }) {
+        return None;
+    }
+    let eval = solidcore::eval::SurfaceEval::new(&solidcore_convert::surface(&f.surface).ok()?).ok()?;
+    let [Some((u0, u1)), Some((v0, v1))] = eval.domain().range else { return None };
     let n = n.max(1);
     let mut out = Vec::with_capacity((n + 1) * (n + 1));
     for i in 0..=n {
-        let u = u0 + (u1 - u0) * i as f64 / n as f64;
         for j in 0..=n {
-            let v = v0 + (v1 - v0) * j as f64 / n as f64;
-            let across: Vec<V> = points.iter().map(|row| de_boor(v_knots, row, v)).collect::<Option<Vec<V>>>()?;
-            out.push(de_boor(u_knots, &across, u)?);
+            let uv = [u0 + (u1 - u0) * i as f64 / n as f64, v0 + (v1 - v0) * j as f64 / n as f64];
+            let p = eval.point(uv)?;
+            out.push([p.x, p.y, p.z]);
         }
     }
     Some(out)

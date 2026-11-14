@@ -384,6 +384,7 @@ fn with_analytic(mut r: ToSolidOut, method: Method, share: f64) -> ToSolidOut {
         faces: 3,
         total_faces: 200,
         area_share: share,
+        max_edge_gap: 0.0,
         merged: Vec::new(),
         left_as_patches: Vec::new(),
     });
@@ -570,4 +571,29 @@ fn a_hybrid_winner_or_loser_is_named_in_the_next_steps_filter_and_the_issue() {
     let result = report.expect("a report").result;
     assert!(result.next_steps.iter().all(|st| st.params["method"].is_null()), "{:?}", result.next_steps);
     assert!(result.issues.iter().any(|i| i.code == "other_method_tried" && i.message.contains("hybrid")));
+}
+
+fn deviating(max_abs: f64, rms: f64, within: f64) -> ToSolidOut {
+    let mut r = result(Verdict::Pass, Some(Some(1.0)), within, 1.0);
+    if let Some(d) = r.deviation.as_mut() {
+        d.max_abs = max_abs;
+        d.rms = rms;
+    }
+    r
+}
+
+#[test]
+fn a_merged_body_with_a_clearly_larger_deviation_is_not_an_upgrade() {
+    use super::super::hybrid_method::rejection;
+    let wrap = deviating(0.30, 0.05, 0.995);
+    // the same share within, but the largest deviation is a tolerance (0.2 mm) over the wrap's
+    assert!(rejection(&deviating(0.30, 0.05, 0.995), &wrap, 0.2).is_none(), "equal is kept");
+    assert!(rejection(&deviating(0.25, 0.04, 0.996), &wrap, 0.2).is_none(), "better is kept");
+    assert!(
+        rejection(&deviating(0.45, 0.05, 0.995), &wrap, 0.2).is_none(),
+        "max 0.15 mm over, inside the band of one tolerance"
+    );
+    assert!(rejection(&deviating(0.55, 0.05, 0.995), &wrap, 0.2).is_some(), "max 0.25 mm over (band 0.2 mm)");
+    assert!(rejection(&deviating(0.30, 0.06, 0.995), &wrap, 0.2).is_some(), "RMS 0.01 mm over (band 0.004 mm)");
+    assert!(rejection(&deviating(0.30, 0.05, 0.98), &wrap, 0.2).is_some(), "a clearly smaller share within");
 }

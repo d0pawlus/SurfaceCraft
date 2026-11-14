@@ -1,10 +1,14 @@
 //! The analytic surface a merged face lies on: its record form (label and NURBS form), parameter
 //! box and side, the parameters of a point on it, and the distance of a point from it.
-use super::revolve::{Arcs, Profile, surface as revolved};
+//!
+//! APP-GEOMETRY: stands in for the kernel's parameter inversion of an analytic surface (the closest-point
+//! parameters `SurfaceEval::project` gives on a spline only; the angle and height of a point on a
+//! cylinder, cone or sphere frame are computed here) and for the point-to-primitive distance of a shape.
 use crate::hybrid::{Shape, V, add, cross, dot, norm, perpendicular, scale, sub, unit};
 use crate::record::brep::{Frame, Surface};
 use crate::{KernelError, Result};
-use std::f64::consts::{FRAC_PI_2, PI, TAU};
+use solidcore::eval::form;
+use std::f64::consts::{PI, TAU};
 
 /// How far (radians) a face may come to the seam of a periodic surface, or to a pole.
 const SEAM_MARGIN: f64 = 0.1;
@@ -20,7 +24,8 @@ pub(super) struct Placement {
     /// The surface's natural normal points against the side the patches face.
     pub flip: bool,
     map: Map,
-    forms: Option<(Arcs, Profile)>,
+    /// The parameters of the NURBS form are the kernel's quarter-grid ones ([`form::param`]).
+    on_form: bool,
 }
 
 /// The geometry of the placed surface.
@@ -77,10 +82,14 @@ impl Placement {
 
     /// The parameters of `p` in the face's surface (the NURBS form's, or the plane's).
     pub(super) fn param(&self, p: V) -> [f64; 2] {
-        let g = self.geo(p);
-        match &self.forms {
-            Some((u, v)) => [u.param(g[0]), v.param(g[1])],
-            None => g,
+        self.params_of_geo(self.geo(p))
+    }
+
+    fn params_of_geo(&self, g: [f64; 2]) -> [f64; 2] {
+        match (&self.map, self.on_form) {
+            (Map::Sphere { .. }, true) => [form::param(g[0]), form::param(g[1])],
+            (_, true) => [form::param(g[0]), g[1]],
+            _ => g,
         }
     }
 }
@@ -152,7 +161,7 @@ pub(super) fn place(shape: &Shape, points: &[V], outward: V) -> Result<Placement
     };
     let geo = padded_box(&placed, points);
     check_reach(&placed, geo)?;
-    finish(&mut placed, geo, shape);
+    finish(&mut placed, geo)?;
     Ok(placed)
 }
 
@@ -167,7 +176,7 @@ fn plane(point: V, normal: V, outward: V) -> Result<Placement> {
         domain: [[0.0; 2]; 2],
         flip: false,
         map: Map::Plane { origin: point, u, v },
-        forms: None,
+        on_form: false,
     })
 }
 
@@ -199,7 +208,7 @@ fn around(origin: V, axis: V, c: V, outward: V, round: Round) -> Result<Placemen
         domain: [[0.0; 2]; 2],
         flip: dot(add(d, scale(axis, lean)), outward) < 0.0,
         map: Map::Around { origin, x, y, z: axis },
-        forms: None,
+        on_form: false,
     })
 }
 
@@ -213,7 +222,7 @@ fn sphere(center: V, radius: f64, c: V, outward: V) -> Result<Placement> {
         domain: [[0.0; 2]; 2],
         flip: dot(d, outward) < 0.0,
         map: Map::Sphere { center, x, y, z },
-        forms: None,
+        on_form: false,
     })
 }
 
@@ -232,34 +241,22 @@ fn check_reach(p: &Placement, geo: [[f64; 2]; 2]) -> Result<()> {
     Ok(())
 }
 
-/// Builds the NURBS form (the kernel's own form of the whole surface over the heights `v` of the
-/// box) and sets the domain to the box in its parameters.
-fn finish(p: &mut Placement, geo: [[f64; 2]; 2], shape: &Shape) {
-    let [[u0, u1], [v0, v1]] = geo;
-    let (origin, basis, profile, u_scale) = match (&p.map, shape) {
-        (Map::Plane { .. }, _) => {
-            p.domain = geo;
-            return;
-        }
-        (Map::Around { origin, x, y, z }, Shape::Cylinder { radius, .. }) => {
-            (*origin, [*x, *y, *z], Profile::Line { v: [v0, v1], radius: [*radius; 2] }, *radius)
-        }
-        (Map::Around { origin, x, y, z }, Shape::Cone { half_angle, .. }) => {
-            let r0 = match &p.surface {
-                Surface::Cone { radius_at_origin, .. } => *radius_at_origin,
-                _ => 0.0,
-            };
-            let s = half_angle.tan();
-            (*origin, [*x, *y, *z], Profile::Line { v: [v0, v1], radius: [r0 + v0 * s, r0 + v1 * s] }, 1.0)
-        }
-        (Map::Sphere { center, x, y, z }, Shape::Sphere { radius, .. }) => {
-            (*center, [*x, *y, *z], Profile::meridian(*radius), 1.0)
-        }
-        _ => return,
-    };
-    let scale = if matches!(shape, Shape::Sphere { .. }) { 0.25 } else { u_scale * FRAC_PI_2 };
-    let arcs = Arcs::new(0.0, TAU, scale);
-    p.nurbs = Some(revolved(origin, basis, &arcs, &profile));
-    p.domain = [[arcs.param(u0), arcs.param(u1)], [profile.param(v0), profile.param(v1)]];
-    p.forms = Some((arcs, profile));
+/// Asks the kernel for the NURBS form of the surface (its whole turn about the axis, over the heights
+/// of the box; a sphere pole to pole: the kernel keeps the label only for its own full forms) and sets
+/// the domain to the box in the form's parameters.
+fn finish(p: &mut Placement, geo: [[f64; 2]; 2]) -> Result<()> {
+    if p.is_plane() {
+        p.domain = geo;
+        return Ok(());
+    }
+    let sphere = matches!(p.map, Map::Sphere { .. });
+    let v_range = if sphere { [-PI / 2.0, PI / 2.0] } else { geo[1] };
+    let label = solidcore_convert::surface(&p.surface).map_err(|e| invalid(&format!("{e}")))?;
+    let (nurbs, _) =
+        form::surface(&label, [[0.0, TAU], v_range]).ok_or_else(|| invalid("the kernel has no form for the face"))?;
+    p.nurbs = Some(solidcore_convert::record_surface(nurbs).map_err(|e| invalid(&format!("{e}")))?);
+    p.on_form = true;
+    let [lo, hi] = [[geo[0][0], geo[1][0]], [geo[0][1], geo[1][1]]].map(|c| p.params_of_geo(c));
+    p.domain = [[lo[0], hi[0]], [lo[1], hi[1]]];
+    Ok(())
 }

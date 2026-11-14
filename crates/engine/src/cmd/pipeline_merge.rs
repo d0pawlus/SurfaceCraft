@@ -32,11 +32,11 @@ const NEAR_REGION_SHARE_OF_TOLERANCE: f64 = 1.0;
 const SEARCH_TOLERANCES: f64 = 4.0;
 /// A group of less area than this many squared tolerances stays patches (collapsed and sliver
 /// patches lie on any surface and are no analytic face).
-const MIN_AREA_IN_TOLERANCES_SQUARED: f64 = 50.0;
+pub(super) const MIN_AREA_IN_TOLERANCES_SQUARED: f64 = 50.0;
 /// A group of fewer patches than this stays patches (one patch is no gain).
 const MIN_GROUP: usize = 2;
 /// Owner of a triangle in no protected region.
-const NONE: u16 = u16::MAX;
+const NONE: u32 = u32::MAX;
 
 /// A protected primitive: what the segmentation found and fitted.
 pub(super) struct Protected {
@@ -45,6 +45,8 @@ pub(super) struct Protected {
     pub shape: Shape,
     pub fit: Primitive,
     pub triangles: Vec<u32>,
+    /// The area of the region of the scan (mm2).
+    pub area: f64,
 }
 
 /// What the merging made of the body.
@@ -55,12 +57,12 @@ pub(super) struct Merging {
 }
 
 /// The region each scan triangle belongs to (`NONE` for none).
-fn region_owners(scan: &Mesh, protected: &[Protected]) -> Vec<u16> {
+fn region_owners(scan: &Mesh, protected: &[Protected]) -> Vec<u32> {
     let mut owner = vec![NONE; scan.triangles.len()];
     for (k, p) in protected.iter().enumerate() {
         for &t in &p.triangles {
             if let Some(slot) = owner.get_mut(t as usize) {
-                *slot = k as u16;
+                *slot = u32::try_from(k).unwrap_or(NONE);
             }
         }
     }
@@ -89,7 +91,7 @@ fn region_mesh(scan: &Mesh, triangles: &[u32]) -> Mesh {
 /// What the choice of a patch's primitive looks at.
 struct Lookup<'a> {
     all: Bvh,
-    owner: Vec<u16>,
+    owner: Vec<u32>,
     regions: Vec<Bvh>,
     protected: &'a [Protected],
     tol: f64,
@@ -109,7 +111,7 @@ impl<'a> Lookup<'a> {
         let middle = samples.get(samples.len() / 2)?;
         let mid = Point3::new(middle[0], middle[1], middle[2]);
         let hit = self.all.closest(&mid, SEARCH_TOLERANCES * self.tol)?;
-        let k = usize::from(self.owner.get(hit.triangle).copied().filter(|&o| o != NONE)?);
+        let k = usize::try_from(self.owner.get(hit.triangle).copied().filter(|&o| o != NONE)?).ok()?;
         let (prim, region) = (self.protected.get(k)?, self.regions.get(k)?);
         let near = NEAR_REGION_SHARE_OF_TOLERANCE * self.tol;
         let fits = |p: &[f64; 3]| {
@@ -133,7 +135,7 @@ fn candidate_groups(
     tol: f64,
     out: &mut Merging,
 ) -> Vec<(usize, Vec<usize>)> {
-    let mut candidates = Vec::new();
+    let mut sized: Vec<(f64, usize, Vec<usize>)> = Vec::new();
     for (k, p) in protected.iter().enumerate() {
         let faces: Vec<usize> =
             (0..body.faces.len()).filter(|&f| owners.get(f).copied().flatten().is_some_and(|o| o.0 == k)).collect();
@@ -144,11 +146,13 @@ fn candidate_groups(
             } else if area < MIN_AREA_IN_TOLERANCES_SQUARED * tol * tol {
                 out.left.push(left(p, group.len(), format!("an area of {area:.2} mm2 is too small to merge")));
             } else {
-                candidates.push((k, group));
+                sized.push((area, k, group));
             }
         }
     }
-    candidates
+    // the largest first: the kernel takes a limited number of groups, and the first are the ones worth most
+    sized.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.2.first().cmp(&b.2.first())));
+    sized.into_iter().map(|(_, k, g)| (k, g)).collect()
 }
 
 /// Merges every group of patches of `body` that lies in a protected region, all groups in one
@@ -174,9 +178,12 @@ pub(super) fn merge_groups(
     if specs.is_empty() {
         return Ok(out);
     }
-    match merge_faces_onto_shapes(body, &specs, GAP_SHARE_OF_TOLERANCE * tol) {
+    match merge_faces_onto_shapes(body, &specs, GAP_SHARE_OF_TOLERANCE * tol, &|| s.cancel.is_cancelled()) {
         Ok(batch) => record(&mut out, protected, &candidates, batch),
         Err(e) => {
+            if s.cancel.is_cancelled() {
+                return Err(cancelled());
+            }
             for (k, g) in &candidates {
                 if let Some(p) = protected.get(*k) {
                     out.left.push(left(p, g.len(), e.to_string()));
@@ -198,6 +205,7 @@ fn record(out: &mut Merging, protected: &[Protected], candidates: &[(usize, Vec<
                 face: r.face,
                 patches: g.len(),
                 max_edge_gap: r.gap,
+                area: 0.0,
             }),
             Err(why) => out.left.push(left(p, g.len(), why)),
         }

@@ -438,16 +438,33 @@ mod patch_tests {
 
 /// Renumbers edges and vertices into the record's canonical order (first appearance walking
 /// faces → loops → oriented edges, then edges' start/end vertices) and rebuilds the uses in
-/// walk order. Faces must all be used forward.
+/// walk order. A face used backward is walked with its loops reversed.
 pub(crate) fn canonicalize(mut b: Brep) -> Brep {
     let ne = b.edges.len();
     let mut new_of_edge = vec![u32::MAX; ne];
     let mut order: Vec<usize> = Vec::with_capacity(ne);
     let mut uses: Vec<Vec<EdgeUseRef>> = vec![Vec::new(); ne];
+    // a face used backward in its shell is walked from the other side: its loops run the other way
+    let backward: std::collections::BTreeSet<usize> = b
+        .shells
+        .iter()
+        .filter_map(|s| match s {
+            Shell::Faces { faces, .. } => Some(faces),
+            _ => None,
+        })
+        .flatten()
+        .filter(|o| !o.forward)
+        .map(|o| o.face as usize)
+        .collect();
     for (fi, f) in b.faces.iter().enumerate() {
         for (li, l) in f.loops.iter().enumerate() {
             if let Loop::Edges { edges } = l {
-                for (p, u) in edges.iter().enumerate() {
+                let walk: Vec<(usize, &OrientedEdge)> = if backward.contains(&fi) {
+                    edges.iter().enumerate().rev().collect()
+                } else {
+                    edges.iter().enumerate().collect()
+                };
+                for (p, u) in walk {
                     let e = u.edge as usize;
                     if let Some(slot) = new_of_edge.get_mut(e)
                         && *slot == u32::MAX

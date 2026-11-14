@@ -10,7 +10,7 @@
 //! the unchanged judge against the original scan, and is returned only when it is not worse than the
 //! wrap it came from. A failure ends the attempt with an issue code and the document as it was.
 use super::freeform::{judge_stage, wrap_mesh_at, wrap_stage};
-use super::merging::{Merging, Protected, merge_groups};
+use super::merging::{MIN_AREA_IN_TOLERANCES_SQUARED, Merging, Protected, merge_groups};
 use super::regions::{candidates, fit_regions};
 use super::{
     LeftOut, MAX_LISTED_LEFT_OUT, Method, Modelled, ScanSummary, Settings, ToSolidIn, ToSolidOut, Verdict, apply_roles,
@@ -41,6 +41,13 @@ use snap::{projected, shape_of};
 /// leave the scan by a few of these, and along a sharp edge the patch boundary is a chord of it, which
 /// is what a group's boundary gap to its primitive is made of.
 const WRAP_TOLERANCE_SHARE: f64 = 0.5;
+/// Vertices of a protected region within this share of the tolerance of their primitive are put on it.
+/// Measured on scans 1 and 4: 0.5 gave 2 and 9 analytic faces (1.2 % and 7.5 % of the area), 1.0 gave 7
+/// and 24 (6.4 % and 16.6 %), and the deviation from the scan stays within the tolerance either way.
+const PROJECT_SHARE_OF_TOLERANCE: f64 = 1.0;
+/// A merged face whose boundary is farther than this share of the tolerance from its primitive is
+/// reported as the issue `hybrid_edge_gap`.
+const EDGE_GAP_NOTE_SHARE: f64 = 0.5;
 /// Chord of the tessellation the area of the faces is measured on, as a share of the tolerance.
 const AREA_CHORD_SHARE: f64 = 1.0;
 
@@ -57,6 +64,9 @@ pub struct MergedFace {
     pub patches: usize,
     /// The largest distance of the face's boundary edges from the primitive (mm).
     pub max_edge_gap: f64,
+    /// The area of the face (mm2), from a tessellation at the tolerance's chord.
+    #[serde(default)]
+    pub area: f64,
 }
 
 /// Patches of a protected region that stay patches.
@@ -84,6 +94,10 @@ pub struct AnalyticSummary {
     /// The merged faces, each with the largest distance of its boundary from its primitive.
     #[serde(default)]
     pub merged: Vec<MergedFace>,
+    /// The largest distance of the boundary edges of any merged face from its primitive (mm), sampled
+    /// at 25 points per edge (not a certified maximum). 0 when nothing was merged.
+    #[serde(default)]
+    pub max_edge_gap: f64,
     /// Groups of patches of a protected region that were not merged, with the reason.
     #[serde(default)]
     pub left_as_patches: Vec<LeftPatches>,
@@ -129,7 +143,7 @@ fn fit_primitives(s: &mut Session, i: &ToSolidIn, set: &Settings, report: &ScanS
 
 /// The protected primitives, largest region first (the order the regions are given): every fitted
 /// primitive the merge can place. Regions of a torus are not protected.
-fn protect(s: &Session, modelled: &[Modelled]) -> Vec<Protected> {
+fn protect(s: &Session, modelled: &[Modelled], scan: &Mesh) -> Vec<Protected> {
     let mut out = Vec::new();
     for m in modelled {
         let Some(o) = s.doc.primitive(m.primitive) else { continue };
@@ -150,6 +164,12 @@ fn protect(s: &Session, modelled: &[Modelled]) -> Vec<Protected> {
             shape: shape_of(&fit),
             fit,
             triangles: region.triangles.to_vec(),
+            area: region
+                .triangles
+                .iter()
+                .filter_map(|&t| scan.triangle(t as usize))
+                .map(|[a, b, c]| 0.5 * (b - a).cross(&(c - a)).norm())
+                .sum(),
         });
     }
     out
@@ -164,15 +184,18 @@ fn wrap_prepared(s: &mut Session, set: &Settings, protected: &[Protected], scan:
     } else {
         let regions: Vec<(&[u32], &surfacecraft_fit::Primitive)> =
             protected.iter().map(|p| (p.triangles.as_slice(), &p.fit)).collect();
-        let copy = s.doc.add_mesh(&format!("{}-prepared", set.name), projected(scan, &regions, set.tolerance));
+        let copy = s.doc.add_mesh(
+            &format!("{}-prepared", set.name),
+            projected(scan, &regions, PROJECT_SHARE_OF_TOLERANCE * set.tolerance),
+        );
         let held = WRAP_TOLERANCE_SHARE * set.tolerance;
         let staged = wrap_stage(s, set, copy, |s, cap| wrap_mesh_at(s, set, copy, cap, held));
         s.doc.remove(copy);
         staged
     };
-    match staged.map_err(failed_at("hybrid_stock_failed"))? {
+    match staged.map_err(failed_at("hybrid_wrap_failed"))? {
         Ok(pair) => Ok(pair),
-        Err(why) => Err(halt("hybrid_stock_failed", format!("the scan could not be wrapped in patches: {why}"))),
+        Err(why) => Err(halt("hybrid_wrap_failed", format!("the scan could not be wrapped in patches: {why}"))),
     }
 }
 
@@ -186,10 +209,14 @@ fn analytic_summary(brep: &Brep, tolerance: f64, m: &Merging) -> Option<Analytic
         return None;
     }
     let (mut on, mut all) = (0.0, 0.0);
+    let mut per_face = vec![0.0; brep.faces.len()];
     for (t, &face) in topo.tri_face.iter().enumerate() {
         let Some([a, b, c]) = topo.mesh.triangle(t) else { continue };
         let area = 0.5 * (b - a).cross(&(c - a)).norm();
         all += area;
+        if let Some(slot) = per_face.get_mut(face as usize) {
+            *slot += area;
+        }
         if analytic.binary_search(&(face as usize)).is_ok() {
             on += area;
         }
@@ -199,17 +226,22 @@ fn analytic_summary(brep: &Brep, tolerance: f64, m: &Merging) -> Option<Analytic
         faces: analytic.len(),
         total_faces: brep.faces.len(),
         area_share: share,
-        merged: m.merged.clone(),
+        max_edge_gap: m.merged.iter().map(|g| g.max_edge_gap).fold(0.0, f64::max),
+        merged: m
+            .merged
+            .iter()
+            .map(|g| MergedFace { area: per_face.get(g.face).copied().unwrap_or(0.0), ..g.clone() })
+            .collect(),
         left_as_patches: m.left.clone(),
     })
 }
 
 /// Per fitted primitive: its merged faces (or none) for the result's `modelled` list.
-fn faces_of(modelled: &[Modelled], m: &Merging) -> Vec<FaceOf> {
+fn faces_of(modelled: &[Modelled], merged: &[MergedFace]) -> Vec<FaceOf> {
     modelled
         .iter()
         .map(|p| {
-            let mine: Vec<&MergedFace> = m.merged.iter().filter(|g| g.primitive == p.primitive).collect();
+            let mine: Vec<&MergedFace> = merged.iter().filter(|g| g.primitive == p.primitive).collect();
             let faces = mine.iter().map(|g| g.face).collect();
             let patches: usize = mine.iter().map(|g| g.patches).sum();
             let (how, role) = if mine.is_empty() {
@@ -230,9 +262,43 @@ fn install(s: &mut Session, w: &WrapOut, body: Brep) -> Step<WrapOut> {
     Ok(WrapOut { body: info, ..w.clone() })
 }
 
-/// Is `merged` worse than the wrap it came from (by the comparison of `auto`)?
-fn is_worse(merged: &ToSolidOut, wrap: &ToSolidOut) -> bool {
-    super::auto::compare(merged, wrap) == Ordering::Less
+/// The band the merged body's largest and RMS deviation from the scan may exceed the wrap's by, as
+/// shares of the tolerance, before it is refused (the comparison of `auto` alone lets a share within
+/// the tolerance drop by half a point). A merged face's boundary may be a tolerance from its patches
+/// (the gap limit), so the largest deviation may grow by that near it (scan 4: 0.54 to 0.67 mm at a
+/// tolerance of 0.2); the RMS, which a wrong face moves, may grow by 0.02 of the tolerance.
+const MAX_DEVIATION_BAND: f64 = 1.0;
+const RMS_DEVIATION_BAND: f64 = 0.02;
+
+/// Why `merged` is not an upgrade of the wrap it came from, if it is not: worse by the comparison of
+/// `auto`, or a larger maximum or RMS deviation from the scan than the wrap's by more than a band.
+pub(super) fn rejection(merged: &ToSolidOut, wrap: &ToSolidOut, tol: f64) -> Option<String> {
+    if super::auto::compare(merged, wrap) == Ordering::Less {
+        let show = |r: &ToSolidOut| {
+            let d = r.deviation.as_ref();
+            format!(
+                "{:?}, {:.2} % within of {:.2} % measured, {}",
+                r.verdict,
+                100.0 * d.map_or(0.0, |d| d.within),
+                100.0 * d.map_or(0.0, |d| d.coverage),
+                if r.body.as_ref().is_some_and(|b| b.volume.is_some()) { "closed" } else { "a sheet" }
+            )
+        };
+        return Some(format!(
+            "the merged body is worse than the wrap by verdict, share within the tolerance or closedness (merged: {}; wrap: {})",
+            show(merged),
+            show(wrap)
+        ));
+    }
+    let (m, w) = (merged.deviation.as_ref()?, wrap.deviation.as_ref()?);
+    let worse = |a: f64, b: f64, band: f64| a > b + band * tol;
+    if worse(m.max_abs, w.max_abs, MAX_DEVIATION_BAND) || worse(m.rms, w.rms, RMS_DEVIATION_BAND) {
+        return Some(format!(
+            "the merged body deviates more from the scan (max {:.3} against {:.3} mm, RMS {:.3} against {:.3} mm)",
+            m.max_abs, w.max_abs, m.rms, w.rms
+        ));
+    }
+    None
 }
 
 /// The merging step on the wrapped body: the merged result when it is not worse than the wrap (by the
@@ -243,7 +309,7 @@ fn merged_or_wrap(
     set: &Settings,
     report: &ScanSummary,
     wrapped: (&WrapOut, Retry),
-    wrap_result: ToSolidOut,
+    mut wrap_result: ToSolidOut,
     protected: &[Protected],
     scan: &Mesh,
 ) -> Step<(ToSolidOut, Merging)> {
@@ -267,28 +333,17 @@ fn merged_or_wrap(
     }
     let merged_w = install(s, w, tried.body.clone())?;
     let merged = judge_stage(s, set, report.clone(), &merged_w, retry).map_err(failed_at("hybrid_failed"))?;
-    if is_worse(&merged, &wrap_result) {
+    if let Some(why) = rejection(&merged, &wrap_result, set.tolerance) {
         install(s, w, (*brep).clone())?;
+        wrap_result.issues.push(issue("hybrid_merge_rejected", format!("the merge was not kept: {why}")));
         return Ok((wrap_result, none(tried.left)));
     }
     Ok((merged, tried))
 }
 
-/// The hybrid attempt without the clean-up of a failure.
-fn build(s: &mut Session, i: &ToSolidIn, set: &Settings, report: &ScanSummary) -> Step<ToSolidOut> {
-    let mut fitted = fit_primitives(s, i, set, report)?;
-    check_cancel(s)?;
-    let protected = protect(s, &fitted.modelled);
-    let scan = s.doc.mesh(set.scan).map(|m| m.mesh.clone()).ok_or_else(|| halt("hybrid_failed", "the scan is gone"))?;
-    let (w, retry) = wrap_prepared(s, set, &protected, &scan)?;
-    check_cancel(s)?;
-    let wrap_result = judge_stage(s, set, report.clone(), &w, retry.clone()).map_err(failed_at("hybrid_failed"))?;
-    let (mut out, merging) = merged_or_wrap(s, set, report, (&w, retry), wrap_result, &protected, &scan)?;
-    let body =
-        s.doc.body(w.body.id).map(|b| b.brep.clone()).ok_or_else(|| halt("hybrid_failed", "the body is gone"))?;
-    let analytic = analytic_summary(&body, set.tolerance, &merging)
-        .ok_or_else(|| halt("hybrid_failed", "the faces could not be measured"))?;
-    let roles = faces_of(&fitted.modelled, &merging);
+/// Fills in what the fits of the call contribute to the result.
+fn conclude(mut out: ToSolidOut, mut fitted: Fitted, merged: &[MergedFace], analytic: AnalyticSummary) -> ToSolidOut {
+    let roles = faces_of(&fitted.modelled, merged);
     apply_roles(&mut fitted.modelled, &roles);
     out.method = Method::Hybrid;
     out.analytic = Some(analytic);
@@ -298,7 +353,64 @@ fn build(s: &mut Session, i: &ToSolidIn, set: &Settings, report: &ScanSummary) -
     out.left_out = fitted.left.into_iter().take(MAX_LISTED_LEFT_OUT).collect();
     out.unassigned_triangles = fitted.unassigned;
     out.modelled = fitted.modelled;
-    Ok(out)
+    out
+}
+
+/// No protected region can give a group: an explicit `method: hybrid` returns the freeform result
+/// (no second wrap is made) with an issue saying why; under `auto` the attempt is a recorded failure,
+/// since `auto` has the freeform result.
+fn without_merge(
+    s: &mut Session,
+    i: &ToSolidIn,
+    set: &Settings,
+    report: &ScanSummary,
+    fitted: Fitted,
+    why: &str,
+) -> Step<ToSolidOut> {
+    if i.method != Method::Hybrid {
+        return Err(halt("hybrid_no_analytic_face", why));
+    }
+    let mut out = super::freeform::freeform_solid(s, set, report.clone()).map_err(failed_at("hybrid_failed"))?;
+    out.issues.push(issue("hybrid_no_analytic_face", format!("no analytic face is possible: {why}")));
+    let faces = out.body.as_ref().map_or(0, |b| b.faces);
+    let analytic = AnalyticSummary {
+        faces: 0,
+        total_faces: faces,
+        area_share: 0.0,
+        max_edge_gap: 0.0,
+        merged: Vec::new(),
+        left_as_patches: Vec::new(),
+    };
+    Ok(conclude(out, fitted, &[], analytic))
+}
+
+/// The hybrid attempt without the clean-up of a failure.
+fn build(s: &mut Session, i: &ToSolidIn, set: &Settings, report: &ScanSummary) -> Step<ToSolidOut> {
+    let fitted = fit_primitives(s, i, set, report)?;
+    check_cancel(s)?;
+    let scan = s.doc.mesh(set.scan).map(|m| m.mesh.clone()).ok_or_else(|| halt("hybrid_failed", "the scan is gone"))?;
+    let protected = protect(s, &fitted.modelled, &scan);
+    let least = MIN_AREA_IN_TOLERANCES_SQUARED * set.tolerance * set.tolerance;
+    if !protected.iter().any(|p| p.area >= least) {
+        let why = format!("no region a primitive fits (plane, cylinder, cone, sphere) has {least:.1} mm2 or more");
+        return without_merge(s, i, set, report, fitted, &why);
+    }
+    let (w, retry) = wrap_prepared(s, set, &protected, &scan)?;
+    check_cancel(s)?;
+    let wrap_result = judge_stage(s, set, report.clone(), &w, retry.clone()).map_err(failed_at("hybrid_failed"))?;
+    let (mut out, merging) = merged_or_wrap(s, set, report, (&w, retry), wrap_result, &protected, &scan)?;
+    let body =
+        s.doc.body(w.body.id).map(|b| b.brep.clone()).ok_or_else(|| halt("hybrid_failed", "the body is gone"))?;
+    let analytic = analytic_summary(&body, set.tolerance, &merging)
+        .ok_or_else(|| halt("hybrid_failed", "the faces could not be measured"))?;
+    if analytic.max_edge_gap > EDGE_GAP_NOTE_SHARE * set.tolerance {
+        let msg = format!(
+            "a merged face's boundary is up to {:.3} mm from its primitive (sampled, not certified); its edges carry that as their tolerance, which STEP keeps",
+            analytic.max_edge_gap
+        );
+        out.issues.push(issue("hybrid_edge_gap", msg));
+    }
+    Ok(conclude(out, fitted, &merging.merged, analytic))
 }
 
 /// The result of an attempt that ended in `code`: no body, and nothing in the document.

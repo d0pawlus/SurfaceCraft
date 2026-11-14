@@ -19,6 +19,9 @@
 //! form in the record, and that form must be the kernel's own: the full revolution with its arcs,
 //! the face being a sub-box of it; any other parameterisation loses the label. The healer is not
 //! run on the edited record (it changes the topology of such a body and the record order is lost).
+//! APP-GEOMETRY: stands in for the kernel making the pcurves (the face's trims in its own parameters)
+//! of the edges of a face on a curved surface: `through` chains cubic Béziers through the parameters of
+//! the edge's samples, and the plane's pcurve is the projection of the edge's control points.
 use crate::hybrid::{Shape, V, add, cross, norm, scale, sub, unit};
 use crate::nurbs::{SurfaceProbe, canonicalize, domain, is_closed};
 use crate::record::brep::{Brep, Curve2, Face, Loop, OrientedEdge, OrientedFace, Region, Shell, Surface};
@@ -26,8 +29,8 @@ use crate::solid::encode;
 use crate::{KernelError, Result, finite_all};
 
 mod boundary;
+mod check;
 mod place;
-mod revolve;
 mod samples;
 
 use boundary::{Boundary, LoopEdge, boundary, edge_points};
@@ -48,7 +51,11 @@ const EDGE_TOLERANCE_PER_GAP: f64 = 1.1;
 /// Cells a side of the grid the area of a patch is taken from.
 const AREA_GRID: usize = 8;
 /// A merged face must tessellate to its patches' area within this share (a face the mesher cannot
-/// triangulate, such as one with a neck narrower than the chord, loses area).
+/// triangulate, such as one with a neck narrower than the chord, loses area). Measured on the gates and
+/// on real scans: the faces that are right differ from their patches' area by at most 0.047 (at the
+/// display chord 0.041, at the tolerance's 0.047; on scans 1 and 4 at most 0.027 and 0.013), the faces
+/// the mesher loses area from by 0.84 on the gates and 2.0 to 6.0 on the scans; 0.1 is 2.1 times the
+/// worst right one.
 const AREA_AGREEMENT: f64 = 0.1;
 
 /// What one merge did.
@@ -163,14 +170,17 @@ struct Prepared {
     edge_list: Vec<LoopEdge>,
     /// The area of the patches it replaces.
     area: f64,
+    cloud: check::Cloud,
     face: Face,
     forward: bool,
     gap: f64,
+    /// The gap the caller allowed: how far the new face may lie from the patches inside them.
+    limit: f64,
     shell: usize,
 }
 
-/// The signed area of a loop in the face's parameters (positive when it runs counter-clockwise).
-fn loop_area(body: &Brep, edges: &[LoopEdge], placed: &Placement) -> Result<f64> {
+/// The parameters of the points along a loop of the face, as the loop runs.
+fn loop_points(body: &Brep, edges: &[LoopEdge], placed: &Placement) -> Result<Vec<[f64; 2]>> {
     let mut pts: Vec<[f64; 2]> = Vec::new();
     for le in edges {
         let mut p = edge_points(body, le.edge)?;
@@ -179,26 +189,62 @@ fn loop_area(body: &Brep, edges: &[LoopEdge], placed: &Placement) -> Result<f64>
         }
         pts.extend(p.iter().map(|q| placed.param(*q)));
     }
-    let n = pts.len();
-    let at = |i: usize| pts.get(i % n.max(1)).copied().unwrap_or([0.0; 2]);
-    Ok(0.5 * (0..n).map(|i| at(i)[0] * at(i + 1)[1] - at(i + 1)[0] * at(i)[1]).sum::<f64>())
+    Ok(pts)
 }
 
-/// The loops of the new face, the outer one (the largest) first, each as the face's loop.
-fn face_loops(body: &Brep, b: &Boundary, placed: &Placement) -> Result<Vec<Loop>> {
-    let mut sized: Vec<(f64, &Vec<LoopEdge>)> = Vec::new();
-    for l in &b.loops {
-        // seen from the side the patches face, the loops run counter-clockwise; a surface whose natural
-        // normal points the other way (a hole, a dimple) sees them clockwise
-        let side = if placed.flip { -1.0 } else { 1.0 };
-        sized.push((side * loop_area(body, l, placed)?, l));
+/// The signed area of a polygon (positive when it runs counter-clockwise).
+fn polygon_area(pts: &[[f64; 2]]) -> f64 {
+    let n = pts.len();
+    let at = |i: usize| pts.get(i % n.max(1)).copied().unwrap_or([0.0; 2]);
+    0.5 * (0..n).map(|i| at(i)[0] * at(i + 1)[1] - at(i + 1)[0] * at(i)[1]).sum::<f64>()
+}
+
+/// Is `p` inside the polygon `poly` (even-odd rule)?
+fn inside(poly: &[[f64; 2]], p: [f64; 2]) -> bool {
+    let n = poly.len();
+    let at = |i: usize| poly.get(i % n.max(1)).copied().unwrap_or([0.0; 2]);
+    let mut crossings = 0;
+    for i in 0..n {
+        let (a, b) = (at(i), at(i + 1));
+        if (a[1] > p[1]) != (b[1] > p[1]) && p[0] < a[0] + (p[1] - a[1]) / (b[1] - a[1]) * (b[0] - a[0]) {
+            crossings += 1;
+        }
     }
-    sized.sort_by(|a, c| c.0.abs().total_cmp(&a.0.abs()));
-    if sized.first().is_some_and(|(area, _)| *area <= 0.0) {
+    crossings % 2 == 1
+}
+
+/// The loops as `(signed area, points)`, the outer one first: it runs counter-clockwise, the others
+/// (holes) clockwise and inside it.
+fn validate_loops(loops: &[(f64, &[[f64; 2]])]) -> Result<()> {
+    let Some((outer_area, outer)) = loops.first() else { return Err(KernelError::Argument("no loop".into())) };
+    if *outer_area <= 0.0 {
         return Err(KernelError::Argument("the outer boundary of the group does not run counter-clockwise".into()));
     }
+    for (area, pts) in loops.iter().skip(1) {
+        let first = pts.first().copied().unwrap_or([0.0; 2]);
+        if *area >= 0.0 || !inside(outer, first) {
+            return Err(KernelError::Argument("a hole of the group winds the wrong way or lies outside it".into()));
+        }
+    }
+    Ok(())
+}
+
+/// The loops of the new face, the outer one (the largest) first, each as the face's loop. The outer
+/// loop must run counter-clockwise seen from the side the patches face, the others (holes) the other
+/// way round and inside the outer one.
+fn face_loops(body: &Brep, b: &Boundary, placed: &Placement) -> Result<Vec<Loop>> {
+    // seen from the side the patches face, the loops run counter-clockwise; a surface whose natural
+    // normal points the other way (a hole, a dimple) sees them clockwise
+    let side = if placed.flip { -1.0 } else { 1.0 };
+    let mut sized: Vec<(f64, Vec<[f64; 2]>, &Vec<LoopEdge>)> = Vec::new();
+    for l in &b.loops {
+        let pts = loop_points(body, l, placed)?;
+        sized.push((side * polygon_area(&pts), pts, l));
+    }
+    sized.sort_by(|a, c| c.0.abs().total_cmp(&a.0.abs()));
+    validate_loops(&sized.iter().map(|(a, p, _)| (*a, p.as_slice())).collect::<Vec<_>>())?;
     let mut out = Vec::with_capacity(sized.len());
-    for (_, l) in sized {
+    for (_, _, l) in sized {
         let mut edges: Vec<OrientedEdge> = Vec::with_capacity(l.len());
         for le in l {
             edges.push(OrientedEdge { edge: le.edge, forward: le.forward, pcurve: pcurve(body, le.edge, placed)? });
@@ -238,11 +284,28 @@ fn prepare(body: &Brep, spec: &GroupSpec, max_gap: f64) -> Result<Prepared> {
         )));
     }
     let placed = place(spec.shape, &samples, outward)?;
+    if placed.flip {
+        return Err(KernelError::Argument(
+            "a face that faces the axis of its surface (a hole, a dimple) is not merged: its sense is not proved"
+                .into(),
+        ));
+    }
     let loops = face_loops(body, &b, &placed)?;
     let face = Face { surface: placed.surface, nurbs: placed.nurbs, domain: placed.domain, loops };
     let area = spec.faces.iter().filter_map(|&f| face_area(body, f, AREA_GRID)).sum();
     let edge_list = b.loops.iter().flatten().copied().collect();
-    Ok(Prepared { faces: spec.faces.to_vec(), edge_list, area, face, forward: !placed.flip, gap, shell: b.shell })
+    let cloud = check::cloud(body, spec.faces)?;
+    Ok(Prepared {
+        faces: spec.faces.to_vec(),
+        edge_list,
+        area,
+        cloud,
+        face,
+        forward: !placed.flip,
+        gap,
+        limit: max_gap,
+        shell: b.shell,
+    })
 }
 
 /// Gives the boundary edges the tolerance of the gap (the kernel's mesher accepts an edge no farther
@@ -356,7 +419,7 @@ fn face_sheet(body: &Brep, face: usize) -> Result<Brep> {
 
 /// For each prepared group whether its new face (`map` gives its place in `brep`) tessellates, alone
 /// and at the display chord and at `chord`, to the area of the patches it replaced.
-fn areas_agree(brep: &Brep, map: &[Option<usize>], groups: &[&Prepared], chord: f64) -> Result<Vec<bool>> {
+fn areas_agree(body: &Brep, brep: &Brep, map: &[Option<usize>], groups: &[&Prepared], chord: f64) -> Result<Vec<bool>> {
     let mut ok = Vec::with_capacity(groups.len());
     for p in groups {
         let first = p.faces.iter().copied().min().unwrap_or(0);
@@ -367,8 +430,21 @@ fn areas_agree(brep: &Brep, map: &[Option<usize>], groups: &[&Prepared], chord: 
         let sheet = face_sheet(brep, face)?;
         let mut good = true;
         for c in [None, Some(chord)] {
-            let got = crate::tess::tessellate_topo(&sheet, c).map(|t| t.mesh.area()).unwrap_or(0.0);
-            good &= (got - p.area).abs() <= AREA_AGREEMENT * p.area.max(1e-12);
+            let Ok(topo) = crate::tess::tessellate_topo(&sheet, c) else {
+                good = false;
+                continue;
+            };
+            eprintln!(
+                "AREA_RATIO {} {:.4} {}",
+                if c.is_none() { "display" } else { "tol" },
+                (topo.mesh.area() - p.area).abs() / p.area.max(1e-12),
+                p.area
+            );
+            good &= (topo.mesh.area() - p.area).abs() <= AREA_AGREEMENT * p.area.max(1e-12);
+            if c.is_none() {
+                let r = check::check_face(&topo.mesh, p.forward, &p.cloud, body, p.limit);
+                good &= r.is_ok();
+            }
         }
         ok.push(good);
     }
@@ -381,17 +457,39 @@ fn areas_agree(brep: &Brep, map: &[Option<usize>], groups: &[&Prepared], chord: 
 /// `max_gap` at most.
 ///
 /// # Errors
-/// An invalid `max_gap`, or no group that could be merged at all (see [`GroupResult`] per group
+/// An invalid `max_gap`, a cancellation (`cancel` says so between groups), or no group that could be merged at all (see [`GroupResult`] per group
 /// for the reasons, in the message of the first).
-pub fn merge_faces_onto_shapes(body: &Brep, specs: &[GroupSpec], max_gap: f64) -> Result<Batch> {
+pub fn merge_faces_onto_shapes(
+    body: &Brep,
+    specs: &[GroupSpec],
+    max_gap: f64,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Batch> {
+    merge_with(body, specs, max_gap, cancel, true)
+}
+
+/// [`merge_faces_onto_shapes`], with `all_at_once` false going straight to the group-by-group path
+/// (the path the kernel's refusal of the whole takes).
+fn merge_with(
+    body: &Brep,
+    specs: &[GroupSpec],
+    max_gap: f64,
+    cancel: &dyn Fn() -> bool,
+    all_at_once: bool,
+) -> Result<Batch> {
     if !(max_gap.is_finite() && max_gap > 0.0 && max_gap <= MAX_GAP) {
         return Err(KernelError::Argument(format!("the gap must be in (0, {MAX_GAP}]")));
     }
     let mut claimed: BTreeSet<usize> = BTreeSet::new();
     let mut prepared: Vec<std::result::Result<Prepared, String>> = Vec::with_capacity(specs.len());
-    for spec in specs {
+    for (k, spec) in specs.iter().enumerate() {
+        if cancel() {
+            return Err(KernelError::Argument("cancelled".into()));
+        }
         let overlaps = spec.faces.iter().any(|f| claimed.contains(f));
-        let p = if overlaps {
+        let p = if k >= MAX_GROUPS {
+            Err(format!("beyond the {MAX_GROUPS} groups one merge takes"))
+        } else if overlaps {
             Err("a face belongs to another group".to_string())
         } else {
             prepare(body, spec, max_gap).map_err(|e| e.to_string())
@@ -407,7 +505,8 @@ pub fn merge_faces_onto_shapes(body: &Brep, specs: &[GroupSpec], max_gap: f64) -
         let why = prepared.iter().find_map(|p| p.as_ref().err()).cloned().unwrap_or_default();
         return Err(KernelError::Argument(format!("no group could be merged: {why}")));
     }
-    let (brep, face_map, accepted) = settle(body, volume, &all, 2.0 * max_gap)?;
+    let run = Run { cancel, all_at_once, chord: 2.0 * max_gap };
+    let (brep, face_map, accepted) = settle(body, volume, &all, &run)?;
     let mut accepted = accepted.into_iter();
     let groups = specs
         .iter()
@@ -425,16 +524,31 @@ pub fn merge_faces_onto_shapes(body: &Brep, specs: &[GroupSpec], max_gap: f64) -
     Ok(Batch { brep, face_map, groups })
 }
 
+/// How the groups are rebuilt: whether to stop, whether to try all at once first, and the chord of
+/// the second tessellation of each face.
+struct Run<'a> {
+    cancel: &'a dyn Fn() -> bool,
+    all_at_once: bool,
+    chord: f64,
+}
+
+/// The most groups one merge takes (the rest stay patches, reported as such): each costs a rebuild
+/// where the kernel refuses the whole.
+pub const MAX_GROUPS: usize = 64;
+
 /// All groups in one rebuild; the groups whose face does not hold its area are dropped and the
 /// rest rebuilt; a rebuild the kernel refuses goes group by group.
 fn settle(
     body: &Brep,
     volume: Option<f64>,
     all: &[&Prepared],
-    chord: f64,
+    run: &Run,
 ) -> Result<(Brep, Vec<Option<usize>>, Vec<bool>)> {
-    let Ok((brep, map)) = apply(body, volume, all) else { return one_by_one(body, volume, all, chord) };
-    let ok = areas_agree(&brep, &map, all, chord)?;
+    if !run.all_at_once {
+        return one_by_one(body, volume, all, run);
+    }
+    let Ok((brep, map)) = apply(body, volume, all) else { return one_by_one(body, volume, all, run) };
+    let ok = areas_agree(body, &brep, &map, all, run.chord)?;
     if ok.iter().all(|&k| k) {
         return Ok((brep, map, ok));
     }
@@ -443,8 +557,8 @@ fn settle(
         return Err(KernelError::Argument("no merged face holds the area of its patches".into()));
     }
     let (brep, map) = apply(body, volume, &kept)?;
-    if !areas_agree(&brep, &map, &kept, chord)?.iter().all(|&k| k) {
-        return one_by_one(body, volume, &kept, chord).map(|(b, m, f)| (b, m, expand(&ok, &f)));
+    if !areas_agree(body, &brep, &map, &kept, run.chord)?.iter().all(|&k| k) {
+        return one_by_one(body, volume, &kept, run).map(|(b, m, f)| (b, m, expand(&ok, &f)));
     }
     Ok((brep, map, ok))
 }
@@ -455,30 +569,43 @@ fn expand(outer: &[bool], inner: &[bool]) -> Vec<bool> {
     outer.iter().map(|&k| k && it.next().copied().unwrap_or(false)).collect()
 }
 
-/// The groups one after the other, each kept when the kernel takes it with the ones before.
+/// Each group on its own body (one rebuild and the checks of that one face), then the kept groups
+/// together (one rebuild): a number of rebuilds linear in the groups. Groups whose faces the kernel
+/// takes alone but not together are dropped from the end until it does.
 fn one_by_one(
     body: &Brep,
     volume: Option<f64>,
     all: &[&Prepared],
-    chord: f64,
+    run: &Run,
 ) -> Result<(Brep, Vec<Option<usize>>, Vec<bool>)> {
-    let mut kept: Vec<&Prepared> = Vec::new();
     let mut flags = Vec::with_capacity(all.len());
     for p in all {
-        kept.push(p);
-        let ok = apply(body, volume, &kept)
-            .and_then(|(b, m)| areas_agree(&b, &m, &kept, chord))
-            .is_ok_and(|f| f.iter().all(|&k| k));
-        if !ok {
-            kept.pop();
+        if (run.cancel)() {
+            return Err(KernelError::Argument("cancelled".into()));
         }
-        flags.push(ok);
+        let alone = [*p];
+        flags.push(
+            apply(body, volume, &alone)
+                .and_then(|(b, m)| areas_agree(body, &b, &m, &alone, run.chord))
+                .is_ok_and(|f| f.iter().all(|&k| k)),
+        );
     }
-    if kept.is_empty() {
-        return Err(KernelError::Argument("the kernel took no group".into()));
+    let mut kept: Vec<&Prepared> = all.iter().zip(&flags).filter(|(_, k)| **k).map(|(p, _)| *p).collect();
+    while !kept.is_empty() {
+        if (run.cancel)() {
+            return Err(KernelError::Argument("cancelled".into()));
+        }
+        if let Ok((brep, map)) = apply(body, volume, &kept)
+            && areas_agree(body, &brep, &map, &kept, run.chord).is_ok_and(|f| f.iter().all(|&k| k))
+        {
+            return Ok((brep, map, flags));
+        }
+        kept.pop();
+        if let Some(last) = flags.iter_mut().rev().find(|f| **f) {
+            *last = false;
+        }
     }
-    let (brep, map) = apply(body, volume, &kept)?;
-    Ok((brep, map, flags))
+    Err(KernelError::Argument("the kernel took no group".into()))
 }
 
 /// Merges the faces `group` of `body` into one face on `shape`, within `max_gap` of it.
@@ -489,10 +616,104 @@ fn one_by_one(
 /// its surface's axis, and a result the kernel does not take or whose volume differs from the
 /// body's by more than the gap allows.
 pub fn merge_faces_onto_shape(body: &Brep, group: &[usize], shape: &Shape, max_gap: f64) -> Result<Merged> {
-    let batch = merge_faces_onto_shapes(body, &[GroupSpec { faces: group, shape }], max_gap)?;
+    let batch = merge_faces_onto_shapes(body, &[GroupSpec { faces: group, shape }], max_gap, &|| false)?;
     match batch.groups.first() {
         Some(Ok(g)) => Ok(Merged { brep: batch.brep, face_map: batch.face_map, face: g.face, gap: g.gap }),
         Some(Err(why)) => Err(KernelError::Argument(why.clone())),
         None => Err(KernelError::Argument("no group".into())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SQUARE: [[f64; 2]; 4] = [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
+
+    fn reversed(p: &[[f64; 2]]) -> Vec<[f64; 2]> {
+        p.iter().rev().copied().collect()
+    }
+
+    #[test]
+    fn an_outer_loop_and_a_clockwise_hole_inside_it_are_accepted() {
+        let hole = reversed(&[[2.0, 2.0], [4.0, 2.0], [4.0, 4.0], [2.0, 4.0]]);
+        let loops = [(polygon_area(&SQUARE), &SQUARE[..]), (polygon_area(&hole), &hole[..])];
+        assert!(validate_loops(&loops).is_ok());
+    }
+
+    #[test]
+    fn a_hole_that_winds_like_the_outer_loop_is_refused() {
+        let hole = [[2.0, 2.0], [4.0, 2.0], [4.0, 4.0], [2.0, 4.0]];
+        let loops = [(polygon_area(&SQUARE), &SQUARE[..]), (polygon_area(&hole), &hole[..])];
+        assert!(validate_loops(&loops).is_err());
+    }
+
+    #[test]
+    fn a_hole_outside_the_outer_loop_and_a_clockwise_outer_loop_are_refused() {
+        let far = reversed(&[[20.0, 2.0], [22.0, 2.0], [22.0, 4.0], [20.0, 4.0]]);
+        assert!(validate_loops(&[(polygon_area(&SQUARE), &SQUARE[..]), (polygon_area(&far), &far[..])]).is_err());
+        let cw = reversed(&SQUARE);
+        assert!(validate_loops(&[(polygon_area(&cw), &cw[..])]).is_err());
+        assert!(validate_loops(&[]).is_err());
+    }
+
+    /// A flat sheet of `n x n` bilinear patches in z = 0, numbered `i * n + j`.
+    fn flat_sheet(n: usize) -> Brep {
+        let id = |i: usize, j: usize| (i * (n + 1) + j) as u32;
+        let pt = |i: usize, j: usize| [i as f64 * 4.0, j as f64 * 4.0, 0.0];
+        let mut nets = Vec::new();
+        let mut corners = Vec::new();
+        for i in 0..n {
+            for j in 0..n {
+                nets.push(vec![vec![pt(i, j), pt(i, j + 1)], vec![pt(i + 1, j), pt(i + 1, j + 1)]]);
+                corners.push([id(i, j), id(i + 1, j), id(i + 1, j + 1), id(i, j + 1)]);
+            }
+        }
+        crate::nurbs::sheet_from_bezier_network(&nets, &corners).expect("a flat sheet")
+    }
+
+    /// Groups of two neighbouring patches along each row of the sheet.
+    fn pairs(n: usize) -> Vec<Vec<usize>> {
+        (0..n).flat_map(|i| (0..n / 2).map(move |k| vec![i * n + 2 * k, i * n + 2 * k + 1])).collect()
+    }
+
+    fn plane() -> Shape {
+        Shape::Plane { point: [0.0; 3], normal: [0.0, 0.0, 1.0] }
+    }
+
+    #[test]
+    fn the_group_by_group_path_gives_the_same_faces_as_the_whole() {
+        let body = flat_sheet(6);
+        let groups = pairs(6);
+        let shape = plane();
+        let specs: Vec<GroupSpec> = groups.iter().map(|g| GroupSpec { faces: g, shape: &shape }).collect();
+        let whole = merge_with(&body, &specs, 0.05, &|| false, true).unwrap();
+        let each = merge_with(&body, &specs, 0.05, &|| false, false).unwrap();
+        assert_eq!(whole.brep.faces.len(), 18, "18 pairs of patches became 18 faces");
+        assert_eq!(each.brep.faces.len(), whole.brep.faces.len());
+        assert!(each.groups.iter().all(|g| g.is_ok()));
+    }
+
+    #[test]
+    fn a_merge_is_cancelled_between_groups_and_takes_a_limited_number() {
+        let body = flat_sheet(6);
+        let groups = pairs(6);
+        let shape = plane();
+        let specs: Vec<GroupSpec> = groups.iter().map(|g| GroupSpec { faces: g, shape: &shape }).collect();
+        assert!(merge_with(&body, &specs, 0.05, &|| true, true).is_err(), "cancelled");
+        let polls = std::cell::Cell::new(0);
+        let late = || {
+            polls.set(polls.get() + 1);
+            polls.get() > 3
+        };
+        assert!(merge_with(&body, &specs, 0.05, &late, false).is_err(), "cancelled part way");
+        let big = flat_sheet(16);
+        let many = pairs(16);
+        let specs: Vec<GroupSpec> = many.iter().map(|g| GroupSpec { faces: g, shape: &shape }).collect();
+        assert!(many.len() > MAX_GROUPS);
+        let r = merge_with(&big, &specs, 0.05, &|| false, true).unwrap();
+        let (ok, refused) =
+            (r.groups.iter().filter(|g| g.is_ok()).count(), r.groups.iter().filter(|g| g.is_err()).count());
+        assert_eq!((ok, refused), (MAX_GROUPS, many.len() - MAX_GROUPS));
     }
 }

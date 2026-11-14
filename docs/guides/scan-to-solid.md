@@ -94,9 +94,23 @@ Hybrid (merge the patches that lie on a primitive; `surface.wrap` and the kernel
   of its cylinder or cone or reach a pole of its sphere (a cap of 90 degrees or more), a result whose
   volume or topology changed, or whose new face the mesher does not tessellate to the area of the
   patches it replaced; `analytic.left_as_patches` says which and why.
-- The merged body is returned when it is not worse than the wrap it was made from (the comparison of
-  `auto`: verdict, share within the tolerance, closedness, analytic share); otherwise the wrap is, with
-  no analytic face. A scan with no protected primitive gives the freeform body.
+- The merged body replaces the wrap only when it is not worse by the comparison of `auto` (verdict,
+  share within the tolerance, closedness, analytic share) and its largest and RMS deviation from the
+  scan are not above the wrap's by more than 1.0 and 0.02 of the tolerance (a merged face's boundary may be a tolerance from its patches, which is what the largest deviation may grow by); otherwise the wrap is the
+  result, with no analytic face and the issue `hybrid_merge_rejected` saying why.
+- Before anything is wrapped, `method: hybrid` checks that some protected region has at least 50
+  squared tolerances of area; if none has, the result is the freeform result (no second wrap) with the
+  issue `hybrid_no_analytic_face`, and under `auto` the attempt is a recorded failure with that code.
+  Likewise a scan with no protected primitive gives the freeform body.
+- `analytic.max_edge_gap` is the largest distance of the boundary edges of any merged face from its
+  primitive, sampled at 25 points per edge (not a certified maximum). Above half the tolerance the
+  issue `hybrid_edge_gap` is added (it does not change the verdict): the boundary edges of those faces
+  carry that gap, times 1.1, as their tolerance, and STEP keeps it, so a reader that checks edges
+  against faces more strictly than that sees a gap of that size there.
+- The merge is checked directly: each new face's normal agrees with the patches it replaced at
+  sampled points, it lies within the gap of them, holes wind opposite to the outer loop and inside it,
+  and it tessellates to their area. At most 64 groups are merged per call (the largest first; the rest
+  are in `left_as_patches`), and a cancelled call stops between groups.
 - A cancelled call stops between the steps; the whole run is one undo step.
 
 Primitives:
@@ -200,10 +214,12 @@ kernel refuses sheets of many faces. Give the wall thickness instead:
   next step (about 3 times the noise) or a smoother scan.
 - `other_method_tried`: `auto` ran the other method as well and it did not do better; see `attempts`.
 - Hybrid method, no body (verdict `fail`; `auto` then returns the other result, and the document is
-  as it was before the attempt): `hybrid_stock_failed` (the wrap of the scan failed),
-  `hybrid_merge_failed` (the merging step failed as a whole), `hybrid_failed` (anything else, with
-  the reason). A scan with no primitive, or no group that could be merged, is not a failure: it gives
-  the wrap with `analytic.faces` 0. `thickness` has no meaning with `method: hybrid`.
+  as it was before the attempt): `hybrid_wrap_failed` (the wrap of the scan failed),
+  `hybrid_merge_failed` (the merging step failed as a whole), `hybrid_no_analytic_face` (under `auto`
+  only: no region is large enough for a group), `hybrid_failed` (anything else, with the reason). A scan
+  with no primitive, or no group that could be merged, is not a failure under `method: hybrid`: it gives
+  the wrap with `analytic.faces` 0. Informational issues of a returned body: `hybrid_edge_gap`,
+  `hybrid_merge_rejected`, `hybrid_no_analytic_face`. `thickness` has no meaning with `method: hybrid`.
 - `mostly_freeform` (only with `method: primitives`): less than half of the scan lies in regions
   a primitive fits. Run again with `method: freeform`.
 - `open_surface` (freeform): the network is a sheet because the scan has open boundaries. The
