@@ -21,6 +21,7 @@ step-export.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+nalgebra.workspace = true
 
 [dev-dependencies]
 rayon.workspace = true

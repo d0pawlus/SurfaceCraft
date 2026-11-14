@@ -14,10 +14,12 @@
 //! boundary, refined by closest-point iterations). Regions whose boundary is not one outline, or
 //! that have no three distinct corners, are listed as skipped. Sharp edges stay sharp: the patches
 //! meet there without any tangent continuity.
-use crate::features_ngon::{RegionRec, ngon_patches, quad_patches};
+use crate::features_ngon::{RegionRec, ngon_patches, ngon_regions, quad_patches};
 use nalgebra::DMatrix;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use surfacecraft_geom::{KdTree, Mesh, Point3, Vec3};
+
+pub use crate::features_ngon::{NgonMode, NgonRegion, NgonSide};
 
 /// Control net `net[i][j]` of a Bézier patch of any degree (`i` along u, `j` along v).
 pub type NetN = Vec<Vec<[f64; 3]>>;
@@ -58,6 +60,9 @@ pub struct FeatureNetwork {
     pub feature_length: f64,
     /// Smooth regions found (large enough).
     pub regions: usize,
+    /// With [`NgonMode::Patch`]: the regions that are not four-sided (and have one outline), for
+    /// the caller to cover with a patch each. Empty otherwise.
+    pub ngons: Vec<NgonRegion>,
 }
 
 fn v3(p: [f64; 3]) -> Vec3 {
@@ -124,7 +129,7 @@ pub fn tessellate_nets(nets: &[NetN], n: usize) -> Mesh {
     Mesh { positions, triangles }
 }
 
-fn bezier_point(c: &[Vec3], t: f64) -> Vec3 {
+pub(crate) fn bezier_point(c: &[Vec3], t: f64) -> Vec3 {
     let b = bernstein(c.len() - 1, t);
     c.iter().zip(&b).map(|(p, w)| p * *w).sum()
 }
@@ -347,11 +352,27 @@ pub(crate) fn fit_interior(net: &mut NetN, points: &[Vec3]) {
     }
 }
 
-/// Builds the patch network of the feature curves of the triangles `tris` of `mesh`.
+/// Builds the patch network of the feature curves of the triangles `tris` of `mesh`; a region that
+/// is not four-sided splits the whole network ([`NgonMode::Split`]).
 ///
 /// # Errors
 /// An error message for an invalid mesh, degree or empty region.
 pub fn feature_network(mesh: &Mesh, tris: &[u32], opts: &FeatureOptions) -> Result<FeatureNetwork, String> {
+    feature_network_with(mesh, tris, opts, NgonMode::Split)
+}
+
+/// [`feature_network`] with the choice of what to do with regions that are not four-sided: with
+/// [`NgonMode::Patch`] only the four-sided ones become Bézier patches and the others are returned
+/// in `ngons` (their sides are the same shared feature curves, sampled densely).
+///
+/// # Errors
+/// An error message for an invalid mesh, degree or empty region.
+pub fn feature_network_with(
+    mesh: &Mesh,
+    tris: &[u32],
+    opts: &FeatureOptions,
+    ngon: NgonMode,
+) -> Result<FeatureNetwork, String> {
     if !(2..=8).contains(&opts.degree) {
         return Err("degree must be 2..=8".into());
     }
@@ -533,6 +554,19 @@ pub fn feature_network(mesh: &Mesh, tris: &[u32], opts: &FeatureOptions) -> Resu
         }
         None
     };
+    // vertex of `mesh` behind each vertex of `sub` (the flattening of n-sided regions works on `mesh`)
+    let mut orig = vec![u32::MAX; nv];
+    if nt == tris.len() {
+        for (t, tri) in sub.triangles.iter().enumerate() {
+            let Some(src) = tris.get(t).and_then(|&i| mesh.triangles.get(i as usize)) else { continue };
+            for (&v, &o) in tri.iter().zip(src.iter()) {
+                if let Some(slot) = orig.get_mut(v as usize) {
+                    *slot = o;
+                }
+            }
+        }
+    }
+    let og = |v: u32| orig.get(v as usize).copied().unwrap_or(u32::MAX);
     let nrm = sub.vertex_normals();
     let degree = opts.degree;
     let mut recs: Vec<RegionRec> = Vec::new();
@@ -619,6 +653,9 @@ pub fn feature_network(mesh: &Mesh, tris: &[u32], opts: &FeatureOptions) -> Resu
             points: Vec::new(),
             mean_normal: lp.iter().map(|&v| nrm[v as usize]).sum(),
             triangles: tri_ids,
+            corner_verts: corners.iter().map(|c| (c.1..=c.2).map(|s| og(at(s % m))).collect()).collect(),
+            side_verts: Vec::with_capacity(count),
+            point_ids: Vec::new(),
         };
         // register the sides (canonical direction: smaller corner id first)
         for c in 0..count {
@@ -626,9 +663,12 @@ pub fn feature_network(mesh: &Mesh, tris: &[u32], opts: &FeatureOptions) -> Resu
             let (cb, first_b, _) = corners[(c + 1) % count];
             let mut pts = vec![cpoints[ca as usize]];
             let end = if (c + 1) % count == 0 { m + first_b } else { first_b };
+            let mut between = Vec::new();
             for step in (last_a + 1)..end {
                 pts.push(sub.positions[at(step % m) as usize].coords);
+                between.push(og(at(step % m)));
             }
+            rec.side_verts.push(between);
             pts.push(cpoints[cb as usize]);
             let forward = ca < cb;
             if !forward {
@@ -655,11 +695,15 @@ pub fn feature_network(mesh: &Mesh, tris: &[u32], opts: &FeatureOptions) -> Resu
                 seen.extend(sub.triangles[t]);
             }
         }
+        rec.point_ids = seen.iter().map(|&v| og(v)).collect();
         rec.points = seen.into_iter().map(|v| sub.positions[v as usize].coords).collect();
         recs.push(rec);
     }
     out.curves = side_curves.len();
-    let patches = if recs.iter().all(|r| r.corners.len() == 4) {
+    let patches = if ngon == NgonMode::Patch {
+        out.ngons = ngon_regions(mesh, &recs, &side_curves);
+        quad_patches(&recs, &side_curves)
+    } else if recs.iter().all(|r| r.corners.len() == 4) {
         quad_patches(&recs, &side_curves)
     } else {
         let first_new = out.corner_points.len() as u32;
