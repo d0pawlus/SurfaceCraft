@@ -362,6 +362,19 @@ pub(crate) fn compare_points(
     scan: &Mesh,
     i: &CompareIn,
 ) -> CmdResult<CompareOut> {
+    let normals = if i.facing { scan.vertex_normals() } else { Vec::new() };
+    compare_points_with(s, body_id, scan_id, (&scan.positions, &normals), i)
+}
+
+/// [`compare_points`] for points that come with their own normals (empty: the facing test is off): the
+/// points of a fold that was taken out have the normals of the surface that replaced it, not their own.
+pub(crate) fn compare_points_with(
+    s: &Session,
+    body_id: ObjectId,
+    scan_id: ObjectId,
+    (positions, normals): (&[surfacecraft_geom::Point3], &[surfacecraft_geom::Vec3]),
+    i: &CompareIn,
+) -> CmdResult<CompareOut> {
     let tol = positive(i.tolerance.unwrap_or(TOLERANCE), "tolerance")?;
     let maxd = positive(i.max_distance.unwrap_or(REACH), "max_distance")?;
     let chord = chord_of(i.chord, tol)?;
@@ -369,10 +382,9 @@ pub(crate) fn compare_points(
     let TopoMesh { mesh, tri_face, .. } = tessellate_topo(&b.brep, Some(chord))?;
     // the face count only: `body_out` would integrate the volume of every patch (0.7 ms each)
     let faces = surfacecraft_kernel::solid::counts(&b.brep).faces;
-    let normals = if i.facing { scan.vertex_normals() } else { Vec::new() };
     // the tree takes the tessellation over (a copy of every triangle would triple its memory)
     let bvh = Bvh::build_owned(mesh);
-    let tagged: Vec<(Sample, Option<usize>)> = samples_mesh_tagged(&scan.positions, &normals, &bvh, maxd)
+    let tagged: Vec<(Sample, Option<usize>)> = samples_mesh_tagged(positions, normals, &bvh, maxd)
         .into_iter()
         .map(|(sample, tri)| (sample, face_of(&tri_face, tri)))
         .collect();

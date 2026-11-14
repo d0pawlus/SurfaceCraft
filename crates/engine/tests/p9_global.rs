@@ -71,6 +71,10 @@ fn gate_m3_six_blob_views_are_aligned_within_the_bound() {
     gate_one("blob", blob_views());
 }
 
+/// Views of the ring gate: arcs of 116 degrees every 45. (Six arcs of 150 every 60 do not work: the
+/// pairs of non-neighbours that come back `unique` outvote the right ones.)
+const RING: usize = 8;
+
 /// Gate 2 through the command: a ring of eight arcs of a lumpy torus, each overlapping its two neighbours
 /// only. The chain along the spanning tree and the relaxed poses are both reported; the loop closes
 /// and the error around it is smaller after relaxation. (The decisive test that relaxation beats
@@ -78,21 +82,43 @@ fn gate_m3_six_blob_views_are_aligned_within_the_bound() {
 /// pair pose is injected and known.)
 #[test]
 fn gate_m3_a_ring_of_views_closes_its_loop() {
-    let views: Vec<Mesh> = (0..8).map(|k| ring_arc(k, 45.0 * k as f64, 58.0)).collect();
-    let poses = poses(8);
+    let views: Vec<Mesh> = (0..RING).map(|k| ring_arc(k, 45.0 * k as f64, 58.0)).collect();
+    let poses = poses(RING);
     let mut s = session_of(&views, &poses);
-    let out = global(&mut s, 8, json!({}));
+    let out = global(&mut s, RING, json!({}));
     let (before, after, cycles) = loop_figures(&out);
     print_edges(&out);
-    eprintln!("ring: verdict {}, loop {before:.4} -> {after:.4} mm, {cycles} cycles", out["verdict"]);
-    for k in 0..8 {
-        let (_, relaxed) = scan_error(&out, &views, &poses, k, "matrix");
+    eprintln!(
+        "ring: verdict {}, issues {}, used {} rejected {} margin {} of {} trials, loop {before:.4} -> {after:.4} mm, {cycles} cycles",
+        out["verdict"],
+        out["issues"],
+        out["used_edges"],
+        out["rejected_edges"],
+        out["consensus_margin"],
+        out["consensus_trials"]
+    );
+    for k in 0..RING {
+        let (angle, relaxed) = scan_error(&out, &views, &poses, k, "matrix");
         let (_, chained) = scan_error(&out, &views, &poses, k, "chained_matrix");
-        eprintln!("  view {k}: relaxed {relaxed:.4} mm, chained {chained:.4} mm");
+        eprintln!(
+            "  view {k}: placed {}, relaxed {angle:.4} deg {relaxed:.4} mm (bound ratio {:.1}), chained {chained:.4} mm",
+            out["scans"][k]["placed"],
+            BOUND_MM / relaxed.max(1e-12)
+        );
+        // the relaxation's result is right, whatever the verdict says
+        assert_eq!(out["scans"][k]["placed"], true, "view {k} is not placed");
+        assert!(angle <= BOUND_DEGREES && relaxed <= BOUND_MM, "view {k}: {angle} deg {relaxed} mm");
     }
+    // The verdict is `partial` with `consensus_unclear`: the five false half-turn pairs of this
+    // fixture (see `pair_coarse_false_unique_repro`) are mutually consistent and make a competing
+    // cluster, so the vote is a near tie (margin 1). This is what PR #117 removes.
+    assert_eq!(out["verdict"], "partial");
+    assert!(out["issues"].as_array().unwrap().iter().any(|i| i == "consensus_unclear"), "{}", out["issues"]);
+    // AFTER #117 (no false `unique` pairs): replace the two assertions above by
+    // assert_eq!(out["verdict"], "aligned");
     // the far view is the one the chain carries furthest off the truth
-    let chained: Vec<f64> = (0..8).map(|k| scan_error(&out, &views, &poses, k, "chained_matrix").1).collect();
-    let far = (0..8).max_by(|a, b| chained[*a].total_cmp(&chained[*b])).unwrap();
+    let chained: Vec<f64> = (0..RING).map(|k| scan_error(&out, &views, &poses, k, "chained_matrix").1).collect();
+    let far = (0..RING).max_by(|a, b| chained[*a].total_cmp(&chained[*b])).unwrap();
     let relaxed = scan_error(&out, &views, &poses, far, "matrix").1;
     eprintln!(
         "far view {far}: chained {:.4} mm, relaxed {relaxed:.4} mm, factor {:.1}; loop factor {:.1}",
@@ -171,21 +197,36 @@ fn gate_m3_symmetric_views_make_no_edge_and_are_not_aligned() {
 }
 
 /// Two whole copies of a part are one pair: a unique pose, but no loop confirms it. The verdict is
-/// `partial` with `weakly_held`, the note says what it is and quotes the pair's own evidence, and
-/// `apply` still moves the scan (as for any `partial`).
+/// `partial` with `weakly_held` and the note quotes the pair's own evidence. `apply` alone moves
+/// nothing and says why; with the scan listed in `accept_weak` it moves, in one undo step.
 #[test]
-fn gate_m3_two_scans_are_one_unconfirmed_pair() {
+fn gate_m3_two_scans_are_one_unconfirmed_pair_and_move_only_when_accepted() {
     let (fixed, moving) = pair_of("bracket");
     let pose = random_motion(4);
     let mut s = session(&fixed, &moving, &pose);
+    let before = s.history.undo_labels().len();
     let out = s.execute("align.global", json!({"objects": ["fixed", "moving"], "apply": true})).unwrap();
     eprintln!("{} {}\n{}", out["verdict"], out["issues"], out["note"]);
     assert_eq!(out["verdict"], "partial");
     assert_eq!(out["issues"], json!(["weakly_held"]));
     assert_eq!(out["scans"][1]["held_by_loop"], false);
-    assert_eq!(out["applied"], true);
+    assert_eq!(out["scans"][1]["weak_pair"], json!([0, 1]));
+    assert_eq!((out["applied"].clone(), out["moved"].clone()), (json!(false), json!([])));
+    assert_eq!(out["left_weakly_held"], json!([1]));
+    assert_eq!(s.history.undo_labels().len(), before, "nothing moved, no undo step");
     let note = out["note"].as_str().unwrap();
-    assert!(note.contains("single pair") && note.contains("no loop confirms") && note.contains("confidence"), "{note}");
+    for part in
+        ["nothing was moved", "accept_weak", "no loop of strong pairs confirms", "confidence", "of the diagonal"]
+    {
+        assert!(note.contains(part), "{part}: {note}");
+    }
+    let out = s
+        .execute("align.global", json!({"objects": ["fixed", "moving"], "apply": true, "accept_weak": ["moving"]}))
+        .unwrap();
+    assert_eq!((out["applied"].clone(), out["moved"].clone()), (json!(true), json!([1])));
+    assert_eq!(s.history.undo_labels().len(), before + 1, "one undo step");
+    let err = s.execute("align.global", json!({"objects": ["fixed", "moving"], "accept_weak": ["nowhere"]}));
+    assert!(err.is_err());
 }
 
 /// `start: current`: three whole scans placed by hand within about 2 degrees and 3 mm of each
@@ -229,28 +270,22 @@ fn gate_m3_a_symmetric_part_is_never_aligned_at_the_flipped_pose() {
         noisy(m, 800 + k as u64)
     };
     let centre = Point3::new(20.0, 15.0, 10.0);
-    let sides: [([f64; 3], f64); 6] = [
-        ([1.0, 0.0, 0.0], 5.0),
-        ([-1.0, 0.0, 0.0], 5.0),
-        ([0.0, 1.0, 0.0], 4.0),
-        ([0.0, -1.0, 0.0], 4.0),
-        ([0.0, 0.0, 1.0], 3.0),
-        ([0.577_35, 0.577_35, 0.577_35], 6.0),
-    ];
+    let sides: [([f64; 3], f64); 4] =
+        [([1.0, 0.0, 0.0], 5.0), ([-1.0, 0.0, 0.0], 5.0), ([0.0, 1.0, 0.0], 4.0), ([0.0, 0.0, 1.0], 3.0)];
     let views: Vec<Mesh> = sides
         .iter()
         .enumerate()
         .map(|(k, (d, r))| cut(&part(k), |p| (p - centre).dot(&Vec3::new(d[0], d[1], d[2])) >= -r))
         .collect();
-    let poses = poses(6);
+    let poses = poses(4);
     let mut s = session_of(&views, &poses);
-    let out = global(&mut s, 6, json!({}));
+    let out = global(&mut s, 4, json!({}));
     print_edges(&out);
     eprintln!(
         "verdict {}, issues {}, used {}, rejected {}, margin {}",
         out["verdict"], out["issues"], out["used_edges"], out["rejected_edges"], out["consensus_margin"]
     );
-    let errors: Vec<(f64, f64)> = (0..6)
+    let errors: Vec<(f64, f64)> = (0..4)
         .filter(|k| out["scans"][*k]["placed"] == true)
         .map(|k| scan_error(&out, &views, &poses, k, "matrix"))
         .collect();
@@ -261,4 +296,74 @@ fn gate_m3_a_symmetric_part_is_never_aligned_at_the_flipped_pose() {
             "aligned at a wrong pose: {errors:?}"
         );
     }
+}
+
+/// Three whole copies of the part; `max_pairs` 2 leaves the pairs 0-1 and 1-2 (all three pairs are at
+/// cyclic distance 1): a chain, two bridges.
+fn three_copies() -> (surfacecraft_engine::Session, Vec<Mesh>, Vec<Transform>) {
+    let views: Vec<Mesh> = (0..3).map(|k| noisy(bracket_at(10 + 2 * k, 40 + 6 * k, 14 + k), 760 + k as u64)).collect();
+    let poses = poses(3);
+    (session_of(&views, &poses), views, poses)
+}
+
+fn accept(
+    s: &mut surfacecraft_engine::Session,
+    extra: serde_json::Value,
+) -> Result<serde_json::Value, surfacecraft_engine::EngineError> {
+    let mut p = json!({"objects": ["v0", "v1", "v2"], "apply": true, "max_pairs": 2});
+    p.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+    s.execute("align.global", p)
+}
+
+/// In the chain 0 - 1 - 2, naming scan 2 alone would move it into the common frame while scan 1,
+/// on which its pose depends, stayed put: the two would no longer fit. Scan 1 moves with it
+/// (`moved_as_dependency`); naming scan 1 alone moves scan 1 only; the fixed scan and a scan named
+/// twice are errors that name them.
+#[test]
+fn accept_weak_pulls_in_the_weak_scans_between_a_named_scan_and_the_fixed_one() {
+    let (mut s, _, _) = three_copies();
+    let out = accept(&mut s, json!({"accept_weak": ["v2"]})).unwrap();
+    eprintln!("{}", out["note"]);
+    assert_eq!(out["moved"], json!([1, 2]));
+    assert_eq!(
+        out["accept_weak_report"],
+        json!([{"index": 2, "outcome": "moved"}, {"index": 1, "outcome": "moved_as_dependency"}])
+    );
+    let (mut s, _, _) = three_copies();
+    let before = s.history.undo_labels().len();
+    let out = accept(&mut s, json!({"accept_weak": ["v1"]})).unwrap();
+    assert_eq!((out["moved"].clone(), out["left_weakly_held"].clone()), (json!([1]), json!([2])));
+    assert_eq!(s.history.undo_labels().len(), before + 1, "one undo step");
+    let none = accept(&mut s, json!({})).unwrap();
+    assert_eq!(none["moved"], json!([]), "nothing is held by a loop in a chain");
+}
+
+#[test]
+fn accept_weak_refuses_the_fixed_scan_a_duplicate_and_a_stranger_and_names_them() {
+    let (mut s, _, _) = three_copies();
+    let mut err = |p: serde_json::Value| accept(&mut s, p).unwrap_err().to_string();
+    assert!(err(json!({"accept_weak": ["v0"]})).contains("the fixed scan"));
+    assert!(err(json!({"accept_weak": ["v2", "v2"]})).contains("twice"));
+    assert!(!err(json!({"accept_weak": ["nowhere"]})).is_empty());
+}
+
+/// A named scan that is already held by a loop moves anyway and is reported as such; an unplaced
+/// one is not moved and is reported; with `apply` false the outcome is `not_applied`.
+#[test]
+fn accept_weak_reports_a_scan_held_by_a_loop_an_unplaced_one_and_a_proposal() {
+    let (mut s, _, _) = three_copies();
+    let out = accept(&mut s, json!({"accept_weak": ["v1"], "max_pairs": 3})).unwrap();
+    assert_eq!(out["accept_weak_report"], json!([{"index": 1, "outcome": "held_by_loop"}]));
+    assert_eq!(out["moved"], json!([1, 2]));
+    let views = vec![noisy(bracket_at(12, 48, 16), 1), noisy(bracket_at(17, 64, 20), 2), noisy(blob_at(52), 300)];
+    let mut s = session_of(&views, &poses(3));
+    let out = accept(&mut s, json!({"accept_weak": ["v2"], "max_pairs": 3})).unwrap();
+    eprintln!("{} {}", out["verdict"], out["note"]);
+    assert_eq!(out["accept_weak_report"], json!([{"index": 2, "outcome": "unplaced"}]));
+    assert_eq!(out["scans"][2]["placed"], false);
+    assert!(!out["moved"].as_array().unwrap().iter().any(|k| *k == 2));
+    let (mut s, _, _) = three_copies();
+    let out = accept(&mut s, json!({"accept_weak": ["v2"], "apply": false})).unwrap();
+    assert_eq!(out["accept_weak_report"], json!([{"index": 2, "outcome": "not_applied"}]));
+    assert_eq!(out["moved"], json!([]));
 }

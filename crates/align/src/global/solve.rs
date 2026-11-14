@@ -4,7 +4,7 @@ use super::graph::{Tree, chain, consensus, spanning_tree};
 use super::pairs::Tried;
 use super::relax::{Edge, MIN_VIRTUAL, misfit, relax, virtual_points};
 use super::report::{EdgeReport, EdgeStatus, GlobalResult, LoopReport};
-use super::{GlobalOptions, REJECT_FACTOR, loops, verdict};
+use super::{GlobalOptions, MAX_RMS_PER_DIAGONAL, MAX_RMS_PER_TOLERANCE, REJECT_FACTOR, loops, verdict};
 use crate::pair::{MIN_OVERLAP, PairVerdict};
 use crate::{AlignError, PairResult};
 use surfacecraft_geom::{Bvh, Cancel, Mesh, Transform, par};
@@ -41,6 +41,8 @@ fn report_of(t: &Tried, status: EdgeStatus, note: Option<String>) -> EdgeReport 
         probes_failed: 0,
         slides: 0,
         probe_margin: None,
+        rms_per_diagonal: 0.0,
+        strong_evidence: false,
         probe_return_gap: 0.0,
         refined: 0,
         note,
@@ -60,13 +62,29 @@ fn report_of(t: &Tried, status: EdgeStatus, note: Option<String>) -> EdgeReport 
         probes_failed: r.probes_failed,
         slides: r.slides,
         probe_margin: r.probe_margin,
+        rms_per_diagonal: 0.0,
+        strong_evidence: false,
         probe_return_gap: r.probe_return_gap,
         refined: r.refined,
         ..base
     }
 }
 
-fn candidate(k: usize, t: &Tried, scans: &[&Mesh], bvhs: &[Option<Bvh>]) -> Cand {
+/// Does a pair carry strong evidence of its own? Its residual must be small against the size of the
+/// scan (a share of the fixed scan's diagonal), and, when the caller gave the tolerance, within
+/// [`MAX_RMS_PER_TOLERANCE`] of it: the pair's own tolerance is derived from its residual and says
+/// nothing, the caller's does.
+// HOOK(#117): `align.pair_coarse` is to report the scans' noise estimate; when `PairResult` carries
+// it, require `rms <= k * noise` here as well, the one scale that does not depend on the size of
+// the part.
+fn pair_is_strong(rms: f64, diagonal: f64, user_tolerance: Option<f64>) -> (f64, bool) {
+    let share = rms / diagonal;
+    let by_size = share.is_finite() && share <= MAX_RMS_PER_DIAGONAL;
+    let by_tolerance = user_tolerance.is_none_or(|t| rms <= MAX_RMS_PER_TOLERANCE * t);
+    (share, by_size && by_tolerance)
+}
+
+fn candidate(k: usize, t: &Tried, scans: &[&Mesh], bvhs: &[Option<Bvh>], tolerance: Option<f64>) -> Cand {
     let r = match &t.outcome {
         Ok(r) => r,
         Err(e) => return Cand { report: report_of(t, EdgeStatus::Failed, Some(e.to_string())), edge: None },
@@ -88,13 +106,29 @@ fn candidate(k: usize, t: &Tried, scans: &[&Mesh], bvhs: &[Option<Bvh>]) -> Cand
     if points.len() < MIN_VIRTUAL {
         return Cand { report: report_of(t, EdgeStatus::TooLittleOverlap, None), edge: None };
     }
-    let edge =
-        Edge { i: t.fixed, j: t.moving, measured: r.transform, weight: weight_of(r), tolerance: r.tolerance, points };
-    Cand { report: report_of(t, EdgeStatus::Used, None), edge: Some(edge) }
+    let diagonal = scans.get(t.fixed).map_or(f64::INFINITY, |m| m.bbox().diagonal());
+    let (share, strong) = pair_is_strong(r.rms, diagonal, tolerance);
+    let edge = Edge {
+        i: t.fixed,
+        j: t.moving,
+        measured: r.transform,
+        weight: weight_of(r),
+        tolerance: r.tolerance,
+        points,
+        strong,
+    };
+    let mut report = report_of(t, EdgeStatus::Used, None);
+    (report.rms_per_diagonal, report.strong_evidence) = (share, strong);
+    Cand { report, edge: Some(edge) }
 }
 
 /// The pair results as candidates for edges; builds the BVH of every scan some unique pair is solved in.
-pub(super) fn candidates(scans: &[&Mesh], tried: &[Tried], cancel: &Cancel) -> Result<Vec<Cand>, AlignError> {
+pub(super) fn candidates(
+    scans: &[&Mesh],
+    tried: &[Tried],
+    tolerance: Option<f64>,
+    cancel: &Cancel,
+) -> Result<Vec<Cand>, AlignError> {
     let wanted = |k: usize| {
         tried.iter().any(|t| t.fixed == k && matches!(&t.outcome, Ok(r) if r.verdict == PairVerdict::Unique))
     };
@@ -105,7 +139,7 @@ pub(super) fn candidates(scans: &[&Mesh], tried: &[Tried], cancel: &Cancel) -> R
     if cancel.is_cancelled() {
         return Err(AlignError::Cancelled);
     }
-    Ok(tried.iter().enumerate().map(|(k, t)| candidate(k, t, scans, &bvhs)).collect())
+    Ok(tried.iter().enumerate().map(|(k, t)| candidate(k, t, scans, &bvhs, tolerance)).collect())
 }
 
 /// The relaxed graph.
@@ -119,7 +153,9 @@ pub(super) struct Solved {
     pub iterations: usize,
     pub converged: bool,
     /// Margin of the first vote that left pairs out.
-    pub margin: Option<usize>,
+    pub margin: Option<(usize, usize)>,
+    /// Trees the last vote tried.
+    pub trials: usize,
 }
 
 /// Misfit of the worst edge in tolerances: its position and value.
@@ -142,12 +178,13 @@ fn graph_of(cands: &[Cand]) -> (Vec<usize>, Vec<Edge>) {
 /// Spanning tree, chain and relaxation over the used edges; an edge that disagrees with the final
 /// poses by more than [`REJECT_FACTOR`] tolerances is marked rejected and the graph is solved again.
 pub(super) fn solve_graph(n: usize, root: usize, cands: &mut [Cand], cancel: &Cancel) -> Result<Solved, AlignError> {
-    let mut margin = None;
+    let (mut margin, mut trials) = (None, 0);
     loop {
         let (members, edges) = graph_of(cands);
         let vote = consensus(n, root, &edges, REJECT_FACTOR);
         if vote.inlier.iter().any(|x| !*x) {
-            margin = margin.or(vote.margin);
+            margin = vote.margin.map(|m| (m, edges.len()));
+            trials = vote.trials;
             for (&k, _) in members.iter().zip(&vote.inlier).filter(|(_, ok)| !**ok) {
                 if let Some(c) = cands.get_mut(k) {
                     c.report.status = EdgeStatus::Rejected;
@@ -178,8 +215,12 @@ pub(super) fn solve_graph(n: usize, root: usize, cands: &mut [Cand], cancel: &Ca
                 iterations: relaxed.iterations,
                 converged: relaxed.converged,
                 margin,
+                trials,
             });
         };
+        // no vote decided this one (the trees agreed, the relaxation did not): which pair is wrong is
+        // read off the worst misfit, so the margin is a tie, whatever an earlier vote found
+        margin = Some((0, edges.len()));
         if let Some(c) = members.get(worst).and_then(|&k| cands.get_mut(k)) {
             c.report.status = EdgeStatus::Rejected;
         }

@@ -107,7 +107,7 @@ pub fn fill_holes_where(mesh: &mut Mesh, max_edges: usize, accept: &dyn Fn(&Mesh
     fill_holes_filtered(mesh, max_edges, false, false, accept)
 }
 
-fn fill_holes_filtered(
+pub(crate) fn fill_holes_filtered(
     mesh: &mut Mesh,
     max_edges: usize,
     smooth: bool,
