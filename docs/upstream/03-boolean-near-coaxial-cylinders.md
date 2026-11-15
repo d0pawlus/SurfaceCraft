@@ -1,4 +1,4 @@
-Status: to be filed; re-checked on head f02d13e on 2026-11-15, fails with upstream fixes off (status 1001) and on (NotSolid); no duplicate found (searches in "Notes for the owner" below). Filing needs the owner's consent.
+Status: filed 2026-11-15 as tangency-labs/solidcraft#17438 (label `bug`; with the owner's consent; the posted text is the part to post below, with the inlined tests run on solidcore `f02d13e` with upstream fixes off and on where there are any). Before filing: to be filed; re-checked on head f02d13e on 2026-11-15, fails with upstream fixes off (status 1001) and on (NotSolid); no duplicate found (searches in "Notes for the owner" below). Filing needs the owner's consent.
 
 # Draft 03: `boolean` (intersect) of two cylinders whose axes are 0.01 degrees apart
 

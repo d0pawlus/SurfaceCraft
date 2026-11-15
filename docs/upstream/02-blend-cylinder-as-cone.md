@@ -1,4 +1,4 @@
-Status: to be filed; re-checked on head f02d13e on 2026-11-15, fails with upstream fixes off and on; no duplicate found (searches in "Notes for the owner" below). Filing needs the owner's consent.
+Status: filed 2026-11-15 as tangency-labs/solidcraft#17437 (as a question, no `bug` label; with the owner's consent; the posted text is the part to post below, with the inlined tests run on solidcore `f02d13e` with upstream fixes off and on where there are any). Before filing: to be filed; re-checked on head f02d13e on 2026-11-15, fails with upstream fixes off and on; no duplicate found (searches in "Notes for the owner" below). Filing needs the owner's consent.
 
 # Draft 02: the round of a box's straight edge is recorded as `Surface::Cone` with half angle 0
 
