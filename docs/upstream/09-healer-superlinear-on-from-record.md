@@ -1,7 +1,10 @@
 # Draft 09: the healer of `Body::from_record(&record, false)` grows faster than linearly with the face count
 
-Status: draft, not filed. Filing needs the owner's consent. If filed, open it in tangency-labs/solidcore (see draft 08
-for the kernel-paused notice, tangency-labs/solidcraft#3992).
+Status: not filed (2026-11-15). The superlinear healer did not reproduce on the current head (`74300b3`, kernel-only test
+`crates/solidcore-ops/tests/record_sheets_repro.rs` on the branch `repro/surfacecraft-kernel-limits` of d0pawlus/solidcore, dev profile,
+loaded machine): see the "Check on the current head" section at the end. The quadratic scan in `post_insert_faceuse` is still in the source
+(`topology/brep/p10.rs`), but only a source reading backs it, and tangency-labs/solidcore AGENTS.md takes a speed fix only with its
+root cause shown as a count on a case slow for users.
 
 **solidcore commit:** `4f2da85c26f7d608808d94cffcf06ebe867ef61d`.
 **Duplicate search** (tangency-labs/solidcraft, read-only `gh search issues`): "healer slow", "healer performance":
@@ -89,3 +92,22 @@ network of more than 2 000 patches without the healer, after its own checks (sha
 edge in at most two faces, neighbouring patches made to agree in direction, and a single closed component turned outward
 by the exact signed volume of its patches; several closed components keep the orientation they were given). So a large body from a source other than that builder is converted without healing unless the trusted
 conversion fails first, and the healer's cost stays what the table above shows if that fallback is taken.
+
+## Check on the current head (2026-11-15)
+
+Kernel-only test `healer_time_is_close_to_linear_in_the_face_count` in `crates/solidcore-ops/tests/record_sheets_repro.rs`, branch
+`repro/surfacecraft-kernel-limits` of d0pawlus/solidcore (`bde355e`), on tangency-labs/solidcore main `74300b3`. Dev profile (the
+only profile allowed on this machine), the machine loaded (1-minute load 15 to 80 during the runs), wall time, one run each:
+
+| faces | `from_record(.., false)` | `from_record(.., true)` |
+|---|---|---|
+| 384 | 58.1 s | 0.044 s |
+| 1 536 | 145.7 s, 208.8 s in a second run | 0.54 s, 0.26 s |
+| 6 144 | 942.4 s | 1.49 s |
+
+Four times the faces took x2.5 (384 to 1 536) and x4.5 (1 536 to 6 144, against the second run) as long: close to linear, not the
+x11 measured at the pin with the `ci` profile at 1 014 and 4 056 faces. The healer is slow in absolute terms (about 150 ms a face in the
+dev profile) but the growth did not reproduce at these sizes, and the wall times are too noisy on a loaded machine to separate x4.5 from a
+mild superlinearity. Not filed: the reproduction does not fail on the current head, and a speed report is taken only with its cause as a
+count (tangency-labs/solidcore AGENTS.md). `post_insert_faceuse` still scans `shell.faces` per face (`p10.rs`, `shell.faces.contains`); the
+sizes where that matters (above about 100 000 faces) were not run in the dev profile.

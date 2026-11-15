@@ -32,7 +32,7 @@ current state and next step: `docs/STATUS.md`.
   Actions runs at two speeds: a DRAFT pull request gets the fast jobs (static checks, clippy, wasm,
   and the tests of the crates and test files it changes on Linux, Windows and macOS, about a
   quarter of an hour); a pull request marked ready gets the full suite on the three systems
-  (`cargo xtask ci`, 40 to 65 minutes). Open a pull request as a draft, iterate until the fast jobs
+  (`cargo xtask ci`, its tests split into parts that run at the same time). Open a pull request as a draft, iterate until the fast jobs
   are green on all three systems (results differ between their math libraries: a test that passes
   locally on macOS has failed on Linux or Windows more than once, so no assertion within 1.5 times
   of a measured value and no exact count that depends on the platform), then mark it ready; a

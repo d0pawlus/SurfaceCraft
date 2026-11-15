@@ -33,6 +33,7 @@ icons!(
     "theme",
     "viewport",
     "align-321",
+    "align-auto",
     "align-axes",
     "align-center",
     "align-fine",

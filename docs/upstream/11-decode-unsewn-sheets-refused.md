@@ -1,8 +1,13 @@
 # Draft 11: decoding a record of separate (unsewn) sheets fails, so separate sheets cannot be sewn
 
-Status: DRAFT — not sent. Filing needs the owner's consent. Open it in tangency-labs/solidcraft as
-kernel-only work (template: Bug report, labels `bug`, `area:kernel`), and only after the
-reproduction below is written and passes on the current solidcore head.
+Status: not filed (2026-11-15). It does not reproduce as a defect on the current head (`74300b3`). Kernel-only test
+`crates/solidcore-ops/tests/record_sheets_repro.rs` (`unsewn_*`) on the branch `repro/surfacecraft-kernel-limits` of d0pawlus/solidcore: a record of
+six separate sheets (a 40 x 30 x 20 mm block, bilinear faces; and bicubic Bezier faces with a flat and a 6 mm domed top), own edges and
+vertices per sheet, one open shell each, validates; `Body::from_record(&record, false)` is refused with the NotYet error described below, which
+the API documents (`solidcore-convert::to_kernel`: an untrusted record whose topology the healer changed has no record order); but
+`Body::from_record(&record, true)` followed by `ops::stitch` at 1e-6 and at 1e-2 gives a closed solid of the exact volume (24 000 and 25 800 mm3).
+So the route exists and the draft's claim "no route" and "sewing fails at every tolerance" is not true for kernel-only sheets; whatever failed in the
+application is not reduced to a kernel case.
 
 **solidcore commit observed:** `4f2da85c26f7d608808d94cffcf06ebe867ef61d`. Not yet checked on the
 current head.

@@ -13,6 +13,9 @@ use surfacecraft_doc::{ObjectId, ObjectKind};
 use surfacecraft_engine::Session;
 use surfacecraft_geom::{Bvh, Point3};
 
+mod template;
+pub use template::{PickContext, template};
+
 /// The SurfaceCraft UI.
 pub struct SurfaceCraftApp {
     /// The engine session every action goes through.
@@ -25,6 +28,12 @@ pub struct SurfaceCraftApp {
     pub palette_command: Option<&'static str>,
     /// The palette's parameter editor (JSON).
     pub palette_params: String,
+    /// The last entry of the command log when the open tool was chosen: what ran before the tool
+    /// was opened is not a result of this use of it (see `align_proposal`).
+    pub(crate) tool_opened_on: Option<std::sync::Arc<surfacecraft_engine::LogEntry>>,
+    /// The camera from before it framed a proposed alignment: where the view returns when the
+    /// proposal is cancelled (the scan is then drawn where it was, which may be out of that frame).
+    pub(crate) camera_before_proposal: Option<Camera>,
     /// The stage whose tools the ribbon shows.
     pub stage: crate::workflow::Stage,
     /// The text of the ribbon's tool search.
@@ -51,6 +60,8 @@ pub struct SurfaceCraftApp {
     pub background_jobs: bool,
     /// The command running now, if one is.
     pub(crate) busy: Option<crate::jobs::Busy>,
+    /// A large file picked for import, waiting for the user's answer (see [`crate::import_reduce`]).
+    pub(crate) pending_import: Option<crate::import_reduce::PendingImport>,
     /// A cancelled command whose thread has not finished yet.
     pub(crate) finishing: Option<surfacecraft_engine::Job>,
     /// Last status line.
@@ -130,6 +141,8 @@ impl SurfaceCraftApp {
             selected_object: None,
             palette_command: None,
             palette_params: "{}".into(),
+            tool_opened_on: None,
+            camera_before_proposal: None,
             stage: crate::workflow::Stage::default(),
             tool_search: String::new(),
             focus_search: false,
@@ -141,6 +154,7 @@ impl SurfaceCraftApp {
             deviation: Default::default(),
             background_jobs: false,
             busy: None,
+            pending_import: None,
             finishing: None,
             status: t("status.ready").to_string(),
             picks: Vec::new(),
@@ -173,6 +187,11 @@ impl SurfaceCraftApp {
 
     /// The nearest object hit by the ray through viewport pixel `(x, y)` of a `w × h` viewport.
     pub(crate) fn ray_hit(&mut self, x: f64, y: f64, w: f64, h: f64) -> Option<Pick> {
+        if crate::align_proposal::current(self).is_some() {
+            // the scan is drawn in a proposed pose it is not in: a click on the picture would
+            // hit something else in the document
+            return None;
+        }
         let (origin, dir) = self.camera.ray(x, y, w, h);
         let items = self.session.display_items();
         let live: Vec<usize> = items.iter().map(|d| d.pick_key).collect();
@@ -292,6 +311,7 @@ impl SurfaceCraftApp {
     /// command's stage.
     pub fn choose_command(&mut self, id: &'static str) {
         self.palette_command = Some(id);
+        self.tool_opened_on = self.session.log.last().cloned();
         self.field_pick = None;
         if let Some(stage) = crate::workflow::Stage::of(id) {
             self.stage = stage;
@@ -312,7 +332,15 @@ impl SurfaceCraftApp {
 
     /// Closes the open tool without running it: the tool panel shows the guide again.
     pub fn close_tool(&mut self) {
+        let proposal_shown = crate::align_proposal::current(self).is_some();
+        if let Some(camera) = self.camera_before_proposal.take()
+            && proposal_shown
+        {
+            // the proposal is dropped: look again at where the scan still is
+            self.camera = camera;
+        }
         self.palette_command = None;
+        self.tool_opened_on = None;
         self.field_pick = None;
         self.cmd_panel.cancel_preview();
     }
@@ -537,7 +565,9 @@ impl SurfaceCraftApp {
             self.view_input(ui, &resp, rect);
         }
         if self.fit_pending {
-            self.camera.fit(&self.session.doc.bbox());
+            // with a proposed alignment on screen, what is shown is the proposed pose
+            let shown = crate::align_proposal::framed_box(self).unwrap_or_else(|| self.session.doc.bbox());
+            self.camera.fit(&shown);
             self.fit_pending = false;
         }
         if !self.gpu {
@@ -584,6 +614,7 @@ impl SurfaceCraftApp {
             .map(|d| DrawItem {
                 key: d.key,
                 color: tokens.object(d.kind),
+                back: tokens.object_back(d.kind),
                 colors: d.colors.clone(),
                 colors_key: d.colors_key,
                 highlight: self.highlight_for(&d),
@@ -666,123 +697,14 @@ pub(crate) fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n { s.to_string() } else { s.chars().take(n).collect::<String>() + "…" }
 }
 
-/// What the UI knows when it prefills parameters.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct PickContext {
-    /// Selected object.
-    pub selected: Option<ObjectId>,
-    /// Picked points.
-    pub points: Vec<[f64; 3]>,
-    /// Picked triangles (original ids of the scan).
-    pub triangles: Vec<u32>,
-    /// Every object of the document (id, kind), so object references can be prefilled with a
-    /// real object instead of a made-up id.
-    pub objects: Vec<(ObjectId, ObjectKind)>,
-    /// Picked B-rep faces (indices in the body record).
-    pub faces: Vec<usize>,
-    /// Picked B-rep edges (indices in the body record).
-    pub edges: Vec<usize>,
-}
-
-impl PickContext {
-    /// The object a reference parameter called `name` should point at: the selection when it is
-    /// of a kind the parameter takes (see [`crate::forms::accepted_kinds`]), else the first
-    /// object that is.
-    #[must_use]
-    pub fn reference_for(&self, name: &str, description: Option<&str>) -> Option<ObjectId> {
-        let kinds = crate::forms::accepted_kinds(name, description);
-        let fits = |k: ObjectKind| kinds.is_empty() || kinds.contains(&k);
-        if let Some(sel) = self.selected
-            && self.objects.iter().any(|(id, k)| *id == sel && fits(*k))
-        {
-            return Some(sel);
-        }
-        self.objects.iter().find(|(_, k)| fits(*k)).map(|(id, _)| *id)
-    }
-}
-
-/// Whether a property schema is an object reference (`ObjRef`: an id or a name).
-fn is_obj_ref(p: &Value) -> bool {
-    p.get("$ref").and_then(Value::as_str).is_some_and(|r| r.ends_with("/ObjRef"))
-}
-
-/// Example parameters from an input schema: required properties with neutral values; `object`
-/// gets the selected object, `from`/`points` the picked points, `triangles` the picked triangles.
-#[must_use]
-pub fn template(schema: &Value, ctx: &PickContext) -> Value {
-    let mut out = serde_json::Map::new();
-    let props = schema.get("properties").and_then(Value::as_object);
-    let required: Vec<&str> = schema
-        .get("required")
-        .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
-    if let Some(props) = props {
-        for name in required {
-            let p = props.get(name).cloned().unwrap_or(Value::Null);
-            let described = p.get("description").and_then(Value::as_str);
-            let v = match name {
-                _ if is_obj_ref(&p) || name == "object" || name == "mesh" => {
-                    ctx.reference_for(name, described).map_or(json!(""), |id| json!(id.0))
-                }
-                _ if p.get("items").is_some_and(is_obj_ref) => {
-                    let n = p.get("minItems").and_then(Value::as_u64).unwrap_or(0) as usize;
-                    let id = ctx.reference_for(name, described).map_or(json!(""), |id| json!(id.0));
-                    Value::Array(vec![id; n])
-                }
-                "from" | "points" if !ctx.points.is_empty() => json!(ctx.points),
-                "triangles" if !ctx.triangles.is_empty() => json!(ctx.triangles),
-                "faces" if !ctx.faces.is_empty() => json!(ctx.faces),
-                "edges" if !ctx.edges.is_empty() => json!(ctx.edges),
-                _ => match crate::fieldpick::PickMode::of(&p).and_then(crate::fieldpick::PickMode::default_value) {
-                    Some(datum) => datum,
-                    None => example(&p, schema),
-                },
-            };
-            out.insert(name.to_string(), v);
-        }
-    }
-    Value::Object(out)
-}
-
-fn example(p: &Value, root: &Value) -> Value {
-    if let Some(r) = p.get("$ref").and_then(Value::as_str) {
-        let name = r.rsplit('/').next().unwrap_or("");
-        if let Some(def) = root.get("$defs").and_then(|d| d.get(name)) {
-            if let Some(e) = def.get("enum").and_then(Value::as_array).and_then(|a| a.first()) {
-                return e.clone();
-            }
-            if let Some(one) = def.get("oneOf").and_then(Value::as_array).and_then(|a| a.first()) {
-                if let Some(c) = one.get("const") {
-                    return c.clone();
-                }
-                if let Some(e) = one.get("enum").and_then(Value::as_array).and_then(|a| a.first()) {
-                    return e.clone();
-                }
-            }
-            return example(def, root);
-        }
-    }
-    // a number that may also be an expression object: the number
-    if let Some(first) = p.get("anyOf").and_then(|a| a.get(0)).filter(|f| f.get("x-expr").is_some()) {
-        return example(first, root);
-    }
-    match p.get("type").and_then(Value::as_str) {
-        Some("string") => json!(""),
-        Some("number") | Some("integer") => json!(0),
-        Some("boolean") => json!(false),
-        Some("array") => {
-            let n = p.get("minItems").and_then(Value::as_u64).unwrap_or(0);
-            let item = p.get("items").map_or(json!(0), |i| example(i, root));
-            Value::Array((0..n).map(|_| item.clone()).collect())
-        }
-        Some("object") => template(p, &PickContext::default()),
-        _ => json!(null),
-    }
-}
-
 /// Viewport colour of an object kind (the Light preset's, used for screenshots).
 #[must_use]
 pub fn kind_color(kind: ObjectKind) -> [f32; 4] {
     Tokens::resolve(crate::theme::Preset::Light).object(kind)
+}
+
+/// Viewport colour of the back side of an object kind (the Light preset's, used for screenshots).
+#[must_use]
+pub fn kind_back(kind: ObjectKind) -> Option<[f32; 4]> {
+    Tokens::resolve(crate::theme::Preset::Light).object_back(kind)
 }

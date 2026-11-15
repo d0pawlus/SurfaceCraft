@@ -29,7 +29,7 @@ pub struct Bench {
     pub first_frame_s: f64,
     /// Frames timed after the first.
     pub frames: usize,
-    /// Mean frames per second over those, camera orbiting, each frame waited for.
+    /// Mean frames per second over those, camera orbiting and panning, each frame waited for.
     pub fps: f64,
     /// Full mesh uploads during the run.
     pub uploads: u64,
@@ -37,8 +37,13 @@ pub struct Bench {
     pub triangles: usize,
 }
 
-/// Renders `frame` once (upload) and then `frames` more times with an orbiting camera, waiting for
-/// the GPU after every frame. `None` without a GPU adapter.
+/// Pixels the benchmark camera pans per frame.
+#[cfg(not(target_arch = "wasm32"))]
+const BENCH_PAN_PX: f64 = 1.0;
+
+/// Renders `frame` once (upload) and then `frames` more times with an orbiting and panning camera
+/// (the precision origin follows its target, as in the application), waiting for the GPU after
+/// every frame. `None` without a GPU adapter.
 #[cfg(not(target_arch = "wasm32"))]
 #[must_use]
 pub fn bench_offscreen(frame: &Frame, frames: usize) -> Option<Bench> {
@@ -58,6 +63,8 @@ pub fn bench_offscreen(frame: &Frame, frames: usize) -> Option<Bench> {
     let t = std::time::Instant::now();
     for _ in 0..frames {
         f.camera.orbit(0.03, 0.002);
+        f.camera.pan(BENCH_PAN_PX, 0.0, f64::from(f.size[1]));
+        f.origin = f.camera.target;
         run(&f)?;
     }
     let secs = t.elapsed().as_secs_f64().max(1e-9);
