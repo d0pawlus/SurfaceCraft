@@ -394,9 +394,15 @@ fn merge_with(
     rounds::merge_rounds(original, specs, max_gap, &Run { cancel, all_at_once, chord: 2.0 * max_gap })
 }
 
-/// The most groups one merge takes (the rest stay patches, reported as such): each costs a rebuild
-/// where the kernel refuses the whole.
-pub const MAX_GROUPS: usize = 64;
+/// The most batches of groups one merge settles (see [`settle::BATCH`]).
+const MAX_BATCHES: usize = 4;
+
+/// The most groups one merge takes (the rest stay patches, reported as such), a hard bound on the input. The work
+/// of a merge is linear in its groups: the groups are settled a batch at a time, and where the kernel refuses a
+/// whole batch each group of it costs up to two rebuilds of the body, in each of the rounds. The bound is four
+/// batches: three times the most groups measured on a real scan (84), and four times the work of the single batch
+/// of 64 that was the bound before the groups were batched.
+pub const MAX_GROUPS: usize = MAX_BATCHES * settle::BATCH;
 
 /// Merges the faces `group` of `body` into one face on `shape`, within `max_gap` of it.
 ///
@@ -485,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn a_merge_is_cancelled_between_groups_and_takes_a_limited_number() {
+    fn a_merge_is_cancelled_between_groups() {
         let body = flat_sheet(6);
         let groups = pairs(6);
         let shape = plane();
@@ -497,14 +503,52 @@ mod tests {
             polls.get() > 3
         };
         assert!(merge_with(&body, &specs, 0.05, &late, false).is_err(), "cancelled part way");
+    }
+
+    /// 128 groups, twice the groups one rebuild settles: every one is merged, all at once and group by group.
+    #[test]
+    fn more_groups_than_one_rebuild_settles_are_all_merged() {
         let big = flat_sheet(16);
         let many = pairs(16);
+        let shape = plane();
         let specs: Vec<GroupSpec> = many.iter().map(|g| GroupSpec { faces: g, shape: &shape }).collect();
-        assert!(many.len() > MAX_GROUPS);
-        let r = merge_with(&big, &specs, 0.05, &|| false, true).unwrap();
-        let (ok, refused) =
-            (r.groups.iter().filter(|g| g.is_ok()).count(), r.groups.iter().filter(|g| g.is_err()).count());
-        assert_eq!((ok, refused), (MAX_GROUPS, many.len() - MAX_GROUPS));
+        assert!(many.len() > settle::BATCH);
+        for all_at_once in [true, false] {
+            let r = merge_with(&big, &specs, 0.05, &|| false, all_at_once).unwrap();
+            let refused: Vec<&String> = r.groups.iter().filter_map(|g| g.as_ref().err()).collect();
+            assert!(refused.is_empty(), "all at once {all_at_once}: {refused:?}");
+            assert_eq!(r.brep.faces.len(), many.len(), "each pair became one face");
+            // the face of each group, the later batches' as well as the first's, is its own plane in the body
+            let faces: BTreeSet<usize> = r.groups.iter().filter_map(|g| g.as_ref().ok().map(|g| g.face)).collect();
+            assert_eq!(faces.len(), many.len(), "all at once {all_at_once}: one face per group");
+            assert!(
+                faces.iter().all(|&f| r.brep.faces.get(f).is_some_and(|f| matches!(f.surface, Surface::Plane { .. })))
+            );
+            for (g, result) in many.iter().zip(&r.groups) {
+                let face = result.as_ref().map(|x| x.face).ok();
+                assert!(
+                    g.iter().all(|&f| r.face_map.get(f).copied().flatten().is_none()
+                        || r.face_map.get(f).copied().flatten() == face)
+                );
+            }
+        }
+    }
+
+    /// The hard bound on hostile input: the specs past [`MAX_GROUPS`] stay patches and say why, the others are
+    /// judged as usual (here two groups and copies of the first, which share its faces).
+    #[test]
+    fn the_specs_past_the_hard_bound_are_refused_with_the_reason() {
+        let body = flat_sheet(4);
+        let (a, b) = (vec![0, 1], vec![2, 3]);
+        let shape = plane();
+        let mut specs = vec![GroupSpec { faces: &a, shape: &shape }, GroupSpec { faces: &b, shape: &shape }];
+        specs.resize(MAX_GROUPS + 2, GroupSpec { faces: &a, shape: &shape });
+        let r = merge_with(&body, &specs, 0.05, &|| false, true).unwrap();
+        assert!(r.groups.iter().take(2).all(std::result::Result::is_ok));
+        let why = |k: usize| r.groups.get(k).and_then(|g| g.as_ref().err()).cloned().unwrap_or_default();
+        assert!(why(2).contains("another group"), "{}", why(2));
+        assert!(why(MAX_GROUPS).contains("beyond"), "{}", why(MAX_GROUPS));
+        assert!(why(MAX_GROUPS + 1).contains("beyond"), "{}", why(MAX_GROUPS + 1));
     }
 
     /// The prepared face of the block of patches `faces` of a flat sheet, and the settled outcome of it with its

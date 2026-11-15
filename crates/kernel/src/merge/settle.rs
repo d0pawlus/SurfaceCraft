@@ -25,6 +25,13 @@ const MAX_AREA_EXCESS: f64 = 0.1;
 /// The chord the judge tessellates the body at, as a share of the tolerance (half the chord of the area check).
 const JUDGE_CHORD_SHARE: f64 = 0.05;
 
+/// The most groups settled together: the groups are put into the body a batch at a time, each batch rebuilt with the
+/// faces the batches before it gave. Where the kernel refuses a whole batch, its groups go one by one, and those it
+/// takes alone but not together are dropped from the end, each drop a rebuild and the checks of the kept faces again:
+/// the batch bounds that work (at most `2 BATCH + 2` rebuilds, and the checks of `BATCH^2 / 2` faces) where a single
+/// batch of all the groups would square it.
+pub(super) const BATCH: usize = 64;
+
 /// Per group: `Ok` when its face was taken, else why not.
 pub(super) type Verdicts = Vec<std::result::Result<(), String>>;
 
@@ -216,25 +223,69 @@ fn kept_of<'a>(all: &[&'a Prepared], v: &Verdicts) -> Vec<&'a Prepared> {
     all.iter().zip(v).filter(|(_, k)| k.is_ok()).map(|(p, _)| *p).collect()
 }
 
-/// All groups in one rebuild; the groups whose face does not hold its area are dropped and the
-/// rest rebuilt; a rebuild the kernel refuses goes group by group.
+/// The groups of `all`, a [`BATCH`] at a time, each batch rebuilt with the groups taken before it (`settle_batch`).
+/// A batch the kernel takes none of leaves its groups as patches with the reason and the next batch goes on.
 pub(super) fn settle(body: &Brep, volume: Option<f64>, all: &[&Prepared], run: &Run) -> Result<Settled> {
-    if !run.all_at_once {
-        return one_by_one(body, volume, all, run);
+    let mut taken: Vec<&Prepared> = Vec::with_capacity(all.len());
+    let mut verdicts: Verdicts = Vec::with_capacity(all.len());
+    let mut last: Option<(Brep, Vec<Option<usize>>)> = None;
+    let mut first_refusal: Option<KernelError> = None;
+    for batch in all.chunks(BATCH) {
+        if (run.cancel)() {
+            return Err(cancelled());
+        }
+        match settle_batch(body, volume, &taken, batch, run) {
+            Ok((brep, map, v)) => {
+                taken.extend(kept_of(batch, &v));
+                verdicts.extend(v);
+                last = Some((brep, map));
+            }
+            Err(_) if (run.cancel)() => return Err(cancelled()),
+            Err(e) => {
+                let why = e.to_string();
+                verdicts.extend(batch.iter().map(|_| Err(why.clone())));
+                first_refusal.get_or_insert(e);
+            }
+        }
     }
-    let Ok((brep, map)) = apply(body, volume, all) else { return one_by_one(body, volume, all, run) };
-    let verdicts = areas_agree(body, &brep, &map, all, run.chord)?;
+    match last {
+        Some((brep, map)) => Ok((brep, map, verdicts)),
+        None => Err(first_refusal.unwrap_or_else(|| KernelError::Argument("no group to merge".into()))),
+    }
+}
+
+/// The groups taken before (`taken`) and `batch` as one list for a rebuild.
+fn with<'a>(taken: &[&'a Prepared], batch: &[&'a Prepared]) -> Vec<&'a Prepared> {
+    taken.iter().chain(batch).copied().collect()
+}
+
+/// One batch in one rebuild with the groups taken before it; the groups whose face does not hold its area are
+/// dropped and the rest rebuilt; a rebuild the kernel refuses goes group by group. The verdicts are the batch's.
+fn settle_batch(
+    body: &Brep,
+    volume: Option<f64>,
+    taken: &[&Prepared],
+    batch: &[&Prepared],
+    run: &Run,
+) -> Result<Settled> {
+    if !run.all_at_once {
+        return one_by_one(body, volume, taken, batch, run);
+    }
+    let Ok((brep, map)) = apply(body, volume, &with(taken, batch)) else {
+        return one_by_one(body, volume, taken, batch, run);
+    };
+    let verdicts = areas_agree(body, &brep, &map, batch, run.chord)?;
     if passed(&verdicts) {
         return Ok((brep, map, verdicts));
     }
-    let kept = kept_of(all, &verdicts);
+    let kept = kept_of(batch, &verdicts);
     if kept.is_empty() {
         let why = verdicts.iter().find_map(|v| v.as_ref().err()).cloned().unwrap_or_default();
         return Err(KernelError::Argument(format!("no merged face holds up: {why}")));
     }
-    let (brep, map) = apply(body, volume, &kept)?;
+    let (brep, map) = apply(body, volume, &with(taken, &kept))?;
     if !passed(&areas_agree(body, &brep, &map, &kept, run.chord)?) {
-        return one_by_one(body, volume, &kept, run).map(|(b, m, f)| (b, m, expand(&verdicts, f)));
+        return one_by_one(body, volume, taken, &kept, run).map(|(b, m, f)| (b, m, expand(&verdicts, f)));
     }
     Ok((brep, map, verdicts))
 }
@@ -251,31 +302,44 @@ fn expand(outer: &Verdicts, inner: Verdicts) -> Verdicts {
         .collect()
 }
 
-/// The verdict on one group rebuilt on its own: an error of the kernel is its reason.
-fn alone(body: &Brep, volume: Option<f64>, p: &Prepared, run: &Run) -> std::result::Result<(), String> {
+/// The verdict on one group rebuilt with the groups taken before it: an error of the kernel is its reason.
+fn alone(
+    body: &Brep,
+    volume: Option<f64>,
+    taken: &[&Prepared],
+    p: &Prepared,
+    run: &Run,
+) -> std::result::Result<(), String> {
     let one = [p];
-    let (b, m) = apply(body, volume, &one).map_err(|e| format!("the kernel did not take the rebuilt body: {e}"))?;
+    let (b, m) = apply(body, volume, &with(taken, &one))
+        .map_err(|e| format!("the kernel did not take the rebuilt body: {e}"))?;
     let verdict = areas_agree(body, &b, &m, &one, run.chord).map_err(|e| e.to_string())?;
     verdict.into_iter().next().unwrap_or_else(|| Err("no verdict".to_string()))
 }
 
-/// Each group on its own body (one rebuild and the checks of that one face), then the kept groups
-/// together (one rebuild): a number of rebuilds linear in the groups. Groups whose faces the kernel
-/// takes alone but not together are dropped from the end until it does.
-fn one_by_one(body: &Brep, volume: Option<f64>, all: &[&Prepared], run: &Run) -> Result<Settled> {
-    let mut verdicts: Verdicts = Vec::with_capacity(all.len());
-    for p in all {
+/// Each group of `batch` on its own with the groups taken before it (one rebuild and the checks of that one face),
+/// then the kept groups together (one rebuild): a number of rebuilds linear in the batch. Groups whose faces the
+/// kernel takes alone but not together are dropped from the end until it does.
+fn one_by_one(
+    body: &Brep,
+    volume: Option<f64>,
+    taken: &[&Prepared],
+    batch: &[&Prepared],
+    run: &Run,
+) -> Result<Settled> {
+    let mut verdicts: Verdicts = Vec::with_capacity(batch.len());
+    for p in batch {
         if (run.cancel)() {
             return Err(cancelled());
         }
-        verdicts.push(alone(body, volume, p, run));
+        verdicts.push(alone(body, volume, taken, p, run));
     }
-    let mut kept = kept_of(all, &verdicts);
+    let mut kept = kept_of(batch, &verdicts);
     while !kept.is_empty() {
         if (run.cancel)() {
             return Err(cancelled());
         }
-        if let Ok((brep, map)) = apply(body, volume, &kept)
+        if let Ok((brep, map)) = apply(body, volume, &with(taken, &kept))
             && areas_agree(body, &brep, &map, &kept, run.chord).is_ok_and(|v| passed(&v))
         {
             return Ok((brep, map, verdicts));
