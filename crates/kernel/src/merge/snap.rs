@@ -101,7 +101,7 @@ pub fn put_on_all_with(closest: &dyn Fn(usize, V) -> Option<V>, count: usize, p:
 }
 
 /// Where `p` goes onto `count` surfaces, and whether that is on all of them: `(q, true)` when the alternating
-/// projections meet; where they do not (surfaces that touch at a shallow angle, or are parallel) the point nearest to
+/// projections meet; where they do not within the rounds (surfaces that meet at a shallow angle) the point nearest to
 /// all of them among the last iterate and the projections of `p` onto each, `(q, false)`: the point is not on them
 /// all, and the groups are judged by their border checks. `None` when the point would move more than `max_move`, or is not finite.
 #[must_use]
@@ -122,8 +122,13 @@ fn onto_all(closest: &dyn Fn(usize, V) -> Option<V>, count: usize, p: V) -> Opti
         if on_all(q) {
             return Some((q, true));
         }
-        if count == 1 || norm(sub(q, before)) < STALLED {
+        if count == 1 {
             break;
+        }
+        if norm(sub(q, before)) < STALLED {
+            // a round that changes nothing without reaching them all: parallel (or offset) surfaces, which have no
+            // common point; nothing is placed
+            return None;
         }
     }
     if count == 1 {

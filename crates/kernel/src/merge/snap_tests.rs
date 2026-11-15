@@ -141,6 +141,11 @@ fn parallel_primitives_are_reported_as_not_met_and_not_settled() {
     let (a, b) = (plane_gauge([0.0, 0.0, 1.0], 0.0), plane_gauge([0.0, 0.0, 1.0], 0.5));
     assert!(put_on_all(&[&a, &b], p(1.0, 1.0, 0.2), 10.0).is_none(), "no point is on both");
     assert!(put_on_all(&[&a, &a], p(1.0, 1.0, 0.2), 10.0).is_some(), "the same plane twice is one plane");
+    let at = p(1.0, 1.0, 0.2);
+    assert!(
+        placed(&|i, q| [&a, &b][i].closest(q), 2, at, 10.0).is_none(),
+        "parallel planes place nothing, not even on one"
+    );
 }
 
 /// A collapsed border is moved only where the loop says it is: a loop that starts elsewhere than the net was laid
