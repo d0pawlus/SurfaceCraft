@@ -37,10 +37,11 @@ Policy:
 
 ## External test models (not in the repository)
 
-Four scans used as the open test corpus. They are too large to commit (105 to 190 MB each), so
+Six scans used as the open test corpus. They are too large to commit (75 to 270 MB each), so
 `xtask/fetch-artec-corpus.sh <dir>` downloads them from the publisher, pinned by version and
 SHA-256, and the tests read them through `SURFACECRAFT_ARTEC_CORPUS` (off by default). The script
-saves the licence text of each archive beside the model. The models are used unmodified; SurfaceCraft
+saves the licence text of each archive beside the model (for the one archive that holds none, the
+statement of the model's page). The models are used unmodified; SurfaceCraft
 is not connected with, sponsored or endorsed by Artec Group.
 
 | Model | Author | Source | Licence |
@@ -49,6 +50,8 @@ is not connected with, sponsored or endorsed by Artec Group.
 | Four-cylinder engine (`four-cylinder-engine.ply`) | Artec Group inc. (www.artec3d.com) | https://www.artec3d.com/3d-models/four-cylinder-engine | as above |
 | Industrial part (`industrial-part.obj`) | Artec Group inc. (www.artec3d.com) | https://www.artec3d.com/3d-models/industrial-part | as above |
 | Water pump (`water-pump.ply`) | Artec Group inc. (www.artec3d.com) | https://www.artec3d.com/3d-models/water-pump | as above |
+| Motorcycle crankcase (`motorcycle-crankcase.ply`) | Artec Group inc. (www.artec3d.com) | https://www.artec3d.com/3d-models/motorcycle-crankcase | as above |
+| Suspension bracket (`suspension-bracket.obj`) | Artec Group inc. (www.artec3d.com) | https://www.artec3d.com/3d-models/suspension-bracket | CC BY 4.0 per the page (read 2026-11-15); the archive holds no licence file |
 
 Anything derived from these models that is committed or published (a crop, a decimated copy, a
 screenshot) carries the same credit and says that it was modified.
