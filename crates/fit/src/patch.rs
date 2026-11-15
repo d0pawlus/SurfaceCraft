@@ -202,16 +202,37 @@ pub(crate) const WRAP_FACING_COS: f64 = 0.3;
 const INNER_INVERSE: [[f64; 2]; 2] = [[3.0, -1.5], [-1.5, 3.0]];
 
 /// The cubic from `a` to `b` through the scan points under the chord at 1/3 and 2/3.
-pub(crate) fn wrap_curve(a: Vec3, b: Vec3, project: &dyn Fn(Vec3) -> Vec3) -> [Vec3; 4] {
+pub(crate) fn chord_curve(a: Vec3, b: Vec3, project: &dyn Fn(Vec3) -> Vec3) -> [Vec3; 4] {
     let q1 = project(a + (b - a) / 3.0);
     let q2 = project(a + (b - a) * (2.0 / 3.0));
     [a, (a * -5.0 + q1 * 18.0 - q2 * 9.0 + b * 2.0) / 6.0, (a * 2.0 - q1 * 9.0 + q2 * 18.0 - b * 5.0) / 6.0, b]
 }
 
+/// The wrap curve from `a` to `b`: [`chord_curve`] refitted to the scan by least squares
+/// ([`crate::patch_refit`]).
+pub(crate) fn wrap_curve(a: Vec3, b: Vec3, project: &dyn Fn(Vec3) -> Vec3) -> [Vec3; 4] {
+    let c = chord_curve(a, b, project);
+    crate::patch_refit::refit_curve(c, project)
+}
+
+/// The wrap patch with the boundary curves `bot` (c0 → c1), `right` (c1 → c2), `top` (c3 → c2),
+/// `left` (c0 → c3): [`interpolated_net`] with its inner points refitted to the scan by least squares
+/// ([`crate::patch_refit`]).
+pub(crate) fn wrap_net(
+    bot: &[Vec3; 4],
+    right: &[Vec3; 4],
+    top: &[Vec3; 4],
+    left: &[Vec3; 4],
+    project: &dyn Fn(Vec3) -> Vec3,
+) -> Net {
+    let net = interpolated_net(bot, right, top, left, project);
+    crate::patch_refit::refit_net(net, project)
+}
+
 /// The net with the boundary curves `bot` (c0 → c1), `right` (c1 → c2), `top` (c3 → c2), `left`
 /// (c0 → c3); its four inner points are set so the patch passes through the scan points under its
 /// samples at 1/3 and 2/3.
-pub(crate) fn wrap_net(
+pub(crate) fn interpolated_net(
     bot: &[Vec3; 4],
     right: &[Vec3; 4],
     top: &[Vec3; 4],

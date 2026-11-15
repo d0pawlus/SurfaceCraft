@@ -8,16 +8,23 @@ patch network over a whole scan.
 - `surface.wrap` with `mesh`: a watertight network of bicubic patches over the whole scan, for
   castings, body panels and organic shapes. `tolerance` (default 0.2 mm), `min_within` (default
   0.99) and `max_patches` (default 12000, at most 60000). The result is a solid when the scan is
-  closed, else a sheet; `deviation` gives `within`, `rms`, `p99` and `max`.
+  closed, else a sheet; `deviation` gives `within`, `rms`, `p99` and `max`. Every patch edge
+  and every patch is refitted to the scan by least squares (sampled, projected onto the scan, its
+  inner control points fitted to those points, kept only when it lies closer), so a patch follows
+  a curved or noisy scan more closely than the few points it was first laid through.
 - `refine` (default `adaptive`): the layout is refined only around the scan points the patches
   miss, so smooth areas keep large patches; `uniform` halves the budget of the whole scan each
   round (more patches for the same tolerance). `levels` lists the patches and the share within
   the tolerance of every round, `refine` the layout used.
 - `max_patches` is a hard bound of every round, the first included (`cap_used` echoes it): no
-  network has more patches. A round that would exceed it is not dropped: the largest refinement
-  that fits is built (adaptive: the most deviating scan points first; uniform: the budget between
-  the two rounds), within 90 % to 100 % of the cap when the search lands there (at most 4
-  reductions of the scan, `probes` in `levels`), and `levels[].partial` says why a round was cut.
+  network has more patches. A round that would exceed it is not dropped. Adaptive: it is cut to the
+  cap by the decimation, and while such rounds raise the share within the tolerance by at least 0.1
+  percentage point the rounds go on at the cap, the detail raised around the points the best round
+  still misses (at the cap a round costs time, not patches, so they go on past `min_within` too);
+  when the first one gains nothing, the largest refinement that fits is searched for as well (the
+  most deviating scan points first). Uniform: the round cut to the cap, then the budget between the
+  two rounds that fits. A search lands within 90 % to 100 % of the cap (at most 4 reductions of the
+  scan, `probes` in `levels`), and `levels[].partial` says why a round was cut.
   The best round is the result. A larger `max_patches` usually raises the share of points within the
   tolerance (the `within` field of the result's deviation), but that is not guaranteed.
   `capped` is true when the cap cut a round and the tolerance is still missed. A scan whose

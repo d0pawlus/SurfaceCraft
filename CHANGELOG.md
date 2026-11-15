@@ -23,6 +23,15 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
   `close_handles` uses it. `mesh.close_handles` takes candidates refused for splitting the surface
   back one by one.
 
+### Changed
+
+- `surface.wrap` fits closer to organic scans: every patch edge and patch is refitted to the scan
+  by least squares (edges with the parameters of their spacing along the curve), and the adaptive
+  rounds held at `max_patches` go on at the cap while each raises the share within the tolerance by
+  at least 0.1 percentage point, past `min_within` too, instead of stopping at the first round cut
+  to the cap. The one corpus scan held at `review` by accuracy now passes (97.87 to 99.15 % within
+  0.2 mm at 60 000 patches; about a fifth more computing time).
+
 ## [0.2.0] - 2026-11-13
 
 Four days and 60 merged pull requests after 0.1.0. The release is about real scans: one command now takes

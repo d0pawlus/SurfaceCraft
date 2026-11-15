@@ -15,9 +15,13 @@
 //!
 //! `max_patches` is a hard bound for every round (three patches per coarse triangle). A first round
 //! that does not fit is cut to the cap ([`trim_to_cap`]). A later round that would not fit is not
-//! dropped: the largest refinement that does fit is searched for ([`search_cap`]) — the worst
-//! missed regions first in the adaptive layout (how many of the scan vertices ranked by their
-//! deviation get more detail), the budget in the uniform one — so the whole cap is spent.
+//! dropped. In the adaptive layout it is cut to the cap by the decimation (detail stays where the
+//! quadric error is highest, which is where the levels were raised), and while such rounds gain the
+//! rounds go on at the cap, the detail raised around the misses of the best round: at the cap a
+//! round costs time, not patches, so they go on past `min_within` too and leave a margin. When the
+//! first such round gains nothing, the largest refinement that fits is searched for ([`search_cap`]:
+//! how many of the scan vertices ranked by their deviation get more detail); in the uniform layout
+//! the budget between the two rounds is. Either way the whole cap is spent.
 use super::wrap::WrapDeviation;
 use super::wrap_cap::{End, Trimmed, decimate_options, search_cap, trim_to_cap};
 use super::wrap_cluster::ClusterError;
@@ -47,6 +51,9 @@ const MAX_COARSE: f64 = 4.0;
 const UNIFORM_ROUNDS: usize = 3;
 /// Rounds at most of the adaptive layout.
 const ADAPTIVE_ROUNDS: usize = 7;
+/// A round cut to the cap must raise the best share within the tolerance by this much for the
+/// rounds to go on at the cap (0.1 percentage points of the samples).
+const MIN_GAIN_AT_CAP: f64 = 0.001;
 /// Most times the budget around a vertex is halved by the adaptive layout.
 const MAX_LEVEL: u8 = 4;
 /// Rings of scan vertices around a missed scan point that are refined with it.
@@ -301,6 +308,8 @@ struct Run {
     /// Tangent patches (the layout search itself runs with unconstrained ones).
     g1: bool,
     best: Option<Round>,
+    /// The distance of every sample from the best round.
+    best_d: Vec<f64>,
     log: Vec<WrapLevel>,
     /// Did `max_patches` cut a round, or stop the refinement?
     hit_cap: bool,
@@ -308,13 +317,13 @@ struct Run {
 
 impl Run {
     fn new(g1: bool) -> Self {
-        Self { g1, best: None, log: Vec::new(), hit_cap: false }
+        Self { g1, best: None, best_d: Vec::new(), log: Vec::new(), hit_cap: false }
     }
 
     /// Lays the patches on `laid`, logs the round and keeps it when it fits the scan better than the
     /// best so far (an equal share keeps the earlier, smaller one). Returns the distance of every
     /// sample and whether the round reached `min_within`.
-    fn add(&mut self, t: &Target, laid: Laid) -> (Vec<f64>, bool) {
+    fn add(&mut self, t: &Target, laid: &Laid) -> (Vec<f64>, bool) {
         let (round, d) = build_round(t, &laid.mesh, laid.budget, self.g1);
         let round = Round { partial: laid.partial, probes: laid.probes, clustered: laid.clustered, ..round };
         self.log.push(level_of(self.log.len() + 1, &round, laid.refined_vertices));
@@ -325,9 +334,17 @@ impl Run {
         self.best = match self.best.take() {
             Some(b) if !fits || b.deviation.within >= round.deviation.within => Some(b),
             None if !fits => None,
-            _ => Some(round),
+            _ => {
+                self.best_d.clone_from(&d);
+                Some(round)
+            }
         };
         (d, met && fits)
+    }
+
+    /// Share within the tolerance of the best round so far (0 before any).
+    fn best_within(&self) -> f64 {
+        self.best.as_ref().map_or(0.0, |b| b.deviation.within)
     }
 
     /// The best round, flagged as capped when the cap cut a round or stopped the refinement and the
@@ -384,7 +401,7 @@ fn uniform_over(t: &Target, run: &mut Run, raw: Mesh, budget: f64, last: usize) 
     let ends =
         (End { x: -(2.0 * budget).ln(), triangles: last }, End { x: -budget.ln(), triangles: raw.triangle_count() });
     if let Some(cut) = trimmed(t, raw, budget, 0)
-        && run.add(t, cut).1
+        && run.add(t, &cut).1
     {
         return None;
     }
@@ -419,7 +436,7 @@ fn uniform_rounds(t: &Target, g1: bool) -> CmdResult<Wrapped> {
         };
         let partial = laid.partial.is_some();
         last = laid.mesh.triangle_count();
-        let (_, met) = run.add(t, laid);
+        let (_, met) = run.add(t, &laid);
         if partial || met {
             break;
         }
@@ -462,18 +479,10 @@ struct Adaptive<'a> {
     last: usize,
 }
 
-/// The next adaptive round, bigger than the cap: first the round cut to the cap (see [`trimmed`]),
-/// then the number of worst missed vertices that get more detail is searched so that the mesh just
-/// fits; the better of the two is kept. Returns the second round, or `None` when there is none to
-/// build (the first met the tolerance, or no refinement fits).
-fn next_round_over(t: &Target, run: &mut Run, a: &Adaptive, raw: Mesh, budget: f64) -> Option<Laid> {
-    let raw_count = raw.triangle_count();
-    let all = refined_count(&raised(t, a.levels, a.ranked, a.ranked.len()));
-    if let Some(cut) = trimmed(t, raw, budget, all)
-        && run.add(t, cut).1
-    {
-        return None;
-    }
+/// The next adaptive round, bigger than the cap, with the number of worst missed vertices that get
+/// more detail searched so that the mesh just fits (`raw_count`: triangles of the round the
+/// budget asked for). `None` when no refinement fits.
+fn searched_round(t: &Target, a: &Adaptive, raw_count: usize, budget: f64) -> Option<Laid> {
     // the count rises steeply with the first vertices refined: the search runs on ln(1 + count)
     let ends = (End { x: 0.0, triangles: a.last }, End { x: (a.ranked.len() as f64).ln_1p(), triangles: raw_count });
     let levels_of = |x: f64| raised(t, a.levels, a.ranked, x.exp_m1().round() as usize);
@@ -506,52 +515,104 @@ fn first_round(t: &Target, raw: Mesh, budget: f64) -> (Mesh, f64) {
     if again.triangle_count() <= t.max_triangles { (again, coarser) } else { (raw, budget) }
 }
 
+/// The levels of the adaptive layout: those of the round being laid and of the last one.
+struct Levels {
+    now: Vec<u8>,
+    /// The levels of the last round (those the next round raises).
+    base: Vec<u8>,
+    /// Missed vertices that the next round is refined around, the worst first.
+    ranked: Vec<u32>,
+    /// Triangles of the last round.
+    last: usize,
+    /// Has a round already been cut to the cap after the first?
+    at_cap: bool,
+}
+
+/// The coarse mesh of an adaptive round and the triangles the reduction gave before any cut: the
+/// scan reduced with the levels, cut to the cap when it does not fit (the first round to the cap,
+/// a later one by the decimation, see [`trimmed`]; when that fails, the refinement that fits is
+/// searched for). `None` ends the rounds.
+fn lay_adaptive(t: &Target, lv: &Levels, round: usize, budget: &mut f64) -> CmdResult<Option<(Laid, usize)>> {
+    let mut raw = reduce_scan(t.scan, *budget, &scale_of(&lv.now));
+    if round == 1 {
+        (raw, *budget) = first_round(t, raw, *budget);
+    }
+    let (raw_count, refined_vertices) = (raw.triangle_count(), refined_count(&lv.now));
+    if raw_count <= t.max_triangles {
+        let laid = Laid { mesh: raw, budget: *budget, partial: None, probes: 0, refined_vertices, clustered: false };
+        return Ok(Some((laid, raw_count)));
+    }
+    if round == 1 {
+        return first_round_over(t, raw, *budget).map(|l| Some((l, raw_count)));
+    }
+    if let Some(cut) = trimmed(t, raw, *budget, refined_vertices) {
+        return Ok(Some((cut, raw_count)));
+    }
+    if lv.at_cap {
+        return Ok(None);
+    }
+    let a = Adaptive { levels: &lv.base, ranked: &lv.ranked, last: lv.last };
+    Ok(searched_round(t, &a, raw_count, *budget).map(|l| (l, raw_count)))
+}
+
+/// Has the best share within the tolerance risen by [`MIN_GAIN_AT_CAP`] since `before`?
+fn gained(run: &Run, before: f64) -> bool {
+    run.best_within() >= before + MIN_GAIN_AT_CAP
+}
+
+/// After a round cut to the cap that missed `min_within`: may the rounds go on at the cap? They
+/// may when it raised the best share by [`MIN_GAIN_AT_CAP`]. When it did not, and it is the first
+/// such round and not already the searched one, the refinement that just fits is searched for and
+/// built as well (the better round is kept) before the rounds end.
+fn go_on_at_cap(t: &Target, run: &mut Run, lv: &Levels, cut: (&Laid, usize), before: f64) -> bool {
+    if gained(run, before) {
+        return true;
+    }
+    let (laid, raw_count) = cut;
+    if !lv.at_cap && laid.probes == 0 {
+        let a = Adaptive { levels: &lv.base, ranked: &lv.ranked, last: lv.last };
+        if let Some(found) = searched_round(t, &a, raw_count, laid.budget) {
+            run.add(t, &found);
+        }
+    }
+    false
+}
+
 /// The adaptive layout: detail levels are raised around the scan points the patches miss, the
 /// coarse mesh is reduced again from the scan with the new levels. A round whose mesh would not
-/// fit `max_patches` is built with as many of the worst missed vertices refined as fit.
+/// fit `max_patches` is cut to it by the decimation; while such rounds gain at least
+/// [`MIN_GAIN_AT_CAP`] the rounds go on at the cap, the levels raised around the misses of the best
+/// round (see [`go_on_at_cap`] for what happens when the first one does not gain).
 fn adaptive_rounds(t: &Target, g1: bool) -> CmdResult<Wrapped> {
     let mut run = Run::new(g1);
-    let mut levels: Vec<u8> = vec![0; t.scan.positions.len()];
-    // the levels of the last round (those the next round raises)
-    let mut base = levels.clone();
-    let mut ranked: Vec<u32> = Vec::new();
-    let mut last = 0;
+    let n = t.scan.positions.len();
+    let mut lv = Levels { now: vec![0; n], base: vec![0; n], ranked: Vec::new(), last: 0, at_cap: false };
     let mut budget = ADAPTIVE_FIRST_BUDGET * t.tolerance;
     for round in 1..=ADAPTIVE_ROUNDS {
-        let mut raw = reduce_scan(t.scan, budget, &scale_of(&levels));
-        if round == 1 {
-            (raw, budget) = first_round(t, raw, budget);
+        let before = run.best_within();
+        let Some((laid, raw_count)) = lay_adaptive(t, &lv, round, &mut budget)? else { break };
+        let reason = laid.partial;
+        let (d, met) = run.add(t, &laid);
+        if reason == Some(PartialReason::FirstRoundOverCap) || (met && reason.is_none()) {
+            break;
         }
-        let laid = if raw.triangle_count() <= t.max_triangles {
-            Laid {
-                mesh: raw,
-                budget,
-                partial: None,
-                probes: 0,
-                refined_vertices: refined_count(&levels),
-                clustered: false,
-            }
-        } else if round == 1 {
-            first_round_over(t, raw, budget)?
-        } else {
+        if reason.is_some() {
             run.hit_cap = true;
-            let a = Adaptive { levels: &base, ranked: &ranked, last };
-            let Some(l) = next_round_over(t, &mut run, &a, raw, budget) else { break };
-            l
-        };
-        let partial = laid.partial.is_some();
-        last = laid.mesh.triangle_count();
-        let (d, met) = run.add(t, laid);
-        ranked = missed_vertices(t, &d);
-        if partial || met || ranked.is_empty() {
+            // at the cap a round costs no patches: it goes on while it gains, even past `min_within`
+            let go_on =
+                if met { gained(&run, before) } else { go_on_at_cap(t, &mut run, &lv, (&laid, raw_count), before) };
+            if !go_on {
+                break;
+            }
+            lv.at_cap = true;
+        }
+        lv.last = laid.mesh.triangle_count();
+        lv.ranked = missed_vertices(t, if lv.at_cap { &run.best_d } else { &d });
+        let next = raise_levels(t.scan, &lv.ranked, &lv.now, LEVEL_RINGS, MAX_LEVEL);
+        if lv.ranked.is_empty() || next == lv.now {
             break;
         }
-        let next = raise_levels(t.scan, &ranked, &levels, LEVEL_RINGS, MAX_LEVEL);
-        if next == levels {
-            break;
-        }
-        base = levels;
-        levels = next;
+        lv.base = std::mem::replace(&mut lv.now, next);
     }
     run.finish(t)
 }
