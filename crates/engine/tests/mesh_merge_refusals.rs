@@ -222,6 +222,12 @@ fn inputs_stay_and_one_undo_removes_the_merge() {
         assert_eq!(s.doc.mesh(id).unwrap().mesh.as_ref(), v, "scan {k} untouched");
     }
     assert!(s.doc.find_by_name("both").is_some());
+    // every number of the report is a finite number in the JSON (none became null)
+    assert!(out["checks"]["removed_worst"].is_f64() && out["checks"]["stacked_share"].is_f64());
+    for r in out["scans"].as_array().unwrap() {
+        let n = |k: &str| r[k].as_u64().unwrap();
+        assert_eq!(n("triangles"), n("kept") + n("restored") + n("collapsed") + n("removed"), "{r}");
+    }
     assert!(out["id"].is_u64());
     s.execute("edit.undo", json!({})).unwrap();
     assert_eq!(s.doc.summaries().len(), 2);

@@ -74,8 +74,10 @@ pub struct MergeScanOut {
     pub kept: usize,
     /// Removed (another scan keeps that surface), including the triangles left out (`dropped`).
     pub removed: usize,
-    /// Removed, then put back because the result had all their corners at exactly their places (pieces of one scan).
+    /// Removed, then put back: the result had all their corners at exactly their places (pieces of one scan), or the seam left them uncovered and they came back on the scan's own vertices.
     pub restored: usize,
+    /// Kept triangles a weld collapsed (two of their corners welded into one). `triangles = kept + restored + collapsed + removed`.
+    pub collapsed: usize,
     /// Triangles left out: exact duplicates, on an edge of three or more triangles, or wound against the rest of their piece.
     pub dropped: usize,
     /// Share of the scan's area within the tolerance of facing surface of another scan (0..1).
@@ -182,6 +184,8 @@ pub struct MergeChecksOut {
     pub moved_vertices: usize,
     /// Largest move (mm; at most a quarter of the tolerance and a tenth of the median edge).
     pub max_vertex_move: f64,
+    /// Welds undone because they would have flipped, folded or doubled a triangle.
+    pub welds_undone: usize,
     /// Triangles the merge added (seam, restored) that cross another triangle of the result.
     pub added_crossings: usize,
     /// Vertices of the result closer than 0.01 median edges to a vertex of another scan with no edge between them (copies of one point left unwelded).
@@ -435,6 +439,7 @@ fn scan_out(object: ObjectId, noise: Option<f64>, r: &surfacecraft_geom::merge::
         kept: r.kept,
         removed: r.removed,
         restored: r.restored,
+        collapsed: r.collapsed,
         dropped: r.dropped,
         overlap_share: r.overlap_share,
         area: r.area,
@@ -489,6 +494,7 @@ fn checks_out(r: &Report) -> MergeChecksOut {
         kept_vertices: c.kept_vertices,
         moved_vertices: c.moved_vertices,
         max_vertex_move: c.max_vertex_move,
+        welds_undone: c.welds_undone,
         added_crossings: c.added_crossings,
         unwelded_vertices: c.unwelded_vertices,
         stacked_share: c.stacked_share,
