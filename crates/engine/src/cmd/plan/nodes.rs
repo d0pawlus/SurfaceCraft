@@ -19,6 +19,17 @@ pub(super) fn radial_axial(p: &Point3, origin: Vec3, axis: Vec3) -> (f64, f64) {
     ((d - axis * t).norm(), t)
 }
 
+/// The smallest and the largest position of `pts` along the axis `(origin, axis)`.
+pub(super) fn axial_extent(pts: &[Point3], origin: Vec3, axis: Vec3) -> (f64, f64) {
+    let (mut t0, mut t1) = (f64::INFINITY, f64::NEG_INFINITY);
+    for p in pts {
+        let t = (p.coords - origin).dot(&axis);
+        t0 = t0.min(t);
+        t1 = t1.max(t);
+    }
+    (t0, t1)
+}
+
 /// One surface (a merged group of coplanar fragments is one node).
 pub(super) struct Node {
     pub(super) members: Vec<usize>,
