@@ -26,7 +26,7 @@ Legenda: ✅ jest · ◐ częściowo lub tylko na danych syntetycznych · ✗ br
 4. **Największe braki względem Geomagic/QuickSurface:** jakość automatycznego powierzchniowania na realnych
    skanach, praca na wielu skanach naraz, przekazanie drzewa cech do SolidWorks/Inventor, lata szlifu GUI.
 5. **Największe braki względem ScanRuler:** warstwa inspekcji (wymiary, GD&T, grubość ścianek, pomiar 2D),
-   auto-wyrównanie, parametry i wyrażenia, gwinty.
+   gwinty.
 
 ## Produkt i platforma
 
@@ -52,7 +52,7 @@ Legenda: ✅ jest · ◐ częściowo lub tylko na danych syntetycznych · ✗ br
 | Czyszczenie siatki | ✅ clean, dziury z zachowaniem krawędzi, wygładzanie, decymacja z mierzoną tolerancją, kopia robocza | ✅ + Rewrap, Defeature | ✅ | ✅ + wrap, boolean, shell, trim-to-scan |
 | Wyrównanie 3-2-1, N punktów, ICP, osie świata | ✅ | ✅ | ✅ | ✅ |
 | Lokalne ICP na regionie | ✅ | ✅ | ◐ | ✅ |
-| Auto-wyrównanie z samego skanu | ◐ `align.principal` (osie główne) | ✅ Quick Fit | ◐ closest axis | ✅ z podglądem |
+| Auto-wyrównanie z samego skanu | ✅ `align.auto` z podglądem propozycji (ściana bazowa, otwarty brzeg, część toczona) | ✅ Quick Fit | ◐ closest axis | ✅ z podglądem |
 | Regiony jako trwała encja + auto-segmentacja | ✅ (resegment, merge, split, insert, separate, enlarge, shrink) | ✅ | ◐ ekstrakcja z zaznaczenia | ◐ tylko regiony płaskie |
 | Prymitywy: płaszczyzna, walec, stożek, sfera, torus, symetria | ✅ z auto-typem po residuum | ✅ | ✅ | ✅ typ wybiera użytkownik |
 | Auto-więzy prymitywów | ✅ równoległość, prostopadłość, współosiowość, równe promienie, styczność, symetria, równe odległości | ✅ | ✅ | ✅ |

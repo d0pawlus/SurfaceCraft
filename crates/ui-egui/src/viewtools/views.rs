@@ -26,7 +26,8 @@ impl SurfaceCraftApp {
     }
     // ----------------------------------------------------- what the frame draws
 
-    /// Clip plane and the gizmo's preview motion for the frame, given the drawn items.
+    /// Clip plane and the preview motions for the frame (a gizmo drag, a proposed alignment), given
+    /// the drawn items.
     pub(crate) fn frame_overlay(&self, items: &[DisplayItem]) -> Overlay {
         let mut o = Overlay { clip: self.tools.section.world_plane(), models: Vec::new() };
         if self.tools.gizmo.dragging()
@@ -35,6 +36,10 @@ impl SurfaceCraftApp {
             for d in items.iter().filter(|d| d.id == id) {
                 o.models.push((d.key, self.tools.gizmo.matrix()));
             }
+        }
+        if let Some(p) = crate::align_proposal::current(self) {
+            // the scan in the pose auto-align proposes, until it is applied or dropped
+            o.models.extend(items.iter().filter(|d| p.objects.contains(&d.id)).map(|d| (d.key, p.matrix)));
         }
         o
     }
