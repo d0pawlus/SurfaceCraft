@@ -5,7 +5,7 @@ use super::geom::{V2, V3, add, cross, dot, scale, sub, unit};
 use super::reference::RefSample;
 use super::rows::{Layout, MIN_DATA, Sample, SideSamples};
 use super::start::{Interior, Loop, Pt, SideData};
-use super::{Continuity, G0_TARGET, G1_TARGET_DEG, G2_TARGET_REL, SideReport};
+use super::{Continuity, FEATURE_SPREAD, G0_TARGET, G1_TARGET_DEG, G2_TARGET_REL, SideReport};
 use crate::nurbs::SurfaceProbe;
 use crate::record::brep::Surface;
 use crate::vpatch::derivatives;
@@ -108,6 +108,17 @@ impl Measure {
                 .iter()
                 .zip(&self.rest_ok)
                 .all(|(s, rest)| s.soft || (*rest && !s.folded && s.gap_max <= G0_TARGET))
+    }
+
+    /// Every hard side is within its gap and angle targets and unfolded (the curvature aside).
+    pub fn g1_ok(&self, frozen: &[bool]) -> bool {
+        self.sides.iter().enumerate().all(|(k, s)| {
+            let lenient = frozen.get(k).copied().unwrap_or(false) && s.gap_max < 10.0 * G0_TARGET;
+            s.soft
+                || (!s.folded
+                    && (s.gap_max <= G0_TARGET || lenient)
+                    && s.angle_max_deg.is_none_or(|a| a <= G1_TARGET_DEG))
+        })
     }
 
     /// Whether the rounds can stop: every side within its targets and the interior on the patch,
@@ -248,6 +259,26 @@ struct SideAcc {
     angle_max: f64,
     curv_max: f64,
     folded: bool,
+    /// Sum, sum of squares and number of the reference curvatures across the side.
+    ref_sum: f64,
+    ref_squares: f64,
+    ref_count: usize,
+}
+
+/// Fewest samples a spread of the reference curvature is taken from.
+const MIN_SPREAD_SAMPLES: usize = 8;
+
+impl SideAcc {
+    /// Does the reference curvature across the side vary along it like a feature of the face?
+    fn feature_across(&self, floor: f64) -> bool {
+        if self.ref_count < MIN_SPREAD_SAMPLES {
+            return false;
+        }
+        let n = self.ref_count as f64;
+        let mean = self.ref_sum / n;
+        let spread = (self.ref_squares / n - mean * mean).max(0.0).sqrt();
+        spread > FEATURE_SPREAD * floor
+    }
 }
 
 /// Everything measured of one side.
@@ -292,11 +323,17 @@ fn sample_reference(
     if let Some(a) = unit(sub(away, scale(r.normal, dot(away, r.normal)))) {
         acc.folded |= dot(w, a) > FOLD_COS;
     }
+    let kappa_ref = r.curvature(w).filter(|k| k.is_finite());
+    if let Some(k) = kappa_ref {
+        acc.ref_sum += k;
+        acc.ref_squares += k * k;
+        acc.ref_count += 1;
+    }
     if sd.continuity == Continuity::G2 {
         let (d0, d1) = (smp.dir[0], smp.dir[1]);
         let sdd = add(add(scale(der[3], d0 * d0), scale(der[4], 2.0 * d0 * d1)), scale(der[5], d1 * d1));
         let kappa_patch = dot(sdd, r.normal) / dot(sd_vec, sd_vec);
-        if let Some(kappa_ref) = r.curvature(w) {
+        if let Some(kappa_ref) = kappa_ref {
             let rel = (kappa_patch - kappa_ref).abs() / kappa_ref.abs().max(cx.floor);
             if rel.is_finite() {
                 acc.curv_max = acc.curv_max.max(rel);
@@ -338,11 +375,11 @@ fn measure_side(
             slabs.add(f, miss);
         }
     }
-    Ok(finish_side(sd, ss, &acc, feet))
+    Ok(finish_side(sd, ss, &acc, feet, cx.floor))
 }
 
 /// The report and the terms of one side from the maxima of its samples.
-fn finish_side(sd: &SideData, ss: &SideSamples, acc: &SideAcc, feet: Vec<V2>) -> SideResult {
+fn finish_side(sd: &SideData, ss: &SideSamples, acc: &SideAcc, feet: Vec<V2>, floor: f64) -> SideResult {
     let g1 = sd.continuity != Continuity::G0;
     let g2 = sd.continuity == Continuity::G2;
     let rest_ok = (!g1 || acc.angle_max <= G1_TARGET_DEG) && (!g2 || acc.curv_max <= G2_TARGET_REL) && !acc.folded;
@@ -359,6 +396,7 @@ fn finish_side(sd: &SideData, ss: &SideSamples, acc: &SideAcc, feet: Vec<V2>) ->
         folded: acc.folded,
         snap_max: sd.snap,
         met: sd.soft || (rest_ok && acc.gap_max <= G0_TARGET),
+        feature_across: g1 && acc.feature_across(floor),
     };
     SideResult {
         report,
