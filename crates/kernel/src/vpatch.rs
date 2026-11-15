@@ -634,8 +634,12 @@ pub fn solve_cancellable(p: &Problem, cancel: &Cancel) -> Result<Solution> {
     let fairness = p.fairness;
     let tr_k3: f64 = (0..nn).filter_map(|i| variation.get((i, i))).sum();
     if fairness > 0.0 && tr_k3 > 0.0 && tr_scale > 0.0 && lambda > 0.0 {
-        let lambda3 = fairness * tr_scale / (3.0 * tr_k3);
-        kmat += variation * (lambda3 / lambda);
+        // relative to the bending weight, which `stiffness` applies to the sum
+        let ratio = fairness * tr_scale / (3.0 * tr_k3) / lambda;
+        if !ratio.is_finite() {
+            return Err(arg("the fairness weight is not finite against the smoothing"));
+        }
+        kmat += variation * ratio;
     }
     let h_s = stiffness(&soft.a, &kmat, lambda, &inactive);
     let mut hard_rows: Vec<LinRow> = Vec::new();

@@ -660,3 +660,59 @@ fn the_largest_accepted_net_solves_within_the_bound() {
     );
     assert!(took <= 1.5 * MAX_SOLVE_SECONDS, "took {took:.1} s against an estimate of {est:.1} s");
 }
+
+/// A paraboloid over the unit square: its curvature is constant, its third derivatives vanish.
+fn bowl(uv: [f64; 2]) -> [f64; 3] {
+    [uv[0], uv[1], 0.2 * (uv[0] * uv[0] + uv[1] * uv[1])]
+}
+
+fn bowl_problem(fairness: f64) -> Problem {
+    let mut data = Vec::new();
+    for i in 0..30 {
+        for j in 0..30 {
+            let uv = [i as f64 / 29.0, j as f64 / 29.0];
+            data.push(DataPoint { uv, at: bowl(uv), weight: 1.0 });
+        }
+    }
+    Problem {
+        domain: UNIT,
+        control: [8, 8],
+        hard: Vec::new(),
+        soft: Vec::new(),
+        data,
+        outline: Vec::new(),
+        smoothing: 1e-3,
+        fairness,
+    }
+}
+
+#[test]
+fn the_curvature_variation_energy_leaves_a_quadratic_shape_alone() {
+    // a heavy weight costs nothing on a shape without third derivatives: the paraboloid is
+    // reproduced at least as closely as without it (measured 5e-7 against 3e-6, the bias of the
+    // bending term, which the heavier energy outweighs)
+    let off = solve(&bowl_problem(0.0)).unwrap();
+    let on = solve(&bowl_problem(100.0)).unwrap();
+    let miss = |s: &Solution| {
+        (0..=10)
+            .flat_map(|i| (0..=10).map(move |j| [0.05 + 0.09 * f64::from(i), 0.05 + 0.09 * f64::from(j)]))
+            .map(|uv| {
+                let (p, q) = (sample(&s.surface, uv), bowl(uv));
+                ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt()
+            })
+            .fold(0.0_f64, f64::max)
+    };
+    eprintln!("MEASURED bowl: miss {:.2e} without the energy, {:.2e} with weight 100", miss(&off), miss(&on));
+    assert!(miss(&on) <= 1e-3, "{}", miss(&on));
+}
+
+#[test]
+fn hostile_fairness_is_refused() {
+    for bad in [f64::NAN, f64::INFINITY, -1.0, 1e300] {
+        assert!(solve(&bowl_problem(bad)).is_err(), "{bad}");
+    }
+    // a weight that overflows against a vanishing smoothing is an error, not a NaN matrix
+    let mut p = bowl_problem(1e40);
+    p.smoothing = 1e-300;
+    assert!(solve(&p).is_err());
+}
