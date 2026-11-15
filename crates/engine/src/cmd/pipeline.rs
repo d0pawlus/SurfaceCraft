@@ -249,6 +249,11 @@ pub(super) fn coverage_issue(d: &DeviationSummary, what: &str) -> Option<Issue> 
     Some(issue("low_coverage", msg))
 }
 
+/// Why a loop is counted in `fill_inside_out`.
+const FILL_INSIDE_OUT_WHY: &str = "the fill would have closed the scan inside out: the scanned face would point into the volume the patch encloses, so the solid would be the space in front of the scanned surface. Such a loop is the open edge of a sheet, not a hole: the sheet was scanned from its hollow side, or its normals are stored inward";
+/// What to do about a loop counted in `fill_inside_out`.
+const FILL_INSIDE_OUT_ADVICE: &str = "check which way the scan's normals face (flip them if they point into the part), then model it as a sheet or give it a `thickness` for a solid; `mesh.fill_holes` with `allow_inward: true` caps it anyway (e.g. for a mould)";
+
 /// The issues of the holes left open: `scan_defects` for those too large to fill, `fill_inside_out` for the
 /// loops whose fill would have closed the scan inside out (see `mesh.clean`): a larger fill limit does not
 /// help those, so `scan_defects` (and its offer of `mesh.fill_holes`) counts only the others.
@@ -260,7 +265,7 @@ pub(super) fn defects_issue(left: usize, inward: usize) -> Vec<Issue> {
     }
     if inward > 0 {
         let msg = format!(
-            "{inward} boundary loops of the scan were not filled: the fill would have closed the scan inside out (the scanned face would point into the volume the patch encloses, so the solid would be the space in front of the scanned surface); such a loop is the open edge of a sheet, not a hole: either the sheet was scanned from its hollow side or its normals are stored inward. The scan is modelled as a sheet; check which way its normals face (flip them if they point into the part) and give it a `thickness` for a solid"
+            "{inward} boundary loops of the scan were not filled: {FILL_INSIDE_OUT_WHY}. What to do: {FILL_INSIDE_OUT_ADVICE}"
         );
         list.push(issue("fill_inside_out", msg));
     }
@@ -630,6 +635,30 @@ mod coverage_tests {
         assert_eq!(code(0.05, 0.95), "scan_inside_out");
         assert_eq!(code(0.10, 0.90), "scan_inside_out");
         assert_eq!(code(0.20, 0.80), "inconsistent_orientation");
+    }
+
+    fn defect_codes(left: usize, inward: usize) -> Vec<String> {
+        defects_issue(left, inward).into_iter().map(|i| i.code).collect()
+    }
+
+    #[test]
+    fn holes_left_open_are_scan_defects_unless_their_fill_would_close_the_scan_inside_out() {
+        assert!(defect_codes(0, 0).is_empty());
+        assert_eq!(defect_codes(3, 0), ["scan_defects"]);
+        assert_eq!(defect_codes(1, 1), ["fill_inside_out"]);
+        assert_eq!(defect_codes(4, 1), ["scan_defects", "fill_inside_out"]);
+        let both = defects_issue(4, 1);
+        assert!(both[0].message.starts_with("3 holes"), "{}", both[0].message);
+        assert!(both[1].message.starts_with("1 boundary loops") && both[1].message.contains("allow_inward"));
+    }
+
+    #[test]
+    fn more_inward_loops_than_holes_left_count_as_the_holes_left() {
+        // a report can never have more inward loops than holes left; if it did, nothing is invented
+        let list = defects_issue(2, 5);
+        assert_eq!(list.iter().map(|i| i.code.as_str()).collect::<Vec<_>>(), ["fill_inside_out"]);
+        assert!(list[0].message.starts_with("2 boundary loops"), "{}", list[0].message);
+        assert!(defects_issue(0, 5).is_empty());
     }
 
     #[test]

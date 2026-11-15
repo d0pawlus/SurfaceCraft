@@ -136,7 +136,15 @@ pub(super) fn run(s: &mut Session, set: &Settings, i: &ToSolidIn) -> CmdResult<T
     let scan_triangles = s.doc.mesh(set.scan).map_or(0, |m| m.mesh.triangle_count());
     let fill_up_to = limit.min(rim.saturating_sub(1));
     if rim > 0 && fill_up_to > 0 {
-        let edit = fill(s, FillIn { object: ObjRef::Id(set.scan.0), max_edges: Some(fill_up_to), smooth: Some(true) })?;
+        let edit = fill(
+            s,
+            FillIn {
+                object: ObjRef::Id(set.scan.0),
+                max_edges: Some(fill_up_to),
+                smooth: Some(true),
+                allow_inward: None,
+            },
+        )?;
         report.holes_filled += edit.holes_filled.unwrap_or(0);
         report.holes_left = edit.holes_left.unwrap_or(report.holes_left);
         report.triangles = edit.triangles;

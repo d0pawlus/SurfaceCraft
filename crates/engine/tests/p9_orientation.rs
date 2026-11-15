@@ -230,3 +230,41 @@ fn a_closed_scan_stored_inside_out_with_a_small_hole_is_still_reported_inside_ou
     assert!(codes.iter().any(|c| c == "scan_inside_out"), "{codes:?}: {out}");
     assert_eq!(out["scan_report"]["holes_left"], 0, "{}", out["scan_report"]);
 }
+
+/// `mesh.clean` and `mesh.fill_holes` leave the rim of a hollow dish open and say so; `mesh.fill_holes`
+/// caps it when asked (`allow_inward`, e.g. for a mould).
+#[test]
+fn the_fill_commands_report_the_rim_they_leave_open_and_cap_it_on_request() {
+    let large = 10 * DISH_RIM_EDGES;
+    for (command, params) in [
+        ("mesh.clean", json!({"object": "scan", "fill_holes_max_edges": large})),
+        ("mesh.fill_holes", json!({"object": "scan", "max_edges": large})),
+    ] {
+        // Arrange
+        let mut s = Session::new();
+        s.doc.add_mesh("scan", dish(true));
+
+        // Act
+        let out = s.execute(command, params).unwrap();
+
+        // Assert
+        assert_eq!(
+            (out["holes_filled"].as_u64(), out["holes_inward"].as_u64()),
+            (Some(0), Some(1)),
+            "{command}: {out}"
+        );
+        assert_eq!(out["holes_left"], 1, "{command}: {out}");
+    }
+
+    // Arrange
+    let mut s = Session::new();
+    s.doc.add_mesh("scan", dish(true));
+
+    // Act
+    let out =
+        s.execute("mesh.fill_holes", json!({"object": "scan", "max_edges": large, "allow_inward": true})).unwrap();
+
+    // Assert
+    assert_eq!((out["holes_filled"].as_u64(), out["holes_inward"].as_u64()), (Some(1), Some(0)), "{out}");
+    assert_eq!(out["holes_left"], 0, "{out}");
+}

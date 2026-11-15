@@ -6,19 +6,20 @@
 //! clearly negative volume, the scanned face points into what was enclosed: the patches cap the
 //! space in front of the scanned face, and every scan point would face away from the solid. The
 //! mesh cannot tell why: an open sheet seen from its hollow side, or a sheet whose normals were
-//! stored inward; either way the loop is its open edge, not a hole, and the closed solid would be
-//! invented material. Such a fill is
-//! refused when the patches are a large share of the piece: they invent a face rather than repair a
-//! hole. A closed scan stored inside out with small holes is still filled (its patches are small),
-//! so that it is still told to be inside out, not left open.
+//! stored inward; either way a loop whose patch alone is a large share of the piece is an open edge,
+//! not a hole, and its patch would invent material. Every such loop of an inside-out piece is
+//! refused, so no open edge is capped on one side and left open on the other (a tube's two ends).
+//! Smaller patches repair holes and are added: a closed scan stored inside out with small holes,
+//! however many, is filled, so that it is still told to be inside out, not left open.
 use super::Patch;
+use super::patch::volume_and_area;
 use crate::{Mesh, Point3};
 use std::collections::{HashMap, HashSet};
 
-/// The patches that close a piece inside out are refused when their area is at least this share of
-/// the area of the piece's own triangles. A hole in a scan is a few percent of it; the cap over the
-/// open edge of a sheet is about as large as the sheet's outline (about 90 % for the square cap of a
-/// sphere in the tests).
+/// A loop of a piece its patches would close inside out is refused when its own patch is at least
+/// this share of the area of the piece's own triangles. A hole in a scan is a few percent of it;
+/// the cap over the open edge of a sheet is about as large as the sheet's outline (about 90 % for
+/// the square cap of a sphere in the tests).
 const INWARD_PATCH_SHARE: f64 = 0.25;
 
 /// A closed piece whose six-fold volume is below this share of its area to the power 3/2 is a
@@ -51,42 +52,12 @@ fn vertex_pieces(mesh: &Mesh) -> Vec<u32> {
     (0..parent.len() as u32).map(|v| find(&mut parent, v)).collect()
 }
 
-/// Six times the signed volume of the tetrahedron from `o` over the triangle, and the triangle's area.
-fn volume_and_area(o: Point3, [a, b, c]: [Point3; 3]) -> (f64, f64) {
-    let (a, b, c) = (a - o, b - o, c - o);
-    (a.dot(&b.cross(&c)), 0.5 * (b - a).cross(&(c - a)).norm())
-}
-
-impl Patch {
-    /// The position of workspace vertex `v`: a mesh vertex or one of the patch's own.
-    fn point(&self, mesh: &Mesh, v: u32) -> Option<Point3> {
-        let base = self.origin.len() as u32;
-        match self.origin.get(v as usize) {
-            Some(&m) if v < base => mesh.positions.get(m as usize).copied(),
-            _ => self.positions.get((v - base) as usize).copied(),
-        }
-    }
-
-    /// Six times the signed volume over `o` and the area of the patch's triangles.
-    fn volume_and_area(&self, mesh: &Mesh, o: Point3) -> (f64, f64) {
-        self.triangles.iter().fold((0.0, 0.0), |(v, a), t| {
-            let corners = [self.point(mesh, t[0]), self.point(mesh, t[1]), self.point(mesh, t[2])];
-            match corners {
-                [Some(p), Some(q), Some(r)] => {
-                    let (dv, da) = volume_and_area(o, [p, q, r]);
-                    (v + dv, a + da)
-                }
-                _ => (v, a),
-            }
-        })
-    }
-}
-
 /// For every loop of `todo` (whose patches are `patches`): is it left open because, with all the
-/// patches in, its piece would be closed inside out by patches that are a large share of it (see the
-/// module)? Of such a piece only the loop with the largest patch is refused; the piece then stays
-/// open and its other holes are filled. A piece with a loop in `left` (not filled) stays open and is
-/// not judged. The mesh is valid.
+/// patches in, its piece would be closed inside out, and its own patch is a large share of the piece
+/// (see the module)? A piece with a loop in `left` (not filled) stays open and is not judged. The
+/// judgement takes every patch of the piece as added; one that `append_if_admitted` drops later would
+/// leave the piece open anyway, so the only effect is a large patch refused on a piece that was not
+/// going to close: conservative, never an inside-out solid. The mesh is valid.
 pub(super) fn refused(mesh: &Mesh, todo: &[Vec<u32>], patches: &[Patch], left: &[Vec<u32>]) -> Vec<bool> {
     let mut refused = vec![false; todo.len()];
     let piece = vertex_pieces(mesh);
@@ -119,35 +90,65 @@ pub(super) fn refused(mesh: &Mesh, todo: &[Vec<u32>], patches: &[Patch], left: &
         *s = (s.0 + dv, s.1 + da);
     }
     for (p, ks) in &loops_of {
-        let (Some(&o), Some(&(mut volume, scan_area))) = (reference.get(p), sums.get(p)) else { continue };
-        let mut patch_area = 0.0;
-        let mut largest: Option<(f64, usize)> = None;
-        for &k in ks {
-            let Some(patch) = patches.get(k) else { continue };
-            let (dv, da) = patch.volume_and_area(mesh, o);
-            volume += dv;
-            patch_area += da;
-            if largest.is_none_or(|(a, _)| da > a) {
-                largest = Some((da, k));
-            }
+        let (Some(&o), Some(&(volume, scan_area))) = (reference.get(p), sums.get(p)) else { continue };
+        let measured: Vec<(usize, f64, f64)> = ks
+            .iter()
+            .filter_map(|&k| patches.get(k).map(|patch| (k, patch.volume_and_area(mesh, o))))
+            .map(|(k, (dv, da))| (k, dv, da))
+            .collect();
+        if !inside_out(volume, scan_area, &measured) {
+            continue;
         }
-        let enclosed = volume.abs() > NO_VOLUME_SHARE * (scan_area + patch_area).powf(1.5);
-        let inward = volume < 0.0 && enclosed;
-        if inward
-            && patch_area >= INWARD_PATCH_SHARE * scan_area
-            && let Some((_, k)) = largest
-            && let Some(slot) = refused.get_mut(k)
-        {
-            *slot = true;
+        for &(k, _, area) in &measured {
+            if area >= INWARD_PATCH_SHARE * scan_area
+                && let Some(slot) = refused.get_mut(k)
+            {
+                *slot = true;
+            }
         }
     }
     refused
 }
 
+/// Whether a piece of six-fold volume `volume` and area `scan_area` (its own triangles), closed by
+/// patches of six-fold volumes and areas `(_, volume, area)`, encloses a volume clearly below zero.
+/// A volume that is not a number is not judged.
+fn inside_out(volume: f64, scan_area: f64, patches: &[(usize, f64, f64)]) -> bool {
+    let closed = volume + patches.iter().map(|p| p.1).sum::<f64>();
+    let area = scan_area + patches.iter().map(|p| p.2).sum::<f64>();
+    closed < 0.0 && closed.abs() > NO_VOLUME_SHARE * area.powf(1.5)
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::holes::{boundary_loops, fill_holes};
+    use crate::holes::{boundary_loops, fill_holes, fill_holes_allowing_inward};
     use crate::{Mesh, Point3, Vec3, synth};
+
+    fn reversed(mut m: Mesh) -> Mesh {
+        m.triangles.iter_mut().for_each(|t| t.swap(1, 2));
+        m
+    }
+
+    fn signed_volume(m: &Mesh) -> f64 {
+        (0..m.triangle_count())
+            .filter_map(|i| m.triangle(i))
+            .map(|[a, b, c]| a.coords.dot(&b.coords.cross(&c.coords)))
+            .sum()
+    }
+
+    /// Keeps the triangles whose centroid `keep` accepts.
+    fn kept(m: &Mesh, keep: impl Fn(Point3) -> bool) -> Mesh {
+        let ids: Vec<u32> =
+            (0..m.triangle_count() as u32).filter(|&t| m.face_centroid(t as usize).is_some_and(&keep)).collect();
+        m.submesh(&ids)
+    }
+
+    /// A ball of radius 15 stored inside out (normals toward the centre).
+    fn ball_inside_out() -> Mesh {
+        let ball = synth::sphere(Point3::origin(), 15.0, 48, 24);
+        assert!(signed_volume(&ball) > 0.0);
+        reversed(ball)
+    }
 
     /// A square cap of a sphere of radius 30, normals away from the centre (seen from its convex
     /// side) or, `hollow`, into the hollow (seen from inside, as a scanner looking into a dish).
@@ -228,5 +229,113 @@ mod tests {
         // Assert
         assert_eq!((rep.filled, rep.inward), (1, 0));
         assert!(boundary_loops(&ball).is_empty());
+    }
+
+    /// Twelve holes of about 3 % of a ball stored inside out each, 36 % in all: every one repairs a
+    /// hole, so all are filled and the closed scan is still inside out (none is left open on its own).
+    #[test]
+    fn many_small_holes_of_a_ball_stored_inside_out_are_all_filled() {
+        // Arrange: discs around the vertices of an icosahedron, well apart
+        let g = (1.0 + 5f64.sqrt()) / 2.0;
+        let mut centres = Vec::new();
+        for (a, b) in [(1.0, g), (-1.0, g), (1.0, -g), (-1.0, -g)] {
+            centres.extend([Vec3::new(0.0, a, b), Vec3::new(a, b, 0.0), Vec3::new(b, 0.0, a)]);
+        }
+        let centres: Vec<Point3> = centres.iter().map(|c| Point3::from(c.normalize() * 15.0)).collect();
+        let mut ball = kept(&ball_inside_out(), |c| centres.iter().all(|h| (c - h).norm() > 5.2));
+        assert_eq!(boundary_loops(&ball).len(), 12);
+
+        // Act
+        let rep = fill_holes(&mut ball, 1000, true);
+
+        // Assert
+        assert_eq!((rep.filled, rep.inward), (12, 0));
+        assert!(boundary_loops(&ball).is_empty());
+        assert!(signed_volume(&ball) < 0.0, "still inside out, to be reported so");
+    }
+
+    /// A tube stored inside out, both ends about a third of its side: both ends stay open, neither is
+    /// capped alone.
+    #[test]
+    fn both_ends_of_a_tube_stored_inside_out_stay_open() {
+        // Arrange
+        let tube = synth::cylinder(Point3::origin(), Vec3::z(), 10.0, 15.0, 48, 12);
+        let mut capped = tube.clone();
+        fill_holes_allowing_inward(&mut capped, 1000, false);
+        let mut tube = if signed_volume(&capped) > 0.0 { reversed(tube) } else { tube };
+        let before = tube.clone();
+
+        // Act
+        let rep = fill_holes(&mut tube, 1000, true);
+
+        // Assert
+        assert_eq!((rep.filled, rep.skipped, rep.inward), (0, 2, 2));
+        assert_eq!(tube, before);
+    }
+
+    /// A ball stored inside out with a hole of about 30 % of it: that patch would invent as much as a
+    /// sheet's cap, so it is refused and counted in `inward` (the caller reports it).
+    #[test]
+    fn a_hole_of_a_third_of_a_ball_stored_inside_out_is_refused_and_counted() {
+        // Arrange
+        let mut ball = kept(&ball_inside_out(), |c| c.z < 6.0);
+        assert_eq!(boundary_loops(&ball).len(), 1);
+
+        // Act
+        let rep = fill_holes(&mut ball, 1000, true);
+
+        // Assert
+        assert_eq!((rep.filled, rep.inward), (0, 1));
+        assert_eq!(boundary_loops(&ball).len(), 1);
+    }
+
+    /// Two pieces in one mesh are judged each on its own.
+    #[test]
+    fn a_hollow_and_a_convex_dish_in_one_mesh_are_judged_apart() {
+        // Arrange
+        let mut both = dish(true);
+        let convex = dish(false);
+        let offset = both.positions.len() as u32;
+        both.positions.extend(convex.positions.iter().map(|p| p + Vec3::new(100.0, 0.0, 0.0)));
+        both.triangles.extend(convex.triangles.iter().map(|t| t.map(|v| v + offset)));
+
+        // Act
+        let rep = fill_holes(&mut both, 1000, true);
+
+        // Assert
+        assert_eq!((rep.filled, rep.inward), (1, 1));
+        let left = boundary_loops(&both);
+        assert_eq!(left.len(), 1);
+        assert!(left[0].iter().all(|&v| v < offset), "the hollow dish keeps its rim");
+    }
+
+    /// A caller who wants the cap (a mould of the dish) gets it.
+    #[test]
+    fn the_rim_of_a_hollow_dish_is_capped_when_inward_fills_are_allowed() {
+        // Arrange
+        let mut m = dish(true);
+
+        // Act
+        let rep = fill_holes_allowing_inward(&mut m, 1000, true);
+
+        // Assert
+        assert_eq!((rep.filled, rep.inward), (1, 0));
+        assert!(boundary_loops(&m).is_empty());
+    }
+
+    /// Positions that are not numbers or that all coincide never panic and are never judged inward.
+    #[test]
+    fn hostile_positions_are_not_judged_inward() {
+        let mut nan = dish(true);
+        nan.positions[300] = Point3::new(f64::NAN, 0.0, f64::INFINITY);
+        let mut point = dish(true);
+        point.positions.iter_mut().for_each(|p| *p = Point3::origin());
+        for (name, mut m) in [("nan", nan), ("point", point)] {
+            // Act
+            let rep = fill_holes(&mut m, 1000, true);
+
+            // Assert
+            assert_eq!(rep.inward, 0, "{name}");
+        }
     }
 }

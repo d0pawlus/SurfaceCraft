@@ -279,7 +279,8 @@ kernel refuses sheets of many faces. Give the wall thickness instead:
 - `skipped_inputs`: a primitive could not be built in; `modelled[].skipped` says why.
 - `low_coverage`: part of the scan has no face (it lies farther than 5 mm from the solid). Look at
   `left_out` and at `unassigned_triangles`.
-- `scan_inside_out`: more than 90 % of the scan points face away from the solid, so the normals of the scan point inward (the solid is turned outward by the kernel). Flip the normals of the scan and run again. (An open scan is not closed inside out by the hole filling: see `fill_inside_out`.)
+- `scan_inside_out`: more than 90 % of the scan points face away from the solid, so the normals of the scan point inward (the solid is turned outward by the kernel). Flip the normals of the scan and run again.
+  The hole filling does not close an open scan inside out: see `fill_inside_out`.
 - `inconsistent_orientation`: at least half of the missing coverage is points that lie on the solid, but a share (`not_facing` in `deviation`) of its points
   face away from it, so the solid is inside out or has faces turned the wrong way. This is a defect
   of the solid, not a part of the scan it misses. It is a verdict of `fail`. A part not much
@@ -339,14 +340,19 @@ kernel refuses sheets of many faces. Give the wall thickness instead:
   points of the file.
 - `scan_defects`: holes too large to fill; `mesh.fill_holes` with a larger `max_edges` (it drops
   the regions), then `scan.to_solid` again without `reuse_regions`.
-- `fill_inside_out`: boundary loops that were not filled because the fill would have closed the scan
-  inside out: the scanned face would point into the volume the patch encloses, so the solid would be
-  the space in front of the scanned surface. Such a loop is the open edge of a sheet, not a hole:
-  either the sheet was scanned from its hollow side or its normals are stored inward (the mesh
-  cannot tell which). A larger `fill_holes_max_edges` does not change it (`mesh.fill_holes` refuses
-  it too, `holes_inward` in its result). The scan is modelled as a sheet; check which way its
-  normals face (flip them if they point into the part) before choosing the sign of `thickness`. Small holes of a closed scan stored inside
-  out are still filled, and that scan is still reported as `scan_inside_out`.
+- `fill_inside_out`: boundary loops that were not filled because the fill would have closed the
+  scan inside out: the scanned face would point into the volume the patch encloses, so the solid
+  would be the space in front of the scanned surface. Such a loop is the open edge of a sheet, not
+  a hole: the sheet was scanned from its hollow side, or its normals are stored inward (the mesh
+  cannot tell which). Only a loop whose own patch is at least a quarter of the scan's area is
+  refused; smaller holes are filled, so a closed scan stored inside out with small holes, however
+  many, is still filled and reported as `scan_inside_out`. A larger `fill_holes_max_edges` does
+  not change it. With method `freeform` or `hybrid` the scan is then wrapped as a sheet (`review`
+  with `open_surface`); with method `primitives` the solid is built from the fitted primitives as
+  before and the issue is context. Check which way the normals face (flip them if they point into
+  the part) before choosing the sign of `thickness`. To cap such a loop anyway (a mould of a dish),
+  run `mesh.fill_holes` with `allow_inward: true`; by default it refuses it too and counts it in
+  `holes_inward`.
 
 ## Messy scans: parts, handles, shells
 

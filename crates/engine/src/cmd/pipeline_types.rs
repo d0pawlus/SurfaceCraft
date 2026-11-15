@@ -46,7 +46,7 @@ pub struct ScanSummary {
     pub holes_left: usize,
     /// Of the holes left, those whose fill would have closed the scan inside out: the open edge of a sheet, not a
     /// hole (see `mesh.clean`).
-    #[serde(default, skip_serializing_if = "is_zero")]
+    #[serde(default)]
     pub holes_inward: usize,
     /// Edges shared by three or more triangles, after cleaning.
     pub non_manifold_edges: usize,
@@ -181,8 +181,4 @@ pub struct ToSolidOut {
     /// How many faces of the body are on an analytic surface and their share of its area (method `hybrid`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analytic: Option<super::hybrid_method::AnalyticSummary>,
-}
-
-fn is_zero(n: &usize) -> bool {
-    *n == 0
 }

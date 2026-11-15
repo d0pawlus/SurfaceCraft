@@ -6,6 +6,8 @@ use crate::{Mesh, Point3, Vec3, par, tri};
 use std::collections::{HashMap, HashSet};
 
 mod inward;
+mod patch;
+use patch::Patch;
 
 /// Closed boundary loops as vertex lists, each in the direction of its triangles' edges.
 #[must_use]
@@ -97,29 +99,43 @@ const WORKSPACE_RINGS: usize = 3;
 /// filled as the simple loops it is made of, a diagonal that is an edge of the mesh already is
 /// avoided, and a patch that would still overload an edge (with the mesh or with another patch) is
 /// not added; that hole stays open and is counted in `skipped`. Nor does a fill close a piece of the
-/// mesh inside out with patches that are a large share of it (`inward`, see `holes::inward`): of such
-/// a piece the loop with the largest patch stays open.
+/// mesh inside out: of a piece its patches would close with the scanned face inward, every loop
+/// whose own patch is a large share of the piece stays open (`inward`, see `holes::inward`).
 pub fn fill_holes(mesh: &mut Mesh, max_edges: usize, smooth: bool) -> FillReport {
     fill_holes_with(mesh, max_edges, smooth, smooth)
+}
+
+/// [`fill_holes`] that also caps the loops it would refuse as closing their piece inside out, for a
+/// caller who wants that cap (a mould of a dish): the report's `inward` stays 0.
+pub fn fill_holes_allowing_inward(mesh: &mut Mesh, max_edges: usize, smooth: bool) -> FillReport {
+    fill_holes_filtered(mesh, max_edges, (smooth, smooth), Guard::AllowInward, &|_, _| true)
+}
+
+/// Whether a fill may close a piece of the mesh inside out (see `holes::inward`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Guard {
+    RefuseInward,
+    AllowInward,
 }
 
 /// [`fill_holes`], with the keeping of sharp edges (`sharpen`, only with `smooth`) on its own
 /// switch.
 pub(crate) fn fill_holes_with(mesh: &mut Mesh, max_edges: usize, smooth: bool, sharpen: bool) -> FillReport {
-    fill_holes_filtered(mesh, max_edges, smooth, sharpen, &|_, _| true)
+    fill_holes_filtered(mesh, max_edges, (smooth, sharpen), Guard::RefuseInward, &|_, _| true)
 }
 
 /// Fills the holes of at most `max_edges` edges whose loop (vertex indices) `accept` approves, flat
 /// (no fairing): the edge count alone says nothing about the size of a hole on a fine or coarse mesh.
 pub fn fill_holes_where(mesh: &mut Mesh, max_edges: usize, accept: &dyn Fn(&Mesh, &[u32]) -> bool) -> FillReport {
-    fill_holes_filtered(mesh, max_edges, false, false, accept)
+    fill_holes_filtered(mesh, max_edges, (false, false), Guard::RefuseInward, accept)
 }
 
+/// The fill behind the public variants: `(smooth, sharpen)` as in [`fill_holes_with`].
 pub(crate) fn fill_holes_filtered(
     mesh: &mut Mesh,
     max_edges: usize,
-    smooth: bool,
-    sharpen: bool,
+    (smooth, sharpen): (bool, bool),
+    guard: Guard,
     accept: &dyn Fn(&Mesh, &[u32]) -> bool,
 ) -> FillReport {
     let mut rep = FillReport::default();
@@ -137,7 +153,10 @@ pub(crate) fn fill_holes_filtered(
     // a single hole stays on this thread (the crease tests read a thread-local reason)
     let patches: Vec<Patch> =
         if todo.len() < 2 { todo.iter().map(fill).collect() } else { par::map_slice(&todo, fill) };
-    let refused = inward::refused(mesh, &todo, &patches, &long);
+    let refused = match guard {
+        Guard::RefuseInward => inward::refused(mesh, &todo, &patches, &long),
+        Guard::AllowInward => vec![false; todo.len()],
+    };
     drop(long);
     for ((lp, patch), refused) in todo.iter().zip(patches).zip(refused) {
         if refused {
@@ -305,34 +324,6 @@ impl VertexFaces {
     fn of(&self, v: u32) -> &[u32] {
         let (a, b) = (self.start[v as usize] as usize, self.start[v as usize + 1] as usize);
         &self.faces[a..b]
-    }
-}
-
-/// What filling one hole added, in the vertex numbers of its workspace.
-struct Patch {
-    /// Mesh vertex of every workspace vertex that was in the mesh.
-    origin: Vec<u32>,
-    /// New vertices (workspace numbers from `origin.len()` on).
-    positions: Vec<Point3>,
-    /// New triangles.
-    triangles: Vec<[u32; 3]>,
-}
-
-impl Patch {
-    /// The triangles in the numbers of a mesh whose next new vertex is `first`.
-    fn mapped(&self, first: u32) -> Vec<[u32; 3]> {
-        let base = self.origin.len() as u32;
-        let map = |v: u32| match self.origin.get(v as usize) {
-            Some(&m) if v < base => m,
-            _ => first + (v - base),
-        };
-        self.triangles.iter().map(|t| t.map(map)).collect()
-    }
-
-    fn append_to(self, mesh: &mut Mesh) {
-        let triangles = self.mapped(mesh.positions.len() as u32);
-        mesh.triangles.extend(triangles);
-        mesh.positions.extend(self.positions);
     }
 }
 
