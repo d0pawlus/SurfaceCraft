@@ -39,5 +39,5 @@ description: Writing and running SurfaceCraft tests and the accuracy gates of de
 - Real scans whose results may be named and committed: the open Artec corpus (car rim, engine,
   industrial part, water pump). `xtask/fetch-artec-corpus.sh <dir>` once, then
   `SURFACECRAFT_ARTEC_CORPUS=<dir>` for `#[ignore]` tests such as
-  `crates/engine/tests/artec_corpus.rs`; the same directory also serves as
+  `crates/engine/tests/artec_corpus.rs` (import) and `artec_patch.rs` (`surface.patch`); the same directory also serves as
   `SURFACECRAFT_LOCAL_CORPUS`. Prefer it over closed scans for any new measurement on real data.
