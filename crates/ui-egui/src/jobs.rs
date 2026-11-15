@@ -69,6 +69,12 @@ pub(crate) struct Busy {
     how: How,
 }
 
+/// Did the command only propose (an alignment run with `apply: false` answers `applied: false`)?
+/// Its tool stays open on the proposal: nothing changed in the document yet.
+fn only_proposed(result: &Value) -> bool {
+    result.get("applied").and_then(Value::as_bool) == Some(false)
+}
+
 impl SurfaceCraftApp {
     /// The session, for whatever changes it: refused (with the reason on the status line) while
     /// a command runs, because the session the app holds then is only what it draws, and the
@@ -100,6 +106,12 @@ impl SurfaceCraftApp {
                 if had == 0 && !self.session.doc.summaries().is_empty() {
                     self.fit_pending = true;
                 }
+                if let Some(pose) = crate::align_proposal::framed_box(self) {
+                    // a proposal just arrived: look at where it puts the scan, and remember the
+                    // view to return to if it is cancelled
+                    self.camera_before_proposal.get_or_insert_with(|| self.camera.clone());
+                    self.camera.fit(&pose);
+                }
                 if id == "deviation.compute" {
                     // a new map is what the Deviation tab shows
                     crate::dock::show_tab(&mut self.workspace, crate::dock::Panel::Deviation);
@@ -114,7 +126,8 @@ impl SurfaceCraftApp {
 
     /// Runs the open tool with its edited parameters. A command that changed the document closes
     /// its tool (the guide shows what comes next); a failed one, or one that only reports
-    /// (statistics, information), stays open with its message or result. Returns whether it ran
+    /// (statistics, information) or only proposes (an alignment without `apply`), stays open with
+    /// its message or result. Returns whether it ran
     /// without an error, or was started in the background.
     pub fn run_palette(&mut self) -> bool {
         self.field_pick = None;
@@ -247,10 +260,12 @@ impl SurfaceCraftApp {
         if let Ok(v) = &result
             && matches!(id, "mesh.import" | "mesh.set_units")
         {
-            let texts: Vec<String> = [crate::import_units::result_note(id, v), crate::import_units::warning_text(v)]
-                .into_iter()
-                .flatten()
-                .collect();
+            let reduced = crate::import_reduce::result_note(v);
+            let texts: Vec<String> =
+                [reduced, crate::import_units::result_note(id, v), crate::import_units::warning_text(v)]
+                    .into_iter()
+                    .flatten()
+                    .collect();
             if !texts.is_empty() {
                 self.status = texts.join(" ");
             }
@@ -258,7 +273,8 @@ impl SurfaceCraftApp {
         match after {
             After::Nothing => {}
             After::CloseTool => {
-                if result.is_ok() && cmd::find(id).is_some_and(|c| c.undoable) {
+                let changed = result.as_ref().is_ok_and(|v| !only_proposed(v));
+                if changed && cmd::find(id).is_some_and(|c| c.undoable) {
                     self.close_tool();
                 }
             }
@@ -321,7 +337,7 @@ impl SurfaceCraftApp {
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn poll_inbox(&mut self) {
         // one file at a time: an import may run in the background, and the next waits for it
-        while !self.is_busy() {
+        while !self.is_busy() && self.pending_import.is_none() {
             let mut inbox = self.inbox.borrow_mut();
             if inbox.is_empty() {
                 return;
@@ -330,12 +346,12 @@ impl SurfaceCraftApp {
             drop(inbox);
             let lower = name.to_lowercase();
             let ext = lower.rsplit('.').next().unwrap_or("").to_string();
-            let stem = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s).to_string();
-            let data = surfacecraft_doc::base64::encode(&bytes);
             if ext == "step" || ext == "stp" {
+                let stem = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s).to_string();
+                let data = surfacecraft_doc::base64::encode(&bytes);
                 self.launch("import.step", json!({"data": data, "name": stem}), After::Fit);
             } else {
-                self.import_mesh_file(json!({"data": data, "format": ext, "name": stem}));
+                self.import_picked_bytes(&name, bytes);
             }
         }
     }
