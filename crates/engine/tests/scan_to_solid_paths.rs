@@ -80,14 +80,14 @@ fn a_scan_with_the_same_evidence_and_readable_orientation_is_rebuilt() {
 
     let step = out["preparation"].as_array().unwrap().iter().find(|p| p["step"] == "remesh").unwrap();
     assert!(step["numbers"]["refused"].is_null() && step["numbers"]["triangles"].as_u64().unwrap() > 0, "{step}");
-    let kept = mesh_names(&s) == ["scan", "solid-remesh"];
-    let discarded = mesh_names(&s) == ["scan"] && step["reason"].as_str().is_some_and(|r| r.contains("discarded"))
-        || out["preparation"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|p| p["reason"].as_str().is_some_and(|r| r.contains("discarded")));
-    assert!(kept || discarded, "{:?} {}", mesh_names(&s), out["preparation"]);
+    let said_discarded = out["preparation"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["step"] == "remesh" && p["reason"].as_str().is_some_and(|r| r.contains("discarded")));
+    // exclusive and complete: discarded means only the scan is left, else the rebuilt mesh stays
+    let expected: &[&str] = if said_discarded { &["scan"] } else { &["scan", "solid-remesh"] };
+    assert_eq!(mesh_names(&s), expected, "{}", out["preparation"]);
 }
 
 /// A box 40 x 30 x 20 whose top is a wave of 2.5 mm: the five flat sides are most of the surface (the
@@ -128,7 +128,9 @@ fn attempts_of(component: &Value) -> Vec<(String, Option<String>, bool, Option<S
 /// call runs exactly two extra attempts, and once they are spent the lists of the parts that come
 /// later name the wrap and the hybrid method as skipped with the reason. Measured (macOS): the wrap of
 /// a part puts 0.996 of it within the tolerance and passes, so parts 1 and 2 take one extra each and
-/// part 3 is refused both; the assertions do not depend on that pass, only on the budget.
+/// part 3 is refused both. The assertions do not depend on the verdicts: only that exactly two extra
+/// attempts run, and that a skipped entry sits in a part at or after the last part that ran one (that
+/// part may itself have spent the last attempt and had a later attempt of its own refused).
 #[test]
 fn the_attempts_of_the_parts_of_one_call_share_a_budget_of_two_extra_attempts() {
     // Arrange
@@ -150,12 +152,12 @@ fn the_attempts_of_the_parts_of_one_call_share_a_budget_of_two_extra_attempts() 
     assert_eq!((lists[0][1].0.as_str(), lists[0][1].3.as_deref()), ("freeform", None), "{lists:?}");
     // the call ran exactly two extra attempts, however it spent them
     assert_eq!(lists.iter().map(|l| ran(l)).sum::<usize>(), 2, "{lists:?}");
-    // an entry is skipped only for the spent budget, and only in parts after those that spent it
+    // an entry is skipped only for the spent budget, and only in parts at or after the last that spent it
     let spent = "the call has used its 2 extra attempts";
     let last_spender = lists.iter().rposition(|l| ran(l) > 0).unwrap();
     let skipped_parts: Vec<usize> =
         lists.iter().enumerate().filter(|(_, l)| l.iter().any(|a| a.3.is_some())).map(|(k, _)| k).collect();
-    assert!(!skipped_parts.is_empty() && skipped_parts.iter().all(|k| *k > last_spender), "{lists:?}");
+    assert!(!skipped_parts.is_empty() && skipped_parts.iter().all(|k| *k >= last_spender), "{lists:?}");
     for l in lists.iter().flatten().filter(|a| a.3.is_some()) {
         assert_eq!(l.3.as_deref(), Some(spent), "{l:?}");
     }
