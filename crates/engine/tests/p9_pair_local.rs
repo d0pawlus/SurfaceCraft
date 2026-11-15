@@ -1,12 +1,16 @@
 //! P9-M2b, local only (needs `SURFACECRAFT_LOCAL_CORPUS`, third-party scans that stay outside the
 //! repository and are named by number only; everything happens in memory, nothing is written):
-//! `SURFACECRAFT_LOCAL_CORPUS=… cargo test --release -p surfacecraft-engine --test p9_pair_local -- --ignored --nocapture`
+//! `SURFACECRAFT_LOCAL_CORPUS=… cargo test --profile ci -p surfacecraft-engine --test p9_pair_local -- --ignored --nocapture`
 //!
 //! Every scan is cut into two pieces along its longest axis and the second piece is moved by a
 //! known motion, three times: `copy` (a decimated copy of the whole scan, as the older local test
 //! does), `halves` (each piece 75 % of the extent, the middle half shared) and `apart` (the pieces
-//! share nothing). `align.pair_coarse` must never call a wrong pose `unique`, and `apart` is never
-//! `unique`. `SURFACECRAFT_LOCAL_SCAN=n` runs one scan only.
+//! share nothing). `align.pair_coarse` must not call a wrong pose `unique`, with one known limit: the
+//! two pieces of a part with a symmetry are congruent copies, a pose that lays one on the other fits
+//! perfectly (both overlaps high, no conflict, the pieces of equal area) and cannot be told from a
+//! scan taken twice. Such a wrong `unique` is counted as `congruent (symmetric part, method limit)`,
+//! printed by scan number and not asserted, up to a small ceiling; every other wrong `unique`, `apart`
+//! included, fails the test. `SURFACECRAFT_LOCAL_SCAN=n` runs one scan only.
 mod pair_common;
 use pair_common::*;
 use serde_json::json;
@@ -58,6 +62,30 @@ struct Row {
     evidence: String,
     /// The larger conflict of the two scans at the pose found.
     conflict: f64,
+    /// The smaller of the two overlaps at the pose found, and the smaller area over the larger.
+    overlap: f64,
+    area_ratio: f64,
+}
+
+/// A wrong `unique` pose whose pieces are congruent under it: both overlaps at least this (measured
+/// 0.73 to 0.97 on the four cases of the corpus), no conflict above the bound, areas within this ratio.
+/// There is no wrong `unique` of another kind in the corpus to measure the margin against.
+const CONGRUENT_MIN_OVERLAP: f64 = 0.45;
+const CONGRUENT_MIN_AREA_RATIO: f64 = 0.7;
+/// Most wrong `unique` poses excused as congruent (measured 4).
+const CONGRUENT_CEILING: usize = 6;
+
+impl Row {
+    fn wrong_unique(&self) -> bool {
+        self.verdict == "unique" && self.error_mm > 1.0
+    }
+
+    fn congruent(&self) -> bool {
+        self.wrong_unique()
+            && self.overlap >= CONGRUENT_MIN_OVERLAP
+            && self.conflict <= UNIQUE_MAX_CONFLICT
+            && self.area_ratio >= CONGRUENT_MIN_AREA_RATIO
+    }
 }
 
 fn run(scan: usize, kind: &'static str, fixed: &Mesh, other: &Mesh, seed: u64) -> Row {
@@ -80,6 +108,8 @@ fn run(scan: usize, kind: &'static str, fixed: &Mesh, other: &Mesh, seed: u64) -
             angle_deg: f64::NAN,
             evidence,
             conflict: f64::NAN,
+            overlap: f64::NAN,
+            area_ratio: f64::NAN,
         };
     };
     let (angle_deg, error_mm) = pose_error(&matrix_of(&out), &pose, other);
@@ -112,6 +142,8 @@ fn run(scan: usize, kind: &'static str, fixed: &Mesh, other: &Mesh, seed: u64) -
         angle_deg,
         evidence,
         conflict: f("conflict_moving").max(f("conflict_fixed")),
+        overlap: f("overlap_moving").min(f("overlap_fixed")),
+        area_ratio: fixed.area().min(other.area()) / fixed.area().max(other.area()),
     }
 }
 
@@ -172,14 +204,21 @@ fn local_corpus_pair_confusion() {
         assert!(found("copy") >= 8, "copy: {} of 13 right", found("copy"));
         assert!(found("halves") >= 6, "halves: {} of 13 right", found("halves"));
     }
+    let congruent: Vec<&Row> = rows.iter().filter(|r| r.congruent()).collect();
+    for r in &congruent {
+        eprintln!(
+            "congruent (symmetric part, method limit): scan {:02} {}: overlap {:.2}, conflict {:.4}, area ratio {:.2}, error {:.1} mm",
+            r.scan, r.kind, r.overlap, r.conflict, r.area_ratio, r.error_mm
+        );
+    }
+    eprintln!("congruent wrong `unique`: {} (ceiling {CONGRUENT_CEILING})", congruent.len());
     let bad: Vec<String> = rows
         .iter()
-        .filter(|r| r.verdict == "unique" && r.error_mm > 1.0 && r.kind != "apart")
+        .filter(|r| r.wrong_unique() && !r.congruent())
         .map(|r| format!("scan {} {}: unique, error {:.2} mm", r.scan, r.kind, r.error_mm))
         .collect();
-    assert!(bad.is_empty(), "a wrong pose called unique: {bad:?}");
-    // `apart` pieces that are congruent copies of each other (a symmetric part) fit each other
-    // perfectly: not told from a scan taken twice, printed above, not asserted
+    assert!(bad.is_empty(), "a wrong pose called unique that is not a congruent copy: {bad:?}");
+    assert!(congruent.len() <= CONGRUENT_CEILING, "{} congruent wrong poses", congruent.len());
 }
 
 /// What caching the noise estimate per scan saves in `align.global`: one estimate of a view of a few
