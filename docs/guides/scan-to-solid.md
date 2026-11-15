@@ -51,7 +51,8 @@ Freeform (`surface.wrap` inside):
   (no T-junctions, no gaps). `levels` of the result lists patches and fit per round.
 - When the first coarse mesh is already bigger than the patch limit allows, it is cut to the limit
   and the wrap stops there (`levels[0].partial: first_round_over_cap`). `surface.wrap` with
-  `coarse_start: true` (used by `scan.to_solid` with `close_handles`, off otherwise) reduces the scan
+  `coarse_start: true` (used by `scan.to_solid` whenever `close_handles` is asked for, also when no
+  handle could be closed and the scan itself is wrapped; off otherwise) reduces the scan
   again with a larger budget instead, in proportion to how far over the limit it was (at most four
   times), so that the first mesh takes about half of the limit, and the adaptive rounds spend the rest
   where the patches miss. It costs one more reduction of the scan.

@@ -289,8 +289,10 @@ fn pass(
     let mut grown = vec![0usize; cands.len()];
     let apart = cut::splitting(&work.mesh, &cands, &skip);
     apart.iter().for_each(|&g| set(&mut skip, g));
-    let back = cut::readmit(&work.mesh, &cands, &mut skip, &apart, READMIT);
-    (0..apart.len() - back.len()).for_each(|_| refuse(rep, Refusal::Loosens));
+    let Some(back) = cut::readmit(&work.mesh, &cands, (&mut skip, &apart), READMIT, cancel) else {
+        return Err(HandleError::Cancelled);
+    };
+    (0..apart.len().saturating_sub(back.len())).for_each(|_| refuse(rep, Refusal::Loosens));
     for _ in 0..ATTEMPTS {
         if skip.iter().all(|&s| s) {
             return Ok((work, false));

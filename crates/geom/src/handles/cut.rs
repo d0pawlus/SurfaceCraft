@@ -115,16 +115,19 @@ pub(super) fn splitting(mesh: &Mesh, cands: &[Candidate], skip: &[bool]) -> Vec<
 /// Candidates refused by [`splitting`] taken back one at a time (the first `max` of `refused`): one
 /// stays in when, cut together with the others that are in, no candidate's loops come apart. Cutting
 /// all candidates at once can cut a band of sponge in two where cutting most of them does not. Returns
-/// those taken back (`skip` is cleared for them).
+/// those taken back (`skip` is cleared for them); `None` when the caller cancelled.
 pub(super) fn readmit(
     mesh: &Mesh,
     cands: &[Candidate],
-    skip: &mut [bool],
-    refused: &[usize],
+    (skip, refused): (&mut [bool], &[usize]),
     max: usize,
-) -> Vec<usize> {
+    cancel: &Cancel,
+) -> Option<Vec<usize>> {
     let mut back = Vec::new();
     for &g in refused.iter().take(max) {
+        if cancel.is_cancelled() {
+            return None;
+        }
         let Some(s) = skip.get_mut(g) else { continue };
         *s = false;
         if splitting(mesh, cands, skip).is_empty() {
@@ -133,7 +136,7 @@ pub(super) fn readmit(
             *s = true;
         }
     }
-    back
+    Some(back)
 }
 
 /// The mesh with the candidates not in `skip` cut out and their loops filled, and what failed; `None`
