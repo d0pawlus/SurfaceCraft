@@ -71,6 +71,9 @@ pub struct DrawItem {
     pub colors_key: u64,
     /// Optional per-triangle highlight (selected triangles of `mesh`), drawn in the highlight colour.
     pub highlight: Option<Arc<Vec<u32>>>,
+    /// Colour of the back side (where the normals point away from the eye); `None` draws both
+    /// sides in the base colour. Per-vertex colours are drawn on both sides instead.
+    pub back: Option<[f32; 4]>,
 }
 
 /// Everything the GPU needs for one frame.
@@ -110,10 +113,41 @@ pub(super) fn colors_need_upload(shown: u64, item: &DrawItem) -> bool {
     shown != color_state(&item.color, item.colors.is_some(), item.colors_key)
 }
 
+/// The per-vertex colours of an item when they fit its mesh (others are not drawn).
+fn vertex_colors(item: &DrawItem) -> Option<&Vec<[f32; 4]>> {
+    item.colors.as_deref().filter(|c| c.len() == item.mesh.positions.len())
+}
+
 pub(super) fn colors_of(item: &DrawItem) -> Vec<[f32; 4]> {
-    let n = item.mesh.positions.len();
-    match &item.colors {
-        Some(c) if c.len() == n => c.as_ref().clone(),
-        _ => vec![item.color; n],
+    vertex_colors(item).map_or_else(|| vec![item.color; item.mesh.positions.len()], Clone::clone)
+}
+
+/// The back colour the shader gets: the item's, unless per-vertex colours are drawn (they are
+/// data and stay the same on both sides). Alpha 0 turns the back colour off.
+pub(super) fn back_of(item: &DrawItem) -> [f32; 4] {
+    match (vertex_colors(item), item.back) {
+        (None, Some(back)) => back,
+        _ => [0.0; 4],
     }
+}
+
+/// The per-object uniform: where the object is drawn and the colour of its back side.
+/// `mesh_origin` and `frame_origin` are those of `shifted_model`.
+pub(super) fn object_uniform(
+    rows: &[[f64; 4]; 4],
+    mesh_origin: &Point3,
+    frame_origin: &Point3,
+    back: [f32; 4],
+) -> ObjectUniform {
+    ObjectUniform { model: shifted_model(rows, mesh_origin, frame_origin), back }
+}
+
+/// Per-object uniform of the mesh shader (`Object` in `mesh.wgsl`).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub(super) struct ObjectUniform {
+    /// Column-major model matrix (the preview motion).
+    model: [[f32; 4]; 4],
+    /// Back-side colour; alpha 0 = none.
+    back: [f32; 4],
 }

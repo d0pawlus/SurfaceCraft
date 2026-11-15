@@ -30,7 +30,11 @@ impl Renderer {
             if let Some(g) = self.meshes.get_mut(&k) {
                 g.used = true;
                 let rows = f.overlay.models.iter().find(|(mk, _)| *mk == k).map_or_else(identity_rows, |(_, m)| *m);
-                queue.write_buffer(&g.model_buf, 0, bytemuck::cast_slice(&shifted_model(&rows, &g.origin, &f.origin)));
+                queue.write_buffer(
+                    &g.model_buf,
+                    0,
+                    bytemuck::bytes_of(&object_uniform(&rows, &g.origin, &f.origin, back_of(item))),
+                );
                 if colors_need_upload(g.color_state, item) {
                     queue.write_buffer(&g.cb, 0, bytemuck::cast_slice(&colors_of(item)));
                     g.color_state = color_state(&item.color, item.colors.is_some(), item.colors_key);

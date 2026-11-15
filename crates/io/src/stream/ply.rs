@@ -14,7 +14,7 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use surfacecraft_geom::Point3;
 
 /// Largest header read (the in-memory reader searches the same prefix).
-const HEADER_LIMIT: u64 = 1 << 20;
+pub(crate) const HEADER_LIMIT: u64 = 1 << 20;
 /// Vertices per cache page.
 pub(crate) const PAGE_VERTICES: usize = 1024;
 /// Pages in the cache.

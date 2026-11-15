@@ -20,7 +20,7 @@ pub use callback::{ViewportCallback, install};
 #[cfg(not(target_arch = "wasm32"))]
 pub use offscreen::{Bench, bench_offscreen, render_offscreen};
 pub use scene::{DrawItem, Frame, Overlay};
-use scene::{identity_rows, shifted_model};
+use scene::{identity_rows, object_uniform};
 
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -145,7 +145,7 @@ impl Renderer {
             label: Some("model"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -156,7 +156,12 @@ impl Renderer {
         });
         let identity_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("identity model"),
-            contents: bytemuck::cast_slice(&shifted_model(&identity_rows(), &Point3::origin(), &Point3::origin())),
+            contents: bytemuck::bytes_of(&object_uniform(
+                &identity_rows(),
+                &Point3::origin(),
+                &Point3::origin(),
+                [0.0; 4],
+            )),
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let identity_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -181,7 +186,7 @@ impl Renderer {
             step_mode,
             attributes: &color_attrs,
         };
-        let make = |topology: wgpu::PrimitiveTopology, label: &str, step: wgpu::VertexStepMode| {
+        let make = |topology: wgpu::PrimitiveTopology, label: &str, step: wgpu::VertexStepMode, fragment: &str| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&layout),
@@ -202,7 +207,7 @@ impl Renderer {
                 multisample: Default::default(),
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: Some("fs_main"),
+                    entry_point: Some(fragment),
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: COLOR_FORMAT,
@@ -214,10 +219,12 @@ impl Renderer {
                 cache: None,
             })
         };
-        let mesh_pipeline = make(wgpu::PrimitiveTopology::TriangleList, "mesh", wgpu::VertexStepMode::Vertex);
+        let mesh_pipeline =
+            make(wgpu::PrimitiveTopology::TriangleList, "mesh", wgpu::VertexStepMode::Vertex, "fs_main");
         let highlight_pipeline =
-            make(wgpu::PrimitiveTopology::TriangleList, "highlight", wgpu::VertexStepMode::Instance);
-        let line_pipeline = make(wgpu::PrimitiveTopology::LineList, "lines", wgpu::VertexStepMode::Vertex);
+            make(wgpu::PrimitiveTopology::TriangleList, "highlight", wgpu::VertexStepMode::Instance, "fs_one_colour");
+        let line_pipeline =
+            make(wgpu::PrimitiveTopology::LineList, "lines", wgpu::VertexStepMode::Vertex, "fs_one_colour");
         let highlight_color = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("highlight colour"),
             contents: bytemuck::cast_slice(&[highlight()]),

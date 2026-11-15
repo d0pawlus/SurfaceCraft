@@ -9,6 +9,8 @@ use surfacecraft_geom::{Mesh, Point3, PointCloud, ReconParams, Rng, Transform, V
 use surfacecraft_io::{Limits, MeshFormat, Scan, read_points, read_scan, write_mesh};
 
 mod deps;
+mod reduce_import;
+pub use reduce_import::{MIN_REDUCE_TO, ReducedOut, declared_triangles, import_triangle_limit};
 mod scale;
 pub(crate) mod scan_size;
 pub(crate) mod size_check;
@@ -141,6 +143,12 @@ pub struct ImportIn {
     /// Unit of the coordinates, converted to mm (default mm).
     #[serde(default)]
     pub units: Option<LengthUnit>,
+    /// Most triangles of the imported mesh: a file with more is reduced while it is read (vertex
+    /// clustering on a grid, `reduced` in the result says by how much), so a scan above the
+    /// triangle limit of an import can still come in. STL and binary PLY are never held whole.
+    #[serde(default)]
+    #[schemars(range(min = 1000))]
+    pub reduce_to: Option<usize>,
 }
 
 /// What reconstructing a point cloud did.
@@ -182,6 +190,9 @@ pub struct ImportOut {
     /// In words, what the unit did, when it did something.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub units_note: Option<String>,
+    /// Present when `reduce_to` reduced the file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reduced: Option<ReducedOut>,
 }
 
 /// Adds an imported mesh: its unit is recorded, and stated when the caller gave one.
@@ -198,7 +209,7 @@ fn add_imported(
     obj.source_units = units.unwrap_or_default();
     obj.units_stated = units.is_some();
     let units_note = units::import_note(units, scale_factor);
-    Ok(ImportOut { mesh: mesh_info(s, id)?, point_cloud: cloud, scale_factor, units_note })
+    Ok(ImportOut { mesh: mesh_info(s, id)?, point_cloud: cloud, scale_factor, units_note, reduced: None })
 }
 
 type Loaded = (Vec<u8>, String, MeshFormat);
@@ -283,14 +294,34 @@ fn import(s: &mut Session, i: ImportIn) -> CmdResult<ImportOut> {
     let (bytes, default_name, fmt) = load(s, &i.path, &i.data, i.format)?;
     let name = i.name.clone().unwrap_or(default_name);
     let scale = units::import_scale(i.scale, i.units);
-    let (mesh, cloud) = match read_scan(&bytes, fmt, &read_limits())? {
+    let factor = scale.unwrap_or(1.0);
+    if let Some(target) = i.reduce_to {
+        reduce_import::check_target(target)?;
+        check_factor(factor)?;
+        if let Some((mesh, reduced)) = reduce_import::read(&bytes, fmt, factor, target)? {
+            let out = add_imported(s, &name, mesh, i.units, factor, None)?;
+            return Ok(ImportOut { reduced: Some(reduced), ..out });
+        }
+    }
+    let scan = read_scan(&bytes, fmt, &read_limits()).map_err(|e| reduce_import::limit_hint(&e, i.reduce_to))?;
+    drop(bytes);
+    let (mesh, cloud) = match scan {
         Scan::Mesh(m) => (scaled(m, scale)?, None),
         Scan::Points(c) => {
             let (m, info) = from_cloud(c, scale, &i.reconstruct.clone().unwrap_or_default())?;
             (m, Some(info))
         }
     };
-    add_imported(s, &name, mesh, i.units, scale.unwrap_or(1.0), cloud)
+    let reduced = match i.reduce_to {
+        Some(target) => reduce_import::reduce_in_memory(&mesh, target)?,
+        None => None,
+    };
+    let (mesh, reduced) = match reduced {
+        Some((m, r)) => (m, Some(r)),
+        None => (mesh, None),
+    };
+    let out = add_imported(s, &name, mesh, i.units, factor, cloud)?;
+    Ok(ImportOut { reduced, ..out })
 }
 
 /// Reconstruction parameters: a file as for `mesh.import`, whose points (vertices, when it has
@@ -602,7 +633,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         "Import mesh…",
         "Mesh",
         true,
-        "Imports STL/OBJ/PLY/XYZ from `path` or base64 `data` (+`format`), optional `scale`, `name`, `units`; point clouds (no faces) are reconstructed (`reconstruct`).",
+        "Imports STL/OBJ/PLY/XYZ from `path` or base64 `data` (+`format`), optional `scale`, `name`, `units`; point clouds (no faces) are reconstructed (`reconstruct`). `reduce_to` reduces a file with more triangles while it is read, so a scan above the triangle limit still comes in.",
         ImportIn,
         ImportOut,
         import

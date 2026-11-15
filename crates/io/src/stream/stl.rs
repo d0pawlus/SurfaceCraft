@@ -36,6 +36,11 @@ pub(crate) fn is_binary(head: &[u8], len: u64) -> bool {
     fits || !looks_ascii
 }
 
+/// The triangle count a binary STL header declares.
+pub(crate) fn declared(bytes: &[u8]) -> Option<u64> {
+    le_u32(bytes, COUNT_AT).map(u64::from)
+}
+
 /// Reads binary STL from the start of `r`.
 pub(crate) fn read_binary<R: Read + Seek>(mut r: R, out: &mut Batcher<'_>) -> Result<(), IoError> {
     let len = r.seek(SeekFrom::End(0)).map_err(|e| io_err(&e))?;

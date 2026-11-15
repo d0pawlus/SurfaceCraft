@@ -82,7 +82,7 @@ impl Renderer {
         });
         let model_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("mesh model"),
-            contents: bytemuck::cast_slice(&shifted_model(&identity_rows(), origin, origin)),
+            contents: bytemuck::bytes_of(&object_uniform(&identity_rows(), origin, origin, back_of(item))),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         let model_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
