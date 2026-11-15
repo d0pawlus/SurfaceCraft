@@ -103,10 +103,11 @@ mod tests {
     }
 
     #[test]
-    fn a_vertex_of_two_parallel_regions_goes_with_the_first() {
+    fn a_vertex_of_two_parallel_regions_stays_where_it_is() {
         let (a, b) = (plane(), Primitive::Plane { point: [0.0, 0.0, 0.5], normal: [0.0, 0.0, 1.0] });
         let out = projected(&mesh(), &[(&[0], &a), (&[1], &b)], 1.0);
-        assert!(out.positions[0].z.abs() < 1e-15 && out.positions[2].z.abs() < 1e-15);
+        // no point is on both planes: the shared vertices are not moved (it would be onto one of them only)
+        assert_eq!((out.positions[0], out.positions[2]), (mesh().positions[0], mesh().positions[2]));
         assert!((out.positions[3].z - 0.5).abs() < 1e-15, "the vertex only the second region has");
     }
 

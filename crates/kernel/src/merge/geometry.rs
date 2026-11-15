@@ -17,6 +17,11 @@ pub(super) struct Group {
 }
 
 impl Group {
+    /// The points along boundary edge `edge`, as `group_of` evaluated them.
+    pub(super) fn edge_points(&self, edge: u32) -> Option<&Vec<V>> {
+        self.boundary.loops.iter().flatten().zip(&self.edges).find(|(le, _)| le.edge == edge).map(|(_, p)| p)
+    }
+
     /// All the boundary points.
     pub(super) fn points(&self) -> Vec<V> {
         self.edges.iter().flatten().copied().collect()

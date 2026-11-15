@@ -206,23 +206,10 @@ pub(super) fn check_face(mesh: &Mesh, forward: bool, cloud: &Cloud, face: (&Brep
     let (mut checked, mut agree) = (0usize, 0usize);
     let mut evals: BTreeMap<usize, SurfaceEval> = BTreeMap::new();
     for k in 0..CHECKS.min(3 * n) {
-        let (t, corner) = spread(k, n);
-        let Some(tri) = mesh.triangle(t) else { continue };
-        let pts = tri.map(|a| [a.x, a.y, a.z]);
-        let (Some(a), Some(b), Some(c)) = (pts.get(corner), pts.get((corner + 1) % 3), pts.get((corner + 2) % 3))
-        else {
-            continue;
-        };
-        let twice = norm(cross(sub(*b, *a), sub(*c, *a)));
-        let Some(tn) =
-            unit(cross(sub(*b, *a), sub(*c, *a))).filter(|_| twice >= MIN_TRIANGLE_AREA_SHARE * 2.0 * mean_area)
-        else {
-            continue;
-        };
+        let Some((corner, middle, tn)) = triangle_probe(mesh, k, n, mean_area) else { continue };
         // the corner, and the middle of the triangle put on the surface (a flat face is cut into a few large
         // triangles whose corners are all on its border: its middle is only seen through the centroids)
-        let middle = [(a[0] + b[0] + c[0]) / 3.0, (a[1] + b[1] + c[1]) / 3.0, (a[2] + b[2] + c[2]) / 3.0];
-        for probe in [*a, gauge.closest(middle).unwrap_or(middle)] {
+        for probe in [corner, gauge.closest(middle).unwrap_or(middle)] {
             let (distance, normal) = nearest_over(cloud, body, &mut evals, probe, reach)?;
             if distance > PROXIMITY_SLACK * gap + 1e-6 && on_segments(probe, &open) > ON_BORDER {
                 return Err(KernelError::Argument(format!(
@@ -245,6 +232,17 @@ pub(super) fn check_face(mesh: &Mesh, forward: bool, cloud: &Cloud, face: (&Brep
         )));
     }
     Ok(())
+}
+
+/// The `k`th probe of the mesh's `n` triangles: a corner, the middle of its triangle and the triangle's normal; `None`
+/// for a sliver (its normal is noise).
+fn triangle_probe(mesh: &Mesh, k: usize, n: usize, mean_area: f64) -> Option<(V, V, V)> {
+    let (t, corner) = spread(k, n);
+    let pts = mesh.triangle(t)?.map(|a| [a.x, a.y, a.z]);
+    let (a, b, c) = (*pts.get(corner)?, *pts.get((corner + 1) % 3)?, *pts.get((corner + 2) % 3)?);
+    let twice = norm(cross(sub(b, a), sub(c, a)));
+    let tn = unit(cross(sub(b, a), sub(c, a))).filter(|_| twice >= MIN_TRIANGLE_AREA_SHARE * 2.0 * mean_area)?;
+    Some((a, [(a[0] + b[0] + c[0]) / 3.0, (a[1] + b[1] + c[1]) / 3.0, (a[2] + b[2] + c[2]) / 3.0], tn))
 }
 
 /// The open edges of `mesh`, the triangle edges with no triangle across them: the boundary of the face as the

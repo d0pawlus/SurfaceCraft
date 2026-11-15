@@ -522,8 +522,10 @@ fn a_vertex_that_would_move_several_gaps_onto_two_primitives_is_not_moved() {
     assert_eq!(kinds(&batch.brep).iter().filter(|k| **k == "plane").count(), 2);
 }
 
-/// The same groups with the fold within reach of the intersection (the planes meet 0.05 mm from it): the
-/// vertices go onto it.
+/// The same groups with the fold within reach of the intersection: it is 0.2 mm from the line of the planes in x and
+/// 0.03 in z, so it moves by 0.2022 mm, against the limit of 1.5 x 0.15 = 0.225 mm. Both figures are the arithmetic of
+/// the fixture (the limit is a constant of the merge), not measurements, so the 1.1 times between them is exact on
+/// every platform. The vertices go onto the line.
 #[test]
 fn a_vertex_within_reach_of_two_primitives_goes_onto_their_intersection() {
     use surfacecraft_kernel::merge::{GroupSpec, merge_faces_onto_shapes};
@@ -538,9 +540,10 @@ fn a_vertex_within_reach_of_two_primitives_goes_onto_their_intersection() {
     let batch = merge_faces_onto_shapes(&body, &specs, 0.15, &|| false).unwrap();
     assert!(batch.groups.iter().all(|g| g.as_ref().is_ok_and(|g| g.snap_note.is_none())), "{:?}", batch.groups);
     let fold: Vec<[f64; 3]> =
-        batch.brep.vertices.iter().filter(|v| (v.point[0] - 10.0).abs() < 0.001).map(|v| v.point).collect();
+        batch.brep.vertices.iter().filter(|v| (v.point[0] - 10.0).abs() < 0.03).map(|v| v.point).collect();
     assert_eq!(fold.len(), 2, "the fold went to x = 10, z = 0: {:?}", batch.brep.vertices);
-    assert!(fold.iter().all(|p| p[2].abs() < 1e-4), "{fold:?}");
+    // (the projection stops within 3 micrometres of both planes, which at 10 degrees is 0.017 mm along them)
+    assert!(fold.iter().all(|p| p[2].abs() < 0.01), "{fold:?}");
 }
 
 /// One edge that is not a Bézier span (two spans) at the border of one group turns the snap off for that group
@@ -662,4 +665,32 @@ fn a_patch_with_a_collapsed_side_moves_with_its_vertex() {
         assert!(found, "lower {lower}: no border of the triangle has the control points 0, 0.015 and 0.03: {points:?}");
         assert!(tess::tessellate_all(&merged.brep, None).is_ok());
     }
+}
+
+/// A group whose snap cannot be kept is tried again as it was, and says so. Four bilinear patches (ruled, so with
+/// straight edges) on a cylinder of radius 10, 0.179 rad each: the chords of the two straight borders are 0.04 mm off
+/// the cylinder (a sagitta, 10 (1 - cos 0.0895)). That is within the gap of 0.1, so the group is snapped, but a
+/// straight edge cannot be re-fitted onto a cylinder, so the border is still 0.04 mm off it and a snapped group may be
+/// only 0.01 off: the snapped group is refused. Without the second try the single group would be lost.
+#[test]
+fn a_single_group_whose_snap_does_not_hold_is_merged_as_it_was() {
+    use surfacecraft_kernel::merge::{GroupSpec, merge_faces_onto_shapes};
+    let (r, step) = (10.0_f64, 0.179_f64);
+    let pt = |i: usize, j: usize| {
+        let a = 1.0 + step * i as f64;
+        [r * a.cos(), r * a.sin(), 10.0 * j as f64]
+    };
+    let nets: Vec<Vec<Vec<[f64; 3]>>> =
+        (0..4).map(|i| vec![vec![pt(i, 0), pt(i, 1)], vec![pt(i + 1, 0), pt(i + 1, 1)]]).collect();
+    let id = |i: usize, j: usize| (2 * i + j) as u32;
+    let corners: Vec<[u32; 4]> = (0..4).map(|i| [id(i, 0), id(i + 1, 0), id(i + 1, 1), id(i, 1)]).collect();
+    let body = sheet_from_bezier_network(&nets, &corners).unwrap();
+    let shape = Shape::Cylinder { point: [0.0; 3], axis: [0.0, 0.0, 1.0], radius: r };
+    let faces = [0usize, 1, 2, 3];
+    let batch = merge_faces_onto_shapes(&body, &[GroupSpec { faces: &faces, shape: &shape }], 0.1, &|| false).unwrap();
+    let g = batch.groups[0].as_ref().unwrap_or_else(|e| panic!("the group is merged as it was: {e}"));
+    let note = g.snap_note.as_deref().expect("says that its snap was taken back");
+    assert!(note.contains("taken back"), "{note}");
+    assert!(g.gap > 0.03 && g.gap < 0.05, "the border is where it was, a sagitta off the cylinder: {}", g.gap);
+    assert_eq!(kinds(&batch.brep), vec!["cylinder"]);
 }

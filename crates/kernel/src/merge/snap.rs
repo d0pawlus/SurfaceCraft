@@ -35,19 +35,22 @@ use super::place::Gauge;
 use crate::hybrid::{V, add, cross, dot, norm, scale, sub, unit};
 use crate::nurbs::{SurfaceProbe, domain};
 use crate::record::brep::{Brep, Curve, Loop, Surface};
-use crate::{Result, finite_all};
+use crate::{KernelError, Result, finite_all};
 use solidcore::math::Vec3;
 use solidcore::nurbs::crv_fit::p1::ParamMethod;
 use solidcore::nurbs::crv_fit::p2::approx_lst_sq;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Alternating projections that put a point on every primitive of its edge or vertex. Two primitives that
-/// meet at 10 degrees converge by a factor of 0.97 a round, so 200 rounds bring a point to a millionth of its
-/// distance; a pair that does not converge by then (parallel, or no common point) is settled by
-/// [`onto_all`]'s fallback.
+/// Alternating projections that put a point on every primitive of its edge or vertex. Two primitives that meet at an
+/// angle `t` converge by a factor of `cos(t)^2` a round: from 0.2 mm to [`ON_SURFACE`] in 200 rounds takes `t` of about
+/// 8 degrees or more. A set of primitives that does not converge by then (nearly parallel, parallel, or with no
+/// common point near the point) is reported as not converged, never settled with a point that is not on them all.
 const MAX_ALTERNATIONS: usize = 200;
-/// A point lies on a primitive when it is this close (mm).
-const ON_SURFACE: f64 = 1e-6;
+/// A point lies on a primitive when it is this close (mm): 3 micrometres.
+const ON_SURFACE: f64 = 3e-3;
+/// A round that moves the point by less than this (mm) without having reached every primitive has found a cycle
+/// (parallel primitives): there is nothing to wait for.
+const STALLED: f64 = 1e-9;
 /// Control points equal within this (mm) are the same point when a patch's border is matched to its edge.
 const SAME_POINT: f64 = 1e-7;
 /// The least dot product of the normals of a moved patch before and after, at the points of the grid where both are
@@ -59,6 +62,12 @@ const MIN_TURN_DOT: f64 = 0.0;
 /// collapsed side has a normal that flips for a displacement of hundredths of a millimetre (measured: dot -0.98
 /// after a move of 0.013 mm at a sine of 0.1).
 const MIN_SIN_BETWEEN_TANGENTS: f64 = 0.4;
+/// The fewest points of the grid at which a moved patch's normal must be readable before and after to say it has not
+/// turned over (of 25).
+const MIN_JUDGED: usize = 4;
+/// A patch with fewer judged points passes if no point moved more than this share of the patch's extent: a patch
+/// turns over only when it moves by about its own size.
+const MAX_UNJUDGED_MOVE: f64 = 0.25;
 /// Cells a side of the grid a moved patch is compared with itself on.
 const MOVED_GRID: usize = 4;
 
@@ -69,9 +78,9 @@ pub(super) struct Target<'a> {
     pub gauge: &'a Gauge,
 }
 
-/// `p` on every one of `gauges` (the points of the surfaces they evaluate), by alternating projections, or,
-/// where they do not meet within [`MAX_ALTERNATIONS`], the nearer of the last iterate and the point on the
-/// first alone. `None` when that is farther from `p` than `max_move`, or not finite.
+/// `p` on every one of `gauges` (the points of the surfaces they evaluate), by alternating projections. `None` when
+/// they do not meet within [`MAX_ALTERNATIONS`] (see there), when the point would move more than `max_move`, or when
+/// it is not finite.
 #[must_use]
 pub fn put_on_all(gauges: &[&Gauge], p: V, max_move: f64) -> Option<V> {
     put_on_all_with(&|i, q| gauges.get(i).and_then(|g| g.closest(q)), gauges.len(), p, max_move)
@@ -90,22 +99,19 @@ fn onto_all(closest: &dyn Fn(usize, V) -> Option<V>, count: usize, p: V) -> Opti
     let on_all = |q: V| (0..count).all(|i| distance(i, q).is_some_and(|d| d <= ON_SURFACE));
     let mut q = p;
     for _ in 0..MAX_ALTERNATIONS {
+        let before = q;
         for i in 0..count {
             q = closest(i, q)?;
         }
         if on_all(q) {
             return Some(q);
         }
+        if count == 1 || norm(sub(q, before)) < STALLED {
+            // one surface is reached by its first projection; several that stand still are parallel
+            return (count == 1).then_some(q);
+        }
     }
-    if count == 1 {
-        return Some(q);
-    }
-    // surfaces that meet at a shallow angle converge slowly: the last iterate is taken when it is nearer all of
-    // them than the point on the first alone
-    let worst = |q: V| (0..count).filter_map(|i| distance(i, q)).fold(0.0_f64, f64::max);
-    let alone = closest(0, p)?;
-    // (by more than rounding: parallel primitives tie, and the first one then decides)
-    Some(if worst(q) + 1e-9 < worst(alone) { q } else { alone })
+    None
 }
 
 /// The groups that touch each boundary edge and each end vertex of one, with the gauges of their primitives.
@@ -154,6 +160,9 @@ fn bezier_of(body: &Brep, edge: u32) -> Option<&Vec<V>> {
 /// Piegl and Tiller A9.7). `None` for a line (the fit needs three control points) or where the kernel
 /// refuses.
 fn least_squares(n: usize, targets: &[V]) -> Option<Vec<V>> {
+    if n + 1 > targets.len() {
+        return None;
+    }
     let points: Vec<Vec3> = targets.iter().map(|p| Vec3::new(p[0], p[1], p[2])).collect();
     let curve = approx_lst_sq(&points, n, n, ParamMethod::Uniform).ok()?;
     let single_span = curve.knots().len() == 2 * (n + 1);
@@ -240,6 +249,10 @@ fn refit_edge(
     max_move: f64,
 ) -> Result<Option<Vec<V>>> {
     let samples = edge_points(body, e)?;
+    if old.len() > samples.len() {
+        // the fit needs at least as many samples as control points (a record from outside can have any number)
+        return Err(KernelError::Argument("a boundary edge has more control points than samples".into()));
+    }
     let Some(targets) = samples.iter().map(|p| put_on_all(gauges, *p, max_move)).collect::<Option<Vec<V>>>() else {
         return Ok(None);
     };
@@ -369,15 +382,23 @@ fn moved_net(net: &[Vec<V>], edits: &[Edit]) -> Option<Vec<Vec<V>>> {
     let mut taken: BTreeSet<usize> = BTreeSet::new();
     let candidates = borders(net);
     for e in edits {
-        let by_loop = e.side.filter(|_| is_collapsed(e.old)).filter(|(k, _)| {
-            candidates.get(*k).and_then(|b| border_points(net, b)).is_some_and(|p| runs_along(&p, e.old).is_some())
-        });
-        let found = by_loop.or_else(|| {
+        // a collapsed border runs along its edge either way round: only the loop can say which end is which, and
+        // when the loop does not lead to a collapsed border (it starts elsewhere than the net was laid out) the
+        // face is refused rather than guessed
+        let found = if is_collapsed(e.old) {
+            e.side.filter(|(k, _)| {
+                !taken.contains(k)
+                    && candidates
+                        .get(*k)
+                        .and_then(|b| border_points(net, b))
+                        .is_some_and(|p| runs_along(&p, e.old).is_some())
+            })
+        } else {
             candidates.iter().enumerate().find_map(|(k, border)| {
                 let same_way = border_points(net, border).and_then(|p| runs_along(&p, e.old))?;
                 (!taken.contains(&k)).then_some((k, same_way))
             })
-        });
+        };
         let (k, same_way) = found?;
         taken.insert(k);
         let order: Vec<&V> = if same_way { e.new.iter().collect() } else { e.new.iter().rev().collect() };
@@ -496,6 +517,18 @@ fn normals_at_grid(body: &Brep, face: usize, n: usize) -> Option<Vec<Option<V>>>
     Some(out)
 }
 
+/// The diagonal of the box of `points` (mm).
+fn extent(points: &[V]) -> f64 {
+    let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+    for p in points {
+        for k in 0..3 {
+            lo[k] = lo[k].min(p[k]);
+            hi[k] = hi[k].max(p[k]);
+        }
+    }
+    norm(sub(hi, lo))
+}
+
 /// A patch that moved: no point of it farther than `max_move` from where it was, still facing the way it did,
 /// and its borders along its changed edges.
 fn moved_patch_ok(before: &Brep, after: &Brep, changed: &Changed, max_move: f64) -> bool {
@@ -504,11 +537,15 @@ fn moved_patch_ok(before: &Brep, after: &Brep, changed: &Changed, max_move: f64)
     let (Some(a), Some(b)) = (face_samples(before, face, MOVED_GRID), face_samples(after, face, MOVED_GRID)) else {
         return false;
     };
-    let near = a.len() == b.len() && a.iter().zip(&b).all(|(p, q)| norm(sub(*p, *q)) <= max_move * (1.0 + 1e-9));
+    let far = a.iter().zip(&b).map(|(p, q)| norm(sub(*p, *q))).fold(0.0_f64, f64::max);
+    let near = a.len() == b.len() && far <= max_move * (1.0 + 1e-9);
     let facing = match (normals_at_grid(before, face, MOVED_GRID), normals_at_grid(after, face, MOVED_GRID)) {
         (Some(n0), Some(n1)) => {
             let pairs: Vec<(V, V)> = n0.iter().zip(&n1).filter_map(|(a, b)| Some(((*a)?, (*b)?))).collect();
-            pairs.iter().all(|(a, b)| dot(*a, *b) >= MIN_TURN_DOT)
+            // a patch whose normal can be read at too few points of the grid (a sliver, a collapsed side) cannot be
+            // shown not to have turned over: it passes only when it moved too little to turn
+            let judged = pairs.len() >= MIN_JUDGED || far <= MAX_UNJUDGED_MOVE * extent(&a);
+            judged && pairs.iter().all(|(a, b)| dot(*a, *b) >= MIN_TURN_DOT)
         }
         _ => false,
     };
@@ -561,12 +598,16 @@ pub(super) struct Snapped {
 
 /// The body with the boundary of every group of `targets` on its primitive, and the patches and edges that
 /// share it moved with it. A group that cannot be snapped (see the header) is left as it was and its reason
-/// is in [`Snapped::why_not`]; the others are snapped without it. No vertex moves farther than `max_move`.
-pub(super) fn snap_boundaries(body: &Brep, targets: &[Target], max_move: f64) -> Snapped {
+/// is in [`Snapped::why_not`]; the others are snapped without it. No vertex moves farther than `max_move`. A
+/// cancellation (`cancel` is polled once a round) ends the step with nothing snapped.
+pub(super) fn snap_boundaries(body: &Brep, targets: &[Target], max_move: f64, cancel: &dyn Fn() -> bool) -> Snapped {
     let mut why_not: Vec<Option<String>> = vec![None; targets.len()];
     let mut live: Vec<usize> = (0..targets.len()).collect();
     // each round refuses at least one group, or ends
     for _ in 0..=targets.len() {
+        if cancel() {
+            break;
+        }
         let touch = touching(body, targets, &live);
         let flags = |touch: &Touch| (0..targets.len()).map(|k| touch.bounded.contains(&k)).collect::<Vec<_>>();
         if touch.edges.is_empty() {
@@ -600,132 +641,5 @@ pub(super) fn snap_boundaries(body: &Brep, targets: &[Target], max_move: f64) ->
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn p(x: f64, y: f64, z: f64) -> V {
-        [x, y, z]
-    }
-
-    #[test]
-    fn a_fit_through_points_on_a_cubic_gives_that_cubic() {
-        let cubic = [p(0.0, 0.0, 0.0), p(1.0, 2.0, 0.5), p(3.0, 2.0, -0.5), p(4.0, 0.0, 0.0)];
-        let samples: Vec<V> = (0..9)
-            .map(|i| {
-                let t = f64::from(i) / 8.0;
-                let w = [(1.0 - t).powi(3), 3.0 * t * (1.0 - t).powi(2), 3.0 * t * t * (1.0 - t), t.powi(3)];
-                (0..3).map(|d| cubic.iter().zip(&w).map(|(q, b)| q[d] * b).sum::<f64>()).collect::<Vec<_>>()
-            })
-            .map(|v| [v[0], v[1], v[2]])
-            .collect();
-        let fit = least_squares(3, &samples).unwrap();
-        for (a, b) in fit.iter().zip(&cubic) {
-            assert!(norm(sub(*a, *b)) < 1e-9, "{a:?} {b:?}");
-        }
-    }
-
-    #[test]
-    fn a_line_has_no_interior_unknowns_and_the_fallback_keeps_its_ends() {
-        assert!(least_squares(1, &[p(0.0, 0.0, 0.0), p(0.5, 0.0, 0.0), p(1.0, 0.0, 0.0)]).is_none());
-        let moved =
-            follow(&[p(0.0, 0.0, 0.0), p(1.0, 0.0, 0.0), p(2.0, 0.0, 0.0)], [p(0.0, 1.0, 0.0), p(2.0, 3.0, 0.0)]);
-        assert_eq!(moved.first(), Some(&p(0.0, 1.0, 0.0)));
-        assert_eq!(moved.last(), Some(&p(2.0, 3.0, 0.0)));
-        assert!((moved[1][1] - 2.0).abs() < 1e-12, "the middle moves by the mean of the end displacements");
-    }
-
-    #[test]
-    fn a_border_is_matched_to_its_edge_either_way_round_and_a_stranger_is_not() {
-        let net = vec![vec![p(0.0, 0.0, 0.0), p(0.0, 1.0, 0.0)], vec![p(1.0, 0.0, 0.0), p(1.0, 1.0, 0.0)]];
-        let old = vec![p(0.0, 0.0, 0.0), p(0.0, 1.0, 0.0)];
-        let new = vec![p(0.0, 0.0, 0.1), p(0.0, 1.0, 0.1)];
-        fn edit<'a>(old: &'a [V], new: &'a [V]) -> Edit<'a> {
-            Edit { old, new, side: None }
-        }
-        let moved = moved_net(&net, &[edit(&old, &new)]).unwrap();
-        assert_eq!((moved[0][0][2], moved[0][1][2], moved[1][0][2]), (0.1, 0.1, 0.0));
-        let backwards = vec![p(0.0, 1.0, 0.0), p(0.0, 0.0, 0.0)];
-        let reversed: Vec<V> = new.iter().rev().copied().collect();
-        assert!(moved_net(&net, &[edit(&backwards, &reversed)]).is_some());
-        assert!(moved_net(&net, &[edit(&[p(5.0, 5.0, 5.0), p(6.0, 5.0, 5.0)], &new)]).is_none());
-    }
-
-    fn plane_gauge(normal: V, d: f64) -> Gauge {
-        Gauge::new(&crate::hybrid::Shape::Plane { point: scale(normal, d), normal }).unwrap()
-    }
-
-    #[test]
-    fn a_point_goes_onto_its_primitives_only_within_the_allowed_move() {
-        let (a, b) = (plane_gauge([0.0, 0.0, 1.0], 0.0), plane_gauge([1.0, 0.0, 0.0], 0.0));
-        let q = put_on_all(&[&a, &b], p(0.05, 3.0, 0.07), 0.2).unwrap();
-        assert!(q[0].abs() < 1e-5 && q[2].abs() < 1e-5, "{q:?}");
-        assert!(put_on_all(&[&a, &b], p(0.05, 3.0, 0.07), 0.05).is_none(), "0.086 away is farther than 0.05");
-        assert!(put_on_all(&[&a], p(0.0, 0.0, 0.3), 0.2).is_none());
-        assert!(put_on_all(&[&a], p(0.0, 0.0, 0.1), f64::NAN).is_none());
-        assert!(put_on_all(&[], p(0.0, 0.0, 0.1), 1.0).is_none());
-    }
-
-    /// Two planes 10 degrees apart: a point between them, near both, is a metre from their line when it is a
-    /// millimetre from each; the alternating projection is bounded and the move is refused.
-    #[test]
-    fn a_point_near_two_planes_at_a_shallow_angle_that_meet_far_away_is_refused() {
-        let t = 10.0_f64.to_radians();
-        let a = plane_gauge([0.0, 0.0, 1.0], 0.0);
-        let b = plane_gauge([-t.sin(), 0.0, t.cos()], 0.0);
-        assert!(put_on_all(&[&a, &b], p(5.7, 0.0, 0.1), 0.3).is_none());
-        assert!(put_on_all(&[&a, &b], p(5.7, 0.0, 0.1), 10.0).is_some());
-    }
-
-    fn two_patches() -> Brep {
-        let net = |x: f64| vec![vec![p(x, 0.0, 0.0), p(x, 1.0, 0.0)], vec![p(x + 1.0, 0.0, 0.0), p(x + 1.0, 1.0, 0.0)]];
-        crate::nurbs::sheet_from_bezier_network(&[net(0.0), net(1.0)], &[[0, 1, 2, 3], [1, 4, 5, 2]]).unwrap()
-    }
-
-    #[test]
-    fn a_body_whose_edges_lost_a_use_does_not_have_its_topology_kept() {
-        let before = two_patches();
-        assert!(topology_kept(&before, &before));
-        let mut after = before.clone();
-        after.edges[0].uses.clear();
-        assert!(!topology_kept(&before, &after));
-    }
-
-    #[test]
-    fn a_patch_that_moved_too_far_or_turned_over_is_not_sound() {
-        let before = two_patches();
-        let changed = |after: &Brep| {
-            let edges = vec![0u32];
-            moved_patch_ok(&before, after, &Changed { face: 1, edges, asked: Groups::new() }, 0.1)
-        };
-        let mut far = before.clone();
-        if let Some(Surface::Spline { points, .. }) = far.faces.get_mut(1).map(|f| &mut f.surface) {
-            points[1][1][2] = 0.5;
-        }
-        assert!(!changed(&far), "a corner 0.5 mm away");
-        let mut turned = before.clone();
-        if let Some(Surface::Spline { points, .. }) = turned.faces.get_mut(1).map(|f| &mut f.surface) {
-            let (a, b) = (points[0][1], points[1][1]);
-            points[0][1] = b;
-            points[1][1] = a;
-        }
-        assert!(!changed(&turned), "folded over");
-    }
-
-    /// A border collapsed to a point runs along a collapsed edge either way round: the side the loop says it is
-    /// decides which end of the new edge is which.
-    #[test]
-    fn a_collapsed_border_is_moved_by_the_side_of_the_loop_it_is() {
-        let at = p(1.0, 1.0, 0.0);
-        let net = vec![vec![at, at, at], vec![p(2.0, 0.0, 0.0), p(2.0, 1.0, 0.0), p(2.0, 2.0, 0.0)]];
-        let old = vec![at, at, at];
-        let new = vec![p(1.0, 1.0, 0.5), p(1.0, 1.0, 0.25), p(1.0, 1.0, 0.0)];
-        // the border net[0][..] is the fourth side backwards: a loop that walks the edge forward on it runs the
-        // border against the edge
-        let moved = |forward: bool| {
-            let edit = Edit { old: &old, new: &new, side: side_of(3, forward) };
-            moved_net(&net, &[edit]).unwrap()[0].iter().map(|q| q[2]).collect::<Vec<f64>>()
-        };
-        assert_eq!(moved(true), vec![0.0, 0.25, 0.5]);
-        assert_eq!(moved(false), vec![0.5, 0.25, 0.0]);
-    }
-}
+#[path = "snap_tests.rs"]
+mod tests;

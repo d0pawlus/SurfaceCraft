@@ -43,6 +43,7 @@ fn snap_round(
     before: &[std::result::Result<Group, String>],
     max_gap: f64,
     refused: &Reasons,
+    cancel: &dyn Fn() -> bool,
 ) -> Snap {
     let gauges: Vec<Option<Gauge>> = specs.iter().take(MAX_GROUPS).map(|s| Gauge::new(s.shape).ok()).collect();
     let closed = is_closed(body);
@@ -60,7 +61,8 @@ fn snap_round(
             spec_of.push(k);
         }
     }
-    let Snapped { body: snapped, snapped: flags, why_not } = snap_boundaries(body, &targets, MOVE_PER_GAP * max_gap);
+    let Snapped { body: snapped, snapped: flags, why_not } =
+        snap_boundaries(body, &targets, MOVE_PER_GAP * max_gap, cancel);
     let (mut moved, mut notes) = (vec![false; specs.len()], vec![None; specs.len()]);
     for (t, &k) in spec_of.iter().enumerate() {
         moved[k] = flags.get(t).copied().unwrap_or(false);
@@ -75,48 +77,69 @@ struct Round {
     undo: Vec<(usize, String)>,
 }
 
-fn round(
-    original: &Brep,
-    specs: &[GroupSpec],
-    before: &[std::result::Result<Group, String>],
+/// What every round reads.
+struct Ctx<'a> {
+    original: &'a Brep,
+    specs: &'a [GroupSpec<'a>],
+    before: &'a [std::result::Result<Group, String>],
     max_gap: f64,
-    refused: Option<&Reasons>,
-    run: &Run,
-) -> Result<Round> {
-    let snap = match refused {
-        // the last round: nothing is snapped and nothing is excluded
-        None => Snap { body: original.clone(), moved: vec![false; specs.len()], why_not: vec![None; specs.len()] },
-        Some(refused) => snap_round(original, specs, before, max_gap, refused),
+    run: &'a Run<'a>,
+}
+
+fn cancelled() -> KernelError {
+    KernelError::Argument("cancelled".into())
+}
+
+/// The snap of a round: the groups not in `taken_back` snapped (when `snapping`), and for each group of
+/// `taken_back` the note that its snap was taken back.
+fn snap_for(ctx: &Ctx, taken_back: &Reasons, snapping: bool) -> Snap {
+    let mut snap = if snapping {
+        snap_round(ctx.original, ctx.specs, ctx.before, ctx.max_gap, taken_back, ctx.run.cancel)
+    } else {
+        Snap { body: ctx.original.clone(), moved: vec![false; ctx.specs.len()], why_not: vec![None; ctx.specs.len()] }
     };
-    let none_refused: Reasons = vec![None; specs.len()];
-    let refused = refused.unwrap_or(&none_refused);
-    let any_moved = snap.moved.iter().any(|m| *m);
-    let after = if any_moved { groups_in(&snap.body, specs) } else { Vec::new() };
-    let groups = if any_moved { &after[..] } else { before };
-    let body = &snap.body;
-    let prepared = prepare_all(body, specs, groups, (max_gap, &snap.moved, refused), run.cancel)?;
-    let note = |k: usize, why: &str| match snap.why_not.get(k).and_then(Option::as_ref) {
+    for (k, why) in taken_back.iter().enumerate() {
+        if let (Some(why), Some(slot)) = (why, snap.why_not.get_mut(k)) {
+            slot.get_or_insert_with(|| format!("its snap was taken back: {why}"));
+        }
+    }
+    snap
+}
+
+/// `why` with the group's own note of why it was not snapped.
+fn noted(snap: &Snap, k: usize, why: &str) -> String {
+    match snap.why_not.get(k).and_then(Option::as_ref) {
         Some(n) => format!("{why} (not snapped: {n})"),
         None => why.to_string(),
-    };
-    let reasons = |why: &str| {
-        prepared.iter().enumerate().map(|(k, p)| p.as_ref().err().cloned().unwrap_or_else(|| note(k, why))).collect()
-    };
-    let all: Vec<&Prepared> = prepared.iter().filter_map(|p| p.as_ref().ok()).collect();
-    if all.is_empty() {
-        let reasons =
-            prepared.iter().enumerate().map(|(k, p)| note(k, &p.as_ref().err().cloned().unwrap_or_default())).collect();
-        return Ok(Round { batch: unchanged(original, reasons), undo: Vec::new() });
     }
-    let volume = is_closed(body).then(|| trusted_volume(body)).transpose()?;
-    let (brep, face_map, mut verdicts) = match settle(body, volume, &all, run) {
-        Ok(settled) => settled,
-        Err(_) if (run.cancel)() => return Err(KernelError::Argument("cancelled".into())),
-        Err(e) => return Ok(Round { batch: unchanged(original, reasons(&e.to_string())), undo: Vec::new() }),
-    };
+}
+
+/// A round in which no group was merged: the body as it was, each group's reason, and the groups that were snapped
+/// to be tried again without their snap.
+fn lost(ctx: &Ctx, snap: &Snap, prepared: &[std::result::Result<Prepared, String>], why: &str) -> Round {
+    let reasons: Vec<String> = prepared
+        .iter()
+        .enumerate()
+        .map(|(k, p)| noted(snap, k, &p.as_ref().err().cloned().unwrap_or_else(|| why.to_string())))
+        .collect();
+    let undo = (0..reasons.len())
+        .filter(|&k| snap.moved.get(k).copied().unwrap_or(false))
+        .filter_map(|k| prepared.get(k).map(|p| (k, p.as_ref().err().cloned().unwrap_or_else(|| why.to_string()))))
+        .collect();
+    Round { batch: unchanged(ctx.original, reasons), undo }
+}
+
+/// The batch of a settled round and the snapped groups that were refused.
+fn finish(
+    ctx: &Ctx,
+    snap: &Snap,
+    prepared: &[std::result::Result<Prepared, String>],
+    settled: super::settle::Settled,
+) -> Round {
+    let (brep, face_map, mut verdicts) = settled;
     verdicts.reverse();
-    let mut results = Vec::with_capacity(specs.len());
-    for (spec, p) in specs.iter().zip(&prepared) {
+    let mut results = Vec::with_capacity(ctx.specs.len());
+    for (spec, p) in ctx.specs.iter().zip(prepared) {
         let outcome = p.as_ref().map_err(Clone::clone).and_then(|p| {
             verdicts.pop().unwrap_or_else(|| Err("no verdict".to_string()))?;
             let first = spec.faces.iter().copied().min().unwrap_or(0);
@@ -138,29 +161,55 @@ fn round(
             Ok((face, gap, patch_area)) => {
                 Ok(GroupResult { face, gap, patch_area, snap_note: snap.why_not.get(k).cloned().flatten() })
             }
-            Err(why) => Err(note(k, &why)),
+            Err(why) => Err(noted(snap, k, &why)),
         })
         .collect();
-    Ok(Round { batch: Batch { brep, face_map, groups }, undo })
+    Round { batch: Batch { brep, face_map, groups }, undo }
+}
+
+/// One round: the groups not in `taken_back` snapped (when `snapping`), prepared and settled on the snapped body.
+fn round(ctx: &Ctx, taken_back: &Reasons, snapping: bool) -> Result<Round> {
+    let snap = snap_for(ctx, taken_back, snapping);
+    let any_moved = snap.moved.iter().any(|m| *m);
+    let after = if any_moved { groups_in(&snap.body, ctx.specs) } else { Vec::new() };
+    let groups = if any_moved { &after[..] } else { ctx.before };
+    let body = &snap.body;
+    let none: Reasons = vec![None; ctx.specs.len()];
+    let prepared = prepare_all(body, ctx.specs, groups, (ctx.max_gap, &snap.moved, &none), ctx.run.cancel)?;
+    let all: Vec<&Prepared> = prepared.iter().filter_map(|p| p.as_ref().ok()).collect();
+    if all.is_empty() {
+        return Ok(lost(ctx, &snap, &prepared, ""));
+    }
+    let volume = match is_closed(body).then(|| trusted_volume(body)).transpose() {
+        Ok(v) => v,
+        // a body the snap made unusable is not the end of the merge: the groups go on without it
+        Err(e) if any_moved => return Ok(lost(ctx, &snap, &prepared, &e.to_string())),
+        Err(e) => return Err(e),
+    };
+    match settle(body, volume, &all, ctx.run) {
+        Ok(settled) => Ok(finish(ctx, &snap, &prepared, settled)),
+        Err(_) if (ctx.run.cancel)() => Err(cancelled()),
+        Err(e) => Ok(lost(ctx, &snap, &prepared, &e.to_string())),
+    }
 }
 
 /// The merge of `specs` in rounds (see the header): the batch of the first round that has no snapped group
-/// refused after its snap.
+/// refused after its snap. A group whose snap is taken back is tried again as it was, and says so.
 pub(super) fn merge_rounds(original: &Brep, specs: &[GroupSpec], max_gap: f64, run: &Run) -> Result<Batch> {
     let before = groups_in(original, specs);
-    let mut refused: Reasons = vec![None; specs.len()];
+    let ctx = Ctx { original, specs, before: &before, max_gap, run };
+    let mut taken_back: Reasons = vec![None; specs.len()];
     for r in 0..MAX_ROUNDS {
-        let last = r + 1 == MAX_ROUNDS;
-        let Round { batch, undo } = round(original, specs, &before, max_gap, (!last).then_some(&refused), run)?;
+        let Round { batch, undo } = round(&ctx, &taken_back, r + 1 < MAX_ROUNDS)?;
         if undo.is_empty() {
             return Ok(batch);
         }
         for (k, why) in undo {
-            if let Some(slot) = refused.get_mut(k) {
+            if let Some(slot) = taken_back.get_mut(k) {
                 *slot = Some(why);
             }
         }
     }
-    // the last round has nothing to undo, so the loop ends in it
+    // the last round snaps nothing, so it has nothing to take back and the loop ends in it
     Err(KernelError::Argument("the rounds of a merge did not end".into()))
 }

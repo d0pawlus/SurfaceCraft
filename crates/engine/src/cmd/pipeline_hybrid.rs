@@ -391,7 +391,8 @@ fn merged_or_wrap(
     let mesh = if tried.merged.is_empty() { None } else { meshed(&tried.body, set.tolerance) };
     stages.push(stage("mesh_check", &watch));
     let Some(mesh) = mesh else {
-        return Ok((wrap_result, none(tried.left)));
+        let why = "the mesher does not take the merged body, so the wrap was kept";
+        return Ok((wrap_result, none(unkept(tried.left, &tried.merged, why))));
     };
     let watch = Stopwatch::start();
     let merged_w = install(s, w, tried.body.clone())?;
@@ -399,20 +400,35 @@ fn merged_or_wrap(
     let watch = Stopwatch::start();
     let merged = judge_stage(s, set, report.clone(), &merged_w, retry).map_err(failed_at("hybrid_failed"))?;
     stages.push(stage("judge_merged", &watch));
-    let (out, kept) = keep_or_wrap(s, w.body.id, &brep, (wrap_result, merged), (set.tolerance, &tried.merged))?;
-    Ok((out, if kept { Merging { mesh: Some(mesh), ..tried } } else { none(tried.left) }))
+    match keep_or_wrap(s, w.body.id, &brep, (wrap_result, merged), (set.tolerance, &tried.merged))? {
+        (out, None) => Ok((out, Merging { mesh: Some(mesh), ..tried })),
+        (out, Some(why)) => {
+            Ok((out, none(unkept(tried.left, &tried.merged, &format!("the merge was not kept: {why}")))))
+        }
+    }
+}
+
+/// `left` and the merged faces that did not make it into the result, as groups left as patches with `why`.
+fn unkept(mut left: Vec<LeftPatches>, merged: &[MergedFace], why: &str) -> Vec<LeftPatches> {
+    left.extend(merged.iter().map(|g| LeftPatches {
+        primitive: g.primitive,
+        kind: g.kind.clone(),
+        patches: g.patches,
+        reason: why.to_string(),
+    }));
+    left
 }
 
 /// The judged merged result when it is not worse than the wrap (with a note of how it deviates), else the wrap's
 /// result with the issue `hybrid_merge_rejected`, and the wrap body `wrap` put back in the document body `id`
-/// (as the wrap had it: the merged one is gone). Says which it kept.
+/// (as the wrap had it: the merged one is gone). Says why the merge was rejected, if it was.
 fn keep_or_wrap(
     s: &mut Session,
     id: ObjectId,
     wrap: &Brep,
     results: (ToSolidOut, ToSolidOut),
     (tolerance, faces): (f64, &[MergedFace]),
-) -> Step<(ToSolidOut, bool)> {
+) -> Step<(ToSolidOut, Option<String>)> {
     let (mut wrap_result, mut merged) = results;
     if let Some(why) = rejection(&merged, &wrap_result, tolerance) {
         set_body(s, id, wrap.clone())?;
@@ -420,12 +436,12 @@ fn keep_or_wrap(
         wrap_result
             .issues
             .push(issue("hybrid_merge_rejected", format!("the merge was not kept: {why} (merged: {list})")));
-        return Ok((wrap_result, false));
+        return Ok((wrap_result, Some(why)));
     }
     if let Some(how) = deviations(&merged, &wrap_result) {
         merged.issues.push(issue("hybrid_merge_deviation", format!("the merge was kept: {how}")));
     }
-    Ok((merged, true))
+    Ok((merged, None))
 }
 
 /// The merged faces in a line: kind, patches and gap of each.
@@ -598,9 +614,9 @@ mod tests {
         let (wrap_result, worse) = (figures(0.1), figures(0.5));
         let before = serde_json::to_value(&wrap_result).unwrap();
         let faces = [];
-        let (out, kept) = keep_or_wrap(&mut s, id, &wrap_brep, (wrap_result.clone(), worse), (0.2, &faces))
+        let (out, rejected) = keep_or_wrap(&mut s, id, &wrap_brep, (wrap_result.clone(), worse), (0.2, &faces))
             .unwrap_or_else(|_| panic!("the decision failed"));
-        assert!(!kept);
+        assert!(rejected.is_some());
         assert_eq!(*s.doc.body(id).unwrap().brep, wrap_brep, "the document holds the wrap's record");
         let mut after = serde_json::to_value(&out).unwrap();
         let issues = after["issues"].as_array_mut().unwrap();
@@ -612,10 +628,36 @@ mod tests {
         assert_eq!(after, expected, "counts, volume and deviation are the wrap's, bit for bit");
         // not worse: kept, with the note, and the document body untouched
         let id2 = s.doc.add_body("merged", merged_brep.clone());
-        let (out, kept) = keep_or_wrap(&mut s, id2, &wrap_brep, (wrap_result, figures(0.1)), (0.2, &faces))
+        let (out, rejected) = keep_or_wrap(&mut s, id2, &wrap_brep, (wrap_result, figures(0.1)), (0.2, &faces))
             .unwrap_or_else(|_| panic!("the decision failed"));
-        assert!(kept);
+        assert!(rejected.is_none());
         assert_eq!(*s.doc.body(id2).unwrap().brep, merged_brep);
         assert!(out.issues.iter().any(|i| i.code == "hybrid_merge_deviation"));
+    }
+
+    /// Merged groups that do not make it into the result (the mesher does not take the merged body, or the merge is
+    /// rejected) are listed with the groups left as patches, each with the reason.
+    #[test]
+    fn merged_groups_that_are_not_kept_are_listed_as_left_as_patches() {
+        let face = |kind: &str, patches| MergedFace {
+            primitive: ObjectId(7),
+            kind: kind.to_string(),
+            face: 0,
+            patches,
+            max_edge_gap: 0.0,
+            area: 0.0,
+            patch_area: 0.0,
+        };
+        let left = vec![LeftPatches {
+            primitive: ObjectId(8),
+            kind: "cone".into(),
+            patches: 1,
+            reason: "a single patch".into(),
+        }];
+        let all = unkept(left, &[face("plane", 5), face("cylinder", 3)], "the mesher does not take the merged body");
+        assert_eq!(all.len(), 3);
+        assert_eq!((all[1].kind.as_str(), all[1].patches), ("plane", 5));
+        assert!(all[1..].iter().all(|l| l.reason.contains("mesher")));
+        assert_eq!(all[0].reason, "a single patch", "what was left stays as it was");
     }
 }

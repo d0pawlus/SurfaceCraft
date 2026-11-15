@@ -43,7 +43,7 @@ mod settle;
 mod snap;
 mod trim;
 
-use boundary::{Boundary, LoopEdge, edge_points};
+use boundary::LoopEdge;
 use geometry::Group;
 pub use place::Gauge;
 use place::{Placement, place};
@@ -131,10 +131,12 @@ fn patch_outward(body: &Brep, face: usize) -> Result<V> {
 
 /// The pcurve of a boundary edge on the new face (a cone or a sphere: planes and cylinders are built by the
 /// kernel, `trim`), along the edge's own interval.
-fn pcurve(body: &Brep, edge: u32, placed: &Placement) -> Result<Curve2> {
+fn pcurve(body: &Brep, group: &Group, edge: u32, placed: &Placement) -> Result<Curve2> {
     let e = body.edges.get(edge as usize).ok_or_else(|| KernelError::Argument("edge index".into()))?;
     let [lo, hi] = e.interval;
-    Ok(through(&edge_points(body, edge)?, lo, hi, placed))
+    let points =
+        group.edge_points(edge).ok_or_else(|| KernelError::Argument("a boundary edge has no points".into()))?;
+    Ok(through(points, lo, hi, placed))
 }
 
 /// A C0 chain of cubic Béziers through the surface parameters of the samples `points` (equally
@@ -181,16 +183,16 @@ struct Prepared {
 }
 
 /// The parameters of the points along a loop of the face, as the loop runs.
-fn loop_points(body: &Brep, edges: &[LoopEdge], placed: &Placement) -> Result<Vec<[f64; 2]>> {
+fn loop_points(group: &Group, edges: &[LoopEdge], placed: &Placement) -> Result<Vec<[f64; 2]>> {
     let mut pts: Vec<[f64; 2]> = Vec::new();
     for le in edges {
-        let mut p = edge_points(body, le.edge)?;
+        let mut p = group.edge_points(le.edge).cloned().unwrap_or_default();
         if !le.forward {
             p.reverse();
         }
         pts.extend(p.iter().map(|q| placed.param(*q)));
     }
-    if pts.iter().any(|q| !finite_all(q)) {
+    if pts.is_empty() || pts.iter().any(|q| !finite_all(q)) {
         return Err(KernelError::Argument("a boundary point has no parameters on the surface".into()));
     }
     Ok(pts)
@@ -236,13 +238,14 @@ fn validate_loops(loops: &[(f64, &[[f64; 2]])]) -> Result<()> {
 /// The loops of the new face, the outer one (the largest) first, each as the face's loop. The outer
 /// loop must run counter-clockwise seen from the side the patches face, the others (holes) the other
 /// way round and inside the outer one.
-fn face_loops(body: &Brep, b: &Boundary, placed: &Placement) -> Result<Vec<Loop>> {
+fn face_loops(body: &Brep, group: &Group, placed: &Placement) -> Result<Vec<Loop>> {
+    let b = &group.boundary;
     // seen from the side the patches face, the loops run counter-clockwise; a surface whose natural
     // normal points the other way (a hole, a dimple) sees them clockwise
     let side = if placed.flip { -1.0 } else { 1.0 };
     let mut sized: Vec<(f64, Vec<[f64; 2]>, &Vec<LoopEdge>)> = Vec::new();
     for l in &b.loops {
-        let pts = loop_points(body, l, placed)?;
+        let pts = loop_points(group, l, placed)?;
         sized.push((side * polygon_area(&pts), pts, l));
     }
     sized.sort_by(|a, c| c.0.abs().total_cmp(&a.0.abs()));
@@ -251,7 +254,11 @@ fn face_loops(body: &Brep, b: &Boundary, placed: &Placement) -> Result<Vec<Loop>
     for (_, _, l) in sized {
         let mut edges: Vec<OrientedEdge> = Vec::with_capacity(l.len());
         for le in l {
-            edges.push(OrientedEdge { edge: le.edge, forward: le.forward, pcurve: pcurve(body, le.edge, placed)? });
+            edges.push(OrientedEdge {
+                edge: le.edge,
+                forward: le.forward,
+                pcurve: pcurve(body, group, le.edge, placed)?,
+            });
         }
         if placed.flip {
             edges.reverse();
@@ -291,7 +298,7 @@ fn prepare(body: &Brep, spec: &GroupSpec, group: &Group, limits: (f64, f64)) -> 
     } else {
         // the kernel's builder gives a partial cone or sphere as an unlabelled rational spline: these two
         // are placed here, with their own pcurves (see the header)
-        let loops = face_loops(body, b, &placed)?;
+        let loops = face_loops(body, group, &placed)?;
         Face { surface: placed.surface, nurbs: placed.nurbs, domain: placed.domain, loops }
     };
     Ok(Prepared {
