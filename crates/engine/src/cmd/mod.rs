@@ -26,6 +26,7 @@ pub mod mesh_edit;
 pub mod mesh_folds;
 pub mod mesh_handles;
 pub mod mesh_merge;
+mod mesh_merge_issues;
 pub mod mesh_remesh;
 pub mod param;
 pub mod pipeline;

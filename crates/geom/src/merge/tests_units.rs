@@ -24,7 +24,7 @@ fn sheet(nx: usize, ny: usize, (x0, y0): (f64, f64), h: f64) -> Mesh {
 }
 
 fn merged(scans: &[Mesh], tol: f64) -> (Mesh, Report) {
-    let (m, rep) = merge(scans, &Params { tolerance: tol }, &Cancel::new(), &mut |_| {}).unwrap();
+    let (m, rep) = merge(scans, &Params { tolerance: tol, ..Params::default() }, &Cancel::new(), &mut |_| {}).unwrap();
     (m.unwrap(), rep)
 }
 
@@ -119,7 +119,7 @@ fn inner_skins_and_debris_are_not_refused_but_reported() {
     let other = synth::sphere(Point3::new(200.0, 0.0, 0.0), 5.0, 16, 8);
     let (_, rep) = merged(&[hollow, other], 0.2);
     assert!(!rep.refused);
-    assert!(rep.issues.contains(&Issue::InnerSkins { scan: 0, skins: 1, debris: 1 }), "{:?}", rep.issues);
+    assert!(rep.issues.contains(&Issue::InnerSkins { scan: 0, skins: 1, debris: 1, unjudged: 0 }), "{:?}", rep.issues);
 }
 
 #[test]

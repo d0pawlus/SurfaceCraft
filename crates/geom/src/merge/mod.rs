@@ -45,6 +45,8 @@ mod seam;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_nest;
+#[cfg(test)]
 mod tests_pairs;
 #[cfg(test)]
 mod tests_round2;
@@ -100,10 +102,24 @@ pub const MAX_TRIANGLES: usize = 20_000_000;
 pub const MAX_TRIANGLES: usize = 2_000_000;
 
 /// Settings of [`merge`].
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Params {
     /// Surface of two scans within this distance (mm) is the same surface.
     pub tolerance: f64,
+    /// What a misaligned or displaced pair does: refuse the merge (the default) or only warn.
+    pub alignment: Alignment,
+}
+
+/// What the alignment findings of a pair (`Misaligned`, `Displaced`) do to the merge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Alignment {
+    /// They refuse it (nothing is made).
+    #[default]
+    Refuse,
+    /// They are reported and the merge proceeds (the caller knows the scans are aligned, or accepts
+    /// what the overlap gives). Refusals that protect the merge itself (a scan turned inside out,
+    /// opposed normals, a patch wound the wrong way) still refuse.
+    Warn,
 }
 
 /// Why nothing was done.
@@ -161,11 +177,11 @@ pub enum Issue {
     Stacked { share: f64, triangles: usize },
     /// Closed pieces of a scan with a negative volume that are not refused: inner skins (inside another
     /// closed piece: the inside of a hollow part) and debris below [`INVERTED_MIN_SHARE`].
-    InnerSkins { scan: usize, skins: usize, debris: usize },
+    /// `unjudged`: of the inner skins, pieces whose inside test could not be completed within its
+    /// budget (taken as inner skins, not refused).
+    InnerSkins { scan: usize, skins: usize, debris: usize, unjudged: usize },
     /// A closed piece of a scan has a negative volume: turned inside out (refused).
-    /// `unjudged`: of all the scan's negative pieces, those whose inside test ran out (judged as if
-    /// alone, so an inner skin among them can read as turned inside out).
-    Inverted { scan: usize, pieces: usize, unjudged: usize },
+    Inverted { scan: usize, pieces: usize },
     /// Exact duplicate triangles and triangles on edges of three or more triangles were left out of a
     /// scan (and count as removed).
     NonManifold { scan: usize, dropped: usize },
@@ -185,7 +201,20 @@ pub enum Issue {
 }
 
 impl Issue {
-    /// Does this issue stop the merge?
+    /// Is this a finding about the alignment of a pair (refused by default, a warning with
+    /// [`Alignment::Warn`])?
+    #[must_use]
+    pub fn is_alignment(&self) -> bool {
+        matches!(self, Issue::Misaligned { .. } | Issue::Displaced { .. })
+    }
+
+    /// Does this issue stop the merge under `alignment`?
+    #[must_use]
+    pub fn refuses_under(&self, alignment: Alignment) -> bool {
+        self.refuses() && !(alignment == Alignment::Warn && self.is_alignment())
+    }
+
+    /// Does this issue stop the merge (by default)?
     #[must_use]
     pub fn refuses(&self) -> bool {
         matches!(
@@ -332,10 +361,10 @@ fn scan_issues(scans: &[Scan]) -> Vec<Issue> {
         }
         let (inverted, skins, debris) = s.negative.counts();
         if inverted > 0 {
-            out.push(Issue::Inverted { scan: k, pieces: inverted, unjudged: s.negative.unjudged });
+            out.push(Issue::Inverted { scan: k, pieces: inverted });
         }
         if skins + debris > 0 {
-            out.push(Issue::InnerSkins { scan: k, skins, debris });
+            out.push(Issue::InnerSkins { scan: k, skins, debris, unjudged: s.negative.unjudged });
         }
     }
     out
@@ -504,7 +533,7 @@ pub fn merge(
     rep.issues.extend(pair_issues(prepared.len(), &pairs, tol));
     rep.pairs = pairs;
     rep.scans = prepared.iter().zip(&covered).map(|(s, c)| first_row(s, *c)).collect();
-    if rep.issues.iter().any(Issue::refuses) {
+    if rep.issues.iter().any(|i| i.refuses_under(p.alignment)) {
         rep.refused = true;
         return Ok((None, rep));
     }

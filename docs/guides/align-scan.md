@@ -277,6 +277,9 @@ Normals, colours and per-vertex data go with the coordinates.
   and there the seam is a re-weld (a restored triangle must cross and cover nothing either). Removed
   triangles whose centre the seam leaves without result surface within the tolerance come back on their
   own scan's vertices (`seam.recovered`).
+- `alignment`: `"refuse"` (the default) or `"warn"`. With `"warn"` the alignment findings below
+  (`scans_misaligned`) are warnings with the same numbers and the merge proceeds (one undo step);
+  the other refusals still refuse.
 - Refused, with the numbers and nothing made (`refused` true, no undo step):
   - `scans_misaligned`: more than 10 % of the surface two scans share (where one lies on facing surface
     of the other, up to 8 tolerances away) lies farther apart than the tolerance. Merging them would
@@ -314,7 +317,10 @@ Normals, colours and per-vertex data go with the coordinates.
 - The report:
   - per scan: triangles `kept`, `removed`, `restored`, `collapsed` (two corners welded into one),
     `dropped`, `overlap_share`, `noise` (absent when the tolerance was given);
-  - per pair: the residual where one lies on the other (`rms`, `p95`, `worst`, `beyond_share`);
+  - per pair: the residual where one lies on the other (`shared`, `within`, `rms`, `p95`, `worst`,
+    `beyond_share`), the points over the other beyond the reach (`over`, their median distance
+    `over_offset` and spread `over_spread`, `one_offset`), `unjudged` points, and the shares of the
+    points that relate the two that lie over the other (`over_share`) and agree (`agree_share`);
   - `seam`: cut edges, length, triangles created, refusals by reason (`refused_unsupported`,
     `refused_crossing`, `refused_corners`, `refused_budget`), recovered triangles and the specks taken back again, what is still uncovered
     after the recovery (`uncovered_after_seam`),
@@ -332,8 +338,10 @@ Normals, colours and per-vertex data go with the coordinates.
   small loop stays open where all views meet in a point; it is reported).
 - Limits:
   - `mesh.merge` expects scans that are already aligned (`align.global`); its checks of the
-    alignment are a best-effort safety net, not a proof. Correct input is never refused. What they
-    do not see, or see only as a warning:
+    alignment are a best-effort safety net, not a proof. Correct input is refused only in the cases
+    marked "refused" below, each with its remedy; every alignment refusal (`scans_misaligned`) can be
+    turned into a warning with `alignment: "warn"` (the merge then proceeds with the same numbers in
+    the issue). What the checks do not see, see only as a warning, or refuse although correct:
     - a scan slid along a flat or cylindrical surface (distances along it do not change);
     - a displacement along the normals larger than the other scan's diagonal: it comes out as
       `scans_disjoint`, not as a misalignment;
@@ -345,8 +353,17 @@ Normals, colours and per-vertex data go with the coordinates.
       one side only: reported as `layers_apart` (at least 14 % of the related points over the
       other), never refused;
     - a shelf over a floor seen by different scans is the same geometry: it warns although correct;
-    - a stepped part whose levels share nothing needs a scan that sees both (a close-up of the
-      step), or the levels read as one scan displaced over the other and are refused;
+    - refused: a stepped part whose levels share nothing reads as one scan displaced over the other.
+      Remedy: a scan that sees both levels (a close-up of the step), or `alignment: "warn"`;
+    - refused: a hollow part whose outside is seen by one scan and whose bore by another that share
+      nothing: the bore's points look across the bore at the outside wall, which faces the same way.
+      Remedy: a scan that sees both, or `alignment: "warn"`;
+    - refused: a feature 1 to 8 tolerances high that only one of two scans resolves over more than
+      10 % of their shared points (a floor under a low shelf, an emboss) reads as `scans_misaligned`.
+      Remedy: a larger tolerance, or `alignment: "warn"`;
+    - refused: a correct pair whose noise has heavy tails, or a ragged or curled border in a narrow
+      overlap, once more than 10 % of its shared points lie beyond the tolerance (the default
+      tolerance covers Gaussian noise only). Remedy: a larger tolerance, or `alignment: "warn"`;
     - pairs that touch by too little for a verdict (fewer than 50 points either way) are reported as
       `overlap_too_small`, not judged.
   - Two OPEN scans that are both turned inside out, consistently, cannot be told from right ones (as

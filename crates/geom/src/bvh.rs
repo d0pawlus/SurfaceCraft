@@ -358,6 +358,86 @@ impl Bvh {
         best.map_or(RayCast::Miss, |(t, d)| RayCast::Hit(t, d))
     }
 
+    /// [`Bvh::ray_cast_bounded`] with a bound on the work (nodes visited and triangles tested
+    /// together, rejected ones included), returning the work done as well: a caller with one budget
+    /// for many casts passes what is left of it.
+    #[must_use]
+    pub fn ray_cast_counted(
+        &self,
+        origin: &Point3,
+        dir: &Vec3,
+        max_t: f64,
+        keep: &dyn Fn(usize) -> bool,
+        max_work: usize,
+    ) -> (RayCast, usize) {
+        if self.nodes.is_empty() || !crate::finite(origin) || !crate::finite_vec(dir) {
+            return (RayCast::Miss, 0);
+        }
+        let inv = Vec3::new(1.0 / dir.x, 1.0 / dir.y, 1.0 / dir.z);
+        let mut best: Option<(usize, f64)> = None;
+        let mut best_t = if max_t.is_nan() { f64::INFINITY } else { max_t };
+        let (mut stack, mut work): (Vec<u32>, usize) = (vec![0], 0);
+        while let Some(ni) = stack.pop() {
+            work += 1;
+            if work > max_work {
+                return (RayCast::Exhausted, work);
+            }
+            let Some(node) = self.nodes.get(ni as usize) else { continue };
+            if !slab(&node.bbox, origin, &inv, best_t) {
+                continue;
+            }
+            if !node.leaf {
+                stack.push(node.left);
+                stack.push(node.right);
+                continue;
+            }
+            for &ti in self.order.get(node.start as usize..node.end as usize).unwrap_or(&[]) {
+                work += 1;
+                if work > max_work {
+                    return (RayCast::Exhausted, work);
+                }
+                if let Some([a, b, c]) = self.tris.get(ti as usize)
+                    && let Some(t) = tri::ray_hit(origin, dir, &a, &b, &c)
+                    && t < best_t
+                    && keep(ti as usize)
+                {
+                    best_t = t;
+                    best = Some((ti as usize, t));
+                }
+            }
+        }
+        (best.map_or(RayCast::Miss, |(t, d)| RayCast::Hit(t, d)), work)
+    }
+
+    /// [`Bvh::candidates`] with a bound on the work (nodes visited and triangles listed together):
+    /// `(triangles, work done, ran out)`; when it ran out the list is incomplete.
+    #[must_use]
+    pub fn candidates_counted(&self, keep: &dyn Fn(&Aabb) -> bool, max_work: usize) -> (Vec<u32>, usize, bool) {
+        let mut out = Vec::new();
+        let mut work = 0usize;
+        let mut stack: Vec<u32> = if self.nodes.is_empty() { Vec::new() } else { vec![0] };
+        while let Some(ni) = stack.pop() {
+            work += 1;
+            if work > max_work {
+                return (out, work, true);
+            }
+            let Some(node) = self.nodes.get(ni as usize) else { continue };
+            if !keep(&node.bbox) {
+                continue;
+            }
+            if node.leaf {
+                let leaf = self.order.get(node.start as usize..node.end as usize).unwrap_or(&[]);
+                work += leaf.len();
+                out.extend_from_slice(leaf);
+            } else {
+                stack.push(node.left);
+                stack.push(node.right);
+            }
+        }
+        out.sort_unstable();
+        (out, work, false)
+    }
+
     /// The triangles whose own box overlaps `query` (touching counts) and that `keep` accepts (a finer test
     /// than the box, applied before counting), ascending, at most `max` of them;
     /// the flag says that there were more (the first ones found are returned, in no useful order).

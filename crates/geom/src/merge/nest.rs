@@ -3,8 +3,12 @@
 //! triangles and one over their boxes are built once; each negative piece finds the pieces whose box
 //! holds one of its vertices through the box BVH, then casts rays from that vertex that count only
 //! the crossings with those pieces (a closed surface whose box does not contain a point is crossed
-//! an even number of times). The cost grows with the pieces that can hold a piece, not with all
-//! pieces times all triangles or all pieces times all pieces.
+//! an even number of times).
+//!
+//! The whole stage has one budget of work (nodes visited, boxes listed, triangles tested),
+//! proportional to the triangles of the closed pieces: a pile of coincident pieces or many
+//! concentric shells cannot make it quadratic. Pieces left when it runs out, and pieces whose test
+//! ran out, are unjudged: counted and reported, taken as inner skins (never refused on that ground).
 use crate::bvh::RayCast;
 use crate::nesting::{DIRECTIONS, MAX_CROSSINGS};
 use crate::{Aabb, Bvh, Cancel, Mesh, Point3, Vec3, pieces};
@@ -14,24 +18,31 @@ use crate::{Aabb, Bvh, Cancel, Mesh, Point3, Vec3, pieces};
 pub const INVERTED_MIN_SHARE: f64 = 0.01;
 /// Rays of the inside test ignore crossings closer than this share of the scan's diagonal.
 const NEST_EPS_SHARE: f64 = 1e-9;
-/// Triangle tests of one ray cast at most (rejected ones count too: many shells along the ray can
-/// exhaust it); a cast that runs out, or a ray that meets [`MAX_CROSSINGS`] surfaces, leaves the
-/// piece unjudged: judged as if alone (it can refuse, never hide an inversion) and counted.
-const MAX_RAY_TESTS: usize = 1 << 16;
-/// Box tests and ray casts between two looks at the cancellation flag.
-const CANCEL_WORK: usize = 4096;
+/// Work of the whole stage at most, per triangle of the closed pieces ...
+pub(super) const WORK_PER_TRIANGLE: usize = 64;
+/// ... plus this.
+pub(super) const WORK_BASE: usize = 1 << 16;
+/// Work of one cast at most (a share of the budget, so that one pile cannot eat it all at once).
+const MAX_CAST_WORK: usize = 1 << 14;
+/// Work between two looks at the cancellation flag (plus one cast at most).
+pub(super) const CANCEL_WORK: usize = 4096;
 
-/// What the nesting test cost: BVH builds, box tests and ray casts.
+/// What the nesting test cost: BVH builds and work (nodes visited, boxes listed, triangles tested).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Cost {
     pub(super) builds: usize,
-    pub(super) boxes: usize,
-    pub(super) casts: usize,
+    pub(super) work: usize,
+    /// The budget of the stage.
+    pub(super) budget: usize,
+    /// Work at which the cancellation flag is looked at next.
+    next_look: usize,
+    /// Looks taken.
+    pub(super) looks: usize,
 }
 
 impl Cost {
-    fn work(&self) -> usize {
-        self.boxes + self.casts
+    fn left(&self) -> usize {
+        self.budget.saturating_sub(self.work)
     }
 }
 
@@ -40,11 +51,12 @@ impl Cost {
 pub(super) struct Negative {
     /// Turned inside out (refuse the merge).
     pub(super) inverted: usize,
-    /// Inside another closed piece: an inner skin.
+    /// Inside another closed piece: an inner skin (the unjudged ones included).
     pub(super) skins: usize,
     /// Small loose pieces below [`INVERTED_MIN_SHARE`] of the area all together.
     pub(super) debris: usize,
-    /// Of all of them, pieces whose inside test ran out (judged as if alone).
+    /// Of the inner skins, pieces whose inside test could not be completed within the budget (no two
+    /// directions agreed): taken as inner skins, reported.
     pub(super) unjudged: usize,
 }
 
@@ -65,7 +77,7 @@ fn volume(mesh: &Mesh, p: &pieces::Piece) -> f64 {
         .sum()
 }
 
-/// Is a piece inside the others: yes, no, or not known (a cast ran out).
+/// Is a piece inside the others: yes, no, or not known (no two directions judged alike).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Inside {
     Yes,
@@ -81,55 +93,80 @@ struct Closed<'p> {
     piece_of: Vec<usize>,
     boxes: Bvh,
     eps: f64,
+    cancel: &'p Cancel,
+    cancelled: std::cell::Cell<bool>,
 }
 
 impl Closed<'_> {
-    /// The pieces other than `k` whose box holds `p`, ascending.
-    fn holding(&self, k: usize, p: &Point3, cost: &mut Cost) -> Vec<usize> {
-        let tests = std::cell::Cell::new(0usize);
-        let found = self.boxes.candidates(&|b| {
-            tests.set(tests.get() + 1);
-            contains(b, p)
-        });
-        cost.boxes += tests.get() + found.len();
-        found
-            .into_iter()
-            .map(|j| j as usize)
-            .filter(|&j| j != k && self.pieces.get(j).is_some_and(|q| contains(&q.bbox, p)))
-            .collect()
+    /// Looks at the cancellation flag once [`CANCEL_WORK`] has been done since the last look; true
+    /// when cancelled (remembered).
+    fn polled(&self, cost: &mut Cost) -> bool {
+        if cost.work >= cost.next_look {
+            cost.next_look = cost.work.saturating_add(CANCEL_WORK);
+            cost.looks += 1;
+            if self.cancel.is_cancelled() {
+                self.cancelled.set(true);
+            }
+        }
+        self.cancelled.get()
     }
 
-    /// Does piece `k` lie inside the union of the other closed pieces (parity of the crossings along
-    /// three directions, majority)? Counts its work in `cost`.
+    /// The pieces other than `k` whose box holds `p`, ascending; `None` when the budget ran out.
+    fn holding(&self, k: usize, p: &Point3, cost: &mut Cost) -> Option<Vec<usize>> {
+        let (found, work, out) = self.boxes.candidates_counted(&|b| contains(b, p), cost.left());
+        cost.work += work;
+        if out {
+            return None;
+        }
+        Some(
+            found
+                .into_iter()
+                .map(|j| j as usize)
+                .filter(|&j| j != k && self.pieces.get(j).is_some_and(|q| contains(&q.bbox, p)))
+                .collect(),
+        )
+    }
+
+    /// Does piece `k` lie inside the union of the other closed pieces? The parity of the crossings
+    /// along three directions; the verdict of at least two judged directions that agree, else
+    /// unknown.
     fn nested(&self, mesh: &Mesh, k: usize, cost: &mut Cost) -> Inside {
         let probe = self.pieces.get(k).and_then(|p| p.triangles.first()).and_then(|&t| mesh.triangles.get(t as usize));
         let Some(p) = probe.and_then(|t| mesh.positions.get(t[0] as usize)).copied() else { return Inside::No };
-        let holders = self.holding(k, &p, cost);
+        let Some(holders) = self.holding(k, &p, cost) else { return Inside::Unknown };
         if holders.is_empty() {
             return Inside::No;
         }
         let keep = |t: usize| self.piece_of.get(t).is_some_and(|j| holders.binary_search(j).is_ok());
-        let mut odd = 0;
+        let (mut odd, mut even) = (0, 0);
         for d in &DIRECTIONS {
             let dir = Vec3::new(d[0], d[1], d[2]).normalize();
             match self.crossings(&p, &dir, &keep, cost) {
-                Some(n) => odd += n % 2,
-                None => return Inside::Unknown,
+                Some(n) if n % 2 == 1 => odd += 1,
+                Some(_) => even += 1,
+                None => {}
             }
         }
-        if odd >= 2 { Inside::Yes } else { Inside::No }
+        if odd >= 2 {
+            Inside::Yes
+        } else if even >= 2 {
+            Inside::No
+        } else {
+            Inside::Unknown
+        }
     }
 
-    /// Crossings of the ray from `p` along `dir` with the triangles `keep` passes; `None` when a cast
-    /// ran out of its budget or the ray met [`MAX_CROSSINGS`] surfaces.
+    /// Crossings of the ray from `p` along `dir` with the triangles `keep` passes; `None` when the
+    /// budget ran out or the ray met [`MAX_CROSSINGS`] surfaces.
     fn crossings(&self, p: &Point3, dir: &Vec3, keep: &dyn Fn(usize) -> bool, cost: &mut Cost) -> Option<usize> {
         let (mut o, mut n) = (*p, 0);
         loop {
-            if n >= MAX_CROSSINGS {
+            if n >= MAX_CROSSINGS || self.polled(cost) {
                 return None;
             }
-            cost.casts += 1;
-            match self.bvh.ray_cast_bounded(&o, dir, f64::INFINITY, keep, MAX_RAY_TESTS) {
+            let (cast, work) = self.bvh.ray_cast_counted(&o, dir, f64::INFINITY, keep, cost.left().min(MAX_CAST_WORK));
+            cost.work += work;
+            match cast {
                 RayCast::Hit(_, t) => {
                     n += 1;
                     o += dir * (t + self.eps);
@@ -157,7 +194,7 @@ pub(super) fn negative_pieces(mesh: &Mesh, cancel: &Cancel) -> Option<Negative> 
 }
 
 /// The two BVHs of the closed pieces (see [`Closed`]).
-fn closed_set<'p>(mesh: &Mesh, closed: Vec<&'p pieces::Piece>) -> Closed<'p> {
+fn closed_set<'p>(mesh: &Mesh, closed: Vec<&'p pieces::Piece>, cancel: &'p Cancel) -> Closed<'p> {
     let ids: Vec<u32> = closed.iter().flat_map(|p| p.triangles.iter().copied()).collect();
     let piece_of: Vec<usize> =
         closed.iter().enumerate().flat_map(|(j, p)| std::iter::repeat_n(j, p.triangles.len())).collect();
@@ -166,7 +203,15 @@ fn closed_set<'p>(mesh: &Mesh, closed: Vec<&'p pieces::Piece>) -> Closed<'p> {
         triangles: (0..closed.len() as u32).map(|j| [2 * j, 2 * j + 1, 2 * j]).collect(),
     };
     let eps = NEST_EPS_SHARE * mesh.bbox().diagonal().max(f64::MIN_POSITIVE);
-    Closed { bvh: Bvh::build(&mesh.submesh(&ids)), pieces: closed, piece_of, boxes: Bvh::build(&boxes), eps }
+    Closed {
+        bvh: Bvh::build(&mesh.submesh(&ids)),
+        pieces: closed,
+        piece_of,
+        boxes: Bvh::build(&boxes),
+        eps,
+        cancel,
+        cancelled: std::cell::Cell::new(false),
+    }
 }
 
 /// [`negative_pieces`] and what its nesting tests cost.
@@ -175,32 +220,38 @@ pub(super) fn negative_pieces_costed(mesh: &Mesh, cancel: &Cancel) -> Option<(Ne
     let closed: Vec<&pieces::Piece> = all.iter().filter(|p| p.closed()).collect();
     let negative: Vec<usize> =
         (0..closed.len()).filter(|&k| closed.get(k).is_some_and(|p| volume(mesh, p) < 0.0)).collect();
-    let mut cost = Cost::default();
+    let triangles: usize = closed.iter().map(|p| p.triangles.len()).sum();
+    let mut cost =
+        Cost { budget: WORK_BASE.saturating_add(WORK_PER_TRIANGLE.saturating_mul(triangles)), ..Cost::default() };
     if negative.is_empty() {
         return Some((Negative::default(), cost));
     }
     cost.builds += 1;
-    let set = closed_set(mesh, closed);
+    let set = closed_set(mesh, closed, cancel);
     let area = mesh.area();
-    let (mut out, mut debris_area, mut next_look) = (Negative::default(), 0.0, 0usize);
+    let (mut out, mut debris_area) = (Negative::default(), 0.0);
     for &k in &negative {
-        // polled by the work done since the last look
-        if cost.work() >= next_look {
-            if cancel.is_cancelled() {
-                return None;
-            }
-            next_look = cost.work() + CANCEL_WORK;
+        // polled by the work done since the last look (also inside the casts)
+        if set.polled(&mut cost) {
+            return None;
         }
         let Some(p) = set.pieces.get(k) else { continue };
-        let inside = set.nested(mesh, k, &mut cost);
-        out.unjudged += usize::from(inside == Inside::Unknown);
-        if inside == Inside::Yes {
-            out.skins += 1;
-        } else if p.area < INVERTED_MIN_SHARE * area {
-            out.debris += 1;
-            debris_area += p.area;
-        } else {
-            out.inverted += 1;
+        // once the budget is spent the rest are unjudged without any more work
+        let inside = if cost.left() == 0 { Inside::Unknown } else { set.nested(mesh, k, &mut cost) };
+        if set.cancelled.get() {
+            return None;
+        }
+        match inside {
+            Inside::Yes => out.skins += 1,
+            Inside::Unknown => {
+                out.skins += 1;
+                out.unjudged += 1;
+            }
+            Inside::No if p.area < INVERTED_MIN_SHARE * area => {
+                out.debris += 1;
+                debris_area += p.area;
+            }
+            Inside::No => out.inverted += 1,
         }
     }
     if debris_area >= INVERTED_MIN_SHARE * area {

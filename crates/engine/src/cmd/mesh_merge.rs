@@ -9,7 +9,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use surfacecraft_doc::{ObjectId, ObjectKind};
 use surfacecraft_geom::Mesh;
-use surfacecraft_geom::merge::{Issue, MergeError, Params, Report, Stage, Topology, merge};
+use surfacecraft_geom::merge::{Alignment, MergeError, Params, Report, Stage, Topology, merge};
 
 /// Wall-clock time since a stage started; zero where the clock is not available (the browser build).
 struct Stopwatch(#[cfg(not(target_arch = "wasm32"))] std::time::Instant);
@@ -59,6 +59,20 @@ pub struct MergeIn {
     /// Name of the new mesh (default "merged").
     #[serde(default)]
     pub name: Option<String>,
+    /// What scans found misaligned or displaced do: "refuse" the merge (the default) or "warn" and merge anyway.
+    #[serde(default)]
+    pub alignment: AlignmentIn,
+}
+
+/// What scans found misaligned or displaced do to the merge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum AlignmentIn {
+    /// Refuse the merge with the numbers (the default).
+    #[default]
+    Refuse,
+    /// Report them as warnings and merge anyway (refusals that protect the merge itself still refuse).
+    Warn,
 }
 
 /// One scan in the merge.
@@ -285,256 +299,6 @@ fn topology_out(t: &Topology) -> MergeTopologyOut {
     }
 }
 
-fn issue(code: &str, severity: &str, scans: Vec<usize>, message: String) -> MergeIssueOut {
-    MergeIssueOut { code: code.into(), severity: severity.into(), scans, message }
-}
-
-/// The issue in the form of the command.
-fn issue_out(i: &Issue) -> MergeIssueOut {
-    refusal_out(i).or_else(|| scan_notice(i)).unwrap_or_else(|| notice_out(i))
-}
-
-/// An issue that refuses, in the form of the command.
-fn refusal_out(i: &Issue) -> Option<MergeIssueOut> {
-    Some(match i {
-        Issue::Misaligned { a, b, near, over, beyond_share, rms, p95 } => issue(
-            "scans_misaligned",
-            "refusal",
-            vec![*a, *b],
-            format!(
-                "scans {a} and {b} disagree where they overlap: {:.1} % of {near} shared points lie farther apart than the tolerance (rms {rms:.4} mm, 95th percentile {p95:.4} mm), and {over} points lie over the other scan farther away than {} tolerances; they are not averaged or stacked: align them better (align.icp, align.global) or give a larger tolerance",
-                100.0 * beyond_share,
-                surfacecraft_geom::merge::REACH_TOLERANCES
-            ),
-        ),
-        Issue::Displaced { a, b, samples, over, within, offset } => issue(
-            "scans_misaligned",
-            "refusal",
-            vec![*a, *b],
-            format!(
-                "scan {a} lies over scan {b} displaced along its normals: {over} of {samples} points of scan {a} lie over scan {b} farther than {} tolerances (median {offset:.4} mm along the normal), {within} within the tolerance, and no scan that shares surface with both ties them; they are not stacked: align them better (align.icp, align.global)",
-                surfacecraft_geom::merge::REACH_TOLERANCES
-            ),
-        ),
-        Issue::Opposed { a, b, opposed, facing } => issue(
-            "opposed_normals",
-            "refusal",
-            vec![*a, *b],
-            format!(
-                "the normals of scans {a} and {b} oppose where they meet ({opposed} points on opposed surface, {facing} on facing surface): one of them is turned inside out; orient it outward and merge again"
-            ),
-        ),
-        Issue::Winding { scan, flipped, share } => issue(
-            "inconsistent_winding",
-            "refusal",
-            vec![*scan],
-            format!(
-                "{flipped} triangles of scan {scan} ({:.2} % of its area) are wound against the rest of their piece: a patch is turned inside out; repair its orientation first",
-                100.0 * share
-            ),
-        ),
-        Issue::Inverted { scan, pieces, unjudged: 0 } => issue(
-            "inverted_scan",
-            "refusal",
-            vec![*scan],
-            format!(
-                "{pieces} closed piece(s) of scan {scan} have a negative volume: turned inside out; orient it outward and merge again"
-            ),
-        ),
-        Issue::Inverted { scan, pieces, unjudged } => issue(
-            "inverted_scan",
-            "refusal",
-            vec![*scan],
-            format!(
-                "{pieces} closed piece(s) of scan {scan} have a negative volume: turned inside out; orient it outward and merge again (for {unjudged} negative piece(s) the test whether they lie inside another piece ran out of its budget: they were judged as if alone)"
-            ),
-        ),
-        _ => return None,
-    })
-}
-
-/// An issue about the scans given that does not refuse, in the form of the command.
-fn scan_notice(i: &Issue) -> Option<MergeIssueOut> {
-    if let Some(out) = pair_notice(i) {
-        return Some(out);
-    }
-    Some(match i {
-        Issue::NonManifold { scan, dropped } => issue(
-            "non_manifold_input",
-            "warning",
-            vec![*scan],
-            format!(
-                "{dropped} triangles of scan {scan} are exact duplicates or lie on edges of three or more triangles and were left out (they count as removed in the checks)"
-            ),
-        ),
-        Issue::InnerSkins { scan, skins, debris } => issue(
-            "inner_skins",
-            "info",
-            vec![*scan],
-            format!(
-                "scan {scan} has {skins} closed inner skin(s) (inside another piece, facing inward as the inside of a hollow part does) and {debris} closed debris piece(s) below {:.0} % of its area together with a negative volume; they are not taken as turned inside out",
-                100.0 * surfacecraft_geom::merge::INVERTED_MIN_SHARE
-            ),
-        ),
-        Issue::Disjoint { groups } => issue(
-            "scans_disjoint",
-            "info",
-            groups.iter().flatten().copied().collect(),
-            format!(
-                "the scans fall into {} groups that share no surface ({groups:?}): the result is a union of separate pieces",
-                groups.len()
-            ),
-        ),
-        _ => return None,
-    })
-}
-
-/// A notice about a pair of scans that does not refuse, in the form of the command.
-fn pair_notice(i: &Issue) -> Option<MergeIssueOut> {
-    Some(match i {
-        Issue::LayersApart { a, b, over, related, offset, spread, one_offset } => issue(
-            "layers_apart",
-            "warning",
-            vec![*a, *b],
-            format!(
-                "scans {a} and {b} meet in places but also lie over each other: {over} of the {related} points of scan {a} that relate to scan {b} lie over it farther than {} tolerances, median {offset:.4} mm along the normals, {spread:.4} mm between the quartiles ({}); either the part has a face there (a shelf over a floor) or one scan is displaced: check the alignment",
-                surfacecraft_geom::merge::REACH_TOLERANCES,
-                if *one_offset {
-                    "one offset: a shift as a whole"
-                } else {
-                    "not one offset: a tilt or a curved surface"
-                }
-            ),
-        ),
-        Issue::SmallOverlap { a, b, near, over } => issue(
-            "overlap_too_small",
-            "info",
-            vec![*a, *b],
-            format!(
-                "scans {a} and {b} touch by too little to judge their alignment: {} and {} points on the other, {} and {} over it (fewer than {} each)",
-                near[0],
-                near[1],
-                over[0],
-                over[1],
-                surfacecraft_geom::merge::MIN_SHARED_SAMPLES
-            ),
-        ),
-        Issue::Unjudged { a, b, samples } => issue(
-            "overlap_unjudged",
-            "warning",
-            vec![*a, *b],
-            format!(
-                "{samples} points of scan {a} could not be judged against scan {b}: the search along their normal ran out of its budget (a pile of triangles)"
-            ),
-        ),
-        _ => return None,
-    })
-}
-
-/// An issue about the result, in the form of the command.
-fn notice_out(i: &Issue) -> MergeIssueOut {
-    match i {
-        Issue::FullyCovered { scan } => issue(
-            "scan_fully_covered",
-            "info",
-            vec![*scan],
-            format!("scan {scan} lies wholly on the others: nothing of it is in the result"),
-        ),
-        Issue::OverBudget { refusals } => issue(
-            "seam_over_budget",
-            "warning",
-            Vec::new(),
-            format!(
-                "{refusals} times a triangle of the seam or the restoration, or the fill of a hole, was left out because testing it for crossings would have compared too many triangles (a pile of triangles, or a very long one among many new ones)"
-            ),
-        ),
-        Issue::SeamOpen { edges, length } => issue(
-            "seam_open",
-            "warning",
-            Vec::new(),
-            format!(
-                "{edges} cut edges ({length:.1} mm) stayed open: no triangle there lay on scanned surface without crossing another"
-            ),
-        ),
-        Issue::RemovedUncovered { share, worst } => issue(
-            "removed_not_covered",
-            "warning",
-            Vec::new(),
-            format!(
-                "only {:.2} % of the removed area lies within the tolerance of the result (worst {worst:.3} mm)",
-                100.0 * share
-            ),
-        ),
-        Issue::Pinched { before, after } => issue(
-            "pinched_vertices",
-            "warning",
-            Vec::new(),
-            format!("the result has {after} pinched vertices (the scans had {before})"),
-        ),
-        other => check_notice(other),
-    }
-}
-
-/// An issue of the result's own checks (and the scans' flipped triangles), in the form of the command.
-fn check_notice(i: &Issue) -> MergeIssueOut {
-    match i {
-        Issue::FlippedDropped { scan, flipped, share } => issue(
-            "flipped_triangles_dropped",
-            "warning",
-            vec![*scan],
-            format!(
-                "{flipped} triangles of scan {scan} ({:.3} % of its area) were wound against the rest of their piece and were left out (they count as removed in the checks)",
-                100.0 * share
-            ),
-        ),
-        Issue::Unoriented { edges } => issue(
-            "unoriented_edges",
-            "warning",
-            Vec::new(),
-            format!("{edges} edges of the result have two triangles that run the same way"),
-        ),
-        Issue::Unwelded { vertices } => issue(
-            "unwelded_vertices",
-            "warning",
-            Vec::new(),
-            format!(
-                "{vertices} vertices of the result lie at (nearly) the point of a vertex of another scan without an edge between them"
-            ),
-        ),
-        Issue::Stacked { share, triangles } => stacked_notice(*share, *triangles),
-        // refusals, scan notices and notices are written by the functions above
-        other @ (Issue::Misaligned { .. }
-        | Issue::Displaced { .. }
-        | Issue::LayersApart { .. }
-        | Issue::Unjudged { .. }
-        | Issue::SmallOverlap { .. }
-        | Issue::Opposed { .. }
-        | Issue::Winding { .. }
-        | Issue::Inverted { .. }
-        | Issue::InnerSkins { .. }
-        | Issue::NonManifold { .. }
-        | Issue::Disjoint { .. }
-        | Issue::FullyCovered { .. }
-        | Issue::SeamOpen { .. }
-        | Issue::OverBudget { .. }
-        | Issue::RemovedUncovered { .. }
-        | Issue::Pinched { .. }) => issue("other", "warning", Vec::new(), format!("{other:?}")),
-    }
-}
-
-/// The notice of two layers left in the result.
-fn stacked_notice(share: f64, triangles: usize) -> MergeIssueOut {
-    issue(
-        "layers_stacked",
-        "warning",
-        Vec::new(),
-        format!(
-            "{triangles} triangles ({:.2} % of the scans' area in the result) lie on another scan's surface: two layers were left there",
-            100.0 * share
-        ),
-    )
-}
-
 /// Noise estimate (σ) and median edge of every scan, and the default tolerance from them.
 fn default_tolerance(meshes: &[Mesh]) -> (Vec<f64>, f64) {
     let noise: Vec<f64> = meshes.iter().map(|m| surfacecraft_deviation::noise_estimate(m).sigma).collect();
@@ -658,10 +422,10 @@ fn meshes_of(s: &Session, objects: &[ObjRef]) -> CmdResult<(Vec<ObjectId>, Vec<M
 }
 
 /// Runs the merge with stage times; the error of a cancellation is the command's.
-fn run(meshes: &[Mesh], tolerance: f64, s: &Session) -> CmdResult<(Option<Mesh>, Report, Vec<MergeStageOut>)> {
+fn run(meshes: &[Mesh], params: Params, s: &Session) -> CmdResult<(Option<Mesh>, Report, Vec<MergeStageOut>)> {
     let mut stages: Vec<(Stage, Stopwatch)> = Vec::new();
     let mut on_stage = |st: Stage| stages.push((st, Stopwatch::start()));
-    let result = merge(meshes, &Params { tolerance }, &s.cancel, &mut on_stage);
+    let result = merge(meshes, &params, &s.cancel, &mut on_stage);
     let done = Stopwatch::start();
     let mut times: Vec<MergeStageOut> = Vec::with_capacity(stages.len());
     for (k, (st, w)) in stages.iter().enumerate() {
@@ -716,7 +480,11 @@ pub(crate) fn merge_cmd(s: &mut Session, i: MergeIn) -> CmdResult<MergeOut> {
     let given = i.tolerance.map(|t| super::deviation::positive(t, "tolerance")).transpose()?;
     let (ids, meshes) = meshes_of(s, &i.objects)?;
     let (noise, tolerance, source) = tolerance_of(&meshes, given)?;
-    let (mesh, rep, stages) = run(&meshes, tolerance, s)?;
+    let alignment = match i.alignment {
+        AlignmentIn::Refuse => Alignment::Refuse,
+        AlignmentIn::Warn => Alignment::Warn,
+    };
+    let (mesh, rep, stages) = run(&meshes, Params { tolerance, alignment }, s)?;
     let triangles = mesh.as_ref().map_or(0, Mesh::triangle_count);
     let out = MergeOut {
         id: None,
@@ -731,7 +499,11 @@ pub(crate) fn merge_cmd(s: &mut Session, i: MergeIn) -> CmdResult<MergeOut> {
         before: topology_out(&rep.before),
         after: topology_out(&rep.after),
         checks: checks_out(&rep),
-        issues: rep.issues.iter().map(issue_out).collect(),
+        issues: rep
+            .issues
+            .iter()
+            .map(|x| super::mesh_merge_issues::issue_out(x, i.alignment == AlignmentIn::Warn))
+            .collect(),
         triangles,
         stages,
         note: note_of(&rep, triangles),
@@ -750,7 +522,7 @@ pub static COMMANDS: &[CommandSpec] = &[command!(
     "Merge scans",
     "Mesh",
     true,
-    "Merges aligned scans (`objects`, 2 to 64 meshes in one frame, e.g. after `align.global`) into one new mesh. Where scans overlap within `tolerance` one layer is kept: the scan in which that surface lies farthest from its own border keeps it (borders are the least reliable part of a scan), the others lose it. The seam between the kept regions is closed by ball pivoting, only with triangles that lie on surface a scan saw, so no surface is made up over an opening nobody scanned. Kept vertices stay where they are, except that seam vertices of later scans move onto coinciding seam vertices of earlier scans, by at most a quarter of the tolerance (and a tenth of the median edge). Scans that disagree in their overlap by more than the tolerance (also when they lie over each other farther apart than 8 tolerances), or whose normals oppose, are refused with the numbers (nothing is made). Reports per scan what was kept and removed, the residual of every pair, the seam, the topology before and after, and how far the removed surface lies from the result.",
+    "Merges aligned scans (`objects`, 2 to 64 meshes in one frame, e.g. after `align.global`) into one new mesh. Where scans overlap within `tolerance` one layer is kept: the scan in which that surface lies farthest from its own border keeps it (borders are the least reliable part of a scan), the others lose it. The seam between the kept regions is closed by ball pivoting, only with triangles that lie on surface a scan saw, so no surface is made up over an opening nobody scanned. Kept vertices stay where they are, except that seam vertices of later scans move onto coinciding seam vertices of earlier scans, by at most a quarter of the tolerance (and a tenth of the median edge). Scans that disagree in their overlap by more than the tolerance, or that lie over each other farther apart than 8 tolerances with no scan agreeing with both to tie them, are refused with the numbers (nothing is made) unless `alignment` is "warn"; scans whose normals oppose are always refused. Reports per scan what was kept and removed, the residual of every pair, the seam, the topology before and after, and how far the removed surface lies from the result.",
     MergeIn,
     MergeOut,
     merge_cmd

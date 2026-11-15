@@ -31,7 +31,7 @@ fn view(k: usize, dir: Vec3, reach: f64) -> Mesh {
 }
 
 fn run(views: &[Mesh], tol: f64) -> (Option<Mesh>, Report) {
-    merge(views, &Params { tolerance: tol }, &Cancel::new(), &mut |_| {}).unwrap()
+    merge(views, &Params { tolerance: tol, ..Params::default() }, &Cancel::new(), &mut |_| {}).unwrap()
 }
 
 /// The rows of the scans add up: every triangle given is kept, put back, collapsed or removed; the
@@ -152,7 +152,8 @@ fn many_views_of_the_blob_merge_manifold_and_oriented() {
 fn hostile_input_is_an_error_not_a_panic() {
     let a = view(0, Vec3::x(), 8.0);
     let cancel = Cancel::new();
-    let go = |scans: &[Mesh], tol: f64| merge(scans, &Params { tolerance: tol }, &cancel, &mut |_| {});
+    let go =
+        |scans: &[Mesh], tol: f64| merge(scans, &Params { tolerance: tol, ..Params::default() }, &cancel, &mut |_| {});
     assert!(matches!(go(std::slice::from_ref(&a), TOL), Err(MergeError::Params(_))), "one scan");
     assert!(matches!(go(&[], TOL), Err(MergeError::Params(_))), "none");
     assert!(matches!(go(&[a.clone(), Mesh::default()], TOL), Err(MergeError::Params(_))), "empty");
@@ -187,14 +188,15 @@ fn hostile_input_is_an_error_not_a_panic() {
 fn a_cancelled_merge_returns_cancelled() {
     let cancel = Cancel::new();
     cancel.cancel();
-    let r = merge(&views_of(2), &Params { tolerance: TOL }, &cancel, &mut |_| {});
+    let r = merge(&views_of(2), &Params { tolerance: TOL, ..Params::default() }, &cancel, &mut |_| {});
     assert!(matches!(r, Err(MergeError::Cancelled)), "{r:?}");
 }
 
 #[test]
 fn the_stages_are_announced_in_order() {
     let mut seen = Vec::new();
-    merge(&views_of(2), &Params { tolerance: TOL }, &Cancel::new(), &mut |s| seen.push(s)).unwrap();
+    merge(&views_of(2), &Params { tolerance: TOL, ..Params::default() }, &Cancel::new(), &mut |s| seen.push(s))
+        .unwrap();
     assert_eq!(seen, vec![Stage::Prepare, Stage::Overlap, Stage::Ownership, Stage::Union, Stage::Seam, Stage::Check]);
 }
 
@@ -208,7 +210,7 @@ fn a_cancellation_during_any_stage_is_honoured() {
             let flag = cancel.clone();
             // the flag is set when the stage starts: the stage itself must see it
             let mut seen = Vec::new();
-            let r = merge(&scans, &Params { tolerance: TOL }, &cancel, &mut |s| {
+            let r = merge(&scans, &Params { tolerance: TOL, ..Params::default() }, &cancel, &mut |s| {
                 seen.push(s);
                 if s == at {
                     flag.cancel();
@@ -464,14 +466,17 @@ fn a_cancellation_at_any_look_stops_the_merge() {
     let views = views_of(2);
     let big = 1usize << 40;
     let counter = Cancel::after_looks(big);
-    merge(&views, &Params { tolerance: TOL }, &counter, &mut |_| {}).unwrap();
+    merge(&views, &Params { tolerance: TOL, ..Params::default() }, &counter, &mut |_| {}).unwrap();
     let looks = big - counter.looks_left();
     eprintln!("{looks} looks at the flag in one merge of two views");
     assert!(looks > 20, "{looks}");
     // fired at its n-th look, for n spread over the whole run: every look that sees it stops the merge
     for n in (1..=looks).step_by((looks / 60).max(1)).chain([looks]) {
-        let r = merge(&views, &Params { tolerance: TOL }, &Cancel::after_looks(n), &mut |_| {});
+        let r = merge(&views, &Params { tolerance: TOL, ..Params::default() }, &Cancel::after_looks(n), &mut |_| {});
         assert!(matches!(r, Err(MergeError::Cancelled)), "fired at look {n} of {looks}: {r:?}");
     }
-    assert!(merge(&views, &Params { tolerance: TOL }, &Cancel::after_looks(looks + 1), &mut |_| {}).is_ok());
+    assert!(
+        merge(&views, &Params { tolerance: TOL, ..Params::default() }, &Cancel::after_looks(looks + 1), &mut |_| {})
+            .is_ok()
+    );
 }

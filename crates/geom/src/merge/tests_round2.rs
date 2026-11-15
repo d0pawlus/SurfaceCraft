@@ -31,7 +31,7 @@ pub(super) fn flipped(m: &Mesh) -> Mesh {
 }
 
 pub(super) fn report(scans: &[Mesh], tol: f64) -> Report {
-    let rep = merge(scans, &Params { tolerance: tol }, &Cancel::new(), &mut |_| {}).unwrap().1;
+    let rep = merge(scans, &Params { tolerance: tol, ..Params::default() }, &Cancel::new(), &mut |_| {}).unwrap().1;
     let shares: Vec<String> = rep
         .pairs
         .iter()
@@ -241,7 +241,7 @@ fn too_many_triangles_are_refused_before_anything_is_built() {
     let three = vec![Point3::origin(), Point3::new(1.0, 0.0, 0.0), Point3::new(0.0, 1.0, 0.0)];
     let big = Mesh { positions: three.clone(), triangles: vec![[0, 1, 2]; MAX_TRIANGLES] };
     let small = Mesh { positions: three, triangles: vec![[0, 1, 2]] };
-    let r = merge(&[big, small], &Params { tolerance: 0.1 }, &Cancel::new(), &mut |_| {});
+    let r = merge(&[big, small], &Params { tolerance: 0.1, ..Params::default() }, &Cancel::new(), &mut |_| {});
     assert!(matches!(r, Err(MergeError::Params(_))), "{r:?}");
 }
 
@@ -459,7 +459,8 @@ fn the_rows_agree_with_a_count_of_the_result_on_a_scan_with_a_duplicate_and_a_fl
     a.triangles.push(first);
     a.triangles[100] = [a.triangles[100][0], a.triangles[100][2], a.triangles[100][1]];
     let b = sheet(24, 24, (14.0, 3.0), 1.25);
-    let (mesh, rep) = merge(&[a.clone(), b], &Params { tolerance: tol }, &Cancel::new(), &mut |_| {}).unwrap();
+    let (mesh, rep) =
+        merge(&[a.clone(), b], &Params { tolerance: tol, ..Params::default() }, &Cancel::new(), &mut |_| {}).unwrap();
     let mesh = mesh.unwrap();
     let row = &rep.scans[0];
     assert_eq!(row.triangles, a.triangle_count());
@@ -491,12 +492,11 @@ fn thousands_of_small_inverted_pieces_cost_one_bvh_and_a_bounded_number_of_casts
     let (n, cost) = nest::negative_pieces_costed(&m, &Cancel::new()).unwrap();
     assert_eq!(n.counts(), (0, 0, count));
     assert_eq!(n.unjudged, 0);
-    // two BVHs (triangles and boxes) built once; the holding boxes found through the box BVH: a few
-    // dozen box tests a piece, not one per piece (3000 x 3001)
+    // two BVHs (triangles and boxes) built once; the holding boxes found through the box BVH and
+    // three short casts a piece: a few hundred units of work a piece, not one box per piece (3000 x
+    // 3001), and within the stage's budget
     assert_eq!(cost.builds, 1);
-    assert!(cost.boxes <= count * 100, "{cost:?}");
-    // per piece three directions, each at most the large sphere's two crossings and a miss
-    assert!(cost.casts <= count * 3 * 3, "{cost:?}");
+    assert!(cost.work <= count * 1000 && cost.work <= cost.budget, "{cost:?}");
     assert!(nest::negative_pieces(&m, &Cancel::after_looks(2)).is_none(), "a cancellation stops the stage");
 }
 

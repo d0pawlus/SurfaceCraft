@@ -410,3 +410,28 @@ fn the_same_merge_for_one_and_four_threads() {
     assert_eq!(ma, mb, "the mesh, bit for bit");
     assert_eq!(a, b, "the report");
 }
+
+#[test]
+fn alignment_warn_merges_a_displaced_pair_with_the_warning_and_refuse_is_the_default() {
+    let tol = 0.1;
+    let views = vec![sheet(0.0), sheet(30.0 * tol)];
+    let mut s = session(&views);
+    let out = merge(&mut s, 2, json!({"tolerance": tol}));
+    assert_refused(&s, &out, "scans_misaligned", 2);
+    let text = out["issues"].as_array().unwrap().iter().find(|i| i["code"] == "scans_misaligned").unwrap()["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(text.contains("alignment \"warn\""), "the refusal names the option: {text}");
+    let mut w = session(&views);
+    let out = merge(&mut w, 2, json!({"tolerance": tol, "alignment": "warn"}));
+    assert_eq!(out["refused"], json!(false), "{out}");
+    let issue = out["issues"].as_array().unwrap().iter().find(|i| i["code"] == "scans_misaligned").unwrap();
+    assert_eq!(issue["severity"], json!("warning"));
+    assert!(out["id"].is_u64());
+    assert_eq!(w.history.undo_labels().len(), 1, "the merge that proceeds is one undo step");
+    for bad in [json!("maybe"), json!(1), json!(null), json!(["warn"])] {
+        let r = w.execute("mesh.merge", json!({"objects": ["v0", "v1"], "tolerance": tol, "alignment": bad}));
+        assert!(r.is_err(), "{bad}");
+    }
+}

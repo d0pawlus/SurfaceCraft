@@ -82,7 +82,12 @@ fn a_pile_of_triangles_at_one_place_does_not_hang_the_comparison() {
         pile.positions.extend([Point3::new(0.0, 0.0, 5.0), Point3::new(10.0, 0.0, 5.0), Point3::new(10.0, 10.0, 5.0)]);
         pile.triangles.push([3 * k, 3 * k + 1, 3 * k + 2]);
     }
-    let r = merge(&[sheet(4, 4, (0.0, 0.0), 1.0), pile], &Params { tolerance: 0.1 }, &Cancel::new(), &mut |_| {});
+    let r = merge(
+        &[sheet(4, 4, (0.0, 0.0), 1.0), pile],
+        &Params { tolerance: 0.1, ..Params::default() },
+        &Cancel::new(),
+        &mut |_| {},
+    );
     let (_, rep) = r.unwrap();
     // the pile lies flat 50 tolerances over the sheet, facing the same way: displaced, refused; the
     // sheet's samples under the pile's box but beside its triangles (y > x) meet 200 000 boxes and
@@ -221,24 +226,31 @@ fn only_clean_agreement_ties_two_scans() {
         over,
         ..PairResidual::default()
     };
-    // 0 and 2 lie over each other and share nothing; 1 agrees with 2, and with 0 as given
-    let pairs = |n: usize, w: usize| {
+    // 0 and 2 lie over each other and share nothing; 1 agrees with 2, and meets 0 as given
+    let pairs = |n: usize, w: usize, o: usize| {
         [
-            r(0, 1, n, w, 0),
-            r(1, 0, n, w, 0),
+            r(0, 1, n, w, o),
+            r(1, 0, n, w, o),
             r(1, 2, 8000, 8000, 0),
             r(2, 1, 8000, 8000, 0),
             r(0, 2, 0, 0, 3000),
             r(2, 0, 0, 0, 3000),
         ]
     };
-    let displaced = |n, w| pair_issues(3, &pairs(n, w), 0.1).iter().any(|i| matches!(i, Issue::Displaced { .. }));
-    // 40 of 45 near samples agree: fewer than MIN_SHARED_SAMPLES, no tie, the displaced pair refused
-    assert!(displaced(45, 40));
-    // 60 of 60 agree, a small share of what 0 and 1 relate: a clean tie however small, no refusal
-    assert!(!displaced(60, 60));
+    let displaced = |n, w, o| {
+        pair_issues(3, &pairs(n, w, o), 0.1)
+            .iter()
+            .any(|i| matches!(i, Issue::Displaced { a: 0, b: 2, .. } | Issue::Displaced { a: 2, b: 0, .. }))
+    };
+    // 60 agreeing with 5000 over: an agreement share of about 1 %, which a share rule would reject;
+    // clean agreement ties them, so the displaced pair 0-2 is not refused
+    assert!(!displaced(60, 60, 5000));
+    // 50 agreeing of 84 near (40 % beyond the tolerance): misaligned, no tie, 0-2 refused
+    assert!(displaced(84, 50, 0));
+    // 40 of 45 near agree: fewer than MIN_SHARED_SAMPLES, no tie, 0-2 refused
+    assert!(displaced(45, 40, 0));
     // 9500 of 10 000 agree (5 % beyond, not misaligned): a tie
-    assert!(!displaced(10_000, 9500));
+    assert!(!displaced(10_000, 9500, 0));
 }
 
 /// A flat sheet of `w` x `h` mm (1 mm cells) at `origin`, spanned by `u` and `v` (its normal u x v).
@@ -310,4 +322,44 @@ fn unjudged_samples_leave_the_verdict_to_the_judged_ones() {
     let issues =
         pair_issues(2, &[none.clone(), PairResidual { a: 1, b: 0, samples: 20_000, ..PairResidual::default() }], 0.1);
     assert!(issues.iter().any(|i| matches!(i, Issue::Unjudged { samples: 19_960, .. })), "{issues:?}");
+}
+
+#[test]
+fn a_tube_seen_outside_by_one_scan_and_inside_by_another_is_refused_unless_warned() {
+    // a documented limit: scan A sees the outside wall of a tube on the left, scan B only the bore
+    // on the right; they share nothing, and B's bore points cast across the bore onto A's outside
+    // wall, which faces the same way: refused as displaced by default, merged with the warning under
+    // alignment "warn"
+    let tol = 0.1;
+    let outside = synth::cylinder(Point3::origin(), Vec3::z(), 10.0, 40.0, 64, 20);
+    let left = |m: &Mesh, keep: &dyn Fn(f64) -> bool| Mesh {
+        positions: m.positions.clone(),
+        triangles: (0..m.triangle_count())
+            .filter(|&t| keep(m.face_centroid(t).unwrap().x))
+            .map(|t| m.triangles[t])
+            .collect(),
+    };
+    let a = left(&outside, &|x| x < -2.0);
+    let bore = synth::cylinder(Point3::origin(), Vec3::z(), 6.0, 40.0, 48, 20);
+    let b = flipped(&left(&bore, &|x| x > 2.0));
+    let rep = report(&[a.clone(), b.clone()], tol);
+    assert!(rep.refused && rep.issues.iter().any(|i| matches!(i, Issue::Displaced { .. })), "{:?}", rep.issues);
+    let warned =
+        merge(&[a, b], &Params { tolerance: tol, alignment: Alignment::Warn }, &Cancel::new(), &mut |_| {}).unwrap();
+    assert!(warned.0.is_some() && !warned.1.refused, "{:?}", warned.1.issues);
+}
+
+#[test]
+fn a_low_feature_one_scan_does_not_see_reads_as_misaligned_unless_warned() {
+    // a documented limit: a 0.4 mm (4 tolerances) step over half a plate seen by one scan, the plain
+    // plate by the other: more than 10 % of their shared points lie beyond the tolerance
+    let tol = 0.1;
+    let a = sheet(20, 20, (0.0, 0.0), 1.0);
+    let mut b = sheet(10, 20, (0.0, 0.0), 1.0);
+    b.append(&moved(&sheet(10, 20, (10.0, 0.0), 1.0), Vec3::new(0.0, 0.0, 4.0 * tol)));
+    let rep = report(&[a.clone(), b.clone()], tol);
+    assert!(rep.refused && rep.issues.iter().any(|i| matches!(i, Issue::Misaligned { .. })), "{:?}", rep.issues);
+    let warned =
+        merge(&[a, b], &Params { tolerance: tol, alignment: Alignment::Warn }, &Cancel::new(), &mut |_| {}).unwrap();
+    assert!(warned.0.is_some() && !warned.1.refused, "{:?}", warned.1.issues);
 }
