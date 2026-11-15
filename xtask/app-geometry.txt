@@ -7,3 +7,7 @@ crates/fit/src/patch.rs
 crates/fit/src/features.rs
 # surface.patch (exception accepted by the owner 2026-11-12): constrained variational B-spline fit is not in solidcore; tangency-labs/solidcraft#759.
 crates/kernel/src/vpatch.rs
+# scan.to_solid method hybrid (exception accepted by the owner 2026-11-14): pcurves and loops of cone and sphere faces, seam and parameter box, snapping patch borders onto a primitive are not in solidcore; docs/upstream/12-merge-onto-primitive.md
+crates/kernel/src/merge.rs
+crates/kernel/src/merge/place.rs
+crates/kernel/src/merge/snap.rs

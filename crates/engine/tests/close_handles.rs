@@ -66,6 +66,8 @@ fn close_handles_options_are_checked() {
         json!({"scan": "scan", "handle_size": 5.0}),
         json!({"scan": "scan", "close_handles": true, "handle_size": -1.0}),
         json!({"scan": "scan", "close_handles": true, "method": "primitives"}),
+        // the hybrid method wraps the scan itself and does not close handles: refused, not ignored
+        json!({"scan": "scan", "close_handles": true, "method": "hybrid"}),
         json!({"scan": "scan", "close_handles": true, "thickness": 1.0}),
     ] {
         assert!(s.execute("scan.to_solid", bad.clone()).is_err(), "{bad}");

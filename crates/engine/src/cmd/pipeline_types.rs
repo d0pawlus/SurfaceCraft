@@ -174,4 +174,7 @@ pub struct ToSolidOut {
     /// What the thickening of an open scan did (`thickness` given).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thickened: Option<super::shell::ThickenedInfo>,
+    /// How many faces of the body are on an analytic surface and their share of its area (method `hybrid`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analytic: Option<super::hybrid_method::AnalyticSummary>,
 }

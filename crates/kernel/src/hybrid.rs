@@ -119,7 +119,7 @@ mod vector;
 
 pub use build::{solid_from_cuts, solid_from_cuts_and_tools, solid_from_plan};
 pub(crate) use cutters::keep_front;
+pub use faces::{analytic_faces, extract_face, faces_on_shape, faces_on_spline, planar_face_outward};
 pub(crate) use faces::{axis_distance, face_vertices, frame_axis};
-pub use faces::{extract_face, faces_on_shape, faces_on_spline, planar_face_outward};
 pub use patch::{cut_by_spline, patch_rise, replace_face, replace_face_up_and_down};
 pub(crate) use vector::{V, add, corners, cross, dot, frame_matrix, norm, perpendicular, scale, sub, unit};
