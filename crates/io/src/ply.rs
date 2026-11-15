@@ -99,14 +99,7 @@ pub(crate) struct PlyHeader {
 pub(crate) fn parse_header(bytes: &[u8]) -> Result<PlyHeader, IoError> {
     let end = find(bytes, b"end_header").ok_or_else(|| bad("PLY", "no end_header"))?;
     let header = std::str::from_utf8(bytes.get(..end).unwrap_or(&[])).map_err(|_| bad("PLY", "header is not text"))?;
-    let mut body_start = end + b"end_header".len();
-    // skip the line terminator
-    if bytes.get(body_start) == Some(&b'\r') {
-        body_start += 1;
-    }
-    if bytes.get(body_start) == Some(&b'\n') {
-        body_start += 1;
-    }
+    let body_start = skip_line_end(bytes, end + b"end_header".len());
     let mut lines = header.lines();
     if lines.next().map(str::trim) != Some("ply") {
         return Err(bad("PLY", "missing magic"));
@@ -114,43 +107,65 @@ pub(crate) fn parse_header(bytes: &[u8]) -> Result<PlyHeader, IoError> {
     let mut enc = None;
     let mut elements: Vec<Element> = Vec::new();
     for line in lines {
-        let toks: Vec<&str> = line.split_whitespace().collect();
-        match toks.as_slice() {
-            ["format", f, _] => {
-                enc = Some(match *f {
-                    "ascii" => Encoding::Ascii,
-                    "binary_little_endian" => Encoding::Le,
-                    "binary_big_endian" => Encoding::Be,
-                    other => return Err(bad("PLY", format!("unknown format {other}"))),
-                });
-            }
-            ["element", name, count] => {
-                let count: usize = count.parse().map_err(|_| bad("PLY", format!("bad element count {count}")))?;
-                elements.push(Element { name: (*name).to_string(), count, props: Vec::new() });
-            }
-            ["property", "list", ct, it, name] => {
-                let (Some(c), Some(i)) = (Scalar::parse(ct), Scalar::parse(it)) else {
-                    return Err(bad("PLY", format!("unknown list types {ct} {it}")));
-                };
-                elements.last_mut().ok_or_else(|| bad("PLY", "property before element"))?.props.push(Prop::List(
-                    (*name).to_string(),
-                    c,
-                    i,
-                ));
-            }
-            ["property", ty, name] => {
-                let t = Scalar::parse(ty).ok_or_else(|| bad("PLY", format!("unknown type {ty}")))?;
-                elements
-                    .last_mut()
-                    .ok_or_else(|| bad("PLY", "property before element"))?
-                    .props
-                    .push(Prop::Scalar((*name).to_string(), t));
-            }
-            _ => {}
-        }
+        header_line(line, &mut enc, &mut elements)?;
     }
     let enc = enc.ok_or_else(|| bad("PLY", "missing format line"))?;
     Ok(PlyHeader { enc, elements, body_start })
+}
+
+/// The offset after the line terminator (`\r`, `\n` or `\r\n`, if any) that starts at `at`.
+fn skip_line_end(bytes: &[u8], mut at: usize) -> usize {
+    if bytes.get(at) == Some(&b'\r') {
+        at += 1;
+    }
+    if bytes.get(at) == Some(&b'\n') {
+        at += 1;
+    }
+    at
+}
+
+/// Applies one header line to the encoding and the elements read so far (unknown lines are
+/// ignored).
+fn header_line(line: &str, enc: &mut Option<Encoding>, elements: &mut Vec<Element>) -> Result<(), IoError> {
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    match toks.as_slice() {
+        ["format", f, _] => *enc = Some(parse_encoding(f)?),
+        ["element", name, count] => elements.push(parse_element(name, count)?),
+        ["property", "list", ct, it, name] => {
+            let (Some(c), Some(i)) = (Scalar::parse(ct), Scalar::parse(it)) else {
+                return Err(bad("PLY", format!("unknown list types {ct} {it}")));
+            };
+            push_prop(elements, Prop::List((*name).to_string(), c, i))?;
+        }
+        ["property", ty, name] => {
+            let t = Scalar::parse(ty).ok_or_else(|| bad("PLY", format!("unknown type {ty}")))?;
+            push_prop(elements, Prop::Scalar((*name).to_string(), t))?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The encoding named by a `format` line.
+fn parse_encoding(f: &str) -> Result<Encoding, IoError> {
+    Ok(match f {
+        "ascii" => Encoding::Ascii,
+        "binary_little_endian" => Encoding::Le,
+        "binary_big_endian" => Encoding::Be,
+        other => return Err(bad("PLY", format!("unknown format {other}"))),
+    })
+}
+
+/// An element declaration (`element <name> <count>`) with no properties yet.
+fn parse_element(name: &str, count: &str) -> Result<Element, IoError> {
+    let count: usize = count.parse().map_err(|_| bad("PLY", format!("bad element count {count}")))?;
+    Ok(Element { name: name.to_string(), count, props: Vec::new() })
+}
+
+/// Adds a property to the element declared last.
+fn push_prop(elements: &mut [Element], prop: Prop) -> Result<(), IoError> {
+    elements.last_mut().ok_or_else(|| bad("PLY", "property before element"))?.props.push(prop);
+    Ok(())
 }
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
