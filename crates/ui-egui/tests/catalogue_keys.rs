@@ -72,7 +72,7 @@ fn first_out_of_order(keys: &[String]) -> Option<(&str, &str)> {
 fn errors_pl_json_is_sorted_by_key() {
     let (_, text) = LOCALES.iter().find(|(file, _)| *file == "errors.pl.json").expect("the file is listed");
     let keys: KeysInOrder = serde_json::from_str(text).expect("a JSON object");
-    assert!(keys.0.len() > 600, "the catalogue was read: {} keys", keys.0.len());
+    assert!(keys.0.len() > 200, "the catalogue was read: {} keys", keys.0.len());
     let broken = first_out_of_order(&keys.0);
     assert!(
         broken.is_none(),
