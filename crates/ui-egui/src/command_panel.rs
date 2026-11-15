@@ -227,9 +227,11 @@ fn signature(d: &DisplayItem) -> (u64, usize) {
 /// Computes the preview of `id` with `params` on a copy of the session.
 fn run_preview(app: &mut SurfaceCraftApp, panel: &mut CommandPanel, id: &'static str, params: Value) {
     panel.log_len = app.session.log.len();
+    // the session's display data first: the copy takes over its cache, so what the command leaves
+    // unchanged keeps its key (a cold cache would let both derive it apart, under two keys)
+    let base: HashSet<(u64, usize)> = app.session.display_items().iter().map(signature).collect();
     match app.session.preview(id, params) {
         Ok(mut copy) => {
-            let base: HashSet<(u64, usize)> = app.session.display_items().iter().map(signature).collect();
             panel.items = copy
                 .display_items()
                 .into_iter()
