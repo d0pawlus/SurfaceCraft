@@ -436,22 +436,22 @@ mod tests {
         assert_eq!((rep.filled, rep.inward), (0, 8));
     }
 
-    /// Two holes of a closed ball stored inside out that touch at one vertex are one opening: small
-    /// together, both are filled and the ball stays inside out (to be reported so); together over
-    /// the share (each under it), both are refused and counted. Two holes each under a share of
-    /// 1/1.5 cannot sum to more than 1.33 times it, so the second case keeps that margin only.
+    /// Holes of a closed ball stored inside out that meet at one vertex are one opening: two small
+    /// together are both filled and the ball stays inside out (to be reported so); eight, each well
+    /// under the share, together well over it (a bowl of the ball is left under a wide opening),
+    /// are all refused and counted.
     #[test]
-    fn two_holes_touching_at_a_vertex_are_judged_together() {
+    fn holes_meeting_at_a_vertex_are_judged_together() {
         let share = super::INWARD_PATCH_SHARE;
-        for (cut, refused) in [(12.5, false), (6.6, true)] {
-            // Arrange: a cap above `cut` removed, its opening split in two at its middle
-            let mut ball = touching_lobes(kept(&ball_inside_out(), |c| c.z < cut), 2);
+        for (cut, holes, refused) in [(12.5, 2, false), (-9.5, 8, true)] {
+            // Arrange: a cap above `cut` removed, its opening split into `holes` meeting at its middle
+            let mut ball = touching_lobes(kept(&ball_inside_out(), |c| c.z < cut), holes);
             let shares = lobe_shares(&ball);
-            assert_eq!(shares.len(), 2, "cut {cut}");
+            assert_eq!(shares.len(), holes, "cut {cut}");
             assert!(shares.iter().all(|&x| x < share / 1.5), "cut {cut}: {shares:?}");
             let total: f64 = shares.iter().sum();
             if refused {
-                assert!(total > share, "cut {cut}: {shares:?}");
+                assert!(total > 1.5 * share, "cut {cut}: {shares:?}");
             } else {
                 assert!(total < share / 1.5, "cut {cut}: {shares:?}");
             }
@@ -461,9 +461,9 @@ mod tests {
 
             // Assert
             if refused {
-                assert_eq!((rep.filled, rep.inward), (0, 2), "cut {cut}: {shares:?}");
+                assert_eq!((rep.filled, rep.inward), (0, holes), "cut {cut}: {shares:?}");
             } else {
-                assert_eq!((rep.filled, rep.inward), (2, 0), "cut {cut}: {shares:?}");
+                assert_eq!((rep.filled, rep.inward), (holes, 0), "cut {cut}: {shares:?}");
                 assert!(boundary_loops(&ball).is_empty());
                 assert!(signed_volume(&ball) < 0.0, "still inside out, to be reported so");
             }
