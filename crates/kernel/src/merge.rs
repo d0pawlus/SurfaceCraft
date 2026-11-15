@@ -399,7 +399,9 @@ const MAX_BATCHES: usize = 4;
 
 /// The most groups one merge takes (the rest stay patches, reported as such), a hard bound on the input. The work
 /// of a merge is linear in its groups: the groups are settled a batch at a time, and where the kernel refuses a
-/// whole batch each group of it costs up to two rebuilds of the body, in each of the rounds. The bound is four
+/// whole batch each group of it costs up to two rebuilds of the body; the faces of all the batches are then judged
+/// in the final body in at most two rounds (see [`settle::BATCH`] for the count). A merge settles at most four times
+/// (its rounds, `rounds`), so 256 groups cost at most about 4 (4 x 130 + 2) rebuilds. The bound is four
 /// batches: three times the most groups measured on a real scan (84), and four times the work of the single batch
 /// of 64 that was the bound before the groups were batched. It counts the specs as they are given, in order (a spec
 /// that overlaps an earlier group or cannot be prepared uses a place too): the bound has to hold before anything is
@@ -609,7 +611,11 @@ mod tests {
     }
 
     /// A new face the kernel gives back as a spline (its surface not recognised) is no analytic face: the group is
-    /// refused with that reason. The body itself stands for the rebuilt one: its face 0 is a spline patch.
+    /// refused with that reason. The body itself stands for the rebuilt one: its face 0 is a spline patch. In a merge
+    /// this verdict is one like any other: the group is dropped and the body rebuilt without it, as for the wrong
+    /// trim of `a_group_refused_in_a_later_batch_leaves_the_earlier_batch_as_it_was` (an exact plane or cylinder
+    /// face the kernel does not label cannot be made on purpose: on a real scan its recognition failed or held as
+    /// the face moved by a micrometre).
     #[test]
     fn a_new_face_given_back_as_a_spline_is_refused_with_the_reason() {
         let body = flat_sheet(4);
@@ -617,6 +623,47 @@ mod tests {
         let p = prepared_groups(&body, &[vec![0, 1, 4, 5]], &shape).remove(0);
         let why = settle::face_verdict(&body, &body, 0, &p, 0.1).unwrap().unwrap_err();
         assert!(why.contains("spline"), "{why}");
+    }
+
+    /// `rejudged` on three groups of a flat sheet: the first is the first batch's (its body is the fallback), the
+    /// second's face held up in its batch but not in the final body (it is judged against three times the area of its
+    /// patches), the third is sound. With two rounds the second is dropped with the reason and the body rebuilt with
+    /// the first and the third; with one round the rebuilt body is not judged again, so the first batch's body comes
+    /// back and the third is given back too.
+    #[test]
+    fn a_face_that_fails_in_the_final_body_is_dropped_within_the_rounds() {
+        let body = flat_sheet(4);
+        let shape = plane();
+        let mut prepared = prepared_groups(&body, &[vec![0, 1], vec![2, 3], vec![8, 9]], &shape);
+        prepared[1].area *= 3.0;
+        let refs: Vec<&Prepared> = prepared.iter().collect();
+        let run = Run { cancel: &|| false, all_at_once: true, chord: 0.1 };
+        for rounds in [2, 1] {
+            let rebuilt = settle::apply(&body, None, &refs).unwrap();
+            let (brep0, map0) = settle::apply(&body, None, &refs[..1]).unwrap();
+            let fallback = settle::Verified { brep: brep0, map: map0, at: vec![0] };
+            let taken = settle::Taken { groups: refs.clone(), at: vec![0, 1, 2] };
+            let state = (taken, vec![Ok(()), Ok(()), Ok(())]);
+            let (brep, map, verdicts) =
+                settle::rejudged(&body, None, state, rebuilt, fallback, (rounds, &run)).unwrap();
+            assert!(verdicts[0].is_ok(), "{rounds}: {:?}", verdicts[0]);
+            let why = verdicts[1].as_ref().unwrap_err();
+            assert!(why.contains("in the body with the faces of the later batches"), "{rounds}: {why}");
+            let merged = if rounds == 2 { 2 } else { 1 };
+            assert_eq!(brep.faces.len(), body.faces.len() - merged, "{rounds}: one face per merged pair");
+            assert!(map[0].is_some_and(|f| matches!(brep.faces[f].surface, Surface::Plane { .. })), "{rounds}");
+            assert_eq!(map[1], None, "{rounds}");
+            assert!(map[2].is_some() && map[3].is_some(), "{rounds}: the second group is patches again");
+            if rounds == 2 {
+                assert!(verdicts[2].is_ok());
+                assert!(map[8].is_some_and(|f| matches!(brep.faces[f].surface, Surface::Plane { .. })));
+                assert_eq!(map[9], None);
+            } else {
+                let why = verdicts[2].as_ref().unwrap_err();
+                assert!(why.contains("taken back") && why.contains("within 1 rounds"), "{why}");
+                assert!(map[8].is_some() && map[9].is_some(), "the third group is patches again");
+            }
+        }
     }
 
     /// The checks of the new faces poll the cancellation between faces: a merge cancelled after its rebuild stops

@@ -162,9 +162,12 @@ Hybrid (merge the patches that lie on a primitive; `surface.wrap` and the kernel
   sampled points (corners and middles of its triangles), it lies within the gap of them (a corner on
   the face's own boundary is left to the border test), the boundary of the face is the border of the
   group (every point of one within the gap and the chord of the other), holes wind opposite to the outer
-  loop and inside it, and it tessellates to their area. The groups are settled 64 at a time (each batch rebuilt with the faces of
-  the batches before it), at most 256 per call (the largest first; the rest are in `left_as_patches`), and a
-  cancelled call stops between groups.
+  loop and inside it, it tessellates to their area, and the kernel gives it back as its analytic surface (a face
+  the rebuild leaves a spline is refused). The groups are settled 64 at a time (each batch rebuilt with the faces of
+  the batches before it), at most 256 per call (the largest first; the rest are in `left_as_patches`); when more
+  than one batch gave faces, all of them are judged again in the final body, in at most two rounds that drop the
+  faces that no longer hold up (after that the first batch's body is kept and the later batches' groups are given
+  back), so the work stays linear in the groups. A cancelled call stops between groups.
 - A cancelled call stops between the steps; the whole run is one undo step.
 
 Primitives:

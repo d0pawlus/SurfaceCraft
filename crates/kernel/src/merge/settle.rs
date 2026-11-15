@@ -28,9 +28,17 @@ const JUDGE_CHORD_SHARE: f64 = 0.05;
 /// The most groups settled together: the groups are put into the body a batch at a time, each batch rebuilt with the
 /// faces the batches before it gave. Where the kernel refuses a whole batch, its groups go one by one, and those it
 /// takes alone but not together are dropped from the end, each drop a rebuild and the checks of the kept faces again:
-/// the batch bounds that work (at most `2 BATCH + 2` rebuilds, and the checks of `BATCH^2 / 2` faces) where a single
-/// batch of all the groups would square it.
+/// the batch bounds that work (at most `2 BATCH + 2` rebuilds, and the checks of about `BATCH^2 / 2` faces) where a
+/// single batch of all the groups would square it. With the judgement of all the faces in the final body
+/// ([`MAX_REJUDGE_ROUNDS`] rounds of at most one rebuild and the checks of every taken face), one settle of `n` groups
+/// costs at most `n / BATCH (2 BATCH + 2) + MAX_REJUDGE_ROUNDS` rebuilds and the checks of about
+/// `n BATCH / 2 + MAX_REJUDGE_ROUNDS n` faces: linear in the groups.
 pub(super) const BATCH: usize = 64;
+
+/// The most rounds in which the faces of all the batches are judged in the final body (`rejudged`). Each round drops
+/// the faces that do not hold up there and rebuilds the body without them; a body whose faces still do not all hold
+/// up after the last round is not returned: the body of the first batch that gave faces is (its faces held up in it).
+pub(super) const MAX_REJUDGE_ROUNDS: usize = 2;
 
 /// Per group: `Ok` when its face was taken, else why not.
 pub(super) type Verdicts = Vec<std::result::Result<(), String>>;
@@ -136,7 +144,7 @@ fn verify(before: &Brep, before_volume: Option<f64>, after: (&Brep, Option<f64>)
 }
 
 /// Assembles, rebuilds and verifies the groups; the body and its face map.
-fn apply(body: &Brep, volume: Option<f64>, groups: &[&Prepared]) -> Result<(Brep, Vec<Option<usize>>)> {
+pub(super) fn apply(body: &Brep, volume: Option<f64>, groups: &[&Prepared]) -> Result<(Brep, Vec<Option<usize>>)> {
     let (rec, map) = assembled(body, groups);
     let (rebuilt, volume_after) = rebuild(&rec)?;
     let removed: usize = groups.iter().map(|p| p.faces.len().saturating_sub(1)).sum();
@@ -261,6 +269,7 @@ pub(super) fn settle(body: &Brep, volume: Option<f64>, all: &[&Prepared], run: &
     let mut last: Option<(Brep, Vec<Option<usize>>)> = None;
     let mut first_refusal: Option<KernelError> = None;
     let mut batches_with_faces = 0_usize;
+    let mut first: Option<Verified> = None;
     for (b, batch) in all.chunks(BATCH).enumerate() {
         if (run.cancel)() {
             return Err(cancelled());
@@ -275,6 +284,9 @@ pub(super) fn settle(body: &Brep, volume: Option<f64>, all: &[&Prepared], run: &
                 }
                 batches_with_faces += 1;
                 verdicts.extend(v);
+                if first.is_none() {
+                    first = Some(Verified { brep: brep.clone(), map: map.clone(), at: taken.at.clone() });
+                }
                 last = Some((brep, map));
             }
             Err(_) if (run.cancel)() => return Err(cancelled()),
@@ -285,32 +297,57 @@ pub(super) fn settle(body: &Brep, volume: Option<f64>, all: &[&Prepared], run: &
             }
         }
     }
-    match last {
-        Some(rebuilt) if batches_with_faces > 1 => rejudged(body, volume, taken, verdicts, rebuilt, run),
-        Some((brep, map)) => Ok((brep, map, verdicts)),
-        None => Err(first_refusal.unwrap_or_else(|| KernelError::Argument("no group to merge".into()))),
+    match (last, first) {
+        (Some(rebuilt), Some(fallback)) if batches_with_faces > 1 => {
+            rejudged(body, volume, (taken, verdicts), rebuilt, fallback, (MAX_REJUDGE_ROUNDS, run))
+        }
+        (Some((brep, map)), _) => Ok((brep, map, verdicts)),
+        (None, _) => Err(first_refusal.unwrap_or_else(|| KernelError::Argument("no group to merge".into()))),
     }
 }
 
 /// The groups taken so far and, for each, its index among all the groups.
-struct Taken<'a> {
-    groups: Vec<&'a Prepared>,
-    at: Vec<usize>,
+pub(super) struct Taken<'a> {
+    pub groups: Vec<&'a Prepared>,
+    pub at: Vec<usize>,
+}
+
+/// A body whose new faces all held up in it, its face map and the indices of its groups among all the groups.
+pub(super) struct Verified {
+    pub brep: Brep,
+    pub map: Vec<Option<usize>>,
+    pub at: Vec<usize>,
+}
+
+/// `fallback` as the outcome: its groups taken, every other group that was taken given back with the reason.
+fn fall_back(fallback: Verified, mut verdicts: Verdicts, why: &str) -> Settled {
+    for (i, v) in verdicts.iter_mut().enumerate() {
+        if fallback.at.contains(&i) {
+            *v = Ok(());
+        } else if v.is_ok() {
+            *v = Err(format!("its batch was taken back: {why}"));
+        }
+    }
+    (fallback.brep, fallback.map, verdicts)
 }
 
 /// The faces of all the batches judged again in the final body `rebuilt`: a face that no longer holds up there is
-/// dropped with the reason and the others rebuilt, until every kept face holds up in the body that is returned (each
-/// round drops one face at least, so there are at most as many rounds as faces).
-fn rejudged(
+/// dropped with the reason and the others rebuilt, for at most `rounds` rounds (see [`MAX_REJUDGE_ROUNDS`]). The body
+/// is returned once every kept face holds up in it; when that is not so within the rounds, or the kernel does not
+/// rebuild the body without the dropped faces, `fallback` (the first batch's body, whose faces held up) is returned and
+/// the groups of the later batches are given back with the reason.
+pub(super) fn rejudged(
     body: &Brep,
     volume: Option<f64>,
-    mut taken: Taken<'_>,
-    mut verdicts: Verdicts,
+    state: (Taken<'_>, Verdicts),
     rebuilt: (Brep, Vec<Option<usize>>),
-    run: &Run,
+    fallback: Verified,
+    limits: (usize, &Run),
 ) -> Result<Settled> {
+    let (rounds, run) = limits;
+    let (mut taken, mut verdicts) = state;
     let (mut brep, mut map) = rebuilt;
-    loop {
+    for _ in 0..rounds {
         let v = areas_agree(body, &brep, &map, &taken.groups, run)?;
         if passed(&v) {
             return Ok((brep, map, verdicts));
@@ -330,11 +367,19 @@ fn rejudged(
             }
         }
         if kept.groups.is_empty() {
-            return Err(KernelError::Argument("no merged face holds up in the body with all the batches".into()));
+            return Ok(fall_back(fallback, verdicts, "no face held up in the body with all the batches"));
         }
-        (brep, map) = apply(body, volume, &kept.groups)?;
+        match apply(body, volume, &kept.groups) {
+            Ok(r) => (brep, map) = r,
+            Err(e) => {
+                let why = format!("the kernel did not rebuild the body without the faces that did not hold up: {e}");
+                return Ok(fall_back(fallback, verdicts, &why));
+            }
+        }
         taken = kept;
     }
+    let why = format!("the faces of the batches did not all hold up together within {rounds} rounds");
+    Ok(fall_back(fallback, verdicts, &why))
 }
 
 /// The groups taken before (`taken`) and `batch` as one list for a rebuild.
