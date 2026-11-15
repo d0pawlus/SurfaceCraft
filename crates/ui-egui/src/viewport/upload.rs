@@ -49,11 +49,9 @@ impl Renderer {
         device: &wgpu::Device,
         model_layout: &wgpu::BindGroupLayout,
         item: &DrawItem,
-        frame_origin: &Point3,
+        origin: &Point3,
     ) -> GpuMesh {
         let m = &item.mesh;
-        // the mesh's own centre, not the frame's origin: it stays put while the camera pans
-        let origin = &m.bbox().center();
         let normals = m.vertex_normals();
         let verts: Vec<Geo> = m
             .positions
@@ -84,7 +82,7 @@ impl Renderer {
         });
         let model_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("mesh model"),
-            contents: bytemuck::cast_slice(&shifted_model(&identity_rows(), origin, frame_origin)),
+            contents: bytemuck::cast_slice(&shifted_model(&identity_rows(), origin, origin)),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         let model_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {

@@ -18,7 +18,10 @@ impl Renderer {
         self.draw_list.clear();
         for item in &f.items {
             let k = item.key;
-            let fresh = self.meshes.get(&k).is_none_or(|g| g.vertices != item.mesh.positions.len());
+            let fresh = self
+                .meshes
+                .get(&k)
+                .is_none_or(|g| g.vertices != item.mesh.positions.len() || origin_too_far(&g.origin, f));
             if fresh {
                 let g = Self::upload(device, &self.model_layout, item, &f.origin);
                 self.meshes.insert(k, g);

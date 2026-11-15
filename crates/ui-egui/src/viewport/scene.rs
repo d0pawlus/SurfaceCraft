@@ -17,8 +17,8 @@ pub struct Overlay {
 
 /// A world-space model matrix as the shader takes it: for vertices stored relative to their mesh's
 /// own origin `m`, giving positions relative to the frame's origin `o` (`p' = M (q + m) - o`),
-/// column-major. The mesh keeps its origin while the frame's follows the camera, so a pan
-/// rewrites this matrix and not the vertices.
+/// column-major. The mesh keeps the origin it was uploaded with while the frame's follows the
+/// camera, so a pan rewrites this matrix and not the vertices (until `origin_too_far`).
 pub(super) fn shifted_model(rows: &[[f64; 4]; 4], m: &Point3, o: &Point3) -> [[f32; 4]; 4] {
     let (mm, oo) = ([m.x, m.y, m.z], [o.x, o.y, o.z]);
     let mut out = [[0f32; 4]; 4];
@@ -31,6 +31,20 @@ pub(super) fn shifted_model(rows: &[[f64; 4]; 4], m: &Point3, o: &Point3) -> [[f
     }
     out[3][3] = 1.0;
     out
+}
+
+/// Largest f32 rounding error of a drawn vertex, in pixels, before a mesh is uploaded again
+/// around the frame's origin.
+const MAX_ROUNDING_PX: f64 = 0.25;
+
+/// Whether vertices stored in f32 relative to `mesh_origin` are too coarse for this frame: the
+/// rounding step at the camera target (its distance from that origin times the f32 epsilon) is
+/// a visible part of a pixel. A pan moves the target by pixels and this takes millions of them,
+/// so panning keeps the upload; zooming far into a part far from the origin renews it once.
+pub(super) fn origin_too_far(mesh_origin: &Point3, f: &Frame) -> bool {
+    let step = (f.origin - mesh_origin).norm() * f64::from(f32::EPSILON);
+    let pixel = f.camera.world_per_pixel(f.camera.distance, f64::from(f.size[1]));
+    step > pixel * MAX_ROUNDING_PX
 }
 
 /// The identity as a world row-major matrix.

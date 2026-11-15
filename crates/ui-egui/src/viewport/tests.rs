@@ -194,3 +194,36 @@ fn panning_does_not_reupload_geometry() {
     assert!(!is_red(&after, 4) && is_red(&after, 60), "the sphere followed the pan to the right");
     assert_eq!(r.uploads, 1, "geometry uploaded once");
 }
+
+/// A drag across the whole screen keeps the upload; zooming far into a part a long way from the
+/// upload origin renews it, and there the new origin keeps features apart that the old one merged.
+#[test]
+fn upload_origin_is_renewed_only_when_rounding_would_show() {
+    let frame = |camera: &Camera| Frame {
+        size: [1280, 800],
+        origin: camera.target,
+        camera: camera.clone(),
+        items: Vec::new(),
+        background: [0.0; 3],
+        overlay: Default::default(),
+    };
+    let mut camera = Camera { distance: 300.0, ..Camera::default() };
+    let uploaded_at = camera.target;
+    for _ in 0..4000 {
+        camera.pan(3.0, -2.0, 800.0);
+        assert!(!origin_too_far(&uploaded_at, &frame(&camera)), "panning keeps the upload");
+    }
+    // a detail a quarter of the screen away, magnified fifty times
+    let mut detail = Camera { distance: 300.0, ..Camera::default() };
+    detail.pan(200.0, 0.0, 800.0);
+    detail.zoom(2000.0);
+    assert!(!origin_too_far(&uploaded_at, &frame(&detail)), "zooming into a scan keeps the upload");
+    // a part 500 m from the upload origin, looked at from 5 mm: vertices 0.01 mm apart
+    let far = Camera { target: Point3::new(500_000.0, 0.0, 0.0), distance: 5.0, ..Camera::default() };
+    assert!(origin_too_far(&uploaded_at, &frame(&far)), "rounding would show");
+    assert!(!origin_too_far(&far.target, &frame(&far)), "the renewed upload is kept");
+    let stored = |x: f64, origin: &Point3| (x - origin.x) as f32;
+    let (a, b) = (far.target.x, far.target.x + 0.01);
+    assert_eq!(stored(a, &uploaded_at), stored(b, &uploaded_at), "merged around the old origin");
+    assert_ne!(stored(a, &far.target), stored(b, &far.target), "apart around the new one");
+}
