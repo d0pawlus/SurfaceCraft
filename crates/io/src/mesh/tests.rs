@@ -45,14 +45,17 @@ fn ascii_stl_and_ply_variants() {
     assert_eq!(m.triangle_count(), 2);
 }
 
-/// A binary STL of a bumpy strip, more triangles than one parse chunk holds.
+/// Triangles a parallel task of the weld works through (a strip above it spans several).
+const MANY: usize = 1 << 14;
+
+/// A binary STL of a bumpy strip, more triangles than one task of the weld takes.
 fn big_stl() -> (Vec<u8>, Mesh) {
     let strip = surfacecraft_geom::synth::plane(Point3::origin(), Vec3::x(), Vec3::y(), 30.0, 20.0, 150, 100);
     let wavy = Mesh {
         positions: strip.positions.iter().map(|p| Point3::new(p.x, p.y, (p.x * 0.7).sin())).collect(),
         triangles: strip.triangles,
     };
-    assert!(wavy.triangle_count() > 3 * STL_CHUNK / 2);
+    assert!(wavy.triangle_count() > 3 * MANY / 2);
     (write_mesh(&wavy, MeshFormat::Stl), wavy)
 }
 
@@ -70,10 +73,67 @@ fn binary_stl_is_the_same_on_one_and_many_threads() {
     assert_eq!(one.vertex_count(), wavy.vertex_count());
 }
 
+/// A binary STL of `corners` (three per facet).
+fn stl_of(corners: &[[f32; 3]]) -> Vec<u8> {
+    let mut bytes = vec![0u8; 80];
+    bytes.extend_from_slice(&((corners.len() / 3) as u32).to_le_bytes());
+    for facet in corners.chunks(3) {
+        bytes.extend_from_slice(&[0u8; 12]);
+        for c in facet {
+            for v in c {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        bytes.extend_from_slice(&[0u8; 2]);
+    }
+    bytes
+}
+
+#[test]
+fn binary_stl_is_the_mesh_of_welding_every_corner() {
+    // shared corners, a repeated corner (a degenerate facet), 0.0 and -0.0, coordinates that
+    // differ below the welding tolerance near zero, and a facet of its own
+    let tiny = 1e-12f32;
+    let corners: Vec<[f32; 3]> = vec![
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [-0.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [2.0, 0.0, 0.0],
+        [tiny, 0.0, 0.0],
+        [0.0, -1.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [5.0, 5.0, 5.0],
+        [6.0, 5.0, 5.0],
+        [5.0, 6.0, 5.0],
+    ];
+    let read = read_mesh(&stl_of(&corners), MeshFormat::Stl, &Limits::default()).unwrap();
+    let mut every = Mesh {
+        positions: corners.iter().map(|c| Point3::new(f64::from(c[0]), f64::from(c[1]), f64::from(c[2]))).collect(),
+        triangles: (0..corners.len() as u32 / 3).map(|t| [3 * t, 3 * t + 1, 3 * t + 2]).collect(),
+    };
+    every.weld(0.0);
+    assert_eq!(read, every);
+    assert_eq!(read.triangle_count(), 4, "the degenerate facet is dropped");
+    // and on a strip with thousands of shared corners
+    let (bytes, wavy) = big_stl();
+    let mut every = Mesh {
+        positions: wavy.triangles.iter().flatten().map(|&i| wavy.positions[i as usize]).collect(),
+        triangles: (0..wavy.triangle_count() as u32).map(|t| [3 * t, 3 * t + 1, 3 * t + 2]).collect(),
+    };
+    every.positions.iter_mut().for_each(|p| *p = Point3::new(p.x as f32 as f64, p.y as f32 as f64, p.z as f32 as f64));
+    every.weld(0.0);
+    assert_eq!(read_mesh(&bytes, MeshFormat::Stl, &Limits::default()).unwrap(), every);
+}
+
 #[test]
 fn the_first_bad_triangle_of_a_binary_stl_is_reported_on_any_thread_count() {
     let (mut bytes, _) = big_stl();
-    for t in [STL_CHUNK + 5, 5000] {
+    for t in [MANY + 5, 5000] {
         let at = 84 + t * 50 + 12;
         bytes[at..at + 4].copy_from_slice(&f32::NAN.to_le_bytes());
     }

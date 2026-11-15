@@ -998,6 +998,7 @@
   "busy.cancel_hint": "Nie czekaj na to polecenie i zostaw dokument bez zmian",
   "busy.in_place": "Ta strona przeglądarki nie ma wątków w tle, więc nie będzie odpowiadać, dopóki polecenie się nie skończy.",
   "status.running": "{name}: trwa…",
+  "status.too_large_to_draw": "Siatka jest za duża, by ta karta graficzna ją narysowała (bufor do {limit} MB): zredukuj ją, aby ją zobaczyć",
   "status.busy": "{name} jeszcze trwa",
   "status.cancelled": "{name}: anulowano",
   "status.finishing": "Anulowane polecenie jeszcze się kończy; spróbuj za chwilę",

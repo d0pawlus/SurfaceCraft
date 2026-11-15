@@ -7,6 +7,7 @@ use surfacecraft_geom::{Mesh, Point3, PointCloud};
 mod obj;
 mod ply;
 mod stl;
+mod stl_corners;
 #[cfg(test)]
 mod tests;
 mod xyz;

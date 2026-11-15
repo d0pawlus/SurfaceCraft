@@ -1,17 +1,15 @@
-//! Binary and ASCII STL: the parallel binary reader, the welded ASCII reader and the writer.
+//! Binary and ASCII STL: the binary reader (corners joined as read), the welded ASCII reader and
+//! the writer.
+use super::stl_corners::CornerFault;
 use super::*;
 use crate::{IoError, bad};
-use surfacecraft_geom::{Mesh, Point3, tri};
+use surfacecraft_geom::{Mesh, tri};
 
 // ---------------------------------------------------------------- STL
 
 fn le_u32(b: &[u8], at: usize) -> Option<u32> {
     let s = b.get(at..at.checked_add(4)?)?;
     Some(u32::from_le_bytes([*s.first()?, *s.get(1)?, *s.get(2)?, *s.get(3)?]))
-}
-
-fn le_f32(b: &[u8], at: usize) -> Option<f32> {
-    le_u32(b, at).map(f32::from_bits)
 }
 
 pub(super) fn read_stl(bytes: &[u8], limits: &Limits) -> Result<Mesh, IoError> {
@@ -22,33 +20,6 @@ pub(super) fn read_stl(bytes: &[u8], limits: &Limits) -> Result<Mesh, IoError> {
         t.trim_start().starts_with("solid") && t.contains("facet")
     });
     if binary_fits || !looks_ascii { read_stl_binary(bytes, limits) } else { read_stl_ascii(bytes, limits) }
-}
-
-/// Triangles of a binary STL parsed per parallel task.
-pub(super) const STL_CHUNK: usize = 1 << 14;
-
-/// Why a chunk of a binary STL was refused (the first in file order is reported).
-enum StlFault {
-    Truncated,
-    NonFinite(usize),
-}
-
-/// Parses the triangles from index `first` on into `corners` (three points per triangle).
-fn parse_stl_chunk(bytes: &[u8], first: usize, corners: &mut [Point3]) -> Result<(), StlFault> {
-    for (k, tri) in corners.chunks_mut(3).enumerate() {
-        let base = 84 + (first + k) * 50 + 12;
-        for (c, slot) in tri.iter_mut().enumerate() {
-            let at = base + c * 12;
-            let (Some(x), Some(y), Some(z)) = (le_f32(bytes, at), le_f32(bytes, at + 4), le_f32(bytes, at + 8)) else {
-                return Err(StlFault::Truncated);
-            };
-            *slot = Point3::new(f64::from(x), f64::from(y), f64::from(z));
-        }
-        if tri.iter().any(|p| !surfacecraft_geom::finite(p)) {
-            return Err(StlFault::NonFinite(first + k));
-        }
-    }
-    Ok(())
 }
 
 fn read_stl_binary(bytes: &[u8], limits: &Limits) -> Result<Mesh, IoError> {
@@ -63,18 +34,12 @@ fn read_stl_binary(bytes: &[u8], limits: &Limits) -> Result<Mesh, IoError> {
     if n.checked_mul(3).is_none_or(|c| c > u32::MAX as usize) {
         return Err(IoError::Limit(format!("{n} triangles need more vertices than an index can address")));
     }
-    // chunks are parsed in parallel; the file order of the points and of the faults is kept
-    let mut positions = vec![Point3::origin(); n * 3];
-    let faults = surfacecraft_geom::par::map_chunks_mut(&mut positions, STL_CHUNK * 3, |k, corners| {
-        parse_stl_chunk(bytes, k * STL_CHUNK, corners)
-    });
-    match faults.into_iter().find_map(Result::err) {
-        Some(StlFault::Truncated) => return Err(bad("STL", "truncated triangle")),
-        Some(StlFault::NonFinite(t)) => return Err(bad("STL", format!("triangle {t} has a non-finite coordinate"))),
-        None => {}
-    }
-    let triangles = surfacecraft_geom::par::map(n, |t| [3 * t as u32, 3 * t as u32 + 1, 3 * t as u32 + 2]);
-    let mut m = Mesh { positions, triangles };
+    // bit-equal corners are joined as they are read; welding joins what is left below the
+    // tolerance, so the mesh is the one of welding every corner
+    let mut m = super::stl_corners::indexed(bytes, n).map_err(|f| match f {
+        CornerFault::Truncated => bad("STL", "truncated triangle"),
+        CornerFault::NonFinite(t) => bad("STL", format!("triangle {t} has a non-finite coordinate")),
+    })?;
     m.weld(0.0);
     Ok(m)
 }
