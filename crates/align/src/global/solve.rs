@@ -4,7 +4,9 @@ use super::graph::{Tree, chain, consensus, spanning_tree};
 use super::pairs::Tried;
 use super::relax::{Edge, MIN_VIRTUAL, misfit, relax, virtual_points};
 use super::report::{EdgeReport, EdgeStatus, GlobalResult, LoopReport};
-use super::{GlobalOptions, MAX_RMS_PER_DIAGONAL, MAX_RMS_PER_TOLERANCE, REJECT_FACTOR, loops, verdict};
+use super::{
+    GlobalOptions, MAX_RMS_PER_DIAGONAL, MAX_RMS_PER_NOISE, MAX_RMS_PER_TOLERANCE, REJECT_FACTOR, loops, verdict,
+};
 use crate::pair::{MIN_OVERLAP, PairVerdict};
 use crate::{AlignError, PairResult};
 use surfacecraft_geom::{Bvh, Cancel, Mesh, Transform, par};
@@ -74,14 +76,14 @@ fn report_of(t: &Tried, status: EdgeStatus, note: Option<String>) -> EdgeReport 
 /// scan (a share of the fixed scan's diagonal), and, when the caller gave the tolerance, within
 /// [`MAX_RMS_PER_TOLERANCE`] of it: the pair's own tolerance is derived from its residual and says
 /// nothing, the caller's does.
-// HOOK(#117): `align.pair_coarse` is to report the scans' noise estimate; when `PairResult` carries
-// it, require `rms <= k * noise` here as well, the one scale that does not depend on the size of
-// the part.
-fn pair_is_strong(rms: f64, diagonal: f64, user_tolerance: Option<f64>) -> (f64, bool) {
+/// And, when the pair reports the noise of its scans (`noise` above 0), within
+/// [`MAX_RMS_PER_NOISE`] times it: the one scale that does not depend on the size of the part.
+fn pair_is_strong(rms: f64, diagonal: f64, user_tolerance: Option<f64>, noise: f64) -> (f64, bool) {
     let share = rms / diagonal;
     let by_size = share.is_finite() && share <= MAX_RMS_PER_DIAGONAL;
     let by_tolerance = user_tolerance.is_none_or(|t| rms <= MAX_RMS_PER_TOLERANCE * t);
-    (share, by_size && by_tolerance)
+    let by_noise = !(noise > 0.0) || rms <= MAX_RMS_PER_NOISE * noise;
+    (share, by_size && by_tolerance && by_noise)
 }
 
 fn candidate(k: usize, t: &Tried, scans: &[&Mesh], bvhs: &[Option<Bvh>], tolerance: Option<f64>) -> Cand {
@@ -107,7 +109,7 @@ fn candidate(k: usize, t: &Tried, scans: &[&Mesh], bvhs: &[Option<Bvh>], toleran
         return Cand { report: report_of(t, EdgeStatus::TooLittleOverlap, None), edge: None };
     }
     let diagonal = scans.get(t.fixed).map_or(f64::INFINITY, |m| m.bbox().diagonal());
-    let (share, strong) = pair_is_strong(r.rms, diagonal, tolerance);
+    let (share, strong) = pair_is_strong(r.rms, diagonal, tolerance, r.noise);
     let edge = Edge {
         i: t.fixed,
         j: t.moving,
@@ -254,4 +256,22 @@ pub(super) fn solve(
         }
     }
     Ok(verdict::finish(n, opts, cands, &solved, loops, possible, tried))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The residual is also judged against the noise of the scans, whatever the size of the part.
+    #[test]
+    fn a_pair_whose_residual_is_many_times_the_noise_is_not_strong() {
+        // 100 mm diagonal: 0.2 mm is 0.2 % of it, small by size
+        let (_, by_size_only) = pair_is_strong(0.2, 100.0, None, 0.0);
+        assert!(by_size_only, "no noise reported: size alone decides");
+        assert!(pair_is_strong(0.2, 100.0, None, 0.1).1, "twice the noise");
+        assert!(!pair_is_strong(0.2, 100.0, None, 0.05).1, "four times the noise");
+        assert!(pair_is_strong(0.2, 100.0, None, f64::NAN).1, "an unknown noise is not a scale");
+        // the caller's tolerance rule still applies
+        assert!(!pair_is_strong(0.2, 100.0, Some(0.3), 0.1).1);
+    }
 }

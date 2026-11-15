@@ -63,7 +63,7 @@ fn gate_one(part: &str, views: Vec<Mesh>) {
 
 #[test]
 fn gate_m3_six_bracket_views_are_aligned_within_the_bound() {
-    gate_one("bracket", bracket_views(6));
+    gate_one("bracket", bracket_views_wide(6));
 }
 
 #[test]
@@ -109,13 +109,12 @@ fn gate_m3_a_ring_of_views_closes_its_loop() {
         assert_eq!(out["scans"][k]["placed"], true, "view {k} is not placed");
         assert!(angle <= BOUND_DEGREES && relaxed <= BOUND_MM, "view {k}: {angle} deg {relaxed} mm");
     }
-    // The verdict is `partial` with `consensus_unclear`: the five false half-turn pairs of this
-    // fixture (see `pair_coarse_false_unique_repro`) are mutually consistent and make a competing
-    // cluster, so the vote is a near tie (margin 1). This is what PR #117 removes.
-    assert_eq!(out["verdict"], "partial");
-    assert!(out["issues"].as_array().unwrap().iter().any(|i| i == "consensus_unclear"), "{}", out["issues"]);
-    // AFTER #117 (no false `unique` pairs): replace the two assertions above by
-    // assert_eq!(out["verdict"], "aligned");
+    // `aligned`: with the false half-turn pairs gone (PR #117: a pose that either scan contradicts is
+    // never `unique`) the vote has nothing to reject and the eight views close the loop. Before, five
+    // false pairs of this fixture made a competing cluster and the verdict was `partial` with
+    // `consensus_unclear` (margin 1).
+    assert_eq!(out["verdict"], "aligned", "{out}");
+    assert_eq!(out["rejected_edges"], 0, "{out}");
     // the far view is the one the chain carries furthest off the truth
     let chained: Vec<f64> = (0..RING).map(|k| scan_error(&out, &views, &poses, k, "chained_matrix").1).collect();
     let far = (0..RING).max_by(|a, b| chained[*a].total_cmp(&chained[*b])).unwrap();
@@ -135,7 +134,7 @@ fn gate_m3_a_ring_of_views_closes_its_loop() {
 /// `partial`; with `apply` nothing of it moves and one undo restores everything.
 #[test]
 fn gate_m3_a_view_of_another_part_is_left_unplaced() {
-    let mut views = bracket_views(5);
+    let mut views = bracket_views_wide(5);
     views.push(noisy(blob_at(52), 300));
     let poses = poses(6);
     let (mut s, ids) = session_with_ids(&views, &poses);

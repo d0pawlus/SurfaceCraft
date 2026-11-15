@@ -18,7 +18,7 @@ pub struct PairIn {
     pub object: ObjRef,
     /// Mesh or body of the other scan, which stays where it is.
     pub target: ObjRef,
-    /// Distance in mm within which a point counts as lying on the other scan (default: found from the residual of the best pose, 0.15 % to 2 % of the target's diagonal).
+    /// Distance in mm within which a point counts as lying on the other scan (default: 5 times the median residual of the best pose, at most 4 times the noise of the two scans, 0.15 % to 2 % of the target's diagonal).
     #[serde(default)]
     pub tolerance: Option<f64>,
     /// Move the mesh (default false: the command only proposes the pose). A pose that is not `unique` is not applied unless `choose` names it.
@@ -48,8 +48,14 @@ pub struct PairOut {
     pub overlap_moving: f64,
     /// Share (0..1) of the target's area that lies on the moving scan within the tolerance.
     pub overlap_fixed: f64,
+    /// Share (0..1) of the moving scan's area that lies where the target is, but off it (beyond twice the tolerance, and not at the end of the target): evidence against the best pose (surface of the moving scan in front of the target, away from it, where the target is: measured on 3000 samples, free space only). A pose where either this or `conflict_fixed` exceeds the bound (0.01) is never `unique`.
+    pub conflict_moving: f64,
+    /// Share (0..1) of the target's area that lies where the moving scan is, but off it: the same evidence from the other side (of the best pose).
+    pub conflict_fixed: f64,
     /// Tolerance used, mm.
     pub tolerance: f64,
+    /// Noise of the two scans combined, mm (each scan's own estimate, as `deviation.noise`; 0 when an estimate is not trustworthy, a coarse mesh): the default tolerance is at most 4 times it.
+    pub noise: f64,
     /// Which stage proposed the best pose.
     pub method: CoarseMethod,
     /// Different poses that fit about as well as the best one (only for an `ambiguous` verdict), best first.
@@ -83,6 +89,9 @@ pub struct PairOut {
     pub probe_margin: Option<f64>,
     /// Largest distance in mm a displaced start ended from the pose, among those that came back.
     pub probe_return_gap: f64,
+    /// Why the orientation of the triangles is not trusted (a scan wound inconsistently or turned inside out, or the two facing opposite ways where they meet); absent when it is. The verdict is then never `unique`: the contradiction evidence reads the side a triangle faces.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orientation_issue: Option<String>,
     /// A sentence about the outcome.
     pub note: String,
 }
@@ -90,6 +99,19 @@ pub struct PairOut {
 fn note_of(r: &PairResult, applied: bool, refused: bool) -> String {
     if r.refined < 2 && r.verdict == PairVerdict::Ambiguous {
         return "only one candidate pose could be refined, so nothing was compared: check the pose by eye".into();
+    }
+    if let (PairVerdict::Ambiguous, Some(why)) = (r.verdict, &r.orientation_issue) {
+        let tail = if refused { ", nothing was moved" } else { "" };
+        return format!(
+            "ambiguous: the orientation of the triangles is not trusted ({why}): check the pose by eye{tail}"
+        );
+    }
+    if r.verdict == PairVerdict::Ambiguous && r.contradicted {
+        let tail = if refused { ", nothing was moved" } else { "" };
+        let others = if r.alternatives.is_empty() { "" } else { " (see also the alternatives)" };
+        return format!(
+            "ambiguous: one scan has surface where the other is but off it, so the overlap may be a coincidence of similar regions: check the pose by eye{others}{tail}"
+        );
     }
     if r.verdict == PairVerdict::Ambiguous && r.alternatives.is_empty() {
         let tail = if refused { ", nothing was moved" } else { "" };
@@ -199,9 +221,13 @@ pub(super) fn pair(s: &mut Session, i: PairIn) -> CmdResult<PairOut> {
         confidence: shown.confidence,
         overlap_moving: shown.overlap_moving,
         overlap_fixed: shown.overlap_fixed,
+        conflict_moving: r.conflict_moving,
+        conflict_fixed: r.conflict_fixed,
         tolerance: r.tolerance,
+        noise: r.noise,
         method: shown.method,
         refused,
+        orientation_issue: r.orientation_issue.clone(),
         note: note_of(&r, i.apply && may_move, refused),
         alternatives: r.alternatives,
         candidates: r.candidates,

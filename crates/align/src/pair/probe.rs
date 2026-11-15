@@ -158,7 +158,7 @@ mod tests {
 
     /// The pose "as built" (identity) as the only candidate, solved with the probes.
     fn alone(moving: &Mesh, fixed: &Mesh) -> crate::pair::PairResult {
-        let scene = Scene::new(moving, fixed, &Cancel::new()).unwrap();
+        let scene = Scene::new(moving, fixed, None, &Cancel::new()).unwrap();
         let only = Cand { t: Transform::identity(), method: CoarseMethod::PrincipalAxes };
         solve(&scene, vec![only], &PairOptions::default(), &Cancel::new()).unwrap()
     }
@@ -190,7 +190,7 @@ mod tests {
     fn a_pinned_shape_gives_no_slide() {
         let fixed = noisy(synth::bracket(), 1);
         let moving = noisy(synth::bracket(), 2);
-        let scene = Scene::new(&moving, &fixed, &Cancel::new()).unwrap();
+        let scene = Scene::new(&moving, &fixed, None, &Cancel::new()).unwrap();
         let tau = 0.3;
         let best = scene.rank(vec![Cand { t: Transform::identity(), method: CoarseMethod::PrincipalAxes }], tau);
         let probe = scene.probe_at(&best[0], tau, &Cancel::new(), PROBE_STEP).unwrap();

@@ -68,6 +68,11 @@ pub const MAX_RMS_PER_DIAGONAL: f64 = 0.003;
 /// (the share `align.pair_coarse` itself requires of a pose it calls `unique`). Right pairs of the
 /// tests read 0.1 of a tolerance of 0.5 mm; 1.2 of one of 0.04 mm.
 pub const MAX_RMS_PER_TOLERANCE: f64 = 0.5;
+/// A pair is strong only if its residual is at most this many times the noise of its two scans (each
+/// scan's estimate, as `align.pair_coarse` reports it; skipped when an estimate was not
+/// trustworthy). The residual of a right pose reads at most 1.0 times the noise on the test fixtures,
+/// 3 times below.
+pub const MAX_RMS_PER_NOISE: f64 = 3.0;
 /// Fewest triangles a scan may have.
 const MIN_TRIANGLES: usize = 4;
 

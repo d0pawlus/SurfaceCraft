@@ -12,13 +12,12 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use surfacecraft_fit::Primitive;
-use surfacecraft_geom::{Bvh, KdTree, Mesh, Point3, Vec3};
+use surfacecraft_geom::{Bvh, Mesh, Point3, Vec3};
 
 pub mod faces;
 
 mod distribution;
 mod hotspot;
-mod noise;
 /// Colours of the deviation map, linear RGBA in 0..1. [`colorize`] paints the viewport from these
 /// constants, and the UI legend resolves the same values through its theme tokens, so the legend
 /// and the map cannot drift apart.
@@ -31,7 +30,6 @@ mod tests;
 
 pub use distribution::{Distribution, HISTOGRAM_BINS, against_mesh, against_primitive, distribution, hist_bin};
 pub use hotspot::{Hotspot, HotspotReport, Sign, Volume, hotspots};
-pub use noise::{NoiseEstimate, estimate_noise, noise_estimate};
 pub use palette::colorize;
 pub use report::{Band, Histogram, MAX_BANDS, MAX_BINS, Percentiles, Report, ReportOptions, report};
 pub use sample::{
@@ -39,3 +37,4 @@ pub use sample::{
     stats_of,
 };
 pub use stats::{DeviationStats, stats};
+pub use surfacecraft_fit::noise::{NoiseEstimate, estimate_noise, noise_estimate};

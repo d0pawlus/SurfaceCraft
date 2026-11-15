@@ -39,7 +39,7 @@ pub use frame::InPlane;
 pub use global::{GlobalOptions, GlobalResult, GlobalVerdict, align_global};
 pub use icp::{IcpOptions, IcpReport, icp, icp_cancellable, icp_with_normals, rms_to_surface};
 pub use kabsch::kabsch;
-pub use pair::{PairCandidate, PairOptions, PairResult, PairVerdict, pair_coarse};
+pub use pair::{PairCandidate, PairOptions, PairResult, PairVerdict, PoseFit, pair_coarse, pose_fit};
 pub use principal::principal_frame;
 pub use settle::{Settled, WorldPlane, settle_symmetry};
 pub use symmetry::{SymmetryPlane, symmetry_plane};

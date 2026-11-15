@@ -7,8 +7,8 @@
 //!    from FPFH descriptor matches and RANSAC (partial overlap, ambiguous axes).
 //! 2. A shortlist of the best distinct candidates by a truncated distance score on a subsample
 //!    through the BVH of the fixed scan; each is refined by two short ICP passes.
-//! 3. A tolerance from the best candidate's residual; every refined candidate is re-scored under
-//!    it, equal poses merged. The best one is polished by a full ICP.
+//! 3. A tolerance from the best candidate's residual, capped by the noise of the two scans; every
+//!    refined candidate is re-scored under it, equal poses merged. The best one is polished by a full ICP.
 //! 4. Verdict: no match when too little of either scan lies on the other; ambiguous when a
 //!    different pose explains the moving scan about as well; otherwise unique.
 //!
@@ -16,7 +16,10 @@
 //! coarse stage (descriptors and matching: a few hundred milliseconds), at most 20 000 vertices in
 //! the final ICP. It stays usable on scans of a million triangles.
 mod candidates;
+mod evaluate;
 mod fpfh;
+mod noise;
+mod orientation;
 mod probe;
 mod ransac;
 mod sample;
@@ -25,10 +28,14 @@ mod verdict;
 
 use crate::{AlignError, IcpOptions, IcpReport, icp_with_normals};
 use sample::Samples;
-use score::{Fit, Target, clearance, corners, fit_of, median, pose_gap};
-use surfacecraft_geom::{Cancel, Mesh, Point3, SurfaceHit, Transform};
+use score::{Fit, Target, clearance, corners, fit_of, free_space_conflicts, median, pose_gap};
+use surfacecraft_geom::{Cancel, Mesh, Point3, Rng, SurfaceHit, Transform};
 
-pub use verdict::{AMBIGUITY_MARGIN, CONFIDENCE_THRESHOLD, CoarseMethod, MIN_OVERLAP, PairCandidate, PairVerdict};
+pub use evaluate::{PoseFit, pose_fit};
+pub use noise::ScanNoise;
+pub use verdict::{
+    AMBIGUITY_MARGIN, CONFIDENCE_THRESHOLD, CoarseMethod, MIN_OVERLAP, PairCandidate, PairVerdict, UNIQUE_MAX_CONFLICT,
+};
 
 /// A triangle and a fixed sample are on the same face when their normals agree to this cosine (30 degrees).
 const SAME_FACE_COS: f64 = 0.866;
@@ -36,6 +43,12 @@ const SAME_FACE_COS: f64 = 0.866;
 const MIN_TRIANGLES: usize = 4;
 /// Most samples per scan in the coarse stage.
 const SAMPLE_CAP: usize = 3000;
+/// Samples of each scan for the conflict test, and the seed of their stream.
+const CONFLICT_SAMPLES: usize = 3000;
+const CONFLICT_SEED: u64 = 0xC0F1_1C75;
+/// Fewest conflict samples a scan must yield (`Mesh::sample_points` can return fewer than asked when
+/// a picked triangle has no normal); with fewer the conflicts are unknown (NaN), never 0.
+const MIN_CONFLICT_SAMPLES: usize = CONFLICT_SAMPLES / 2;
 /// Moving samples used to score the unrefined candidates.
 const SHORTLIST_SAMPLES: usize = 1500;
 /// Candidates refined by ICP: the best 8 distinct ones, and up to 16 when more score within
@@ -49,10 +62,19 @@ const MAX_ALTERNATIVES: usize = 7;
 const COARSE_TAU: f64 = 0.06;
 /// Cut distances of the two refinement passes, as fractions of the diagonal.
 const REFINE_CUTS: [f64; 2] = [0.05, 0.015];
-/// Search range for the tolerance (fractions of the diagonal) and its factor over the median
-/// residual.
+/// Range of the tolerance (fractions of the diagonal).
 const TAU_RANGE: (f64, f64) = (0.0015, 0.02);
+/// The pose's own tolerance: this many times the median distance of its matched points.
 const TAU_FACTOR: f64 = 5.0;
+/// The tolerance never exceeds this many times the noise of the pair (the noise estimates of the two
+/// scans combined): a tolerance made of the residual of the pose alone is passed by that pose by
+/// construction (a pose on other regions of a lumpy surface has a residual of 0.6 mm among scans
+/// of noise 0.05 mm, and a tolerance five times that).
+const TAU_SIGMAS: f64 = 4.0;
+/// With no trustworthy noise estimate (a coarse mesh) the cap is this share of the mean edge length
+/// of the coarser scan: the chord error between two tessellations of a surface is a small part of the
+/// edge (sag = edge squared over eight radii of curvature, the radius being several edges at least).
+const TAU_EDGE: f64 = 0.05;
 /// Poses closer than this fraction of the diagonal (largest displacement of the corners of the
 /// moving scan's box) are one pose.
 const SAME_POSE_BEFORE: f64 = 0.03;
@@ -62,7 +84,7 @@ const SAME_POSE_AFTER: f64 = 0.02;
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PairOptions {
     /// Distance (mm) within which a point of one scan counts as lying on the other; `None` takes
-    /// it from the residual of the best pose (between 0.15 % and 2 % of the diagonal).
+    /// it from the residual of the best pose, at most four times the noise of the two scans (between 0.15 % and 2 % of the diagonal).
     pub tolerance: Option<f64>,
     /// How far the probes displace a pose, as a fraction of the extent of the moving scan (default
     /// 0.2). For tests: a start displaced far beyond reach has no pairs and counts as failed.
@@ -71,6 +93,9 @@ pub struct PairOptions {
     /// and the 24 principal-axes poses are tried, so a roughly placed pair costs a fraction of a
     /// search. `None` (the default) is the full search.
     pub given: Option<Transform>,
+    /// The noise estimates of the moving and of the fixed scan, when the caller has them already
+    /// (`align.global` estimates each scan once, not once per pair); `None` estimates them.
+    pub noises: Option<(ScanNoise, ScanNoise)>,
 }
 
 /// What [`pair_coarse`] found.
@@ -86,10 +111,24 @@ pub struct PairResult {
     pub confidence: f64,
     /// Tolerance (mm) used.
     pub tolerance: f64,
+    /// Noise (mm) of the pair: the noise estimates of the two scans combined, 0 when either is not
+    /// trustworthy (see [`ScanNoise`]: the default tolerance then has no noise cap); otherwise the
+    /// default tolerance is at most four times it.
+    pub noise: f64,
     /// Share (0..1) of the moving scan's area on the fixed scan.
     pub overlap_moving: f64,
     /// Share (0..1) of the fixed scan's area on the moving scan.
     pub overlap_fixed: f64,
+    /// Share (0..1) of the moving scan's area that lies where the fixed scan is, but off it.
+    pub conflict_moving: f64,
+    /// Share (0..1) of the fixed scan's area that lies where the moving scan is, but off it.
+    pub conflict_fixed: f64,
+    /// Does either scan contradict the best pose by more than [`UNIQUE_MAX_CONFLICT`]?
+    pub contradicted: bool,
+    /// Why the orientation of the triangles is not trusted (a scan wound inconsistently or turned
+    /// inside out, or the two scans facing opposite ways where they meet), `None` when it is; the
+    /// pose is then never `unique`. See `orientation` for what cannot be detected.
+    pub orientation_issue: Option<String>,
     /// RMS distance (mm) of the matched part of the moving scan (0 when nothing matched).
     pub rms: f64,
     /// Stage that proposed the best pose.
@@ -143,10 +182,30 @@ struct Scene<'a> {
     mov: Samples,
     fix: Samples,
     fixed: Target<'a>,
+    /// The moving scan as a target (border-aware), for the fixed scan's side of every measure.
+    moving_target: Target<'a>,
+    /// Area-uniform samples of each scan for the conflict test: as many for a small scan as for a
+    /// large one (the coarse samples are as dense as the larger scan allows, a small patch gets a few
+    /// hundred of them and a share of them is a few samples).
+    conflict_mov: Vec<Point3>,
+    conflict_fix: Vec<Point3>,
+    /// What the triangles of each scan say about their orientation.
+    winding_moving: orientation::Winding,
+    winding_fixed: orientation::Winding,
     /// The moving samples as a point-only mesh, the source of the short ICP passes.
     mov_cloud: Mesh,
     diag: f64,
     spacing: f64,
+    /// Noise (mm) of the pair: the estimates of the two scans combined as a root of squares; `None`
+    /// when an estimate is not trustworthy (the tolerance then has no noise cap).
+    noise: Option<f64>,
+    /// Mean edge length (mm) of the coarser scan, taken as an equilateral triangle of the mean area.
+    edge: f64,
+}
+
+/// Mean edge length of a mesh of `area` (mm): that of the equilateral triangle of the mean area.
+fn mean_edge(m: &Mesh, area: f64) -> f64 {
+    (4.0 * area / (m.triangle_count().max(1) as f64 * 3.0_f64.sqrt())).sqrt()
 }
 
 fn check_scan(m: &Mesh, what: &str) -> Result<f64, AlignError> {
@@ -165,7 +224,12 @@ fn check_scan(m: &Mesh, what: &str) -> Result<f64, AlignError> {
 }
 
 impl<'a> Scene<'a> {
-    fn new(moving: &'a Mesh, fixed: &'a Mesh, cancel: &Cancel) -> Result<Self, AlignError> {
+    fn new(
+        moving: &'a Mesh,
+        fixed: &'a Mesh,
+        noises: Option<(ScanNoise, ScanNoise)>,
+        cancel: &Cancel,
+    ) -> Result<Self, AlignError> {
         let (am, af) = (check_scan(moving, "moving")?, check_scan(fixed, "fixed")?);
         let diag = fixed.bbox().diagonal();
         if !(diag.is_finite() && diag > 0.0) {
@@ -184,7 +248,42 @@ impl<'a> Scene<'a> {
         let fix =
             sample::sample(fixed, sample::count_for(af, spacing, SAMPLE_CAP), spacing, 2, cancel).ok_or_else(few)?;
         let mov_cloud = Mesh { positions: mov.pts.clone(), triangles: Vec::new() };
-        Ok(Scene { moving, mov, fix, fixed: Target::new(fixed, diag), mov_cloud, diag, spacing })
+        let (nm, nf) = match noises {
+            Some(n) => n,
+            None => {
+                let m = ScanNoise::of(moving);
+                if cancel.is_cancelled() {
+                    return Err(AlignError::Cancelled);
+                }
+                (m, ScanNoise::of(fixed))
+            }
+        };
+        if cancel.is_cancelled() {
+            return Err(AlignError::Cancelled);
+        }
+        let noise = noise::pair_noise(&nm, &nf);
+        let conflict_samples = |m: &Mesh, stream: u64| -> Vec<Point3> {
+            m.sample_points(CONFLICT_SAMPLES, &mut Rng::new(CONFLICT_SEED ^ stream))
+                .into_iter()
+                .map(|(p, _)| p)
+                .collect()
+        };
+        Ok(Scene {
+            moving,
+            mov,
+            fix,
+            fixed: Target::new(fixed, diag),
+            moving_target: Target::new(moving, moving.bbox().diagonal()),
+            conflict_mov: conflict_samples(moving, 3),
+            conflict_fix: conflict_samples(fixed, 4),
+            winding_moving: orientation::winding(moving, moving.bbox().diagonal()),
+            winding_fixed: orientation::winding(fixed, diag),
+            mov_cloud,
+            diag,
+            spacing,
+            noise,
+            edge: mean_edge(moving, am).max(mean_edge(fixed, af)),
+        })
     }
 
     /// The given pose and the principal-axes poses (no descriptors).
@@ -303,22 +402,30 @@ impl<'a> Scene<'a> {
         fit_of(&self.fixed, &self.mov.pts, t, tau, false).msac
     }
 
-    /// The tolerance: the user's, or five times the median residual of the best refined pose.
-    fn tolerance(&self, refined: &[Cand], user: Option<f64>) -> f64 {
+    /// The tolerance of pose `t`: the user's, or the smaller of five times the median residual of
+    /// the pose and `TAU_SIGMAS` times the noise of the pair (the pose may tighten the tolerance but
+    /// never loosen it past what the data allow), within the range.
+    fn tolerance_at(&self, t: &Transform, user: Option<f64>) -> f64 {
         let (lo, hi) = (TAU_RANGE.0 * self.diag, TAU_RANGE.1 * self.diag);
         if let Some(u) = user {
             return u;
         }
-        let tau0 = hi;
-        let Some(best) = refined.iter().min_by(|a, b| self.msac_at(&a.t, tau0).total_cmp(&self.msac_at(&b.t, tau0)))
-        else {
-            return lo;
-        };
         let dist: Vec<f64> = surfacecraft_geom::par::map_slice(&self.mov.pts, |p| {
-            self.fixed.bvh.closest(&best.t.apply(p), tau0).map_or(f64::NAN, |h| h.distance)
+            self.fixed.bvh.closest(&t.apply(p), hi).map_or(f64::NAN, |h| h.distance)
         });
         let inside: Vec<f64> = dist.into_iter().filter(|d| d.is_finite()).collect();
-        (TAU_FACTOR * median(inside)).clamp(lo, hi)
+        let from_pose = TAU_FACTOR * median(inside);
+        from_pose.min(self.noise.map_or(TAU_EDGE * self.edge, |n| TAU_SIGMAS * n)).clamp(lo, hi)
+    }
+
+    /// The tolerance of the best refined candidate (see [`Scene::tolerance_at`]).
+    fn tolerance(&self, refined: &[Cand], user: Option<f64>) -> f64 {
+        let tau0 = TAU_RANGE.1 * self.diag;
+        let best = refined.iter().min_by(|a, b| self.msac_at(&a.t, tau0).total_cmp(&self.msac_at(&b.t, tau0)));
+        match best {
+            Some(b) => self.tolerance_at(&b.t, user),
+            None => user.unwrap_or(TAU_RANGE.0 * self.diag),
+        }
     }
 
     /// Refined candidates scored under `tau`, best first, equal poses merged.
@@ -391,10 +498,38 @@ impl<'a> Scene<'a> {
         }
     }
 
-    /// Per pose, the share of the fixed scan's samples within `tau` of the moving scan placed there.
-    fn overlaps_fixed(&self, poses: &[Transform], tau: f64) -> Vec<f64> {
-        let moving = Target::plain(self.moving);
-        poses.iter().map(|t| fit_of(&moving, &self.fix.pts, &t.inverse(), tau, false).share).collect()
+    /// Why the orientation of the triangles is not trusted at pose `t` (see `orientation`), if it is
+    /// not: either scan's own winding, or the normals of the two opposing where the scans meet.
+    fn orientation_issue(&self, t: &Transform, tau: f64) -> Option<String> {
+        if let Some(why) = self.winding_moving.problem() {
+            return Some(format!("the moving scan: {why}"));
+        }
+        if let Some(why) = self.winding_fixed.problem() {
+            return Some(format!("the fixed scan: {why}"));
+        }
+        let opposed = orientation::opposed_share(&self.fixed.bvh, &self.mov.pts, &self.mov.nrm, t, tau);
+        (!(opposed <= orientation::MAX_OPPOSED))
+            .then(|| "the two scans face opposite ways where they meet: one is turned inside out".to_string())
+    }
+
+    /// Per pose, how the fixed scan's samples fit the moving scan placed there (the other side of
+    /// [`fit_of`] on the moving samples): the share within `tau` and the conflicts.
+    fn fits_fixed(&self, poses: &[Transform], tau: f64) -> Vec<Fit> {
+        poses.iter().map(|t| fit_of(&self.moving_target, &self.fix.pts, &t.inverse(), tau, true)).collect()
+    }
+
+    /// The conflicts of both scans at pose `t` on the dedicated samples: (moving, fixed). A point
+    /// of one scan is in conflict when it lies in the free space of the other scan: the other scan
+    /// is there (the closest point of it is not at its border) but more than twice `tau` away and
+    /// the point is in front of it. Surface beyond the border of the other scan, and surface behind
+    /// it, is neutral: both numbers are measured inside the footprint of the other scan.
+    fn conflicts_at(&self, t: &Transform, tau: f64) -> (f64, f64) {
+        if self.conflict_mov.len() < MIN_CONFLICT_SAMPLES || self.conflict_fix.len() < MIN_CONFLICT_SAMPLES {
+            return (f64::NAN, f64::NAN);
+        }
+        let moving = free_space_conflicts(&self.fixed, &self.conflict_mov, t, tau);
+        let fixed = free_space_conflicts(&self.moving_target, &self.conflict_fix, &t.inverse(), tau);
+        (moving, fixed)
     }
 }
 
@@ -402,11 +537,11 @@ fn finite_or_zero(x: f64) -> f64 {
     if x.is_finite() { x } else { 0.0 }
 }
 
-fn alternative(r: &Ranked, overlap_fixed: f64) -> PairCandidate {
+fn alternative(r: &Ranked, other: &Fit) -> PairCandidate {
     PairCandidate {
         transform: r.cand.t,
         overlap_moving: r.fit.share,
-        overlap_fixed,
+        overlap_fixed: other.share,
         confidence: 0.0,
         rms: finite_or_zero(r.fit.rms),
         score: r.fit.score(),
@@ -419,7 +554,7 @@ fn alternative(r: &Ranked, overlap_fixed: f64) -> PairCandidate {
 /// method. Input is checked (finite, with area); an error means no pose could be tried, a
 /// [`PairVerdict::NoMatch`] means the best one found is not a match.
 pub fn pair_coarse(moving: &Mesh, fixed: &Mesh, opts: &PairOptions, cancel: &Cancel) -> Result<PairResult, AlignError> {
-    let scene = Scene::new(moving, fixed, cancel)?;
+    let scene = Scene::new(moving, fixed, opts.noises, cancel)?;
     scene.check_tolerance(opts.tolerance)?;
     let hyps = match &opts.given {
         Some(g) => scene.given_hypotheses(g),
@@ -456,10 +591,13 @@ fn solve(scene: &Scene, hyps: Vec<Cand>, opts: &PairOptions, cancel: &Cancel) ->
         }
     }
     let poses: Vec<Transform> = std::iter::once(best.cand.t).chain(ranked.iter().map(|r| r.cand.t)).collect();
-    let shares = scene.overlaps_fixed(&poses, tau);
+    let shares = scene.fits_fixed(&poses, tau);
     let checks =
         verdict::ProbeFacts { attempted: probe.attempted, completed: probe.completed, slides: probe.slides.len() };
-    let mut result = conclude(&best, &ranked, tau, &shares, refined_count, probe.stability, checks)?;
+    let conflicts = scene.conflicts_at(&best.cand.t, tau);
+    let orientation = scene.orientation_issue(&best.cand.t, tau);
+    let mut result =
+        conclude(&best, &ranked, tau, &shares, (conflicts, orientation), refined_count, probe.stability, checks)?;
     result.probed = probe.attempted;
     result.probes_failed = probe.attempted - probe.completed;
     result.slides = probe.slides.len();
@@ -469,18 +607,20 @@ fn solve(scene: &Scene, hyps: Vec<Cand>, opts: &PairOptions, cancel: &Cancel) ->
     result.probe_margin = probe.margin;
     result.probe_return_gap = probe.returned_gap;
     result.candidates = candidates;
+    result.noise = scene.noise.unwrap_or(0.0);
     result.icp_iterations = icp_iterations;
     result.icp_converged = icp_converged;
     Ok(result)
 }
 
-/// The verdict and the result from the best pose and the other distinct ones; `shares[0]` is the
-/// best pose's share of the fixed scan on the moving one, `shares[k]` that of `others[k - 1]`.
+/// The verdict and the result from the best pose and the other distinct ones; `fixed[0]` is how the
+/// fixed scan fits the moving one at the best pose, `fixed[k]` the same at `others[k - 1]`.
 fn conclude(
     best: &Ranked,
     others: &[Ranked],
     tau: f64,
-    shares: &[f64],
+    fixed: &[Fit],
+    evidence: ((f64, f64), Option<String>),
     refined: usize,
     stable: f64,
     probes: verdict::ProbeFacts,
@@ -488,29 +628,47 @@ fn conclude(
     if !best.cand.t.to_rows().iter().flatten().all(|v| v.is_finite()) {
         return Err(AlignError::Degenerate("the pose is not finite".into()));
     }
-    let overlap_fixed = shares.first().copied().unwrap_or(0.0);
+    let fixed_fit = fixed.first().copied().unwrap_or(Fit { share: 0.0, conflict: 0.0, rms: f64::INFINITY, msac: 0.0 });
+    let (conflicts, orientation) = evidence;
+    let overlap_fixed = fixed_fit.share;
     let overlap = best.fit.share.max(overlap_fixed);
     let nearest = others
         .iter()
         .map(|r| clearance(&best.fit, &r.fit))
         .fold(None, |m: Option<f64>, c| Some(m.map_or(c, |x| x.min(c))));
-    let (verdict, confidence) = verdict::judge(&best.fit, overlap, tau, nearest, refined, stable, probes);
+    let facts = verdict::Facts {
+        best: &best.fit,
+        overlap,
+        tau,
+        clearance: nearest,
+        refined,
+        stable,
+        conflict: conflicts.0.max(conflicts.1),
+        orientation_ok: orientation.is_none(),
+        probes,
+    };
+    let (verdict, confidence) = verdict::judge(&facts);
     let alternatives: Vec<PairCandidate> = others
         .iter()
-        .zip(shares.iter().skip(1))
+        .zip(fixed.iter().skip(1))
         .filter(|(r, _)| {
             verdict == PairVerdict::Ambiguous && (r.slide || clearance(&best.fit, &r.fit) < AMBIGUITY_MARGIN)
         })
         .take(MAX_ALTERNATIVES)
-        .map(|(r, s)| alternative(r, *s))
+        .map(|(r, s)| alternative(r, s))
         .collect();
     Ok(PairResult {
         transform: best.cand.t,
         verdict,
         confidence,
         tolerance: tau,
+        noise: 0.0,
         overlap_moving: best.fit.share,
         overlap_fixed,
+        conflict_moving: conflicts.0,
+        conflict_fixed: conflicts.1,
+        contradicted: !(conflicts.0.max(conflicts.1) <= UNIQUE_MAX_CONFLICT),
+        orientation_issue: orientation,
         rms: finite_or_zero(best.fit.rms),
         method: best.cand.method,
         alternatives,
@@ -531,96 +689,4 @@ fn conclude(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use surfacecraft_geom::{Rng, Vec3, synth};
-
-    fn bracket(block: usize, seed: u64) -> Mesh {
-        let mut m = synth::cuboid(Point3::origin(), Vec3::new(60.0, 40.0, 20.0), block);
-        m.append(&synth::cylinder(Point3::new(45.0, 12.0, 20.0), Vec3::z(), 6.0, 10.0, 48, 6));
-        m.append(&synth::sphere(Point3::new(15.0, 28.0, 20.0), 5.0, 32, 16));
-        synth::add_noise(&mut m, 0.05, &mut Rng::new(seed));
-        m
-    }
-
-    fn part(m: &Mesh, keep: impl Fn(&Point3) -> bool) -> Mesh {
-        let ids: Vec<u32> = (0..m.triangle_count())
-            .filter(|&i| m.face_centroid(i).is_some_and(|c| keep(&c)))
-            .map(|i| i as u32)
-            .collect();
-        m.submesh(&ids)
-    }
-
-    /// Two partial scans share half the part: no principal frame lines them up (their centroids
-    /// and axes differ), so a candidate near the truth can only come from the descriptors.
-    #[test]
-    fn only_the_descriptors_find_the_pose_of_partial_scans() {
-        let fixed = part(&bracket(12, 1), |c| c.z > 1.0 && c.x <= 54.0);
-        let moving = part(&bracket(15, 2), |c| c.z > 1.0 && c.x >= 6.0);
-        let pose = Transform::rotation_axis_angle(&Vec3::new(0.2, 0.7, -0.4), 2.0)
-            .then_after(&Transform::translation(Vec3::new(60.0, 10.0, -30.0)));
-        let moved = moving.transformed(&pose);
-        let scene = Scene::new(&moved, &fixed, &Cancel::new()).unwrap();
-        let hyps = scene.hypotheses(&Cancel::new()).unwrap();
-        let truth = pose.inverse();
-        let miss = |method: CoarseMethod| {
-            hyps.iter()
-                .filter(|c| c.method == method)
-                .map(|c| c.t.max_displacement(&truth, &moved.positions))
-                .fold(f64::INFINITY, f64::min)
-        };
-        let (descriptors, principal) = (miss(CoarseMethod::Descriptors), miss(CoarseMethod::PrincipalAxes));
-        assert!(descriptors < 3.0, "descriptor candidates miss the truth by {descriptors} mm");
-        assert!(
-            principal > 8.0,
-            "the principal axes should not find it ({principal} mm): the test would prove nothing"
-        );
-    }
-
-    #[test]
-    fn a_whole_part_is_found_from_its_principal_axes_alone() {
-        let fixed = bracket(12, 1);
-        let moving = bracket(15, 2);
-        let pose = Transform::rotation_axis_angle(&Vec3::new(1.0, 0.1, 0.3), 2.8)
-            .then_after(&Transform::translation(Vec3::new(-50.0, 20.0, 90.0)));
-        let moved = moving.transformed(&pose);
-        let scene = Scene::new(&moved, &fixed, &Cancel::new()).unwrap();
-        let hyps = scene.hypotheses(&Cancel::new()).unwrap();
-        let near = hyps
-            .iter()
-            .filter(|c| c.method == CoarseMethod::PrincipalAxes)
-            .map(|c| c.t.max_displacement(&pose.inverse(), &moved.positions))
-            .fold(f64::INFINITY, f64::min);
-        assert!(near < 3.0, "{near}");
-    }
-
-    /// Finding 6: the count of refined candidates is produced by `solve`; with a single candidate
-    /// there is nothing to compare, so the right pose is still not certain, and `refined` says 1.
-    #[test]
-    fn one_candidate_gives_refined_one_and_never_unique() {
-        let fixed = bracket(12, 1);
-        let pose = Transform::rotation_axis_angle(&Vec3::new(1.0, 0.1, 0.3), 2.8)
-            .then_after(&Transform::translation(Vec3::new(-50.0, 20.0, 90.0)));
-        let moved = bracket(15, 2).transformed(&pose);
-        let scene = Scene::new(&moved, &fixed, &Cancel::new()).unwrap();
-        let hyps = scene.hypotheses(&Cancel::new()).unwrap();
-        let truth = pose.inverse();
-        let best = hyps
-            .iter()
-            .min_by(|a, b| {
-                a.t.max_displacement(&truth, &moved.positions)
-                    .total_cmp(&b.t.max_displacement(&truth, &moved.positions))
-            })
-            .copied()
-            .unwrap();
-        let alone = solve(&scene, vec![best], &PairOptions::default(), &Cancel::new()).unwrap();
-        assert_eq!(alone.refined, 1);
-        assert_eq!(alone.verdict, PairVerdict::Ambiguous);
-        assert_eq!(alone.confidence, 0.0);
-        let err = alone.transform.max_displacement(&truth, &moved.positions);
-        assert!(err < 0.2, "the pose itself is right: {err}");
-        let all = solve(&scene, hyps, &PairOptions::default(), &Cancel::new()).unwrap();
-        assert!(all.refined >= 2, "{}", all.refined);
-        assert_eq!(all.verdict, PairVerdict::Unique);
-    }
-}
+mod tests;
