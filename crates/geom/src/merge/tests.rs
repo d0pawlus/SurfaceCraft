@@ -130,7 +130,7 @@ fn hostile_input_is_an_error_not_a_panic() {
     let a = view(0, Vec3::x(), 8.0);
     let cancel = Cancel::new();
     let go = |scans: &[Mesh], tol: f64| merge(scans, &Params { tolerance: tol }, &cancel, &mut |_| {});
-    assert!(matches!(go(&[a.clone()], TOL), Err(MergeError::Params(_))), "one scan");
+    assert!(matches!(go(std::slice::from_ref(&a), TOL), Err(MergeError::Params(_))), "one scan");
     assert!(matches!(go(&[], TOL), Err(MergeError::Params(_))), "none");
     assert!(matches!(go(&[a.clone(), Mesh::default()], TOL), Err(MergeError::Params(_))), "empty");
     for tol in [0.0, -1.0, f64::NAN, f64::INFINITY] {
