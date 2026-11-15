@@ -431,6 +431,7 @@ fn failure(set: &Settings, id: ObjectId, why: &str) -> ToSolidOut {
         attempts: Vec::new(),
         prep: PrepOut::default(),
         thickened: None,
+        analytic: None,
     }
 }
 

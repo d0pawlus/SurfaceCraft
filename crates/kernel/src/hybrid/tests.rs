@@ -300,3 +300,16 @@ fn bad_input_is_refused() {
     assert!(extract_face(&b, 99).is_err());
     assert!(replace_face(&b, 99, &wave_surface(0.0, 1.0, 0.0, 1.0)).is_err());
 }
+
+#[test]
+fn a_corner_patch_is_not_an_analytic_face() {
+    let rounded = solid::make_box([0.0; 3], [10.0, 10.0, 10.0]).unwrap();
+    let edges: Vec<usize> = (0..rounded.edges.len()).collect();
+    let r = solid::fillet(&rounded, &edges, 2.0).unwrap();
+    assert!(
+        r.faces.iter().any(|f| matches!(f.surface, Surface::BallPatch { .. })),
+        "the rounds meet in a corner patch"
+    );
+    let ball = r.faces.iter().filter(|f| matches!(f.surface, Surface::BallPatch { .. })).count();
+    assert_eq!(analytic_faces(&r).len() + ball, r.faces.len());
+}

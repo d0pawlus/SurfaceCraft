@@ -379,6 +379,8 @@ mod tests {
         assert_eq!(sheet.faces.len(), 1);
         assert_eq!(sheet.faces[0].loops.len(), 2);
         sheet.validate().unwrap();
+        // every face of the sheet is used forward, which `canonicalize` leaves as it is
+        assert_eq!(crate::nurbs::canonicalize(sheet.clone()), sheet);
         // the tessellation honours the outline: its area is that of the L minus the hole
         // (parameter rectangle 60 × 40 mm is almost flat: the wave adds a few percent)
         let full = crate::tess::tessellate(&sheet_from_spline(&s).unwrap(), Some(0.01)).unwrap().area();

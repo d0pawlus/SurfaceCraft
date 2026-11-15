@@ -375,6 +375,48 @@ fn kind_name(p: &Primitive) -> &'static str {
     }
 }
 
+/// How the cut, tool or addition of item `k` came out: the text, whether it was applied, and the
+/// shape as planned.
+fn item_outcome(k: usize, plan: &plan::Plan, cuts: &[Cut], built: &hybrid::Built) -> Option<(String, bool, Shape)> {
+    let role = plan.roles.get(k)?;
+    let of_tools = |sts: Vec<&CutStatus>, none: &str| match sts.iter().find(|st| matches!(st, CutStatus::Skipped(_))) {
+        Some(bad) => (describe(bad).0, false, role.shape.clone()),
+        None if sts.is_empty() => (none.to_string(), false, role.shape.clone()),
+        None => (sts.first().map_or(String::new(), |st| describe(st).0), true, role.shape.clone()),
+    };
+    Some(match role.kind {
+        RoleKind::Global | RoleKind::Blend => {
+            let ci = plan.cut_members.iter().position(|m| m.contains(&k));
+            match ci.and_then(|ci| built.primitives.get(ci).zip(cuts.get(ci))) {
+                Some((st, cut)) => {
+                    let (how, ok) = describe(st);
+                    (how, ok, cut.shape.clone())
+                }
+                None => ("skipped: not passed to the kernel".to_string(), false, role.shape.clone()),
+            }
+        }
+        RoleKind::LocalSubtract => {
+            of_tools(role.tools.iter().filter_map(|&t| built.tools.get(t)).collect(), "skipped: no tool")
+        }
+        RoleKind::LocalAdd => {
+            of_tools(role.adds.iter().filter_map(|&t| built.adds.get(t)).collect(), "skipped: no addition")
+        }
+        RoleKind::Skipped => (format!("skipped: {}", role.how), false, role.shape.clone()),
+    })
+}
+
+/// Per planned item: its role, how it was applied (or why not) and its faces in the built solid.
+fn item_faces(items: &[Item], plan: &plan::Plan, cuts: &[Cut], built: &hybrid::Built, tol: f64) -> Vec<FaceOf> {
+    let mut out = Vec::with_capacity(items.len());
+    for (k, it) in items.iter().enumerate() {
+        let Some(role) = plan.roles.get(k) else { continue };
+        let Some((how, applied, shape)) = item_outcome(k, plan, cuts, built) else { continue };
+        let faces = if applied { hybrid::faces_on_shape(&built.brep, &shape, tol) } else { Vec::new() };
+        out.push(FaceOf { object: it.id, faces, how, role: role.kind.name().to_string() });
+    }
+    out
+}
+
 pub(crate) fn from_regions(s: &mut Session, i: FromRegionsIn) -> CmdResult<FromRegionsOut> {
     if i.primitives.is_empty() && i.surfaces.is_empty() {
         return Err(CmdError::Params("give `primitives` and/or `surfaces`".into()));
@@ -436,41 +478,9 @@ pub(crate) fn from_regions(s: &mut Session, i: FromRegionsIn) -> CmdResult<FromR
     let mut faces_of = skipped_early;
     let tol = 0.02 * diag.max(1.0) / 10.0 + 1e-3;
     let mut skipped = faces_of.len();
-    for (k, it) in items.iter().enumerate() {
-        let Some(role) = plan.roles.get(k) else { continue };
-        let (how, applied, shape) = match role.kind {
-            RoleKind::Global | RoleKind::Blend => {
-                let ci = plan.cut_members.iter().position(|m| m.contains(&k));
-                match ci.and_then(|ci| built.primitives.get(ci).zip(cuts.get(ci))) {
-                    Some((st, cut)) => {
-                        let (how, ok) = describe(st);
-                        (how, ok, cut.shape.clone())
-                    }
-                    None => ("skipped: not passed to the kernel".to_string(), false, role.shape.clone()),
-                }
-            }
-            RoleKind::LocalSubtract => {
-                let sts: Vec<&CutStatus> = role.tools.iter().filter_map(|&t| built.tools.get(t)).collect();
-                match sts.iter().find(|st| matches!(st, CutStatus::Skipped(_))) {
-                    Some(bad) => (describe(bad).0, false, role.shape.clone()),
-                    None if sts.is_empty() => ("skipped: no tool".to_string(), false, role.shape.clone()),
-                    None => (sts.first().map_or(String::new(), |st| describe(st).0), true, role.shape.clone()),
-                }
-            }
-            RoleKind::LocalAdd => {
-                let sts: Vec<&CutStatus> = role.adds.iter().filter_map(|&t| built.adds.get(t)).collect();
-                match sts.iter().find(|st| matches!(st, CutStatus::Skipped(_))) {
-                    Some(bad) => (describe(bad).0, false, role.shape.clone()),
-                    None if sts.is_empty() => ("skipped: no addition".to_string(), false, role.shape.clone()),
-                    None => (sts.first().map_or(String::new(), |st| describe(st).0), true, role.shape.clone()),
-                }
-            }
-            RoleKind::Skipped => (format!("skipped: {}", role.how), false, role.shape.clone()),
-        };
-        let faces = if applied { hybrid::faces_on_shape(&built.brep, &shape, tol) } else { Vec::new() };
-        skipped += usize::from(!applied);
-        faces_of.push(FaceOf { object: it.id, faces, how, role: role.kind.name().to_string() });
-    }
+    let of_items = item_faces(&items, &plan, &cuts, &built, tol);
+    skipped += of_items.iter().filter(|f| f.how.starts_with("skipped")).count();
+    faces_of.extend(of_items);
     for (((id, _), f), st) in surf_regions.iter().zip(&free).zip(&built.freeform) {
         let (how, applied) = describe(st);
         let faces = if applied { hybrid::faces_on_spline(&built.brep, &f.surface, tol)? } else { Vec::new() };
