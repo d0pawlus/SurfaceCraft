@@ -2,11 +2,15 @@
 //! variant refines the patch (centroid splits and Delaunay flips) and fairs it with the
 //! surrounding ring held fixed (membrane, then thin-plate iterations).
 use crate::ear::{ear_clip_avoiding, fan_fill};
-use crate::{Mesh, Point3, Vec3, par, tri};
+use crate::{Mesh, Point3, par, tri};
 use std::collections::{HashMap, HashSet};
 
+mod crossing;
+mod fair;
 mod inward;
 mod patch;
+use crossing::Crossings;
+use fair::{Fairing, fair_patch};
 use patch::Patch;
 
 /// Closed boundary loops as vertex lists, each in the direction of its triangles' edges.
@@ -150,7 +154,9 @@ pub(crate) fn fill_holes_filtered(
     let faces = VertexFaces::new(mesh);
     let mut uses = EdgeUses::new(mesh, &todo);
     let source: &Mesh = mesh;
-    let fill = |lp: &Vec<u32>| fill_in_workspace(source, &faces, &uses, lp, smooth, sharpen);
+    // only a smooth patch is checked for crossings (a flat one lies in its loop's mean plane)
+    let crossings = smooth.then(|| Crossings::new(source));
+    let fill = |lp: &Vec<u32>| fill_in_workspace(source, &faces, &uses, lp, smooth, sharpen, crossings.as_ref());
     // a single hole stays on this thread (the crease tests read a thread-local reason)
     let patches: Vec<Patch> =
         if todo.len() < 2 { todo.iter().map(fill).collect() } else { par::map_slice(&todo, fill) };
@@ -159,6 +165,7 @@ pub(crate) fn fill_holes_filtered(
         Guard::AllowInward => vec![false; todo.len()],
     };
     drop(long);
+    drop(crossings);
     for ((lp, patch), refused) in todo.iter().zip(patches).zip(refused) {
         if refused {
             rep.skipped += 1;
@@ -173,7 +180,8 @@ pub(crate) fn fill_holes_filtered(
             if added.is_some() {
                 break;
             }
-            let again = fill_in_workspace(mesh, &faces, &uses, lp, smooth, sharpen);
+            let crossings = smooth.then(|| Crossings::new(mesh));
+            let again = fill_in_workspace(mesh, &faces, &uses, lp, smooth, sharpen, crossings.as_ref());
             added = append_if_admitted(mesh, &mut uses, again);
         }
         match added {
@@ -361,7 +369,8 @@ fn workspace(mesh: &Mesh, faces: &VertexFaces, lp: &[u32]) -> (Vec<u32>, Mesh) {
 
 /// Fills the loop `lp` in a copy of the triangles around it, which is all the fairing and the
 /// sharpening read; the copy numbers its vertices in the order of the mesh's, so the patch is the
-/// one the whole mesh would give.
+/// one the whole mesh would give. A smooth patch that would pass through the mesh or itself is
+/// faired as a membrane instead, when that one does not (see `holes::crossing`).
 fn fill_in_workspace(
     mesh: &Mesh,
     faces: &VertexFaces,
@@ -369,6 +378,7 @@ fn fill_in_workspace(
     lp: &[u32],
     smooth: bool,
     sharpen: bool,
+    crossings: Option<&Crossings>,
 ) -> Patch {
     let (origin, mut work) = workspace(mesh, faces, lp);
     let local = |v: u32| origin.binary_search(&v).map_or(0, |k| k as u32);
@@ -385,26 +395,43 @@ fn fill_in_workspace(
         fan_fill(&mut work, &rev);
     }
     if smooth {
-        refine_and_fair(&mut work, first_tri, &lp);
-        if let Some(around) = &around {
-            crate::crease::sharpen_patch(&mut work, around, first_tri, first_vertex, &lp);
-        }
+        let refined = refine_patch(&mut work, first_tri, &lp);
+        let faired = |fairing: Fairing| {
+            let mut w = work.clone();
+            if let Some(first_new) = refined {
+                fair_patch(&mut w, first_tri, first_new, fairing);
+            }
+            if let Some(around) = &around {
+                crate::crease::sharpen_patch(&mut w, around, first_tri, first_vertex, &lp);
+            }
+            w
+        };
+        let crosses = |w: &Mesh| crossings.is_some_and(|c| c.patch_crosses(&origin, w, first_tri));
+        let thin_plate = faired(Fairing::ThinPlate);
+        work = if refined.is_some() && crosses(&thin_plate) {
+            let membrane = faired(Fairing::Membrane);
+            if crosses(&membrane) { thin_plate } else { membrane }
+        } else {
+            thin_plate
+        };
     }
     Patch { origin, positions: work.positions.split_off(first_vertex), triangles: work.triangles.split_off(first_tri) }
 }
 
 /// Refines the triangles from `first` on (centroid splits until edges are about the loop's mean
-/// edge, Delaunay flips) and fairs their interior vertices with the loop held fixed.
-fn refine_and_fair(mesh: &mut Mesh, first: usize, lp: &[u32]) {
+/// edge, Delaunay flips) for the fairing of their interior vertices with the loop held fixed;
+/// returns the first vertex the refinement added, or `None` for a loop too short or too small to
+/// refine (nothing to fair).
+fn refine_patch(mesh: &mut Mesh, first: usize, lp: &[u32]) -> Option<usize> {
     let n = lp.len();
     if n < 3 {
-        return;
+        return None;
     }
     let target: f64 =
         (0..n).map(|k| (mesh.positions[lp[k] as usize] - mesh.positions[lp[(k + 1) % n] as usize]).norm()).sum::<f64>()
             / n as f64;
     if !(target > 0.0) {
-        return;
+        return None;
     }
     let outside = outside_edges(mesh, first);
     let first_vertex = mesh.positions.len();
@@ -434,7 +461,7 @@ fn refine_and_fair(mesh: &mut Mesh, first: usize, lp: &[u32]) {
         }
     }
     flip_patch(mesh, first, &outside);
-    fair_patch(mesh, first, first_vertex);
+    Some(first_vertex)
 }
 
 /// The undirected edges of the triangles before `first`: the mesh around a patch, which a flip of
@@ -513,158 +540,6 @@ fn flip_pass(mesh: &mut Mesh, first: usize, outside: &HashSet<(u32, u32)>) -> bo
         flipped = true;
     }
     flipped
-}
-
-/// One row of the fairing operator (see [`fair_patch`]).
-struct RowOp {
-    len: usize,
-    cols: Vec<usize>,
-    own: Option<usize>,
-}
-
-/// Fairs the vertices from `first_vertex` on: membrane (umbrella) iterations, then thin-plate
-/// (umbrella of the umbrella) iterations, the rest of the mesh fixed.
-fn fair_patch(mesh: &mut Mesh, first_tri: usize, first_vertex: usize) {
-    let nv = mesh.positions.len();
-    if first_vertex >= nv {
-        return;
-    }
-    // rings of patch vertices and of the boundary vertices they touch (from patch and from the
-    // original triangles around the boundary, so the thin-plate step sees the outer surface)
-    let mut ring: HashMap<u32, Vec<u32>> = HashMap::new();
-    let mut add = |a: u32, b: u32| {
-        ring.entry(a).or_default().push(b);
-    };
-    let mut touched: HashSet<u32> = HashSet::new();
-    for t in &mesh.triangles[first_tri..] {
-        for &v in t {
-            touched.insert(v);
-        }
-    }
-    for t in &mesh.triangles {
-        if t.iter().any(|v| touched.contains(v)) {
-            for k in 0..3 {
-                add(t[k], t[(k + 1) % 3]);
-                add(t[(k + 1) % 3], t[k]);
-            }
-        }
-    }
-    for r in ring.values_mut() {
-        r.sort_unstable();
-        r.dedup();
-    }
-    let free: Vec<u32> = (first_vertex as u32..nv as u32).collect();
-    let lap = |pos: &[Point3], v: u32| -> Option<Vec3> {
-        let r = ring.get(&v)?;
-        if r.is_empty() {
-            return None;
-        }
-        let c = r.iter().fold(Vec3::zeros(), |a, &j| a + pos[j as usize].coords) / r.len() as f64;
-        Some(c - pos[v as usize].coords)
-    };
-    for _ in 0..200 {
-        for &v in &free {
-            if let Some(l) = lap(&mesh.positions, v) {
-                mesh.positions[v as usize] += l;
-            }
-        }
-    }
-    // thin plate: minimise Σ_touched |Δx|² over the free vertices (normal equations, CG per axis)
-    let rows: Vec<u32> = {
-        let mut r: Vec<u32> = touched.iter().copied().collect();
-        r.sort_unstable();
-        r
-    };
-    // the free vertices are the last ones, so a vertex's column is its offset from the first
-    let col_of = |v: u32| (v as usize >= first_vertex).then(|| v as usize - first_vertex);
-    let nf = free.len();
-    let empty: Vec<u32> = Vec::new();
-    let ring_of = |v: u32| ring.get(&v).unwrap_or(&empty);
-    // every row of M once: ring size, columns of its free ring members, its own column
-    let ops: Vec<RowOp> = rows
-        .iter()
-        .map(|&v| {
-            let r = ring_of(v);
-            RowOp { len: r.len(), cols: r.iter().filter_map(|&j| col_of(j)).collect(), own: col_of(v) }
-        })
-        .collect();
-    // M x (rows) for free values x, fixed ones taken as zero
-    let m_apply = |x: &[f64]| -> Vec<f64> {
-        ops.iter()
-            .map(|o| {
-                if o.len == 0 {
-                    return 0.0;
-                }
-                let avg = o.cols.iter().map(|&k| x[k]).sum::<f64>() / o.len as f64;
-                avg - o.own.map_or(0.0, |k| x[k])
-            })
-            .collect()
-    };
-    let mt_apply = |y: &[f64]| -> Vec<f64> {
-        let mut out = vec![0.0; nf];
-        for (ri, o) in ops.iter().enumerate() {
-            if o.len == 0 {
-                continue;
-            }
-            let w = y[ri] / o.len as f64;
-            for &k in &o.cols {
-                out[k] += w;
-            }
-            if let Some(k) = o.own {
-                out[k] -= y[ri];
-            }
-        }
-        out
-    };
-    for axis in 0..3 {
-        // constant part: Δ of the fixed vertices alone
-        let fixed_lap: Vec<f64> = rows
-            .iter()
-            .map(|&v| {
-                let r = ring_of(v);
-                if r.is_empty() {
-                    return 0.0;
-                }
-                let avg =
-                    r.iter().filter(|&&j| col_of(j).is_none()).map(|&j| mesh.positions[j as usize][axis]).sum::<f64>()
-                        / r.len() as f64;
-                avg - if col_of(v).is_some() { 0.0 } else { mesh.positions[v as usize][axis] }
-            })
-            .collect();
-        let b: Vec<f64> = mt_apply(&fixed_lap).iter().map(|x| -x).collect();
-        let mut x: Vec<f64> = free.iter().map(|&v| mesh.positions[v as usize][axis]).collect();
-        let ax = mt_apply(&m_apply(&x));
-        let mut r: Vec<f64> = b.iter().zip(&ax).map(|(b, a)| b - a).collect();
-        let mut p = r.clone();
-        let mut rr: f64 = r.iter().map(|v| v * v).sum();
-        let tol = rr * 1e-20;
-        for _ in 0..(4 * nf).clamp(50, 4000) {
-            if rr <= tol || rr == 0.0 {
-                break;
-            }
-            let ap = mt_apply(&m_apply(&p));
-            let pap: f64 = p.iter().zip(&ap).map(|(a, b)| a * b).sum();
-            if !(pap > 0.0) {
-                break;
-            }
-            let alpha = rr / pap;
-            for k in 0..nf {
-                x[k] += alpha * p[k];
-                r[k] -= alpha * ap[k];
-            }
-            let rr2: f64 = r.iter().map(|v| v * v).sum();
-            let beta = rr2 / rr;
-            rr = rr2;
-            for k in 0..nf {
-                p[k] = r[k] + beta * p[k];
-            }
-        }
-        for (k, &v) in free.iter().enumerate() {
-            if x[k].is_finite() {
-                mesh.positions[v as usize][axis] = x[k];
-            }
-        }
-    }
 }
 
 #[cfg(test)]
