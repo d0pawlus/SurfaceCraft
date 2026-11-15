@@ -53,6 +53,11 @@ Aplikacja ma mieć **wszystkie cztery** (potwierdzone przez użytkownika):
 3. **Dopasowanie powierzchni swobodnych** (NURBS / freeform na bazie siatki quadów).
 4. **Pełne odtworzenie drzewa cech parametrycznych** (szkic → cechy → historia).
 
+Decyzja właściciela z 2026-11-15 (D1 planu P9): dochodzi piąta funkcja,
+5. **Warstwa inspekcji**: elementy konstrukcyjne, wymiary z nominałem i tolerancją, GD&T strefą minimalną,
+   raport PASS/FAIL, mapa grubości ścianek, pomiar 2D z płaskiego skanera, zakładka „Pomiar” (etap I planu
+   [P9](../plans/2026-11-12-p9-competitive-gaps.md)).
+
 Podstawą merytoryczną jest analiza funkcjonalna QuickSurface, zapisana w repo jako
 [`2026-11-08-quicksurface-functional-analysis.md`](./2026-11-08-quicksurface-functional-analysis.md)
 (katalog 2890 komend, baza wiedzy wideo, instrukcja obsługi). Z niej pochodzą obserwacje
@@ -79,6 +84,8 @@ komend, nie zdekompilowanego kodu), zgodnie z zasadami clean-room ekosystemu (pa
 - Edycja/naprawa meshu na poziomie QS (fill holes, remove outliers, decimation) — minimalny zestaw
   w MVP, pełny pakiet później.
 - Integracja „push do SolidWorks/Inventor" (QS to ma; my jesteśmy samodzielni — eksport plikowy wystarcza).
+  Eksport drzewa cech jako skrypt dla zewnętrznego CAD (etap X planu P9) właściciel przewidział na przyszłość
+  (decyzja D2 z 2026-11-15); do tego czasu pozostaje poza zakresem.
 - Współbieżna edycja wielu użytkowników, chmura, konta.
 - Bezpośrednie sterowanie sprzętem skanera/sondą (GDX ma to jako LiveCapture/Scanner Direct Control —
   dziesiątki sterowników producentów; osobny, duży workstream integracyjny, poza zakresem).

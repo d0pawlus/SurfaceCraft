@@ -20,18 +20,18 @@
 | **X** | Przekazanie drzewa cech do zewnętrznego CAD (wymaga decyzji D2) | model z bramki P5 odtworzony z wygenerowanego skryptu w docelowym CAD, objętość w 1e-6 | 3–4 dni |
 
 Etapy O i V idą pierwsze i po kolei. S, M i C są od siebie niezależne i mogą biec równolegle (limit 3 kompilujących
-agentów, [integration.md](../../integration.md)). R, I, X po decyzjach właściciela.
+agentów, [integration.md](../../integration.md)). R i I według decyzji z 2026-11-15; X w przyszłości.
 
 ## Decyzje właściciela (blokują wskazane pakiety)
 
-| Id | Decyzja | Blokuje | Domyślnie, gdy brak decyzji |
+| Id | Decyzja | Blokuje | Rozstrzygnięcie właściciela (2026-11-15) |
 |---|---|---|---|
-| D1 | Czy SurfaceCraft dostaje warstwę inspekcji (wymiary, GD&T, grubość ścianek, pomiar 2D)? Design doc §2 dziś ją wyklucza | etap I | etap I nie startuje |
-| D2 | Czy robimy eksport drzewa cech jako skrypt dla zewnętrznego CAD? Design doc §3: push-do-CAD jest nie-celem | etap X | etap X nie startuje |
-| D3 | Certyfikaty do podpisu (Windows, Apple Developer ID) | R1 | wydania zostają niepodpisane |
-| D4 | Dostawca LLM i klucz dla asystenta | R2 | asystent zostaje z programem-dostawcą |
-| D5 | Zgoda na zgłoszenia upstream do `tangency-labs/solidcraft` (healer ponadliniowy, `item budget`) | O3 (część upstream) | zostaje obejście po stronie aplikacji |
-| D6 | Prawdziwe skany części pryzmatycznych do lokalnego korpusu oraz czy właściciel przepuści te same skany przez Geomagic i QuickSurface (tylko liczby zbiorcze trafiają do repo) | V2, V3 | próg wyboru metody zostaje sprawdzony tylko syntetycznie |
+| D1 | Czy SurfaceCraft dostaje warstwę inspekcji (wymiary, GD&T, grubość ścianek, pomiar 2D)? Design doc §2 dziś ją wyklucza | etap I | **tak: pełna warstwa inspekcji** (I1–I7); etap I startuje po bieżącej kolejce |
+| D2 | Czy robimy eksport drzewa cech jako skrypt dla zewnętrznego CAD? Design doc §3: push-do-CAD jest nie-celem | etap X | **w przyszłości**; etap X na razie nie startuje |
+| D3 | Certyfikaty do podpisu (Windows, Apple Developer ID) | R1 | **w przyszłości**; do tego czasu wydania niepodpisane |
+| D4 | Dostawca LLM i klucz dla asystenta | R2 | **najpopularniejsze aktualne standardy API**, nie jeden dostawca (patrz R2) |
+| D5 | Zgoda na zgłoszenia upstream do `tangency-labs/solidcraft` (healer ponadliniowy, `item budget`) | O3 (część upstream) | **zgoda** na zgłoszenia do `tangency-labs/solidcore` i `tangency-labs/solidcraft` zgodnie z zasadami ich repozytoriów (szkice `docs/upstream/08`–`12`) |
+| D6 | Prawdziwe skany części pryzmatycznych do lokalnego korpusu oraz czy właściciel przepuści te same skany przez Geomagic i QuickSurface (tylko liczby zbiorcze trafiają do repo) | V2, V3 | prawdziwe skany = **4 otwarte skany Artec Group (CC BY)**, pobierane skryptem, poza repo z uwagi na rozmiar; przebieg przez Geomagic i QuickSurface (V3) bez rozstrzygnięcia |
 
 Zostają nie-celami (bez pakietu): sterowanie skanerem, formaty zamknięte (Parasolid, JT, natywne pliki CAD).
 
@@ -103,7 +103,7 @@ Katalog kompilacji klonowany ze wzorca, najwyżej 3 kompilujących agentów nara
 | Id | Zakres | Model |
 |---|---|---|
 | R1 | Podpisane wydania (po D3), MSI, AppImage, macOS Intel, VERSIONINFO w binarkach Windows | Haiku |
-| R2 | Asystent z prawdziwym dostawcą (po D4): program-dostawca w repo, zgoda użytkownika na wysyłkę danych, tryby align i workflow sprawdzone na skanie | Sonnet |
+| R2 | Asystent z prawdziwymi dostawcami (D4): klienci najpopularniejszych aktualnych standardów API — zgodny z OpenAI (Chat Completions; obejmuje też OpenRouter, Ollama, LM Studio, vLLM i inne serwery lokalne), Anthropic Messages, Google Gemini — wybór dostawcy, modelu i adresu w ustawieniach, klucz z zmiennej środowiskowej albo systemowego magazynu kluczy (nigdy w pliku projektu), zgoda użytkownika na wysyłkę danych, tryby align i workflow sprawdzone na skanie; build wasm bez kluczy w przeglądarce poza jawną zgodą | Sonnet |
 | R3 | Dostępność: drzewo AccessKit w oknie natywnym | Haiku |
 | R4 | Kody błędów w `EngineError` zamiast dopasowywania tekstu; test kompletności tłumaczeń | Haiku |
 | R5 | Jednostki mm/cal w wyświetlaniu, punkty odzyskiwania sesji, schematy myszy innych CAD-ów, SpaceMouse | Haiku |
@@ -136,8 +136,8 @@ Katalog kompilacji klonowany ze wzorca, najwyżej 3 kompilujących agentów nara
 2. **Fala 2:** O2, O4, O6, P8-H11 → V1, V2 (bramka etapu O na korpusie).
 3. **Fala 3:** P8-G2, M1, M2, C1, C2, P8-H7, P8-H8.
 4. **Fala 4:** S1, S2, M3, M4, C3, C4, C5.
-5. **Fala 5:** M5, C6, C7, C8, R3–R7, P8-H10; R1, R2 po decyzjach.
-6. **Fala 6 (po D1, D2):** I1–I7, X1–X2.
+5. **Fala 5:** M5, C6, C7, C8, R2–R7, P8-H10; R1 po certyfikatach (D3, w przyszłości).
+6. **Fala 6:** I1–I7 (D1: tak); X1–X2 w przyszłości (D2).
 
 Po każdej fali: przebieg integracyjny, STATUS, aktualizacja [porównania](../../comparison.md).
 
@@ -145,6 +145,6 @@ Po każdej fali: przebieg integracyjny, STATUS, aktualizacja [porównania](../..
 
 - O2 (G1 przy dowolnej walencji) to znany trudny problem; jeśli konstrukcja po stronie aplikacji nie zejdzie
   poniżej 1°, pakiet kończy się raportem i propozycją prymitywu jądra (upstream, D5).
-- O3 i O4 zależą od zachowania solidcore; bez zgody D5 zostają obejścia.
+- O3 i O4 zależą od zachowania solidcore; zgoda D5 jest (2026-11-15), obejścia zostają do czasu odpowiedzi maintainerów.
 - Szacunki zakładają tempo fal 1 i 2 z P8 (18 pakietów w 2 dni) i wolną maszynę do kompilacji; ręczne
   sprawdzenia właściciela nie są w nich liczone.
