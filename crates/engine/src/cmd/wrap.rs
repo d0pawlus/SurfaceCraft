@@ -297,6 +297,9 @@ pub(crate) fn wrap(s: &mut Session, i: WrapIn) -> CmdResult<WrapOut> {
         .with_coarse_start(i.coarse_start.unwrap_or(false));
     let wrapped = wrap_rounds(&target, set.refine)?;
     let round = wrapped.best;
+    if let Ok(mut g) = LAST_WRAP_DIAG.lock() {
+        *g = round.diag.clone();
+    }
     if round.set.nets.is_empty() {
         return Err(CmdError::Failed("the scan gave no patches".into()));
     }
@@ -336,6 +339,10 @@ pub(crate) fn wrap(s: &mut Session, i: WrapIn) -> CmdResult<WrapOut> {
         warning: (!warnings.is_empty()).then(|| warnings.join("; ")),
     })
 }
+
+/// DIAGNOSTIC (bisect branch only): the patches of the last wrap's result.
+pub(crate) static LAST_WRAP_DIAG: std::sync::Mutex<Vec<surfacecraft_fit::patch_g1::PatchDiag>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// The `surface.wrap` command.
 pub static COMMANDS: &[CommandSpec] = &[command!(

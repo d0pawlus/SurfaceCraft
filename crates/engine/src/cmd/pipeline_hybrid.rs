@@ -214,7 +214,15 @@ fn wrap_prepared(s: &mut Session, set: &Settings, protected: &[Protected], scan:
         staged
     };
     match staged.map_err(failed_at("hybrid_wrap_failed"))? {
-        Ok(pair) => Ok(pair),
+        Ok(pair) => {
+            eprintln!(
+                "DIAG wrap: patches {} capped {} levels {}",
+                pair.0.patches,
+                pair.0.capped,
+                serde_json::to_string(&pair.0.levels).unwrap_or_default()
+            );
+            Ok(pair)
+        }
         Err(why) => Err(halt("hybrid_wrap_failed", format!("the scan could not be wrapped in patches: {why}"))),
     }
 }

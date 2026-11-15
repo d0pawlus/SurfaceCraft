@@ -192,6 +192,74 @@ impl<'a> Lookup<'a> {
     }
 }
 
+/// DIAGNOSTIC (bisect branch only): every patch near the wall primitive (ObjectId 11).
+fn diag_wall(lookup: &Lookup, body: &Brep, owners: &[Option<(usize, f64)>]) {
+    let Some(k) = lookup.protected.iter().position(|p| p.primitive.0 == 11) else { return };
+    let (Some(prim), Some(region)) = (lookup.protected.get(k), lookup.regions.get(k)) else { return };
+    let diag = crate::cmd::wrap::LAST_WRAP_DIAG.lock().map(|g| g.clone()).unwrap_or_default();
+    let target = Point3::new(0.9, 7.9, 2.4);
+    let tol = lookup.tol;
+    eprintln!("DIAG faces {} diag {} prim11 kind {}", body.faces.len(), diag.len(), prim.kind);
+    for f in 0..body.faces.len() {
+        let Some(dense) = face_samples(body, f, 24) else { continue };
+        let worst = dense.iter().map(|p| prim.fit.distance(&Point3::new(p[0], p[1], p[2])).abs()).fold(0.0, f64::max);
+        let near_target =
+            dense.iter().map(|p| (Point3::new(p[0], p[1], p[2]) - target).norm()).fold(f64::INFINITY, f64::min);
+        let mid_owner = dense
+            .get(dense.len() / 2)
+            .and_then(|m| lookup.all.closest(&Point3::new(m[0], m[1], m[2]), 4.0 * tol))
+            .and_then(|h| lookup.owner.get(h.triangle).copied());
+        let admitted = owners.get(f).copied().flatten().is_some_and(|o| o.0 == k);
+        if !(admitted || mid_owner == Some(k as u32) || near_target < 2.0) {
+            continue;
+        }
+        let (samples, _) = lookup.samples_of(body, f).unwrap_or_default();
+        let near = NEAR_REGION_SHARE_OF_TOLERANCE * tol;
+        let off = samples
+            .iter()
+            .filter(|p| prim.fit.distance(&Point3::new(p[0], p[1], p[2])).abs() > SAMPLE_SHARE_OF_TOLERANCE * tol)
+            .count();
+        let outside = samples
+            .iter()
+            .filter(|p| {
+                let q = Point3::new(p[0], p[1], p[2]);
+                region.closest(&q, near).is_none() && !lookup.unassigned_on(&q, prim, near)
+            })
+            .count();
+        let d = diag.get(f);
+        let corner_check = d.map_or(f64::NAN, |d| {
+            let c = d.net[0][0];
+            dense.first().map_or(f64::NAN, |p| {
+                ((p[0] - c[0]).powi(2) + (p[1] - c[1]).powi(2) + (p[2] - c[2]).powi(2)).sqrt().min(
+                    dense
+                        .iter()
+                        .map(|p| ((p[0] - c[0]).powi(2) + (p[1] - c[1]).powi(2) + (p[2] - c[2]).powi(2)).sqrt())
+                        .fold(f64::INFINITY, f64::min),
+                )
+            })
+        });
+        eprintln!(
+            "DIAG face {f} admitted {admitted} mid_owner_is_prim {} max_dist_dense {:.3} near_target {:.3} samples {} off {off} outside {outside} corner_match {:.2e} tri {:?} rim_edge {:?} rim_vertex {:?} side_refit {:?} side_gap {:?} inside_refit {:?}",
+            mid_owner == Some(k as u32),
+            worst,
+            near_target,
+            samples.len(),
+            corner_check,
+            d.map(|d| d.tri),
+            d.map(|d| d.rim_edge),
+            d.map(|d| d.rim_vertex),
+            d.map(|d| d.side_refit),
+            d.map(|d| d.side_gap.map(|g| (g * 1000.0).round() / 1000.0)),
+            d.map(|d| d.inside_refit)
+        );
+        if near_target < 1.5 {
+            if let Some(d) = d {
+                eprintln!("DIAG   net of face {f}: {:?}", d.net);
+            }
+        }
+    }
+}
+
 fn left(p: &Protected, patches: usize, reason: impl Into<String>) -> LeftPatches {
     LeftPatches { primitive: p.primitive, kind: p.kind.to_string(), patches, reason: reason.into() }
 }
@@ -242,6 +310,7 @@ pub(super) fn merge_groups(
 ) -> Result<Merging, CmdError> {
     let lookup = Lookup::new(scan, protected, tol);
     let owners: Vec<Option<(usize, f64)>> = par::map(body.faces.len(), |f| lookup.owner_of(body, f));
+    diag_wall(&lookup, body, &owners);
     let mut out = Merging { body: body.clone(), merged: Vec::new(), left: Vec::new(), notes: Vec::new(), mesh: None };
     let candidates = candidate_groups(body, protected, &owners, tol, &mut out);
     if s.cancel.is_cancelled() {

@@ -237,7 +237,9 @@ pub(crate) fn refit_net(net: Net, project: Project) -> Net {
     for _ in 0..PASSES {
         let Some(next) = net_through(&cur, &cur_s) else { break };
         let next_s = net_samples(&next, project);
-        if closer(&best_s, &next_s, MIN_NET_SAMPLES) && (std::env::var("TMP_GUARD").is_ok_and(|v| v == "0") || keeps_facing(&net, &next)) {
+        if closer(&best_s, &next_s, MIN_NET_SAMPLES)
+            && (std::env::var("TMP_GUARD").is_ok_and(|v| v == "0") || keeps_facing(&net, &next))
+        {
             (best, best_s) = (next, next_s.clone());
         }
         (cur, cur_s) = (next, next_s);

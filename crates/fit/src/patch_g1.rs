@@ -367,7 +367,10 @@ impl Layer<'_> {
     /// the rim and would lean the curve.
     fn refits_edge(&self, a: u32, b: u32) -> bool {
         let narrow = std::env::var("TMP_RIM").is_ok_and(|v| v == "0");
-        self.refit && !self.g1 && !self.free.contains(&key(a, b)) && (narrow || (!self.rim.contains(&a) && !self.rim.contains(&b)))
+        self.refit
+            && !self.g1
+            && !self.free.contains(&key(a, b))
+            && (narrow || (!self.rim.contains(&a) && !self.rim.contains(&b)))
     }
 
     /// Are the spokes and the patches of triangle `f` refitted? Not with tangent patches, and not when
@@ -583,6 +586,33 @@ fn patch_net(l: &Layer, tri: &Triangle, k: usize, curves: [Curve; 4], ng: Vec3, 
     (free, false)
 }
 
+/// DIAGNOSTIC (bisect branch only): what was built for each patch.
+#[derive(Clone, Debug)]
+pub struct PatchDiag {
+    pub tri: usize,
+    pub rim_edge: bool,
+    pub rim_vertex: bool,
+    /// bot, right, top, left: refitted?
+    pub side_refit: [bool; 4],
+    /// bot, right, top, left: largest distance of the curve to the scan (9 samples)
+    pub side_gap: [f64; 4],
+    pub inside_refit: bool,
+    pub net: crate::patch::Net,
+}
+/// DIAGNOSTIC (bisect branch only).
+pub static DIAG: std::sync::Mutex<Vec<PatchDiag>> = std::sync::Mutex::new(Vec::new());
+
+fn curve_gap(l: &Layer, c: &Curve) -> f64 {
+    (0..=8)
+        .map(|k| {
+            let t = k as f64 / 8.0;
+            let b = bern(t);
+            let p = c[0] * b[0] + c[1] * b[1] + c[2] * b[2] + c[3] * b[3];
+            l.scan.closest(&Point3::from(p), f64::INFINITY).map_or(f64::INFINITY, |h| h.distance)
+        })
+        .fold(0.0, f64::max)
+}
+
 fn add_triangle(l: &Layer, tri: &Triangle, build: &mut Build) {
     let nf = l.face_normal.get(tri.f).copied().unwrap_or_else(Vec3::z);
     let ng = l.normals.centre.get(tri.f).copied().unwrap_or(nf);
@@ -596,6 +626,23 @@ fn add_triangle(l: &Layer, tri: &Triangle, build: &mut Build) {
             continue;
         };
         let (net, tangent) = patch_net(l, tri, k, [bot, right, top, left], ng, nf);
+        {
+            let t = tri.corners;
+            let narrow = std::env::var("TMP_RIM").is_ok_and(|v| v == "0");
+            let spokes = l.refits_triangle(tri.f) || (narrow && l.refit && !l.g1);
+            let d = PatchDiag {
+                tri: tri.f,
+                rim_edge: l.on_rim(tri.f),
+                rim_vertex: t.iter().any(|v| l.rim.contains(v)),
+                side_refit: [l.refits_edge(t[k], t[(k + 1) % 3]), spokes, spokes, l.refits_edge(t[(k + 2) % 3], t[k])],
+                side_gap: [curve_gap(l, &bot), curve_gap(l, &right), curve_gap(l, &top), curve_gap(l, &left)],
+                inside_refit: l.refits_triangle(tri.f),
+                net,
+            };
+            if let Ok(mut g) = DIAG.lock() {
+                g.push(d);
+            }
+        }
         build.fallbacks += usize::from(!tangent);
         build.set.nets.push(net);
         build.set.corners.push([c0, c1, g, c3]);
@@ -624,6 +671,9 @@ fn wrap_with(
     options: &G1Options,
     refit: bool,
 ) -> G1Wrap {
+    if let Ok(mut g) = DIAG.lock() {
+        g.clear();
+    }
     let face_normal: Vec<Vec3> =
         (0..coarse.triangle_count()).map(|f| coarse.face_normal(f).unwrap_or_else(Vec3::z)).collect();
     let vertices: Vec<Vec3> =

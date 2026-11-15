@@ -162,6 +162,8 @@ pub(super) struct Round {
     probes: usize,
     /// Was the coarse mesh made by grid clustering?
     pub(super) clustered: bool,
+    /// DIAGNOSTIC (bisect branch only)
+    pub(super) diag: Vec<surfacecraft_fit::patch_g1::PatchDiag>,
 }
 
 /// The scan, its acceleration structure and the points the patches are measured at.
@@ -203,7 +205,11 @@ impl<'a> Target<'a> {
             samples: scan.positions.iter().step_by(stride).copied().collect(),
             tolerance,
             min_within,
-            stop_within: if std::env::var("TMP_STOP").is_ok_and(|v| v == "0") { min_within } else { min_within + STOP_MARGIN * (1.0 - min_within) },
+            stop_within: if std::env::var("TMP_STOP").is_ok_and(|v| v == "0") {
+                min_within
+            } else {
+                min_within + STOP_MARGIN * (1.0 - min_within)
+            },
             max_triangles: (max_patches / PATCHES_PER_TRIANGLE).max(4),
             coarse_start: false,
             max_patches,
@@ -295,6 +301,7 @@ fn build_round(t: &Target, coarse: &Mesh, budget: f64, g1: bool) -> (Round, Vec<
         partial: None,
         probes: 0,
         clustered: false,
+        diag: surfacecraft_fit::patch_g1::DIAG.lock().map(|g| g.clone()).unwrap_or_default(),
     };
     (round, d)
 }
