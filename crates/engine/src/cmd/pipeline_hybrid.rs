@@ -391,8 +391,7 @@ fn merged_or_wrap(
     let mesh = if tried.merged.is_empty() { None } else { meshed(&tried.body, set.tolerance) };
     stages.push(stage("mesh_check", &watch));
     let Some(mesh) = mesh else {
-        let why = "the mesher does not take the merged body, so the wrap was kept";
-        return Ok((wrap_result, none(unkept(tried.left, &tried.merged, why))));
+        return Ok(without_mesh(wrap_result, tried, &brep));
     };
     let watch = Stopwatch::start();
     let merged_w = install(s, w, tried.body.clone())?;
@@ -406,6 +405,14 @@ fn merged_or_wrap(
             Ok((out, none(unkept(tried.left, &tried.merged, &format!("the merge was not kept: {why}")))))
         }
     }
+}
+
+/// The result when the mesher does not take the merged body: the wrap's result and body, with the merged groups listed
+/// as left as patches.
+fn without_mesh(wrap_result: ToSolidOut, tried: Merging, wrap: &Brep) -> (ToSolidOut, Merging) {
+    let why = "the mesher does not take the merged body, so the wrap was kept";
+    let left = unkept(tried.left, &tried.merged, why);
+    (wrap_result, Merging { body: wrap.clone(), merged: Vec::new(), left, notes: Vec::new(), mesh: None })
 }
 
 /// `left` and the merged faces that did not make it into the result, as groups left as patches with `why`.
@@ -659,5 +666,37 @@ mod tests {
         assert_eq!((all[1].kind.as_str(), all[1].patches), ("plane", 5));
         assert!(all[1..].iter().all(|l| l.reason.contains("mesher")));
         assert_eq!(all[0].reason, "a single patch", "what was left stays as it was");
+    }
+
+    /// A merged body the mesher does not take is not returned: the wrap's result is, unchanged, with the wrap's body and
+    /// the merged groups listed as left as patches (no merged face, no note, no mesh).
+    #[test]
+    fn a_merged_body_the_mesher_does_not_take_gives_the_wrap_and_lists_the_groups() {
+        let (wrap_brep, merged_brep) = (sheet(0.0), sheet(0.5));
+        let wrap_result = result(Verdict::Pass, SOLID, 1.0, 1.0);
+        let before = serde_json::to_value(&wrap_result).unwrap();
+        let group = MergedFace {
+            primitive: ObjectId(7),
+            kind: "plane".into(),
+            face: 0,
+            patches: 4,
+            max_edge_gap: 0.0,
+            area: 0.0,
+            patch_area: 0.0,
+        };
+        let tried = Merging {
+            body: merged_brep,
+            merged: vec![group],
+            left: Vec::new(),
+            notes: vec!["a note".into()],
+            mesh: None,
+        };
+        let (out, merging) = without_mesh(wrap_result, tried, &wrap_brep);
+        assert_eq!(serde_json::to_value(&out).unwrap(), before, "the wrap's result, unchanged");
+        assert_eq!(merging.body, wrap_brep);
+        assert!(merging.merged.is_empty() && merging.notes.is_empty() && merging.mesh.is_none());
+        assert_eq!(merging.left.len(), 1);
+        assert_eq!((merging.left[0].kind.as_str(), merging.left[0].patches), ("plane", 4));
+        assert!(merging.left[0].reason.contains("mesher"));
     }
 }
