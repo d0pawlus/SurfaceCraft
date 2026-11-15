@@ -199,3 +199,100 @@ fn soft_sides_off_the_data_still_give_a_sheet() {
     assert_eq!(patch.sheet.faces.len(), 1);
     assert!(patch.report.sides.iter().all(|s| s.soft), "{:?}", patch.report);
 }
+
+/// Height of a cylinder of radius `BEND` with its axis along y, touching z = 0 from below.
+const BEND: f64 = 40.0;
+fn bent(x: f64) -> f64 {
+    (BEND * BEND - x * x).sqrt() - BEND
+}
+
+/// Surface texture of a real scan (a cast or machined skin): ripples far below the tolerance whose
+/// curvature, `TEXTURE * (TAU / RIPPLE)^2 = 0.033 1/mm`, is larger than the shape's own.
+const TEXTURE: f64 = 0.03;
+const RIPPLE: f64 = 6.0;
+fn textured(x: f64, y: f64) -> f64 {
+    let w = std::f64::consts::TAU / RIPPLE;
+    bent(x) + TEXTURE * (w * x).sin() * (w * y).sin()
+}
+
+/// Largest error of the patch's normal curvature across the bend against the cylinder's `1 / BEND`,
+/// on a grid well inside the outline.
+fn bend_curvature_error(patch: &Patch) -> f64 {
+    let probe = crate::nurbs::SurfaceProbe::new(&patch.surface).unwrap();
+    let mut worst = 0.0_f64;
+    for i in -4..=4 {
+        for j in -4..=4 {
+            let (x, y) = (2.0 * f64::from(i), 2.0 * f64::from(j));
+            let (_, _, uv) = probe.closest_uv([x, y, bent(x)]).unwrap();
+            let d = crate::vpatch::derivatives(&patch.surface, uv).unwrap();
+            let (su, sv) = (d[1], d[2]);
+            // the parameter direction whose image is closest to the x axis
+            let (e, f, g) = (geom::dot(su, su), geom::dot(su, sv), geom::dot(sv, sv));
+            let (bu, bv) = (su[0], sv[0]);
+            let det = e * g - f * f;
+            let (du, dv) = ((g * bu - f * bv) / det, (e * bv - f * bu) / det);
+            let sd = geom::add(geom::scale(su, du), geom::scale(sv, dv));
+            let sdd = geom::add(
+                geom::add(geom::scale(d[3], du * du), geom::scale(d[4], 2.0 * du * dv)),
+                geom::scale(d[5], dv * dv),
+            );
+            let n = geom::unit(geom::cross(su, sv)).unwrap();
+            let kappa = geom::dot(sdd, n) / geom::dot(sd, sd);
+            worst = worst.max((kappa.abs() - 1.0 / BEND).abs());
+        }
+    }
+    worst
+}
+
+/// The textured cylinder as a request: soft sides on the scan, 6000 points, nets up to 24.
+fn textured_request(tolerance: f64) -> Request {
+    let mut r = rng(31);
+    let poly = pentagon();
+    let sides: Vec<Side> = (0..poly.len())
+        .map(|k| {
+            let (a, b) = (poly[k], poly[(k + 1) % poly.len()]);
+            let points = (0..SIDE_POINTS)
+                .map(|i| {
+                    let t = i as f64 / (SIDE_POINTS - 1) as f64;
+                    let (x, y) = (a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]));
+                    let end = i == 0 || i + 1 == SIDE_POINTS;
+                    [x, y, if end { bent(x) } else { textured(x, y) }]
+                })
+                .collect();
+            Side { points, continuity: Continuity::G0, reference: None, uv: None, soft: true }
+        })
+        .collect();
+    let mut req = request(sides);
+    req.max_control = 24;
+    req.tolerance = tolerance;
+    let flat = data_inside(&mut r, 6000, 0.5, |_| 0.0);
+    req.data = flat.into_iter().map(|p| [p[0], p[1], p[2] / 3.0 + textured(p[0], p[1])]).collect();
+    req
+}
+
+#[test]
+fn soft_fit_of_a_dense_scan_keeps_the_curvature_of_the_shape() {
+    // a net sized from the number of points (22 by 22 here) follows the texture: its curvature is
+    // off by 0.032 1/mm, more than the cylinder's own 0.025, and useless as a G2 reference. Within
+    // the tolerance the coarse start is kept: measured 0.0009 1/mm (macOS aarch64)
+    let patch = fit_patch(&textured_request(0.2)).unwrap();
+    let rep = &patch.report;
+    assert_eq!(rep.control, [6, 6], "{rep:?}");
+    assert!(rep.within_tolerance, "{rep:?}");
+    assert!(bend_curvature_error(&patch) <= 0.005, "{:.5} {rep:?}", bend_curvature_error(&patch));
+}
+
+#[test]
+fn soft_fit_grows_the_net_when_the_tolerance_asks_for_the_texture() {
+    // the texture is 0.03 mm high: a tolerance below it cannot be met by the start net
+    let coarse = fit_patch(&textured_request(0.2)).unwrap().report;
+    let fine = fit_patch(&textured_request(0.02)).unwrap().report;
+    eprintln!(
+        "MEASURED textured: start max {:.4}; grown net {:?} rounds {} max {:.4}",
+        coarse.max, fine.control, fine.rounds, fine.max
+    );
+    assert!(fine.control[0] > 6 && fine.control[1] > 6, "{fine:?}");
+    assert!(fine.rounds > 1, "{fine:?}");
+    // measured: max 0.067 at 6 by 6, 0.039 at the grown net; bound at 1.5 times less than the start
+    assert!(fine.max <= coarse.max / 1.5, "{} against {}: {fine:?}", fine.max, coarse.max);
+}

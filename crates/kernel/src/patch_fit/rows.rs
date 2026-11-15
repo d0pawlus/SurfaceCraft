@@ -197,17 +197,26 @@ impl Rows {
     }
 }
 
-/// `S_dd · n = κ |S_d|²` with `κ` of the reference face along the previous round's `S_d`.
+/// `S_dd · n = κ |S_d|²` with `κ` of the reference face along the previous round's `S_d`, as a
+/// Newton step about that round's surface.
 fn curvature_row(prev: &Surface, smp: &Sample, r: &RefSample) -> Result<Option<Row>> {
     let d = derivatives(prev, smp.uv)?;
     let sd = add(scale(d[1], smp.dir[0]), scale(d[2], smp.dir[1]));
     let Some(w) = unit(sd) else { return Ok(None) };
     let Some(kappa) = r.curvature(w) else { return Ok(None) };
-    let value = kappa * dot(sd, sd);
-    if !value.is_finite() {
+    let speed = kappa * dot(sd, sd);
+    if !speed.is_finite() {
         return Ok(None);
     }
-    Ok(Some(Row::Curvature { uv: smp.uv, dir: smp.dir, normal: r.normal, value }))
+    // Newton step of `S_dd · n − κ |S_d|² = 0` about the previous surface (κ kept): the speed
+    // `|S_d|²` of the new surface is `2 S_d⁰ · S_d − |S_d⁰|²` to first order
+    Ok(Some(Row::Curvature {
+        uv: smp.uv,
+        dir: smp.dir,
+        normal: r.normal,
+        tangent: scale(sd, -2.0 * kappa),
+        value: -speed,
+    }))
 }
 
 fn rows_per_sample(c: Continuity) -> usize {

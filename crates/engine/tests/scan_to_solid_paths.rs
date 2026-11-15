@@ -128,9 +128,11 @@ fn attempts_of(component: &Value) -> Vec<(String, Option<String>, bool, Option<S
 /// call runs exactly two extra attempts, and once they are spent the lists of the parts that come
 /// later name the wrap and the hybrid method as skipped with the reason. Measured (macOS): the wrap of
 /// a part puts 0.996 of it within the tolerance and passes, so parts 1 and 2 take one extra each and
-/// part 3 is refused both. The assertions do not depend on the verdicts: only that exactly two extra
-/// attempts run, and that a skipped entry sits in a part at or after the last part that ran one (that
-/// part may itself have spent the last attempt and had a later attempt of its own refused).
+/// part 3 is refused both. A part refused the wrap that way still gets its own one wrap afterwards
+/// (`freeform_fallback`: a part's own wrap is no extra attempt), listed after the skipped entries. The
+/// assertions do not depend on the verdicts: only that exactly two extra attempts run, and that a
+/// skipped entry sits in a part at or after the last part that ran one (that part may itself have
+/// spent the last attempt and had a later attempt of its own refused).
 #[test]
 fn the_attempts_of_the_parts_of_one_call_share_a_budget_of_two_extra_attempts() {
     // Arrange
@@ -145,8 +147,11 @@ fn the_attempts_of_the_parts_of_one_call_share_a_budget_of_two_extra_attempts() 
     let parts = out["components"].as_array().unwrap();
     assert_eq!(parts.len(), 3, "{out}");
     let lists: Vec<_> = parts.iter().map(attempts_of).collect();
-    let ran =
-        |list: &[(String, Option<String>, bool, Option<String>)]| list.iter().filter(|a| a.3.is_none()).count() - 1;
+    // a part's own wrap after a refused one (the entries after the first skipped one) is no extra attempt
+    let ran = |list: &[(String, Option<String>, bool, Option<String>)]| {
+        let before_refusal = list.iter().position(|a| a.3.is_some()).unwrap_or(list.len());
+        list.iter().take(before_refusal).filter(|a| a.3.is_none()).count() - 1
+    };
     // every part starts with the primitives; the first part, with a full budget, runs the wrap
     assert!(lists.iter().all(|l| l[0].0 == "primitives" && l[0].3.is_none()), "{lists:?}");
     assert_eq!((lists[0][1].0.as_str(), lists[0][1].3.as_deref()), ("freeform", None), "{lists:?}");
@@ -166,8 +171,33 @@ fn the_attempts_of_the_parts_of_one_call_share_a_budget_of_two_extra_attempts() 
     let entry = part["attempts"].as_array().unwrap().iter().find(|a| a["skipped"].is_object()).unwrap();
     assert_eq!(entry["skipped"]["call"]["command"], "scan.to_solid", "{entry}");
     assert_eq!(entry["skipped"]["call"]["params"]["method"], entry["method"], "{entry}");
-    // a part whose extra attempts were refused keeps the primitives result, marked as returned
-    assert!(lists[skipped_parts[0]][0].2, "{lists:?}");
+    // a part whose wrap was refused and whose primitives did not pass gets its own wrap afterwards;
+    // exactly one entry of each part is the returned one
+    let rank = |v: &Option<String>| match v.as_deref() {
+        Some("pass") => 2,
+        Some("review") => 1,
+        _ => 0,
+    };
+    for (k, l) in lists.iter().enumerate() {
+        let returned: Vec<_> = l.iter().filter(|a| a.2).collect();
+        assert_eq!(returned.len(), 1, "part {k}: {lists:?}");
+        assert_eq!(returned[0].1.as_deref(), parts[k]["verdict"].as_str(), "the component is the returned attempt");
+        if !l.iter().any(|a| a.0 == "freeform" && a.3.is_some()) {
+            continue;
+        }
+        // the wrap was refused: the part's own wrap follows, and the better of the two by verdict is
+        // returned (equal verdicts: the share within the tolerance decides, so either may be returned)
+        let own = l.iter().skip_while(|a| a.3.is_none()).find(|a| a.0 == "freeform" && a.3.is_none());
+        let own = own.unwrap_or_else(|| panic!("part {k} refused its wrap and got none: {lists:?}"));
+        let (first, wrap) = (rank(&l[0].1), rank(&own.1));
+        let fell_back = parts[k]["preparation"].as_array().unwrap().iter().any(|p| p["step"] == "freeform_fallback");
+        assert_eq!(fell_back, own.2, "the step says which result was kept: {}", parts[k]);
+        if wrap > first {
+            assert!(own.2, "part {k}: the better wrap is returned: {lists:?}");
+        } else if wrap < first {
+            assert!(l[0].2, "part {k}: the better primitives result is returned: {lists:?}");
+        }
+    }
     assert_eq!(s.doc.bodies.len(), 3);
 }
 

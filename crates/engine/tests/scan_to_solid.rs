@@ -90,9 +90,11 @@ fn gate_scan_to_solid_rebuilds_a_chamfered_pin_in_one_call() {
 
 /// `auto` on the three-shell bracket: the scan is split, the box is modelled with primitives and the
 /// boss, which no primitive closes, is wrapped in patches as a freeform part (P9-O7: its holes are
-/// consolidated into a freeform area). Both parts pass; the ball, about 3 % of the surface, is below
-/// `part_share` and is reported, so the verdict is a `review` whose only issue is `unmodelled_pieces`
-/// (the twin of the next test, which forces the primitives method).
+/// consolidated into a freeform area). The ball, about 3 % of the surface and below `part_share`, is a
+/// closed solid well above the debris floor, so it is modelled as a small part (a sphere). All three
+/// pass, so the verdict is a pass with one export of the three solids (the twin of the next test,
+/// which forces the primitives method). Before small parts were modelled the ball was left out and
+/// the verdict was a `review` for `unmodelled_pieces`.
 #[test]
 fn auto_on_the_three_shell_scan_models_the_box_with_primitives_and_the_boss_as_freeform() {
     let mut s = Session::new();
@@ -101,12 +103,14 @@ fn auto_on_the_three_shell_scan_models_the_box_with_primitives_and_the_boss_as_f
     let parts = out["components"].as_array().unwrap();
     assert!(parts.iter().any(|c| c["method"] == "primitives" && c["verdict"] == "pass"), "{out}");
     assert!(parts.iter().any(|c| c["method"] == "freeform" && c["verdict"] == "pass"), "{out}");
-    assert_eq!(out["verdict"], "review", "{out}");
-    let issues: Vec<&str> = out["issues"].as_array().unwrap().iter().map(|i| i["code"].as_str().unwrap()).collect();
-    assert_eq!(issues, ["unmodelled_pieces"], "{out}");
+    let ball = parts.iter().find(|c| c["co_equal"] == false).unwrap_or_else(|| panic!("{out}"));
+    assert_eq!((ball["verdict"].clone(), ball["body"]["faces"].clone()), (json!("pass"), json!(1)), "{out}");
+    assert_eq!(parts.len(), 3, "{out}");
+    assert_eq!(out["verdict"], "pass", "{out}");
+    assert_eq!(out["issues"], json!([]), "{out}");
     let commands: Vec<&str> =
         out["next_steps"].as_array().unwrap().iter().map(|n| n["command"].as_str().unwrap()).collect();
-    assert_eq!(commands, ["export.step", "scan.split"], "{out}");
+    assert_eq!(commands, ["export.step"], "{out}");
     let ids: Vec<&Value> = out["bodies"].as_array().unwrap().iter().map(|b| &b["id"]).collect();
     assert_eq!(out["next_steps"][0]["params"]["objects"].as_array().unwrap().iter().collect::<Vec<_>>(), ids, "{out}");
 }
@@ -125,16 +129,17 @@ fn a_scan_that_does_not_close_gets_a_verdict_and_next_steps_not_an_error() {
     let parts = out["components"].as_array().unwrap();
     // measured areas: the box 8 803 mm2, the boss 895 mm2 (10.2 % of the box), the ball about 3 % of
     // the surface. The boss sits just above the default `part_share` of 10 %, so the test asks for 5 %:
-    // the boss is clearly co-equal (twice the share) and the ball clearly minor
-    assert_eq!(parts.len(), 2, "{out}");
+    // the boss is clearly co-equal (twice the share); the ball is not, and is modelled as a small part
+    assert_eq!(parts.len(), 3, "{out}");
+    assert_eq!(parts.iter().filter(|c| c["co_equal"] == true).count(), 2, "{out}");
     let verdicts: Vec<&str> = parts.iter().map(|c| c["verdict"].as_str().unwrap()).collect();
-    assert_eq!(verdicts.iter().filter(|v| **v == "pass").count(), 1, "{verdicts:?}");
+    assert_eq!(verdicts.iter().filter(|v| **v == "pass").count(), 2, "{verdicts:?}");
     assert_eq!(verdicts.iter().filter(|v| **v == "fail").count(), 1, "{verdicts:?}");
     let failed = parts.iter().find(|c| c["verdict"] == "fail").unwrap();
     assert!(codes(&failed["issues"]).contains(&"no_solid".to_string()), "{failed}");
     let passed = parts.iter().find(|c| c["verdict"] == "pass").unwrap();
     assert!(passed["deviation"]["within"].as_f64().unwrap() >= 0.99, "{passed}");
-    assert_eq!(out["preparation"][0]["numbers"]["minor_and_debris_pieces"], 1, "{out}");
+    assert_eq!(out["preparation"][0]["numbers"]["minor_and_debris_pieces"], 0, "{out}");
     eprintln!("verdict {} issues {}", out["verdict"], out["issues"]);
     assert_ne!(out["verdict"], "pass", "{out}");
     assert!(!codes(&out["issues"]).is_empty(), "{out}");

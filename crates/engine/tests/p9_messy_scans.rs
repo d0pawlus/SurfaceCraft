@@ -527,7 +527,7 @@ fn gate_unmodelled_pieces_are_an_issue_and_cap_the_verdict() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|i| i["message"].as_str().is_some_and(|m| m.contains("50 pieces")))
+            .any(|i| i["message"].as_str().is_some_and(|m| m.contains("pieces not modelled: 50 (")))
     );
     // what to do about it: the message says, and the next steps split the scan; no claim that every part passed
     let says = |what: &[&str]| {

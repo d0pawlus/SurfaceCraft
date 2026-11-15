@@ -55,6 +55,7 @@ Katalog kompilacji klonowany ze wzorca, najwyżej 3 kompilujących agentów nara
 | O5 | STEP bryły wielołatowej: wspólne wierzchołki i krawędzie zapisywane raz; cel ≤ 6 KB na łatę (dziś ok. 24 KB) | `crates/io/step` | Sonnet | — |
 | O6 | Prawdziwy model hybrydowy: `scan.to_solid` z metodą `hybrid` — prymitywy tam, gdzie pasują, łaty na reszcie, jedna zamknięta bryła | `engine/cmd/{pipeline,plan}`, `kernel/hybrid.rs` | Sonnet | O1, O2 |
 | O7 | Segmentacja skanu organicznego bez dojścia do limitu 10 000 regionów: scalanie regionów swobodnych w obszary krzywiznowe | `fit/segment.rs` | Sonnet | — |
+| O8 | Zszycie osobnych arkuszy w bryłę: `surface.patch` i `surface.from_curves` z `ngon: "patch"` zwracają dziś osobne arkusze; podniesienie pinu solidcore do wersji, w której `Body::from_record(.., true)` i `ops::stitch` zszywają arkusze (potwierdzone tylko w kernelu, STATUS „Złożenie arkuszy”), komenda w aplikacji, bramka: zamknięta bryła o objętości zgodnej z danymi syntetycznymi. Decyzja właściciela 2026-11-15: funkcja planu, nie dług | `crates/kernel`, `engine/cmd/surface*` | Sonnet | P8-H9, #114 |
 | — | P8-H9 (układ retopologii dopasowany do konturu regionu, odwrócone łaty, `surface.from_curves` bez 4 rogów), P8-H11 (maski i pokrycie w `surface.fit`) | | | |
 
 ### Etap V — weryfikacja
@@ -136,7 +137,7 @@ Katalog kompilacji klonowany ze wzorca, najwyżej 3 kompilujących agentów nara
 2. **Fala 2:** O2, O4, O6, P8-H11 → V1, V2 (bramka etapu O na korpusie).
 3. **Fala 3:** P8-G2, M1, M2, C1, C2, P8-H7, P8-H8.
 4. **Fala 4:** S1, S2, M3, M4, C3, C4, C5.
-5. **Fala 5:** M5, C6, C7, C8, R2–R7, P8-H10; R1 po certyfikatach (D3, w przyszłości).
+5. **Fala 5:** M5, C6, C7, C8, R2–R7, P8-H10, O8 (kolejność O8 ustalana po scaleniu M4 i poprawki owinięcia dla skanu 2); R1 po certyfikatach (D3, w przyszłości).
 6. **Fala 6:** I1–I7 (D1: tak); X1–X2 w przyszłości (D2).
 
 Po każdej fali: przebieg integracyjny, STATUS, aktualizacja [porównania](../../comparison.md).

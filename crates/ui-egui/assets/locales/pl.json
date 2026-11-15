@@ -914,6 +914,7 @@
   "param.angle_tolerance_degrees": "Tolerancja kąta",
   "param.max_patches": "Maks. płatów",
   "param.allow_retry": "Ponów z większym limitem",
+  "param.allow_inward": "Łataj brzegi zwrócone do środka",
   "param.refine": "Zagęszczanie",
   "param.crease_deg": "Kąt załamania",
   "param.continuity": "Ciągłość",
