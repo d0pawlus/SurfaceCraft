@@ -218,20 +218,10 @@ impl CtxData {
     }
 }
 
-/// A cheap identity of a display item's geometry (the preview copy tessellates bodies again, so
-/// pointers cannot tell what changed).
-fn signature(d: &DisplayItem) -> (u64, u64) {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut mix = |x: u64| h = (h ^ x).wrapping_mul(0x0000_0100_0000_01b3);
-    mix(d.id.0);
-    mix(d.mesh.positions.len() as u64);
-    mix(d.mesh.triangles.len() as u64);
-    for p in &d.mesh.positions {
-        mix(p.x.to_bits());
-        mix(p.y.to_bits());
-        mix(p.z.to_bits());
-    }
-    (d.id.0, h)
+/// The identity of a display item's geometry: the preview copy shares the session's display
+/// cache, so geometry the command left unchanged keeps its key there.
+fn signature(d: &DisplayItem) -> (u64, usize) {
+    (d.id.0, d.key)
 }
 
 /// Computes the preview of `id` with `params` on a copy of the session.
@@ -239,7 +229,7 @@ fn run_preview(app: &mut SurfaceCraftApp, panel: &mut CommandPanel, id: &'static
     panel.log_len = app.session.log.len();
     match app.session.preview(id, params) {
         Ok(mut copy) => {
-            let base: HashSet<(u64, u64)> = app.session.display_items().iter().map(signature).collect();
+            let base: HashSet<(u64, usize)> = app.session.display_items().iter().map(signature).collect();
             panel.items = copy
                 .display_items()
                 .into_iter()

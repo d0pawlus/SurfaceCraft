@@ -123,7 +123,9 @@ pub(crate) struct Collapser<'a> {
     stamp: Vec<u32>,
     vfaces: Vec<Vec<u32>>,
     heap: BinaryHeap<Cand>,
-    seen_pair: HashSet<(u32, u32)>,
+    /// The edges re-queued by one collapse, in the order they were first met (reused between
+    /// collapses: a table sized for the whole mesh cost a full clear on every collapse).
+    requeue: Vec<(u32, u32)>,
     guard: Option<Guard<'a>>,
     live: usize,
     /// Tests switch the orientation check off to show what it prevents.
@@ -160,7 +162,7 @@ impl<'a> Collapser<'a> {
             alive_v: vec![true; nv],
             stamp: vec![0; nv],
             heap: BinaryHeap::new(),
-            seen_pair: HashSet::with_capacity(live * 3 / 2),
+            requeue: Vec::new(),
             tris,
             pos,
             q,
@@ -194,10 +196,11 @@ impl<'a> Collapser<'a> {
 
     fn seed(&mut self, parallel: bool) {
         let mut edges: Vec<(u32, u32)> = Vec::with_capacity(self.tris.len() * 3 / 2);
+        let mut seen: HashSet<(u32, u32)> = HashSet::with_capacity(self.tris.len() * 3 / 2);
         for t in &self.tris {
             for k in 0..3 {
                 let (a, b) = (t[k], t[(k + 1) % 3]);
-                if self.seen_pair.insert((a.min(b), a.max(b))) {
+                if seen.insert((a.min(b), a.max(b))) {
                     edges.push((a.min(b), a.max(b)));
                 }
             }
@@ -356,20 +359,24 @@ impl<'a> Collapser<'a> {
         for &o in &nbs {
             self.stamp[o as usize] = self.stamp[o as usize].wrapping_add(1);
         }
-        // re-queue every edge around the neighbours (their stamps changed)
-        self.seen_pair.clear();
+        // re-queue every edge around the neighbours (their stamps changed), each once, in the order
+        // first met (a few hundred edges at most: a linear search beats clearing a mesh-sized table)
+        let mut requeue = std::mem::take(&mut self.requeue);
+        requeue.clear();
         for &o in nbs.iter().chain(std::iter::once(&a)) {
             for k in 0..self.vfaces[o as usize].len() {
                 let t = self.tris[self.vfaces[o as usize][k] as usize];
                 for j in 0..3 {
                     let (x, y) = (t[j], t[(j + 1) % 3]);
                     let key = (x.min(y), x.max(y));
-                    if self.seen_pair.insert(key) {
+                    if !requeue.contains(&key) {
+                        requeue.push(key);
                         self.push(key.0, key.1);
                     }
                 }
             }
         }
+        self.requeue = requeue;
     }
 
     /// Collapses refused so far for turning a triangle against the surface it came from.
