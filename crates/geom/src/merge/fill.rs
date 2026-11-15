@@ -9,7 +9,8 @@ use super::union::{Origin, Union, directed};
 use crate::Mesh;
 use std::collections::HashSet;
 
-/// Pieces handled between two looks at the cancellation flag (in `drop_islands`).
+/// Pieces (in `drop_islands`), and triangles of one piece (in `lies_on_rest`), handled between two
+/// looks at the cancellation flag.
 const CANCEL_EVERY: usize = 256;
 /// Loops of open seam edges up to this many edges are filled.
 pub const SMALL_LOOP_EDGES: usize = 64;

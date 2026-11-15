@@ -115,7 +115,7 @@ fn inner_skins_and_debris_are_not_refused_but_reported() {
         positions: speck.positions,
         triangles: speck.triangles.iter().map(|t| [t[0], t[2], t[1]]).collect(),
     });
-    assert_eq!(nest::negative_pieces(&hollow, &Cancel::new()).unwrap(), (0, 1, 1));
+    assert_eq!(nest::negative_pieces(&hollow, &Cancel::new()).unwrap().counts(), (0, 1, 1));
     let other = synth::sphere(Point3::new(200.0, 0.0, 0.0), 5.0, 16, 8);
     let (_, rep) = merged(&[hollow, other], 0.2);
     assert!(!rep.refused);

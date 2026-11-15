@@ -187,14 +187,17 @@ fn run(number: usize, kind: &str, whole: &Mesh, parts: &[Mesh]) {
         .flatten()
         .map(|p| {
             format!(
-                "{}-{} shared {} within {} over {} over_share {:.4} agree_share {:.4}",
+                "{}-{} shared {} within {} over {} over_share {:.4} agree_share {:.4} spread_tol {:.2}",
                 p["a"],
                 p["b"],
                 p["shared"],
                 p["within"],
                 p["over"],
                 p["over_share"].as_f64().unwrap_or(0.0),
-                p["agree_share"].as_f64().unwrap_or(0.0)
+                p["agree_share"].as_f64().unwrap_or(0.0),
+                // the spread of the over distances in tolerances (no length of a scan in the output)
+                p["over_spread"].as_f64().unwrap_or(0.0)
+                    / out["tolerance"].as_f64().unwrap_or(1.0).max(f64::MIN_POSITIVE)
             )
         })
         .collect();

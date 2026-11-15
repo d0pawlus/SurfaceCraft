@@ -298,10 +298,12 @@ Normals, colours and per-vertex data go with the coordinates.
     small pieces below 1 % of the scan's area all together) are not refused; they are reported as `inner_skins` with their counts.
 - Reported, not refused: `layers_apart` (two scans that meet somewhere also lie over each other:
   at least 14 % of the points of one that relate to the other, on it or over it, lie over it beyond
-  the reach, with nothing of their own scan in between; the issue gives the median offset and its
+  the reach, with nothing of their own scan in between, or a tight cluster of them at one offset;
+  the issue gives the median offset and its
   spread, and says whether it is one offset, a shift as a whole, or not, a tilt or a curved surface;
   check the alignment), `overlap_unjudged` (samples whose search along the normal ran out of its budget in a
-  pile of triangles), `seam_over_budget` (seam or restored triangles left out because the crossing
+  pile of triangles), `overlap_too_small` (two scans that touch by fewer than 50 points either way:
+  not judged), `seam_over_budget` (seam or restored triangles left out because the crossing
   test would have compared too many triangles), `non_manifold_input` (exact duplicate triangles and triangles on edges of
   three or more triangles are left out and counted as removed), `flipped_triangles_dropped`, `scans_disjoint` (groups of scans that share no surface: the result is a
   union of separate pieces), `scan_fully_covered` (a scan lies wholly on others and adds nothing),
@@ -330,12 +332,23 @@ Normals, colours and per-vertex data go with the coordinates.
   blob merge into one piece that wraps no worse than one full scan of the blob (in a few noise draws a
   small loop stays open where all views meet in a point; it is reported).
 - Limits:
-  - A scan displaced along a face parallel to the displacement (an L part shifted along its floor's
-    normal, whose walls still agree), tilted, or seen over the other from one side only cannot be
-    told from a shelf over a floor seen by different scans: both are reported as `layers_apart`, never
-    refused and never silent. Only a displaced pair that nothing ties (no agreement of its own on at
-    least 25 % of what relates the two, and none through other scans) is refused. Correct input
-    measured at most 8.4 % over (one scan of many small shells), displaced input at least 22 %.
+  - `mesh.merge` expects scans that are already aligned (`align.global`); its checks of the
+    alignment are a best-effort safety net, not a proof. Correct input is never refused. What they
+    do not see, or see only as a warning:
+    - a scan slid along a flat or cylindrical surface (distances along it do not change);
+    - a displacement along the normals larger than the other scan's diagonal: it comes out as
+      `scans_disjoint`, not as a misalignment;
+    - a displaced pair that both overlap a third scan agreeing with each: it cannot be told from a
+      real step of the part, and is not refused;
+    - a scan displaced along a face parallel to the displacement, tilted, or seen over the other from
+      one side only: reported as `layers_apart` (at least 14 % of the related points over the other,
+      or a tight cluster at one offset such as the end caps of a slender part slid along its axis),
+      never refused;
+    - a shelf over a floor seen by different scans is the same geometry: it warns although correct;
+    - a stepped part whose levels share nothing needs a scan that sees both (a close-up of the
+      step), or the levels read as one scan displaced over the other and are refused;
+    - pairs that touch by too little for a verdict (fewer than 50 points either way) are reported as
+      `overlap_too_small`, not judged.
   - Two OPEN scans that are both turned inside out, consistently, cannot be told from right ones (as
     with `align.pair_coarse`).
   - A wall thinner than the tolerance, seen from its two sides by two different scans only, reads as

@@ -45,6 +45,8 @@ mod seam;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_pairs;
+#[cfg(test)]
 mod tests_round2;
 #[cfg(test)]
 mod tests_units;
@@ -135,6 +137,10 @@ pub enum Issue {
     /// else a tilt or a curved surface). A scan displaced along a face parallel to the displacement
     /// looks so, and so does a shelf over a floor seen by different scans: not refused, reported.
     LayersApart { a: usize, b: usize, over: usize, related: usize, offset: f64, spread: f64, one_offset: bool },
+    /// Scans `a` and `b` touch (`near` samples of each on the other, `over` over it) by too little for
+    /// any verdict on their alignment: fewer than [`MIN_SHARED_SAMPLES`] of each (reported, not
+    /// judged).
+    SmallOverlap { a: usize, b: usize, near: [usize; 2], over: [usize; 2] },
     /// Samples of `a` whose cast toward `b` ran out of its budget (a pile of triangles): not judged.
     Unjudged { a: usize, b: usize, samples: usize },
     /// The normals of two scans oppose where they meet: one is turned inside out (refused).
@@ -157,7 +163,9 @@ pub enum Issue {
     /// closed piece: the inside of a hollow part) and debris below [`INVERTED_MIN_SHARE`].
     InnerSkins { scan: usize, skins: usize, debris: usize },
     /// A closed piece of a scan has a negative volume: turned inside out (refused).
-    Inverted { scan: usize, pieces: usize },
+    /// `unjudged`: of all the scan's negative pieces, those whose inside test ran out (judged as if
+    /// alone, so an inner skin among them can read as turned inside out).
+    Inverted { scan: usize, pieces: usize, unjudged: usize },
     /// Exact duplicate triangles and triangles on edges of three or more triangles were left out of a
     /// scan (and count as removed).
     NonManifold { scan: usize, dropped: usize },
@@ -167,7 +175,7 @@ pub enum Issue {
     FullyCovered { scan: usize },
     /// Triangles of the seam or the restoration refused because the crossing test would have compared
     /// more triangles than allowed: not judged, left out.
-    OverBudget { triangles: usize },
+    OverBudget { refusals: usize },
     /// Part of the seam stayed open (no triangle there lay on scanned surface or could avoid crossing).
     SeamOpen { edges: usize, length: f64 },
     /// Less than [`COVERED_SHARE`] of the removed area lies within the tolerance of the result.
@@ -322,9 +330,9 @@ fn scan_issues(scans: &[Scan]) -> Vec<Issue> {
         } else if flipped > 0 {
             out.push(Issue::FlippedDropped { scan: k, flipped, share });
         }
-        let (inverted, skins, debris) = s.negative;
+        let (inverted, skins, debris) = s.negative.counts();
         if inverted > 0 {
-            out.push(Issue::Inverted { scan: k, pieces: inverted });
+            out.push(Issue::Inverted { scan: k, pieces: inverted, unjudged: s.negative.unjudged });
         }
         if skins + debris > 0 {
             out.push(Issue::InnerSkins { scan: k, skins, debris });
@@ -354,6 +362,7 @@ fn pair_issues(n: usize, pairs: &[PairResidual], tol: f64) -> Vec<Issue> {
                 out.extend(layers_apart(x, y, tol));
             }
             out.extend(refused);
+            out.extend(too_small(a, b, x, y));
             for r in [x, y].into_iter().flatten().filter(|r| r.unknown > 0) {
                 out.push(Issue::Unjudged { a: r.a, b: r.b, samples: r.unknown });
             }
@@ -426,9 +435,20 @@ fn misaligned(a: usize, b: usize, x: Option<&PairResidual>, y: Option<&PairResid
     })
 }
 
-/// Do scans `a` and `b` lie over each other at one offset both ways (see [`Issue::LayersApart`])?
-/// Both directions are needed: a shelf partly over a floor, or the steps of a part, give a share one
-/// way or at many offsets; a whole copy displaced gives it both ways at one offset.
+/// Do scans `a` and `b` touch (some near samples) by too little for any verdict: fewer than
+/// [`MIN_SHARED_SAMPLES`] near and over in both directions?
+fn too_small(a: usize, b: usize, x: Option<&PairResidual>, y: Option<&PairResidual>) -> Option<Issue> {
+    let count = |r: Option<&PairResidual>, f: fn(&PairResidual) -> usize| r.map_or(0, f);
+    let near = [count(x, |r| r.near), count(y, |r| r.near)];
+    let over = [count(x, |r| r.over), count(y, |r| r.over)];
+    let touch = near.iter().any(|&n| n > 0);
+    let small = near.iter().chain(&over).all(|&n| n < MIN_SHARED_SAMPLES);
+    (touch && small).then_some(Issue::SmallOverlap { a, b, near, over })
+}
+
+/// Do two scans that meet somewhere also lie over each other (see [`Issue::LayersApart`]): in either
+/// direction a material share of the related samples over the other, or a tight cluster of them at
+/// one offset?
 fn layers_apart(x: Option<&PairResidual>, y: Option<&PairResidual>, tol: f64) -> Option<Issue> {
     let both = || [x, y].into_iter().flatten();
     // only scans that meet somewhere: pieces that share nothing and lie over each other are tied by a
@@ -436,8 +456,9 @@ fn layers_apart(x: Option<&PairResidual>, y: Option<&PairResidual>, tol: f64) ->
     if !both().any(|r| r.near >= MIN_SHARED_SAMPLES) {
         return None;
     }
-    let r =
-        both().filter(|r| r.lies_over(MIN_SHARED_SAMPLES)).max_by(|p, q| p.over_share().total_cmp(&q.over_share()))?;
+    let r = both()
+        .filter(|r| r.lies_over(MIN_SHARED_SAMPLES) || r.clustered(MIN_SHARED_SAMPLES, tol))
+        .max_by(|p, q| p.over_share().total_cmp(&q.over_share()))?;
     Some(Issue::LayersApart {
         a: r.a,
         b: r.b,
@@ -686,7 +707,7 @@ fn result_issues(rep: &mut Report) {
         }
     }
     if rep.seam.over_budget > 0 {
-        rep.issues.push(Issue::OverBudget { triangles: rep.seam.over_budget });
+        rep.issues.push(Issue::OverBudget { refusals: rep.seam.over_budget });
     }
     if rep.seam.open_edges > 0 {
         rep.issues.push(Issue::SeamOpen { edges: rep.seam.open_edges, length: rep.seam.open_length });

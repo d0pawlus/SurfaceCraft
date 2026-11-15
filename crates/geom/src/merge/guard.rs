@@ -122,13 +122,15 @@ pub(super) struct Guard<'a> {
     /// The corner rule of the seam, once the seam is being closed.
     pub(super) corners: Option<Corners>,
     pub(super) unsupported: usize,
-    /// Triangles refused because the crossing test would have compared more than `max_near`.
+    /// Refusals because the crossing test would have compared more than `max_near`: triangles, and
+    /// holes the fill left open for that reason (once per fill pass).
     pub(super) over_budget: usize,
     /// Comparisons one crossing test may make ([`MAX_NEAR`]; lowered in tests).
     pub(super) max_near: usize,
     /// Set when a try of `accept_all` was refused for the budget (cleared by its caller).
     pub(super) patch_over_budget: bool,
     /// Collections of the new triangles a crossing test made (for a test of the early refusal).
+    #[cfg(test)]
     collections: std::cell::Cell<usize>,
     pub(super) crossing: usize,
     pub(super) bad_corners: usize,
@@ -165,6 +167,7 @@ impl<'a> Guard<'a> {
             over_budget: 0,
             max_near: MAX_NEAR,
             patch_over_budget: false,
+            #[cfg(test)]
             collections: std::cell::Cell::new(0),
             crossing: 0,
             bad_corners: 0,
@@ -221,8 +224,10 @@ impl<'a> Guard<'a> {
         // over the budget is refused before anything is collected
         let large = self.too_large(&bx);
         if large && near.len() + self.index_of.len() > self.max_near {
+            self.compared.set(near.len() + self.index_of.len());
             return Clash::Budget;
         }
+        #[cfg(test)]
         self.collections.set(self.collections.get() + 1);
         let mut ids: Vec<u32> =
             if large { self.index_of.values().copied().collect() } else { self.cells_of(&bx).copied().collect() };

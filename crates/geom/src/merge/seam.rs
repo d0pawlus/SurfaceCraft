@@ -47,8 +47,9 @@ pub struct SeamReport {
     pub crossing: usize,
     /// Candidate triangles refused by the corner rule (two rims bridged, a rim facing away).
     pub bad_corners: usize,
-    /// Candidate triangles refused because the crossing test would have compared more triangles
-    /// than allowed (a pile, or a very long triangle among many new ones).
+    /// Refusals because the crossing test would have compared more triangles than allowed (a pile, or
+    /// a very long triangle among many new ones): candidate triangles, and holes the fill left open
+    /// for that reason (once per fill pass).
     pub over_budget: usize,
     /// Removed triangles the seam left uncovered, and those put back.
     pub recovered: super::recover::Recovered,

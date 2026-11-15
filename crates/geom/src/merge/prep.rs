@@ -32,8 +32,8 @@ pub(super) struct Scan {
     pub(super) non_manifold: usize,
     /// Triangles left out for being wound against the rest of their piece, and their share of the area.
     pub(super) flipped: (usize, f64),
-    /// Closed pieces with a negative volume: (turned inside out, inner skins, debris).
-    pub(super) negative: (usize, usize, usize),
+    /// Closed pieces with a negative volume.
+    pub(super) negative: super::nest::Negative,
     /// Topology of the scan as given to the merge (after the drop).
     pub(super) topology: Topology,
 }

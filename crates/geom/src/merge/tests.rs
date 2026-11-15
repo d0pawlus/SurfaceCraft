@@ -433,6 +433,29 @@ fn removed_surface_the_recovery_could_not_put_back_is_reported_uncovered() {
     assert!(recover_rounds(&mut u, &scans, &removed, &mut guard, 0.1, &mut rep, &cancel).is_some());
     assert!(rep.recovered.uncovered > 0 && rep.recovered.triangles > 0, "{:?}", rep.recovered);
     assert!(rep.recovered.uncovered + rep.recovered.triangles <= scans[0].mesh.triangle_count());
+    // one look at the end, not a sum over the rounds: what is uncovered now
+    assert_eq!(rep.recovered.uncovered, recover::uncovered(&u, &scans, &removed, 0.1, &cancel).unwrap().len());
+}
+
+#[test]
+fn a_cancellation_inside_one_large_island_stops_the_island_test() {
+    // two pieces: a large sheet and a second sheet of 2 x 20 x 20 = 800 triangles lying on it (an
+    // island tested triangle by triangle): a token that fires at its second look stops inside it
+    let mut pos = grid(30, 0.0, 0.0);
+    let island = grid(20, 2.0, 2.0);
+    let n = pos.positions.len() as u32;
+    pos.positions.extend(island.positions.iter().map(|p| Point3::new(p.x, p.y, 0.01)));
+    pos.triangles.extend(island.triangles.iter().map(|t| t.map(|v| v + n)));
+    let scans = vec![prep::prepare(&pos, &cancel_none()).unwrap()];
+    let mut u = union::assemble(&scans, &[vec![false; pos.triangle_count()]]);
+    assert!(fill::drop_islands(&mut u, 0.1, &Cancel::after_looks(2)).is_none());
+    let mut v = union::assemble(&scans, &[vec![false; pos.triangle_count()]]);
+    let (_, dropped, _) = fill::drop_islands(&mut v, 0.1, &cancel_none()).unwrap();
+    assert_eq!(dropped, 800, "the island lies on the sheet and is dropped when not cancelled");
+}
+
+fn cancel_none() -> Cancel {
+    Cancel::new()
 }
 
 #[test]

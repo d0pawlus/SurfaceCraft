@@ -108,6 +108,10 @@ pub struct MergePairOut {
     pub over: usize,
     /// Median distance of those points to `b` along their normal (mm; 0 when none).
     pub over_offset: f64,
+    /// Spread of those distances between their quartiles (mm).
+    pub over_spread: f64,
+    /// Those distances are one offset (spread within the tolerance or a tenth of the median): a shift as a whole; else a tilt or a curved surface.
+    pub one_offset: bool,
     /// Points whose cast toward `b` ran out of its budget (a pile of triangles): not judged.
     pub unjudged: usize,
     /// Points on opposed surface of `b` within the tolerance (one of the two is turned inside out).
@@ -155,7 +159,7 @@ pub struct MergeSeamOut {
     pub strays_dropped: usize,
     /// Seam triangles refused for joining vertices of one piece of one scan that share no cut edge.
     pub refused_corners: usize,
-    /// Triangles refused because the crossing test would have compared more triangles than allowed (not judged, left out).
+    /// Refusals because the crossing test would have compared more triangles than allowed (not judged, left out): triangles, and holes left unfilled for that reason (once per fill pass).
     pub refused_budget: usize,
     /// Recovered triangles taken back again as small specks the seam had cut off.
     pub specks_dropped: usize,
@@ -213,7 +217,7 @@ pub struct MergeChecksOut {
 /// Something to know, with its numbers.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 pub struct MergeIssueOut {
-    /// `scans_misaligned`, `opposed_normals`, `inconsistent_winding`, `inverted_scan` (these refuse), `layers_apart`, `overlap_unjudged`, `non_manifold_input`, `flipped_triangles_dropped`, `inner_skins`, `scans_disjoint`, `scan_fully_covered`, `seam_open`, `seam_over_budget`, `removed_not_covered`, `layers_stacked`, `unwelded_vertices`, `unoriented_edges`, `pinched_vertices`, `other` (an issue without a form of its own).
+    /// `scans_misaligned`, `opposed_normals`, `inconsistent_winding`, `inverted_scan` (these refuse), `layers_apart`, `overlap_unjudged`, `overlap_too_small`, `non_manifold_input`, `flipped_triangles_dropped`, `inner_skins`, `scans_disjoint`, `scan_fully_covered`, `seam_open`, `seam_over_budget`, `removed_not_covered`, `layers_stacked`, `unwelded_vertices`, `unoriented_edges`, `pinched_vertices`, `other` (an issue without a form of its own).
     pub code: String,
     /// `refusal`, `warning` or `info`.
     pub severity: String,
@@ -329,12 +333,20 @@ fn refusal_out(i: &Issue) -> Option<MergeIssueOut> {
                 100.0 * share
             ),
         ),
-        Issue::Inverted { scan, pieces } => issue(
+        Issue::Inverted { scan, pieces, unjudged: 0 } => issue(
             "inverted_scan",
             "refusal",
             vec![*scan],
             format!(
                 "{pieces} closed piece(s) of scan {scan} have a negative volume: turned inside out; orient it outward and merge again"
+            ),
+        ),
+        Issue::Inverted { scan, pieces, unjudged } => issue(
+            "inverted_scan",
+            "refusal",
+            vec![*scan],
+            format!(
+                "{pieces} closed piece(s) of scan {scan} have a negative volume: turned inside out; orient it outward and merge again (for {unjudged} negative piece(s) the test whether they lie inside another piece ran out of its budget: they were judged as if alone)"
             ),
         ),
         _ => return None,
@@ -394,6 +406,19 @@ fn pair_notice(i: &Issue) -> Option<MergeIssueOut> {
                 }
             ),
         ),
+        Issue::SmallOverlap { a, b, near, over } => issue(
+            "overlap_too_small",
+            "info",
+            vec![*a, *b],
+            format!(
+                "scans {a} and {b} touch by too little to judge their alignment: {} and {} points on the other, {} and {} over it (fewer than {} each)",
+                near[0],
+                near[1],
+                over[0],
+                over[1],
+                surfacecraft_geom::merge::MIN_SHARED_SAMPLES
+            ),
+        ),
         Issue::Unjudged { a, b, samples } => issue(
             "overlap_unjudged",
             "warning",
@@ -415,12 +440,12 @@ fn notice_out(i: &Issue) -> MergeIssueOut {
             vec![*scan],
             format!("scan {scan} lies wholly on the others: nothing of it is in the result"),
         ),
-        Issue::OverBudget { triangles } => issue(
+        Issue::OverBudget { refusals } => issue(
             "seam_over_budget",
             "warning",
             Vec::new(),
             format!(
-                "{triangles} triangles of the seam or the restoration were left out because testing them for crossings would have compared too many triangles (a pile of triangles, or a very long one among many new ones)"
+                "{refusals} times a triangle of the seam or the restoration, or the fill of a hole, was left out because testing it for crossings would have compared too many triangles (a pile of triangles, or a very long one among many new ones)"
             ),
         ),
         Issue::SeamOpen { edges, length } => issue(
@@ -482,6 +507,7 @@ fn check_notice(i: &Issue) -> MergeIssueOut {
         | Issue::Displaced { .. }
         | Issue::LayersApart { .. }
         | Issue::Unjudged { .. }
+        | Issue::SmallOverlap { .. }
         | Issue::Opposed { .. }
         | Issue::Winding { .. }
         | Issue::Inverted { .. }
@@ -536,7 +562,7 @@ fn scan_out(object: ObjectId, noise: Option<f64>, r: &surfacecraft_geom::merge::
     }
 }
 
-fn pair_out(p: &surfacecraft_geom::merge::PairResidual) -> MergePairOut {
+fn pair_out(p: &surfacecraft_geom::merge::PairResidual, tol: f64) -> MergePairOut {
     MergePairOut {
         a: p.a,
         b: p.b,
@@ -545,6 +571,8 @@ fn pair_out(p: &surfacecraft_geom::merge::PairResidual) -> MergePairOut {
         over: p.over,
         within: p.within,
         over_offset: p.over_offset,
+        over_spread: p.over_spread,
+        one_offset: p.one_offset(tol),
         unjudged: p.unknown,
         opposed: p.opposed,
         rms: p.rms,
@@ -697,7 +725,7 @@ pub(crate) fn merge_cmd(s: &mut Session, i: MergeIn) -> CmdResult<MergeOut> {
         tolerance_source: source.into(),
         reach: rep.reach,
         scans: ids.iter().zip(&noise).zip(&rep.scans).map(|((id, n), r)| scan_out(*id, *n, r)).collect(),
-        pairs: rep.pairs.iter().map(pair_out).collect(),
+        pairs: rep.pairs.iter().map(|p| pair_out(p, tolerance)).collect(),
         eaten: rep.eaten,
         seam: seam_out(&rep),
         before: topology_out(&rep.before),
