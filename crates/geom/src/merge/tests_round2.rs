@@ -145,12 +145,12 @@ fn a_parallel_layer_within_the_tolerance_is_refused_although_the_boxes_do_not_me
             Point3::new(3.0, 0.5, 0.5 * tol),
             Point3::new(0.5, 3.0, 0.5 * tol),
         ],
-        vec![0; 6],
+        vec![0, 0, 0, 1, 1, 1],
         Vec::new(),
     );
     let mut g = guard_over(&scans, &u, tol);
     assert!(g.restorable(Pts::of(&u), [0, 1, 2]));
-    assert!(!g.restorable(Pts::of(&u), [3, 4, 5]), "a layer 0.5 tol over a recorded triangle");
+    assert!(!g.restorable(Pts::of(&u), [3, 4, 5]), "a layer of another scan 0.5 tol over a recorded triangle");
 }
 
 #[test]
@@ -320,4 +320,43 @@ fn a_recovered_speck_is_taken_back_and_forgotten_by_the_guard() {
     assert_eq!(fill::drop_specks(&mut u, &mut g), 1);
     assert_eq!(u.triangles.len(), big.triangles.len());
     assert!(g.restorable(Pts::of(&u), pierce), "taken back: the guard forgot it");
+}
+
+#[test]
+fn two_pieces_over_each_other_tied_by_a_third_are_the_part_not_a_misalignment() {
+    // 0 and 2 share nothing and lie over each other displaced (a step); 1 agrees with both
+    let r = |a: usize, b: usize, near: usize, over: usize| PairResidual {
+        a,
+        b,
+        samples: 20_000,
+        near,
+        within: near,
+        over,
+        ..PairResidual::default()
+    };
+    let pairs =
+        [r(0, 1, 6000, 0), r(1, 0, 4700, 0), r(1, 2, 4400, 0), r(2, 1, 10_000, 0), r(0, 2, 0, 900), r(2, 0, 0, 2200)];
+    let issues = pair_issues(3, &pairs);
+    assert!(issues.is_empty(), "{issues:?}");
+    // the same two alone are refused
+    let alone = pair_issues(2, &[r(0, 1, 0, 900), r(1, 0, 0, 2200)]);
+    assert!(alone.iter().any(|i| matches!(i, Issue::Misaligned { .. })), "{alone:?}");
+}
+
+#[test]
+fn a_scan_s_own_second_layer_comes_back_but_another_scan_s_does_not() {
+    let scans = vec![prep::prepare(&sheet(1, 1, (0.0, 0.0), 1.0), &Cancel::new()).unwrap()];
+    let tol = 0.1;
+    let mut pos = vec![Point3::new(0.0, 0.0, 0.0), Point3::new(4.0, 0.0, 0.0), Point3::new(0.0, 4.0, 0.0)];
+    let inner = [Point3::new(0.5, 0.5, 0.5 * tol), Point3::new(3.0, 0.5, 0.5 * tol), Point3::new(0.5, 3.0, 0.5 * tol)];
+    pos.extend(inner);
+    pos.extend(inner);
+    // 0..3 kept of scan 0; 3..6 scan 0's own second layer; 6..9 the same layer from scan 1
+    let u = union_of(pos, vec![0, 0, 0, 0, 0, 0, 1, 1, 1], vec![[0, 1, 2]]);
+    let mut g = guard_over(&scans, &u, tol);
+    assert!(g.restorable(Pts::of(&u), [3, 4, 5]), "the scan's own layer, as scanned");
+    let v = union_of(u.positions.clone(), u.scan_of.clone(), vec![[0, 1, 2]]);
+    let mut h = guard_over(&scans, &v, tol);
+    assert!(!h.restorable(Pts::of(&v), [6, 7, 8]), "another scan's layer over it is a stack");
+    assert!(!h.accept(Pts::of(&v), [3, 4, 5]), "a seam triangle is never let cover");
 }

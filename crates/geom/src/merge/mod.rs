@@ -312,28 +312,28 @@ fn pair(pairs: &[PairResidual], a: usize, b: usize) -> Option<&PairResidual> {
 
 /// Issues of the pairs: misaligned, opposed, and the groups of scans that share nothing.
 fn pair_issues(n: usize, pairs: &[PairResidual]) -> Vec<Issue> {
+    let both = |a: usize, b: usize| [pair(pairs, a, b), pair(pairs, b, a)].into_iter().flatten();
+    // scans tied by shared surface, directly or through others: one lying over another displaced is
+    // then the part's own shape (a step, a shelf), not a misalignment, since both agree with a third
+    let tied = groups_of(n, |a, b| both(a, b).any(|r| r.near >= MIN_SHARED_SAMPLES));
     let mut out = Vec::new();
-    let mut group: Vec<usize> = (0..n).collect();
     for a in 0..n {
         for b in a + 1..n {
             let (x, y) = (pair(pairs, a, b), pair(pairs, b, a));
-            out.extend(misaligned(a, b, x, y));
+            out.extend(misaligned(a, b, x, y, tied.get(a) == tied.get(b)));
             let flipped =
                 [x, y].into_iter().flatten().find(|r| r.opposed >= MIN_SHARED_SAMPLES && r.opposed > r.within);
             if let Some(r) = flipped {
                 out.push(Issue::Opposed { a, b, opposed: r.opposed, facing: r.within });
             }
-            // scans are together in space when one lies on the other within the reach, or over it
-            // displaced (a stray ray hit of pieces that share nothing does not join them)
-            if [x, y].into_iter().flatten().any(|r| r.near > 0 || r.displaced(MIN_SHARED_SAMPLES)) {
-                let (ga, gb) = (group[a], group[b]);
-                group.iter_mut().filter(|g| **g == gb).for_each(|g| *g = ga);
-            }
         }
     }
+    // scans are together in space when one lies on the other within the reach, or over it displaced
+    // (a stray ray hit of pieces that share nothing does not join them)
+    let group = groups_of(n, |a, b| both(a, b).any(|r| r.near > 0 || r.displaced(MIN_SHARED_SAMPLES)));
     let mut groups: Vec<Vec<usize>> = Vec::new();
     for k in 0..n {
-        match groups.iter_mut().find(|g| g.first().is_some_and(|&f| group[f] == group[k])) {
+        match groups.iter_mut().find(|g| g.first().is_some_and(|&f| group.get(f) == group.get(k))) {
             Some(g) => g.push(k),
             None => groups.push(vec![k]),
         }
@@ -344,10 +344,25 @@ fn pair_issues(n: usize, pairs: &[PairResidual]) -> Vec<Issue> {
     out
 }
 
+/// The group of every one of `n` scans, two scans in one group when `linked` ties them, directly or
+/// through others.
+fn groups_of(n: usize, linked: impl Fn(usize, usize) -> bool) -> Vec<usize> {
+    let mut group: Vec<usize> = (0..n).collect();
+    for a in 0..n {
+        for b in a + 1..n {
+            if linked(a, b) {
+                let (ga, gb) = (group[a], group[b]);
+                group.iter_mut().filter(|g| **g == gb).for_each(|g| *g = ga);
+            }
+        }
+    }
+    group
+}
+
 /// Are scans `a` and `b` misaligned (their residuals `x` of a on b and `y` of b on a): more than
 /// [`MISALIGNED_SHARE`] of the shared surface beyond the tolerance, or lying over each other displaced
-/// beyond the reach?
-fn misaligned(a: usize, b: usize, x: Option<&PairResidual>, y: Option<&PairResidual>) -> Option<Issue> {
+/// beyond the reach while nothing ties them (`tied`: both share surface with others that agree)?
+fn misaligned(a: usize, b: usize, x: Option<&PairResidual>, y: Option<&PairResidual>, tied: bool) -> Option<Issue> {
     let both = || [x, y].into_iter().flatten();
     let worse =
         both().filter(|r| r.near >= MIN_SHARED_SAMPLES).max_by(|p, q| p.beyond_share().total_cmp(&q.beyond_share()));
@@ -365,6 +380,9 @@ fn misaligned(a: usize, b: usize, x: Option<&PairResidual>, y: Option<&PairResid
     }
     // displaced along the normal: every sample over the other lies beyond the tolerance; the share
     // reported is that of the samples over the other (rms and p95 are of the few near ones, if any)
+    if tied {
+        return None;
+    }
     both().find(|r| r.displaced(MIN_SHARED_SAMPLES)).map(|r| issue(r, r.over as f64 / r.samples.max(1) as f64))
 }
 

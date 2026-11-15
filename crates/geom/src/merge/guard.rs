@@ -24,11 +24,18 @@ const TOUCH_SHARE: f64 = 1e-6;
 pub(super) struct Pts<'p> {
     pub(super) pos: &'p [Point3],
     pub(super) nrm: &'p [Vec3],
+    pub(super) scan: &'p [u32],
 }
 
 impl<'p> Pts<'p> {
     pub(super) fn of(u: &'p Union) -> Self {
-        Pts { pos: &u.positions, nrm: &u.normals }
+        Pts { pos: &u.positions, nrm: &u.normals, scan: &u.scan_of }
+    }
+
+    /// The scan all corners of `t` come from, if they come from one.
+    fn scan_of(&self, t: &[u32; 3]) -> Option<u32> {
+        let s = *self.scan.get(t[0] as usize)?;
+        t.iter().all(|&v| self.scan.get(v as usize) == Some(&s)).then_some(s)
     }
 
     fn corners(&self, t: &[u32; 3]) -> Option<[Point3; 3]> {
@@ -170,13 +177,21 @@ impl<'a> Guard<'a> {
     /// found with its box grown by the tolerance (a parallel layer within the tolerance has a box of
     /// its own that the exact one does not meet). At most [`MAX_NEAR`] triangles are compared; a
     /// test that would need more counts as crossing.
-    fn crosses(&self, p: Pts<'_>, t: [u32; 3], c: &[Point3; 3]) -> bool {
+    ///
+    /// With `own` (a restored or recovered triangle), a triangle of the same scan is tested for
+    /// crossing only, not for covering: a scan's own layers (a thin wall, a double skin) are its data
+    /// and come back as they were.
+    fn crosses(&self, p: Pts<'_>, t: [u32; 3], c: &[Point3; 3], own: bool) -> bool {
         let bx = grown(&Aabb::from_points(c.iter()), self.tol);
         let (near, more) = self.kept.overlapping_up_to(&bx, MAX_NEAR, &|_| true);
         if more {
             return true;
         }
-        let clash = |x: &[u32; 3]| p.corners(x).is_some_and(|y| clashes((c, &t), (&y, x), self.tol));
+        let mine = if own { p.scan_of(&t) } else { None };
+        let clash = |x: &[u32; 3]| {
+            let same = mine.is_some() && p.scan_of(x) == mine;
+            p.corners(x).is_some_and(|y| clashes((c, &t), (&y, x), if same { None } else { Some(self.tol) }))
+        };
         if near.iter().filter_map(|&i| self.kept_tris.get(i as usize)).any(clash) {
             return true;
         }
@@ -274,7 +289,7 @@ impl<'a> Guard<'a> {
     /// scanned surface by construction) for crossings and covers only, and records it when it passes.
     pub(super) fn restorable(&mut self, p: Pts<'_>, t: [u32; 3]) -> bool {
         let Some(c) = p.corners(&t) else { return false };
-        if self.crosses(p, t, &c) {
+        if self.crosses(p, t, &c, true) {
             self.crossing += 1;
             return false;
         }
@@ -294,7 +309,7 @@ impl<'a> Guard<'a> {
             self.unsupported += 1;
             return false;
         }
-        if self.crosses(p, t, &c) {
+        if self.crosses(p, t, &c, false) {
             self.crossing += 1;
             return false;
         }
@@ -323,10 +338,10 @@ impl<'a> Guard<'a> {
 
 /// Do triangles `x` and `y` (corners and vertices) clash: cross (an edge through the other, also for
 /// two sharing one vertex: the edge opposite it), or lie over each other (a corner of one inside the
-/// other within `slab` of its plane)?
-fn clashes((cx, ix): (&[Point3; 3], &[u32; 3]), (cy, iy): (&[Point3; 3], &[u32; 3]), slab: f64) -> bool {
+/// other within `slab` of its plane; not tested without a `slab`)?
+fn clashes((cx, ix): (&[Point3; 3], &[u32; 3]), (cy, iy): (&[Point3; 3], &[u32; 3]), slab: Option<f64>) -> bool {
     let shared: Vec<u32> = ix.iter().copied().filter(|v| iy.contains(v)).collect();
-    let over = covers(cx, cy, iy, ix, slab) || covers(cy, cx, ix, iy, slab);
+    let over = slab.is_some_and(|slab| covers(cx, cy, iy, ix, slab) || covers(cy, cx, ix, iy, slab));
     match shared.as_slice() {
         [] => over || nesting::crosses(cx, cy),
         [v] => over || opposite_pierces((cx, ix), cy, *v) || opposite_pierces((cy, iy), cx, *v),
