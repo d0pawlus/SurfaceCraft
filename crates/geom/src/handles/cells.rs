@@ -296,6 +296,11 @@ fn judge(mesh: &Mesh, topo: &Topo, p: Part) -> Option<Candidate> {
     }
     let mut on_boundary: Vec<u32> = p.boundary.iter().flat_map(|&(a, b)| [a, b]).collect();
     on_boundary.sort_unstable();
+    // a vertex on two loops (a pinch on the boundary) would merge them and make the count lie
+    let pinched_rim = on_boundary.chunk_by(|a, b| a == b).any(|run| run.len() != 2);
+    if pinched_rim {
+        return None;
+    }
     on_boundary.dedup();
     let mut inside: Vec<u32> =
         p.tris.iter().filter_map(|&t| mesh.triangles.get(t as usize)).flatten().copied().collect();

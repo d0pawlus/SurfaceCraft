@@ -309,11 +309,11 @@ modelled as it is).
     (verdict at most `review`). The deviation is measured against the scan as it was, so what was cut
     out counts against the solid.
   - A freeform result that is not a pass on a scan with at least 64 handles offers it as a next step.
-  - On the real scan with about 2600 handles (open, three rims) it closed about three quarters of them
-    and the verdict went from `fail` to `review`; the share within the tolerance stays short of a pass
-    (see the pull request for the figures). In a dense sponge a part is cut out whole, so the area cut
-    out can be large where the tunnels are close together; a scan without small handles is returned as
-    it is, bit for bit.
+  - On a real scan with about 2600 handles (open, three rims) it closed about four fifths of them,
+    cutting out under 3 % of the area, and the verdict went from `fail` to `review`; about 10 % of the
+    scan stays out of the tolerance, so it is no pass. In a dense sponge a part is cut out whole, so
+    the area cut out can be large where tunnels are close together. Closing takes minutes on a million
+    triangles of real scan. A scan without small handles is returned as it is, bit for bit.
 - A scan that already works is not touched: no preparation step, the same result as before. The
   piece analysis that decides this is O(n log n) on the cleaned scan (see the PR for the time on a
   million triangles).

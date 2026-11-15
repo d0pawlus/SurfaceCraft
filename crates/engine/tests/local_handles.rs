@@ -458,7 +458,15 @@ fn rims(mesh: &Mesh) {
 /// `scan.to_solid`, then where the vertices out of tolerance lie.
 fn to_solid_and_misses(s: &mut Session, zone: &[bool]) {
     let t0 = std::time::Instant::now();
-    let out = s.execute("scan.to_solid", json!({"scan": "scan", "method": "freeform"})).unwrap();
+    let mut params = json!({"scan": "scan", "method": "freeform"});
+    if let Some(extra) = std::env::var("SURFACECRAFT_LOCAL_TO_SOLID_PARAMS")
+        .ok()
+        .and_then(|x| serde_json::from_str::<serde_json::Value>(&x).ok())
+        && let (Some(p), Some(x)) = (params.as_object_mut(), extra.as_object())
+    {
+        p.extend(x.clone());
+    }
+    let out = s.execute("scan.to_solid", params).unwrap();
     eprintln!(
         "    scan.to_solid: verdict {} patches {} within {} in {:.0} s; issues {:?}; retry {}; levels {}",
         out["verdict"],

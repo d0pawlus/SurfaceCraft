@@ -66,7 +66,7 @@ pub(super) fn splitting(mesh: &Mesh, cands: &[Candidate], skip: &[bool]) -> Vec<
     let mut out = Vec::new();
     for (g, c) in cands.iter().enumerate().filter(|(g, _)| !skip.get(*g).copied().unwrap_or(true)) {
         let roots: Vec<u32> = c.loops.iter().map(|&v| root(&mut s, v)).collect();
-        if roots.windows(2).any(|w| w[0] != w[1]) {
+        if roots.windows(2).any(|w| matches!(w, [a, b] if a != b)) {
             out.push(g);
         }
     }
@@ -93,7 +93,7 @@ pub(super) fn attempt(mesh: &Mesh, cands: &[Candidate], skip: &[bool], bound: f6
     Attempt { mesh: out, failed, fill_distance, added }
 }
 
-/// Components of the triangles of `m` (through shared vertices): the root of every vertex.
+/// Components of the triangles of `m` (through shared vertices), as a union-find to read with [`root`].
 fn components(m: &Mesh) -> Vec<u32> {
     let mut s = sets(m.positions.len());
     for t in &m.triangles {
