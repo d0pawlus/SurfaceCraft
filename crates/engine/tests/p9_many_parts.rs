@@ -4,24 +4,9 @@
 //! verdict; every other piece is left out with its reason, and surface not modelled to a pass above
 //! 2 % of the scan keeps the call from a pass. Tolerances are those of design doc §11.1, unchanged.
 use serde_json::{Value, json};
-use surfacecraft_engine::Session;
+mod scan_common;
+use scan_common::{session_with, wavy, weld};
 use surfacecraft_geom::{Mesh, Point3, Rng, Vec3, synth};
-
-fn weld(mut m: Mesh) -> Mesh {
-    m.weld(1e-9);
-    m
-}
-
-/// A closed organic part: a sphere of radius `r` at `c` with a wavy skin, noise 0.02.
-fn wavy(c: Point3, r: f64, k: f64, res: usize) -> Mesh {
-    let mut m = weld(synth::sphere(Point3::origin(), 1.0, res, res / 2));
-    for p in &mut m.positions {
-        let d = p.coords;
-        p.coords = c.coords + d * r * (1.0 + 0.08 * (k * d.x).sin() * (k * 0.7 * d.y).cos());
-    }
-    synth::add_noise(&mut m, 0.02, &mut Rng::new(c.x as u64 + 3));
-    m
-}
 
 /// A small closed part: a ball of radius `r` (well above the debris floor of 10 mm across).
 fn small_part(at: Point3, r: f64) -> Mesh {
@@ -31,12 +16,6 @@ fn small_part(at: Point3, r: f64) -> Mesh {
 /// A speck of scan debris: a ball 3 mm across of 224 triangles.
 fn speck(at: Point3) -> Mesh {
     weld(synth::sphere(at, 1.5, 16, 8))
-}
-
-fn session_with(m: Mesh) -> Session {
-    let mut s = Session::new();
-    s.doc.add_mesh("scan", m);
-    s
 }
 
 fn codes(out: &Value) -> Vec<String> {
@@ -55,7 +34,7 @@ fn gate_a_large_part_and_small_closed_parts_are_all_modelled_and_pass() {
     for k in 0..6 {
         scan.append(&small_part(Point3::new(60.0 + 25.0 * f64::from(k), 0.0, 0.0), 5.0 + 0.2 * f64::from(k)));
     }
-    let mut s = session_with(scan);
+    let mut s = session_with("scan", scan);
     let out = s.execute("scan.to_solid", json!({"scan": "scan", "method": "freeform"})).unwrap();
     let comps = parts(&out);
     assert_eq!(comps.len(), 7, "{out}");
@@ -86,7 +65,7 @@ fn gate_an_open_and_an_unoriented_piece_are_left_out_with_reasons_and_cap_at_rev
     let mut turned = small_part(Point3::new(120.0, 0.0, 0.0), 6.0);
     turned.triangles.iter_mut().skip(100).take(2).for_each(|t| t.swap(1, 2));
     scan.append(&turned);
-    let mut s = session_with(scan);
+    let mut s = session_with("scan", scan);
     // the opening of the sheet (about 24 edges) stays open: holes up to 10 edges are filled
     let out =
         s.execute("scan.to_solid", json!({"scan": "scan", "method": "freeform", "fill_holes_max_edges": 10})).unwrap();
@@ -112,7 +91,7 @@ fn gate_small_parts_that_fail_do_not_fail_the_call() {
     // each wavy ball is about 4 % of the area of the box
     scan.append(&wavy(Point3::new(120.0, 0.0, 0.0), 7.0, 5.0, 60));
     scan.append(&wavy(Point3::new(160.0, 0.0, 0.0), 7.0, 4.0, 60));
-    let mut s = session_with(scan);
+    let mut s = session_with("scan", scan);
     let out = s.execute("scan.to_solid", json!({"scan": "scan", "method": "primitives"})).unwrap();
     let comps = parts(&out);
     assert_eq!(comps.len(), 3, "{out}");
@@ -141,7 +120,7 @@ fn gate_debris_specks_are_not_modelled() {
     for _ in 0..40 {
         scan.append(&speck(Point3::new(rng.range(-20.0, 80.0), rng.range(40.0, 120.0), rng.range(-10.0, 30.0))));
     }
-    let mut s = session_with(scan);
+    let mut s = session_with("scan", scan);
     let out = s.execute("scan.to_solid", json!({"scan": "scan", "method": "freeform"})).unwrap();
     assert_eq!(parts(&out).len(), 2, "{out}");
     let numbers = &out["preparation"][0]["numbers"];
@@ -159,7 +138,7 @@ fn gate_cleaning_keeps_a_small_part_below_its_default() {
     let small = small_part(Point3::new(60.0, 0.0, 0.0), 6.0);
     assert!(small.triangle_count() * 100 < scan.triangle_count(), "below the default of the cleaning");
     scan.append(&small);
-    let mut s = session_with(scan);
+    let mut s = session_with("scan", scan);
     let out = s.execute("scan.to_solid", json!({"scan": "scan", "method": "freeform"})).unwrap();
     assert_eq!(parts(&out).len(), 2, "{out}");
     assert_eq!(out["verdict"], "pass", "{out}");
@@ -179,7 +158,7 @@ fn hostile_pieces_never_panic() {
         scan.positions.extend([Point3::new(p, 0.0, 0.0), Point3::new(p, 1.0, 0.0), Point3::new(p, 0.0, 1.0)]);
         scan.triangles.push([k, k + 1, k + 2]);
     }
-    let mut s = session_with(scan);
+    let mut s = session_with("scan", scan);
     let r = s.execute("scan.to_solid", json!({"scan": "scan", "method": "freeform", "part_share": 0.0}));
     if let Ok(out) = r {
         assert!(parts(&out).len() <= 2, "{out}");
@@ -197,7 +176,7 @@ fn gate_a_part_after_the_spent_budget_still_gets_its_freeform_wrap() {
         boss.positions.iter_mut().for_each(|p| p.x += 80.0 + 40.0 * f64::from(k));
         scan.append(&boss);
     }
-    let mut s = session_with(scan);
+    let mut s = session_with("scan", scan);
     let out = s.execute("scan.to_solid", json!({"scan": "scan"})).unwrap();
     let comps = parts(&out);
     assert_eq!(comps.len(), 5, "{out}");

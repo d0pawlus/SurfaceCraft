@@ -5,17 +5,15 @@
 //! path it always took. Tolerances are those of design doc §11.1, unchanged.
 use serde_json::{Value, json};
 use std::f64::consts::{PI, TAU};
-use surfacecraft_engine::Session;
+
 use surfacecraft_geom::pieces::pieces;
 use surfacecraft_geom::{Mesh, Point3, Rng, Vec3, synth};
 
+mod scan_common;
+use scan_common::{inject_fins, session_with, wavy, weld};
+
 const TOLERANCE: f64 = 0.2;
 const MIN_WITHIN: f64 = 0.99;
-
-fn weld(mut m: Mesh) -> Mesh {
-    m.weld(1e-9);
-    m
-}
 
 fn flip(mut m: Mesh) -> Mesh {
     m.triangles.iter_mut().for_each(|t| t.swap(1, 2));
@@ -29,17 +27,6 @@ fn speck(at: Point3, size: f64) -> Mesh {
         positions: vec![p(0.0, 0.0, 0.0), p(1.0, 0.0, 0.0), p(0.0, 1.0, 0.0), p(0.0, 0.0, 1.0)],
         triangles: vec![[0, 2, 1], [0, 1, 3], [1, 2, 3], [2, 0, 3]],
     }
-}
-
-/// A closed organic part: a sphere of radius `r` at `c` with a wavy skin, noise 0.02.
-fn wavy(c: Point3, r: f64, k: f64, res: usize) -> Mesh {
-    let mut m = weld(synth::sphere(Point3::origin(), 1.0, res, res / 2));
-    for p in &mut m.positions {
-        let d = p.coords;
-        p.coords = c.coords + d * r * (1.0 + 0.08 * (k * d.x).sin() * (k * 0.7 * d.y).cos());
-    }
-    synth::add_noise(&mut m, 0.02, &mut Rng::new(c.x as u64 + 3));
-    m
 }
 
 /// `parts` placed 60 mm apart along x, plus `specks` closed specks of debris far away.
@@ -78,12 +65,6 @@ fn three_parts_and_debris() -> (Mesh, [Mesh; 3]) {
         ));
     }
     (all, [a, b, c])
-}
-
-fn session_with(name: &str, m: Mesh) -> Session {
-    let mut s = Session::new();
-    s.doc.add_mesh(name, m);
-    s
 }
 
 #[test]
@@ -280,21 +261,6 @@ fn inject_handles(m: &mut Mesh, count: usize, gap: f64, rng: &mut Rng) -> usize 
     keep.extend(bridges);
     m.triangles = keep;
     pairs.len()
-}
-
-/// Fins: a triangle on an existing edge, its tip 0.15 mm off the surface (an edge of three triangles).
-fn inject_fins(m: &mut Mesh, count: usize, rng: &mut Rng) {
-    let normals = m.vertex_normals();
-    for _ in 0..count {
-        let t = m.triangles[rng.index(m.triangles.len())];
-        let (a, b) = (t[0] as usize, t[1] as usize);
-        let tip = Point3::from(
-            (m.positions[a].coords + m.positions[b].coords) / 2.0 + (normals[a] + normals[b]).normalize() * 0.15,
-        );
-        m.positions.push(tip);
-        let n = (m.positions.len() - 1) as u32;
-        m.triangles.push([t[1], t[0], n]);
-    }
 }
 
 /// Slivers: small triangles that pass through the shell.
