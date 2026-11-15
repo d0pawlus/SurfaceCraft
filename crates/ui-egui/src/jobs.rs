@@ -107,7 +107,9 @@ impl SurfaceCraftApp {
                     self.fit_pending = true;
                 }
                 if let Some(pose) = crate::align_proposal::framed_box(self) {
-                    // a proposal just arrived: look at where it puts the scan
+                    // a proposal just arrived: look at where it puts the scan, and remember the
+                    // view to return to if it is cancelled
+                    self.camera_before_proposal.get_or_insert_with(|| self.camera.clone());
                     self.camera.fit(&pose);
                 }
                 if id == "deviation.compute" {

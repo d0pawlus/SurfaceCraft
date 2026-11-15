@@ -223,3 +223,52 @@ fn a_failed_apply_leaves_the_form_proposing() {
     assert_eq!(app.palette_command, Some("align.auto"), "the tool stays open on the failure");
     h.get_by_label("Propose");
 }
+
+#[test]
+fn cancel_returns_the_view_to_where_the_scan_still_is() {
+    let mut h = harness(tilted_box());
+    h.run();
+    let (target, distance) = (h.state().camera.target, h.state().camera.distance);
+    h.get_by_label("Propose").click();
+    h.run();
+
+    h.get_by_label("Cancel").click();
+    h.run();
+
+    let camera = &h.state().camera;
+    assert!((camera.target - target).norm() < 1e-9, "{:?} -> {:?}", target, camera.target);
+    assert!((camera.distance - distance).abs() < 1e-9);
+}
+
+#[test]
+fn fit_frames_the_proposed_pose_while_it_is_shown() {
+    let mut h = harness(tilted_box());
+    h.run();
+    h.get_by_label("Propose").click();
+    h.run();
+    let framed = h.state().camera.target;
+    h.state_mut().camera.pan(300.0, 200.0, 600.0);
+
+    h.state_mut().perform(surfacecraft_ui_egui::shell::AppAction::FitAll);
+    h.run();
+
+    let target = h.state().camera.target;
+    assert!((target - framed).norm() < 1e-6, "Fit shows the proposal again: {framed:?} -> {target:?}");
+}
+
+#[test]
+fn clicks_do_not_pick_while_the_scan_is_drawn_in_a_proposed_pose() {
+    let mut h = harness(tilted_box());
+    h.run();
+    h.get_by_label("Propose").click();
+    h.run();
+    let (w, hgt) = (f64::from(SIZE[0]), f64::from(SIZE[1]));
+    // look straight at where the scan really is: without a proposal this click hits it
+    let real = h.state().session.doc.bbox();
+    h.state_mut().camera.fit(&real);
+
+    let hit = h.state_mut().pick_at(w / 2.0, hgt / 2.0, w, hgt, false);
+
+    assert!(!hit, "the picture under the pointer is not where the scan is");
+    assert!(h.state().picks.is_empty());
+}
