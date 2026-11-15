@@ -47,13 +47,13 @@ fn parts(out: &Value) -> Vec<Value> {
     out["components"].as_array().cloned().unwrap_or_default()
 }
 
-/// One large part and six small closed parts (each about 1 to 2 % of its area): all seven are modelled
+/// One large part and six small closed parts (each 3 to 4 % of its area, 17 to 21 mm across): all seven are modelled
 /// and pass, so the call passes; the small parts say so, and every solid is exported.
 #[test]
 fn gate_a_large_part_and_small_closed_parts_are_all_modelled_and_pass() {
     let mut scan = wavy(Point3::origin(), 30.0, 3.0, 160);
     for k in 0..6 {
-        scan.append(&small_part(Point3::new(60.0 + 25.0 * f64::from(k), 0.0, 0.0), 6.0 + 0.5 * f64::from(k)));
+        scan.append(&small_part(Point3::new(60.0 + 25.0 * f64::from(k), 0.0, 0.0), 5.0 + 0.2 * f64::from(k)));
     }
     let mut s = session_with(scan);
     let out = s.execute("scan.to_solid", json!({"scan": "scan", "method": "freeform"})).unwrap();
@@ -78,11 +78,12 @@ fn gate_a_large_part_and_small_closed_parts_are_all_modelled_and_pass() {
 #[test]
 fn gate_an_open_and_an_unoriented_piece_are_left_out_with_reasons_and_cap_at_review() {
     let mut scan = wavy(Point3::origin(), 30.0, 3.0, 160);
-    scan.append(&small_part(Point3::new(60.0, 0.0, 0.0), 7.0));
-    let mut open = small_part(Point3::new(90.0, 0.0, 0.0), 8.0);
+    // each piece is about 4 % of the largest: far from the 10 % of a co-equal part
+    scan.append(&small_part(Point3::new(60.0, 0.0, 0.0), 6.0));
+    let mut open = small_part(Point3::new(90.0, 0.0, 0.0), 6.0);
     open.triangles.truncate(open.triangles.len() - 120);
     scan.append(&open);
-    let mut turned = small_part(Point3::new(120.0, 0.0, 0.0), 8.0);
+    let mut turned = small_part(Point3::new(120.0, 0.0, 0.0), 6.0);
     turned.triangles.iter_mut().skip(100).take(2).for_each(|t| t.swap(1, 2));
     scan.append(&turned);
     let mut s = session_with(scan);
@@ -108,8 +109,9 @@ fn gate_an_open_and_an_unoriented_piece_are_left_out_with_reasons_and_cap_at_rev
 #[test]
 fn gate_small_parts_that_fail_do_not_fail_the_call() {
     let mut scan = synth::cuboid(Point3::new(0.0, 0.0, 0.0), Vec3::new(60.0, 50.0, 40.0), 24);
-    scan.append(&wavy(Point3::new(120.0, 0.0, 0.0), 8.0, 5.0, 60));
-    scan.append(&wavy(Point3::new(160.0, 0.0, 0.0), 8.5, 4.0, 60));
+    // each wavy ball is about 4 % of the area of the box
+    scan.append(&wavy(Point3::new(120.0, 0.0, 0.0), 7.0, 5.0, 60));
+    scan.append(&wavy(Point3::new(160.0, 0.0, 0.0), 7.0, 4.0, 60));
     let mut s = session_with(scan);
     let out = s.execute("scan.to_solid", json!({"scan": "scan", "method": "primitives"})).unwrap();
     let comps = parts(&out);
@@ -154,7 +156,7 @@ fn gate_debris_specks_are_not_modelled() {
 #[test]
 fn gate_cleaning_keeps_a_small_part_below_its_default() {
     let mut scan = wavy(Point3::origin(), 30.0, 3.0, 240);
-    let small = small_part(Point3::new(60.0, 0.0, 0.0), 8.0);
+    let small = small_part(Point3::new(60.0, 0.0, 0.0), 6.0);
     assert!(small.triangle_count() * 100 < scan.triangle_count(), "below the default of the cleaning");
     scan.append(&small);
     let mut s = session_with(scan);
@@ -184,13 +186,13 @@ fn hostile_pieces_never_panic() {
     }
 }
 
-/// A block and three bosses that no primitive closes: under `auto` each boss is tried with
+/// A block and four bosses that no primitive closes: under `auto` each boss is tried with
 /// primitives first and wrapped as freeform second. The first two bosses spend the call's two extra
-/// attempts; the third must still get its one wrap (it is not an extra attempt) and pass.
+/// attempts; the others must still get their one wrap (it is not an extra attempt) and pass.
 #[test]
 fn gate_a_part_after_the_spent_budget_still_gets_its_freeform_wrap() {
     let mut scan = synth::cuboid(Point3::new(0.0, 0.0, 0.0), Vec3::new(40.0, 30.0, 20.0), 16);
-    for k in 0..3 {
+    for k in 0..4 {
         let mut boss = weld(synth::cylinder(Point3::origin(), Vec3::z(), 8.0, 31.0, 96, 24));
         boss.positions.iter_mut().for_each(|p| p.x += 80.0 + 40.0 * f64::from(k));
         scan.append(&boss);
@@ -198,7 +200,7 @@ fn gate_a_part_after_the_spent_budget_still_gets_its_freeform_wrap() {
     let mut s = session_with(scan);
     let out = s.execute("scan.to_solid", json!({"scan": "scan"})).unwrap();
     let comps = parts(&out);
-    assert_eq!(comps.len(), 4, "{out}");
+    assert_eq!(comps.len(), 5, "{out}");
     for c in &comps {
         assert_eq!(c["verdict"], "pass", "{c}");
     }

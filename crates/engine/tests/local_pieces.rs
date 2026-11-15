@@ -3,7 +3,8 @@
 //! scans stay outside the repository (`SURFACECRAFT_LOCAL_CORPUS`).
 //!
 //! Run: `SURFACECRAFT_LOCAL_CORPUS=… cargo test --profile ci -p surfacecraft-engine --test local_pieces -- --ignored --nocapture`
-//! (`SURFACECRAFT_LOCAL_CORPUS_NUMBERS=13,2` limits the run).
+//! (`SURFACECRAFT_LOCAL_CORPUS_NUMBERS=13,2` limits the run; `SURFACECRAFT_LOCAL_UNITS=<n>=m` imports
+//! scan `n` in metres).
 use serde_json::json;
 use surfacecraft_engine::Session;
 use surfacecraft_geom::{Mesh, pieces};
@@ -27,6 +28,15 @@ fn corpus() -> Vec<(usize, std::path::PathBuf)> {
     numbered
 }
 
+/// The units of scan `n`: `SURFACECRAFT_LOCAL_UNITS` as `<number>=<units>` pairs, comma-separated.
+fn units_of(n: usize) -> Option<String> {
+    let list = std::env::var("SURFACECRAFT_LOCAL_UNITS").ok()?;
+    list.split(',').find_map(|pair| {
+        let (k, u) = pair.split_once('=')?;
+        (k.trim().parse::<usize>().ok()? == n).then(|| u.trim().to_string())
+    })
+}
+
 fn signed_volume(m: &Mesh) -> f64 {
     (0..m.triangle_count())
         .filter_map(|i| m.triangle(i))
@@ -46,8 +56,8 @@ fn list_pieces_of_every_scan() {
     for (n, path) in files {
         let mut s = Session::new();
         let mut import = json!({"path": path.to_string_lossy(), "name": "scan"});
-        if n == 8 {
-            import["units"] = json!("m");
+        if let Some(units) = units_of(n) {
+            import["units"] = json!(units);
         }
         if s.execute("mesh.import", import).is_err() {
             eprintln!("C{n:02}: import failed");
@@ -118,8 +128,8 @@ fn raw_closed_pieces_of_every_scan() {
     for (n, path) in corpus() {
         let mut s = Session::new();
         let mut import = json!({"path": path.to_string_lossy(), "name": "scan"});
-        if n == 8 {
-            import["units"] = json!("m");
+        if let Some(units) = units_of(n) {
+            import["units"] = json!(units);
         }
         if s.execute("mesh.import", import).is_err() {
             continue;
@@ -161,7 +171,11 @@ fn raw_closed_pieces_of_every_scan() {
 fn model_every_piece_alone() {
     for (n, path) in corpus() {
         let mut s = Session::new();
-        if s.execute("mesh.import", json!({"path": path.to_string_lossy(), "name": "scan"})).is_err() {
+        let mut import = json!({"path": path.to_string_lossy(), "name": "scan"});
+        if let Some(units) = units_of(n) {
+            import["units"] = json!(units);
+        }
+        if s.execute("mesh.import", import).is_err() {
             continue;
         }
         s.execute("mesh.clean", json!({"object": "scan", "fill_holes_max_edges": 400})).unwrap();
@@ -223,8 +237,8 @@ fn to_solid_of_many_parts() {
     for (n, path) in corpus() {
         let mut s = Session::new();
         let mut import = json!({"path": path.to_string_lossy(), "name": "scan"});
-        if n == 8 {
-            import["units"] = json!("m");
+        if let Some(units) = units_of(n) {
+            import["units"] = json!(units);
         }
         s.execute("mesh.import", import).unwrap();
         let started = std::time::Instant::now();
@@ -265,6 +279,40 @@ fn to_solid_of_many_parts() {
                 c["verdict"],
                 c["deviation"]["within"].as_f64().unwrap_or(0.0),
                 c["retry"]["reason"],
+            );
+        }
+    }
+}
+
+/// Where the time of a small part goes: the wrap alone against the whole freeform run (wrap, solid,
+/// deviation and verdict), on the listed pieces (`SURFACECRAFT_PIECES`, indices of `scan.split`).
+#[test]
+#[ignore = "needs SURFACECRAFT_LOCAL_CORPUS (third-party scans, never committed)"]
+fn time_the_stages_of_small_parts() {
+    let only: Vec<usize> = std::env::var("SURFACECRAFT_PIECES")
+        .map(|l| l.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_default();
+    for (n, path) in corpus() {
+        let mut s = Session::new();
+        s.execute("mesh.import", json!({"path": path.to_string_lossy(), "name": "scan"})).unwrap();
+        s.execute("mesh.clean", json!({"object": "scan", "fill_holes_max_edges": 400})).unwrap();
+        let split = s.execute("scan.split", json!({"object": "scan", "min_share": 1e-6})).unwrap();
+        for (k, p) in split["parts"].as_array().unwrap().iter().enumerate().filter(|(k, _)| only.contains(k)) {
+            let t = std::time::Instant::now();
+            let w = s.execute("surface.wrap", json!({"mesh": p["id"], "tolerance": 0.2})).unwrap();
+            let wrap_s = t.elapsed().as_secs_f64();
+            let t = std::time::Instant::now();
+            let out =
+                s.execute("scan.to_solid", json!({"scan": p["id"], "clean": false, "method": "freeform"})).unwrap();
+            let all_s = t.elapsed().as_secs_f64();
+            let t = std::time::Instant::now();
+            let body = out["body"]["id"].clone();
+            s.execute("body.compare", json!({"body": body, "scan": p["id"], "tolerance": 0.2, "facing": true}))
+                .unwrap();
+            let cmp_s = t.elapsed().as_secs_f64();
+            eprintln!(
+                "C{n:02} part {k}: tris {} wrap alone {wrap_s:.2} s ({} patches, {} rounds); freeform run {all_s:.2} s; one deviation compare {cmp_s:.2} s",
+                p["triangles"], w["patches"], w["rounds"]
             );
         }
     }

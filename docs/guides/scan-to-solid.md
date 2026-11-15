@@ -397,7 +397,10 @@ modelled as it is).
   the patch limit and short of the tolerance, and only in that part's first attempt) and the other method of
   `auto` all draw from it, whichever part asks first; when it is spent they are not run (an `auto` attempt
   that was not run is listed with its reason). A part's own wrap is not an extra attempt (a part the
-  primitives could not close is wrapped as freeform once, as its one wrap; a scan with strong topology
+  primitives could not close, or that the primitives did not pass on while `auto`'s freeform attempt
+  was refused because the budget was spent, is wrapped as freeform once, as its one wrap, and the
+  better of the two results is kept: on the scan of many parts twelve small parts ended without a pass
+  that way, and each passes as freeform; a scan with strong topology
   evidence is rebuilt and that wrap is made on the rebuilt scan). The worst case is therefore 130 wraps
   per call: one for each of the 128 parts and the 2 extra attempts, and at most 4 rebuilds. A part that
   was refused shows it: `components[].retry` with reason `budget_spent`, a `remesh` step in
