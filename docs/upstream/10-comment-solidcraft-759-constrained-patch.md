@@ -1,8 +1,8 @@
 # Draft 10: comment for tangency-labs/solidcraft#759 (constrained variational patch: what we learned)
 
-Status: DRAFT — not sent. Posting needs the owner's consent. Post it as one comment on #759
-("Patch on edges: G1/G2, N-sided loops, minimum-energy fit, guide points"). It covers the kernel side
-only and contains no application code.
+Status: posted 2026-11-15 as one comment on tangency-labs/solidcraft#759 (open, no earlier comments):
+https://github.com/tangency-labs/solidcraft/issues/759#issuecomment-6895148017. The posted text is this draft without the reference to draft 11,
+the closing sections and the word "scan", with the solidcore commit line dropped (the numbers are the application's solver's, not solidcore's).
 
 **solidcore commit the numbers come from:** `4f2da85c26f7d608808d94cffcf06ebe867ef61d`. Check the
 current head before posting.

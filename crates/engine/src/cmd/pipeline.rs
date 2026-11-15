@@ -5,7 +5,6 @@
 //! next steps, so that an agent needs one call instead of a dozen and cannot miss a poor result.
 use super::deviation::{NOISE_PRIMITIVE_MM, positive, yes};
 use super::hybrid::{FaceOf, FromRegionsIn, from_regions};
-use super::mesh_edit::{CleanIn, clean};
 use super::primitive::{AutoConstrainIn, auto_constrain};
 use super::qa::{CompareIn, CompareOut, QaIn, compare, scan_qa};
 use super::region::{AutoIn, RegionsOut, auto_segment};
@@ -33,12 +32,18 @@ mod hybrid_method;
 mod judge;
 #[path = "pipeline_merge.rs"]
 mod merging;
+#[path = "pipeline_parts.rs"]
+mod parts;
+#[path = "pipeline_parts_report.rs"]
+mod parts_report;
 #[path = "pipeline_prepare.rs"]
 mod prepare;
 #[path = "pipeline_shell.rs"]
 mod shell;
 #[path = "pipeline_shell_folds.rs"]
 mod shell_folds;
+pub use parts::LeftOutReason;
+pub use parts_report::PieceOut;
 pub use prepare::{ComponentOut, PrepOut, PrepStep};
 #[path = "pipeline_rebuild.rs"]
 mod rebuild;
@@ -147,10 +152,10 @@ pub struct ToSolidIn {
     /// `max_patches` is given).
     #[serde(default = "yes")]
     pub allow_retry: bool,
-    /// Rebuild a closed scan with many handles or non-manifold edges, or that wrapping did not pass on, with `mesh.remesh` and wrap it (again) (default true; for at most the 4 largest parts). The wrap again, the larger-cap retry (`allow_retry`, for the first part in area order that qualifies for it) and the other method of `auto` are extra attempts: one budget of 2 per call (a count, no clock). At most 26 wraps per call in all (a wrap for each of 24 parts, and the 2 extra attempts). `false`: the scan is wrapped as it is.
+    /// Rebuild a closed scan with many handles or non-manifold edges, or that wrapping did not pass on, with `mesh.remesh` and wrap it (again) (default true; for at most the 4 largest co-equal parts of a split scan, never for its small parts). The wrap again, the larger-cap retry (`allow_retry`, for the first part in area order that qualifies for it) and the other method of `auto` are extra attempts: one budget of 2 per call (a count, no clock). At most 130 wraps per call in all (a wrap for each of 128 parts, and the 2 extra attempts). `false`: the scan is wrapped as it is.
     #[serde(default = "yes")]
     pub rebuild: bool,
-    /// A part of a scan with several pieces is co-equal, and modelled, when its area is at least this share of the largest piece's (0..1, default 0.1). Smaller pieces and debris are reported, not modelled.
+    /// A part of a scan with several pieces is co-equal, and modelled, when its area is at least this share of the largest piece's (0..1, default 0.1); its verdict is the call's. A smaller piece is modelled as a small part when it is a closed, consistently oriented solid of at least 100 triangles and 50 tolerances across; every other piece is reported with its reason, not modelled. A small part never fails the call: small parts that did not pass, pieces left out and parts beyond the cap keep it at `review` when together they hold more than 2 % of the surface (parts beyond the cap always do).
     #[serde(default)]
     pub part_share: Option<f64>,
     /// Wall thickness in mm of the solid made from an open scan (no default; not 0, at most half the scan's size): the cleaned scan is thickened and the shell wrapped (method `freeform`); deviation and verdict are measured against the scan. Positive puts the material behind the scanned face, negative in front of it; an error when the scan is closed, or has several co-equal parts (`scan.split` first).
@@ -174,7 +179,7 @@ pub struct ToSolidIn {
     /// Name of the solid (default "solid").
     #[serde(default)]
     pub name: Option<String>,
-    /// Which co-equal parts of a scan with several parts are modelled: `all` (default, the largest 24, one solid each), `largest`, or a number of the largest parts.
+    /// Which parts of a scan with several parts are modelled: `all` (default: every co-equal part, then the small parts, at most 128, one solid each), `largest`, or a number of the largest co-equal parts (no small parts then).
     #[serde(default)]
     pub components: Option<prepare::Components>,
 }
@@ -247,6 +252,29 @@ pub(super) fn coverage_issue(d: &DeviationSummary, what: &str) -> Option<Issue> 
         100.0 * far
     );
     Some(issue("low_coverage", msg))
+}
+
+/// Why a loop is counted in `fill_inside_out`.
+const FILL_INSIDE_OUT_WHY: &str = "the fill would have closed the scan inside out: the scanned face would point into the volume the patch encloses, so the solid would be the space in front of the scanned surface. Such a loop is the open edge of a sheet, not a hole: the sheet was scanned from its hollow side, or its normals are stored inward";
+/// What to do about a loop counted in `fill_inside_out`.
+const FILL_INSIDE_OUT_ADVICE: &str = "check which way the scan's normals face (flip them if they point into the part), then model it as a sheet or give it a `thickness` for a solid; `mesh.fill_holes` with `allow_inward: true` caps it anyway (e.g. for a mould)";
+
+/// The issues of the holes left open: `scan_defects` for those too large to fill, `fill_inside_out` for the
+/// loops whose fill would have closed the scan inside out (see `mesh.clean`): a larger fill limit does not
+/// help those, so `scan_defects` (and its offer of `mesh.fill_holes`) counts only the others.
+pub(super) fn defects_issue(left: usize, inward: usize) -> Vec<Issue> {
+    let inward = inward.min(left);
+    let mut list = Vec::new();
+    if left > inward {
+        list.push(issue("scan_defects", format!("{} holes of the scan were too large to fill", left - inward)));
+    }
+    if inward > 0 {
+        let msg = format!(
+            "{inward} boundary loops of the scan were not filled: {FILL_INSIDE_OUT_WHY}. What to do: {FILL_INSIDE_OUT_ADVICE}"
+        );
+        list.push(issue("fill_inside_out", msg));
+    }
+    list
 }
 
 fn issue(code: &str, message: String) -> Issue {
@@ -359,22 +387,13 @@ fn prepare(s: &mut Session, i: &ToSolidIn, scan: ObjectId) -> CmdResult<ScanSumm
     if let Some(f) = qa.findings.iter().find(|f| BLOCKING_FINDINGS.contains(&f.code.as_str())) {
         return Err(CmdError::Failed(format!("the scan cannot be modelled: {}", f.message)));
     }
-    let (mut filled, mut left, mut non_manifold) = (0, qa.holes, qa.non_manifold_edges);
+    let (mut filled, mut left, mut inward, mut non_manifold) = (0, qa.holes, 0, qa.non_manifold_edges);
     if i.clean && !i.reuse_regions {
-        let edit = clean(
-            s,
-            CleanIn {
-                object: ObjRef::Id(scan.0),
-                min_component_fraction: None,
-                min_component_triangles: None,
-                outlier_ratio: None,
-                fill_holes_max_edges: Some(i.fill_holes_max_edges.unwrap_or(FILL_HOLES_MAX_EDGES)),
-                remove_folds: None,
-                fold_tolerance: None,
-            },
-        )?;
+        let fill = i.fill_holes_max_edges.unwrap_or(FILL_HOLES_MAX_EDGES);
+        let edit = parts::clean_keeping_small_parts(s, scan, i.tolerance.unwrap_or(TOLERANCE), fill)?;
         filled = edit.holes_filled.unwrap_or(0);
         left = edit.holes_left.unwrap_or(0);
+        inward = edit.holes_inward.unwrap_or(0);
         if non_manifold > 0 {
             // cleaning removes debris and spikes, which is where most such edges are
             non_manifold = scan_qa(s, QaIn { object: ObjRef::Id(scan.0) })?.non_manifold_edges;
@@ -387,6 +406,7 @@ fn prepare(s: &mut Session, i: &ToSolidIn, scan: ObjectId) -> CmdResult<ScanSumm
         holes_before: qa.holes,
         holes_filled: filled,
         holes_left: left,
+        holes_inward: inward,
         non_manifold_edges: non_manifold,
         noise_sigma: noise,
         noise_used: None,
@@ -519,6 +539,7 @@ fn primitives_solid(s: &mut Session, i: &ToSolidIn, set: &Settings, scan_report:
         left_out: left,
         unassigned,
         holes_left: scan_report.holes_left,
+        holes_inward: scan_report.holes_inward,
         non_manifold: scan_report.non_manifold_edges,
     };
     build(s, set, &mut o)?;
@@ -609,6 +630,30 @@ mod coverage_tests {
         assert_eq!(code(0.05, 0.95), "scan_inside_out");
         assert_eq!(code(0.10, 0.90), "scan_inside_out");
         assert_eq!(code(0.20, 0.80), "inconsistent_orientation");
+    }
+
+    fn defect_codes(left: usize, inward: usize) -> Vec<String> {
+        defects_issue(left, inward).into_iter().map(|i| i.code).collect()
+    }
+
+    #[test]
+    fn holes_left_open_are_scan_defects_unless_their_fill_would_close_the_scan_inside_out() {
+        assert!(defect_codes(0, 0).is_empty());
+        assert_eq!(defect_codes(3, 0), ["scan_defects"]);
+        assert_eq!(defect_codes(1, 1), ["fill_inside_out"]);
+        assert_eq!(defect_codes(4, 1), ["scan_defects", "fill_inside_out"]);
+        let both = defects_issue(4, 1);
+        assert!(both[0].message.starts_with("3 holes"), "{}", both[0].message);
+        assert!(both[1].message.starts_with("1 boundary loops") && both[1].message.contains("allow_inward"));
+    }
+
+    #[test]
+    fn more_inward_loops_than_holes_left_count_as_the_holes_left() {
+        // a report can never have more inward loops than holes left; if it did, nothing is invented
+        let list = defects_issue(2, 5);
+        assert_eq!(list.iter().map(|i| i.code.as_str()).collect::<Vec<_>>(), ["fill_inside_out"]);
+        assert!(list[0].message.starts_with("2 boundary loops"), "{}", list[0].message);
+        assert!(defects_issue(0, 5).is_empty());
     }
 
     #[test]

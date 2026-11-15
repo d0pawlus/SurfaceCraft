@@ -29,6 +29,11 @@ pub struct EditOut {
     /// Holes left open (above the size limit, not triangulable, or whose fill would put three triangles on one edge).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub holes_left: Option<usize>,
+    /// Of the holes left, those whose fill would have closed the mesh inside out: the scanned face would point
+    /// into the volume the patches enclose, which then cap the space in front of it (the loop is the open edge
+    /// of a sheet seen from its hollow side, or of one whose normals are stored inward, not a hole).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub holes_inward: Option<usize>,
     /// Folds removed by `mesh.clean` (see `remove_folds`); absent when the step did not run.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub folds: Option<FoldsOut>,
@@ -127,6 +132,7 @@ fn edit_mesh(
         added_triangles: 0,
         holes_filled: None,
         holes_left: None,
+        holes_inward: None,
         folds: None,
         max_displacement: None,
         regions_dropped: 0,
@@ -143,6 +149,16 @@ fn edit_mesh(
         store_editable(s, id, m)?;
     }
     Ok(o)
+}
+
+/// Changes the geometry of mesh `object` with `f`, as the edit commands do (regions of the mesh go when
+/// its triangles change).
+pub(crate) fn edit_geometry(s: &mut Session, object: &ObjRef, f: impl FnOnce(&mut Mesh)) -> CmdResult<()> {
+    edit_mesh(s, object, |m, _| {
+        f(m);
+        Ok(())
+    })
+    .map(|_| ())
 }
 
 /// Stores `m` as the geometry edits act on (see [`edit_mesh`]).
@@ -195,11 +211,16 @@ pub struct CleanIn {
     pub fold_tolerance: Option<f64>,
 }
 
+/// Components with fewer triangles than this share of the largest are removed by default.
+pub(crate) const CLEAN_COMPONENT_FRACTION: f64 = 0.01;
+/// Components with fewer triangles than this are removed by default.
+pub(crate) const CLEAN_COMPONENT_TRIANGLES: usize = 20;
+
 /// Default tolerance of the fold removal (mm): the one of `scan.to_solid`.
 const FOLD_TOLERANCE_MM: f64 = 0.2;
 
 pub(crate) fn clean(s: &mut Session, i: CleanIn) -> CmdResult<EditOut> {
-    let frac = fraction(i.min_component_fraction, "min_component_fraction", 0.01)?;
+    let frac = fraction(i.min_component_fraction, "min_component_fraction", CLEAN_COMPONENT_FRACTION)?;
     let ratio = i.outlier_ratio.unwrap_or(1.5);
     if !(ratio.is_finite() && ratio >= 0.0) {
         return Err(CmdError::Params("outlier_ratio must be ≥ 0".into()));
@@ -211,7 +232,8 @@ pub(crate) fn clean(s: &mut Session, i: CleanIn) -> CmdResult<EditOut> {
         if ratio > 0.0 {
             removed += edit::remove_outliers(m, ratio);
         }
-        removed += edit::remove_small_components(m, frac, i.min_component_triangles.unwrap_or(20));
+        removed +=
+            edit::remove_small_components(m, frac, i.min_component_triangles.unwrap_or(CLEAN_COMPONENT_TRIANGLES));
         o.removed_triangles = removed;
         // what the scan recorded: the triangles after this are patches of the hole filling
         let scan_triangles = m.triangle_count();
@@ -221,6 +243,7 @@ pub(crate) fn clean(s: &mut Session, i: CleanIn) -> CmdResult<EditOut> {
             o.added_triangles += m.triangle_count() - before;
             o.holes_filled = Some(r.filled);
             o.holes_left = Some(r.skipped);
+            o.holes_inward = Some(r.inward);
         }
         // after the holes are filled: a patch can cross the sheet around it
         if i.remove_folds.unwrap_or(false) {
@@ -321,15 +344,27 @@ pub struct FillIn {
     /// Curvature-following fill (refined, thin-plate faired); `false` = flat (default true).
     #[serde(default)]
     pub smooth: Option<bool>,
+    /// Also cap the loops whose fill would close the mesh inside out (default false): the scanned face would
+    /// point into the volume the patch encloses, so the loop is the open edge of a sheet, not a hole, and by
+    /// default it is left open and counted in `holes_inward`. `true` caps it anyway, e.g. to make a mould of a
+    /// dish; the closed mesh then faces inward.
+    #[serde(default)]
+    pub allow_inward: Option<bool>,
 }
 
 pub(crate) fn fill(s: &mut Session, i: FillIn) -> CmdResult<EditOut> {
     edit_mesh(s, &i.object, |m, o| {
         let before = m.triangle_count();
-        let r = edit::fill_holes(m, i.max_edges.unwrap_or(300), i.smooth.unwrap_or(true));
+        let (max_edges, smooth) = (i.max_edges.unwrap_or(300), i.smooth.unwrap_or(true));
+        let r = if i.allow_inward.unwrap_or(false) {
+            edit::fill_holes_allowing_inward(m, max_edges, smooth)
+        } else {
+            edit::fill_holes(m, max_edges, smooth)
+        };
         o.added_triangles = m.triangle_count() - before;
         o.holes_filled = Some(r.filled);
         o.holes_left = Some(r.skipped);
+        o.holes_inward = Some(r.inward);
         Ok(())
     })
 }
