@@ -526,24 +526,43 @@ fn blob_mesh() -> Mesh {
     m
 }
 
-/// A scan in which no group of patches merges gives the freeform verdict with no analytic face; when it
-/// has no region a primitive fits at all, the hybrid body is the freeform body (same counts and volume).
+/// On an organic part (which has no face of a primitive of its own) every analytic face the hybrid method reports is
+/// within the tolerance and accounted for, and the result is never worse than the freeform one. Whether a group of its
+/// patches lies within the tolerance of a fitted cone or cylinder, and is merged into one analytic face, depends on the
+/// platform (on Linux six patches did, 0.142 mm from the cone: within the tolerance and the gap, as the merge is allowed
+/// to), so the test holds with 0 or 1 or more groups merged. Each assertion and the change that makes it fail:
+/// the verdict equality, a merge that worsens the body (the judge's rejection removed); `faces == merged.len()`, an
+/// analytic face the summary does not list; the gap bound, a boundary left farther than the tolerance from its
+/// primitive (the gap limit loosened); the `hybrid_edge_gap` note, that issue dropped; the within share, a merged body
+/// that covers less of the scan than the freeform wrap; the equality with freeform when no primitive fitted, a hybrid wrap
+/// that differs from the freeform one without a primitive to show for it.
+/// (`with_no_region_large_enough_the_hybrid_method_returns_the_freeform_result_at_once` is the case where no group
+/// can merge by construction.)
 #[test]
-fn a_scan_without_a_merged_group_gives_the_freeform_result() {
+fn on_an_organic_part_every_analytic_face_is_within_tolerance_and_reported() {
     let mut s = scanned_session(&blob_mesh(), 5);
     let h = to_solid(&mut s, "hybrid");
     let f = to_solid(&mut s, "freeform");
     assert_eq!(h["method"], "hybrid", "{h}");
     assert_eq!(h["verdict"], f["verdict"], "{h}");
-    assert_eq!(h["analytic"]["faces"], 0, "{h}");
-    assert!(h["analytic"]["merged"].as_array().unwrap().is_empty());
+    let merged = h["analytic"]["merged"].as_array().unwrap();
+    assert_eq!(h["analytic"]["faces"].as_u64().unwrap() as usize, merged.len(), "{h}");
+    let codes: Vec<&str> = h["issues"].as_array().unwrap().iter().filter_map(|i| i["code"].as_str()).collect();
+    for g in merged {
+        let gap = g["max_edge_gap"].as_f64().unwrap();
+        assert!(gap <= 0.2 + 1e-9, "{g}");
+        assert!(gap <= 0.1 || codes.contains(&"hybrid_edge_gap"), "a gap above half the tolerance is noted: {h}");
+    }
+    let within = |r: &Value| r["deviation"]["within"].as_f64().unwrap();
+    assert!(within(&h) >= within(&f) - 1e-3, "{} against {}", within(&h), within(&f));
     let modelled = h["modelled"].as_array().unwrap();
     if modelled.is_empty() {
+        // no primitive fitted at all: the hybrid body is the freeform one
         assert_eq!(h["patches"], f["patches"]);
         assert_eq!(h["body"]["faces"], f["body"]["faces"]);
         let (v, w) = (h["body"]["volume"].as_f64().unwrap(), f["body"]["volume"].as_f64().unwrap());
         assert!((v - w).abs() <= 1e-9 * w.abs(), "volume {v} against {w}");
-    } else {
+    } else if merged.is_empty() {
         // primitives were fitted (which depends on the platform) but none of them has a merged face
         assert!(
             modelled.iter().all(|m| m["role"] == "patches" && m["faces"].as_array().is_some_and(Vec::is_empty)),
