@@ -143,7 +143,7 @@ pub(super) fn try_remove(
             && lp.iter().any(|&v| owner.get(v as usize).is_some_and(|&g| g != u32::MAX))
     };
     let before = out.triangles.len();
-    holes::fill_holes_filtered(&mut out, FILL_MAX_EDGES, true, true, &touches);
+    holes::fill_holes_filtered(&mut out, FILL_MAX_EDGES, (true, true), holes::Guard::RefuseInward, &touches);
     let added = out.triangles.len() - before;
     let live = |g: &usize| !skip.get(*g).copied().unwrap_or(false);
     let measured: Vec<Vec<u32>> =

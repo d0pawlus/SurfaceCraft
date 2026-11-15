@@ -29,6 +29,11 @@ pub struct EditOut {
     /// Holes left open (above the size limit, not triangulable, or whose fill would put three triangles on one edge).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub holes_left: Option<usize>,
+    /// Of the holes left, those whose fill would have closed the mesh inside out: the scanned face would point
+    /// into the volume the patches enclose, which then cap the space in front of it (the loop is the open edge
+    /// of a sheet seen from its hollow side, or of one whose normals are stored inward, not a hole).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub holes_inward: Option<usize>,
     /// Folds removed by `mesh.clean` (see `remove_folds`); absent when the step did not run.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub folds: Option<FoldsOut>,
@@ -127,6 +132,7 @@ fn edit_mesh(
         added_triangles: 0,
         holes_filled: None,
         holes_left: None,
+        holes_inward: None,
         folds: None,
         max_displacement: None,
         regions_dropped: 0,
@@ -237,6 +243,7 @@ pub(crate) fn clean(s: &mut Session, i: CleanIn) -> CmdResult<EditOut> {
             o.added_triangles += m.triangle_count() - before;
             o.holes_filled = Some(r.filled);
             o.holes_left = Some(r.skipped);
+            o.holes_inward = Some(r.inward);
         }
         // after the holes are filled: a patch can cross the sheet around it
         if i.remove_folds.unwrap_or(false) {
@@ -337,15 +344,27 @@ pub struct FillIn {
     /// Curvature-following fill (refined, thin-plate faired); `false` = flat (default true).
     #[serde(default)]
     pub smooth: Option<bool>,
+    /// Also cap the loops whose fill would close the mesh inside out (default false): the scanned face would
+    /// point into the volume the patch encloses, so the loop is the open edge of a sheet, not a hole, and by
+    /// default it is left open and counted in `holes_inward`. `true` caps it anyway, e.g. to make a mould of a
+    /// dish; the closed mesh then faces inward.
+    #[serde(default)]
+    pub allow_inward: Option<bool>,
 }
 
 pub(crate) fn fill(s: &mut Session, i: FillIn) -> CmdResult<EditOut> {
     edit_mesh(s, &i.object, |m, o| {
         let before = m.triangle_count();
-        let r = edit::fill_holes(m, i.max_edges.unwrap_or(300), i.smooth.unwrap_or(true));
+        let (max_edges, smooth) = (i.max_edges.unwrap_or(300), i.smooth.unwrap_or(true));
+        let r = if i.allow_inward.unwrap_or(false) {
+            edit::fill_holes_allowing_inward(m, max_edges, smooth)
+        } else {
+            edit::fill_holes(m, max_edges, smooth)
+        };
         o.added_triangles = m.triangle_count() - before;
         o.holes_filled = Some(r.filled);
         o.holes_left = Some(r.skipped);
+        o.holes_inward = Some(r.inward);
         Ok(())
     })
 }
