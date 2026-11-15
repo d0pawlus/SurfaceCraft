@@ -21,22 +21,24 @@ impl Partition {
     }
 }
 
-/// The partition named by `--partition <spec>` or `--partition=<spec>` in `args`, if any.
+/// The partition named by `--partition <spec>` or `--partition=<spec>` in `args` (the arguments
+/// after `test`), if any; any other argument is refused, so a misspelt flag does not silently run
+/// the whole suite.
 pub(crate) fn from_args(args: &[String]) -> Result<Option<Partition>, String> {
     let mut found = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let value = if a == "--partition" {
-            Some(it.next().ok_or("--partition needs a value such as count:1/3")?.as_str())
+            it.next().ok_or("--partition needs a value such as count:1/3")?.as_str()
+        } else if let Some(v) = a.strip_prefix("--partition=") {
+            v
         } else {
-            a.strip_prefix("--partition=")
+            return Err(format!("test: unknown argument {a:?} (expected --partition count:K/N)"));
         };
-        if let Some(v) = value {
-            if found.is_some() {
-                return Err("--partition given twice".into());
-            }
-            found = Some(parse(v)?);
+        if found.is_some() {
+            return Err("--partition given twice".into());
         }
+        found = Some(parse(value)?);
     }
     Ok(found)
 }
@@ -70,13 +72,19 @@ mod tests {
 
     #[test]
     fn no_flag_means_the_whole_suite() {
-        assert_eq!(from_args(&args(&["test"])), Ok(None));
+        assert_eq!(from_args(&args(&[])), Ok(None));
+    }
+
+    #[test]
+    fn a_misspelt_flag_is_refused_instead_of_running_everything() {
+        assert!(from_args(&args(&["--partiton", "count:1/2"])).is_err());
+        assert!(from_args(&args(&["count:1/2"])).is_err());
     }
 
     #[test]
     fn both_spellings_are_read() {
-        let a = from_args(&args(&["test", "--partition", "count:2/3"])).unwrap().unwrap();
-        let b = from_args(&args(&["test", "--partition=hash:2/3"])).unwrap().unwrap();
+        let a = from_args(&args(&["--partition", "count:2/3"])).unwrap().unwrap();
+        let b = from_args(&args(&["--partition=hash:2/3"])).unwrap().unwrap();
         assert_eq!(a.spec(), "count:2/3");
         assert_eq!(b.spec(), "hash:2/3");
     }
