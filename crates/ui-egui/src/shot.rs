@@ -12,6 +12,7 @@ pub fn draw_items(session: &mut Session) -> Vec<DrawItem> {
         .map(|d| DrawItem {
             key: d.key,
             color: crate::app::kind_color(d.kind),
+            back: crate::app::kind_back(d.kind),
             mesh: d.mesh,
             colors: d.colors,
             colors_key: d.colors_key,

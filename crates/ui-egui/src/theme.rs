@@ -191,6 +191,7 @@ tokens! {
     StatusError => "status.error",
     ViewportBackground => "viewport.background",
     ObjectMesh => "object.mesh",
+    ObjectMeshBack => "object.mesh_back",
     ObjectBody => "object.body",
     ObjectPrimitive => "object.primitive",
     ObjectSurface => "object.surface",
@@ -232,6 +233,7 @@ fn raw(preset: Preset, token: Token) -> [u8; 4] {
     let shared = |t: Token| -> [u8; 4] {
         match t {
             ObjectMesh => [158, 168, 184, 255],
+            ObjectMeshBack => [156, 108, 232, 255],
             ObjectBody => [89, 140, 217, 255],
             ObjectPrimitive => [242, 191, 51, 140],
             ObjectSurface => [140, 217, 242, 204],
@@ -294,6 +296,7 @@ fn raw(preset: Preset, token: Token) -> [u8; 4] {
             StatusError => [194, 40, 40, 255],
             ViewportBackground => [217, 222, 230, 255],
             ObjectMesh => [120, 130, 148, 255],
+            ObjectMeshBack => [124, 72, 200, 255],
             other => shared(other),
         },
         Preset::HighContrast => match token {
@@ -317,6 +320,7 @@ fn raw(preset: Preset, token: Token) -> [u8; 4] {
             StatusError => [255, 90, 90, 255],
             ViewportBackground => [0, 0, 0, 255],
             ObjectMesh => [220, 220, 220, 255],
+            ObjectMeshBack => [190, 110, 255, 255],
             ObjectBody => [80, 160, 255, 255],
             other => shared(other),
         },
@@ -401,6 +405,18 @@ impl Tokens {
             K::Mesh | K::Region | K::Feature => Token::ObjectMesh,
         };
         self.rgba(token)
+    }
+
+    /// Viewport colour of the back side (the side the normals point away from) of an object
+    /// kind: scans are open surfaces, so which side is which must be visible. `None` for the
+    /// kinds drawn in one colour.
+    #[must_use]
+    pub fn object_back(&self, kind: surfacecraft_doc::ObjectKind) -> Option<[f32; 4]> {
+        use surfacecraft_doc::ObjectKind as K;
+        match kind {
+            K::Mesh | K::Region | K::Feature => Some(self.rgba(Token::ObjectMeshBack)),
+            K::Body | K::Primitive | K::Surface | K::Quad | K::Sketch => None,
+        }
     }
 }
 

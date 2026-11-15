@@ -584,6 +584,7 @@ impl SurfaceCraftApp {
             .map(|d| DrawItem {
                 key: d.key,
                 color: tokens.object(d.kind),
+                back: tokens.object_back(d.kind),
                 colors: d.colors.clone(),
                 colors_key: d.colors_key,
                 highlight: self.highlight_for(&d),
@@ -785,4 +786,10 @@ fn example(p: &Value, root: &Value) -> Value {
 #[must_use]
 pub fn kind_color(kind: ObjectKind) -> [f32; 4] {
     Tokens::resolve(crate::theme::Preset::Light).object(kind)
+}
+
+/// Viewport colour of the back side of an object kind (the Light preset's, used for screenshots).
+#[must_use]
+pub fn kind_back(kind: ObjectKind) -> Option<[f32; 4]> {
+    Tokens::resolve(crate::theme::Preset::Light).object_back(kind)
 }
