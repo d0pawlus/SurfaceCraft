@@ -47,6 +47,9 @@ pub struct SeamReport {
     pub crossing: usize,
     /// Candidate triangles refused by the corner rule (two rims bridged, a rim facing away).
     pub bad_corners: usize,
+    /// Candidate triangles refused because the crossing test would have compared more triangles
+    /// than allowed (a pile, or a very long triangle among many new ones).
+    pub over_budget: usize,
     /// Removed triangles the seam left uncovered, and those put back.
     pub recovered: super::recover::Recovered,
     /// Triangles of small pieces dropped because they lay wholly on the rest of the result.
@@ -127,8 +130,10 @@ pub(super) fn refill(
         let tiny: Vec<Vec<u32>> = left.into_iter().filter(|l| l.len() <= WIDEN_EDGES).collect();
         // once per merge: the refill after the recovery does not widen again
         let widened = if round < WIDEN_ROUNDS && rep.widen_rounds == 0 {
-            rep.widen_rounds += 1;
-            super::fill::widen(u, guard, &tiny)
+            let w = super::fill::widen(u, guard, &tiny);
+            // counted only when something was widened: a later refill may still widen once
+            rep.widen_rounds += usize::from(w > 0);
+            w
         } else {
             0
         };

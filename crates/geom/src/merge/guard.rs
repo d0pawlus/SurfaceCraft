@@ -94,6 +94,15 @@ impl Corners {
     }
 }
 
+/// What the crossing test found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Clash {
+    Clear,
+    Crossing,
+    /// The test would have needed more comparisons than allowed.
+    Budget,
+}
+
 /// The guard (see the module).
 pub(super) struct Guard<'a> {
     scans: &'a [Scan],
@@ -113,6 +122,10 @@ pub(super) struct Guard<'a> {
     /// The corner rule of the seam, once the seam is being closed.
     pub(super) corners: Option<Corners>,
     pub(super) unsupported: usize,
+    /// Triangles refused because the crossing test would have compared more than `max_near`.
+    pub(super) over_budget: usize,
+    /// Comparisons one crossing test may make ([`MAX_NEAR`]; lowered in tests).
+    pub(super) max_near: usize,
     pub(super) crossing: usize,
     pub(super) bad_corners: usize,
 }
@@ -145,6 +158,8 @@ impl<'a> Guard<'a> {
             compared: std::cell::Cell::new(0),
             corners: None,
             unsupported: 0,
+            over_budget: 0,
+            max_near: MAX_NEAR,
             crossing: 0,
             bad_corners: 0,
         }
@@ -175,17 +190,17 @@ impl<'a> Guard<'a> {
 
     /// Does triangle `t` (corners `c`) cross or cover a kept or a new triangle? Triangles near it are
     /// found with its box grown by the tolerance (a parallel layer within the tolerance has a box of
-    /// its own that the exact one does not meet). At most [`MAX_NEAR`] triangles are compared; a
-    /// test that would need more counts as crossing.
+    /// its own that the exact one does not meet). At most `max_near` ([`MAX_NEAR`]) triangles are
+    /// compared; a test that would need more is [`Clash::Budget`] (refused, counted apart).
     ///
     /// With `own` (a restored or recovered triangle), a triangle of the same scan is tested for
     /// crossing only, not for covering: a scan's own layers (a thin wall, a double skin) are its data
     /// and come back as they were.
-    fn crosses(&self, p: Pts<'_>, t: [u32; 3], c: &[Point3; 3], own: bool) -> bool {
+    fn crosses(&self, p: Pts<'_>, t: [u32; 3], c: &[Point3; 3], own: bool) -> Clash {
         let bx = grown(&Aabb::from_points(c.iter()), self.tol);
-        let (near, more) = self.kept.overlapping_up_to(&bx, MAX_NEAR, &|_| true);
+        let (near, more) = self.kept.overlapping_up_to(&bx, self.max_near, &|_| true);
         if more {
-            return true;
+            return Clash::Budget;
         }
         let mine = if own { p.scan_of(&t) } else { None };
         let clash = |x: &[u32; 3]| {
@@ -193,12 +208,12 @@ impl<'a> Guard<'a> {
             p.corners(x).is_some_and(|y| clashes((c, &t), (&y, x), if same { None } else { Some(self.tol) }))
         };
         if near.iter().filter_map(|&i| self.kept_tris.get(i as usize)).any(clash) {
-            return true;
+            return Clash::Crossing;
         }
-        // the new triangles near it: those of its cells (or all, for a candidate too large for the
-        // grid) and the large ones, each once, within the budget left
+        // the new triangles near it: those of its cells (or all live ones, for a candidate too large
+        // for the grid) and the large ones, each once, within the budget left
         let mut ids: Vec<u32> = if self.too_large(&bx) {
-            (0..self.added.len() as u32).collect()
+            self.index_of.values().copied().collect()
         } else {
             self.cells_of(&bx).copied().collect()
         };
@@ -206,10 +221,29 @@ impl<'a> Guard<'a> {
         ids.sort_unstable();
         ids.dedup();
         self.compared.set(near.len() + ids.len());
-        if near.len() + ids.len() > MAX_NEAR {
-            return true;
+        if near.len() + ids.len() > self.max_near {
+            return Clash::Budget;
         }
-        ids.iter().filter_map(|&i| self.added.get(i as usize).copied().flatten()).any(|x| clash(&x))
+        if ids.iter().filter_map(|&i| self.added.get(i as usize).copied().flatten()).any(|x| clash(&x)) {
+            Clash::Crossing
+        } else {
+            Clash::Clear
+        }
+    }
+
+    /// Counts a refusal of `crosses`; true when the triangle passed.
+    fn passed(&mut self, clash: Clash) -> bool {
+        match clash {
+            Clash::Clear => true,
+            Clash::Crossing => {
+                self.crossing += 1;
+                false
+            }
+            Clash::Budget => {
+                self.over_budget += 1;
+                false
+            }
+        }
     }
 
     /// The cells the box `bx` spans along each axis.
@@ -289,8 +323,8 @@ impl<'a> Guard<'a> {
     /// scanned surface by construction) for crossings and covers only, and records it when it passes.
     pub(super) fn restorable(&mut self, p: Pts<'_>, t: [u32; 3]) -> bool {
         let Some(c) = p.corners(&t) else { return false };
-        if self.crosses(p, t, &c, true) {
-            self.crossing += 1;
+        let clash = self.crosses(p, t, &c, true);
+        if !self.passed(clash) {
             return false;
         }
         self.add(t, &c);
@@ -309,8 +343,8 @@ impl<'a> Guard<'a> {
             self.unsupported += 1;
             return false;
         }
-        if self.crosses(p, t, &c, false) {
-            self.crossing += 1;
+        let clash = self.crosses(p, t, &c, false);
+        if !self.passed(clash) {
             return false;
         }
         self.add(t, &c);
@@ -320,14 +354,14 @@ impl<'a> Guard<'a> {
     /// Tests the built triangles `patch` together and records them only when all pass; the counts of a
     /// refused try are not kept (it is one of several).
     pub(super) fn accept_all(&mut self, p: Pts<'_>, patch: &[[u32; 3]]) -> bool {
-        let mark = (self.unsupported, self.crossing, self.bad_corners);
+        let mark = (self.unsupported, self.crossing, self.bad_corners, self.over_budget);
         let mut added: Vec<[u32; 3]> = Vec::with_capacity(patch.len());
         for &t in patch {
             if !self.accept(p, t) {
                 for a in added {
                     self.forget(p, a);
                 }
-                (self.unsupported, self.crossing, self.bad_corners) = mark;
+                (self.unsupported, self.crossing, self.bad_corners, self.over_budget) = mark;
                 return false;
             }
             added.push(t);

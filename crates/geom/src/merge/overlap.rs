@@ -78,8 +78,11 @@ enum Seen {
     /// Opposed surface of the other scan within the tolerance (and no facing one within it).
     Opposed,
     /// No surface within the reach, but along the sample's normal (either way) the first surface of
-    /// the other scan, within its size, faces the same way: the two lie over each other, apart.
-    Over,
+    /// the other scan, within its size, faces the same way: the two lie over each other, apart (the
+    /// distance along the normal).
+    Over(f64),
+    /// No surface within the reach, and a cast along the normal ran out of its budget: unknown.
+    Unknown,
 }
 
 /// The agreement of scan `a`'s samples with scan `b`.
@@ -100,6 +103,12 @@ pub struct PairResidual {
     /// Samples with no surface of `b` within the reach that lie over facing surface of `b` farther away
     /// (along their normal, within the size of `b`): `b` is there, but displaced.
     pub over: usize,
+    /// Median distance along the normal of the samples over `b` (mm; 0 when none).
+    pub over_offset: f64,
+    /// Spread of those distances: 75th minus 25th percentile (mm).
+    pub over_spread: f64,
+    /// Samples whose cast along the normal ran out of its budget (a pile of triangles): not judged.
+    pub unknown: usize,
     /// Root mean square of the distances of the near samples (mm).
     pub rms: f64,
     /// 95th percentile of those distances (mm).
@@ -124,9 +133,26 @@ impl PairResidual {
     /// (Scans offset by more than the reach: they share no surface within it but lie over each other.)
     #[must_use]
     pub fn displaced(&self, min: usize) -> bool {
-        self.over >= min && self.over as f64 >= OVER_SHARE * self.samples as f64 && self.within < min
+        self.lies_over(min) && self.within < min
+    }
+
+    /// Do at least [`OVER_SHARE`] of the samples (and `min`) lie over `b` beyond the reach?
+    #[must_use]
+    pub fn lies_over(&self, min: usize) -> bool {
+        self.over >= min && self.over as f64 >= OVER_SHARE * self.samples as f64
+    }
+
+    /// Are the distances of the samples over `b` all about one value: their spread within the larger of
+    /// `tol` and [`OFFSET_SPREAD_SHARE`] of their median? (A copy displaced as a whole lies at one
+    /// offset; the steps and shelves of a part lie at many.)
+    #[must_use]
+    pub fn one_offset(&self, tol: f64) -> bool {
+        self.over_spread <= tol.max(OFFSET_SPREAD_SHARE * self.over_offset)
     }
 }
+
+/// Over samples whose distances spread by at most this share of their median lie at one offset.
+pub const OFFSET_SPREAD_SHARE: f64 = 0.1;
 
 /// What sample `s` of one scan finds on `other` (reach `reach`, tolerance `tol`).
 fn look(s: &Sample, other: &Scan, reach: f64, tol: f64) -> Option<Seen> {
@@ -158,14 +184,16 @@ fn over(s: &Sample, other: &Scan, reach: f64) -> Option<Seen> {
     }
     // a bounded cast: a pile of triangles at one place costs at most MAX_RAY_TESTS, and a cast that
     // runs out says nothing
-    let hit = [s.normal, -s.normal]
+    let casts = [s.normal, -s.normal].map(|d| other.bvh.ray_cast_bounded(&s.point, &d, wide, &|_| true, MAX_RAY_TESTS));
+    // a direction that ran out may hide a nearer surface: the sample says nothing
+    if casts.iter().any(|c| matches!(c, RayCast::Exhausted)) {
+        return Some(Seen::Unknown);
+    }
+    let hit = casts
         .iter()
-        .filter_map(|d| match other.bvh.ray_cast_bounded(&s.point, d, wide, &|_| true, MAX_RAY_TESTS) {
-            RayCast::Hit(t, at) => Some((t, at)),
-            RayCast::Miss | RayCast::Exhausted => None,
-        })
+        .filter_map(|c| if let RayCast::Hit(t, at) = c { Some((*t, *at)) } else { None })
         .min_by(|a, b| a.1.total_cmp(&b.1))?;
-    (hit.1 > reach && other.face_normal(hit.0).dot(&s.normal) >= COS_FACING).then_some(Seen::Over)
+    (hit.1 > reach && other.face_normal(hit.0).dot(&s.normal) >= COS_FACING).then_some(Seen::Over(hit.1))
 }
 
 fn opposes(other: &Scan, s: &Sample, hit: &crate::SurfaceHit) -> bool {
@@ -204,14 +232,20 @@ fn summary(a: usize, b: usize, samples: usize, seen: &[Option<Seen>], tol: f64) 
     let mut d: Vec<f64> =
         seen.iter().filter_map(|s| if let Some(Seen::Facing(x)) = s { Some(*x) } else { None }).collect();
     let opposed = seen.iter().filter(|s| matches!(s, Some(Seen::Opposed))).count();
-    let over = seen.iter().filter(|s| matches!(s, Some(Seen::Over))).count();
+    let mut offsets: Vec<f64> =
+        seen.iter().filter_map(|s| if let Some(Seen::Over(x)) = s { Some(*x) } else { None }).collect();
+    offsets.sort_by(f64::total_cmp);
+    let over = offsets.len();
+    let quantile = |q: usize| offsets.get((over * q / 100).min(over.saturating_sub(1))).copied().unwrap_or(0.0);
+    let (over_offset, over_spread) = (quantile(50), quantile(75) - quantile(25));
+    let unknown = seen.iter().filter(|s| matches!(s, Some(Seen::Unknown))).count();
     let near = d.len();
     let within = d.iter().filter(|&&x| x <= tol).count();
     let rms = if near == 0 { 0.0 } else { (d.iter().map(|x| x * x).sum::<f64>() / near as f64).sqrt() };
     d.sort_by(f64::total_cmp);
     let p95 = d.get((near * PERCENTILE / 100).min(near.saturating_sub(1))).copied().unwrap_or(0.0);
     let worst = d.last().copied().unwrap_or(0.0);
-    PairResidual { a, b, samples, near, within, opposed, over, rms, p95, worst }
+    PairResidual { a, b, samples, near, within, opposed, over, over_offset, over_spread, unknown, rms, p95, worst }
 }
 
 /// The pair residuals (every ordered pair with something near) and, per scan, the share of its
@@ -235,7 +269,7 @@ pub(super) fn residuals(
         covered.push(if samples.is_empty() { 0.0 } else { hit as f64 / samples.len() as f64 });
         for (b, seen) in per_other.iter().enumerate().filter(|(b, _)| *b != a) {
             let r = summary(a, b, samples.len(), seen, tol);
-            if r.near > 0 || r.opposed > 0 || r.over > 0 {
+            if r.near > 0 || r.opposed > 0 || r.over > 0 || r.unknown > 0 {
                 pairs.push(r);
             }
         }

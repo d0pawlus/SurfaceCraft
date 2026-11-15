@@ -276,21 +276,22 @@ fn nested(mesh: &Mesh, closed: &[&pieces::Piece], k: usize) -> bool {
 }
 
 /// Closed pieces with a negative volume, sorted: (turned inside out, inner skins, debris). An inner
-/// skin lies inside another closed piece of the scan (the inside of a hollow part faces inward); debris
-/// is a piece below [`INVERTED_MIN_SHARE`] of the scan's area, as long as all such pieces together
-/// stay below it (many small inverted pieces are a scan turned inside out in parts: counted as
-/// turned inside out). Only the first refuse the merge.
+/// skin lies inside another closed piece of the scan (the inside of a hollow part, a cavity, faces
+/// inward), whatever its size; debris is a piece below [`INVERTED_MIN_SHARE`] of the scan's area
+/// that lies inside nothing, as long as all such pieces together stay below it (many small inverted
+/// pieces are a scan turned inside out in parts: counted as turned inside out). Only the first
+/// refuse the merge.
 pub(super) fn negative_pieces(mesh: &Mesh) -> (usize, usize, usize) {
     let all = pieces::pieces(mesh);
     let closed: Vec<&pieces::Piece> = all.iter().filter(|p| p.closed()).collect();
     let area = mesh.area();
     let (mut inverted, mut skins, mut debris, mut debris_area) = (0, 0, 0, 0.0);
     for (k, p) in closed.iter().enumerate().filter(|(_, p)| volume(mesh, p) < 0.0) {
-        if p.area < INVERTED_MIN_SHARE * area {
+        if nested(mesh, &closed, k) {
+            skins += 1;
+        } else if p.area < INVERTED_MIN_SHARE * area {
             debris += 1;
             debris_area += p.area;
-        } else if nested(mesh, &closed, k) {
-            skins += 1;
         } else {
             inverted += 1;
         }

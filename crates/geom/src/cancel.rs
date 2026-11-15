@@ -34,12 +34,14 @@ impl Cancel {
 
     /// A token that cancels itself at its `n`-th look (`n` ≥ 1): for testing that a computation
     /// polls and stops wherever the flag is set.
+    #[cfg(test)]
     #[must_use]
     pub fn after_looks(n: usize) -> Self {
         Cancel(Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(n)))
     }
 
     /// Looks taken at a token from [`Cancel::after_looks`] that are still to come (0 once it fired).
+    #[cfg(test)]
     #[must_use]
     pub fn looks_left(&self) -> usize {
         self.1.load(Ordering::Acquire)

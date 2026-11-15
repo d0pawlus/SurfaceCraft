@@ -117,7 +117,7 @@ fn a_view_moved_by_several_tolerances_is_refused() {
     let (mesh, rep) = run(&[view(0, Vec3::x(), 8.0), moved], TOL);
     print(&rep);
     assert!(mesh.is_none() && rep.refused);
-    assert!(rep.issues.iter().any(|i| matches!(i, Issue::Misaligned { .. })));
+    assert!(rep.issues.iter().any(|i| matches!(i, Issue::Misaligned { .. } | Issue::Displaced { .. })));
 }
 
 fn views_of(n: usize) -> Vec<Mesh> {
@@ -413,6 +413,26 @@ fn a_refused_recovery_leaves_no_vertex_behind() {
     assert_eq!(u.normals.len(), u.positions.len());
     assert_eq!(u.scan_of.len(), u.positions.len());
     assert!(u.vertex_of.iter().flatten().all(|&x| x == prep::NONE || (x as usize) < u.positions.len()));
+}
+
+#[test]
+fn removed_surface_the_recovery_could_not_put_back_is_reported_uncovered() {
+    let cancel = Cancel::new();
+    let scans = vec![prep::prepare(&grid(6, 0.0, 0.0), &cancel).unwrap()];
+    let removed = vec![vec![true; scans[0].mesh.triangle_count()]];
+    let mut u = union::assemble(&scans, &removed);
+    let mut guard = guard::Guard::new(&scans, &u, 0.1, 4.0);
+    // a wall through the whole grid refuses every triangle that would come back
+    let first = u.positions.len() as u32;
+    u.positions.extend([Point3::new(-1.0, 3.0, -1.0), Point3::new(8.0, 3.0, -1.0), Point3::new(3.0, 3.0, 5.0)]);
+    u.normals.extend([Vec3::y(); 3]);
+    u.scan_of.extend([1; 3]);
+    let wall = [first, first + 1, first + 2];
+    assert!(guard.restorable(guard::Pts::of(&u), wall));
+    let mut rep = seam::SeamReport::default();
+    assert!(recover_rounds(&mut u, &scans, &removed, &mut guard, 0.1, &mut rep, &cancel).is_some());
+    assert!(rep.recovered.uncovered > 0, "{:?}", rep.recovered);
+    assert!(rep.recovered.uncovered + rep.recovered.triangles <= scans[0].mesh.triangle_count());
 }
 
 #[test]

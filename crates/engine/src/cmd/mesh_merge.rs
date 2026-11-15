@@ -102,10 +102,14 @@ pub struct MergePairOut {
     pub samples: usize,
     /// Of them, on facing surface of `b` (not past its border) within the search reach.
     pub shared: usize,
+    /// Of the shared points, within the tolerance.
+    pub within: usize,
     /// Points with no surface of `b` within the reach that lie over facing surface of `b` farther away (along their normal, within the size of `b`): `b` is there, displaced.
     pub over: usize,
-    /// Of those, within the tolerance.
-    pub within: usize,
+    /// Median distance of those points to `b` along their normal (mm; 0 when none).
+    pub over_offset: f64,
+    /// Points whose cast toward `b` ran out of its budget (a pile of triangles): not judged.
+    pub unjudged: usize,
     /// Points on opposed surface of `b` within the tolerance (one of the two is turned inside out).
     pub opposed: usize,
     /// Root mean square of the distances of the shared points (mm).
@@ -139,7 +143,7 @@ pub struct MergeSeamOut {
     pub refused_crossing: usize,
     /// Seam triangles taken back because they met another fan at one vertex only, before the hole was filled again.
     pub unpinched: usize,
-    /// Removed triangles whose centre the seam left without result surface within the tolerance.
+    /// Removed triangles whose centre is still without result surface within the tolerance after the seam and the recovery (one look at the end).
     pub uncovered_after_seam: usize,
     /// Of them, put back on their own scan's vertices (nothing moves, no scans are joined by them).
     pub recovered: usize,
@@ -147,6 +151,8 @@ pub struct MergeSeamOut {
     pub strays_dropped: usize,
     /// Seam triangles refused for joining vertices of one piece of one scan that share no cut edge.
     pub refused_corners: usize,
+    /// Triangles refused because the crossing test would have compared more triangles than allowed (not judged, left out).
+    pub refused_budget: usize,
     /// Recovered triangles taken back again as small specks the seam had cut off.
     pub specks_dropped: usize,
     /// Cut edges left open.
@@ -163,6 +169,7 @@ pub struct MergeTopologyOut {
     /// Boundary loops (the rims of open pieces and their holes).
     pub loops: usize,
     /// Genus (handles), sum over the pieces; absent when a piece has none (pinched, non-manifold, not oriented).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub genus: Option<usize>,
     /// Edges of three or more triangles.
     pub non_manifold_edges: usize,
@@ -202,7 +209,7 @@ pub struct MergeChecksOut {
 /// Something to know, with its numbers.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 pub struct MergeIssueOut {
-    /// `scans_misaligned`, `opposed_normals`, `inconsistent_winding`, `inverted_scan` (these refuse), `non_manifold_input`, `flipped_triangles_dropped`, `inner_skins`, `scans_disjoint`, `scan_fully_covered`, `seam_open`, `removed_not_covered`, `layers_stacked`, `unwelded_vertices`, `unoriented_edges`, `pinched_vertices`.
+    /// `scans_misaligned`, `opposed_normals`, `inconsistent_winding`, `inverted_scan` (these refuse), `layers_apart`, `overlap_unjudged`, `non_manifold_input`, `flipped_triangles_dropped`, `inner_skins`, `scans_disjoint`, `scan_fully_covered`, `seam_open`, `seam_over_budget`, `removed_not_covered`, `layers_stacked`, `unwelded_vertices`, `unoriented_edges`, `pinched_vertices`, `other` (an issue without a form of its own).
     pub code: String,
     /// `refusal`, `warning` or `info`.
     pub severity: String,
@@ -225,6 +232,7 @@ pub struct MergeStageOut {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 pub struct MergeOut {
     /// The new mesh; absent when the merge refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
     /// The merge refused (see the issues of severity `refusal`); nothing was made.
     pub refused: bool,
@@ -291,6 +299,15 @@ fn refusal_out(i: &Issue) -> Option<MergeIssueOut> {
                 surfacecraft_geom::merge::REACH_TOLERANCES
             ),
         ),
+        Issue::Displaced { a, b, samples, over, within, offset } => issue(
+            "scans_misaligned",
+            "refusal",
+            vec![*a, *b],
+            format!(
+                "scan {a} lies over scan {b} displaced along its normals: {over} of {samples} points of scan {a} lie over scan {b} farther than {} tolerances (median {offset:.4} mm along the normal), {within} within the tolerance, and no scan that shares surface with both ties them; they are not stacked: align them better (align.icp, align.global)",
+                surfacecraft_geom::merge::REACH_TOLERANCES
+            ),
+        ),
         Issue::Opposed { a, b, opposed, facing } => issue(
             "opposed_normals",
             "refusal",
@@ -322,6 +339,9 @@ fn refusal_out(i: &Issue) -> Option<MergeIssueOut> {
 
 /// An issue about the scans given that does not refuse, in the form of the command.
 fn scan_notice(i: &Issue) -> Option<MergeIssueOut> {
+    if let Some(out) = pair_notice(i) {
+        return Some(out);
+    }
     Some(match i {
         Issue::NonManifold { scan, dropped } => issue(
             "non_manifold_input",
@@ -353,6 +373,34 @@ fn scan_notice(i: &Issue) -> Option<MergeIssueOut> {
     })
 }
 
+/// A notice about a pair of scans that does not refuse, in the form of the command.
+fn pair_notice(i: &Issue) -> Option<MergeIssueOut> {
+    Some(match i {
+        Issue::LayersApart { a, b, over, samples, offset } => issue(
+            "layers_apart",
+            "warning",
+            vec![*a, *b],
+            format!(
+                "scans {a} and {b} agree in places but also lie over each other at one offset, both ways: {} of {} points of scan {a} and {} of {} of scan {b} lie over the other farther than {} tolerances, median {offset:.4} mm along the normals; either the part has a face there (a shelf over a floor) or one scan is displaced along a face parallel to the displacement: check the alignment",
+                over[0],
+                samples[0],
+                over[1],
+                samples[1],
+                surfacecraft_geom::merge::REACH_TOLERANCES
+            ),
+        ),
+        Issue::Unjudged { a, b, samples } => issue(
+            "overlap_unjudged",
+            "warning",
+            vec![*a, *b],
+            format!(
+                "{samples} points of scan {a} could not be judged against scan {b}: the search along their normal ran out of its budget (a pile of triangles)"
+            ),
+        ),
+        _ => return None,
+    })
+}
+
 /// An issue about the result, in the form of the command.
 fn notice_out(i: &Issue) -> MergeIssueOut {
     match i {
@@ -361,6 +409,14 @@ fn notice_out(i: &Issue) -> MergeIssueOut {
             "info",
             vec![*scan],
             format!("scan {scan} lies wholly on the others: nothing of it is in the result"),
+        ),
+        Issue::OverBudget { triangles } => issue(
+            "seam_over_budget",
+            "warning",
+            Vec::new(),
+            format!(
+                "{triangles} triangles of the seam or the restoration were left out because testing them for crossings would have compared too many triangles (a pile of triangles, or a very long one among many new ones)"
+            ),
         ),
         Issue::SeamOpen { edges, length } => issue(
             "seam_open",
@@ -415,17 +471,12 @@ fn check_notice(i: &Issue) -> MergeIssueOut {
                 "{vertices} vertices of the result lie at (nearly) the point of a vertex of another scan without an edge between them"
             ),
         ),
-        Issue::Stacked { share, triangles } => issue(
-            "layers_stacked",
-            "warning",
-            Vec::new(),
-            format!(
-                "{triangles} triangles ({:.2} % of the scans' area in the result) lie on another scan's surface: two layers were left there",
-                100.0 * share
-            ),
-        ),
+        Issue::Stacked { share, triangles } => stacked_notice(*share, *triangles),
         // refusals, scan notices and notices are written by the functions above
         other @ (Issue::Misaligned { .. }
+        | Issue::Displaced { .. }
+        | Issue::LayersApart { .. }
+        | Issue::Unjudged { .. }
         | Issue::Opposed { .. }
         | Issue::Winding { .. }
         | Issue::Inverted { .. }
@@ -434,9 +485,23 @@ fn check_notice(i: &Issue) -> MergeIssueOut {
         | Issue::Disjoint { .. }
         | Issue::FullyCovered { .. }
         | Issue::SeamOpen { .. }
+        | Issue::OverBudget { .. }
         | Issue::RemovedUncovered { .. }
         | Issue::Pinched { .. }) => issue("other", "warning", Vec::new(), format!("{other:?}")),
     }
+}
+
+/// The notice of two layers left in the result.
+fn stacked_notice(share: f64, triangles: usize) -> MergeIssueOut {
+    issue(
+        "layers_stacked",
+        "warning",
+        Vec::new(),
+        format!(
+            "{triangles} triangles ({:.2} % of the scans' area in the result) lie on another scan's surface: two layers were left there",
+            100.0 * share
+        ),
+    )
 }
 
 /// Noise estimate (σ) and median edge of every scan, and the default tolerance from them.
@@ -474,6 +539,8 @@ fn pair_out(p: &surfacecraft_geom::merge::PairResidual) -> MergePairOut {
         shared: p.near,
         over: p.over,
         within: p.within,
+        over_offset: p.over_offset,
+        unjudged: p.unknown,
         opposed: p.opposed,
         rms: p.rms,
         p95: p.p95,
@@ -498,6 +565,7 @@ fn seam_out(r: &Report) -> MergeSeamOut {
         recovered: s.recovered.triangles.saturating_sub(s.recovered.specks_dropped),
         strays_dropped: s.islands_dropped,
         refused_corners: s.bad_corners,
+        refused_budget: s.over_budget,
         specks_dropped: s.recovered.specks_dropped,
         open_edges: s.open_edges,
         open_length: s.open_length,

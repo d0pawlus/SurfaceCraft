@@ -82,6 +82,7 @@ fn scans_misaligned_by_several_tolerances_are_refused() {
 #[test]
 fn scans_misaligned_beyond_the_reach_are_refused() {
     let tol = 0.1;
+    let mut displaced = 0;
     for times in [10.0, 30.0, 100.0] {
         let mut views = halves();
         views[1] = views[1].transformed(&Transform::translation(Vec3::new(0.0, 0.0, times * tol)));
@@ -91,7 +92,27 @@ fn scans_misaligned_beyond_the_reach_are_refused() {
         eprintln!("{times} tolerances: over {over:?}, issues {:?}", codes(&out));
         assert_refused(&s, &out, "scans_misaligned", 2);
         assert!(!codes(&out).contains(&"scans_disjoint".to_string()));
+        displaced += usize::from(says_what_was_measured(&out));
     }
+    // the nearer offsets may still share points on the blob's flanks (the share form, also checked)
+    assert!(displaced >= 1, "at least the farthest offset is refused as displaced");
+}
+
+/// Checks that the refusal's text gives the numbers of its pair; true for the displaced form.
+fn says_what_was_measured(out: &Value) -> bool {
+    let issue = out["issues"].as_array().unwrap().iter().find(|i| i["code"] == "scans_misaligned").unwrap();
+    let text = issue["message"].as_str().unwrap();
+    let ab: Vec<usize> = issue["scans"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as usize).collect();
+    let pairs = out["pairs"].as_array().unwrap();
+    if text.contains("shared points") {
+        // the share form: the shared points of one of the two directions
+        assert!(pairs.iter().any(|p| text.contains(&format!("of {} shared points", p["shared"]))), "{text}");
+        return false;
+    }
+    let pair = pairs.iter().find(|p| p["a"] == ab[0] && p["b"] == ab[1]).unwrap();
+    assert!(text.contains(&format!("{} of {} points of scan {}", pair["over"], pair["samples"], ab[0])), "{text}");
+    assert!(text.contains(&format!("{} within the tolerance", pair["within"])), "{text}");
+    true
 }
 
 #[test]
@@ -245,6 +266,9 @@ fn pieces_of_one_scan_merge_back_into_it() {
     let mut s = session(&pieces);
     let out = merge(&mut s, 3, json!({}));
     let m = mesh_of(&s, &out["id"]);
+    // exact, not bounded: the pieces carry the scan's own vertices bit for bit, so a removed
+    // triangle whose corners are all in the union comes back with no distance decided (no tolerance,
+    // no rounding of the math library involved); the seam is a re-weld (passed on all three systems)
     assert_eq!(out["after"]["pieces"], json!(1));
     assert_eq!(out["after"]["loops"], json!(0));
     let mut at: std::collections::HashSet<[u64; 3]> = std::collections::HashSet::new();

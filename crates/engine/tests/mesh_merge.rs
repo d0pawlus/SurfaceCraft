@@ -170,9 +170,10 @@ fn assert_clean(label: &str, m: &Measured) {
     assert_eq!(a["non_manifold_edges"], json!(0), "{label}");
     assert_eq!(a["unoriented_edges"], json!(0), "{label}");
     assert_eq!(c["added_crossings"], json!(0), "{label}");
-    // a weld moves a seam vertex by at most a quarter of the tolerance
+    // a weld moves a seam vertex by at most the weld share of the tolerance
     let tol = m.out["tolerance"].as_f64().unwrap();
-    assert!(c["max_vertex_move"].as_f64().unwrap() <= 0.25 * tol * (1.0 + 1e-9), "{label}: welds are bounded");
+    let bound = surfacecraft_geom::merge::WELD_SHARE * tol * (1.0 + 1e-9);
+    assert!(c["max_vertex_move"].as_f64().unwrap() <= bound, "{label}: welds are bounded");
     assert!(!m.out["refused"].as_bool().unwrap(), "{label}");
     let has = |code: &str| codes(&m.out).iter().any(|k| k == code);
     assert_eq!(has("seam_open"), seam["open_edges"].as_u64().unwrap() > 0, "{label}");
@@ -202,7 +203,9 @@ fn gate_m4_merge_blob_views_into_one_piece_with_at_most_two_open_loops() {
             // the union of the views covers the whole blob: measured one closed piece of genus 0, no
             // point twice, no open seam edge, no second layer (stacked share 0.0000). Bounded, not
             // exact (the blob is made with sin and cos, whose last bit differs between the math
-            // libraries): one piece, at most 2 open loops (the noise sweep below finds a loop left at
+            // libraries): one piece (a second piece needs the seam to leave a whole band around the
+            // blob open, not a triangle or two that a last bit can move; measured one piece on all
+            // three systems in CI and on 90 of 90 noise draws of the sweep), at most 2 open loops (the noise sweep below finds a loop left at
             // the pole in a few draws), open seam edges at most 2 % of the cut edges, unwelded
             // vertices at most 2, stacked share at most 0.001
             let at = |k: &str| m.out["after"][k].as_u64().unwrap();
@@ -250,10 +253,18 @@ fn gate_m4_merge_bracket_views_leave_what_the_union_leaves_open() {
             // the views themselves are 3 mm off the truth in places (coarse triangles over the cut
             // holes): the merge is measured against them. Measured: within 0.9983 to 0.9991 against
             // 0.9991 to 0.9995 of the views (bound: 0.01 below); worst 1.5 to 3.0 mm against 3.0
-            // (bound: never worse than the views); covered 0.9922 to 0.9979 (bound 0.95: a miss share 6 times the
+            // (bound: the views' worst plus the weld radius, an invariant: every vertex of the merge is
+            // a vertex of a view at its place, or one welded by at most the weld radius, a quarter of
+            // the tolerance; seam triangles add no vertex); covered 0.9922 to 0.9979 (bound 0.95: a miss share 6 times the
             // largest measured)
             assert!(m.within >= m.within_in - 0.01, "{label}: {} against {}", m.within, m.within_in);
-            assert!(m.worst <= m.worst_in, "{label}: {} against {}", m.worst, m.worst_in);
+            let tol = m.out["tolerance"].as_f64().unwrap();
+            assert!(
+                m.worst <= m.worst_in + surfacecraft_geom::merge::WELD_SHARE * tol,
+                "{label}: {} against {}",
+                m.worst,
+                m.worst_in
+            );
             assert!(m.covered >= 0.95, "{label}: {}", m.covered);
         }
     }
@@ -296,9 +307,10 @@ fn gate_m4_merged_blob_wraps_like_one_full_scan() {
     );
 }
 
-/// Closed cases of the sweep below, measured 83 of 90 (88 before the round-1 review fixes, c0ef6b3;
-/// the open ones leave one loop at the pole of the blob where the views meet in a point).
-const SWEEP_CLOSED_FLOOR: usize = 83;
+/// A regression alarm for the sweep below, well under the measured 83 of 90 closed (88 before the
+/// round-1 review fixes, c0ef6b3; the open ones leave one loop at the pole of the blob where the views
+/// meet in a point). The per-case invariants (`assert_clean`, one piece) are the gate.
+const SWEEP_CLOSED_FLOOR: usize = 60;
 
 /// The blob gate over thirty more noise series (local: the topology of the gate must not depend on
 /// the noise draw). Fails when fewer cases than the floor close.
@@ -314,6 +326,7 @@ fn blob_gate_over_noise_series() {
             let closed = m.out["after"]["pieces"] == json!(1) && m.out["after"]["loops"] == json!(0);
             eprintln!("SWEEP series {series} n {n}: {}", if closed { "closed" } else { "OPEN" });
             closed_cases += usize::from(closed);
+            assert_eq!(m.out["after"]["pieces"], json!(1), "series {series} n {n}: one piece on every draw");
         }
     }
     eprintln!("SWEEP closed {closed_cases} of 90");

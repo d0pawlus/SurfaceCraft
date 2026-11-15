@@ -77,12 +77,14 @@ pub const STACKED_SHARE: f64 = 0.005;
 pub const RECOVER_ROUNDS: usize = 3;
 /// The guard's grid cell, in largest ball diameters (two radii).
 const CELL_RADII: f64 = 2.0;
-/// Triangles of all scans together at most. The merge holds, per triangle of the input, about 300
+/// Triangles of all scans together at most. The merge holds, per triangle of the input, about 450
 /// bytes at its peak: the scan as prepared (indices, neighbours, a copy for its BVH of 72 bytes, vertex
-/// normals and distances), the union, the result and its BVH (72 bytes again) and the list of removed
-/// triangles (8 bytes); the coverage samples are a fixed budget, not per triangle. 20 million
-/// triangles therefore need about 6 GB on a native target; the browser build (32-bit, 4 GB of
-/// address space shared with everything else) takes 2 million (about 600 MB).
+/// normals and distances, about 150), the union and the guard's copy of it with its BVH (about 110),
+/// the hash sets of the restoration (vertex sets and directed edges, about 100 with their overhead),
+/// the result and its BVH (about 50), the set of triangles put back, the list of removed triangles
+/// and the stacked-layer flags (16 a triangle, in blocks); the coverage samples are a fixed budget,
+/// not per triangle. 20 million triangles therefore need about 9 GB on a native target; the browser
+/// build (32-bit, 4 GB of address space shared with everything else) takes 2 million (about 900 MB).
 #[cfg(not(target_arch = "wasm32"))]
 pub const MAX_TRIANGLES: usize = 20_000_000;
 /// Triangles of all scans together at most in the browser build (see the native value).
@@ -115,9 +117,19 @@ pub enum MergeError {
 pub enum Issue {
     /// The scans disagree in their overlap by more than the tolerance (refused).
     /// `over`: samples lying over the other scan displaced beyond the reach. `beyond_share`: of the
-    /// near samples, the share beyond the tolerance; when the scans are displaced along their normals
-    /// (no near samples), the share of all samples lying over the other.
+    /// near samples, the share beyond the tolerance.
     Misaligned { a: usize, b: usize, near: usize, over: usize, beyond_share: f64, rms: f64, p95: f64 },
+    /// Scan `a` lies over scan `b` displaced along its normals: `over` of `samples` samples of `a` lie
+    /// over `b` beyond the reach (median `offset` mm along the normal), `within` agree with it, and
+    /// no scan that shares surface with both ties them (refused).
+    Displaced { a: usize, b: usize, samples: usize, over: usize, within: usize, offset: f64 },
+    /// Two scans that agree somewhere also lie over each other at one offset, both ways: `over` of
+    /// `samples` samples of each beyond the reach, median `offset` mm along the normals. A copy
+    /// displaced along a face parallel to the displacement looks so, and so does a shelf over a floor
+    /// seen by different scans: not refused, reported.
+    LayersApart { a: usize, b: usize, over: [usize; 2], samples: [usize; 2], offset: f64 },
+    /// Samples of `a` whose cast toward `b` ran out of its budget (a pile of triangles): not judged.
+    Unjudged { a: usize, b: usize, samples: usize },
     /// The normals of two scans oppose where they meet: one is turned inside out (refused).
     Opposed { a: usize, b: usize, opposed: usize, facing: usize },
     /// Triangles of a scan wound against the rest of their piece cover more than
@@ -130,7 +142,9 @@ pub enum Issue {
     /// Vertices of different scans left unwelded at (nearly) one point.
     Unwelded { vertices: usize },
     /// More than [`STACKED_SHARE`] of the scans' area in the result lies on another scan's surface
-    /// (`triangles` of them).
+    /// (`triangles` of them). Two layers of one scan are its own data (a double skin, a thin wall) and
+    /// raise no notice; which scan a triangle belongs to is told by its vertices, so a seam triangle
+    /// with three corners of one scan counts as that scan.
     Stacked { share: f64, triangles: usize },
     /// Closed pieces of a scan with a negative volume that are not refused: inner skins (inside another
     /// closed piece: the inside of a hollow part) and debris below [`prep::INVERTED_MIN_SHARE`].
@@ -144,6 +158,9 @@ pub enum Issue {
     Disjoint { groups: Vec<Vec<usize>> },
     /// A scan lies wholly on others: nothing of it is in the result.
     FullyCovered { scan: usize },
+    /// Triangles of the seam or the restoration refused because the crossing test would have compared
+    /// more triangles than allowed: not judged, left out.
+    OverBudget { triangles: usize },
     /// Part of the seam stayed open (no triangle there lay on scanned surface or could avoid crossing).
     SeamOpen { edges: usize, length: f64 },
     /// Less than [`COVERED_SHARE`] of the removed area lies within the tolerance of the result.
@@ -158,7 +175,11 @@ impl Issue {
     pub fn refuses(&self) -> bool {
         matches!(
             self,
-            Issue::Misaligned { .. } | Issue::Opposed { .. } | Issue::Winding { .. } | Issue::Inverted { .. }
+            Issue::Misaligned { .. }
+                | Issue::Displaced { .. }
+                | Issue::Opposed { .. }
+                | Issue::Winding { .. }
+                | Issue::Inverted { .. }
         )
     }
 }
@@ -311,7 +332,7 @@ fn pair(pairs: &[PairResidual], a: usize, b: usize) -> Option<&PairResidual> {
 }
 
 /// Issues of the pairs: misaligned, opposed, and the groups of scans that share nothing.
-fn pair_issues(n: usize, pairs: &[PairResidual]) -> Vec<Issue> {
+fn pair_issues(n: usize, pairs: &[PairResidual], tol: f64) -> Vec<Issue> {
     let both = |a: usize, b: usize| [pair(pairs, a, b), pair(pairs, b, a)].into_iter().flatten();
     // scans tied by shared surface, directly or through others: one lying over another displaced is
     // then the part's own shape (a step, a shelf), not a misalignment, since both agree with a third
@@ -320,7 +341,15 @@ fn pair_issues(n: usize, pairs: &[PairResidual]) -> Vec<Issue> {
     for a in 0..n {
         for b in a + 1..n {
             let (x, y) = (pair(pairs, a, b), pair(pairs, b, a));
-            out.extend(misaligned(a, b, x, y, tied.get(a) == tied.get(b)));
+            let refused = misaligned(a, b, x, y, tied.get(a) == tied.get(b));
+            // a pair refused as displaced says it already
+            if !matches!(refused, Some(Issue::Displaced { .. })) {
+                out.extend(layers_apart(a, b, x, y, tol));
+            }
+            out.extend(refused);
+            for r in [x, y].into_iter().flatten().filter(|r| r.unknown > 0) {
+                out.push(Issue::Unjudged { a: r.a, b: r.b, samples: r.unknown });
+            }
             let flipped =
                 [x, y].into_iter().flatten().find(|r| r.opposed >= MIN_SHARED_SAMPLES && r.opposed > r.within);
             if let Some(r) = flipped {
@@ -366,24 +395,46 @@ fn misaligned(a: usize, b: usize, x: Option<&PairResidual>, y: Option<&PairResid
     let both = || [x, y].into_iter().flatten();
     let worse =
         both().filter(|r| r.near >= MIN_SHARED_SAMPLES).max_by(|p, q| p.beyond_share().total_cmp(&q.beyond_share()));
-    let issue = |r: &PairResidual, share: f64| Issue::Misaligned {
-        a,
-        b,
-        near: r.near,
-        over: r.over,
-        beyond_share: share,
-        rms: r.rms,
-        p95: r.p95,
-    };
     if let Some(r) = worse.filter(|r| r.beyond_share() > MISALIGNED_SHARE) {
-        return Some(issue(r, r.beyond_share()));
+        return Some(Issue::Misaligned {
+            a,
+            b,
+            near: r.near,
+            over: r.over,
+            beyond_share: r.beyond_share(),
+            rms: r.rms,
+            p95: r.p95,
+        });
     }
-    // displaced along the normal: every sample over the other lies beyond the tolerance; the share
-    // reported is that of the samples over the other (rms and p95 are of the few near ones, if any)
     if tied {
         return None;
     }
-    both().find(|r| r.displaced(MIN_SHARED_SAMPLES)).map(|r| issue(r, r.over as f64 / r.samples.max(1) as f64))
+    both().find(|r| r.displaced(MIN_SHARED_SAMPLES)).map(|r| Issue::Displaced {
+        a: r.a,
+        b: r.b,
+        samples: r.samples,
+        over: r.over,
+        within: r.within,
+        offset: r.over_offset,
+    })
+}
+
+/// Do scans `a` and `b` lie over each other at one offset both ways (see [`Issue::LayersApart`])?
+/// Both directions are needed: a shelf partly over a floor, or the steps of a part, give a share one
+/// way or at many offsets; a whole copy displaced gives it both ways at one offset.
+fn layers_apart(a: usize, b: usize, x: Option<&PairResidual>, y: Option<&PairResidual>, tol: f64) -> Option<Issue> {
+    let (x, y) = (x?, y?);
+    let each = |r: &PairResidual| r.lies_over(MIN_SHARED_SAMPLES) && r.one_offset(tol);
+    if !(each(x) && each(y) && (x.over_offset - y.over_offset).abs() <= tol) {
+        return None;
+    }
+    Some(Issue::LayersApart {
+        a,
+        b,
+        over: [x.over, y.over],
+        samples: [x.samples, y.samples],
+        offset: 0.5 * (x.over_offset + y.over_offset),
+    })
 }
 
 /// Median of the scans' median edges: the length scale of the tie band, the weld radius cap, the
@@ -417,7 +468,7 @@ pub fn merge(
     rep.issues = scan_issues(&prepared);
     stage(Stage::Overlap);
     let (pairs, covered) = overlap::residuals(&prepared, rep.reach, tol, cancel).ok_or(MergeError::Cancelled)?;
-    rep.issues.extend(pair_issues(prepared.len(), &pairs));
+    rep.issues.extend(pair_issues(prepared.len(), &pairs, tol));
     rep.pairs = pairs;
     rep.scans = prepared.iter().zip(&covered).map(|(s, c)| first_row(s, *c)).collect();
     if rep.issues.iter().any(Issue::refuses) {
@@ -468,10 +519,13 @@ fn build(
     rep.seam.unsupported = guard.unsupported;
     rep.seam.crossing = guard.crossing;
     rep.seam.bad_corners = guard.bad_corners;
+    rep.seam.over_budget = guard.over_budget;
     polled()?;
-    let (dropped, count, recovered) = fill::drop_islands(&mut u, tol, cancel).ok_or(MergeError::Cancelled)?;
+    let (dropped, count, [recovered, restored]) =
+        fill::drop_islands(&mut u, tol, cancel).ok_or(MergeError::Cancelled)?;
     rep.seam.islands_dropped = count;
     rep.seam.recovered.triangles = rep.seam.recovered.triangles.saturating_sub(recovered);
+    rep.seam.restored = rep.seam.restored.saturating_sub(restored);
     for (s, t) in dropped {
         if let Some(r) = removed.get_mut(s as usize).and_then(|r| r.get_mut(t as usize)) {
             *r = true;
@@ -497,6 +551,7 @@ fn recover_rounds(
     cancel: &Cancel,
 ) -> Option<()> {
     for _ in 0..RECOVER_ROUNDS {
+        let before = u.triangles.len();
         let r = recover::recover(u, scans, removed, guard, (tol, cancel))?;
         if r.triangles == 0 {
             break;
@@ -506,14 +561,16 @@ fn recover_rounds(
             return None;
         }
         rep.recovered.rounds += 1;
-        rep.recovered.uncovered += r.uncovered;
         rep.recovered.triangles += r.triangles;
         rep.recovered.specks_dropped += specks;
+        // this round's own progress: the specks may include triangles of earlier rounds
+        let gained = u.triangles.len() > before;
         seam::refill(u, scans, guard, rep, cancel)?;
-        if specks >= r.triangles {
+        if !gained {
             break;
         }
     }
+    rep.recovered.uncovered = recover::uncovered(u, scans, removed, tol, cancel)?.len();
     Some(())
 }
 
@@ -613,6 +670,9 @@ fn result_issues(rep: &mut Report) {
         if r.kept + r.restored == 0 {
             rep.issues.push(Issue::FullyCovered { scan: k });
         }
+    }
+    if rep.seam.over_budget > 0 {
+        rep.issues.push(Issue::OverBudget { triangles: rep.seam.over_budget });
     }
     if rep.seam.open_edges > 0 {
         rep.issues.push(Issue::SeamOpen { edges: rep.seam.open_edges, length: rep.seam.open_length });

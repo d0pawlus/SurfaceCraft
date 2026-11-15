@@ -9,7 +9,7 @@ use super::union::{Origin, Union, directed};
 use crate::Mesh;
 use std::collections::HashSet;
 
-/// Loops (or pieces) handled between two looks at the cancellation flag.
+/// Pieces handled between two looks at the cancellation flag (in `drop_islands`).
 const CANCEL_EVERY: usize = 256;
 /// Loops of open seam edges up to this many edges are filled.
 pub const SMALL_LOOP_EDGES: usize = 64;
@@ -90,12 +90,9 @@ pub(super) fn fill_small(
         u.triangles.iter().flat_map(|t| (0..3).map(move |k| undirected(t[k], t[(k + 1) % 3]))).collect();
     let mut work = Mesh { positions: u.positions.clone(), triangles: Vec::new() };
     let (mut filled, mut added) = (0, 0);
-    for (n, lp) in loops.into_iter().enumerate() {
-        if n % CANCEL_EVERY == 0 && cancel.is_cancelled() {
-            return None;
-        }
+    for lp in loops {
         let rev: Vec<u32> = lp.iter().rev().copied().collect();
-        let Some(patch) = patch_for(&mut work, &rev, &taken, u, guard) else {
+        let Some(patch) = patch_for(&mut work, &rev, (&taken, u), guard, cancel)? else {
             left.push(lp);
             continue;
         };
@@ -116,14 +113,15 @@ fn fan(lp: &[u32], k: usize) -> Vec<[u32; 3]> {
 
 /// The triangles that fill the loop `lp` (in the fill's direction): the ear clipping, else the first
 /// fan from one of its vertices, whose triangles all pass `guard` and use no edge of the mesh as a
-/// diagonal.
+/// diagonal. `None` when cancelled (polled once per try: each try tests at most one triangle per edge
+/// of the loop).
 fn patch_for(
     work: &mut Mesh,
     lp: &[u32],
-    taken: &HashSet<u64>,
-    u: &Union,
+    (taken, u): (&HashSet<u64>, &Union),
     guard: &mut Guard<'_>,
-) -> Option<Vec<[u32; 3]>> {
+    cancel: &crate::Cancel,
+) -> Option<Option<Vec<[u32; 3]>>> {
     work.triangles.clear();
     let mut tries: Vec<Vec<[u32; 3]>> = Vec::with_capacity(lp.len() + 1);
     if crate::ear::ear_clip_avoiding(work, lp, &|a, b| taken.contains(&undirected(a, b))) {
@@ -141,7 +139,15 @@ fn patch_for(
         }
         count.iter().all(|(e, &n)| if boundary.contains(e) { n == 1 } else { n == 2 && !taken.contains(e) })
     };
-    tries.into_iter().find(|p| diagonal_free(p) && guard.accept_all(Pts::of(u), p))
+    for p in tries {
+        if cancel.is_cancelled() {
+            return None;
+        }
+        if diagonal_free(&p) && guard.accept_all(Pts::of(u), &p) {
+            return Some(Some(p));
+        }
+    }
+    Some(None)
 }
 
 /// The fans of triangles `tris` around vertex `v` (triangles joined across the edges through `v`).
@@ -268,16 +274,34 @@ pub(super) fn drop_specks(u: &mut Union, guard: &mut Guard<'_>) -> usize {
 /// Pieces made only of recovered triangles below this share of the result's area are dropped.
 pub const SPECK_SHARE: f64 = 0.01;
 
+/// Does every triangle of `part` have its centre within `tol` of facing surface of the rest of `mesh`?
+fn lies_on_rest(mesh: &Mesh, bvh: &crate::Bvh, part: &[u32], tol: f64) -> bool {
+    let mine: HashSet<u32> = part.iter().copied().collect();
+    part.iter().all(|&t| {
+        let (Some(c), Some(n)) = (mesh.face_centroid(t as usize), mesh.face_normal(t as usize)) else {
+            return false;
+        };
+        let keep = |o: usize| {
+            !mine.contains(&(o as u32)) && mesh.face_normal(o).is_some_and(|m| m.dot(&n) >= super::overlap::COS_FACING)
+        };
+        bvh.closest_filtered(&c, tol, &keep).is_some()
+    })
+}
+
 /// Drops the pieces of the union other than the largest that lie wholly (the centre of every
 /// triangle) within `tol` of facing surface of the rest: a stray triangle of a scan left on the
 /// merged surface, a second layer. Returns the kept scan triangles dropped as `(scan, triangle)`, the
-/// number dropped and of them the recovered ones. Runs after the guard's last use: the guard is not
+/// number dropped and of them the recovered and the restored ones. Runs after the guard's last use: the guard is not
 /// told (nothing is accepted after it), the vertices left unused stay out of the result's mesh.
-pub(super) fn drop_islands(u: &mut Union, tol: f64, cancel: &crate::Cancel) -> Option<(Vec<(u32, u32)>, usize, usize)> {
+pub(super) fn drop_islands(
+    u: &mut Union,
+    tol: f64,
+    cancel: &crate::Cancel,
+) -> Option<(Vec<(u32, u32)>, usize, [usize; 2])> {
     let mesh = Mesh { positions: u.positions.clone(), triangles: u.triangles.clone() };
     let parts = crate::edit::components(&mesh);
     if parts.len() < 2 {
-        return Some((Vec::new(), 0, 0));
+        return Some((Vec::new(), 0, [0, 0]));
     }
     let bvh = crate::Bvh::build(&mesh);
     let mut drop = vec![false; u.triangles.len()];
@@ -285,18 +309,7 @@ pub(super) fn drop_islands(u: &mut Union, tol: f64, cancel: &crate::Cancel) -> O
         if n % CANCEL_EVERY == 0 && cancel.is_cancelled() {
             return None;
         }
-        let mine: HashSet<u32> = part.iter().copied().collect();
-        let on_rest = part.iter().all(|&t| {
-            let (Some(c), Some(n)) = (mesh.face_centroid(t as usize), mesh.face_normal(t as usize)) else {
-                return false;
-            };
-            let keep = |o: usize| {
-                !mine.contains(&(o as u32))
-                    && mesh.face_normal(o).is_some_and(|m| m.dot(&n) >= super::overlap::COS_FACING)
-            };
-            bvh.closest_filtered(&c, tol, &keep).is_some()
-        });
-        if on_rest {
+        if lies_on_rest(&mesh, &bvh, part, tol) {
             for &t in part {
                 if let Some(d) = drop.get_mut(t as usize) {
                     *d = true;
@@ -312,10 +325,11 @@ pub(super) fn drop_islands(u: &mut Union, tol: f64, cancel: &crate::Cancel) -> O
         .filter_map(|(o, _)| if let Origin::Kept(s, t) = o { Some((*s, *t)) } else { None })
         .collect();
     let count = drop.iter().filter(|d| **d).count();
-    let recovered = u.origin.iter().zip(&drop).filter(|(o, d)| **d && matches!(o, Origin::Recovered(..))).count();
+    let of = |f: fn(&Origin) -> bool| u.origin.iter().zip(&drop).filter(|(o, d)| **d && f(o)).count();
+    let back = [of(|o| matches!(o, Origin::Recovered(..))), of(|o| matches!(o, Origin::Restored(..)))];
     let mut keep = drop.iter().map(|d| !d);
     u.triangles.retain(|_| keep.next().unwrap_or(true));
     let mut keep = drop.iter().map(|d| !d);
     u.origin.retain(|_| keep.next().unwrap_or(true));
-    Some((kept, count, recovered))
+    Some((kept, count, back))
 }

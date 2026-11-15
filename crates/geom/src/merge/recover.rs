@@ -14,13 +14,18 @@ use crate::{Bvh, Cancel, Mesh};
 use std::collections::HashSet;
 
 /// Triangles tried between two looks at the cancellation flag (each try compares at most
-/// `MAX_NEAR` triangles, so the work between two looks is bounded).
+/// `MAX_NEAR` triangles, so between two looks at most 64 times that).
 const CANCEL_EVERY: usize = 64;
+
+/// Removed triangles looked at between two looks at the cancellation flag (one nearest-surface query
+/// each).
+const UNCOVERED_CANCEL_EVERY: usize = 1024;
 
 /// What the recovery did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Recovered {
-    /// Removed triangles whose centre the seam left without facing result surface within the tolerance.
+    /// Removed triangles whose centre has no facing result surface within the tolerance after the
+    /// last round of recovery (one look at the end: what is still uncovered).
     pub uncovered: usize,
     /// Of them, put back.
     pub triangles: usize,
@@ -31,7 +36,8 @@ pub struct Recovered {
 }
 
 /// The removed triangles (not restored) whose centre has no facing result surface within `tol`.
-fn uncovered(
+/// `None` when cancelled (polled every [`UNCOVERED_CANCEL_EVERY`] triangles).
+pub(super) fn uncovered(
     u: &Union,
     scans: &[Scan],
     removed: &[Vec<bool>],
@@ -51,6 +57,9 @@ fn uncovered(
         }
         let gone = removed.get(s).map_or(&[][..], Vec::as_slice);
         for t in (0..scan.mesh.triangles.len()).filter(|&t| gone.get(t).copied().unwrap_or(false)) {
+            if t % UNCOVERED_CANCEL_EVERY == 0 && cancel.is_cancelled() {
+                return None;
+            }
             if back.contains(&(s as u32, t as u32)) {
                 continue;
             }

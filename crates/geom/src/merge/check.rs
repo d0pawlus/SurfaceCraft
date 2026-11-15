@@ -125,14 +125,9 @@ pub(super) fn coverage(
             one.iter().try_for_each(|&p| emit(p))?;
         }
     } else if n < MAX_REMOVED_SAMPLES {
-        let rest = (MAX_REMOVED_SAMPLES - n) as f64;
-        for t in (0..n).filter_map(gone) {
-            let m = 1 + (area(&t) / total.max(f64::MIN_POSITIVE) * rest) as usize;
-            let nrm = crate::tri::normal(&t[0], &t[1], &t[2]).unwrap_or_else(Vec3::z);
-            (0..m).try_for_each(|k| emit((super::overlap::point_in(&t, k), nrm, area(&t) / m as f64)))?;
-        }
+        by_area((n, gone), total, MAX_REMOVED_SAMPLES - n, &mut emit)?;
     } else {
-        spread(n, gone, total, &mut emit)?;
+        spread((n, gone), total, MAX_REMOVED_SAMPLES, &mut emit)?;
     }
     if cancel.is_cancelled() {
         return None;
@@ -141,15 +136,32 @@ pub(super) fn coverage(
     Some(cov)
 }
 
-/// Exactly [`MAX_REMOVED_SAMPLES`] points spread over the removed triangles by area (the k-th at the
-/// area fraction `(k + ½) / count`), handed to `emit` one by one.
-fn spread(
-    n: usize,
-    gone: &dyn Fn(usize) -> Option<[Point3; 3]>,
+/// One point in every removed triangle and `rest` more by area, handed to `emit` one by one.
+fn by_area(
+    (n, gone): (usize, &dyn Fn(usize) -> Option<[Point3; 3]>),
     total: f64,
+    rest: usize,
     emit: &mut dyn FnMut((Point3, Vec3, f64)) -> Option<()>,
 ) -> Option<()> {
-    let count = MAX_REMOVED_SAMPLES;
+    for t in (0..n).filter_map(gone) {
+        let a = crate::tri::area(&t[0], &t[1], &t[2]);
+        // a non-finite area (coordinates near the limit of f64) gets its one point
+        let share = a / total.max(f64::MIN_POSITIVE) * rest as f64;
+        let m = 1 + if share.is_finite() { (share as usize).min(MAX_REMOVED_SAMPLES) } else { 0 };
+        let nrm = crate::tri::normal(&t[0], &t[1], &t[2]).unwrap_or_else(Vec3::z);
+        (0..m).try_for_each(|k| emit((super::overlap::point_in(&t, k), nrm, a / m as f64)))?;
+    }
+    Some(())
+}
+
+/// At most `count` points spread over the removed triangles by area (the k-th at the area fraction
+/// `(k + ½) / count`, each standing for `total / count` of the area), handed to `emit` one by one.
+pub(super) fn spread(
+    (n, gone): (usize, &dyn Fn(usize) -> Option<[Point3; 3]>),
+    total: f64,
+    count: usize,
+    emit: &mut dyn FnMut((Point3, Vec3, f64)) -> Option<()>,
+) -> Option<()> {
     let step = total / count as f64;
     let (mut i, mut upto, mut k) = (0usize, 0.0, 0usize);
     while k < count && i < n {
