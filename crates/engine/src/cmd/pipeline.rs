@@ -25,6 +25,8 @@ mod auto;
 mod budget;
 #[path = "pipeline_freeform.rs"]
 mod freeform;
+#[path = "pipeline_handles.rs"]
+mod handles;
 #[path = "pipeline_hybrid.rs"]
 mod hybrid_method;
 #[path = "pipeline_judge.rs"]
@@ -163,6 +165,12 @@ pub struct ToSolidIn {
     /// Remove folds of the scan before it is thickened (default false; needs `thickness`): small groups of triangles that face against the surface around them and pass through the sheet (often a hole-fill patch crossing its surroundings) block a wall however thin. A removal taller than `tolerance` keeps the verdict at `review` with the issue `scan_folds_removed`. Without it nothing changes; a shell result with crossings offers it as a next step when folds that could be removed exist.
     #[serde(default)]
     pub remove_folds: bool,
+    /// Close the small handles of the cleaned scan before it is wrapped (default false; method `freeform` or `auto`, not with `thickness`): tunnels, bridges and the sponge of tiny tunnels where the two sides of a thin wall come closer than the scanner resolves stall the reduction and spend the patch budget. They are closed on a copy (`mesh.close_handles`, up to `handle_size`), the copy is wrapped, and the solid is measured against the scan as it was; what was cut out is reported in `preparation`, and whenever anything was cut the issue `scan_handles_closed` is raised (verdict at most `review`: the topology changed, and the deviation cannot see material added over an opening). A freeform result that is not a pass on a scan with many handles offers it as a next step.
+    #[serde(default)]
+    pub close_handles: bool,
+    /// Largest neighbourhood in which handles are closed (mm, default 12 median edges of the scan; needs `close_handles`).
+    #[serde(default)]
+    pub handle_size: Option<f64>,
     /// Name of the solid (default "solid").
     #[serde(default)]
     pub name: Option<String>,
@@ -194,6 +202,9 @@ struct Settings {
     max_patches: Option<usize>,
     allow_retry: bool,
     rebuild: bool,
+    /// Close the small handles of the scan before it is wrapped (`close_handles`), up to `handle_size`.
+    close_handles: bool,
+    handle_size: Option<f64>,
     name: String,
 }
 
@@ -269,6 +280,7 @@ fn settings(s: &Session, i: &ToSolidIn) -> CmdResult<Settings> {
     {
         return Err(CmdError::Params(format!("max_patches must be {}..={PATCH_LIMIT}", freeform::MIN_PATCHES)));
     }
+    handle_settings(i)?;
     Ok(Settings {
         budget: budget::CallBudget::default(),
         scan,
@@ -278,8 +290,33 @@ fn settings(s: &Session, i: &ToSolidIn) -> CmdResult<Settings> {
         max_patches: i.max_patches,
         allow_retry: i.allow_retry,
         rebuild: i.rebuild,
+        close_handles: i.close_handles,
+        handle_size: i.handle_size,
         name: i.name.clone().unwrap_or_else(|| "solid".to_string()),
     })
+}
+
+/// `close_handles` and `handle_size` make sense together, with the freeform method, without `thickness`.
+fn handle_settings(i: &ToSolidIn) -> CmdResult<()> {
+    if let Some(h) = i.handle_size
+        && !(h.is_finite() && h > 0.0)
+    {
+        return Err(CmdError::Params(format!("handle_size must be a positive number of mm, not {h}")));
+    }
+    if !i.close_handles {
+        return if i.handle_size.is_some() {
+            Err(CmdError::Params("`handle_size` needs `close_handles: true`".into()))
+        } else {
+            Ok(())
+        };
+    }
+    if i.method == Method::Primitives || i.method == Method::Hybrid || i.reuse_regions {
+        return Err(CmdError::Params("`close_handles` prepares the scan for method `freeform` (or `auto`): it has no meaning with method `primitives`, `hybrid` or `reuse_regions`".into()));
+    }
+    if i.thickness.is_some() {
+        return Err(CmdError::Params("`close_handles` is not combined with `thickness`: close the handles with `mesh.close_handles` and thicken the new mesh".into()));
+    }
+    Ok(())
 }
 
 fn triangle_count(s: &Session, scan: ObjectId) -> usize {

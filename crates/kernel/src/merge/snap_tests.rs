@@ -62,15 +62,25 @@ fn a_point_goes_onto_its_primitives_only_within_the_allowed_move() {
     assert!(put_on_all(&[], p(0.0, 0.0, 0.1), 1.0).is_none());
 }
 
-/// Two planes 10 degrees apart: a point between them, near both, is a metre from their line when it is a
-/// millimetre from each; the alternating projection is bounded and the move is refused.
+/// Two planes 10 degrees apart: a point between them, near both, is far from their line when it is close to each; the
+/// move onto the line is refused beyond the limit. At 10 degrees the alternation (a factor of 0.97 a round) does not
+/// reach a nanometre in 200 rounds, so `put_on_all` reports it, and `placed` gives the point nearest both, flagged as
+/// not on both; at 30 degrees it converges and is on both.
 #[test]
 fn a_point_near_two_planes_at_a_shallow_angle_that_meet_far_away_is_refused() {
-    let t = 10.0_f64.to_radians();
-    let a = plane_gauge([0.0, 0.0, 1.0], 0.0);
-    let b = plane_gauge([-t.sin(), 0.0, t.cos()], 0.0);
-    assert!(put_on_all(&[&a, &b], p(5.7, 0.0, 0.1), 0.3).is_none());
-    assert!(put_on_all(&[&a, &b], p(5.7, 0.0, 0.1), 10.0).is_some());
+    let plane_at = |deg: f64| {
+        let t = deg.to_radians();
+        (plane_gauge([0.0, 0.0, 1.0], 0.0), plane_gauge([-t.sin(), 0.0, t.cos()], 0.0))
+    };
+    let (a, b) = plane_at(30.0);
+    assert!(put_on_all(&[&a, &b], p(0.1, 0.0, 0.05), 0.3).is_some());
+    assert!(put_on_all(&[&a, &b], p(5.7, 0.0, 0.1), 0.3).is_none(), "far from the line");
+    let (a, b) = plane_at(10.0);
+    assert!(put_on_all(&[&a, &b], p(0.5, 0.0, 0.1), 10.0).is_none(), "not converged in 200 rounds");
+    let (q, on_all) = placed(&|i, q| [&a, &b][i].closest(q), 2, p(0.5, 0.0, 0.1), 10.0).unwrap();
+    assert!(!on_all);
+    let worst = [&a, &b].iter().filter_map(|g| g.distance(q)).fold(0.0_f64, f64::max);
+    assert!(worst <= 0.1 + 1e-9, "nearer both than the point was: {worst}");
 }
 
 fn two_patches() -> Brep {

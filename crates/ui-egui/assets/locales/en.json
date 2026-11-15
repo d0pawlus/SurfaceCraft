@@ -651,6 +651,8 @@
   "cmd.import.step": "Import STEP",
   "cmd.mesh.clean": "Clean scan",
   "cmd.mesh.clean.hint": "Removes duplicate points, bad triangles and tiny loose specks in one go.",
+  "cmd.mesh.close_handles": "Close small handles",
+  "cmd.mesh.close_handles.hint": "Closes the tiny tunnels and bridges of a scan (e.g. where the two sides of a thin wall run together) as a new mesh; the rim and the rest of the surface stay.",
   "cmd.mesh.decimate": "Simplify",
   "cmd.mesh.decimate.hint": "Reduces the number of triangles, so the scan is lighter to work with.",
   "cmd.mesh.export": "Export mesh",

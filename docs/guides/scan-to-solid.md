@@ -322,6 +322,11 @@ kernel refuses sheets of many faces. Give the wall thickness instead:
   `open_result`, `failed`, `budget_spent`) and the `error` of a failed second wrap. `budget_spent`: the retry was due but the call had used its extra attempts, so no second network was made (a call that needed no retry has no `retry`). A `max_patches` you give is
   never exceeded. Beyond that, `surface.wrap` with a larger `max_patches` (up to 60000); the STEP
   file grows with the patch count.
+- `scan_handles_closed` (with `close_handles`): small handles were closed before the wrap. It is
+  raised whenever anything was cut, so the verdict is at most `review`: the solid has the topology of
+  the repaired scan, not of the scan, and the deviation (measured from the points of the scan) cannot
+  see material added over a real opening. The message and the `close_handles` step of `preparation`
+  say how many parts, how much area, and how far what was cut out lies from the repaired scan.
 - `non_manifold_edges`: edges shared by three or more triangles are left after cleaning; the
   regions and holes next to them are unreliable. `mesh.reconstruct` builds a new mesh from the
   points of the file.
@@ -385,6 +390,48 @@ modelled as it is).
   default 5 mm, or a loop of more than two edges that was not filled (a missing triangle is one)), a resolution beyond its
   limits (16 million grid columns, 40 million ray crossings, 6 million quads; fewer on 32-bit
   targets), and a wall the voxel cannot resolve when `voxel` is given.
+- **Small handles of an open scan** (`close_handles`, off by default). Where the two sides of a thin
+  wall come closer than the scanner resolves, the scan carries a sponge of tiny tunnels and bridges:
+  thousands of handles on a surface that is open, so `mesh.remesh` cannot rebuild it. The reduction
+  of the wrap stalls on them (a collapse that would close a tunnel is refused), the coarse mesh keeps
+  the handle regions at full resolution and the patch limit is spent there. `scan.to_solid` with
+  `close_handles: true` (method `freeform` or `auto`; not with `thickness` or `primitives`) closes
+  them on a copy of the cleaned scan (`mesh.close_handles` does it alone, as a new mesh), wraps the
+  copy and measures the solid against the scan as it was; the copy is removed afterwards. When nothing
+  could be closed, the scan is modelled as without the option (a step says so).
+  - What is closed: around seeds a quarter of a scale apart along the surface, the geodesic balls
+    one scale across are looked at, from four median edges up to `handle_size` (default 12 median
+    edges), each scale √2 times the one before, and at `handle_size`; the smallest balls first. A
+    connected part of a ball that
+    is not a disk (it has genus, or several boundary loops that are joined outside it) is cut out and
+    each of its loops filled with the smooth hole fill; it closes its genus plus its loops less one. A
+    handle about half a scale across lies wholly in the ball of its nearest seed. A real hole through
+    a thin wall narrower than `handle_size` is a tunnel too and is closed; a wider one is kept.
+  - What is never touched: the rim of the scan and every vertex away from the parts cut out; a part
+    that reaches the rim or an edge of three or more triangles, or meets the rest at a pinched vertex.
+    A part is left, and counted in `refused`, when cutting it would split the surface or leave a piece
+    loose (`splits`), it is a whole closed piece that a ball holds (`whole_pieces`: it would be
+    deleted), a hole stays open (`unfillable`), more than a quarter of one patch of its fill lies
+    farther than the tolerance from what it replaced (`fill_far`: a cap over the mouth of a real
+    opening), or what it removed is not covered by the result (`uncovered`: more than a quarter of the
+    points sampled over its triangles farther than the tolerance, or one farther than a quarter of the
+    ball; the samples are the corners, edge midpoints, centres and a lattice of the triangles, so the
+    wall of a bore made of long triangles counts), or the fill leaves a pinched vertex. A part that
+    fails is grown by a ring of triangles (twice at most) before it is left. The passes stop when no
+    handle is left, and `handle_size` is never more than the diagonal of the scan.
+  - What is reported: a `close_handles` step in `preparation` with the handles before and after (from
+    the Euler characteristic), the handles closed, the parts and what each scale closed, the refusals,
+    the boundary loops and pieces before and after (the same), the triangles and area cut out and their
+    share (triangles of the scan only), the triangles the fills added, and the points sampled over what
+    was cut out: how many, how many lie within the tolerance of the repaired scan, and the farthest (the
+    tunnel walls that went). Anything cut raises `scan_handles_closed` (verdict at most `review`). The
+    deviation is measured against the scan as it was, so what was cut out counts against the solid.
+  - A freeform result that is not a pass on a scan with at least 64 handles offers it as a next step.
+  - On a real scan with about 2600 handles (open, three rims) it closed about four fifths of them,
+    cutting out under 3 % of the area, and the verdict went from `fail` to `review`; about 10 % of the
+    scan stays out of the tolerance, so it is no pass. In a dense sponge a part is cut out whole, so
+    the area cut out can be large where tunnels are close together. Closing takes minutes on a million
+    triangles of real scan. A scan without small handles is returned as it is, bit for bit.
 - A scan that already works is not touched: no preparation step, the same result as before. The
   piece analysis that decides this is O(n log n) on the cleaned scan (see the PR for the time on a
   million triangles).
