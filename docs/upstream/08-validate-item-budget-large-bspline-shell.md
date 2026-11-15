@@ -1,9 +1,11 @@
 # Draft 08: `Brep::validate` refuses a closed B-spline shell of about 40 000 bicubic patches with `item budget`
 
-Status: draft, not filed. Filing needs the owner's consent. It is probably a question or documentation request rather
-than a bug (see "Assessment"). If filed, open it in tangency-labs/solidcore (SurfaceCraft's drafts 04 to 07 name
-tangency-labs/solidcraft; the kernel-paused notice in tangency-labs/solidcraft#3992 says new kernel issues get the
-label `kernel-paused`).
+Status: not filed (2026-11-15). On the current solidcore head (`74300b3`, 2026-11-15) `Brep::validate` and
+`MAX_ITEMS` are documented as the bound for a record from outside the kernel, and `Brep::validate_built` as the check of a record the
+kernel built, "every check but the item budget"; that is the reading this draft asked for, so the report would be a request for a
+message that names the limit and nothing else. tangency-labs/solidcore AGENTS.md takes issues for what real use hits, and the
+real use (a decode with `from_record`, which uses `validate_built`) works. The text below is kept as the record of the measurement
+at the pin.
 
 **solidcore commit:** `4f2da85c26f7d608808d94cffcf06ebe867ef61d` (the same text is at `b9c02da`).
 **Duplicate search** (tangency-labs/solidcraft, read-only `gh search issues`): "item budget", "MAX_ITEMS",

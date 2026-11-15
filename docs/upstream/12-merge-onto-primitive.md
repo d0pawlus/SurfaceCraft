@@ -1,6 +1,6 @@
 # Request: put the boundary of a group of patches on a primitive, and make an analytic face of the group (draft)
 
-Status: **draft only.** Nothing has been filed at tangency-labs/solidcore (filing needs the owner's consent).
+Status: filed 2026-11-15 as tangency-labs/solidcraft#17328 (Feature request template, label `enhancement`; kernel-only text, checked against solidcore main `74300b3`: nothing there makes an analytic face of a group of patches; no duplicate found).
 Debt: exception accepted by the owner 2026-11-14 for exactly these three files (listed in `xtask/app-geometry.txt`); to be proposed upstream with the owner's consent, then removed.
 Pin: `solidcore` rev `4f2da85c26f7d608808d94cffcf06ebe867ef61d`.
 
