@@ -97,6 +97,9 @@ fn run_one(number: usize, path: &std::path::Path) -> Result<String, String> {
         out["retry"],
         out["attempts"]
     );
+    if !out["analytic"].is_null() {
+        eprintln!("C{number:02} analytic {}", out["analytic"]);
+    }
     for p in out["preparation"].as_array().into_iter().flatten() {
         eprintln!("C{number:02} preparation {}: {}", p["step"], p["numbers"]);
     }
