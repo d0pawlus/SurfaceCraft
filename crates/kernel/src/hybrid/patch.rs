@@ -70,6 +70,30 @@ pub fn patch_rise(body: &Brep, face: usize, surface: &Surface, outward: V) -> Re
     if top.is_finite() { Ok(top) } else { Err(KernelError::Argument("the patch could not be sampled".into())) }
 }
 
+/// The profile arc of a circle edge of `frame` and `radius` from `a` to `b` (the full circle when
+/// `closed`, or when `b` does not lie after `a` counter-clockwise).
+fn profile_arc(frame: &Frame, radius: f64, a: V, b: V, closed: bool) -> Result<crate::feature::ProfileCurve> {
+    let axis = unit(frame_axis(frame)).ok_or_else(|| KernelError::Argument("degenerate circle frame".into()))?;
+    let (x, y) = (frame.x_axis, frame.y_axis);
+    let ang = |p: V| {
+        let d = sub(p, frame.origin);
+        dot(d, y).atan2(dot(d, x))
+    };
+    let start = ang(a);
+    let mut end = ang(b);
+    if closed || end <= start + 1e-12 {
+        end += std::f64::consts::TAU;
+    }
+    Ok(crate::feature::ProfileCurve::Arc {
+        center: frame.origin,
+        axis,
+        reference: unit(x).unwrap_or(x),
+        radius,
+        start,
+        end,
+    })
+}
+
 /// The outer loop of a planar face as profile curves (lines and circular arcs only).
 fn face_profile(body: &Brep, face: usize) -> Result<Vec<crate::feature::ProfileCurve>> {
     use crate::feature::ProfileCurve;
@@ -95,26 +119,7 @@ fn face_profile(body: &Brep, face: usize) -> Result<Vec<crate::feature::ProfileC
         match &e.curve {
             Curve::Line { .. } => out.push(ProfileCurve::Line { start: a, end: b }),
             Curve::Circle { frame, radius } => {
-                let axis =
-                    unit(frame_axis(frame)).ok_or_else(|| KernelError::Argument("degenerate circle frame".into()))?;
-                let (x, y) = (frame.x_axis, frame.y_axis);
-                let ang = |p: V| {
-                    let d = sub(p, frame.origin);
-                    dot(d, y).atan2(dot(d, x))
-                };
-                let start = ang(a);
-                let mut end = ang(b);
-                if e.vertices[0] == e.vertices[1] || end <= start + 1e-12 {
-                    end += std::f64::consts::TAU;
-                }
-                out.push(ProfileCurve::Arc {
-                    center: frame.origin,
-                    axis,
-                    reference: unit(x).unwrap_or(x),
-                    radius: *radius,
-                    start,
-                    end,
-                });
+                out.push(profile_arc(frame, *radius, a, b, e.vertices[0] == e.vertices[1])?);
             }
             _ => {
                 return Err(KernelError::Argument(

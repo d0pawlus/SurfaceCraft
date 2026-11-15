@@ -232,28 +232,40 @@ fn radius_of(c: &Cut) -> f64 {
     }
 }
 
-/// Applies the blends among `cuts` (partial cylinders, cones, tori, spheres) that are still
-/// pending in `status`. With `last` unset only the cylinders are tried and failures stay pending
-/// (a later pass sees the solid with its bosses); with `last` set every blend is tried and the
-/// ones that fail get their reason.
-pub(crate) fn blend_pass(mut body: ops::Body, cuts: &[Cut], status: &mut [CutStatus], last: bool) -> Result<ops::Body> {
-    fn set(status: &mut [CutStatus], i: usize, s: CutStatus) {
-        if let Some(x) = status.get_mut(i) {
-            *x = s;
-        }
+/// Sets the status of cut `i` (nothing happens when `i` is out of range).
+fn set_status(status: &mut [CutStatus], i: usize, s: CutStatus) {
+    if let Some(x) = status.get_mut(i) {
+        *x = s;
     }
-    // --- cylinders, grouped by radius, largest first: one blend call per group, so that the
-    // kernel makes the corner patch where three rounds of one radius meet
-    let mut cyl: Vec<usize> = cuts
+}
+
+/// Is the shape a cylinder?
+fn is_cylinder(s: &Shape) -> bool {
+    matches!(s, Shape::Cylinder { .. })
+}
+
+/// Is the shape a torus?
+fn is_torus(s: &Shape) -> bool {
+    matches!(s, Shape::Torus { .. })
+}
+
+/// The partial cuts of one `kind` that are still pending, largest radius first.
+fn pending_by_radius(cuts: &[Cut], status: &[CutStatus], kind: fn(&Shape) -> bool) -> Vec<usize> {
+    let mut idx: Vec<usize> = cuts
         .iter()
         .enumerate()
-        .filter(|(i, c)| matches!(c.shape, Shape::Cylinder { .. }) && !c.full && status.get(*i).is_some_and(pending))
+        .filter(|(i, c)| kind(&c.shape) && !c.full && status.get(*i).is_some_and(pending))
         .map(|(i, _)| i)
         .collect();
-    cyl.sort_by(|&x, &y| {
+    idx.sort_by(|&x, &y| {
         let (rx, ry) = (cuts.get(x).map_or(0.0, radius_of), cuts.get(y).map_or(0.0, radius_of));
         ry.total_cmp(&rx)
     });
+    idx
+}
+
+/// Groups the cylinders `cyl` (largest radius first) into runs of nearly one radius.
+fn radius_groups(cuts: &[Cut], cyl: Vec<usize>) -> Vec<Vec<usize>> {
     let mut groups: Vec<Vec<usize>> = Vec::new();
     for i in cyl {
         let r = cuts.get(i).map_or(0.0, radius_of);
@@ -264,129 +276,178 @@ pub(crate) fn blend_pass(mut body: ops::Body, cuts: &[Cut], status: &mut [CutSta
             _ => groups.push(vec![i]),
         }
     }
-    let find = |rec: &Brep, c: &Cut| match &c.shape {
+    groups
+}
+
+/// The edge of `rec` that the cylinder cut `c` rounds (none for any other shape).
+fn find_cylinder_edge(rec: &Brep, c: &Cut) -> Option<usize> {
+    match &c.shape {
         Shape::Cylinder { point, axis, radius } => cylinder_fillet_edge(rec, *point, *axis, *radius, c.convex),
         _ => None,
-    };
-    for g in groups {
-        let rec = encode(&body)?;
-        let mut found: Vec<(usize, usize)> = Vec::new();
-        for &i in &g {
-            match cuts.get(i).and_then(|c| find(&rec, c)) {
-                Some(e) => found.push((i, e)),
-                None if last => set(
-                    status,
-                    i,
-                    CutStatus::Skipped("no edge of two planes tangent to this cylinder was found".into()),
-                ),
-                None => {}
-            }
-        }
-        if found.is_empty() {
-            continue;
-        }
-        let mut edges: Vec<usize> = found.iter().map(|f| f.1).collect();
-        edges.sort_unstable();
-        edges.dedup();
-        let mean = found.iter().map(|f| cuts.get(f.0).map_or(0.0, radius_of)).sum::<f64>() / found.len() as f64;
-        match solid::fillet(&rec, &edges, mean).and_then(|b| decode(&b)) {
-            Ok(b) => {
-                body = b;
-                for &(i, _) in &found {
-                    set(status, i, CutStatus::Applied("fillet"));
-                }
-            }
-            Err(_) => {
-                // one by one: the kernel may refuse the combination but take each round
-                for &(i, _) in &found {
-                    let Some(c) = cuts.get(i) else { continue };
-                    let rec = encode(&body)?;
-                    let Some(e) = find(&rec, c) else {
-                        set(status, i, CutStatus::Skipped("its edge was consumed by an earlier blend".into()));
-                        continue;
-                    };
-                    match solid::fillet(&rec, &[e], radius_of(c)).and_then(|b| decode(&b)) {
-                        Ok(b) => {
-                            body = b;
-                            set(status, i, CutStatus::Applied("fillet"));
-                        }
-                        Err(err) => set(status, i, CutStatus::Skipped(format!("the kernel refused the fillet: {err}"))),
-                    }
-                }
-            }
+    }
+}
+
+/// Fillets the edges of one group of cylinders in a single kernel call, so that the kernel makes
+/// the corner patch where rounds of one radius meet; falls back to one call per edge.
+fn fillet_group(
+    body: &mut ops::Body,
+    cuts: &[Cut],
+    status: &mut [CutStatus],
+    group: &[usize],
+    last: bool,
+) -> Result<()> {
+    let rec = encode(body)?;
+    let mut found: Vec<(usize, usize)> = Vec::new();
+    for &i in group {
+        match cuts.get(i).and_then(|c| find_cylinder_edge(&rec, c)) {
+            Some(e) => found.push((i, e)),
+            None if last => set_status(
+                status,
+                i,
+                CutStatus::Skipped("no edge of two planes tangent to this cylinder was found".into()),
+            ),
+            None => {}
         }
     }
-    if !last {
-        return Ok(body);
+    if found.is_empty() {
+        return Ok(());
     }
-    // --- tori: the circular fillet of a boss's base or a disc's rim, largest first
-    let mut tori: Vec<usize> = cuts
-        .iter()
-        .enumerate()
-        .filter(|(i, c)| matches!(c.shape, Shape::Torus { .. }) && !c.full && status.get(*i).is_some_and(pending))
-        .map(|(i, _)| i)
-        .collect();
-    tori.sort_by(|&x, &y| {
-        let (rx, ry) = (cuts.get(x).map_or(0.0, radius_of), cuts.get(y).map_or(0.0, radius_of));
-        ry.total_cmp(&rx)
-    });
-    for i in tori {
+    let mut edges: Vec<usize> = found.iter().map(|f| f.1).collect();
+    edges.sort_unstable();
+    edges.dedup();
+    let mean = found.iter().map(|f| cuts.get(f.0).map_or(0.0, radius_of)).sum::<f64>() / found.len() as f64;
+    match solid::fillet(&rec, &edges, mean).and_then(|b| decode(&b)) {
+        Ok(b) => {
+            *body = b;
+            for &(i, _) in &found {
+                set_status(status, i, CutStatus::Applied("fillet"));
+            }
+        }
+        Err(_) => fillet_each(body, cuts, status, &found)?,
+    }
+    Ok(())
+}
+
+/// Fillets the `found` (cut, edge) pairs one by one, each on the solid as the earlier ones left it.
+fn fillet_each(body: &mut ops::Body, cuts: &[Cut], status: &mut [CutStatus], found: &[(usize, usize)]) -> Result<()> {
+    // one by one: the kernel may refuse the combination but take each round
+    for &(i, _) in found {
         let Some(c) = cuts.get(i) else { continue };
-        let Shape::Torus { center, axis, major_radius, minor_radius } = &c.shape else { continue };
-        let rec = encode(&body)?;
-        let Some(e) = torus_edge(&rec, *center, *axis, *major_radius, *minor_radius, c.convex) else {
-            set(
-                status,
-                i,
-                CutStatus::Skipped(
-                    "no circular edge of a plane and a coaxial cylinder is tangent to this torus".into(),
-                ),
-            );
+        let rec = encode(body)?;
+        let Some(e) = find_cylinder_edge(&rec, c) else {
+            set_status(status, i, CutStatus::Skipped("its edge was consumed by an earlier blend".into()));
             continue;
         };
-        match solid::fillet(&rec, &[e], *minor_radius).and_then(|b| decode(&b)) {
+        match solid::fillet(&rec, &[e], radius_of(c)).and_then(|b| decode(&b)) {
             Ok(b) => {
-                body = b;
-                set(status, i, CutStatus::Applied("fillet (circular edge)"));
+                *body = b;
+                set_status(status, i, CutStatus::Applied("fillet"));
             }
-            Err(err) => set(status, i, CutStatus::Skipped(format!("the kernel refused the circular fillet: {err}"))),
+            Err(err) => set_status(status, i, CutStatus::Skipped(format!("the kernel refused the fillet: {err}"))),
         }
     }
-    // --- cones: a chamfer of a circular edge
+    Ok(())
+}
+
+/// The circular fillets of the pending torus cuts (a boss's base or a disc's rim), largest first.
+fn blend_tori(body: &mut ops::Body, cuts: &[Cut], status: &mut [CutStatus]) -> Result<()> {
+    for i in pending_by_radius(cuts, status, is_torus) {
+        let Some(c) = cuts.get(i) else { continue };
+        blend_torus(body, i, c, status)?;
+    }
+    Ok(())
+}
+
+/// Fillets the circular edge that the torus cut `c` (number `i`) rounds.
+fn blend_torus(body: &mut ops::Body, i: usize, c: &Cut, status: &mut [CutStatus]) -> Result<()> {
+    let Shape::Torus { center, axis, major_radius, minor_radius } = &c.shape else { return Ok(()) };
+    let rec = encode(body)?;
+    let Some(e) = torus_edge(&rec, *center, *axis, *major_radius, *minor_radius, c.convex) else {
+        set_status(
+            status,
+            i,
+            CutStatus::Skipped("no circular edge of a plane and a coaxial cylinder is tangent to this torus".into()),
+        );
+        return Ok(());
+    };
+    match solid::fillet(&rec, &[e], *minor_radius).and_then(|b| decode(&b)) {
+        Ok(b) => {
+            *body = b;
+            set_status(status, i, CutStatus::Applied("fillet (circular edge)"));
+        }
+        Err(err) => set_status(status, i, CutStatus::Skipped(format!("the kernel refused the circular fillet: {err}"))),
+    }
+    Ok(())
+}
+
+/// The chamfers of circular edges that the pending cone cuts make.
+fn blend_cones(body: &mut ops::Body, cuts: &[Cut], status: &mut [CutStatus]) -> Result<()> {
     for (i, c) in cuts.iter().enumerate() {
-        let Shape::Cone { apex, axis, half_angle } = &c.shape else { continue };
-        if c.full || !status.get(i).is_some_and(pending) {
-            continue;
-        }
-        let rec = encode(&body)?;
-        let Some((e, along, dp, dc)) = cone_chamfer_edge(&rec, *apex, *axis, *half_angle, c.convex) else {
-            set(
-                status,
-                i,
-                CutStatus::Skipped("no circular edge of a plane and a coaxial cylinder meets this cone".into()),
-            );
-            continue;
-        };
-        match solid::chamfer_sides(&rec, &[e], &[along], dp, dc).and_then(|b| decode(&b)) {
-            Ok(b) => {
-                body = b;
-                set(status, i, CutStatus::Applied("chamfer"));
-            }
-            Err(err) => set(status, i, CutStatus::Skipped(format!("the kernel refused the chamfer: {err}"))),
-        }
+        blend_cone(body, i, c, status)?;
     }
-    // --- spheres: the corner patch the kernel made where equal rounds meet
-    let rec = encode(&body)?;
+    Ok(())
+}
+
+/// Chamfers the circular edge that the cone cut `c` (number `i`) makes, if it is a pending cone.
+fn blend_cone(body: &mut ops::Body, i: usize, c: &Cut, status: &mut [CutStatus]) -> Result<()> {
+    let Shape::Cone { apex, axis, half_angle } = &c.shape else { return Ok(()) };
+    if c.full || !status.get(i).is_some_and(pending) {
+        return Ok(());
+    }
+    let rec = encode(body)?;
+    let Some((e, along, dp, dc)) = cone_chamfer_edge(&rec, *apex, *axis, *half_angle, c.convex) else {
+        set_status(
+            status,
+            i,
+            CutStatus::Skipped("no circular edge of a plane and a coaxial cylinder meets this cone".into()),
+        );
+        return Ok(());
+    };
+    match solid::chamfer_sides(&rec, &[e], &[along], dp, dc).and_then(|b| decode(&b)) {
+        Ok(b) => {
+            *body = b;
+            set_status(status, i, CutStatus::Applied("chamfer"));
+        }
+        Err(err) => set_status(status, i, CutStatus::Skipped(format!("the kernel refused the chamfer: {err}"))),
+    }
+    Ok(())
+}
+
+/// Marks the pending sphere cuts as applied where `rec` has the corner patch of equal rounds.
+fn mark_spheres(rec: &Brep, cuts: &[Cut], status: &mut [CutStatus]) {
     for (i, c) in cuts.iter().enumerate() {
         let Shape::Sphere { center, radius } = &c.shape else { continue };
         if c.full || !status.get(i).is_some_and(pending) {
             continue;
         }
-        if has_ball_face(&rec, *center, *radius) {
-            set(status, i, CutStatus::Applied("corner patch of equal rounds"));
+        if has_ball_face(rec, *center, *radius) {
+            set_status(status, i, CutStatus::Applied("corner patch of equal rounds"));
         } else {
-            set(status, i, CutStatus::Skipped("the solid has no corner patch of equal rounds at this sphere".into()));
+            set_status(
+                status,
+                i,
+                CutStatus::Skipped("the solid has no corner patch of equal rounds at this sphere".into()),
+            );
         }
     }
+}
+
+/// Applies the blends among `cuts` (partial cylinders, cones, tori, spheres) that are still
+/// pending in `status`. With `last` unset only the cylinders are tried and failures stay pending
+/// (a later pass sees the solid with its bosses); with `last` set every blend is tried and the
+/// ones that fail get their reason.
+pub(crate) fn blend_pass(mut body: ops::Body, cuts: &[Cut], status: &mut [CutStatus], last: bool) -> Result<ops::Body> {
+    // cylinders, grouped by radius, largest first: one blend call per group
+    let cyl = pending_by_radius(cuts, status, is_cylinder);
+    for g in radius_groups(cuts, cyl) {
+        fillet_group(&mut body, cuts, status, &g, last)?;
+    }
+    if !last {
+        return Ok(body);
+    }
+    blend_tori(&mut body, cuts, status)?;
+    blend_cones(&mut body, cuts, status)?;
+    // spheres: the corner patch the kernel made where equal rounds meet
+    mark_spheres(&encode(&body)?, cuts, status);
     Ok(body)
 }

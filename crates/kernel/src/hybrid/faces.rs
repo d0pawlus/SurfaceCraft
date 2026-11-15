@@ -85,59 +85,73 @@ pub(crate) fn axis_distance(p: V, point: V, axis: V) -> f64 {
     norm(sub(d, scale(axis, dot(d, axis))))
 }
 
+/// Is a cylindrical surface (`frame`, `radius`) the cylinder about the axis through `point` along
+/// `axis` of radius `r`, within `tol`?
+fn cylinder_matches(frame: &Frame, radius: f64, point: V, axis: V, r: f64, tol: f64) -> bool {
+    unit(frame_axis(frame)).is_some_and(|a| dot(a, axis).abs() > 0.999)
+        && (radius - r).abs() < tol
+        && axis_distance(frame.origin, point, axis) < tol
+}
+
+/// Does the analytic `surface` (plane, cylinder, cone, sphere, corner patch, torus) lie on `shape`,
+/// within `tol`? Any other pairing is false.
+fn analytic_on_shape(surface: &Surface, shape: &Shape, tol: f64) -> bool {
+    match (surface, shape) {
+        (Surface::Plane { origin, u_axis, v_axis }, Shape::Plane { point, normal }) => unit(cross(*u_axis, *v_axis))
+            .is_some_and(|n| dot(n, *normal).abs() > 0.999 && dot(sub(*point, *origin), n).abs() < tol),
+        (Surface::Cylinder { frame, radius }, Shape::Cylinder { point, axis, radius: r }) => {
+            cylinder_matches(frame, *radius, *point, *axis, *r, tol)
+        }
+        // a blend's cylinder comes back as a cone of half angle zero (SMLib's own form)
+        (Surface::Cone { frame, radius_at_origin, half_angle }, Shape::Cylinder { point, axis, radius: r })
+            if half_angle.abs() < 1e-9 =>
+        {
+            cylinder_matches(frame, *radius_at_origin, *point, *axis, *r, tol)
+        }
+        (Surface::Cone { frame, half_angle, .. }, Shape::Cone { apex, axis, half_angle: h }) => {
+            unit(frame_axis(frame)).is_some_and(|a| dot(a, *axis).abs() > 0.999)
+                && (half_angle.abs() - h).abs() < 0.02
+                && axis_distance(frame.origin, *apex, *axis) < tol
+        }
+        (Surface::Sphere { frame, radius }, Shape::Sphere { center, radius: r }) => {
+            (radius - r).abs() < tol && norm(sub(frame.origin, *center)) < tol
+        }
+        // the corner of three equal rounds
+        (Surface::BallPatch { center: c, radius }, Shape::Sphere { center, radius: r }) => {
+            (radius - r).abs() < tol && norm(sub(*c, *center)) < tol
+        }
+        (
+            Surface::Torus { frame, major_radius, minor_radius, .. },
+            Shape::Torus { center, axis, major_radius: mr, minor_radius: nr },
+        ) => {
+            unit(frame_axis(frame)).is_some_and(|a| dot(a, *axis).abs() > 0.999)
+                && (major_radius - mr).abs() < tol
+                && (minor_radius - nr).abs() < tol
+                && norm(sub(frame.origin, *center)) < tol
+        }
+        _ => false,
+    }
+}
+
+/// Does face `i` of `body`, on `surface`, lie on `shape` (same surface type, parameters within `tol`)?
+fn face_on_shape(body: &Brep, i: usize, surface: &Surface, shape: &Shape, tol: f64) -> bool {
+    match (surface, shape) {
+        // a sweep of an arc (a pocket's rounded corner) or a revolve (a hole's wall, a drill
+        // point) comes back as a rational spline: it is on the shape when its corners are
+        (
+            Surface::Spline { .. } | Surface::RationalSpline { .. },
+            Shape::Cylinder { .. } | Shape::Cone { .. } | Shape::Torus { .. },
+        ) => spline_face_on_revolved(body, i, shape, tol),
+        _ => analytic_on_shape(surface, shape, tol),
+    }
+}
+
 /// The faces of `body` that lie on `shape` (same surface type, parameters within `tol`).
 #[must_use]
 pub fn faces_on_shape(body: &Brep, shape: &Shape, tol: f64) -> Vec<usize> {
     let mut out = Vec::new();
     for (i, f) in body.faces.iter().enumerate() {
-        let hit = match (&f.surface, shape) {
-            (Surface::Plane { origin, u_axis, v_axis }, Shape::Plane { point, normal }) => {
-                unit(cross(*u_axis, *v_axis))
-                    .is_some_and(|n| dot(n, *normal).abs() > 0.999 && dot(sub(*point, *origin), n).abs() < tol)
-            }
-            (Surface::Cylinder { frame, radius }, Shape::Cylinder { point, axis, radius: r }) => {
-                unit(frame_axis(frame)).is_some_and(|a| dot(a, *axis).abs() > 0.999)
-                    && (radius - r).abs() < tol
-                    && axis_distance(frame.origin, *point, *axis) < tol
-            }
-            // a blend's cylinder comes back as a cone of half angle zero (SMLib's own form)
-            (Surface::Cone { frame, radius_at_origin, half_angle }, Shape::Cylinder { point, axis, radius: r })
-                if half_angle.abs() < 1e-9 =>
-            {
-                unit(frame_axis(frame)).is_some_and(|a| dot(a, *axis).abs() > 0.999)
-                    && (radius_at_origin - r).abs() < tol
-                    && axis_distance(frame.origin, *point, *axis) < tol
-            }
-            (Surface::Cone { frame, half_angle, .. }, Shape::Cone { apex, axis, half_angle: h }) => {
-                unit(frame_axis(frame)).is_some_and(|a| dot(a, *axis).abs() > 0.999)
-                    && (half_angle.abs() - h).abs() < 0.02
-                    && axis_distance(frame.origin, *apex, *axis) < tol
-            }
-            (Surface::Sphere { frame, radius }, Shape::Sphere { center, radius: r }) => {
-                (radius - r).abs() < tol && norm(sub(frame.origin, *center)) < tol
-            }
-            // the corner of three equal rounds
-            (Surface::BallPatch { center: c, radius }, Shape::Sphere { center, radius: r }) => {
-                (radius - r).abs() < tol && norm(sub(*c, *center)) < tol
-            }
-            (
-                Surface::Torus { frame, major_radius, minor_radius, .. },
-                Shape::Torus { center, axis, major_radius: mr, minor_radius: nr },
-            ) => {
-                unit(frame_axis(frame)).is_some_and(|a| dot(a, *axis).abs() > 0.999)
-                    && (major_radius - mr).abs() < tol
-                    && (minor_radius - nr).abs() < tol
-                    && norm(sub(frame.origin, *center)) < tol
-            }
-            // a sweep of an arc (a pocket's rounded corner) or a revolve (a hole's wall, a drill
-            // point) comes back as a rational spline: it is on the shape when its corners are
-            (
-                Surface::Spline { .. } | Surface::RationalSpline { .. },
-                Shape::Cylinder { .. } | Shape::Cone { .. } | Shape::Torus { .. },
-            ) => spline_face_on_revolved(body, i, shape, tol),
-            _ => false,
-        };
-        if hit {
+        if face_on_shape(body, i, &f.surface, shape, tol) {
             out.push(i);
         }
     }

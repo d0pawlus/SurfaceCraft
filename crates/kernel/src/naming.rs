@@ -48,6 +48,53 @@ fn axis_of(f: &crate::record::brep::Frame) -> V3 {
     unit(cross(f.x_axis, f.y_axis))
 }
 
+/// What a surface says about a face signature: the kind, the signed normal (or axis) and the axis
+/// (a point, a direction) when the surface is one of revolution.
+type SurfaceInfo = (&'static str, V3, Option<(V3, V3)>);
+
+/// The kind, normal and axis of `surface` for a face used forward (`fwd`) or reversed.
+fn surface_info(surface: &Surface, fwd: bool) -> SurfaceInfo {
+    match surface {
+        Surface::Plane { u_axis, v_axis, .. } => {
+            let n = unit(cross(*u_axis, *v_axis));
+            ("plane", if fwd { n } else { [-n[0], -n[1], -n[2]] }, None)
+        }
+        Surface::PlaneThrough { origin, u_point, v_point } => {
+            let n = unit(cross(sub(*u_point, *origin), sub(*v_point, *origin)));
+            ("plane", if fwd { n } else { [-n[0], -n[1], -n[2]] }, None)
+        }
+        Surface::Cylinder { frame, .. } => ("cylinder", axis_of(frame), Some((frame.origin, axis_of(frame)))),
+        Surface::Cone { frame, .. } => ("cone", axis_of(frame), Some((frame.origin, axis_of(frame)))),
+        Surface::Torus { frame, .. } => ("torus", axis_of(frame), Some((frame.origin, axis_of(frame)))),
+        Surface::Sphere { frame, .. } => ("sphere", [0.0; 3], Some((frame.origin, [0.0; 3]))),
+        Surface::BallPatch { center, .. } => ("sphere", [0.0; 3], Some((*center, [0.0; 3]))),
+        Surface::PlacedRevolution { origin, axis, .. } => ("revolution", unit(*axis), Some((*origin, unit(*axis)))),
+        Surface::Spline { .. } | Surface::RationalSpline { .. } => ("spline", [0.0; 3], None),
+    }
+}
+
+/// The mean of `pts` (the origin for none).
+fn mean_point(pts: &[V3]) -> V3 {
+    let n = pts.len().max(1) as f64;
+    let mut c = [0.0; 3];
+    for p in pts {
+        for k in 0..3 {
+            c[k] += p[k] / n;
+        }
+    }
+    c
+}
+
+/// `c` projected onto the axis through `o` along `d` (just `o` when `d` is no direction).
+fn project_to_axis(c: V3, o: V3, d: V3) -> V3 {
+    if norm(d) > 0.5 {
+        let t = dot(sub(c, o), d);
+        [o[0] + d[0] * t, o[1] + d[1] * t, o[2] + d[2] * t]
+    } else {
+        o
+    }
+}
+
 /// The geometric signature of a face (positions normalised to the body's bounding box).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FaceSig {
@@ -140,28 +187,9 @@ impl<'a> Ctx<'a> {
         Some(mid(p0, p1))
     }
 
-    fn face_sig(&self, f: usize) -> Option<FaceSig> {
-        let face = self.b.faces.get(f)?;
-        let fwd = self.forward.get(f).copied().unwrap_or(true);
-        // (kind, signed normal, axis (point, direction) if the surface is one of revolution)
-        let (kind, normal, axis): (&str, V3, Option<(V3, V3)>) = match &face.surface {
-            Surface::Plane { u_axis, v_axis, .. } => {
-                let n = unit(cross(*u_axis, *v_axis));
-                ("plane", if fwd { n } else { [-n[0], -n[1], -n[2]] }, None)
-            }
-            Surface::PlaneThrough { origin, u_point, v_point } => {
-                let n = unit(cross(sub(*u_point, *origin), sub(*v_point, *origin)));
-                ("plane", if fwd { n } else { [-n[0], -n[1], -n[2]] }, None)
-            }
-            Surface::Cylinder { frame, .. } => ("cylinder", axis_of(frame), Some((frame.origin, axis_of(frame)))),
-            Surface::Cone { frame, .. } => ("cone", axis_of(frame), Some((frame.origin, axis_of(frame)))),
-            Surface::Torus { frame, .. } => ("torus", axis_of(frame), Some((frame.origin, axis_of(frame)))),
-            Surface::Sphere { frame, .. } => ("sphere", [0.0; 3], Some((frame.origin, [0.0; 3]))),
-            Surface::BallPatch { center, .. } => ("sphere", [0.0; 3], Some((*center, [0.0; 3]))),
-            Surface::PlacedRevolution { origin, axis, .. } => ("revolution", unit(*axis), Some((*origin, unit(*axis)))),
-            Surface::Spline { .. } | Surface::RationalSpline { .. } => ("spline", [0.0; 3], None),
-        };
-        // centroid: mean of the distinct edges of the outer loop
+    /// The midpoints of the distinct edges of the outer loop of `face` (every vertex of the body when
+    /// it has no loop).
+    fn face_points(&self, face: &crate::record::brep::Face) -> Vec<V3> {
         let mut pts: Vec<V3> = Vec::new();
         if let Some(Loop::Edges { edges }) = face.loops.first() {
             let mut seen: Vec<u32> = Vec::new();
@@ -180,20 +208,17 @@ impl<'a> Ctx<'a> {
                 pts.push(v.point);
             }
         }
-        let n = pts.len().max(1) as f64;
-        let mut c = [0.0; 3];
-        for p in &pts {
-            for k in 0..3 {
-                c[k] += p[k] / n;
-            }
-        }
+        pts
+    }
+
+    fn face_sig(&self, f: usize) -> Option<FaceSig> {
+        let face = self.b.faces.get(f)?;
+        let fwd = self.forward.get(f).copied().unwrap_or(true);
+        let (kind, normal, axis) = surface_info(&face.surface, fwd);
+        // centroid: mean of the distinct edges of the outer loop
+        let mut c = mean_point(&self.face_points(face));
         if let Some((o, d)) = axis {
-            c = if norm(d) > 0.5 {
-                let t = dot(sub(c, o), d);
-                [o[0] + d[0] * t, o[1] + d[1] * t, o[2] + d[2] * t]
-            } else {
-                o
-            };
+            c = project_to_axis(c, o, d);
         }
         Some(FaceSig { kind: kind.to_string(), normal, centroid: self.norm_pt(c) })
     }

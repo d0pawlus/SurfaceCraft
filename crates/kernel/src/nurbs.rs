@@ -18,8 +18,10 @@ use solidcore::surface::surface::{Surface as KSurface, SurfaceKind};
 mod bezier_volume;
 mod network_check;
 mod orientation;
+mod sheet;
 mod trim;
 pub use network_check::MAX_NETWORK_PATCHES;
+use sheet::{boundary_curves, boundary_edges, corner_vertices, sheet_record};
 pub use trim::{MAX_OUTLINE_CORNERS, trimmed_sheet};
 
 /// Largest control net accepted (per direction).
@@ -170,59 +172,11 @@ fn line2(a: [f64; 2], b: [f64; 2], t0: f64, t1: f64) -> Curve2 {
 /// iso-curves (exact: a clamped B-spline's boundary curves are its outer control rows).
 pub fn sheet_from_spline(s: &Surface) -> Result<Brep> {
     let (u, v, points) = spline_parts(s)?;
-    let [[u0, u1], [v0, v1]] = domain(s)?;
-    let nu = points.len();
-    let nv = points.first().map_or(0, Vec::len);
-    let row = |j: usize| -> Vec<[f64; 3]> { points.iter().filter_map(|r| r.get(j).copied()).collect() };
-    let col = |i: usize| -> Vec<[f64; 3]> { points.get(i).cloned().unwrap_or_default() };
-    // edges: bottom v=v0 (u), right u=u1 (v), top v=v1 (u), left u=u0 (v)
-    let curves = [
-        Curve::Spline { knots: u.to_vec(), points: row(0) },
-        Curve::Spline { knots: v.to_vec(), points: col(nu - 1) },
-        Curve::Spline { knots: u.to_vec(), points: row(nv - 1) },
-        Curve::Spline { knots: v.to_vec(), points: col(0) },
-    ];
-    let probe = SurfaceProbe::new(s)?;
-    let corners = [probe.eval(u0, v0)?, probe.eval(u1, v0)?, probe.eval(u1, v1)?, probe.eval(u0, v1)?];
-    let vertices: Vec<Vertex> = corners.iter().map(|c| Vertex { point: *c, tolerance: 1e-7 }).collect();
-    // vertex indices [start, end] of each edge on its own parameter
-    let ends: [[u32; 2]; 4] = [[0, 1], [1, 2], [3, 2], [0, 3]];
-    let intervals = [[u0, u1], [v0, v1], [u0, u1], [v0, v1]];
-    // the outer loop runs counter-clockwise in (u, v): bottom →, right ↑, top ←, left ↓
-    let forward = [true, true, false, false];
-    let pcurves = [
-        line2([u0, v0], [u1, v0], u0, u1),
-        line2([u1, v0], [u1, v1], v0, v1),
-        line2([u0, v1], [u1, v1], u0, u1),
-        line2([u0, v0], [u0, v1], v0, v1),
-    ];
-    let mut edges = Vec::with_capacity(4);
-    let mut loop_edges = Vec::with_capacity(4);
-    for k in 0..4 {
-        edges.push(Edge {
-            curve: curves[k].clone(),
-            nurbs: None,
-            interval: intervals[k],
-            vertices: ends[k],
-            tolerance: 1e-7,
-            uses: vec![EdgeUseRef { face: 0, r#loop: 0, position: k as u32, upper: !forward[k] }],
-        });
-        loop_edges.push(OrientedEdge { edge: k as u32, forward: forward[k], pcurve: pcurves[k].clone() });
-    }
-    let brep = Brep {
-        version: crate::record::brep::VERSION,
-        tolerance: 1e-6,
-        regions: vec![Region { shells: vec![0], void: false }],
-        shells: vec![Shell::Faces { faces: vec![OrientedFace { face: 0, forward: true }], wires: vec![] }],
-        faces: vec![Face {
-            surface: s.clone(),
-            nurbs: None,
-            domain: [[u0, u1], [v0, v1]],
-            loops: vec![Loop::Edges { edges: loop_edges }],
-        }],
-        edges,
-        vertices,
-    };
+    let dom = domain(s)?;
+    let curves = boundary_curves(u, v, points);
+    let vertices = corner_vertices(s, dom)?;
+    let (edges, loop_edges) = boundary_edges(&curves, dom);
+    let brep = sheet_record(s, dom, edges, loop_edges, vertices);
     brep.validate().map_err(|e| op_err("record validate", e))?;
     // the kernel must accept it as a body
     solidcore_ops::Body::from_record(&brep, false).map_err(|e| op_err("from_record", e))?;

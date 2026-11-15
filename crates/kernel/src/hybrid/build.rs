@@ -38,6 +38,37 @@ pub fn solid_from_plan(
     tools: &[crate::local::LocalTool],
     adds: &[crate::local::LocalAdd],
 ) -> Result<Built> {
+    check_plan(lo, hi, cuts, free, tools, adds)?;
+    let half = 4.0 * norm(sub(hi, lo)).max(1.0);
+    let body = ops::make_box(lo, sub(hi, lo)).map_err(|e| op_err("make_box", e))?;
+    let mut status: Vec<CutStatus> = vec![CutStatus::Skipped("not applied".into()); cuts.len()];
+    // 1. planes
+    let body = apply_planes(body, cuts, &mut status, half)?;
+    // 2. fillets of the edges the planes make (rounds that need a boss or a pocket wait)
+    let body = crate::blends::blend_pass(body, cuts, &mut status, false)?;
+    // 3. full-revolution shapes
+    let body = apply_revolutions(body, cuts, &mut status, lo, hi)?;
+    // 3b. local tools: blind holes, pockets, slots
+    let (body, tstatus) = subtract_tools(body, tools, lo, hi);
+    // 3c. local additions: bosses and domes
+    let (body, astatus) = unite_adds(body, adds);
+    // 3d. the remaining blends: rounds and chamfers of the edges the pockets and bosses made
+    let body = crate::blends::blend_pass(body, cuts, &mut status, true)?;
+    // 4. freeform tools
+    let (body, fstatus) = cut_free(body, free)?;
+    check_closed_solid(&body)?;
+    Ok(Built { brep: encode(&body)?, primitives: status, freeform: fstatus, tools: tstatus, adds: astatus })
+}
+
+/// Refuses stock bounds, cuts or local tools the build cannot start from.
+fn check_plan(
+    lo: V,
+    hi: V,
+    cuts: &[Cut],
+    free: &[FreeCut],
+    tools: &[crate::local::LocalTool],
+    adds: &[crate::local::LocalAdd],
+) -> Result<()> {
     if !finite_all(&lo) || !finite_all(&hi) || (0..3).any(|i| hi[i] <= lo[i]) {
         return Err(KernelError::Argument("stock bounds must be finite with hi > lo".into()));
     }
@@ -50,11 +81,11 @@ pub fn solid_from_plan(
     if tools.len() > 256 || adds.len() > 256 {
         return Err(KernelError::Argument("at most 256 local tools".into()));
     }
-    let half = 4.0 * norm(sub(hi, lo)).max(1.0);
-    let stock = ops::make_box(lo, sub(hi, lo)).map_err(|e| op_err("make_box", e))?;
-    let mut body = stock;
-    let mut status: Vec<CutStatus> = vec![CutStatus::Skipped("not applied".into()); cuts.len()];
-    // 1. planes
+    Ok(())
+}
+
+/// Cuts the stock by every plane among `cuts`, in order.
+fn apply_planes(mut body: ops::Body, cuts: &[Cut], status: &mut [CutStatus], half: f64) -> Result<ops::Body> {
     for (i, c) in cuts.iter().enumerate() {
         if let Shape::Plane { point, normal } = &c.shape {
             let n = unit(*normal).ok_or_else(|| KernelError::Argument("plane normal is zero".into()))?;
@@ -64,9 +95,11 @@ pub fn solid_from_plan(
             }
         }
     }
-    // 2. fillets of the edges the planes make (rounds that need a boss or a pocket wait)
-    body = crate::blends::blend_pass(body, cuts, &mut status, false)?;
-    // 3. full-revolution shapes
+    Ok(body)
+}
+
+/// Intersects or subtracts the full-revolution shapes among `cuts`; partial ones wait for the blends.
+fn apply_revolutions(mut body: ops::Body, cuts: &[Cut], status: &mut [CutStatus], lo: V, hi: V) -> Result<ops::Body> {
     for (i, c) in cuts.iter().enumerate() {
         match &c.shape {
             Shape::Plane { .. } => continue,
@@ -92,36 +125,52 @@ pub fn solid_from_plan(
             *s = CutStatus::Applied(how);
         }
     }
-    // 3b. local tools: blind holes, pockets, slots
+    Ok(body)
+}
+
+/// The cut status that stands for the outcome of a local tool or addition.
+fn local_status(r: Result<crate::local::Applied>) -> CutStatus {
+    match r {
+        Ok(crate::local::Applied::Done(how)) => CutStatus::Applied(how),
+        Ok(crate::local::Applied::Partly(why)) => CutStatus::Skipped(why),
+        Err(e) => CutStatus::Skipped(e.to_string()),
+    }
+}
+
+/// Subtracts the local tools (blind holes, pockets, slots) in order, with the status of each.
+fn subtract_tools(mut body: ops::Body, tools: &[crate::local::LocalTool], lo: V, hi: V) -> (ops::Body, Vec<CutStatus>) {
     let mut tstatus = Vec::with_capacity(tools.len());
     for t in tools {
         let (b, r) = crate::local::subtract_tool(body, t, lo, hi);
         body = b;
-        tstatus.push(match r {
-            Ok(crate::local::Applied::Done(how)) => CutStatus::Applied(how),
-            Ok(crate::local::Applied::Partly(why)) => CutStatus::Skipped(why),
-            Err(e) => CutStatus::Skipped(e.to_string()),
-        });
+        tstatus.push(local_status(r));
     }
-    // 3c. local additions: bosses and domes
+    (body, tstatus)
+}
+
+/// Unites the local additions (bosses, domes) in order, with the status of each.
+fn unite_adds(mut body: ops::Body, adds: &[crate::local::LocalAdd]) -> (ops::Body, Vec<CutStatus>) {
     let mut astatus = Vec::with_capacity(adds.len());
     for t in adds {
         let (b, r) = crate::local::unite_add(body, t);
         body = b;
-        astatus.push(match r {
-            Ok(crate::local::Applied::Done(how)) => CutStatus::Applied(how),
-            Ok(crate::local::Applied::Partly(why)) => CutStatus::Skipped(why),
-            Err(e) => CutStatus::Skipped(e.to_string()),
-        });
+        astatus.push(local_status(r));
     }
-    // 3d. the remaining blends: rounds and chamfers of the edges the pockets and bosses made
-    body = crate::blends::blend_pass(body, cuts, &mut status, true)?;
-    // 4. freeform tools
+    (body, astatus)
+}
+
+/// Splits the body by each freeform tool in order, with the status of each.
+fn cut_free(mut body: ops::Body, free: &[FreeCut]) -> Result<(ops::Body, Vec<CutStatus>)> {
     let mut fstatus = Vec::with_capacity(free.len());
     for f in free {
         body = cut_by_spline_body(&body, &f.surface, f.outward)?;
         fstatus.push(CutStatus::Applied("split"));
     }
+    Ok((body, fstatus))
+}
+
+/// Verifies that the body is one closed manifold solid.
+fn check_closed_solid(body: &ops::Body) -> Result<()> {
     if !body.is_manifold_solid().map_err(|e| op_err("is_manifold_solid", e))? {
         return Err(KernelError::Op {
             op: "solid_from_cuts",
@@ -135,5 +184,5 @@ pub fn solid_from_plan(
             message: format!("the result has {n} solids, expected 1"),
         });
     }
-    Ok(Built { brep: encode(&body)?, primitives: status, freeform: fstatus, tools: tstatus, adds: astatus })
+    Ok(())
 }

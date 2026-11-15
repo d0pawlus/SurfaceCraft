@@ -331,6 +331,101 @@ fn oriented(body: &Brep) -> Vec<bool> {
     forward
 }
 
+/// The result of reading one face as an analytic shape: the shape, or why it is none.
+type ShapeResult = std::result::Result<FaceShape, String>;
+
+/// `n` as the outward normal of a face: flipped when the face is used reversed.
+fn flip(n: V, fwd: bool) -> V {
+    if fwd { n } else { scale(n, -1.0) }
+}
+
+/// A plane through `origin` with the unit `normal` (none when degenerate), oriented by `fwd`.
+fn plane_shape(normal: Option<V>, origin: V, fwd: bool) -> ShapeResult {
+    normal
+        .filter(|_| finite_all(&origin))
+        .map(|n| FaceShape::Plane { point: origin, normal: flip(n, fwd) })
+        .ok_or_else(|| "degenerate plane".to_string())
+}
+
+/// A cylinder face of `frame` and `radius`, convex when `fwd`.
+fn cylinder_shape(frame: &Frame, radius: f64, fwd: bool) -> ShapeResult {
+    frame_axis(frame)
+        .filter(|_| radius.is_finite() && radius > 0.0 && finite_all(&frame.origin))
+        .map(|axis| FaceShape::Cylinder { point: frame.origin, axis, radius, convex: fwd })
+        .ok_or_else(|| "degenerate cylinder".to_string())
+}
+
+/// A cone face (or the cylinder of a blend, a cone of half angle zero), convex when `fwd`.
+fn cone_shape(frame: &Frame, radius_at_origin: f64, half_angle: f64, fwd: bool) -> ShapeResult {
+    let a = half_angle.abs();
+    match frame_axis(frame) {
+        Some(z) if a.is_finite() && finite_all(&frame.origin) && radius_at_origin.is_finite() => {
+            if a < 1e-9 {
+                // a blend's cylinder comes back as a cone of half angle zero
+                if radius_at_origin > 0.0 {
+                    Ok(FaceShape::Cylinder { point: frame.origin, axis: z, radius: radius_at_origin, convex: fwd })
+                } else {
+                    Err("degenerate cone".to_string())
+                }
+            } else if a < std::f64::consts::FRAC_PI_2 - 1e-6 {
+                // r(v) = r0 + v tan(h): the apex is at v = −r0 / tan(h); it widens along +z
+                // for a positive half angle, along −z for a negative one
+                let v0 = -radius_at_origin / half_angle.tan();
+                let apex = add(frame.origin, scale(z, v0));
+                let axis = if half_angle > 0.0 { z } else { scale(z, -1.0) };
+                Ok(FaceShape::Cone { apex, axis, half_angle: a, convex: fwd })
+            } else {
+                Err("a cone this wide is a plane".to_string())
+            }
+        }
+        _ => Err("degenerate cone".to_string()),
+    }
+}
+
+/// A sphere face of `frame` and `radius`, convex when `fwd`.
+fn sphere_shape(frame: &Frame, radius: f64, fwd: bool) -> ShapeResult {
+    if radius.is_finite() && radius > 0.0 && finite_all(&frame.origin) {
+        Ok(FaceShape::Sphere { center: frame.origin, radius, convex: fwd })
+    } else {
+        Err("degenerate sphere".to_string())
+    }
+}
+
+/// A ring torus face of `frame` and the two radii, convex when `fwd`.
+fn torus_shape(frame: &Frame, major_radius: f64, minor_radius: f64, fwd: bool) -> ShapeResult {
+    frame_axis(frame)
+        .filter(|_| {
+            major_radius.is_finite()
+                && minor_radius.is_finite()
+                && minor_radius > 0.0
+                && major_radius > minor_radius
+                && finite_all(&frame.origin)
+        })
+        .map(|axis| FaceShape::Torus { center: frame.origin, axis, major_radius, minor_radius, convex: fwd })
+        .ok_or_else(|| "degenerate torus".to_string())
+}
+
+/// The oriented analytic shape of one surface (`fwd`: the face uses it forward), or why it is none.
+fn surface_shape(surface: &Surface, fwd: bool) -> ShapeResult {
+    match surface {
+        Surface::Plane { origin, u_axis, v_axis } => plane_shape(unit(cross(*u_axis, *v_axis)), *origin, fwd),
+        Surface::PlaneThrough { origin, u_point, v_point } => {
+            plane_shape(unit(cross(sub(*u_point, *origin), sub(*v_point, *origin))), *origin, fwd)
+        }
+        Surface::Cylinder { frame, radius } => cylinder_shape(frame, *radius, fwd),
+        Surface::Cone { frame, radius_at_origin, half_angle } => cone_shape(frame, *radius_at_origin, *half_angle, fwd),
+        Surface::Sphere { frame, radius } => sphere_shape(frame, *radius, fwd),
+        Surface::Torus { frame, major_radius, minor_radius, .. } => {
+            torus_shape(frame, *major_radius, *minor_radius, fwd)
+        }
+        Surface::BallPatch { .. } => Err("a corner patch of three rounds is not an analytic face".to_string()),
+        Surface::Spline { .. } | Surface::RationalSpline { .. } => {
+            Err("a freeform (spline) surface has no analytic parameters".to_string())
+        }
+        Surface::PlacedRevolution { .. } => Err("a swept profile is a freeform surface".to_string()),
+    }
+}
+
 /// The oriented analytic shape of every face of `body`, or the reason a face is not one (a
 /// freeform surface, a corner patch, a swept profile, values that are not finite). A bounded
 /// number of faces only: more than [`MAX_FACES`] is an error.
@@ -342,82 +437,7 @@ pub fn face_shapes(body: &Brep) -> Result<Vec<std::result::Result<FaceShape, Str
     let mut out = Vec::with_capacity(body.faces.len());
     for (i, f) in body.faces.iter().enumerate() {
         let fwd = forward.get(i).copied().unwrap_or(true);
-        let flip = |n: V| if fwd { n } else { scale(n, -1.0) };
-        let shape = match &f.surface {
-            Surface::Plane { origin, u_axis, v_axis } => unit(cross(*u_axis, *v_axis))
-                .filter(|_| finite_all(origin))
-                .map(|n| FaceShape::Plane { point: *origin, normal: flip(n) })
-                .ok_or_else(|| "degenerate plane".to_string()),
-            Surface::PlaneThrough { origin, u_point, v_point } => {
-                unit(cross(sub(*u_point, *origin), sub(*v_point, *origin)))
-                    .filter(|_| finite_all(origin))
-                    .map(|n| FaceShape::Plane { point: *origin, normal: flip(n) })
-                    .ok_or_else(|| "degenerate plane".to_string())
-            }
-            Surface::Cylinder { frame, radius } => frame_axis(frame)
-                .filter(|_| radius.is_finite() && *radius > 0.0 && finite_all(&frame.origin))
-                .map(|axis| FaceShape::Cylinder { point: frame.origin, axis, radius: *radius, convex: fwd })
-                .ok_or_else(|| "degenerate cylinder".to_string()),
-            Surface::Cone { frame, radius_at_origin, half_angle } => {
-                let a = half_angle.abs();
-                match frame_axis(frame) {
-                    Some(z) if a.is_finite() && finite_all(&frame.origin) && radius_at_origin.is_finite() => {
-                        if a < 1e-9 {
-                            // a blend's cylinder comes back as a cone of half angle zero
-                            if *radius_at_origin > 0.0 {
-                                Ok(FaceShape::Cylinder {
-                                    point: frame.origin,
-                                    axis: z,
-                                    radius: *radius_at_origin,
-                                    convex: fwd,
-                                })
-                            } else {
-                                Err("degenerate cone".to_string())
-                            }
-                        } else if a < std::f64::consts::FRAC_PI_2 - 1e-6 {
-                            // r(v) = r0 + v tan(h): the apex is at v = −r0 / tan(h); it widens along +z
-                            // for a positive half angle, along −z for a negative one
-                            let v0 = -radius_at_origin / half_angle.tan();
-                            let apex = add(frame.origin, scale(z, v0));
-                            let axis = if *half_angle > 0.0 { z } else { scale(z, -1.0) };
-                            Ok(FaceShape::Cone { apex, axis, half_angle: a, convex: fwd })
-                        } else {
-                            Err("a cone this wide is a plane".to_string())
-                        }
-                    }
-                    _ => Err("degenerate cone".to_string()),
-                }
-            }
-            Surface::Sphere { frame, radius } => {
-                if radius.is_finite() && *radius > 0.0 && finite_all(&frame.origin) {
-                    Ok(FaceShape::Sphere { center: frame.origin, radius: *radius, convex: fwd })
-                } else {
-                    Err("degenerate sphere".to_string())
-                }
-            }
-            Surface::Torus { frame, major_radius, minor_radius, .. } => frame_axis(frame)
-                .filter(|_| {
-                    major_radius.is_finite()
-                        && minor_radius.is_finite()
-                        && *minor_radius > 0.0
-                        && major_radius > minor_radius
-                        && finite_all(&frame.origin)
-                })
-                .map(|axis| FaceShape::Torus {
-                    center: frame.origin,
-                    axis,
-                    major_radius: *major_radius,
-                    minor_radius: *minor_radius,
-                    convex: fwd,
-                })
-                .ok_or_else(|| "degenerate torus".to_string()),
-            Surface::BallPatch { .. } => Err("a corner patch of three rounds is not an analytic face".to_string()),
-            Surface::Spline { .. } | Surface::RationalSpline { .. } => {
-                Err("a freeform (spline) surface has no analytic parameters".to_string())
-            }
-            Surface::PlacedRevolution { .. } => Err("a swept profile is a freeform surface".to_string()),
-        };
-        out.push(shape);
+        out.push(surface_shape(&f.surface, fwd));
     }
     Ok(out)
 }
@@ -499,6 +519,67 @@ fn find_faces(body: &Brep, want: &FaceShape) -> Vec<usize> {
     }
 }
 
+/// A move that was not applied, with the reason.
+fn failed(msg: String) -> MoveOutcome {
+    MoveOutcome { applied: false, message: Some(msg) }
+}
+
+/// The faces a move acts on: the given indices until something has moved, then the faces of the
+/// running result `current` that lie on the original surface `shape` (the reason when they are
+/// not all found again).
+fn faces_to_move(current: Option<&Brep>, shape: &FaceShape, m: &FaceMove) -> std::result::Result<Vec<usize>, String> {
+    let Some(rec) = current else { return Ok(m.faces.clone()) };
+    let found = find_faces(rec, shape);
+    if found.len() != m.faces.len() {
+        return Err(format!(
+            "the face cannot be found again after earlier moves ({} found, {} expected)",
+            found.len(),
+            m.faces.len()
+        ));
+    }
+    Ok(found)
+}
+
+/// The running state of [`offset_face_groups`]: the shapes of the original faces, the kernel body
+/// with its record order, and the record of the last applied move.
+struct FaceMover {
+    shapes: Vec<std::result::Result<FaceShape, String>>,
+    kb: ops::Body,
+    order: ops::Order,
+    current: Option<Brep>,
+}
+
+impl FaceMover {
+    /// Runs one move on the kernel body; an error only when the kernel's record cannot be read back.
+    fn apply(&mut self, m: &FaceMove) -> Result<MoveOutcome> {
+        if !m.distance.is_finite() || m.distance == 0.0 || m.faces.is_empty() {
+            return Ok(failed("the distance must be finite and not zero".into()));
+        }
+        let Some(first) = m.faces.first().and_then(|&f| self.shapes.get(f)) else {
+            return Ok(failed("face out of range".into()));
+        };
+        let shape = match first {
+            Ok(s) => s,
+            Err(reason) => return Ok(failed(reason.clone())),
+        };
+        let indices = match faces_to_move(self.current.as_ref(), shape, m) {
+            Ok(found) => found,
+            Err(msg) => return Ok(failed(msg)),
+        };
+        match ops::offset_faces(&self.kb, &self.order, &indices, m.distance) {
+            Ok(()) => match self.kb.to_record() {
+                Ok((rec, ord)) => {
+                    self.order = ord;
+                    self.current = Some(rec);
+                    Ok(MoveOutcome { applied: true, message: None })
+                }
+                Err(e) => Err(op_err("to_record", e)),
+            },
+            Err(e) => Ok(failed(format!("the kernel refused the move: {e}"))),
+        }
+    }
+}
+
 /// Offsets groups of faces, one kernel call per group (`ops::offset_faces`; the faces around a
 /// moved one are extended or trimmed to meet it, tangent blends follow). Each group is found
 /// again in the running result by its surface, so earlier moves cannot shift the indices; a
@@ -509,56 +590,13 @@ pub fn offset_face_groups(body: &Brep, moves: &[FaceMove]) -> Result<(Brep, Vec<
         return Err(KernelError::Argument("too many face moves".into()));
     }
     let shapes = face_shapes(body)?;
-    let (kb, mut order) = ops::Body::from_record(body, false).map_err(|e| op_err("from_record", e))?;
-    let mut current: Option<Brep> = None;
+    let (kb, order) = ops::Body::from_record(body, false).map_err(|e| op_err("from_record", e))?;
+    let mut mover = FaceMover { shapes, kb, order, current: None };
     let mut out = Vec::with_capacity(moves.len());
     for m in moves {
-        let fail = |msg: String| MoveOutcome { applied: false, message: Some(msg) };
-        if !m.distance.is_finite() || m.distance == 0.0 || m.faces.is_empty() {
-            out.push(fail("the distance must be finite and not zero".into()));
-            continue;
-        }
-        let Some(first) = m.faces.first().and_then(|&f| shapes.get(f)) else {
-            out.push(fail("face out of range".into()));
-            continue;
-        };
-        let shape = match first {
-            Ok(s) => s,
-            Err(reason) => {
-                out.push(fail(reason.clone()));
-                continue;
-            }
-        };
-        // the faces to move: the given indices until something has moved, then the faces of the
-        // running result that lie on the original surface
-        let indices = match &current {
-            None => m.faces.clone(),
-            Some(rec) => {
-                let found = find_faces(rec, shape);
-                if found.len() != m.faces.len() {
-                    out.push(fail(format!(
-                        "the face cannot be found again after earlier moves ({} found, {} expected)",
-                        found.len(),
-                        m.faces.len()
-                    )));
-                    continue;
-                }
-                found
-            }
-        };
-        match ops::offset_faces(&kb, &order, &indices, m.distance) {
-            Ok(()) => match kb.to_record() {
-                Ok((rec, ord)) => {
-                    order = ord;
-                    current = Some(rec);
-                    out.push(MoveOutcome { applied: true, message: None });
-                }
-                Err(e) => return Err(op_err("to_record", e)),
-            },
-            Err(e) => out.push(fail(format!("the kernel refused the move: {e}"))),
-        }
+        out.push(mover.apply(m)?);
     }
-    let rebuilt = match current {
+    let rebuilt = match mover.current {
         Some(r) => r,
         None => body.clone(),
     };
