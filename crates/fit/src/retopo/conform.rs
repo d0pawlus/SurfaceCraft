@@ -559,6 +559,53 @@ fn resnap_loop(
         .collect())
 }
 
+/// The moves of one loop of a split layout (see [`resnap_loop`]), checked on a copy of `out`: the
+/// quads they touch must stay proper.
+fn checked_resnap(
+    out: &super::QuadMesh,
+    layout: &super::QuadMesh,
+    lp: &OutlineLoop,
+    ids: &[u32],
+    params: (f64, f64),
+) -> Result<Vec<(u32, Point3)>, &'static str> {
+    let moves = resnap_loop(layout, lp, ids, params)?;
+    let mut verts = out.vertices.clone();
+    for &(id, p) in &moves {
+        if let Some(v) = verts.get_mut(id as usize) {
+            *v = p;
+        }
+    }
+    let moved: BTreeSet<u32> = moves.iter().map(|m| m.0).collect();
+    if touched_quads_proper(out, &verts, &moved) { Ok(moves) } else { Err("re-snapping would leave an invalid quad") }
+}
+
+/// Counts the outcome of one loop in `report` and applies its moves to `out`.
+fn apply_resnap(
+    report: &mut ConformReport,
+    out: &mut super::QuadMesh,
+    moves: Result<Vec<(u32, Point3)>, &'static str>,
+) {
+    match moves {
+        Ok(moves) if moves.is_empty() => {
+            report.unchanged += 1;
+            report.reason.get_or_insert("no layout vertex within reach of the outline");
+        }
+        Ok(moves) => {
+            report.conformed += 1;
+            report.snapped += moves.len();
+            for (id, p) in moves {
+                if let Some(v) = out.vertices.get_mut(id as usize) {
+                    *v = p;
+                }
+            }
+        }
+        Err(why) => {
+            report.rolled_back += 1;
+            report.reason.get_or_insert(why);
+        }
+    }
+}
+
 /// Puts the free-boundary vertices of a split `layout` that are within `max_move` of `outline`
 /// back onto it: one arc solve per loop (order, minimum gap including the closing pair), the
 /// touched quads validated on a copy. A loop that fails keeps its positions and is reported.
@@ -580,39 +627,8 @@ pub fn snap_to_outline(
             report.reason.get_or_insert("no outline loop matches the layout loop");
             continue;
         };
-        let moves = resnap_loop(layout, lp, ids, (edge, max_move)).and_then(|moves| {
-            let mut verts = out.vertices.clone();
-            for &(id, p) in &moves {
-                if let Some(v) = verts.get_mut(id as usize) {
-                    *v = p;
-                }
-            }
-            let moved: BTreeSet<u32> = moves.iter().map(|m| m.0).collect();
-            if touched_quads_proper(&out, &verts, &moved) {
-                Ok(moves)
-            } else {
-                Err("re-snapping would leave an invalid quad")
-            }
-        });
-        match moves {
-            Ok(moves) if moves.is_empty() => {
-                report.unchanged += 1;
-                report.reason.get_or_insert("no layout vertex within reach of the outline");
-            }
-            Ok(moves) => {
-                report.conformed += 1;
-                report.snapped += moves.len();
-                for (id, p) in moves {
-                    if let Some(v) = out.vertices.get_mut(id as usize) {
-                        *v = p;
-                    }
-                }
-            }
-            Err(why) => {
-                report.rolled_back += 1;
-                report.reason.get_or_insert(why);
-            }
-        }
+        let moves = checked_resnap(&out, layout, lp, ids, (edge, max_move));
+        apply_resnap(&mut report, &mut out, moves);
     }
     (out, report)
 }
