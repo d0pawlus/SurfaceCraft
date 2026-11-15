@@ -167,14 +167,25 @@ fn nearest_over(
     a: V,
     reach: f64,
 ) -> Result<(f64, Option<V>)> {
-    let mut best: Option<(f64, Option<V>)> = None;
+    nearest_over_face(cloud, body, evals, a, reach).map(|(d, n, _)| (d, n))
+}
+
+/// DIAGNOSTIC (bisect branch only): [`nearest_over`] with the face it found.
+fn nearest_over_face(
+    cloud: &Cloud,
+    body: &Brep,
+    evals: &mut BTreeMap<usize, SurfaceEval>,
+    a: V,
+    reach: f64,
+) -> Result<(f64, Option<V>, usize)> {
+    let mut best: Option<(f64, Option<V>, usize)> = None;
     for f in cloud.nearest_faces(a, NEAREST_PATCHES) {
         if let std::collections::btree_map::Entry::Vacant(slot) = evals.entry(f) {
             slot.insert(evaluator(body, f)?);
         }
         let found = evals.get(&f).and_then(|e| nearest_on_patch(cloud, e, f, a, reach));
         if let Some(m) = found.filter(|m| best.is_none_or(|b| m.0 < b.0)) {
-            best = Some(m);
+            best = Some((m.0, m.1, f));
         }
     }
     best.ok_or_else(|| {
@@ -210,7 +221,7 @@ pub(super) fn check_face(mesh: &Mesh, forward: bool, cloud: &Cloud, face: (&Brep
         // the corner, and the middle of the triangle put on the surface (a flat face is cut into a few large
         // triangles whose corners are all on its border: its middle is only seen through the centroids)
         for probe in [corner, gauge.closest(middle).unwrap_or(middle)] {
-            let (distance, normal) = nearest_over(cloud, body, &mut evals, probe, reach)?;
+            let (distance, normal, near_face) = nearest_over_face(cloud, body, &mut evals, probe, reach)?;
             if distance > PROXIMITY_SLACK * gap + 1e-6 && on_segments(probe, &open) > ON_BORDER {
                 // DIAGNOSTIC (bisect branch only): what each candidate patch gives for this probe
                 for f in cloud.nearest_faces(probe, NEAREST_PATCHES) {
@@ -244,9 +255,25 @@ pub(super) fn check_face(mesh: &Mesh, forward: bool, cloud: &Cloud, face: (&Brep
             if let Some(pn) = normal {
                 checked += 1;
                 agree += usize::from(sign * dot(tn, pn) >= MIN_DOT);
+                // DIAGNOSTIC (bisect branch only)
+                eprintln!(
+                    "DIAG normal probe ({:.3}, {:.3}, {:.3}) patch {near_face} (patch sign {}) distance {distance:.3} face normal ({:.3}, {:.3}, {:.3}) forward {forward} patch normal ({:.3}, {:.3}, {:.3}) signed dot {:.3}",
+                    probe[0],
+                    probe[1],
+                    probe[2],
+                    cloud.signs.get(&near_face).copied().unwrap_or(f64::NAN),
+                    tn[0],
+                    tn[1],
+                    tn[2],
+                    pn[0],
+                    pn[1],
+                    pn[2],
+                    sign * dot(tn, pn)
+                );
             }
         }
     }
+    eprintln!("DIAG check_face end: {agree} of {checked} agree, mesh triangles {n}, forward {forward}");
     if checked == 0 || ((checked - agree) as f64) > DISAGREE_ALLOWANCE * checked as f64 {
         return Err(KernelError::Argument(format!(
             "the new face's normal disagrees with the patches' ({agree} of {checked} checked)"
