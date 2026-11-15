@@ -114,6 +114,8 @@ pub(super) struct Facts<'a> {
     pub stable: f64,
     /// The larger of the two scans' conflicts (see [`UNIQUE_MAX_CONFLICT`]).
     pub conflict: f64,
+    /// Is the orientation of the triangles of both scans trustworthy (see `orientation`)?
+    pub orientation_ok: bool,
     /// What the probes found.
     pub probes: ProbeFacts,
 }
@@ -135,7 +137,7 @@ pub(super) fn judge(f: &Facts) -> (PairVerdict, f64) {
     if probes.slides > 0 || probes.attempted == 0 || probes.completed < probes.attempted {
         return (PairVerdict::Ambiguous, confidence.min(0.25));
     }
-    if !(f.stable >= STABILITY_FLOOR) || !(f.conflict <= UNIQUE_MAX_CONFLICT) {
+    if !(f.stable >= STABILITY_FLOOR) || !(f.conflict <= UNIQUE_MAX_CONFLICT) || !f.orientation_ok {
         return (PairVerdict::Ambiguous, confidence.min(0.25));
     }
     let verdict = if confidence >= CONFIDENCE_THRESHOLD { PairVerdict::Unique } else { PairVerdict::Ambiguous };
@@ -161,7 +163,17 @@ mod tests {
         stable: f64,
         probes: ProbeFacts,
     ) -> (PairVerdict, f64) {
-        judge(&Facts { best, overlap, tau: 0.3, clearance, refined, stable, conflict: 0.0, probes })
+        judge(&Facts {
+            best,
+            overlap,
+            tau: 0.3,
+            clearance,
+            refined,
+            stable,
+            conflict: 0.0,
+            orientation_ok: true,
+            probes,
+        })
     }
 
     #[test]
@@ -223,6 +235,7 @@ mod tests {
             refined: 8,
             stable: 0.1,
             conflict,
+            orientation_ok: true,
             probes: OK,
         };
         assert_eq!(judge(&facts(0.0)).0, PairVerdict::Unique);
@@ -234,5 +247,10 @@ mod tests {
         // conflicts of the moving scan (a weak patch stays ambiguous whatever pose it lands on)
         assert_eq!(judge(&facts(0.5)).0, PairVerdict::Ambiguous);
         assert_ne!(judge(&facts(f64::NAN)).0, PairVerdict::Unique);
+        // an orientation that is not trusted is never unique either
+        let turned = Facts { orientation_ok: false, ..facts(0.0) };
+        let (verdict, confidence) = judge(&turned);
+        assert_eq!(verdict, PairVerdict::Ambiguous);
+        assert!(confidence <= 0.25);
     }
 }

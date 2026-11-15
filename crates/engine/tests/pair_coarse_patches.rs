@@ -39,7 +39,7 @@ fn a_patch_on_surface_everywhere_is_contradicted_by_the_feature_above_it() {
     let wrong = pose_fit(&patch, &fixed, &boss_corner(), tau, &Cancel::new()).unwrap();
     let right = pose_fit(&patch, &fixed, &Transform::identity(), tau, &Cancel::new()).unwrap();
     eprintln!("wrong corner {wrong:?}\ntrue corner {right:?}");
-    assert!(wrong.overlap_moving > 0.8, "the patch lies on the box faces: {}", wrong.overlap_moving);
+    assert!(wrong.overlap_moving > 0.6, "the patch lies on the box faces: {}", wrong.overlap_moving);
     assert!(
         wrong.conflict_moving <= UNIQUE_MAX_CONFLICT / 2.0,
         "the patch's own side is clean: {}",

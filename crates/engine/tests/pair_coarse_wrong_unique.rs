@@ -26,9 +26,18 @@ fn worst_conflict(c: &Case) -> f64 {
 }
 
 fn gate(series: u64) {
-    let cases = all_cases(&[series]);
-    eprintln!("{}", table(&cases));
-    let wrong = wrong_unique_lines(&cases);
+    check(&all_cases(&[series]), series, MIN_RECALL, true);
+}
+
+/// The assertions of the gate over `cases`; `recall` is the share of the pairs that share at least
+/// 0.4 that must be found (0 to assert none). With `conflict_decides` every wrong pose the command
+/// returns must be contradicted by more than the bound (2x); on coarse meshes the tolerance is
+/// capped by the edge length instead and the conflicts cannot resolve the relief, so only the
+/// absence of wrong `unique` is asserted (the true poses read up to 0.08 there: the edge cap is below
+/// the chord error of such meshes, which is why they are certified less often).
+fn check(cases: &[Case], series: u64, recall: f64, conflict_decides: bool) {
+    eprintln!("{}", table(cases));
+    let wrong = wrong_unique_lines(cases);
     assert!(wrong.is_empty(), "wrong poses called unique:\n{}", wrong.join("\n"));
     assert!(
         cases.iter().filter(|c| c.overlap() < NOTHING).all(|c| !c.is_unique()),
@@ -39,6 +48,13 @@ fn gate(series: u64) {
     let right_at_truth =
         cases.iter().filter_map(|c| c.at_truth).map(|t| t.conflict_moving.max(t.conflict_fixed)).fold(0.0, f64::max);
     let wrong_found: Vec<&Case> = cases.iter().filter(|c| c.is_wrong() && c.verdict != "no_match").collect();
+    // a margin assertion over an empty population tests nothing
+    let measured_at_truth = cases.iter().filter(|c| c.at_truth.is_some()).count();
+    assert!(
+        measured_at_truth > 0 && !wrong_found.is_empty(),
+        "{measured_at_truth} right poses measured, {} wrong found",
+        wrong_found.len()
+    );
     let best_wrong = wrong_found.iter().map(|c| worst_conflict(c)).fold(f64::INFINITY, f64::min);
     eprintln!(
         "series {series}: larger conflict of the two scans: right poses at the truth at most {right_at_truth:.4} \
@@ -47,21 +63,40 @@ fn gate(series: u64) {
         wrong_found.len(),
         best_wrong / UNIQUE_MAX_CONFLICT
     );
-    assert!(right_at_truth * MARGIN <= UNIQUE_MAX_CONFLICT, "a right pose is near the bound: {right_at_truth}");
-    assert!(best_wrong >= MARGIN * UNIQUE_MAX_CONFLICT, "a wrong pose is near the bound: {best_wrong}");
     assert!(
-        wrong_found.iter().all(|c| c.out["verdict"] != "unique" && worst_conflict(c) > UNIQUE_MAX_CONFLICT),
+        !conflict_decides || right_at_truth * MARGIN <= UNIQUE_MAX_CONFLICT,
+        "a right pose is near the bound: {right_at_truth}"
+    );
+    assert!(
+        !conflict_decides || best_wrong >= MARGIN * UNIQUE_MAX_CONFLICT,
+        "a wrong pose is near the bound: {best_wrong}"
+    );
+    assert!(
+        !conflict_decides
+            || wrong_found.iter().all(|c| c.out["verdict"] != "unique" && worst_conflict(c) > UNIQUE_MAX_CONFLICT),
         "every wrong pose the command returns is contradicted"
     );
     let sharing: Vec<&Case> = cases.iter().filter(|c| c.overlap() >= SHARING).collect();
     let found = sharing.iter().filter(|c| c.is_unique()).count() as f64 / sharing.len() as f64;
     eprintln!("series {series}: {found:.2} of the {} pairs that share at least {SHARING} are found", sharing.len());
-    assert!(found >= MIN_RECALL, "recall {found}");
+    assert!(found >= recall, "recall {found}");
 }
 
 #[test]
 fn gate_m2_no_wrong_pose_is_unique_series_0() {
     gate(0);
+}
+
+/// Meshes whose noise estimate is not `smooth` (triangles of 4 to 10 mm): the tolerance has no noise
+/// cap there, and the conflicts have to carry the verdict alone.
+#[test]
+fn gate_m2_no_wrong_pose_is_unique_on_coarse_meshes() {
+    let views = coarse_fixtures(0);
+    let smooth = views.iter().flat_map(|(_, v)| v).filter(|m| surfacecraft_deviation::noise_estimate(m).smooth).count();
+    let total: usize = views.iter().map(|(_, v)| v.len()).sum();
+    eprintln!("{smooth} of {total} coarse views have a smooth noise estimate");
+    assert!(smooth * 2 <= total, "the fixtures are meant to be coarse: {smooth} of {total} are smooth");
+    check(&coarse_cases(&[0]), 0, 0.0, false);
 }
 
 #[test]

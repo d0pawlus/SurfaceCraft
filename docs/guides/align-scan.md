@@ -145,8 +145,9 @@ Normals, colours and per-vertex data go with the coordinates.
 - The `tolerance` (default) is five times the median distance of the best pose's points, but never
   more than four times the `noise` of the pair (each scan's own estimate, combined): a tolerance made
   of the pose's own residual lets a pose that merely lies on other regions of a lumpy surface pass
-  as a fit. A coarse mesh makes the estimate unreliable (`noise` 0): the tolerance then has no noise
-  cap and the conflicts below carry the verdict.
+  as a fit. A coarse mesh makes the estimate unreliable (`noise` 0): the cap is then 5 % of the mean
+  edge length of the coarser scan (the chord error between two tessellations is a small part of an
+  edge), and a pair of coarse scans is certified less often.
 - `conflict_moving` and `conflict_fixed`: the share of each scan's area (3000 samples of each, however
   small the scan) that lies in the free space of the other: the other scan is there, but the point
   is in front of its surface and more than twice the tolerance away. Surface beyond the end of the
@@ -174,6 +175,15 @@ Normals, colours and per-vertex data go with the coordinates.
 - It proposes by default (`apply` false); a pose that is not `unique` is applied only when
   `choose` names it (0 the best, 1 and up the alternatives; `choose` needs `apply`). The result then
   carries the numbers of the pose chosen. When `apply` was given and nothing moved, `refused` is true.
+- The orientation of the triangles is checked, because the conflicts read the side a triangle faces
+  (a scan turned inside out makes every conflict vanish): a pose is never `unique` (it is
+  `ambiguous` with a confidence of at most 0.25, and `orientation_issue` and the note say why) when a
+  scan's triangles are wound against each other or duplicated (more than 2 % of its shared edges), when
+  a closed scan has a negative volume, or when the normals of the two scans mostly oppose where they
+  meet. What cannot be seen: two OPEN scans that are both turned inside out, consistently. Each is
+  wound consistently, neither is closed and their normals agree, so nothing flags them and the
+  contradiction evidence is blind for both: check the orientation of your scans (a shaded view shows
+  an inverted scan dark) before you trust `unique`.
 - Limit, in plain words: two pieces of a part that has a symmetry cannot be told from the same piece
   scanned twice, so such a pair can come back `unique` at a wrong pose (the pieces are congruent and
   every surface fits). Give a rough start (place the scans by hand: `align.global` with `start`

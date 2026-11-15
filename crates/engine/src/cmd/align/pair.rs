@@ -89,6 +89,9 @@ pub struct PairOut {
     pub probe_margin: Option<f64>,
     /// Largest distance in mm a displaced start ended from the pose, among those that came back.
     pub probe_return_gap: f64,
+    /// Why the orientation of the triangles is not trusted (a scan wound inconsistently or turned inside out, or the two facing opposite ways where they meet); absent when it is. The verdict is then never `unique`: the contradiction evidence reads the side a triangle faces.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orientation_issue: Option<String>,
     /// A sentence about the outcome.
     pub note: String,
 }
@@ -96,6 +99,12 @@ pub struct PairOut {
 fn note_of(r: &PairResult, applied: bool, refused: bool) -> String {
     if r.refined < 2 && r.verdict == PairVerdict::Ambiguous {
         return "only one candidate pose could be refined, so nothing was compared: check the pose by eye".into();
+    }
+    if let (PairVerdict::Ambiguous, Some(why)) = (r.verdict, &r.orientation_issue) {
+        let tail = if refused { ", nothing was moved" } else { "" };
+        return format!(
+            "ambiguous: the orientation of the triangles is not trusted ({why}): check the pose by eye{tail}"
+        );
     }
     if r.verdict == PairVerdict::Ambiguous && r.contradicted {
         let tail = if refused { ", nothing was moved" } else { "" };
@@ -218,6 +227,7 @@ pub(super) fn pair(s: &mut Session, i: PairIn) -> CmdResult<PairOut> {
         noise: r.noise,
         method: shown.method,
         refused,
+        orientation_issue: r.orientation_issue.clone(),
         note: note_of(&r, i.apply && may_move, refused),
         alternatives: r.alternatives,
         candidates: r.candidates,

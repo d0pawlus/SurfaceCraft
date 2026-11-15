@@ -57,38 +57,74 @@ impl Case {
 }
 
 fn wedge(k: usize, series: u64) -> Mesh {
-    let whole = noisy(blob_at(48 + 4 * k), 900 + k as u64 + 1000 * series);
+    wedge_at(k, series, 48 + 4 * k)
+}
+
+fn wedge_at(k: usize, series: u64, nu: usize) -> Mesh {
+    let whole = noisy(blob_at(nu), 900 + k as u64 + 1000 * series);
     cut(&whole, |p| {
         let d = (p.y.atan2(p.x).to_degrees() - 60.0 * k as f64 + 540.0).rem_euclid(360.0) - 180.0;
         d.abs() <= 70.0
     })
 }
 
-/// The four fixtures of series `series`: views of the bracket, of the blob, wedges of the blob, arcs
-/// of the lumpy ring (all with sigma 0.05 and their own tessellation and noise).
-/// The lumpy ring of `global_common` without the parts of the lumps inside the tube.
-fn visible_ring(k: usize, series: u64) -> Mesh {
-    let mut m = synth::torus(Point3::origin(), Vec3::z(), 40.0, 9.0, 72 + 4 * k, 20 + k);
+/// The lumpy ring of `global_common` without the parts of the lumps inside the tube; `coarse`
+/// tessellates it at a third of the resolution.
+fn visible_ring(k: usize, series: u64, coarse: bool) -> Mesh {
+    let (nu, nv, lump_nu, lump_nv) = if coarse { (30 + 2 * k, 9 + k, 10, 5) } else { (72 + 4 * k, 20 + k, 20, 10) };
+    let mut m = synth::torus(Point3::origin(), Vec3::z(), 40.0, 9.0, nu, nv);
     let azimuths = [8.0, 31.0, 62.0, 80.0, 118.0, 139.0, 171.0, 203.0, 236.0, 262.0, 291.0, 330.0];
     for (i, a) in azimuths.iter().enumerate() {
         let (s, c) = f64::to_radians(*a).sin_cos();
         let radius = 3.5 + 0.9 * ((i * 7) % 5) as f64;
         let z = 1.8 * (((i * 5) % 7) as f64 - 3.0);
         let out = 44.0 + 0.7 * ((i * 3) % 4) as f64;
-        let lump = synth::sphere(Point3::new(out * c, out * s, z), radius, 20, 10);
+        let lump = synth::sphere(Point3::new(out * c, out * s, z), radius, lump_nu, lump_nv);
         m.append(&cut(&lump, |p| (p.x.hypot(p.y) - 40.0).hypot(p.z) >= 9.0));
     }
     noisy(m, 600 + k as u64 + 1000 * series)
 }
 
-fn visible_ring_arc(k: usize, centre: f64, half: f64, series: u64) -> Mesh {
-    cut(&visible_ring(k, series), |p| {
+fn visible_ring_arc(k: usize, centre: f64, half: f64, series: u64, coarse: bool) -> Mesh {
+    cut(&visible_ring(k, series, coarse), |p| {
         let d = (p.y.atan2(p.x).to_degrees() - centre + 540.0).rem_euclid(360.0) - 180.0;
         d.abs() <= half
     })
 }
 
+/// The four fixtures at a fraction of the resolution (triangles of 4 to 10 mm, a ring tube of 12
+/// segments): meshes whose noise estimate is not `smooth`, so the tolerance has no noise cap (see
+/// `ScanNoise`). `PAIR_COARSE=1` runs them in the printed table; the gate `coarse_*` asserts them.
+pub fn coarse_fixtures(series: u64) -> Vec<(&'static str, Vec<Mesh>)> {
+    let bracket = SIDES.iter().enumerate().map(|(k, (d, r))| {
+        let whole = noisy(visible_bracket_at(4 + k, 14 + 2 * k, 6 + k), 100 + k as u64 + 1000 * series);
+        let (dir, c) = (Vec3::new(d[0], d[1], d[2]), Point3::new(30.0, 20.0, 15.0));
+        cut(&whole, |p| (p - c).dot(&dir) >= -*r)
+    });
+    let blob_sides: [([f64; 3], f64); 6] = [
+        ([1.0, 0.0, 0.0], 8.0),
+        ([-1.0, 0.0, 0.0], 8.0),
+        ([0.0, 1.0, 0.0], 5.0),
+        ([0.0, -1.0, 0.0], 5.0),
+        ([0.0, 0.0, 1.0], 3.5),
+        ([0.0, 0.0, -1.0], 3.5),
+    ];
+    let blob = blob_sides.iter().enumerate().map(|(k, (d, reach))| {
+        let dir = Vec3::new(d[0], d[1], d[2]);
+        cut(&noisy(blob_at(16 + 2 * k), 200 + k as u64 + 1000 * series), |p| p.coords.dot(&dir) >= -*reach)
+    });
+    vec![
+        ("bracket", bracket.collect()),
+        ("blob", blob.collect()),
+        ("wedges", (0..6).map(|k| wedge_at(k, series, 14 + 2 * k)).collect()),
+        ("ring", (0..8).map(|k| visible_ring_arc(k, 45.0 * k as f64, 58.0, series, true)).collect()),
+    ]
+}
+
 pub fn fixtures(series: u64) -> Vec<(&'static str, Vec<Mesh>)> {
+    if std::env::var("PAIR_COARSE").is_ok() {
+        return coarse_fixtures(series);
+    }
     if std::env::var("PAIR_ORIGINAL").is_ok() {
         return original_fixtures(series);
     }
@@ -96,7 +132,7 @@ pub fn fixtures(series: u64) -> Vec<(&'static str, Vec<Mesh>)> {
         ("bracket", bracket_views_s(6, series)),
         ("blob", blob_views_s(series)),
         ("wedges", (0..6).map(|k| wedge(k, series)).collect()),
-        ("ring", (0..8).map(|k| visible_ring_arc(k, 45.0 * k as f64, 58.0, series)).collect()),
+        ("ring", (0..8).map(|k| visible_ring_arc(k, 45.0 * k as f64, 58.0, series, false)).collect()),
     ]
 }
 
@@ -156,6 +192,16 @@ pub fn error_against_truth(out: &Value, views: &[Mesh], poses: &[Transform], i: 
 }
 
 /// The cases of series `series_list` of every fixture.
+pub fn coarse_cases(series_list: &[u64]) -> Vec<Case> {
+    let mut all = Vec::new();
+    for &series in series_list {
+        for (name, views) in coarse_fixtures(series) {
+            all.extend(run(name, &views, series));
+        }
+    }
+    all
+}
+
 pub fn all_cases(series_list: &[u64]) -> Vec<Case> {
     let only = std::env::var("PAIR_FIXTURES").unwrap_or_default();
     let mut all = Vec::new();

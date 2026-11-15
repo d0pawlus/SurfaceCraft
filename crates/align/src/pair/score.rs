@@ -163,24 +163,37 @@ pub(super) fn fit_of(target: &Target, pts: &[Point3], t: &Transform, tau: f64, c
     }
 }
 
+/// Hits whose triangle has no normal (degenerate) that `free_space_conflicts` tolerates, as a share
+/// of the points: they count as no conflict, so more of them than this and the answer is unknown.
+const MAX_UNKNOWN_HITS: f64 = 0.01;
+
 /// The share of `pts` (moved by `t`) that lie in the free space of `target`: where the target is
 /// (the closest point of it is not at its border) but more than twice `tau` away and in front of its
 /// surface (on the side its triangle normal points to). A point behind the surface is unobservable by
 /// the target (its other side: the underside of a box seen from the top) and says nothing. Needs
-/// triangles oriented consistently, outward, as the descriptors of `pair_coarse` do.
+/// triangles oriented consistently, outward (checked by `super::orientation`, fail-closed).
+///
+/// NaN (never a pass: every comparison with it fails) when there are no points, or when more than
+/// [`MAX_UNKNOWN_HITS`] of them hit a triangle without a normal.
 pub(super) fn free_space_conflicts(target: &Target, pts: &[Point3], t: &Transform, tau: f64) -> f64 {
     if pts.is_empty() {
-        return 0.0;
+        return f64::NAN;
     }
-    let bad: Vec<bool> = surfacecraft_geom::par::map_slice(pts, |p| {
+    // Some(conflict) for a point that hit a triangle with a normal or none at all; None for a hit
+    // on a triangle without a normal
+    let votes: Vec<Option<bool>> = surfacecraft_geom::par::map_slice(pts, |p| {
         let q = t.apply(p);
-        let Some(h) = target.bvh.closest(&q, f64::INFINITY) else { return false };
+        let Some(h) = target.bvh.closest(&q, f64::INFINITY) else { return Some(false) };
         if h.distance <= CONFLICT_TAUS * tau || target.on_border(h.triangle, &h.point, true) {
-            return false;
+            return Some(false);
         }
-        target.bvh.triangle_normal(h.triangle).is_some_and(|n| (q - h.point).dot(&n) > 0.0)
+        target.bvh.triangle_normal(h.triangle).map(|n| (q - h.point).dot(&n) > 0.0)
     });
-    bad.iter().filter(|b| **b).count() as f64 / pts.len() as f64
+    let unknown = votes.iter().filter(|v| v.is_none()).count();
+    if unknown as f64 > MAX_UNKNOWN_HITS * pts.len() as f64 {
+        return f64::NAN;
+    }
+    votes.iter().filter(|v| **v == Some(true)).count() as f64 / pts.len() as f64
 }
 
 /// A direction in which the matched part may be loose: a small rigid motion (rotation vector
@@ -449,6 +462,17 @@ mod tests {
         assert!(weakest_first(&a).is_none());
         a[(2, 3)] = f64::INFINITY;
         assert!(weakest_first(&a).is_none());
+    }
+
+    /// No points, no answer: NaN, which no comparison passes (never a clean 0).
+    #[test]
+    fn free_space_conflicts_of_nothing_are_unknown() {
+        let mesh = plane_mesh();
+        let target = Target::new(&mesh, 30.0);
+        assert!(free_space_conflicts(&target, &[], &Transform::identity(), 0.5).is_nan());
+        let above = [Point3::new(5.0, 5.0, 3.0), Point3::new(5.0, 5.0, -3.0)];
+        let share = free_space_conflicts(&target, &above, &Transform::identity(), 0.5);
+        assert!((share - 0.5).abs() < 1e-12, "in front counts, behind does not: {share}");
     }
 
     #[test]

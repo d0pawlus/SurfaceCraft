@@ -67,8 +67,14 @@ where
     let given = (opts.start == StartMode::Current).then(Transform::identity);
     let options = PairOptions { tolerance: opts.tolerance, given, ..PairOptions::default() };
     // the noise of a scan is estimated once, not once per pair it is in
-    let noises: Vec<ScanNoise> =
-        par::map(scans.len(), |k| scans.get(k).map_or(ScanNoise { sigma: 0.0, smooth: false }, |m| ScanNoise::of(m)));
+    let untrusted = ScanNoise { sigma: 0.0, smooth: false };
+    let noises: Vec<ScanNoise> = par::map(scans.len(), |k| match scans.get(k) {
+        Some(m) if !cancel.is_cancelled() => ScanNoise::of(m),
+        _ => untrusted,
+    });
+    if cancel.is_cancelled() {
+        return Err(AlignError::Cancelled);
+    }
     let tried = par::map(list.len(), |k| {
         let &(fixed, moving) = list.get(k)?;
         let (f, m) = (scans.get(fixed)?, scans.get(moving)?);
