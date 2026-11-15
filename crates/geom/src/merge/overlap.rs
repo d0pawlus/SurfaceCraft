@@ -11,6 +11,8 @@ pub const PAIR_SAMPLES: usize = 20_000;
 const CHUNK: usize = 4096;
 /// Two surfaces face the same way when the cosine of the angle of their normals is at least this.
 pub(super) const COS_FACING: f64 = 0.5;
+/// A pair is displaced only when at least this share of the samples lies over the other scan.
+pub const OVER_SHARE: f64 = 0.05;
 /// The high quantile of the residual reported (percent).
 const PERCENTILE: usize = 95;
 /// Two surfaces oppose when that cosine is at most minus this.
@@ -104,11 +106,14 @@ impl PairResidual {
         if self.near == 0 { 0.0 } else { (self.near - self.within) as f64 / self.near as f64 }
     }
 
-    /// Do more samples lie over `b` displaced beyond the reach than agree with it within the tolerance?
+    /// Do more samples lie over `b` displaced beyond the reach than agree with it within the tolerance,
+    /// and at least [`OVER_SHARE`] of all samples? (Rays along the normals of a part with many faces
+    /// meet a facing surface of a piece that lies elsewhere now and then: a percent of the samples
+    /// of pieces that share nothing was measured on a real scan.)
     /// (Scans offset by more than the reach: they share no surface within it but lie over each other.)
     #[must_use]
     pub fn displaced(&self, min: usize) -> bool {
-        self.over >= min && self.over > self.within
+        self.over >= min && self.over as f64 >= OVER_SHARE * self.samples as f64 && self.over > self.within
     }
 }
 

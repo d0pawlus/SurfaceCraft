@@ -134,7 +134,18 @@ fn run(number: usize, kind: &str, whole: &Mesh, parts: &[Mesh]) {
         }
     };
     if kind == "exact" {
-        assert_eq!(out["refused"], json!(false), "scan {number}: {:?}", codes(&out));
+        let pairs: Vec<String> = out["pairs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|p| {
+                format!(
+                    "{}-{} samples {} shared {} within {} over {}",
+                    p["a"], p["b"], p["samples"], p["shared"], p["within"], p["over"]
+                )
+            })
+            .collect();
+        assert_eq!(out["refused"], json!(false), "scan {number}: {:?} {pairs:?}", codes(&out));
     }
     let tol = out["tolerance"].as_f64().unwrap_or(0.0);
     let topo = surfacecraft_geom::merge::topology(whole);
