@@ -248,60 +248,6 @@ pub(super) fn median_edge(mesh: &Mesh) -> f64 {
     *l.select_nth_unstable_by(k, f64::total_cmp).1
 }
 
-/// A closed piece smaller than this share of its scan's area is not judged for being inside out
-/// (debris).
-pub const INVERTED_MIN_SHARE: f64 = 0.01;
-/// Rays of the inside test ignore crossings closer than this share of the scan's diagonal.
-const NEST_EPS_SHARE: f64 = 1e-9;
-
-/// Signed volume of a piece, measured about the centre of its box.
-fn volume(mesh: &Mesh, p: &pieces::Piece) -> f64 {
-    let o = p.bbox.center();
-    p.triangles
-        .iter()
-        .filter_map(|&t| mesh.triangle(t as usize))
-        .map(|[a, b, c]| (a - o).dot(&(b - o).cross(&(c - o))))
-        .sum()
-}
-
-/// Does piece `k` lie inside the other closed pieces (an inner skin, whose volume is negative)?
-fn nested(mesh: &Mesh, closed: &[&pieces::Piece], k: usize) -> bool {
-    let others: Vec<u32> =
-        closed.iter().enumerate().filter(|(j, _)| *j != k).flat_map(|(_, q)| q.triangles.iter().copied()).collect();
-    let probe = closed.get(k).and_then(|p| p.triangles.first()).and_then(|&t| mesh.triangles.get(t as usize));
-    let (Some(tri), false) = (probe, others.is_empty()) else { return false };
-    let Some(&p) = mesh.positions.get(tri[0] as usize) else { return false };
-    let bvh = Bvh::build(&mesh.submesh(&others));
-    crate::nesting::point_inside(&bvh, &p, NEST_EPS_SHARE * mesh.bbox().diagonal().max(f64::MIN_POSITIVE))
-}
-
-/// Closed pieces with a negative volume, sorted: (turned inside out, inner skins, debris). An inner
-/// skin lies inside another closed piece of the scan (the inside of a hollow part, a cavity, faces
-/// inward), whatever its size; debris is a piece below [`INVERTED_MIN_SHARE`] of the scan's area
-/// that lies inside nothing, as long as all such pieces together stay below it (many small inverted
-/// pieces are a scan turned inside out in parts: counted as turned inside out). Only the first
-/// refuse the merge.
-pub(super) fn negative_pieces(mesh: &Mesh) -> (usize, usize, usize) {
-    let all = pieces::pieces(mesh);
-    let closed: Vec<&pieces::Piece> = all.iter().filter(|p| p.closed()).collect();
-    let area = mesh.area();
-    let (mut inverted, mut skins, mut debris, mut debris_area) = (0, 0, 0, 0.0);
-    for (k, p) in closed.iter().enumerate().filter(|(_, p)| volume(mesh, p) < 0.0) {
-        if nested(mesh, &closed, k) {
-            skins += 1;
-        } else if p.area < INVERTED_MIN_SHARE * area {
-            debris += 1;
-            debris_area += p.area;
-        } else {
-            inverted += 1;
-        }
-    }
-    if debris_area >= INVERTED_MIN_SHARE * area {
-        return (inverted + debris, skins, 0);
-    }
-    (inverted, skins, debris)
-}
-
 /// `mesh` without the triangles `drop` flags, and the corners of those dropped.
 fn without(mesh: Mesh, drop: &[bool]) -> (Mesh, Vec<[Point3; 3]>) {
     let gone: Vec<[Point3; 3]> =
@@ -345,7 +291,7 @@ pub(super) fn prepare(given: &Mesh, cancel: &Cancel) -> Option<Scan> {
         bvh: Bvh::build(&mesh),
         bbox: mesh.bbox(),
         median_edge: median_edge(&mesh),
-        negative: negative_pieces(&mesh),
+        negative: super::nest::negative_pieces(&mesh, cancel)?,
         topology: topology(&mesh),
         mesh,
         dropped,
