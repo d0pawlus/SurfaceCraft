@@ -113,7 +113,7 @@ pub fn pinch_free_groups(body: &Brep, faces: &[usize]) -> Vec<Vec<usize>> {
 }
 
 /// Does face `face` have one of `vertices` as a corner?
-fn touches(body: &Brep, face: usize, vertices: &std::collections::BTreeSet<u32>) -> bool {
+pub(super) fn touches(body: &Brep, face: usize, vertices: &std::collections::BTreeSet<u32>) -> bool {
     let Some(f) = body.faces.get(face) else { return false };
     f.loops.iter().any(|l| match l {
         crate::record::brep::Loop::Edges { edges } => edges.iter().any(|oe| {

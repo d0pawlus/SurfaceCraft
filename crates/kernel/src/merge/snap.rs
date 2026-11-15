@@ -594,8 +594,13 @@ fn topology_kept(before: &Brep, after: &Brep) -> bool {
         && before.edges.iter().zip(&after.edges).all(|(a, b)| a.uses == b.uses && matches!(b.uses.len(), 1 | 2))
 }
 
+/// Per group, the neighbouring patches that failed the check of the moved patches (a peel takes the group's
+/// patches at their corners off the group: `peel`).
+type Folded = BTreeMap<usize, BTreeSet<usize>>;
+
 /// The patches that moved but are not part of a snapped group (those are replaced by their face) must be
-/// sound; the groups that asked for a patch that is not are refused. An unsound topology refuses every group.
+/// sound; the groups that asked for a patch that is not are refused, and the patch is noted against them. An
+/// unsound topology refuses every group.
 fn check_moved(
     before: &Brep,
     after: &Brep,
@@ -603,11 +608,11 @@ fn check_moved(
     own: &BTreeSet<usize>,
     live: &[usize],
     max_move: f64,
-) -> Refused {
-    let mut refused = Refused::new();
+) -> (Refused, Folded) {
+    let (mut refused, mut folded) = (Refused::new(), Folded::new());
     if !topology_kept(before, after) {
         blame(&mut refused, live.iter().copied(), "the snap changed the topology of the body");
-        return refused;
+        return (refused, folded);
     }
     for c in changed {
         if !own.contains(&c.face) && !moved_patch_ok(before, after, c, max_move) {
@@ -616,17 +621,49 @@ fn check_moved(
                 c.asked.iter().copied(),
                 "a neighbouring patch would fold, turn over or come off its border",
             );
+            for &g in &c.asked {
+                folded.entry(g).or_default().insert(c.face);
+            }
         }
     }
-    refused
+    (refused, folded)
 }
 
 /// What [`snap_boundaries`] made: the body, which targets (by index) have their boundary on the primitive and,
-/// of those that have not, why.
+/// of those that have not, why, and the neighbouring patches that failed the check of the moved patches for them.
 pub(super) struct Snapped {
     pub body: Brep,
     pub snapped: Vec<bool>,
     pub why_not: Vec<Option<String>>,
+    pub folded: Vec<BTreeSet<usize>>,
+}
+
+/// One try of the snap of the groups `live`.
+enum Try {
+    /// The body snapped, and which targets have a boundary on their primitive.
+    Done(Brep, Vec<bool>),
+    /// The groups that cannot be snapped, and the patches that failed the check of the moved ones for them.
+    Refused(Refused, Folded),
+}
+
+fn try_snap(body: &Brep, targets: &[Target], live: &[usize], max_move: f64) -> Try {
+    let touch = touching(body, targets, live);
+    let flags: Vec<bool> = (0..targets.len()).map(|k| touch.bounded.contains(&k)).collect();
+    if touch.edges.is_empty() {
+        return Try::Done(body.clone(), flags);
+    }
+    let own: BTreeSet<usize> =
+        live.iter().filter_map(|&k| targets.get(k)).flat_map(|t| t.faces.iter().copied()).collect();
+    let moves = match plan(body, &touch, max_move) {
+        Ok(m) => m,
+        Err(refused) => return Try::Refused(refused, Folded::new()),
+    };
+    let (after, changed) = match applied(body, &moves) {
+        Ok(a) => a,
+        Err(refused) => return Try::Refused(refused, Folded::new()),
+    };
+    let (refused, folded) = check_moved(body, &after, &changed, &own, live, max_move);
+    if refused.is_empty() { Try::Done(after, flags) } else { Try::Refused(refused, folded) }
 }
 
 /// The body with the boundary of every group of `targets` on its primitive, and the patches and edges that
@@ -635,41 +672,36 @@ pub(super) struct Snapped {
 /// cancellation (`cancel` is polled once a round) ends the step with nothing snapped.
 pub(super) fn snap_boundaries(body: &Brep, targets: &[Target], max_move: f64, cancel: &dyn Fn() -> bool) -> Snapped {
     let mut why_not: Vec<Option<String>> = vec![None; targets.len()];
+    let mut folded: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); targets.len()];
     let mut live: Vec<usize> = (0..targets.len()).collect();
     // each round refuses at least one group, or ends
     for _ in 0..=targets.len() {
         if cancel() {
             break;
         }
-        let touch = touching(body, targets, &live);
-        let flags = |touch: &Touch| (0..targets.len()).map(|k| touch.bounded.contains(&k)).collect::<Vec<_>>();
-        if touch.edges.is_empty() {
-            return Snapped { body: body.clone(), snapped: flags(&touch), why_not };
-        }
-        let own: BTreeSet<usize> =
-            live.iter().filter_map(|&k| targets.get(k)).flat_map(|t| t.faces.iter().copied()).collect();
-        let attempt = plan(body, &touch, max_move).and_then(|m| {
-            let (after, changed) = applied(body, &m)?;
-            let refused = check_moved(body, &after, &changed, &own, &live, max_move);
-            if refused.is_empty() { Ok(after) } else { Err(refused) }
-        });
-        match attempt {
-            Ok(after) => return Snapped { body: after, snapped: flags(&touch), why_not },
-            Err(refused) if !refused.is_empty() => {
+        match try_snap(body, targets, &live, max_move) {
+            Try::Done(after, snapped) => return Snapped { body: after, snapped, why_not, folded },
+            Try::Refused(refused, failed) if !refused.is_empty() => {
                 for (k, why) in refused {
                     if let Some(slot) = why_not.get_mut(k) {
                         *slot = Some(why);
                     }
                     live.retain(|&g| g != k);
                 }
+                for (k, faces) in failed {
+                    if let Some(slot) = folded.get_mut(k) {
+                        slot.extend(faces);
+                    }
+                }
             }
-            Err(_) => break,
+            Try::Refused(..) => break,
         }
     }
     Snapped {
         body: body.clone(),
         snapped: vec![false; targets.len()],
         why_not: vec![Some("the boundaries could not be moved consistently".to_string()); targets.len()],
+        folded,
     }
 }
 

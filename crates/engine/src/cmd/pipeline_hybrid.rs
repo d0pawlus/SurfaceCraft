@@ -10,7 +10,7 @@
 //! the unchanged judge against the original scan, and is returned only when it is not worse than the
 //! wrap it came from. A failure ends the attempt with an issue code and the document as it was.
 use super::freeform::{judge_stage, wrap_mesh_at, wrap_stage};
-use super::merging::{MIN_AREA_IN_TOLERANCES_SQUARED, Merging, Protected, merge_groups};
+use super::merging::{MIN_AREA_IN_TOLERANCES_SQUARED, Merging, Protected, merge_groups, peel_note};
 use super::rebuild::Stopwatch;
 use super::regions::{candidates, fit_regions};
 use super::{
@@ -71,6 +71,10 @@ pub struct MergedFace {
     /// The area of the patches it replaced (mm2).
     #[serde(default)]
     pub patch_area: f64,
+    /// Patches of its group peeled off the border, which stay patches: snapping the border there would have folded
+    /// a neighbouring patch, or it lay farther than the gap from the primitive (issue `hybrid_border_peeled`).
+    #[serde(default)]
+    pub peeled: usize,
 }
 
 /// How long one stage of the attempt took.
@@ -420,7 +424,7 @@ fn unkept(mut left: Vec<LeftPatches>, merged: &[MergedFace], why: &str) -> Vec<L
     left.extend(merged.iter().map(|g| LeftPatches {
         primitive: g.primitive,
         kind: g.kind.clone(),
-        patches: g.patches,
+        patches: g.patches + g.peeled,
         reason: why.to_string(),
     }));
     left
@@ -540,6 +544,9 @@ fn build(s: &mut Session, i: &ToSolidIn, set: &Settings, report: &ScanSummary) -
         );
         out.issues.push(issue("hybrid_snap_skipped", msg));
     }
+    if let Some(msg) = peel_note(&merging.merged) {
+        out.issues.push(issue("hybrid_border_peeled", msg));
+    }
     if analytic.max_edge_gap > EDGE_GAP_NOTE_SHARE * set.tolerance {
         let msg = format!(
             "a merged face's boundary is up to {:.3} mm from its primitive (sampled, not certified); its edges carry that as their tolerance, which STEP keeps",
@@ -654,6 +661,7 @@ mod tests {
             max_edge_gap: 0.0,
             area: 0.0,
             patch_area: 0.0,
+            peeled: 0,
         };
         let left = vec![LeftPatches {
             primitive: ObjectId(8),
@@ -661,9 +669,11 @@ mod tests {
             patches: 1,
             reason: "a single patch".into(),
         }];
-        let all = unkept(left, &[face("plane", 5), face("cylinder", 3)], "the mesher does not take the merged body");
+        let peeled = MergedFace { peeled: 2, ..face("cylinder", 3) };
+        let all = unkept(left, &[face("plane", 5), peeled], "the mesher does not take the merged body");
         assert_eq!(all.len(), 3);
         assert_eq!((all[1].kind.as_str(), all[1].patches), ("plane", 5));
+        assert_eq!(all[2].patches, 5, "the patches peeled off a group stay patches with the rest of it");
         assert!(all[1..].iter().all(|l| l.reason.contains("mesher")));
         assert_eq!(all[0].reason, "a single patch", "what was left stays as it was");
     }
@@ -683,6 +693,7 @@ mod tests {
             max_edge_gap: 0.0,
             area: 0.0,
             patch_area: 0.0,
+            peeled: 0,
         };
         let tried = Merging {
             body: merged_brep,

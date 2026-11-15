@@ -719,9 +719,10 @@ fn a_border_slightly_beyond_the_gap_is_snapped_and_a_far_one_is_refused() {
 
 /// The slack of 1.25 gaps admits a group to the snap only: a group with its border between 1.0 and 1.25 gaps off the
 /// plane (1.1 here) whose snap cannot be made (one boundary edge is two spans, the same quadratic cut at its middle)
-/// is held to the gap itself and refused, not merged as it was.
+/// is held to the gap itself, not merged as it was: the patches on its boundary edges beyond the gap are peeled off
+/// (they stay patches) and what is left, within the gap, is merged as it is.
 #[test]
-fn a_border_beyond_the_gap_whose_snap_is_refused_is_not_merged_unsnapped() {
+fn a_border_beyond_the_gap_whose_snap_is_refused_is_peeled_and_the_rest_merged_within_the_gap() {
     use surfacecraft_kernel::merge::{GroupSpec, merge_faces_onto_shapes};
     use surfacecraft_kernel::record::brep::Curve;
     let net = box_with_saddle_top(0.0352);
@@ -742,6 +743,8 @@ fn a_border_beyond_the_gap_whose_snap_is_refused_is_not_merged_unsnapped() {
     };
     let plane = plane_through([0.0, 0.0, 10.0], [0.0, 0.0, 1.0]);
     let batch = merge_faces_onto_shapes(&body, &[GroupSpec { faces: &top, shape: &plane }], 0.04, &|| false).unwrap();
-    let why = batch.groups[0].as_ref().expect_err("refused, not merged unsnapped");
-    assert!(why.contains("from the surface (limit 0.0400)"), "{why}");
+    let g = batch.groups[0].as_ref().expect("the patches on the far border are peeled off, the rest is merged");
+    assert!(g.peeled >= 1 && g.peeled < top.len(), "not merged whole: {g:?}");
+    assert!(g.gap <= 0.04, "what is merged unsnapped is held to the gap itself: {g:?}");
+    assert!(g.snap_note.is_some(), "and says why it was not snapped");
 }

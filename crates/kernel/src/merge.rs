@@ -36,6 +36,7 @@ use crate::{KernelError, Result, finite_all};
 mod boundary;
 mod check;
 mod geometry;
+mod peel;
 mod place;
 mod rounds;
 mod samples;
@@ -107,6 +108,9 @@ pub struct GroupResult {
     pub patch_area: f64,
     /// Why its boundary was not moved onto the primitive first (the group was merged as it was), if it was not.
     pub snap_note: Option<String>,
+    /// Patches of the group peeled off its border, which stay patches (their snap would have folded a neighbour, or
+    /// the border there was too far from the primitive): the face replaced the others.
+    pub peeled: usize,
 }
 
 /// The outward direction of a patch face at the middle of its domain (its natural normal turned

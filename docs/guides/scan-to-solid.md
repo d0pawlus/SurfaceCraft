@@ -149,8 +149,13 @@ Hybrid (merge the patches that lie on a primitive; `surface.wrap` and the kernel
   or a neighbouring patch that would fold, turn over or come off its border stops the move for the
   groups concerned only. Such a group is merged as it was (its border may then be as far from the
   primitive as the gap allows, not a tenth of it) and the issue `hybrid_snap_skipped` says why, or it
-  stays patches with the reason in `left_as_patches`. A group that is snapped and then refused is
-  put back: its neighbours are as the wrap had them.
+  stays patches with the reason in `left_as_patches`. A group that could be merged neither way (its
+  border cannot be moved and is farther than the tolerance from the primitive) is peeled: the patches
+  at the corners of a neighbour that would fold and those on a border edge beyond the tolerance stay
+  patches, and the rest is tried again (at most 4 times, each time smaller; never into pieces, a hole
+  or less than 2 patches). `analytic.merged[].peeled` counts them and the issue
+  `hybrid_border_peeled` names the faces. A group that is snapped and then refused is put back: its
+  neighbours are as the wrap had them.
 - The merge is checked directly: each new face's normal agrees with the patches it replaced at
   sampled points (corners and middles of its triangles), it lies within the gap of them (a corner on
   the face's own boundary is left to the border test), the boundary of the face is the border of the
@@ -294,7 +299,7 @@ kernel refuses sheets of many faces. Give the wall thickness instead:
   `hybrid_merge_failed` (the merging step failed as a whole), `hybrid_no_analytic_face` (under `auto`
   only: no region is large enough for a group), `hybrid_failed` (anything else, with the reason). A scan
   with no primitive, or no group that could be merged, is not a failure under `method: hybrid`: it gives
-  the wrap with `analytic.faces` 0. Informational issues of a returned body: `hybrid_edge_gap`,
+  the wrap with `analytic.faces` 0. Informational issues of a returned body: `hybrid_border_peeled`, `hybrid_edge_gap`,
   `hybrid_merge_rejected`, `hybrid_no_analytic_face`, `hybrid_snap_skipped`. `thickness` has no meaning
   with `method: hybrid`.
 - `mostly_freeform` (only with `method: primitives`): less than half of the scan lies in regions

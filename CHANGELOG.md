@@ -18,6 +18,12 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
   vertex away from them; `scan.to_solid` takes it as the option `close_handles` (with `handle_size`),
   wraps the repaired copy, measures the solid against the scan as it was and raises
   `scan_handles_closed` (#120).
+- `scan.to_solid` with `method: hybrid`: a group of patches whose border cannot be snapped onto its
+  primitive (a neighbouring patch would fold) and is farther than the tolerance from it is no longer
+  lost whole: the patches at the corners of the neighbours that fail and on the border edges beyond
+  the tolerance are peeled off (they stay patches) and the rest is merged, at most 4 peels a round,
+  never into pieces, a hole or a single patch. `analytic.merged[].peeled` counts them and the issue
+  `hybrid_border_peeled` names the faces.
 
 ## [0.2.0] - 2026-11-13
 

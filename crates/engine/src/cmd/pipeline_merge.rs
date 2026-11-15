@@ -285,7 +285,8 @@ fn record(out: &mut Merging, protected: &[Protected], candidates: &[(usize, Vec<
                     primitive: p.primitive,
                     kind: p.kind.to_string(),
                     face: r.face,
-                    patches: g.len(),
+                    patches: g.len().saturating_sub(r.peeled),
+                    peeled: r.peeled,
                     max_edge_gap: r.gap,
                     area: 0.0,
                     patch_area: r.patch_area,
@@ -295,4 +296,50 @@ fn record(out: &mut Merging, protected: &[Protected], candidates: &[(usize, Vec<
         }
     }
     out.body = batch.brep;
+}
+
+/// The message of the issue `hybrid_border_peeled`: the merged faces whose group lost patches along its border (they
+/// stay patches), or `None` when none did.
+pub(super) fn peel_note(merged: &[MergedFace]) -> Option<String> {
+    let peeled: Vec<String> = merged
+        .iter()
+        .filter(|m| m.peeled > 0)
+        .map(|m| format!("{} of {} patches without {} at its border", m.kind, m.patches + m.peeled, m.peeled))
+        .collect();
+    (!peeled.is_empty()).then(|| {
+        format!(
+            "{} merged face(s) left patches along their border as patches (snapping the border there would fold a \
+             neighbouring patch, or it is farther than the tolerance from the primitive): {}",
+            peeled.len(),
+            peeled.join("; ")
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn face(patches: usize, peeled: usize) -> MergedFace {
+        MergedFace {
+            primitive: ObjectId(7),
+            kind: "plane".into(),
+            face: 0,
+            patches,
+            max_edge_gap: 0.0,
+            area: 0.0,
+            patch_area: 0.0,
+            peeled,
+        }
+    }
+
+    /// No issue when no group lost a patch; else one line per face that did, with the group's size and the count.
+    #[test]
+    fn the_peel_issue_names_the_faces_whose_border_was_peeled() {
+        assert!(peel_note(&[]).is_none());
+        assert!(peel_note(&[face(12, 0)]).is_none());
+        let msg = peel_note(&[face(12, 0), face(40, 3)]).expect("one face was peeled");
+        assert!(msg.starts_with("1 merged face(s)"), "{msg}");
+        assert!(msg.contains("plane of 43 patches without 3 at its border"), "{msg}");
+    }
 }
