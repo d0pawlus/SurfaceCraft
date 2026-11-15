@@ -5,7 +5,6 @@
 //! next steps, so that an agent needs one call instead of a dozen and cannot miss a poor result.
 use super::deviation::{NOISE_PRIMITIVE_MM, positive, yes};
 use super::hybrid::{FaceOf, FromRegionsIn, from_regions};
-use super::mesh_edit::{CleanIn, clean};
 use super::primitive::{AutoConstrainIn, auto_constrain};
 use super::qa::{CompareIn, CompareOut, QaIn, compare, scan_qa};
 use super::region::{AutoIn, RegionsOut, auto_segment};
@@ -156,7 +155,7 @@ pub struct ToSolidIn {
     /// Rebuild a closed scan with many handles or non-manifold edges, or that wrapping did not pass on, with `mesh.remesh` and wrap it (again) (default true; for at most the 4 largest co-equal parts of a split scan, never for its small parts). The wrap again, the larger-cap retry (`allow_retry`, for the first part in area order that qualifies for it) and the other method of `auto` are extra attempts: one budget of 2 per call (a count, no clock). At most 130 wraps per call in all (a wrap for each of 128 parts, and the 2 extra attempts). `false`: the scan is wrapped as it is.
     #[serde(default = "yes")]
     pub rebuild: bool,
-    /// A part of a scan with several pieces is co-equal, and modelled, when its area is at least this share of the largest piece's (0..1, default 0.1); its verdict is the call's. A smaller piece is modelled as a small part when it is a closed, consistently oriented solid of at least 100 triangles and 50 tolerances across (a small part that does not pass caps the verdict at `review` only with the pieces left out); every other piece is reported with its reason, not modelled.
+    /// A part of a scan with several pieces is co-equal, and modelled, when its area is at least this share of the largest piece's (0..1, default 0.1); its verdict is the call's. A smaller piece is modelled as a small part when it is a closed, consistently oriented solid of at least 100 triangles and 50 tolerances across; every other piece is reported with its reason, not modelled. A small part never fails the call: small parts that did not pass, pieces left out and parts beyond the cap keep it at `review` when together they hold more than 2 % of the surface (parts beyond the cap always do).
     #[serde(default)]
     pub part_share: Option<f64>,
     /// Wall thickness in mm of the solid made from an open scan (no default; not 0, at most half the scan's size): the cleaned scan is thickened and the shell wrapped (method `freeform`); deviation and verdict are measured against the scan. Positive puts the material behind the scanned face, negative in front of it; an error when the scan is closed, or has several co-equal parts (`scan.split` first).
@@ -367,21 +366,8 @@ fn prepare(s: &mut Session, i: &ToSolidIn, scan: ObjectId) -> CmdResult<ScanSumm
     }
     let (mut filled, mut left, mut non_manifold) = (0, qa.holes, qa.non_manifold_edges);
     if i.clean && !i.reuse_regions {
-        // a scan of many parts keeps its small parts, which the default (a share of the largest piece) drops
-        let tolerance = i.tolerance.unwrap_or(TOLERANCE);
-        let keep = s.doc.mesh(scan).and_then(|m| parts::keep_components_from(&m.mesh, tolerance));
-        let edit = clean(
-            s,
-            CleanIn {
-                object: ObjRef::Id(scan.0),
-                min_component_fraction: keep.map(|_| 0.0),
-                min_component_triangles: keep,
-                outlier_ratio: None,
-                fill_holes_max_edges: Some(i.fill_holes_max_edges.unwrap_or(FILL_HOLES_MAX_EDGES)),
-                remove_folds: None,
-                fold_tolerance: None,
-            },
-        )?;
+        let fill = i.fill_holes_max_edges.unwrap_or(FILL_HOLES_MAX_EDGES);
+        let edit = parts::clean_keeping_small_parts(s, scan, i.tolerance.unwrap_or(TOLERANCE), fill)?;
         filled = edit.holes_filled.unwrap_or(0);
         left = edit.holes_left.unwrap_or(0);
         if non_manifold > 0 {

@@ -145,6 +145,16 @@ fn edit_mesh(
     Ok(o)
 }
 
+/// Changes the geometry of mesh `object` with `f`, as the edit commands do (regions of the mesh go when
+/// its triangles change).
+pub(crate) fn edit_geometry(s: &mut Session, object: &ObjRef, f: impl FnOnce(&mut Mesh)) -> CmdResult<()> {
+    edit_mesh(s, object, |m, _| {
+        f(m);
+        Ok(())
+    })
+    .map(|_| ())
+}
+
 /// Stores `m` as the geometry edits act on (see [`edit_mesh`]).
 fn store_editable(s: &mut Session, id: ObjectId, m: Mesh) -> CmdResult<()> {
     let obj = s.doc.mesh_mut(id).ok_or_else(|| CmdError::Params(format!("no mesh {id}")))?;

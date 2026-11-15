@@ -63,30 +63,50 @@ fn small_closed_solids_are_planned_after_the_co_equal_parts() {
     for k in 0..12 {
         m.append(&ball(100.0 + 30.0 * f64::from(k), 5.0 + 0.1 * f64::from(k), 16));
     }
-    let (p, listed) = pieces_of(&m);
-    let plan = plan_of(&p, listed, (PART_SHARE, TOL), None);
+    let (p, _) = pieces_of(&m);
+    let plan = plan_of(&p, (PART_SHARE, TOL), None);
     assert_eq!((plan.chosen.len(), plan.co_equal), (13, 1));
     assert!(plan.left_out.is_empty() && plan.beyond_cap.is_empty());
     let areas: Vec<f64> = plan.chosen.iter().skip(1).map(|k| p.area(*k)).collect();
     assert!(areas.windows(2).all(|w| w[0] >= w[1]), "small parts by area: {areas:?}");
     assert!(worth_splitting(&plan));
-    let asked = plan_of(&p, listed, (PART_SHARE, TOL), Some(1));
+    let asked = plan_of(&p, (PART_SHARE, TOL), Some(1));
     assert_eq!((asked.chosen.len(), asked.not_requested.len()), (1, 12));
 }
 
-/// More parts than the cap: the cap keeps the co-equal ones first and counts the rest.
+/// More parts than the cap, all equal: each is co-equal by its area (the split listing stops at 64,
+/// the co-equal rule does not); the cap models the first 128 and counts the rest.
 #[test]
 fn the_cap_counts_what_it_leaves_out() {
     let mut m = Mesh::default();
     for k in 0..(MAX_COMPONENTS + 12) {
         m.append(&ball(30.0 * k as f64, 5.0, 16));
     }
-    let (p, listed) = pieces_of(&m);
-    let plan = plan_of(&p, listed, (PART_SHARE, TOL), None);
+    let (p, _) = pieces_of(&m);
+    let plan = plan_of(&p, (PART_SHARE, TOL), None);
     assert_eq!((plan.chosen.len(), plan.beyond_cap.len()), (MAX_COMPONENTS, 12));
-    // each ball holds under 1 % of the scan, so none is a listed part: the largest stands in as the
-    // co-equal one and the others are small parts
-    assert_eq!((listed, plan.co_equal), (0, 1));
+    assert_eq!(plan.co_equal, MAX_COMPONENTS, "more co-equal parts than the cap: the cap takes co-equal ones only");
+}
+
+/// Seventy equal balls: past the 64 the split lists, every one is still co-equal; a ball just above a
+/// tenth of the largest area is co-equal, one just below is a small part.
+#[test]
+fn co_equal_is_decided_by_area_not_by_the_listing() {
+    let mut m = Mesh::default();
+    for k in 0..70 {
+        m.append(&ball(30.0 * f64::from(k), 5.0, 16));
+    }
+    let (p, listed) = pieces_of(&m);
+    assert_eq!(listed, scan_split::MAX_PARTS);
+    let plan = plan_of(&p, (PART_SHARE, TOL), None);
+    assert_eq!((plan.co_equal, plan.chosen.len()), (70, 70));
+    // r = 20: area 5027; r = 6.4: 515 (10.2 %); r = 6.2: 483 (9.6 %)
+    let mut two = ball(0.0, 20.0, 96);
+    two.append(&ball(100.0, 6.4, 96));
+    two.append(&ball(200.0, 6.2, 96));
+    let (p, _) = pieces_of(&two);
+    let plan = plan_of(&p, (PART_SHARE, TOL), None);
+    assert_eq!((plan.co_equal, plan.chosen.len()), (2, 3));
 }
 
 /// One part and debris (small specks): nothing to split.
@@ -97,26 +117,51 @@ fn one_part_with_debris_is_not_worth_a_split() {
         m.append(&ball(100.0 + 10.0 * f64::from(k), 1.5, 8));
     }
     let (p, listed) = pieces_of(&m);
-    let plan = plan_of(&p, listed, (PART_SHARE, TOL), None);
+    let plan = plan_of(&p, (PART_SHARE, TOL), None);
     assert_eq!(listed, 1);
     assert_eq!(plan.left_out.len(), 30);
     assert!(plan.left_out.iter().all(|(_, r)| *r == LeftOutReason::Debris));
     assert!(!worth_splitting(&plan));
 }
 
-/// The cleaning keeps a small part that its default (a share of the largest piece) would drop, and
-/// keeps its defaults when there is none.
+/// The cleaning protects exactly the small parts below its default: debris only gives nothing; a
+/// closed ball of 224 triangles is protected, an open fragment of the same size beside it is not.
 #[test]
-fn the_cleaning_keeps_small_parts_below_its_default() {
+fn the_cleaning_protects_exactly_the_small_parts_below_its_default() {
     let mut m = ball(0.0, 40.0, 240);
     assert!(m.triangle_count() / 100 > 224, "a 224-triangle ball is below 1 % of the largest");
     for k in 0..5 {
         m.append(&ball(100.0 + 10.0 * f64::from(k), 1.5, 16));
     }
-    assert_eq!(keep_components_from(&m, TOL), None, "debris only");
-    m.append(&ball(300.0, 5.0, 16));
-    assert_eq!(keep_components_from(&m, TOL), Some(224));
-    assert_eq!(keep_components_from(&Mesh::default(), TOL), None);
+    assert!(protected_triangles(&m, TOL).is_empty(), "debris only");
+    let mut open = ball(300.0, 6.0, 20);
+    open.triangles.truncate(open.triangles.len() - 40);
+    m.append(&open);
+    assert!(protected_triangles(&m, TOL).is_empty(), "an open fragment is not protected");
+    let before = m.triangle_count() as u32;
+    m.append(&ball(400.0, 5.0, 16));
+    let kept = protected_triangles(&m, TOL);
+    assert_eq!(kept.len(), 224);
+    assert!(kept.iter().all(|t| *t >= before), "exactly the triangles of the ball");
+    assert!(protected_triangles(&Mesh::default(), TOL).is_empty());
+}
+
+/// The volume of a piece far from the origin keeps its digits; a piece with an infinite coordinate
+/// has no volume and is no part.
+#[test]
+fn the_volume_is_taken_about_the_piece_and_must_be_finite() {
+    let near = only_piece(&ball(0.0, 5.0, 16)).1;
+    let mut far = ball(0.0, 5.0, 16);
+    far.positions.iter_mut().for_each(|p| *p += surfacecraft_geom::Vec3::new(1e6, 1e6, 1e6));
+    let (p, v) = only_piece(&far);
+    assert!((v - near).abs() < 1e-6 * near, "{v} against {near}");
+    assert_eq!(reason_of(&p, v, TOL), None);
+    let mut broken = ball(0.0, 5.0, 16);
+    if let Some(q) = broken.positions.get_mut(3) {
+        q.x = f64::INFINITY;
+    }
+    let ps = pieces(&broken);
+    assert!(ps.iter().all(|p| reason_of(p, signed_volume(&broken, p), TOL).is_some()), "{}", ps.len());
 }
 
 /// Co-equal counting for the shell check is unchanged: two equal balls are two co-equal parts, a

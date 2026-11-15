@@ -263,6 +263,12 @@ fn to_solid_of_many_parts() {
         if let Some(p) = out["preparation"].as_array().and_then(|a| a.first()) {
             eprintln!("    preparation {}: {}", p["step"], p["numbers"]);
         }
+        // what one copy of the document costs once every part is in it (a split run takes one per part)
+        let t = std::time::Instant::now();
+        let copies: Vec<_> = (0..20).map(|_| s.doc.clone()).collect();
+        let per = t.elapsed().as_secs_f64() / 20.0;
+        drop(copies);
+        eprintln!("    one copy of the document ({} objects): {:.3} ms", s.doc.all_ids().len(), per * 1000.0);
         for (k, c) in comps.iter().enumerate() {
             let tried: Vec<String> = c["attempts"]
                 .as_array()

@@ -212,7 +212,7 @@ pub(super) fn split_parts(
     let a = scan_split::analyse(&mesh, MIN_SHARE, true);
     let listed = a.parts.len();
     let pieces = Pieces::of(&mesh, a);
-    let plan = parts::plan_of(&pieces, listed, (part_share, set.tolerance), requested);
+    let plan = parts::plan_of(&pieces, (part_share, set.tolerance), requested);
     if listed < 2 && !parts::worth_splitting(&plan) {
         return Ok(None);
     }
@@ -240,6 +240,16 @@ pub(super) fn split_parts(
 /// chosen moment without relying on time.
 #[cfg(test)]
 static AFTER_PART: std::sync::Mutex<Option<Box<dyn Fn(usize) + Send>>> = std::sync::Mutex::new(None);
+
+/// Test hook: the part of this name ends in an error inside its run (as a part whose pipeline fails).
+#[cfg(test)]
+static FAIL_NAME: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn fail_hook(part_in: &ToSolidIn) -> CmdResult<()> {
+    let hit = FAIL_NAME.lock().ok().is_some_and(|g| g.is_some() && *g == part_in.name);
+    if hit { Err(CmdError::Failed("the test made this part fail".into())) } else { Ok(()) }
+}
 
 #[cfg(test)]
 fn after_part_hook(n: usize) {
@@ -277,9 +287,11 @@ fn run_part(
         ..i.clone()
     };
     let triangles = s.doc.mesh(id).map_or(0, |m| m.mesh.triangle_count());
+    let before = object_ids(s);
     let mut out = model_part(s, &part_in, set, id)?;
     if needs_freeform(i.method, &out, &set.budget.refusal()) {
-        out = freeform_fallback(s, &part_in, set, id, out)?;
+        let first = added_since(s, &before);
+        out = freeform_fallback(s, &part_in, set, (id, &first), out)?;
     }
     let comp = ComponentOut {
         mesh: id,
@@ -325,28 +337,47 @@ fn wins(again: &ToSolidOut, first: &ToSolidOut) -> bool {
     again.body.is_some() && (a > f || (a == f && within(again) > within(first)))
 }
 
-/// The part's one freeform wrap after a failed primitives result: the better of the two is kept (its
-/// attempts after the other's), the other's solid is removed.
+/// Every object id of the document.
+fn object_ids(s: &Session) -> std::collections::BTreeSet<u64> {
+    s.doc.all_ids().into_iter().collect()
+}
+
+/// The objects added to the document since `before` was taken.
+fn added_since(s: &Session, before: &std::collections::BTreeSet<u64>) -> Vec<ObjectId> {
+    s.doc.all_ids().into_iter().filter(|x| !before.contains(x)).map(ObjectId).collect()
+}
+
+/// Removes the objects of an attempt that lost.
+fn remove_all(s: &mut Session, ids: &[ObjectId]) {
+    for x in ids {
+        s.doc.remove(*x);
+    }
+}
+
+/// The part's one freeform wrap after a failed primitives result (whose objects are `first`): the
+/// better of the two is kept (its attempts after the other's), every object of the other attempt is
+/// removed, and the solid kept has the part's name.
 fn freeform_fallback(
     s: &mut Session,
     part_in: &ToSolidIn,
     set: &Settings,
-    id: ObjectId,
+    (id, first): (ObjectId, &[ObjectId]),
     mut out: ToSolidOut,
 ) -> CmdResult<ToSolidOut> {
     let watch = Stopwatch::start();
+    let before = object_ids(s);
     let mut again = model_part(s, &ToSolidIn { method: Method::Freeform, ..part_in.clone() }, set, id)?;
+    let second = added_since(s, &before);
+    let name = part_in.name.clone().unwrap_or_else(|| set.name.clone());
     if !wins(&again, &out) {
-        if let Some(b) = &again.body {
-            s.doc.remove(b.id);
-        }
+        remove_all(s, &second);
         again.attempts.iter_mut().for_each(|a| a.returned = false);
         out.attempts.append(&mut again.attempts);
+        rename_body(s, &out, &name);
         return Ok(out);
     }
-    if let Some(b) = &out.body {
-        s.doc.remove(b.id);
-    }
+    remove_all(s, first);
+    rename_body(s, &again, &name);
     let step = PrepStep {
         step: "freeform_fallback".into(),
         reason: "the primitives did not model this part, so it was wrapped in patches as its one wrap".into(),
@@ -359,6 +390,15 @@ fn freeform_fallback(
     again.attempts = tried;
     again.prep.preparation.insert(0, step);
     Ok(again)
+}
+
+/// Gives the solid of `out` the name `name`.
+fn rename_body(s: &mut Session, out: &ToSolidOut, name: &str) {
+    if let Some(b) = &out.body
+        && s.doc.body(b.id).is_some_and(|o| o.name != name)
+    {
+        s.doc.rename(b.id, name);
+    }
 }
 
 /// Runs `run` on the document; a failure other than a cancellation takes back everything the run
@@ -384,6 +424,8 @@ pub(super) fn restoring_on_failure<T>(
 fn model_part(s: &mut Session, part_in: &ToSolidIn, set: &Settings, id: ObjectId) -> CmdResult<ToSolidOut> {
     // the extra attempts of all parts of a call draw from one budget (the call's own)
     let run = |s: &mut Session| {
+        #[cfg(test)]
+        fail_hook(part_in)?;
         let pset = Settings { budget: set.budget.clone(), ..settings(s, part_in)? };
         let scan = pset.scan;
         let report = prepare(s, part_in, scan)?;

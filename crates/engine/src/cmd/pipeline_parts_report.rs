@@ -1,10 +1,10 @@
 //! The result of a split `scan.to_solid` run (P9-O9): one verdict, the issues and next steps of the
 //! whole scan, built from the result of each modelled part and from what was left out.
 //!
-//! The verdict is the worst co-equal part's. Small parts never lower it below `review`: a small part
-//! that does not pass counts, with the pieces left out and the parts beyond the cap, as surface that
-//! was not modelled to a pass, and when that is more than [`UNMODELLED_REVIEW_SHARE`] of the scan the
-//! verdict is at most `review`. The output stays bounded whatever the number of parts: the issues of
+//! The verdict is the worst co-equal part's. A small part never lowers it below `review`: small parts
+//! without a pass, pieces left out and parts beyond the cap keep it at most `review` when together they
+//! hold more than [`UNMODELLED_REVIEW_SHARE`] of the scan (parts beyond the cap always do). Small parts
+//! without a pass are never silent: `small_parts_not_passed` counts them and a next step names them. The output stays bounded whatever the number of parts: the issues of
 //! small parts are summed up in one issue, their next steps are at most [`MAX_SMALL_PART_STEPS`].
 use super::parts::LeftOutReason;
 use super::prepare::{ComponentOut, PrepOut, PrepStep};
@@ -94,23 +94,33 @@ fn co_equal_issues(parts: &[(ComponentOut, ToSolidOut)]) -> Vec<Issue> {
     issues
 }
 
-/// "3 open, 2 debris": the reasons of the pieces left out.
-fn reasons_text(tally: &Tally) -> String {
-    let words: Vec<String> = tally.by_reason.iter().map(|(r, n, _)| format!("{n} {}", r.word())).collect();
-    words.join(", ")
+/// The pieces left out with a reason, `0` when none.
+fn left_with(tally: &Tally, r: LeftOutReason) -> usize {
+    tally.by_reason.iter().find(|x| x.0 == r).map_or(0, |x| x.1)
 }
 
 fn left_out_issue(tally: &Tally) -> Issue {
     let msg = format!(
-        "{} pieces ({} of them debris), {:.1} % of the surface of the scan, were not modelled ({}): a piece is modelled when it is co-equal (at least `part_share` of the largest part) or a closed, consistently oriented solid of at least {} triangles and {} tolerances across; lower `part_share` to model them with the rest, or run `scan.split` and model a piece on its own with `scan.to_solid`",
+        "pieces not modelled: {} ({:.1} % of the surface of the scan); by reason: debris {}, open {}, not oriented {}, inside out {}; a piece is modelled when it is co-equal (at least `part_share` of the largest part) or a closed, consistently oriented solid of at least {} triangles and {} tolerances across; lower `part_share` to model them with the rest, or run `scan.split` and model a piece on its own with `scan.to_solid`",
         tally.left_out.0,
-        tally.debris_pieces,
         100.0 * tally.left_out.1,
-        reasons_text(tally),
+        left_with(tally, LeftOutReason::Debris),
+        left_with(tally, LeftOutReason::Open),
+        left_with(tally, LeftOutReason::NotOriented),
+        left_with(tally, LeftOutReason::InsideOut),
         super::parts::MIN_PART_TRIANGLES,
         super::parts::MIN_PART_SPAN,
     );
     issue("unmodelled_pieces", msg)
+}
+
+/// The word of a verdict as in the output.
+fn verdict_word(v: Verdict) -> &'static str {
+    match v {
+        Verdict::Pass => "pass",
+        Verdict::Review => "review",
+        Verdict::Fail => "fail",
+    }
 }
 
 fn small_parts_issue(parts: &[(ComponentOut, ToSolidOut)], (count, share): (usize, f64)) -> Issue {
@@ -118,50 +128,60 @@ fn small_parts_issue(parts: &[(ComponentOut, ToSolidOut)], (count, share): (usiz
         .iter()
         .filter(|(c, _)| !c.co_equal && c.verdict != Verdict::Pass)
         .take(MAX_NAMED_PARTS)
-        .map(|(c, _)| format!("{} ({:?})", c.name, c.verdict).to_lowercase())
+        .map(|(c, _)| format!("{} ({})", c.name, verdict_word(c.verdict)))
         .collect();
     let msg = format!(
-        "{count} small parts, {:.1} % of the surface of the scan, were modelled without a pass (among them {}); each has its verdict and issues in `components`",
+        "small parts modelled without a pass: {count} ({:.1} % of the surface of the scan), among them {}; each has its verdict and issues in `components`",
         100.0 * share,
         named.join(", ")
     );
     issue("parts_not_passed", msg)
 }
 
-/// The issues of the parts (named by part when there are several) and of what was not modelled to
-/// a pass; whether the verdict must come down to `review` for them.
-pub(super) fn collect_issues(parts: &[(ComponentOut, ToSolidOut)], tally: &Tally) -> (Vec<Issue>, bool) {
+/// What the parts and the tally say about the whole call.
+pub(super) struct Findings {
+    pub issues: Vec<Issue>,
+    /// The verdict is at most `review`.
+    pub cap: bool,
+    /// Surface was left out (pieces, cavity skins, parts beyond the cap): the split is a next step.
+    pub left_out: bool,
+}
+
+/// The issues of the parts (named by part when there are several) and of what was not modelled to a
+/// pass. Pieces left out, small parts without a pass and parts beyond the cap keep the verdict at most
+/// `review` when together they hold more than [`UNMODELLED_REVIEW_SHARE`] of the scan; parts beyond the
+/// cap always do. A small part never makes the call `fail`.
+pub(super) fn collect_issues(parts: &[(ComponentOut, ToSolidOut)], tally: &Tally) -> Findings {
     let mut issues = co_equal_issues(parts);
     let missed = small_not_passed(parts, tally);
-    let unmodelled = tally.left_out.1 + missed.1 + tally.beyond_cap.1;
-    let over = unmodelled > UNMODELLED_REVIEW_SHARE;
+    let over = tally.left_out.1 + missed.1 + tally.beyond_cap.1 > UNMODELLED_REVIEW_SHARE;
     if over && tally.left_out.0 > 0 {
         issues.push(left_out_issue(tally));
     }
     if over && missed.0 > 0 {
         issues.push(small_parts_issue(parts, missed));
     }
-    let mut cap = over;
-    if tally.cavities.1 > UNMODELLED_REVIEW_SHARE {
+    let cavities = tally.cavities.1 > UNMODELLED_REVIEW_SHARE;
+    if cavities {
         let msg = format!(
             "{} inner shells (cavity skins of hollow parts, {:.1} % of the surface) were not modelled: the solids are the outer shells; `scan.split` makes a mesh of each shell if a cavity has to be modelled on its own",
             tally.cavities.0,
             100.0 * tally.cavities.1
         );
         issues.push(issue("nested_shell_skipped", msg));
-        cap = true;
     }
-    if tally.beyond_cap.0 > 0 {
+    let beyond = tally.beyond_cap.0 > 0;
+    if beyond {
         let msg = format!(
-            "{} more parts ({:.1} % of the surface) were not modelled: at most {} are per call, the co-equal ones and then the largest; run `scan.split` and model the others on their own (`scan.to_solid` on each mesh), or raise `part_share` to leave the small ones out",
+            "parts beyond the limit of {} per call, not modelled: {} ({:.1} % of the surface); the co-equal ones come first, then the largest; run `scan.split` and model the others on their own (`scan.to_solid` on each mesh), or raise `part_share` to leave the small ones out",
+            super::parts::MAX_COMPONENTS,
             tally.beyond_cap.0,
             100.0 * tally.beyond_cap.1,
-            super::parts::MAX_COMPONENTS
         );
         issues.push(issue("parts_beyond_limit", msg));
-        cap = true;
     }
-    (issues, cap)
+    let left_out = (over && tally.left_out.0 > 0) || cavities || beyond;
+    Findings { issues, cap: over || cavities || beyond, left_out }
 }
 
 /// The steps of the parts that did not pass, each labelled with its part: all co-equal ones (three
@@ -178,6 +198,22 @@ fn steps_of_parts_not_passed(parts: &[(ComponentOut, ToSolidOut)]) -> Vec<NextSt
         }
     }
     next
+}
+
+/// When small parts did not pass: how many, the first [`MAX_NAMED_PARTS`] named, and the call that
+/// models the first of them on its own (also when they hold too little of the surface to be an issue).
+fn small_parts_step(parts: &[(ComponentOut, ToSolidOut)]) -> Option<NextStep> {
+    let missed: Vec<&ComponentOut> =
+        parts.iter().map(|p| &p.0).filter(|c| !c.co_equal && c.verdict != Verdict::Pass).collect();
+    let first = missed.first()?;
+    let named: Vec<String> =
+        missed.iter().take(MAX_NAMED_PARTS).map(|c| format!("{} ({})", c.name, verdict_word(c.verdict))).collect();
+    let why = format!(
+        "small parts that did not pass: {} ({}); each has its verdict in `components`: model one on its own, this one first",
+        missed.len(),
+        named.join(", ")
+    );
+    Some(NextStep { command: "scan.to_solid".into(), params: json!({"scan": first.mesh.0}), why })
 }
 
 /// The next steps of a split result: every part passed and nothing left out: one export of all the
@@ -203,6 +239,7 @@ pub(super) fn next_steps_of(parts: &[(ComponentOut, ToSolidOut)], scan: ObjectId
         };
         next.push(export(&passed, why));
     } else {
+        next.extend(small_parts_step(parts));
         next.extend(steps_of_parts_not_passed(parts));
         if !passed.is_empty() {
             next.push(export(&passed, format!("export the {} parts that passed", passed.len())));
@@ -272,13 +309,14 @@ pub(super) fn combine(
     parts: Vec<(ComponentOut, ToSolidOut)>,
     tally: Tally,
 ) -> ToSolidOut {
-    let (issues, capped) = collect_issues(&parts, &tally);
+    let found = collect_issues(&parts, &tally);
+    let (issues, capped) = (found.issues, found.cap);
     let mut verdict = parts.iter().filter(|c| c.0.co_equal).fold(Verdict::Pass, |v, c| worst(v, c.0.verdict));
     if capped && verdict == Verdict::Pass {
         verdict = Verdict::Review;
     }
     let deviation = aggregate(&parts);
-    let next = next_steps_of(&parts, set.scan, capped);
+    let next = next_steps_of(&parts, set.scan, found.left_out);
     let largest = parts.iter().enumerate().max_by(|a, b| a.1.0.area.total_cmp(&b.1.0.area)).map_or(0, |(k, _)| k);
     let bodies: Vec<BodyOut> = parts.iter().filter_map(|(c, _)| c.body.clone()).collect();
     let step = split_step(&parts, &tally);

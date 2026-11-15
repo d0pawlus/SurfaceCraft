@@ -13,10 +13,15 @@
 //! real part of the scan of many parts has 294 triangles and 32.9 mm across (the parts cleaning used
 //! to drop there: 236 to 248 triangles, 69 to 82 mm); the closed debris on the other scans that faces
 //! outward has at most 50 triangles and 1.22 mm across (8.0 mm for a flat closed sliver of no volume).
-use crate::cmd::mesh_edit::{CLEAN_COMPONENT_FRACTION, CLEAN_COMPONENT_TRIANGLES};
+use crate::Session;
+use crate::cmd::mesh_edit::{
+    CLEAN_COMPONENT_FRACTION, CLEAN_COMPONENT_TRIANGLES, CleanIn, EditOut, clean, edit_geometry,
+};
 use crate::cmd::scan_split::{Analysis, MIN_SHARE};
+use crate::cmd::{CmdResult, ObjRef};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use surfacecraft_doc::ObjectId;
 use surfacecraft_geom::Mesh;
 use surfacecraft_geom::pieces::{Piece, pieces};
 
@@ -86,12 +91,17 @@ impl Pieces {
     }
 }
 
-/// Signed volume enclosed by the triangles of `p`.
+/// Signed volume enclosed by the triangles of `p`, summed about the centre of its bounding box (so that
+/// a piece far from the origin keeps its digits).
 pub(super) fn signed_volume(mesh: &Mesh, p: &Piece) -> f64 {
+    let c = p.bbox.center().coords;
     p.triangles
         .iter()
         .filter_map(|t| mesh.triangle(*t as usize))
-        .map(|[a, b, c]| a.coords.dot(&b.coords.cross(&c.coords)) / 6.0)
+        .map(|[a, b, d]| {
+            let (a, b, d) = (a.coords - c, b.coords - c, d.coords - c);
+            a.dot(&b.cross(&d)) / 6.0
+        })
         .sum()
 }
 
@@ -103,7 +113,7 @@ pub(super) fn reason_of(p: &Piece, volume: f64, tolerance: f64) -> Option<LeftOu
         Some(LeftOutReason::Open)
     } else if p.unoriented_edges > 0 {
         Some(LeftOutReason::NotOriented)
-    } else if volume.is_nan() || volume <= 0.0 {
+    } else if !(volume.is_finite() && volume > 0.0) {
         Some(LeftOutReason::InsideOut)
     } else {
         None
@@ -132,17 +142,22 @@ fn by_area(p: &Pieces, mut ks: Vec<usize>) -> Vec<usize> {
     ks
 }
 
-/// The co-equal parts (largest first) and the rest of the pieces that are not cavity skins.
-fn co_equal_of(p: &Pieces, listed: usize, part_share: f64) -> (Vec<usize>, Vec<usize>) {
-    let outer: Vec<usize> = (0..p.all.len()).filter(|k| !p.cavity.get(*k).copied().unwrap_or(false)).collect();
+/// The co-equal parts (largest first) and the rest of the pieces that are not cavity skins. A piece is
+/// co-equal by its area alone (at least `part_share` of the largest outer piece), wherever the split
+/// listing ends; the largest outer piece is always co-equal, so a call always has one.
+fn co_equal_of(p: &Pieces, part_share: f64) -> (Vec<usize>, Vec<usize>) {
+    let mut outer: Vec<usize> = (0..p.all.len()).filter(|k| !p.cavity.get(*k).copied().unwrap_or(false)).collect();
+    if outer.is_empty() {
+        // only cavity skins (an analysis that nests every piece in another): the largest piece stands in
+        outer = (0..p.all.len()).collect();
+    }
     let largest = outer.iter().map(|k| p.area(*k)).fold(0.0, f64::max);
     let (equal, rest): (Vec<usize>, Vec<usize>) =
-        outer.iter().copied().partition(|k| *k < listed && p.area(*k) >= part_share * largest);
+        outer.iter().copied().partition(|k| p.area(*k) >= part_share * largest);
     let mut equal = by_area(p, equal);
     if equal.is_empty() {
-        // never a result without a body: fall back to the largest outer piece (or the largest piece)
-        let pool = if outer.is_empty() { (0..p.all.len()).collect() } else { outer };
-        equal.extend(pool.into_iter().max_by(|x, y| p.area(*x).total_cmp(&p.area(*y))));
+        // non-finite areas: fall back to the first outer piece
+        equal.extend(outer.first().copied());
     }
     let rest = rest.into_iter().filter(|k| !equal.contains(k)).collect();
     (equal, rest)
@@ -163,15 +178,11 @@ fn small_parts_of(p: &Pieces, rest: Vec<usize>, tolerance: f64) -> (Vec<usize>, 
 }
 
 /// The plan of a split run: what is modelled, in which order, and what is left out and why. A
-/// request for a number of parts takes the largest co-equal ones and nothing else.
-pub(super) fn plan_of(
-    p: &Pieces,
-    listed: usize,
-    (part_share, tolerance): (f64, f64),
-    requested: Option<usize>,
-) -> Plan {
+/// request for a number of parts takes the largest co-equal ones and nothing else. More than
+/// [`MAX_COMPONENTS`] co-equal parts: the largest are modelled, the rest are beyond the cap.
+pub(super) fn plan_of(p: &Pieces, (part_share, tolerance): (f64, f64), requested: Option<usize>) -> Plan {
     let cavities: Vec<usize> = (0..p.all.len()).filter(|k| p.cavity.get(*k).copied().unwrap_or(false)).collect();
-    let (mut equal, rest) = co_equal_of(p, listed, part_share);
+    let (mut equal, rest) = co_equal_of(p, part_share);
     let (small, left_out) = small_parts_of(p, rest, tolerance);
     if let Some(n) = requested {
         let take = n.min(MAX_COMPONENTS).min(equal.len());
@@ -196,27 +207,64 @@ pub(super) fn worth_splitting(plan: &Plan) -> bool {
 /// Number of co-equal parts of `mesh` (those a split run would model as co-equal; 1 for a single piece).
 pub(super) fn coequal_parts(mesh: &Mesh) -> usize {
     let a = crate::cmd::scan_split::analyse(mesh, MIN_SHARE, true);
-    let listed = a.parts.len();
-    if listed < 2 {
-        return listed;
+    if a.parts.len() + a.extra.len() + a.rest.len() < 2 {
+        return a.parts.len() + a.extra.len() + a.rest.len();
     }
-    co_equal_of(&Pieces::of(mesh, a), listed, PART_SHARE).0.len()
+    co_equal_of(&Pieces::of(mesh, a), PART_SHARE).0.len()
 }
 
-/// The smallest component the cleaning of `scan.to_solid` must keep: `Some` with a triangle count below
-/// the default of `mesh.clean` when a piece under that default is a small part by [`reason_of`] (a
-/// scan of many parts, where the default is a share of the largest piece); `None` otherwise, and the
-/// cleaning keeps its defaults.
-pub(super) fn keep_components_from(mesh: &Mesh, tolerance: f64) -> Option<usize> {
+/// The triangles of the pieces of `mesh` that the default cleaning would remove (below 1 % of the
+/// largest piece's triangles, or 20) but that are small parts by [`reason_of`]. They are judged on the
+/// scan as it is: a piece that would only qualify once a hole of it is filled is not kept (none on the
+/// scan of many parts: the 10 pieces the default dropped there were all closed).
+pub(super) fn protected_triangles(mesh: &Mesh, tolerance: f64) -> Vec<u32> {
     let ps = pieces(mesh);
-    let largest = ps.iter().map(|p| p.triangles.len()).max()?;
+    let Some(largest) = ps.iter().map(|p| p.triangles.len()).max() else { return Vec::new() };
     let floor = ((largest as f64 * CLEAN_COMPONENT_FRACTION).ceil() as usize).max(CLEAN_COMPONENT_TRIANGLES);
-    ps.iter()
+    let mut tris: Vec<u32> = ps
+        .iter()
         .filter(|p| p.triangles.len() < floor)
         .filter(|p| reason_of(p, signed_volume(mesh, p), tolerance).is_none())
-        .map(|p| p.triangles.len())
-        .min()
-        .map(|n| n.max(CLEAN_COMPONENT_TRIANGLES))
+        .flat_map(|p| p.triangles.iter().copied())
+        .collect();
+    tris.sort_unstable();
+    tris
+}
+
+/// The cleaning of `scan.to_solid`: `mesh.clean` with its defaults and the hole filling of the call.
+/// The small parts the defaults would drop are protected by identity: taken out first, the rest
+/// cleaned exactly as before, then put back unchanged (no outlier removal touches them). A scan
+/// without such a piece is cleaned exactly as before.
+pub(super) fn clean_keeping_small_parts(
+    s: &mut Session,
+    scan: ObjectId,
+    tolerance: f64,
+    fill_holes_max_edges: usize,
+) -> CmdResult<EditOut> {
+    let object = ObjRef::Id(scan.0);
+    let kept = s.doc.mesh(scan).map(|m| (protected_triangles(&m.mesh, tolerance), m.mesh.clone()));
+    let kept = kept.filter(|(t, _)| !t.is_empty()).map(|(t, m)| {
+        let rest: Vec<u32> = (0..m.triangle_count() as u32).filter(|x| t.binary_search(x).is_err()).collect();
+        (m.submesh(&t), m.submesh(&rest))
+    });
+    if let Some((_, rest)) = &kept {
+        edit_geometry(s, &object, |m| *m = rest.clone())?;
+    }
+    let input = CleanIn {
+        object: object.clone(),
+        min_component_fraction: None,
+        min_component_triangles: None,
+        outlier_ratio: None,
+        fill_holes_max_edges: Some(fill_holes_max_edges),
+        remove_folds: None,
+        fold_tolerance: None,
+    };
+    let mut edit = clean(s, input)?;
+    if let Some((parts, _)) = kept {
+        edit.triangles += parts.triangle_count();
+        edit_geometry(s, &object, |m| m.append(&parts))?;
+    }
+    Ok(edit)
 }
 
 #[cfg(test)]

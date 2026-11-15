@@ -173,14 +173,31 @@ fn the_attempts_of_the_parts_of_one_call_share_a_budget_of_two_extra_attempts() 
     assert_eq!(entry["skipped"]["call"]["params"]["method"], entry["method"], "{entry}");
     // a part whose wrap was refused and whose primitives did not pass gets its own wrap afterwards;
     // exactly one entry of each part is the returned one
-    for k in &skipped_parts {
-        let l = &lists[*k];
-        let refused_wrap = l.iter().any(|a| a.0 == "freeform" && a.3.is_some());
-        let own_wrap = l.iter().skip_while(|a| a.3.is_none()).any(|a| a.0 == "freeform" && a.3.is_none());
-        let primitives_passed = l[0].1.as_deref() == Some("pass");
-        assert!(!refused_wrap || primitives_passed || own_wrap, "{lists:?}");
+    let rank = |v: &Option<String>| match v.as_deref() {
+        Some("pass") => 2,
+        Some("review") => 1,
+        _ => 0,
+    };
+    for (k, l) in lists.iter().enumerate() {
+        let returned: Vec<_> = l.iter().filter(|a| a.2).collect();
+        assert_eq!(returned.len(), 1, "part {k}: {lists:?}");
+        assert_eq!(returned[0].1.as_deref(), parts[k]["verdict"].as_str(), "the component is the returned attempt");
+        if !l.iter().any(|a| a.0 == "freeform" && a.3.is_some()) {
+            continue;
+        }
+        // the wrap was refused: the part's own wrap follows, and the better of the two by verdict is
+        // returned (equal verdicts: the share within the tolerance decides, so either may be returned)
+        let own = l.iter().skip_while(|a| a.3.is_none()).find(|a| a.0 == "freeform" && a.3.is_none());
+        let own = own.unwrap_or_else(|| panic!("part {k} refused its wrap and got none: {lists:?}"));
+        let (first, wrap) = (rank(&l[0].1), rank(&own.1));
+        let fell_back = parts[k]["preparation"].as_array().unwrap().iter().any(|p| p["step"] == "freeform_fallback");
+        assert_eq!(fell_back, own.2, "the step says which result was kept: {}", parts[k]);
+        if wrap > first {
+            assert!(own.2, "part {k}: the better wrap is returned: {lists:?}");
+        } else if wrap < first {
+            assert!(l[0].2, "part {k}: the better primitives result is returned: {lists:?}");
+        }
     }
-    assert!(lists.iter().all(|l| l.iter().filter(|a| a.2).count() == 1), "{lists:?}");
     assert_eq!(s.doc.bodies.len(), 3);
 }
 
