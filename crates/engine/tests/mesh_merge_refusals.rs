@@ -100,6 +100,41 @@ fn a_scan_wound_both_ways_is_refused() {
     assert_refused(&s, &out, "inconsistent_winding", 2);
 }
 
+/// The `count` triangles of view 0 nearest to the point of the blob farthest along +x, flipped: a
+/// patch turned inside out where only view 0 sees the surface.
+fn with_flipped_patch(count: usize) -> Vec<Mesh> {
+    let mut views = halves();
+    let m = &mut views[0];
+    let tip = m.positions.iter().copied().max_by(|a, b| a.x.total_cmp(&b.x)).unwrap();
+    let away = |i: usize| (m.face_centroid(i).unwrap() - tip).norm();
+    let mut ids: Vec<usize> = (0..m.triangle_count()).collect();
+    ids.sort_by(|&i, &j| away(i).total_cmp(&away(j)));
+    ids.truncate(count);
+    for i in &ids {
+        let t = m.triangles[*i];
+        m.triangles[*i] = [t[0], t[2], t[1]];
+    }
+    eprintln!("{} triangles flipped", ids.len());
+    views
+}
+
+#[test]
+fn a_patch_turned_inside_out_is_refused() {
+    let mut s = session(&with_flipped_patch(60));
+    let out = merge(&mut s, 2, json!({}));
+    assert_refused(&s, &out, "inconsistent_winding", 2);
+}
+
+#[test]
+fn a_few_flipped_triangles_are_left_out_and_reported() {
+    // one triangle (0.07 % of the area, below the 0.1 % that refuses) is left out; no flipped part remains
+    let mut s = session(&with_flipped_patch(1));
+    let out = merge(&mut s, 2, json!({}));
+    assert!(codes(&out).contains(&"flipped_triangles_dropped".to_string()), "{:?}", codes(&out));
+    assert_eq!(out["after"]["unoriented_edges"], json!(0));
+    assert!(out["scans"][0]["dropped"].as_u64().unwrap() >= 1);
+}
+
 #[test]
 fn a_closed_scan_turned_inside_out_is_refused() {
     let whole = noisy(blob_at(48), 3);
@@ -121,7 +156,7 @@ fn triangles_on_non_manifold_edges_are_left_out_and_counted() {
     let mut s = session(&views);
     let out = merge(&mut s, 2, json!({}));
     assert!(codes(&out).contains(&"non_manifold_input".to_string()), "{:?}", codes(&out));
-    assert!(out["scans"][0]["dropped_non_manifold"].as_u64().unwrap() >= 3, "the fin and the two triangles under it");
+    assert!(out["scans"][0]["dropped"].as_u64().unwrap() >= 3, "the fin and the two triangles under it");
     assert_eq!(out["after"]["non_manifold_edges"], json!(0));
     assert_eq!(out["after"]["unoriented_edges"], json!(0));
 }
@@ -198,6 +233,7 @@ fn pieces_of_one_scan_merge_back_into_it() {
     // measured 0.999 (1984 of 1986 vertices of the scan, bit for bit)
     assert!(share >= 0.95, "{share}");
     assert_eq!(out["checks"]["moved_vertices"], json!(0));
+    assert_eq!(out["checks"]["unwelded_vertices"], json!(0));
 }
 
 #[test]

@@ -72,12 +72,12 @@ pub struct MergeScanOut {
     pub triangles: usize,
     /// Kept in the result as they were.
     pub kept: usize,
-    /// Removed (another scan keeps that surface), including triangles left out for lying on an edge of three or more triangles.
+    /// Removed (another scan keeps that surface), including the triangles left out (`dropped`).
     pub removed: usize,
     /// Removed, then put back because the result had all their corners at exactly their places (pieces of one scan).
     pub restored: usize,
-    /// Triangles left out because they lie on an edge of three or more triangles.
-    pub dropped_non_manifold: usize,
+    /// Triangles left out: exact duplicates, on an edge of three or more triangles, or wound against the rest of their piece.
+    pub dropped: usize,
     /// Share of the scan's area within the tolerance of facing surface of another scan (0..1).
     pub overlap_share: f64,
     /// Area of the scan and the area removed (mm²).
@@ -134,6 +134,10 @@ pub struct MergeSeamOut {
     pub refused_crossing: usize,
     /// Seam triangles taken back because they met another fan at one vertex only, before the hole was filled again.
     pub unpinched: usize,
+    /// Removed triangles whose centre the seam left without result surface within the tolerance.
+    pub uncovered_after_seam: usize,
+    /// Of them, put back on their own scan's vertices (nothing moves, no scans are joined by them).
+    pub recovered: usize,
     /// Triangles of small stray pieces dropped because they lay wholly on the rest of the result.
     pub strays_dropped: usize,
     /// Cut edges left open.
@@ -174,16 +178,18 @@ pub struct MergeChecksOut {
     pub kept_vertices: usize,
     /// Of them, moved by a weld of coincident seam vertices.
     pub moved_vertices: usize,
-    /// Largest move (mm; at most 0.001 median edges).
+    /// Largest move (mm; at most a quarter of the tolerance and a tenth of the median edge).
     pub max_vertex_move: f64,
     /// Triangles the merge added (seam, restored) that cross another triangle of the result.
     pub added_crossings: usize,
+    /// Vertices of the result closer than 0.01 median edges to a vertex of another scan with no edge between them (copies of one point left unwelded).
+    pub unwelded_vertices: usize,
 }
 
 /// Something to know, with its numbers.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 pub struct MergeIssueOut {
-    /// `scans_misaligned`, `opposed_normals`, `inconsistent_winding`, `inverted_scan` (these refuse), `non_manifold_input`, `scans_disjoint`, `scan_fully_covered`, `seam_open`, `removed_not_covered`, `pinched_vertices`.
+    /// `scans_misaligned`, `opposed_normals`, `inconsistent_winding`, `inverted_scan` (these refuse), `non_manifold_input`, `flipped_triangles_dropped`, `scans_disjoint`, `scan_fully_covered`, `seam_open`, `removed_not_covered`, `unwelded_vertices`, `unoriented_edges`, `pinched_vertices`.
     pub code: String,
     /// `refusal`, `warning` or `info`.
     pub severity: String,
@@ -256,7 +262,7 @@ fn issue(code: &str, severity: &str, scans: Vec<usize>, message: String) -> Merg
 
 /// The issue in the form of the command.
 fn issue_out(i: &Issue) -> MergeIssueOut {
-    refusal_out(i).unwrap_or_else(|| notice_out(i))
+    refusal_out(i).or_else(|| scan_notice(i)).unwrap_or_else(|| notice_out(i))
 }
 
 /// An issue that refuses, in the form of the command.
@@ -279,12 +285,13 @@ fn refusal_out(i: &Issue) -> Option<MergeIssueOut> {
                 "the normals of scans {a} and {b} oppose where they meet ({opposed} points on opposed surface, {facing} on facing surface): one of them is turned inside out; orient it outward and merge again"
             ),
         ),
-        Issue::Winding { scan, unoriented, interior } => issue(
+        Issue::Winding { scan, flipped, share } => issue(
             "inconsistent_winding",
             "refusal",
             vec![*scan],
             format!(
-                "the triangles of scan {scan} are wound against each other on {unoriented} of {interior} interior edges: its orientation is mixed; repair it first"
+                "{flipped} triangles of scan {scan} ({:.2} % of its area) are wound against the rest of their piece: a patch is turned inside out; repair its orientation first",
+                100.0 * share
             ),
         ),
         Issue::Inverted { scan, pieces } => issue(
@@ -299,15 +306,15 @@ fn refusal_out(i: &Issue) -> Option<MergeIssueOut> {
     })
 }
 
-/// An issue that does not refuse, in the form of the command.
-fn notice_out(i: &Issue) -> MergeIssueOut {
-    match i {
+/// An issue about the scans given that does not refuse, in the form of the command.
+fn scan_notice(i: &Issue) -> Option<MergeIssueOut> {
+    Some(match i {
         Issue::NonManifold { scan, dropped } => issue(
             "non_manifold_input",
             "warning",
             vec![*scan],
             format!(
-                "{dropped} triangles of scan {scan} lie on edges of three or more triangles and were left out (they count as removed in the checks)"
+                "{dropped} triangles of scan {scan} are exact duplicates or lie on edges of three or more triangles and were left out (they count as removed in the checks)"
             ),
         ),
         Issue::Disjoint { groups } => issue(
@@ -319,6 +326,13 @@ fn notice_out(i: &Issue) -> MergeIssueOut {
                 groups.len()
             ),
         ),
+        _ => return None,
+    })
+}
+
+/// An issue about the result, in the form of the command.
+fn notice_out(i: &Issue) -> MergeIssueOut {
+    match i {
         Issue::FullyCovered { scan } => issue(
             "scan_fully_covered",
             "info",
@@ -348,6 +362,29 @@ fn notice_out(i: &Issue) -> MergeIssueOut {
             Vec::new(),
             format!("the result has {after} pinched vertices (the scans had {before})"),
         ),
+        Issue::FlippedDropped { scan, flipped, share } => issue(
+            "flipped_triangles_dropped",
+            "warning",
+            vec![*scan],
+            format!(
+                "{flipped} triangles of scan {scan} ({:.3} % of its area) were wound against the rest of their piece and were left out (they count as removed in the checks)",
+                100.0 * share
+            ),
+        ),
+        Issue::Unoriented { edges } => issue(
+            "unoriented_edges",
+            "warning",
+            Vec::new(),
+            format!("{edges} edges of the result have two triangles that run the same way"),
+        ),
+        Issue::Unwelded { vertices } => issue(
+            "unwelded_vertices",
+            "warning",
+            Vec::new(),
+            format!(
+                "{vertices} vertices of the result lie at (nearly) the point of a vertex of another scan without an edge between them"
+            ),
+        ),
         other => issue("other", "warning", Vec::new(), format!("{other:?}")),
     }
 }
@@ -370,7 +407,7 @@ fn scan_out(object: ObjectId, noise: f64, r: &surfacecraft_geom::merge::ScanRow)
         kept: r.kept,
         removed: r.removed,
         restored: r.restored,
-        dropped_non_manifold: r.dropped,
+        dropped: r.dropped,
         overlap_share: r.overlap_share,
         area: r.area,
         removed_area: r.removed_area,
@@ -405,6 +442,8 @@ fn seam_out(r: &Report) -> MergeSeamOut {
         refused_unsupported: s.unsupported,
         refused_crossing: s.crossing,
         unpinched: s.unpinched,
+        uncovered_after_seam: s.recovered.uncovered,
+        recovered: s.recovered.triangles,
         strays_dropped: s.islands_dropped,
         open_edges: s.open_edges,
         open_length: s.open_length,
@@ -422,6 +461,7 @@ fn checks_out(r: &Report) -> MergeChecksOut {
         moved_vertices: c.moved_vertices,
         max_vertex_move: c.max_vertex_move,
         added_crossings: c.added_crossings,
+        unwelded_vertices: c.unwelded_vertices,
     }
 }
 

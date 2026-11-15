@@ -92,7 +92,7 @@ fn run(number: usize, kind: &str, whole: &Mesh, parts: &[Mesh]) {
         None => (0.0, 0.0),
     };
     eprintln!(
-        "| {number} | {kind} | {} | {tol:.4} | {near:.4} | {same:.4} | {}/{} | {}/{} | {} ({:.1} mm) | {:.4} | {secs:.1} | {:?} |",
+        "| {number} | {kind} | {} | {tol:.4} | {near:.4} | {same:.4} | {}/{} | {}/{} | {} ({:.1} mm) | {:.4} | {} | {secs:.1} | {:?} |",
         whole.triangle_count(),
         out["after"]["pieces"],
         topo.pieces,
@@ -101,6 +101,7 @@ fn run(number: usize, kind: &str, whole: &Mesh, parts: &[Mesh]) {
         out["seam"]["open_edges"],
         out["seam"]["open_length"].as_f64().unwrap_or(0.0),
         out["checks"]["removed_within_share"].as_f64().unwrap_or(0.0),
+        out["checks"]["unwelded_vertices"],
         codes(&out)
     );
     let stages: Vec<String> = out["stages"].as_array().map_or_else(Vec::new, |v| {
@@ -114,9 +115,9 @@ fn run(number: usize, kind: &str, whole: &Mesh, parts: &[Mesh]) {
 fn local_corpus_pieces_merge_back() {
     let only: Option<usize> = std::env::var("SURFACECRAFT_LOCAL_SCAN").ok().and_then(|v| v.parse().ok());
     eprintln!(
-        "| scan | kind | triangles | tolerance | within tol | bit for bit | pieces merge/scan | loops merge/scan | open seam | removed within | s | issues |"
+        "| scan | kind | triangles | tolerance | within tol | bit for bit | pieces merge/scan | loops merge/scan | open seam | removed within | unwelded | s | issues |"
     );
-    eprintln!("|---|---|---|---|---|---|---|---|---|---|---|---|");
+    eprintln!("|---|---|---|---|---|---|---|---|---|---|---|---|---|");
     for (i, path) in corpus().iter().enumerate() {
         let number = i + 1;
         if only.is_some_and(|n| n != number) {

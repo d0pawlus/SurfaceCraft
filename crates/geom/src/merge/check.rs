@@ -110,3 +110,35 @@ pub(super) fn added_crossings(u: &Union) -> usize {
     });
     flags.iter().filter(|f| **f).count()
 }
+
+/// Vertices of the result closer than this share of the median edge to a vertex of another scan
+/// without an edge between them are left unwelded along the seam.
+pub const DUPLICATE_SHARE: f64 = 0.01;
+
+/// Vertices of the result (those triangles use) with a vertex of another scan closer than `radius`
+/// that shares no edge with them: two copies of one point left unwelded.
+pub(super) fn unwelded(u: &Union, radius: f64) -> usize {
+    let mut used = vec![false; u.positions.len()];
+    let mut edges: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+    for t in &u.triangles {
+        for k in 0..3 {
+            let (a, b) = (t[k], t[(k + 1) % 3]);
+            edges.insert((a.min(b), a.max(b)));
+            if let Some(f) = used.get_mut(a as usize) {
+                *f = true;
+            }
+        }
+    }
+    let ids: Vec<u32> =
+        (0..u.positions.len() as u32).filter(|&v| used.get(v as usize).copied().unwrap_or(false)).collect();
+    let pts: Vec<Point3> = ids.iter().filter_map(|&v| u.positions.get(v as usize).copied()).collect();
+    let tree = crate::KdTree::build(&pts);
+    let flags = par::map_slice(&ids, |&v| {
+        let (Some(p), Some(sv)) = (u.positions.get(v as usize), u.scan_of.get(v as usize)) else { return false };
+        tree.within(p, radius)
+            .into_iter()
+            .filter_map(|j| ids.get(j).copied())
+            .any(|w| w != v && u.scan_of.get(w as usize) != Some(sv) && !edges.contains(&(v.min(w), v.max(w))))
+    });
+    flags.iter().filter(|f| **f).count()
+}

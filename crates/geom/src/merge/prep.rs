@@ -14,7 +14,7 @@ pub(super) const NONE: u32 = u32::MAX;
 pub(super) struct Scan {
     /// The scan without the triangles on edges of three or more triangles.
     pub(super) mesh: Mesh,
-    /// Triangles dropped because they lie on an edge of three or more triangles.
+    /// Triangles left out (duplicates, non-manifold, wound the wrong way).
     pub(super) dropped: Vec<[Point3; 3]>,
     /// Per triangle and edge `k` (`t[k] → t[k + 1]`): the triangle across it, [`NONE`] on the border.
     pub(super) across: Vec<[u32; 3]>,
@@ -28,10 +28,10 @@ pub(super) struct Scan {
     pub(super) bbox: Aabb,
     /// Median edge length (mm).
     pub(super) median_edge: f64,
-    /// Interior edges whose two triangles run the same way (wound against each other).
-    pub(super) unoriented_edges: usize,
-    /// Interior edges.
-    pub(super) interior_edges: usize,
+    /// Triangles left out as exact duplicates or for lying on an edge of three or more triangles.
+    pub(super) non_manifold: usize,
+    /// Triangles left out for being wound against the rest of their piece, and their share of the area.
+    pub(super) flipped: (usize, f64),
     /// Closed pieces with a negative volume (turned inside out).
     pub(super) inverted_pieces: usize,
     /// Topology of the scan as given to the merge (after the drop).
@@ -287,17 +287,37 @@ fn inverted_pieces(mesh: &Mesh) -> usize {
         .count()
 }
 
-/// Prepares `given` (already validated); `None` when cancelled.
-pub(super) fn prepare(given: &Mesh, cancel: &Cancel) -> Option<Scan> {
-    let bad = non_manifold_triangles(given);
-    let mut mesh = given.clone();
-    let dropped: Vec<[Point3; 3]> =
-        bad.iter().enumerate().filter(|(_, b)| **b).filter_map(|(t, _)| given.triangle(t)).collect();
-    if !dropped.is_empty() {
-        let mut keep = bad.iter().map(|b| !b);
-        mesh.triangles.retain(|_| keep.next().unwrap_or(false));
+/// `mesh` without the triangles `drop` flags, and the corners of those dropped.
+fn without(mesh: Mesh, drop: &[bool]) -> (Mesh, Vec<[Point3; 3]>) {
+    let gone: Vec<[Point3; 3]> =
+        drop.iter().enumerate().filter(|(_, d)| **d).filter_map(|(t, _)| mesh.triangle(t)).collect();
+    if gone.is_empty() {
+        return (mesh, gone);
     }
-    let (across, interior_edges, unoriented_edges) = adjacency(&mesh);
+    let mut out = mesh;
+    let mut keep = drop.iter().map(|d| !d);
+    out.triangles.retain(|_| keep.next().unwrap_or(false));
+    (out, gone)
+}
+
+/// Prepares `given` (already validated); `None` when cancelled. Exact duplicate triangles, triangles
+/// on edges of three or more triangles and triangles wound against the rest of their piece are left
+/// out (and counted).
+pub(super) fn prepare(given: &Mesh, cancel: &Cancel) -> Option<Scan> {
+    let area = given.area();
+    let dups = super::orient::duplicates(given);
+    let (mesh, mut dropped) = without(given.clone(), &dups);
+    let bad = non_manifold_triangles(&mesh);
+    let (mesh, more) = without(mesh, &bad);
+    let non_manifold = dropped.len() + more.len();
+    dropped.extend(more);
+    let (across, _, _) = adjacency(&mesh);
+    let flip = super::orient::flipped(&mesh, &across);
+    let (mesh, wrong) = without(mesh, &flip);
+    let flipped_area: f64 = wrong.iter().map(|[a, b, c]| crate::tri::area(a, b, c)).sum();
+    let flipped = (wrong.len(), if area > 0.0 { flipped_area / area } else { 0.0 });
+    dropped.extend(wrong);
+    let across = if flipped.0 > 0 { adjacency(&mesh).0 } else { across };
     let border_distance = border_distance(&mesh, &across, cancel)?;
     Some(Scan {
         normals: vertex_normals(&mesh),
@@ -308,10 +328,10 @@ pub(super) fn prepare(given: &Mesh, cancel: &Cancel) -> Option<Scan> {
         topology: topology(&mesh),
         mesh,
         dropped,
+        non_manifold,
+        flipped,
         across,
         border_distance,
-        unoriented_edges,
-        interior_edges,
     })
 }
 

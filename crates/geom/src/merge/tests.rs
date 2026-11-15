@@ -174,3 +174,17 @@ fn the_stages_are_announced_in_order() {
     merge(&views_of(2), &Params { tolerance: TOL }, &Cancel::new(), &mut |s| seen.push(s)).unwrap();
     assert_eq!(seen, vec![Stage::Prepare, Stage::Overlap, Stage::Ownership, Stage::Union, Stage::Seam, Stage::Check]);
 }
+
+#[test]
+fn a_cancellation_during_any_stage_is_honoured() {
+    for at in [Stage::Prepare, Stage::Overlap, Stage::Ownership, Stage::Union, Stage::Seam, Stage::Check] {
+        let cancel = Cancel::new();
+        let flag = cancel.clone();
+        let r = merge(&views_of(2), &Params { tolerance: TOL }, &cancel, &mut |s| {
+            if s == at {
+                flag.cancel();
+            }
+        });
+        assert!(matches!(r, Err(MergeError::Cancelled)), "{at:?}: {r:?}");
+    }
+}

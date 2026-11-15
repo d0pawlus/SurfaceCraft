@@ -65,11 +65,13 @@ fn simple(walk: Vec<u32>) -> Vec<Vec<u32>> {
     out
 }
 
-/// Fills the small seam loops of `u` through `guard`. Returns (loops filled, triangles added).
-pub(super) fn fill_small(u: &mut Union, scans: &[Scan], guard: &mut Guard<'_>) -> (usize, usize) {
+/// Fills the small seam loops of `u` through `guard`. Returns (loops filled, triangles added, the
+/// small loops left open).
+pub(super) fn fill_small(u: &mut Union, scans: &[Scan], guard: &mut Guard<'_>) -> (usize, usize, Vec<Vec<u32>>) {
     let loops: Vec<Vec<u32>> = seam_loops(u, scans).into_iter().filter(|l| l.len() <= SMALL_LOOP_EDGES).collect();
+    let mut left = Vec::new();
     if loops.is_empty() {
-        return (0, 0);
+        return (0, 0, left);
     }
     let mut taken: HashSet<u64> =
         u.triangles.iter().flat_map(|t| (0..3).map(move |k| undirected(t[k], t[(k + 1) % 3]))).collect();
@@ -77,14 +79,17 @@ pub(super) fn fill_small(u: &mut Union, scans: &[Scan], guard: &mut Guard<'_>) -
     let (mut filled, mut added) = (0, 0);
     for lp in loops {
         let rev: Vec<u32> = lp.iter().rev().copied().collect();
-        let Some(patch) = patch_for(&mut work, &rev, &taken, u, guard) else { continue };
+        let Some(patch) = patch_for(&mut work, &rev, &taken, u, guard) else {
+            left.push(lp);
+            continue;
+        };
         taken.extend(patch.iter().flat_map(|t| (0..3).map(move |k| undirected(t[k], t[(k + 1) % 3]))));
         added += patch.len();
         filled += 1;
         u.origin.extend(std::iter::repeat_n(Origin::Seam, patch.len()));
         u.triangles.extend(patch);
     }
-    (filled, added)
+    (filled, added, left)
 }
 
 /// A fan of the loop `lp` from its vertex `k`.
@@ -169,7 +174,31 @@ pub(super) fn unpinch(u: &mut Union, guard: &mut Guard<'_>) -> usize {
             }
         }
     }
-    let gone: Vec<[u32; 3]> = u.triangles.iter().zip(&drop).filter(|(_, d)| **d).map(|(t, _)| *t).collect();
+    take_back(u, guard, &drop)
+}
+
+/// Takes back the seam triangles at the vertices of the small loops that could not be filled, so
+/// that each hole grows by a ring and can be filled as a whole (a twisted corner of the band, where
+/// no triangle over the small loop faces the right way). Returns how many.
+pub(super) fn widen(u: &mut Union, guard: &mut Guard<'_>, left: &[Vec<u32>]) -> usize {
+    let mut at = vec![false; u.positions.len()];
+    for v in left.iter().flatten() {
+        if let Some(f) = at.get_mut(*v as usize) {
+            *f = true;
+        }
+    }
+    let drop: Vec<bool> = u
+        .triangles
+        .iter()
+        .zip(&u.origin)
+        .map(|(t, o)| matches!(o, Origin::Seam) && t.iter().any(|v| at.get(*v as usize).copied().unwrap_or(false)))
+        .collect();
+    take_back(u, guard, &drop)
+}
+
+/// Removes the triangles `drop` flags from `u` and from the guard's record.
+fn take_back(u: &mut Union, guard: &mut Guard<'_>, drop: &[bool]) -> usize {
+    let gone: Vec<[u32; 3]> = u.triangles.iter().zip(drop).filter(|(_, d)| **d).map(|(t, _)| *t).collect();
     for &t in &gone {
         guard.forget(&u.positions, t);
     }

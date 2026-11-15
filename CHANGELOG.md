@@ -19,7 +19,7 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
   by more than the tolerance, whose normals oppose, or that are wound both ways or turned inside out
   are refused with the numbers; the report gives per scan what was kept and removed, the residual
   of every pair, the seam, the topology before and after and how far the removed surface lies from
-  the result.
+  the result (#123).
 
 - `mesh.close_handles`: closes the small handles of a scan (tunnels, bridges and the sponge of tiny
   tunnels where the two sides of a thin wall run together) as a new mesh, keeping the rim and every

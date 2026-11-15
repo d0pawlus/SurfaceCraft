@@ -16,6 +16,10 @@ pub const RADII_EDGES: [f64; 3] = [1.0, 2.0, 4.0];
 pub const SUPPORT_SLOPE: f64 = 0.1;
 /// Rounds of taking back the seam triangles at a pinched vertex and filling the holes again.
 const UNPINCH_ROUNDS: usize = 4;
+/// Holes of at most this many edges that no triangle could fill are widened by a ring ...
+const WIDEN_EDGES: usize = 8;
+/// ... in this many rounds at most.
+const WIDEN_ROUNDS: usize = 1;
 /// Triangles near a new one tested for a crossing at most (the rest is taken as crossing).
 const MAX_NEAR: usize = 1 << 16;
 
@@ -37,12 +41,15 @@ pub struct SeamReport {
     /// Small holes left by the pivoting that were filled, and the triangles that took.
     pub filled_loops: usize,
     pub fill_triangles: usize,
-    /// Seam triangles taken back because they met another fan at a vertex only (a pinch).
+    /// Seam triangles taken back because they met another fan at a vertex only (a pinch) or bordered a
+    /// small hole no triangle could fill, before the hole was filled again.
     pub unpinched: usize,
     /// Candidate triangles refused because no scan saw surface there.
     pub unsupported: usize,
     /// Candidate triangles refused because they crossed a triangle there already.
     pub crossing: usize,
+    /// Removed triangles the seam left uncovered, and those put back.
+    pub recovered: super::recover::Recovered,
     /// Triangles of small pieces dropped because they lay wholly on the rest of the result.
     pub islands_dropped: usize,
     /// Front edges left open (no triangle on their other side) after the seam step.
@@ -277,16 +284,7 @@ pub(super) fn close(
     rep.built = built.len();
     u.origin.extend(std::iter::repeat_n(Origin::Seam, built.len()));
     u.triangles.extend(built);
-    for _ in 0..UNPINCH_ROUNDS {
-        let (loops, tris) = super::fill::fill_small(u, scans, guard);
-        rep.filled_loops += loops;
-        rep.fill_triangles += tris;
-        let undone = super::fill::unpinch(u, guard);
-        rep.unpinched += undone;
-        if undone == 0 {
-            break;
-        }
-    }
+    refill(u, scans, guard, rep);
     measure_open(u, scans, rep);
     Some(())
 }
@@ -344,6 +342,29 @@ impl Corners {
         let Some(n) = crate::tri::normal(&c[0], &c[1], &c[2]) else { return false };
         rim.iter().all(|&v| u.normals.get(v as usize).is_some_and(|m| m.dot(&n) >= COS_FACING))
     }
+}
+
+/// Fills the small holes of the seam, takes back the seam triangles at pinched vertices and fills
+/// again, a few rounds.
+pub(super) fn refill(u: &mut Union, scans: &[Scan], guard: &mut Guard<'_>, rep: &mut SeamReport) {
+    for round in 0..UNPINCH_ROUNDS {
+        let (loops, tris, left) = super::fill::fill_small(u, scans, guard);
+        rep.filled_loops += loops;
+        rep.fill_triangles += tris;
+        // a twisted corner is a hole of a few edges; widening it once may let it be filled, widening
+        // again and again only opens the seam
+        let tiny: Vec<Vec<u32>> = left.into_iter().filter(|l| l.len() <= WIDEN_EDGES).collect();
+        let widened = if round < WIDEN_ROUNDS { super::fill::widen(u, guard, &tiny) } else { 0 };
+        let undone = super::fill::unpinch(u, guard) + widened;
+        rep.unpinched += undone;
+        if undone == 0 {
+            break;
+        }
+    }
+    // the last round may have taken triangles back: fill what that opened
+    let (loops, tris, _) = super::fill::fill_small(u, scans, guard);
+    rep.filled_loops += loops;
+    rep.fill_triangles += tris;
 }
 
 /// The open seam edges of `u` and their length.

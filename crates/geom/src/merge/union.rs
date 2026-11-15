@@ -1,6 +1,6 @@
 //! The kept triangles of all scans as one vertex and triangle list, before the seam is closed:
 //! every kept vertex once, at its own position; seam vertices of different scans that coincide
-//! (closer than [`WELD_SHARE`] of the median edge) welded into the one of the scan listed first;
+//! (closer than [`WELD_SHARE`] of the tolerance) welded into the one of the scan listed first;
 //! removed triangles whose corners all exist in the union at exactly their positions restored
 //! (pieces cut from one scan share their vertices and triangles where they overlap: there the seam
 //! is a re-weld, not new surface).
@@ -8,8 +8,9 @@ use super::prep::{NONE, Scan};
 use crate::{KdTree, Point3, Vec3};
 use std::collections::{HashMap, HashSet};
 
-/// Seam vertices of different scans closer than this share of the median edge are one vertex.
-pub const WELD_SHARE: f64 = 1e-3;
+/// Seam vertices of different scans closer than this share of the tolerance (and a tenth of the
+/// median edge) are one vertex: two copies of one point a scan pair left on either side of the seam.
+pub const WELD_SHARE: f64 = 0.25;
 /// Passes over the removed triangles when restoring (a triangle may need a neighbour restored first).
 const RESTORE_PASSES: usize = 3;
 
@@ -18,8 +19,10 @@ const RESTORE_PASSES: usize = 3;
 pub(super) enum Origin {
     /// Triangle `1` of scan `0`, kept.
     Kept(u32, u32),
-    /// Triangle `1` of scan `0`, removed and restored.
+    /// Triangle `1` of scan `0`, removed and restored (its corners all at exactly their places).
     Restored(u32, u32),
+    /// Triangle `1` of scan `0`, removed, left uncovered by the seam and put back on its own vertices.
+    Recovered(u32, u32),
     /// Built to close the seam.
     Seam,
 }
@@ -88,7 +91,7 @@ impl Union {
     /// from, or an edge of a seam triangle?
     pub(super) fn seam_side(&self, scans: &[Scan], i: usize, k: usize) -> bool {
         match self.origin.get(i) {
-            Some(Origin::Kept(s, t) | Origin::Restored(s, t)) => {
+            Some(Origin::Kept(s, t) | Origin::Restored(s, t) | Origin::Recovered(s, t)) => {
                 scans.get(*s as usize).is_some_and(|sc| !sc.is_border(*t as usize, k))
             }
             Some(Origin::Seam) => true,
