@@ -284,17 +284,24 @@ Normals, colours and per-vertex data go with the coordinates.
     (`align.icp`, `align.global`) or give a larger tolerance knowingly. Also refused: scans offset by
     more than 8 tolerances, which share no surface within that reach but lie over each other (flat
     scans too, whose boxes do not overlap within the reach). They are found along each sample's
-    normal: the first surface of the other scan faces the same way (`pairs[].over`), at least 5 % of
-    the samples lie over it and fewer than 50 agree with it. Scans that are apart
+    normal: the first surface of the other scan faces the same way (`pairs[].over`, median distance
+    `pairs[].over_offset`), at least 5 % of the samples lie over it, fewer than 50 agree with it,
+    and no chain of scans that share surface ties the two (pieces of a part that lie over each
+    other, a step, are not a misalignment). Scans that are apart
     in space are no refusal: they give a union of pieces and the notice `scans_disjoint`.
   - `opposed_normals`: the normals of two scans oppose where they meet. One is turned inside out.
   - `inconsistent_winding`: triangles wound against the rest of their piece cover more than 0.1 % of a
     scan's area (a patch turned inside out). Fewer are left out and reported as
     `flipped_triangles_dropped`, so the result never has a flipped part.
   - `inverted_scan`: a closed piece of a scan has a negative volume. Inner skins (inside another
-    closed piece, as the inside of a hollow part) and debris (small pieces below 1 % of the scan's
-    area all together) are not refused; they are reported as `inner_skins` with their counts.
-- Reported, not refused: `non_manifold_input` (exact duplicate triangles and triangles on edges of
+    closed piece, as the inside of a hollow part or a cavity, whatever their size) and debris (loose
+    small pieces below 1 % of the scan's area all together) are not refused; they are reported as `inner_skins` with their counts.
+- Reported, not refused: `layers_apart` (two scans that agree somewhere also lie over each other at
+  one offset, both ways: a shelf over a floor seen by different scans looks so, and so does a scan
+  displaced along a face parallel to the displacement, which the geometry cannot tell apart; check the
+  alignment), `overlap_unjudged` (samples whose search along the normal ran out of its budget in a
+  pile of triangles), `seam_over_budget` (seam or restored triangles left out because the crossing
+  test would have compared too many triangles), `non_manifold_input` (exact duplicate triangles and triangles on edges of
   three or more triangles are left out and counted as removed), `flipped_triangles_dropped`, `scans_disjoint` (groups of scans that share no surface: the result is a
   union of separate pieces), `scan_fully_covered` (a scan lies wholly on others and adds nothing),
   `seam_open` (cut edges no triangle could close), `removed_not_covered` (less than 99 % of the removed
@@ -307,7 +314,8 @@ Normals, colours and per-vertex data go with the coordinates.
     `dropped`, `overlap_share`, `noise` (absent when the tolerance was given);
   - per pair: the residual where one lies on the other (`rms`, `p95`, `worst`, `beyond_share`);
   - `seam`: cut edges, length, triangles created, refusals by reason (`refused_unsupported`,
-    `refused_crossing`, `refused_corners`), recovered triangles and the specks taken back again,
+    `refused_crossing`, `refused_corners`, `refused_budget`), recovered triangles and the specks taken back again, what is still uncovered
+    after the recovery (`uncovered_after_seam`),
     open edges and their length;
   - `before` (the scans together) and `after`: pieces, boundary loops, genus, non-manifold and
     unoriented edges, pinched vertices;
