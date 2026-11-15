@@ -346,22 +346,46 @@ kernel refuses sheets of many faces. Give the wall thickness instead:
 `preparation` (`[{step, reason, numbers}]`, `numbers.ms` the time spent; empty when the scan was
 modelled as it is).
 
-- **Several parts in one file** (`split`). Pieces of the scan are sorted three ways. A piece with at
-  least 1 % of the triangles or of the area is a *part*; a part with at least `part_share` (default
-  10 %) of the area of the largest piece is *co-equal* and gets a solid of its own (the largest 24
-  at most; `components` takes `all`, `largest` or a number). Parts below that are *minor* and
-  pieces below 1 % are *debris*: they are not modelled. Exactly one co-equal part: that part is
-  modelled by the usual path. Several: `components[]` has a verdict per part, `bodies` lists every
+- **Several parts in one file** (`split`). Every piece of the cleaned scan is sorted by what it is.
+  A piece with at least `part_share` (default 10 %) of the area of the largest piece that is not a
+  cavity skin is *co-equal* (by its area alone; the largest piece always is): it is modelled whatever
+  its quality, and its verdict is the call's. Any other piece is a *small part* when it is a solid:
+  watertight (no boundary edge), consistently oriented (no edge that two triangles run the same
+  way), enclosing a positive volume, with at least 100 triangles and at least 50 tolerances across
+  (10 mm at 0.2 mm). Every other piece is left out with its reason: `debris` (too small), `open`,
+  `not_oriented` or `inside_out`. The floors come from the corpus: the closed debris that faces
+  outward there has at most 50 triangles and 1.2 mm across, the smallest real part 236 triangles and
+  33 mm. Co-equal parts are modelled first, then small parts, each by area, 128 at most (more than
+  128 co-equal parts: the largest 128);
+  `components` takes `all`, `largest` or a number (a number takes co-equal parts only). The cleaning
+  of `scan.to_solid` protects by identity the small parts that its own default (1 % of the largest
+  piece's triangles) would remove: they are taken out, the rest is cleaned exactly as before, and they
+  are put back unchanged. A piece is judged as it is in the scan: one that would only qualify once a
+  hole of it is filled is not protected (none on the corpus). A scan with one co-equal part and no small part is modelled by the usual path.
+  Otherwise `components[]` has a verdict per part (`co_equal` says which kind), `bodies` lists every
   solid, the top-level `body` and `patches` are the largest part's, `deviation` is the aggregate
-  over the modelled parts (area-weighted share within tolerance, largest maximum) and `verdict`
-  the worst co-equal part's.
-- **What was not modelled is reported** (each issue says what to do: `part_share`, `scan.split`, `components`; the next steps include the split). More than 2 % of the surface in minor pieces and debris:
-  issue `unmodelled_pieces` (count and area share) and the verdict is at most `review`. The inner
-  skin of a hollow part is not modelled either: `nested_shell_skipped`, at most `review`. Co-equal
-  parts past the 24 cap: `parts_beyond_limit` (count and area share), at most `review`. Parts you
-  did not ask for with `components: largest` or a number are no issue and do not lower a pass;
-  `preparation[0].numbers.not_requested` counts them. After a split with every part passed, one
-  `export.step` names all the solids; otherwise each next step says which part it is for.
+  over the modelled parts (area-weighted share within tolerance, largest maximum) and `verdict` the
+  worst co-equal part's. A small part never fails the call. Small
+  parts are never rebuilt (`mesh.remesh`): on the corpus that cost minutes per part and did not help.
+- **What was not modelled to a pass is reported** (each issue says what to do: `part_share`,
+  `scan.split`, `components`; the next steps include the split). When the pieces left out, the
+  small parts without a pass and the parts past the 128 cap hold more than 2 % of the surface, the
+  verdict is at most `review`, with `unmodelled_pieces` (count, area share and the count per reason)
+  and `parts_not_passed` (count, area share, the first five names). At most 2 % is no issue and
+  allows a pass, but small parts that did not pass are never silent: each keeps its own verdict in
+  `components`, `preparation[0].numbers` counts them (`small_parts_not_passed` with its area share,
+  beside `left_out_by_reason` and `unmodelled_area_share`), and a next step names them (at most
+  five) with the call that models the first one on its own. `minor_and_debris_pieces` and
+  `minor_and_debris_area_share` count the pieces left out (every reason); `debris_pieces` counts
+  those with reason `debris` only. `pieces_left_out` lists the 16 largest pieces left out with reason, triangles,
+  area, share and bounding box. The inner skin of a hollow part is not modelled either:
+  `nested_shell_skipped`, at most `review`. Parts past the cap: `parts_beyond_limit` (count and area
+  share), at most `review`. Parts you did not ask for with `components: largest` or a number are no
+  issue and do not lower a pass; `preparation[0].numbers.not_requested` counts them. After a split
+  with every part passed, one `export.step` names all the solids; otherwise each next step says
+  which part it is for (all co-equal parts that did not pass, at most 3 steps from small parts). When
+  a part's own wrap after a refused one is kept, every object of the losing attempt is removed and the
+  solid has the part's name.
   `scan.split` does the separation alone (`min_share` above 0 and at most 1) and reports nesting
   (`cavity`, a hollow part's inner skin, or `inclusion`, a separate part inside another). It lists at
   most 64 parts; the significant pieces past that are not made into meshes but are counted in
@@ -373,16 +397,19 @@ modelled as it is).
   tolerance must gain more than 0.5 points; a tie keeps the plain result). `rebuild: false` turns it
   off. A rebuild repairs topology, so it is not tried for a closed result whose only issue is
   `out_of_tolerance` (that is the patch budget) unless the scan shows some topology evidence (genus
-  16 or more, or 5 or more non-manifold edges). The rebuild is made for at most the 4 largest parts.
+  16 or more, or 5 or more non-manifold edges). The rebuild is made for at most the 4 largest co-equal parts.
 - **Extra attempts of one call** are counted in one place, a budget of 2 per call (a count of
   attempts, no clock, so the result does not depend on the machine's speed): the rebuild-and-wrap-again,
   the larger-cap retry (`allow_retry`: for the first part, in area order, whose first result is capped by
   the patch limit and short of the tolerance, and only in that part's first attempt) and the other method of
   `auto` all draw from it, whichever part asks first; when it is spent they are not run (an `auto` attempt
   that was not run is listed with its reason). A part's own wrap is not an extra attempt (a part the
-  primitives could not close is wrapped as freeform once, as its one wrap; a scan with strong topology
-  evidence is rebuilt and that wrap is made on the rebuilt scan). The worst case is therefore 26 wraps
-  per call: one for each of the 24 parts and the 2 extra attempts, and at most 4 rebuilds. A part that
+  primitives could not close, or that the primitives did not pass on while `auto`'s freeform attempt
+  was refused because the budget was spent, is wrapped as freeform once, as its one wrap, and the
+  better of the two results is kept: on the scan of many parts twelve small parts ended without a pass
+  that way, and each passes as freeform; a scan with strong topology
+  evidence is rebuilt and that wrap is made on the rebuilt scan). The worst case is therefore 130 wraps
+  per call: one for each of the 128 parts and the 2 extra attempts, and at most 4 rebuilds. A part that
   was refused shows it: `components[].retry` with reason `budget_spent`, a `remesh` step in
   `components[].preparation` saying "not done: the call has used its 2 extra attempts", or the
   skipped entry in `components[].attempts`. For a split scan the top-level `attempts` and `retry`

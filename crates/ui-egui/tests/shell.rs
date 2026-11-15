@@ -269,6 +269,27 @@ fn luminance(c: egui::Color32) -> f32 {
     0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
 }
 
+/// A scan shows its two sides in different colours in every preset; the back colour is not the
+/// selection colour either, and closed kinds (bodies) have none.
+#[test]
+fn a_scan_has_a_back_colour_distinct_from_its_front_in_every_preset() {
+    use surfacecraft_doc::ObjectKind as K;
+    let apart = |a: [f32; 4], b: [f32; 4]| (0..3).map(|i| (a[i] - b[i]).abs()).fold(0.0, f32::max);
+    for preset in Preset::ALL {
+        let t = Tokens::resolve(preset);
+        for kind in [K::Mesh, K::Region, K::Feature] {
+            let back = t.object_back(kind);
+            assert_eq!(back, Some(t.rgba(Token::ObjectMeshBack)), "{preset:?} {kind:?}");
+            let back = back.unwrap_or_default();
+            assert!(apart(back, t.object(kind)) > 0.15, "{preset:?} {kind:?}: back and front too close");
+            assert!(apart(back, t.rgba(Token::Highlight)) > 0.15, "{preset:?}: back and selection too close");
+        }
+        for kind in [K::Body, K::Primitive, K::Surface, K::Quad, K::Sketch] {
+            assert_eq!(t.object_back(kind), None, "{preset:?} {kind:?}");
+        }
+    }
+}
+
 fn contrast(a: egui::Color32, b: egui::Color32) -> f32 {
     let (la, lb) = (luminance(a), luminance(b));
     (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
