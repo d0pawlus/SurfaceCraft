@@ -131,6 +131,17 @@ fn binary_stl_is_the_mesh_of_welding_every_corner() {
 }
 
 #[test]
+fn a_binary_stl_with_more_distinct_corners_than_the_limit_is_refused() {
+    // every facet apart: three vertices per triangle
+    let corners: Vec<[f32; 3]> = (0..300).map(|i| [i as f32, (i % 7) as f32, 1.0]).collect();
+    let bytes = stl_of(&corners);
+    let tight = Limits { max_vertices: 299, ..Limits::default() };
+    assert!(matches!(read_mesh(&bytes, MeshFormat::Stl, &tight), Err(IoError::Limit(_))));
+    let enough = Limits { max_vertices: 300, ..Limits::default() };
+    assert_eq!(read_mesh(&bytes, MeshFormat::Stl, &enough).unwrap().vertex_count(), 300);
+}
+
+#[test]
 fn the_first_bad_triangle_of_a_binary_stl_is_reported_on_any_thread_count() {
     let (mut bytes, _) = big_stl();
     for t in [MANY + 5, 5000] {

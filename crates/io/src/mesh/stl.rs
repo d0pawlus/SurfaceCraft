@@ -36,9 +36,14 @@ fn read_stl_binary(bytes: &[u8], limits: &Limits) -> Result<Mesh, IoError> {
     }
     // bit-equal corners are joined as they are read; welding joins what is left below the
     // tolerance, so the mesh is the one of welding every corner
-    let mut m = super::stl_corners::indexed(bytes, n).map_err(|f| match f {
+    let mut m = super::stl_corners::indexed(bytes, n, limits.max_vertices).map_err(|f| match f {
         CornerFault::Truncated => bad("STL", "truncated triangle"),
         CornerFault::NonFinite(t) => bad("STL", format!("triangle {t} has a non-finite coordinate")),
+        CornerFault::TooManyVertices => IoError::Limit(format!(
+            "more than {} distinct corners (the triangles share too few of them)",
+            limits.max_vertices
+        )),
+        CornerFault::Colliding => bad("STL", "corner coordinates made to collide in the reader's table"),
     })?;
     m.weld(0.0);
     Ok(m)
