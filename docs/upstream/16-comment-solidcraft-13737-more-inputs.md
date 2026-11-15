@@ -1,4 +1,4 @@
-Status: to be posted as a comment on tangency-labs/solidcraft#13737 (open, `needs-triage`, no comments as of 2026-11-15); measured on head f02d13e on 2026-11-15 (three inputs refused with fixes off and on, a fourth refused with fixes off and read back with all fixes on). Posting needs the owner's consent.
+Status: posted 2026-11-15 with the owner's consent: https://github.com/tangency-labs/solidcraft/issues/13737#issuecomment-6898964179 . Before posting: to be posted as a comment on tangency-labs/solidcraft#13737 (open, `needs-triage`, no comments as of 2026-11-15); measured on head f02d13e on 2026-11-15 (three inputs refused with fixes off and on, a fourth refused with fixes off and read back with all fixes on). Posting needs the owner's consent.
 
 # Draft 16: comment on #13737, three more inputs that hit the squareness refusal
 

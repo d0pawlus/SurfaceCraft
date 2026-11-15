@@ -1,4 +1,4 @@
-Status: to be posted as a comment on tangency-labs/solidcraft#13797 ("STEP: move SolidCraft's exporter into solidcore", open, `help wanted`, `area:io`, free again since 2026-11-15); a question with evidence read from the head source (solidcore f02d13e, 2026-11-15), not measured: nothing was run. Posting needs the owner's consent.
+Status: posted 2026-11-15 with the owner's consent: https://github.com/tangency-labs/solidcraft/issues/13797#issuecomment-6898964499 . Before posting: to be posted as a comment on tangency-labs/solidcraft#13797 ("STEP: move SolidCraft's exporter into solidcore", open, `help wanted`, `area:io`, free again since 2026-11-15); a question with evidence read from the head source (solidcore f02d13e, 2026-11-15), not measured: nothing was run. Posting needs the owner's consent.
 
 # Draft 17: comment on #13797, no PCURVEs on analytic faces
 
