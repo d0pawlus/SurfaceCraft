@@ -41,8 +41,26 @@ fn patches_of(w: &G1Wrap, f: usize) -> &[crate::patch::Net] {
     w.set.nets.get(3 * f..3 * f + 3).unwrap_or(&[])
 }
 
+/// Largest angle (degrees) between the normals of two patches over a 7 x 7 grid with its border.
+fn largest_turn(a: &crate::patch::Net, b: &crate::patch::Net) -> f64 {
+    let t = [0.0, 1.0 / 6.0, 1.0 / 3.0, 0.5, 2.0 / 3.0, 5.0 / 6.0, 1.0];
+    let mut worst: f64 = 0.0;
+    for &u in &t {
+        for &v in &t {
+            if let (Some(x), Some(y)) = (normal(a, u, v), normal(b, u, v)) {
+                worst = worst.max(x.dot(&y).clamp(-1.0, 1.0).acos().to_degrees());
+            }
+        }
+    }
+    worst
+}
+
+/// Largest turn the rim patches may show against the plain construction (degrees). Measured 9.2 on
+/// this dome; the hybrid method refuses a face whose patches disagree with it by more than 60.
+const MAX_RIM_TURN_DEG: f64 = 20.0;
+
 #[test]
-fn on_the_open_rim_curves_and_patches_are_the_plain_construction() {
+fn on_the_open_rim_patches_stay_close_to_the_plain_ones() {
     // Arrange
     let (coarse, scan) = dome_pair();
     let rim = rim_triangles(&coarse);
@@ -52,14 +70,18 @@ fn on_the_open_rim_curves_and_patches_are_the_plain_construction() {
     let refitted = run(&coarse, &scan, false, true);
     let plain = run(&coarse, &scan, false, false);
 
-    // Assert: every patch of a rim triangle (its rim curve, its edges that end on the rim, its spokes
-    // and its inside) is exactly the plain one; away from the rim the refit is at work
+    // Assert: the rim curves and the inside of the rim patches are plain; their spokes and the
+    // edges that end on the rim are refitted, which turns the rim patches by little; away from the
+    // rim the refit is at work
     assert_eq!(refitted.set.nets.len(), 3 * coarse.triangle_count());
-    assert_eq!(refitted.set.nets.len(), plain.set.nets.len());
-    for &f in &rim {
-        assert_eq!(patches_of(&refitted, f), patches_of(&plain, f), "rim triangle {f}");
-    }
-    assert_ne!(refitted.set.nets, plain.set.nets, "the refit changes the patches away from the rim");
+    let turn = rim
+        .iter()
+        .flat_map(|&f| patches_of(&refitted, f).iter().zip(patches_of(&plain, f)))
+        .map(|(a, b)| largest_turn(a, b))
+        .fold(0.0, f64::max);
+    eprintln!("rim patches turn by at most {turn:.2} degrees against the plain construction");
+    assert!(turn < MAX_RIM_TURN_DEG, "{turn}");
+    assert_ne!(refitted.set.nets, plain.set.nets, "the refit changes the patches");
 }
 
 #[test]

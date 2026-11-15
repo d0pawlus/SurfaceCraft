@@ -332,8 +332,6 @@ struct Layer<'a> {
     normals: LayoutNormals,
     /// Coarse edges with fewer or more than two faces: no neighbour to be tangent to.
     free: BTreeSet<EdgeKey>,
-    /// Coarse vertices on a free edge: the open border (rim) of the scan.
-    rim: BTreeSet<u32>,
     g1: bool,
     /// Refit the curves and patches of the unconstrained wrap to the scan ([`crate::patch_refit`]).
     refit: bool,
@@ -358,18 +356,26 @@ impl Layer<'_> {
         (0..3).any(|e| t.is_some_and(|t| self.free.contains(&key(t[e], t[(e + 1) % 3]))))
     }
 
-    /// Is the unconstrained curve of coarse edge `(a, b)` refitted? Not with tangent patches (their
-    /// construction is tuned to the plain curves, see [`patch_net`]), not on the open border of the
-    /// scan and not when either end lies on it: samples beyond the rim, or next to it, are pulled onto
-    /// the rim and would lean the curve.
-    fn refits_edge(&self, a: u32, b: u32) -> bool {
-        self.refit && !self.g1 && !self.free.contains(&key(a, b)) && !self.rim.contains(&a) && !self.rim.contains(&b)
+    /// Are the curves and patches of the unconstrained wrap refitted at all? Not with tangent patches:
+    /// their construction is tuned to the plain curves (see [`patch_net`]).
+    fn refits(&self) -> bool {
+        self.refit && !self.g1
     }
 
-    /// Are the spokes and the patches of triangle `f` refitted? Not with tangent patches, and not when
-    /// the triangle has an edge on the open border of the scan (see [`Layer::refits_edge`]).
-    fn refits_triangle(&self, f: usize) -> bool {
-        self.refit && !self.g1 && !self.on_rim(f)
+    /// Is the curve of coarse edge `(a, b)` refitted? Not on the open border of the scan: samples
+    /// beyond the rim are pulled onto it and would lean the curve. Edges that only end on the rim
+    /// are refitted (their samples lie inside; `on_the_open_rim_patches_stay_close_to_the_plain_ones`
+    /// bounds what that does to the rim patches): leaving them plain too made a band two triangles
+    /// deep along the rim that the rounds refined (431 to 504 faces on the open part of
+    /// `p9_hybrid_scan`), and the hybrid method then refused the wall at the cut on Linux and Windows.
+    fn refits_edge(&self, a: u32, b: u32) -> bool {
+        self.refits() && !self.free.contains(&key(a, b))
+    }
+
+    /// Is the inside of the patches of triangle `f` refitted? Not when the triangle has an edge on the
+    /// open border of the scan (see [`Layer::refits_edge`]); its spokes are.
+    fn refits_patches(&self, f: usize) -> bool {
+        self.refits() && !self.on_rim(f)
     }
 
     fn corner_normal(&self, f: usize, v: u32) -> Vec3 {
@@ -496,7 +502,7 @@ struct Triangle {
 fn add_spokes(l: &Layer, tri: &Triangle, nf: Vec3, build: &mut Build) -> u32 {
     let on_face = |at: Vec3| l.project(at, &[nf]);
     let try_face = |at: Vec3| l.try_project(at, &[nf]);
-    let refit = l.refits_triangle(tri.f);
+    let refit = l.refits();
     let p = |v: u32| build.vertices.get(v as usize).copied().unwrap_or_else(Vec3::zeros);
     let pg = on_face((p(tri.corners[0]) + p(tri.corners[1]) + p(tri.corners[2])) / 3.0);
     let g = build.vertices.len() as u32;
@@ -549,8 +555,8 @@ fn patch_net(l: &Layer, tri: &Triangle, k: usize, curves: [Curve; 4], ng: Vec3, 
     let [bot, right, top, left] = curves;
     let on_face = |at: Vec3| l.project(at, &[nf]);
     if !l.g1 {
-        // see [`Layer::refits_triangle`] for the patches that are not refitted
-        if l.refits_triangle(tri.f) {
+        // see [`Layer::refits_patches`] for the patches that are not refitted
+        if l.refits_patches(tri.f) {
             let try_face = |at: Vec3| l.try_project(at, &[nf]);
             return (wrap_net(&bot, &right, &top, &left, &try_face), true);
         }
@@ -607,11 +613,6 @@ pub fn wrap_patches_g1(coarse: &Mesh, scan: &Bvh, surface: &ScanSurface, reach: 
     wrap_with(coarse, (scan, surface), reach, options, true)
 }
 
-/// The vertices of the free edges.
-fn rim_of(free: &BTreeSet<EdgeKey>) -> BTreeSet<u32> {
-    free.iter().flat_map(|&(a, b)| [a, b]).collect()
-}
-
 /// [`wrap_patches_g1`] with the least-squares refit on or off (off: the plain construction everywhere).
 fn wrap_with(
     coarse: &Mesh,
@@ -630,8 +631,7 @@ fn wrap_with(
         layout_normals(&layout, options.crease_deg)
     };
     let free: BTreeSet<EdgeKey> = edges.iter().filter(|(_, f)| f.len() != 2).map(|(k, _)| *k).collect();
-    let rim = rim_of(&free);
-    let layer = Layer { coarse, scan, reach, face_normal, normals, free, rim, g1: options.g1, refit };
+    let layer = Layer { coarse, scan, reach, face_normal, normals, free, g1: options.g1, refit };
     let mut build = Build { vertices, curves: Curves::new(), set: PatchSet::default(), fallbacks: 0 };
     let mid = edge_curves(&layer, &edges, &mut build);
     for (f, t) in coarse.triangles.iter().enumerate() {

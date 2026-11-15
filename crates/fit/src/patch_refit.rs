@@ -46,12 +46,11 @@ const MIN_CURVE_SAMPLES: usize = 3;
 /// points need four, but when the samples of one side are lost (past a hole or beyond the reach)
 /// nothing holds that side and the fit could swing it; with fewer the plain patch stays.
 const MIN_NET_SAMPLES: usize = 18;
-/// A refitted patch must face like its input to within this cosine (about 25 degrees) at every point
-/// of [`GUARD_T`]: a refit corrects where the surface lies, it does not turn it. A looser limit (the
-/// wrap's facing limit, 0.3) let patches turn by up to 72 degrees, and the hybrid method then found
-/// patches disagreeing with the analytic face by more than its 60 degrees and kept a whole wall of an
-/// open part as patches (`p9_hybrid_scan`, on Windows).
-const MIN_TURN_COS: f64 = 0.9;
+/// A refitted patch must face like its input to within this cosine at every point of [`GUARD_T`]
+/// (the facing limit of the wrap's projections). A tighter one (0.9) changed nothing on the open part
+/// of `p9_hybrid_scan` and cost scan 2 of the local corpus 0.15 points of its share within the
+/// tolerance.
+const MIN_TURN_COS: f64 = 0.3;
 /// Where (in u and in v) a refitted patch's normals are checked against its input, borders included.
 const GUARD_T: [f64; 7] = [0.0, 1.0 / 6.0, 1.0 / 3.0, 0.5, 2.0 / 3.0, 5.0 / 6.0, 1.0];
 
