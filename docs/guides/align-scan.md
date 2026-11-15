@@ -298,8 +298,7 @@ Normals, colours and per-vertex data go with the coordinates.
     small pieces below 1 % of the scan's area all together) are not refused; they are reported as `inner_skins` with their counts.
 - Reported, not refused: `layers_apart` (two scans that meet somewhere also lie over each other:
   at least 14 % of the points of one that relate to the other, on it or over it, lie over it beyond
-  the reach, with nothing of their own scan in between, or a tight cluster of them at one offset;
-  the issue gives the median offset and its
+  the reach, with nothing of their own scan in between; the issue gives the median offset and its
   spread, and says whether it is one offset, a shift as a whole, or not, a tilt or a curved surface;
   check the alignment), `overlap_unjudged` (samples whose search along the normal ran out of its budget in a
   pile of triangles), `overlap_too_small` (two scans that touch by fewer than 50 points either way:
@@ -340,10 +339,11 @@ Normals, colours and per-vertex data go with the coordinates.
       `scans_disjoint`, not as a misalignment;
     - a displaced pair that both overlap a third scan agreeing with each: it cannot be told from a
       real step of the part, and is not refused;
+    - a slender part slid along its own axis: only its end caps lie over the other (a share of
+      about its radius over its length), under the 14 % that `layers_apart` needs: not seen;
     - a scan displaced along a face parallel to the displacement, tilted, or seen over the other from
-      one side only: reported as `layers_apart` (at least 14 % of the related points over the other,
-      or a tight cluster at one offset such as the end caps of a slender part slid along its axis),
-      never refused;
+      one side only: reported as `layers_apart` (at least 14 % of the related points over the
+      other), never refused;
     - a shelf over a floor seen by different scans is the same geometry: it warns although correct;
     - a stepped part whose levels share nothing needs a scan that sees both (a close-up of the
       step), or the levels read as one scan displaced over the other and are refused;

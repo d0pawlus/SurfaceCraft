@@ -265,17 +265,19 @@ fn a_stepped_part_linked_by_a_close_up_merges_and_is_not_refused() {
     assert!(warns(&rep), "{:?}", rep.issues);
 }
 
+/// A documented limit, not a detection: a closed rod slid along its own axis.
 #[test]
-fn a_closed_rod_slid_along_its_axis_is_warned() {
+fn a_closed_rod_slid_along_its_axis_is_a_documented_limit() {
     let tol = 0.1;
     // a 10 x 10 x 100 mm rod (L/D 10) and another tessellation of it slid 20 tolerances along its axis:
     // the sides slide along themselves and agree; only the end caps lie over each other, at one
-    // offset, about 2.4 % of the samples
+    // offset, about 5 % of the related samples, under LAYERS_SHARE. A tight-cluster rule would catch
+    // it, but a correct scan of the local corpus has as tight a cluster at a share within 1.4 times:
+    // left out, listed in the guide's limits. The merge is not refused and raises no layers_apart.
     let a = synth::cuboid(Point3::origin(), Vec3::new(10.0, 10.0, 100.0), 20);
     let b = synth::cuboid(Point3::new(0.0, 0.0, 20.0 * tol), Vec3::new(10.0, 10.0, 100.0), 24);
     let rep = report(&[a, b], tol);
-    let cluster = rep.issues.iter().any(|i| matches!(i, Issue::LayersApart { one_offset: true, .. }));
-    assert!(!rep.refused && cluster, "{:?}", rep.issues);
+    assert!(!rep.refused && !warns(&rep), "{:?}", rep.issues);
 }
 
 #[test]

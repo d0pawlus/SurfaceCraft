@@ -178,16 +178,6 @@ impl PairResidual {
         self.over >= min && self.related() >= min && self.over_share() >= LAYERS_SHARE
     }
 
-    /// Do at least `min` samples lie over `b` at one tight offset (spread within
-    /// [`CLUSTER_SPREAD_TOLERANCES`] tolerances), at least [`CLUSTER_SHARE`] of the related ones? The
-    /// end caps of a slender part slid along its axis are such a cluster although their share is
-    /// small (about r / L); the stray hits the share of [`PairResidual::lies_over`] guards against
-    /// are scattered.
-    #[must_use]
-    pub fn clustered(&self, min: usize, tol: f64) -> bool {
-        self.over >= min && self.over_spread <= CLUSTER_SPREAD_TOLERANCES * tol && self.over_share() >= CLUSTER_SHARE
-    }
-
     /// Are the distances of the samples over `b` all about one value: their spread within the larger of
     /// `tol` and [`OFFSET_SPREAD_SHARE`] of their median? (A copy shifted as a whole lies at one offset;
     /// a tilt or a curved surface at many.)
@@ -202,15 +192,6 @@ impl PairResidual {
 /// on correct input (the same set), 0.22 at the least on displaced input (a strip seen from one
 /// side): 1.7 times above the first and 1.5 below the second.
 pub const LAYERS_SHARE: f64 = 0.14;
-
-/// Over samples at one tight offset are a cluster when they are at least this share of the related
-/// samples. PROVISIONAL: to be chosen from the local corpus (the over share of every correct pair
-/// with a tight spread, by scan number) with margin; a rod of L/D 10 slid along its axis measures
-/// about 0.024.
-pub const CLUSTER_SHARE: f64 = 0.01;
-/// The spread (quartiles) of a cluster's offsets at most this many tolerances. PROVISIONAL, as
-/// [`CLUSTER_SHARE`]: a shift as a whole has a spread of 0.
-pub const CLUSTER_SPREAD_TOLERANCES: f64 = 1.0;
 
 /// Over samples whose distances spread by at most this share of their median lie at one offset.
 pub const OFFSET_SPREAD_SHARE: f64 = 0.1;

@@ -447,8 +447,9 @@ fn too_small(a: usize, b: usize, x: Option<&PairResidual>, y: Option<&PairResidu
 }
 
 /// Do two scans that meet somewhere also lie over each other (see [`Issue::LayersApart`]): in either
-/// direction a material share of the related samples over the other, or a tight cluster of them at
-/// one offset?
+/// direction a material share of the related samples over the other? (A tight cluster at one offset
+/// was tried for the end caps of a slender part slid along its axis and left out: a correct scan of
+/// the local corpus has one as tight at a share within 1.4 times of the rod's.)
 fn layers_apart(x: Option<&PairResidual>, y: Option<&PairResidual>, tol: f64) -> Option<Issue> {
     let both = || [x, y].into_iter().flatten();
     // only scans that meet somewhere: pieces that share nothing and lie over each other are tied by a
@@ -456,9 +457,8 @@ fn layers_apart(x: Option<&PairResidual>, y: Option<&PairResidual>, tol: f64) ->
     if !both().any(|r| r.near >= MIN_SHARED_SAMPLES) {
         return None;
     }
-    let r = both()
-        .filter(|r| r.lies_over(MIN_SHARED_SAMPLES) || r.clustered(MIN_SHARED_SAMPLES, tol))
-        .max_by(|p, q| p.over_share().total_cmp(&q.over_share()))?;
+    let r =
+        both().filter(|r| r.lies_over(MIN_SHARED_SAMPLES)).max_by(|p, q| p.over_share().total_cmp(&q.over_share()))?;
     Some(Issue::LayersApart {
         a: r.a,
         b: r.b,
