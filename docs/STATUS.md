@@ -451,7 +451,7 @@ dostał piątą funkcję); D2 — eksport drzewa cech dla zewnętrznego CAD w pr
 podpisu w przyszłości (wydania nadal niepodpisane); D4 — asystent obsługuje najpopularniejsze aktualne standardy API
 (zgodny z OpenAI, Anthropic Messages, Google Gemini; R2); D5 — zgoda na zgłoszenia do solidcore/solidcraft zgodnie z
 zasadami ich repozytoriów (szkice `docs/upstream/08`–`12`); D6 — prawdziwe skany to 4 otwarte skany Artec Group (CC BY),
-pobierane skryptem i trzymane poza repo z uwagi na rozmiar; przebieg przez Geomagic i QuickSurface (V3) bez
-rozstrzygnięcia. Kolejność po tym: (1) #123, #127, skan 2 (inna sesja); (2) wypełnienie dużej dziury odwracające bryłę
+pobierane skryptem i trzymane poza repo z uwagi na rozmiar; przebieg przez Geomagic i QuickSurface (V3) nie
+teraz. Kolejność po tym: (1) #123, #127, skan 2 (inna sesja); (2) wypełnienie dużej dziury odwracające bryłę
 (skany 5, 6; w toku); (3) zgłoszenia upstream; (4) M5 i R4 po M4; (5) dług hybrydy i skan 3; (6) R2 i etap I; (7) reszta
 fal 3–5 planu P9.

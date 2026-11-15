@@ -31,7 +31,7 @@ agentów, [integration.md](../../integration.md)). R i I według decyzji z 2026-
 | D3 | Certyfikaty do podpisu (Windows, Apple Developer ID) | R1 | **w przyszłości**; do tego czasu wydania niepodpisane |
 | D4 | Dostawca LLM i klucz dla asystenta | R2 | **najpopularniejsze aktualne standardy API**, nie jeden dostawca (patrz R2) |
 | D5 | Zgoda na zgłoszenia upstream do `tangency-labs/solidcraft` (healer ponadliniowy, `item budget`) | O3 (część upstream) | **zgoda** na zgłoszenia do `tangency-labs/solidcore` i `tangency-labs/solidcraft` zgodnie z zasadami ich repozytoriów (szkice `docs/upstream/08`–`12`) |
-| D6 | Prawdziwe skany części pryzmatycznych do lokalnego korpusu oraz czy właściciel przepuści te same skany przez Geomagic i QuickSurface (tylko liczby zbiorcze trafiają do repo) | V2, V3 | prawdziwe skany = **4 otwarte skany Artec Group (CC BY)**, pobierane skryptem, poza repo z uwagi na rozmiar; przebieg przez Geomagic i QuickSurface (V3) bez rozstrzygnięcia |
+| D6 | Prawdziwe skany części pryzmatycznych do lokalnego korpusu oraz czy właściciel przepuści te same skany przez Geomagic i QuickSurface (tylko liczby zbiorcze trafiają do repo) | V2, V3 | prawdziwe skany = **4 otwarte skany Artec Group (CC BY)**, pobierane skryptem, poza repo z uwagi na rozmiar; przebieg przez Geomagic i QuickSurface (V3) **nie teraz** |
 
 Zostają nie-celami (bez pakietu): sterowanie skanerem, formaty zamknięte (Parasolid, JT, natywne pliki CAD).
 
