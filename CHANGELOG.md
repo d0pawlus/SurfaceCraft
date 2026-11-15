@@ -20,7 +20,7 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
   fields, a standard view (`front`, `back`, `left`, `right`, `top`, `bottom`, `iso`) and `fit`, applied in that
   order (view, fields, fit-all), and refuses bad numbers, unknown fields and unknown views without changing
   anything. These are requests of the app, not engine commands: the camera is state of the viewport, so they
-  exist in the desktop app only (#NNN).
+  exist in the desktop app only (#153).
 - `mesh.close_handles`: closes the small handles of a scan (tunnels, bridges and the sponge of tiny
   tunnels where the two sides of a thin wall run together) as a new mesh, keeping the rim and every
   vertex away from them; `scan.to_solid` takes it as the option `close_handles` (with `handle_size`),
