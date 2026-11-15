@@ -198,10 +198,14 @@ impl<'a> Guard<'a> {
         }
     }
 
-    /// Records a restored triangle (a triangle of a scan, at exactly its place) without tests: later
-    /// seam triangles are tested against it.
-    pub(super) fn record(&mut self, pts: &[Point3], t: [u32; 3]) -> bool {
+    /// Tests a restored triangle (a triangle of a scan, at exactly its place, so on scanned surface by
+    /// construction) for crossings and covers only, and records it when it passes.
+    pub(super) fn restorable(&mut self, pts: &[Point3], t: [u32; 3]) -> bool {
         let c = t.map(|v| pts.get(v as usize).copied().unwrap_or_else(Point3::origin));
+        if self.crosses(pts, t, &c) {
+            self.crossing += 1;
+            return false;
+        }
         self.add(t, &c);
         true
     }

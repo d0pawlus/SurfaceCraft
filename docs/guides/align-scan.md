@@ -272,8 +272,9 @@ Normals, colours and per-vertex data go with the coordinates.
   and no kept vertex moves, except that seam vertices of different scans closer than a quarter of the
   tolerance (and a tenth of the median edge) are welded. Removed triangles whose corners all exist in
   the result at exactly their places are put back: pieces cut from one scan share their tessellation,
-  and there the seam is a re-weld. Removed triangles whose centre the seam leaves without result surface
-  within the tolerance come back on their own scan's vertices (`seam.recovered`).
+  and there the seam is a re-weld (a restored triangle must cross and cover nothing either). Removed
+  triangles whose centre the seam leaves without result surface within the tolerance come back on their
+  own scan's vertices (`seam.recovered`).
 - Refused, with the numbers and nothing made (`refused` true, no undo step):
   - `scans_misaligned`: more than 10 % of the surface two scans share (where one lies on facing surface
     of the other, up to 8 tolerances away) lies farther apart than the tolerance. Merging them would
@@ -288,8 +289,10 @@ Normals, colours and per-vertex data go with the coordinates.
   three or more triangles are left out and counted as removed), `flipped_triangles_dropped`, `scans_disjoint` (groups of scans that share no surface: the result is a
   union of separate pieces), `scan_fully_covered` (a scan lies wholly on others and adds nothing),
   `seam_open` (cut edges no triangle could close), `removed_not_covered` (less than 99 % of the removed
-  area within the tolerance of the result), `unwelded_vertices` (vertices of different scans closer
-  than 0.01 median edges with no edge between them), `unoriented_edges` and `pinched_vertices`.
+  area within the tolerance of the result), `layers_stacked` (more than 0.5 % of the scans' area in the
+  result lies on another scan's surface: two layers left), `unwelded_vertices` (vertices of different
+  scans closer than 0.01 median edges with no edge between them), `unoriented_edges` and
+  `pinched_vertices`.
 - The report:
   - per scan: triangles `kept`, `removed`, `restored`, `overlap_share`;
   - per pair: the residual where one lies on the other (`rms`, `p95`, `worst`, `beyond_share`);
@@ -299,7 +302,8 @@ Normals, colours and per-vertex data go with the coordinates.
   - `checks`: the removed triangles are sampled by area (up to 2 million points; every triangle at
     least once) and measured against the result (`removed_within_share`, `removed_worst`). Also the
     vertices that moved and by how much, the triangles the merge added that cross another (0 by
-    construction) and `unwelded_vertices`;
+    construction), `unwelded_vertices` and `stacked_share` (the share of the scans' area in the result
+    within the tolerance of facing surface of another scan: two layers);
   - `stages` in milliseconds.
 - The result is what `scan.to_solid` (method `freeform`) wraps: four noisy views of the organic test
   blob merge into one closed piece of genus 0 that wraps to `pass`, as one full scan of the blob does.

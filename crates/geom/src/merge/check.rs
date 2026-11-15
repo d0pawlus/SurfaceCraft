@@ -142,3 +142,36 @@ pub(super) fn unwelded(u: &Union, radius: f64) -> usize {
     });
     flags.iter().filter(|f| **f).count()
 }
+
+/// The scan a union triangle comes from (`None` for a seam triangle).
+fn scan_of(o: Option<&Origin>) -> Option<u32> {
+    match o {
+        Some(Origin::Kept(s, _) | Origin::Restored(s, _) | Origin::Recovered(s, _)) => Some(*s),
+        _ => None,
+    }
+}
+
+/// Share of the area of the scan triangles in the result whose centre lies within `tol` of facing
+/// surface of a scan triangle of another scan that shares no vertex with it: two layers left where
+/// the scans overlapped (seam triangles are left out on both sides).
+pub(super) fn stacked_share(u: &Union, tol: f64) -> f64 {
+    let mesh = Mesh { positions: u.positions.clone(), triangles: u.triangles.clone() };
+    let bvh = Bvh::build(&mesh);
+    let ids: Vec<usize> = (0..mesh.triangles.len()).filter(|&i| scan_of(u.origin.get(i)).is_some()).collect();
+    let flags = par::map_slice(&ids, |&i| {
+        let (Some(c), Some(n), Some(t), Some(s)) =
+            (mesh.face_centroid(i), mesh.face_normal(i), mesh.triangles.get(i), scan_of(u.origin.get(i)))
+        else {
+            return (0.0, false);
+        };
+        let other = |o: usize| {
+            scan_of(u.origin.get(o)).is_some_and(|so| so != s)
+                && mesh.triangles.get(o).is_some_and(|ot| !ot.iter().any(|v| t.contains(v)))
+                && mesh.face_normal(o).is_some_and(|m| m.dot(&n) >= super::overlap::COS_FACING)
+        };
+        (mesh.face_area(i), bvh.closest_filtered(&c, tol, &other).is_some())
+    });
+    let total = flags.iter().fold(0.0, |a, f| a + f.0);
+    let stacked = flags.iter().filter(|f| f.1).fold(0.0, |a, f| a + f.0);
+    if total > 0.0 { stacked / total } else { 0.0 }
+}

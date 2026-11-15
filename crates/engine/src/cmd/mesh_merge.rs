@@ -184,12 +184,14 @@ pub struct MergeChecksOut {
     pub added_crossings: usize,
     /// Vertices of the result closer than 0.01 median edges to a vertex of another scan with no edge between them (copies of one point left unwelded).
     pub unwelded_vertices: usize,
+    /// Share of the area of the scans' triangles in the result whose centre lies within the tolerance of facing surface of another scan's triangles: two layers left where the scans overlapped (near 0 when the overlaps were removed).
+    pub stacked_share: f64,
 }
 
 /// Something to know, with its numbers.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 pub struct MergeIssueOut {
-    /// `scans_misaligned`, `opposed_normals`, `inconsistent_winding`, `inverted_scan` (these refuse), `non_manifold_input`, `flipped_triangles_dropped`, `scans_disjoint`, `scan_fully_covered`, `seam_open`, `removed_not_covered`, `unwelded_vertices`, `unoriented_edges`, `pinched_vertices`.
+    /// `scans_misaligned`, `opposed_normals`, `inconsistent_winding`, `inverted_scan` (these refuse), `non_manifold_input`, `flipped_triangles_dropped`, `scans_disjoint`, `scan_fully_covered`, `seam_open`, `removed_not_covered`, `layers_stacked`, `unwelded_vertices`, `unoriented_edges`, `pinched_vertices`.
     pub code: String,
     /// `refusal`, `warning` or `info`.
     pub severity: String,
@@ -362,6 +364,13 @@ fn notice_out(i: &Issue) -> MergeIssueOut {
             Vec::new(),
             format!("the result has {after} pinched vertices (the scans had {before})"),
         ),
+        other => check_notice(other),
+    }
+}
+
+/// An issue of the result's own checks (and the scans' flipped triangles), in the form of the command.
+fn check_notice(i: &Issue) -> MergeIssueOut {
+    match i {
         Issue::FlippedDropped { scan, flipped, share } => issue(
             "flipped_triangles_dropped",
             "warning",
@@ -383,6 +392,15 @@ fn notice_out(i: &Issue) -> MergeIssueOut {
             Vec::new(),
             format!(
                 "{vertices} vertices of the result lie at (nearly) the point of a vertex of another scan without an edge between them"
+            ),
+        ),
+        Issue::Stacked { share } => issue(
+            "layers_stacked",
+            "warning",
+            Vec::new(),
+            format!(
+                "{:.2} % of the scans' area in the result lies on another scan's surface: two layers were left there",
+                100.0 * share
             ),
         ),
         other => issue("other", "warning", Vec::new(), format!("{other:?}")),
@@ -462,6 +480,7 @@ fn checks_out(r: &Report) -> MergeChecksOut {
         max_vertex_move: c.max_vertex_move,
         added_crossings: c.added_crossings,
         unwelded_vertices: c.unwelded_vertices,
+        stacked_share: c.stacked_share,
     }
 }
 

@@ -64,6 +64,53 @@ fn compare(whole: &Mesh, merged: &Mesh, tol: f64) -> (f64, f64) {
     (near as f64 / picked.len() as f64, same as f64 / picked.len() as f64)
 }
 
+/// Vertices of `m` (used by a triangle) with another vertex closer than `r` and no edge between them:
+/// the near-coincident points the scan itself has (the baseline of `unwelded_vertices`).
+fn near_pairs(m: &Mesh, r: f64) -> usize {
+    let mut edges = std::collections::HashSet::new();
+    let mut used = vec![false; m.positions.len()];
+    for t in &m.triangles {
+        for k in 0..3 {
+            let (a, b) = (t[k], t[(k + 1) % 3]);
+            edges.insert((a.min(b), a.max(b)));
+            used[a as usize] = true;
+        }
+    }
+    let ids: Vec<u32> = (0..m.positions.len() as u32).filter(|&v| used[v as usize]).collect();
+    let pts: Vec<_> = ids.iter().map(|&v| m.positions[v as usize]).collect();
+    let tree = surfacecraft_geom::KdTree::build(&pts);
+    ids.iter()
+        .enumerate()
+        .filter(|&(i, &v)| {
+            tree.within(&pts[i], r)
+                .into_iter()
+                .map(|j| ids[j])
+                .any(|w| w != v && !edges.contains(&(v.min(w), v.max(w))))
+        })
+        .count()
+}
+
+/// The scan's own self-crossings (triangles crossing another they share no vertex with) and the share
+/// of its area whose centre lies within `tol` of facing surface it shares no vertex with (its own
+/// double layers): the baselines of `added_crossings` and `stacked_share`.
+fn own_faults(m: &Mesh, tol: f64) -> (usize, f64) {
+    let bvh = Bvh::build(m);
+    let crossing = surfacecraft_geom::nesting::sampled_self_intersections(m, &bvh, m.triangle_count()).crossing;
+    let (mut total, mut stacked) = (0.0, 0.0);
+    for i in 0..m.triangle_count() {
+        let (Some(c), Some(n)) = (m.face_centroid(i), m.face_normal(i)) else { continue };
+        let t = m.triangles[i];
+        let other = |o: usize| {
+            !m.triangles[o].iter().any(|v| t.contains(v)) && m.face_normal(o).is_some_and(|k| k.dot(&n) >= 0.5)
+        };
+        total += m.face_area(i);
+        if bvh.closest_filtered(&c, tol, &other).is_some() {
+            stacked += m.face_area(i);
+        }
+    }
+    (crossing, if total > 0.0 { stacked / total } else { 0.0 })
+}
+
 fn codes(out: &Value) -> Vec<String> {
     out["issues"]
         .as_array()
@@ -87,12 +134,13 @@ fn run(number: usize, kind: &str, whole: &Mesh, parts: &[Mesh]) {
     };
     let tol = out["tolerance"].as_f64().unwrap_or(0.0);
     let topo = surfacecraft_geom::merge::topology(whole);
+    let own = own_faults(whole, tol);
     let (near, same) = match out["id"].as_u64() {
         Some(id) => compare(whole, s.doc.mesh(surfacecraft_doc::ObjectId(id)).unwrap().mesh.as_ref(), tol),
         None => (0.0, 0.0),
     };
     eprintln!(
-        "| {number} | {kind} | {} | {tol:.4} | {near:.4} | {same:.4} | {}/{} | {}/{} | {} ({:.1} mm) | {:.4} | {} | {secs:.1} | {:?} |",
+        "| {number} | {kind} | {} | {tol:.4} | {near:.4} | {same:.4} | {}/{} | {}/{} | {} ({:.1} mm) | {:.4} | {} ({}) | {} ({}) | {:.4} ({:.4}) | {secs:.1} | {:?} |",
         whole.triangle_count(),
         out["after"]["pieces"],
         topo.pieces,
@@ -102,6 +150,11 @@ fn run(number: usize, kind: &str, whole: &Mesh, parts: &[Mesh]) {
         out["seam"]["open_length"].as_f64().unwrap_or(0.0),
         out["checks"]["removed_within_share"].as_f64().unwrap_or(0.0),
         out["checks"]["unwelded_vertices"],
+        near_pairs(whole, 0.01 * surfacecraft_geom::quality::edge_census(whole).lengths.median),
+        out["checks"]["added_crossings"],
+        own.0,
+        out["checks"]["stacked_share"].as_f64().unwrap_or(0.0),
+        own.1,
         codes(&out)
     );
     let stages: Vec<String> = out["stages"].as_array().map_or_else(Vec::new, |v| {
@@ -115,9 +168,9 @@ fn run(number: usize, kind: &str, whole: &Mesh, parts: &[Mesh]) {
 fn local_corpus_pieces_merge_back() {
     let only: Option<usize> = std::env::var("SURFACECRAFT_LOCAL_SCAN").ok().and_then(|v| v.parse().ok());
     eprintln!(
-        "| scan | kind | triangles | tolerance | within tol | bit for bit | pieces merge/scan | loops merge/scan | open seam | removed within | unwelded | s | issues |"
+        "| scan | kind | triangles | tolerance | within tol | bit for bit | pieces merge/scan | loops merge/scan | open seam | removed within | unwelded (scan's own) | added crossings (scan's own) | stacked (scan's own) | s | issues |"
     );
-    eprintln!("|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    eprintln!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
     for (i, path) in corpus().iter().enumerate() {
         let number = i + 1;
         if only.is_some_and(|n| n != number) {

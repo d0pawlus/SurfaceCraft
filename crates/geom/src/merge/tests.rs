@@ -272,8 +272,8 @@ fn ico_halves(k: usize) -> Vec<Mesh> {
 }
 
 /// The fixtures' blob is a UV sphere whose poles are fans of slivers right on the seam; on a surface
-/// of near-equilateral triangles the merge is closed at every resolution tried (k = 5 to 7, 80 000
-/// to 330 000 triangles a half; 0 open seam edges measured).
+/// of near-equilateral triangles the merge is closed (k = 5 and 6 here, about 13 000 and 51 000
+/// triangles a half; k = 7, about 200 000 a half, closed too when tried; 0 open seam edges measured).
 #[test]
 fn halves_of_an_even_organic_surface_merge_closed_at_fine_resolution() {
     for k in [5, 6] {

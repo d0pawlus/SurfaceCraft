@@ -138,7 +138,7 @@ fn run_case(label: &str, views: &[Mesh], truth: &Mesh) -> Measured {
     views.iter().for_each(|v| all.append(v));
     let (within_in, worst_in) = against_truth(&all, truth, tol);
     eprintln!(
-        "{label}: tol {tol:.3} | pieces {} loops {} genus {} nm {} unoriented {} pinched {} | truth within {within:.4} (views {within_in:.4}) worst {worst:.3} (views {worst_in:.3}) covered {covered:.4} | removed within {:.4} worst {:.3} | seam cut {} created {} open {} ({:.1} mm) strays {} | crossings {} unwelded {} | {} triangles | {secs:.2} s | issues {:?}",
+        "{label}: tol {tol:.3} | pieces {} loops {} genus {} nm {} unoriented {} pinched {} | truth within {within:.4} (views {within_in:.4}) worst {worst:.3} (views {worst_in:.3}) covered {covered:.4} | removed within {:.4} worst {:.3} | seam cut {} created {} open {} ({:.1} mm) strays {} | crossings {} unwelded {} stacked {:.4} | {} triangles | {secs:.2} s | issues {:?}",
         out["after"]["pieces"],
         out["after"]["loops"],
         out["after"]["genus"],
@@ -154,6 +154,7 @@ fn run_case(label: &str, views: &[Mesh], truth: &Mesh) -> Measured {
         out["seam"]["strays_dropped"],
         out["checks"]["added_crossings"],
         out["checks"]["unwelded_vertices"],
+        out["checks"]["stacked_share"].as_f64().unwrap(),
         out["triangles"],
         codes(&out)
     );
@@ -177,6 +178,7 @@ fn assert_clean(label: &str, m: &Measured) {
     let pinched = a["pinched_vertices"].as_u64().unwrap() > m.out["before"]["pinched_vertices"].as_u64().unwrap();
     assert_eq!(has("pinched_vertices"), pinched, "{label}");
     assert_eq!(has("unwelded_vertices"), c["unwelded_vertices"].as_u64().unwrap() > 0, "{label}");
+    assert_eq!(has("layers_stacked"), c["stacked_share"].as_f64().unwrap() > 0.005, "{label}");
 }
 
 #[test]
@@ -195,8 +197,10 @@ fn gate_m4_merge_blob_views_into_one_closed_piece() {
             let label = format!("blob {n} views{}", if perturbed { " perturbed" } else { "" });
             let m = run_case(&label, &views, &truth);
             assert_clean(&label, &m);
-            // the union of the views covers the whole blob: one closed piece of genus 0, no point twice
+            // the union of the views covers the whole blob: one closed piece of genus 0, no point twice,
+            // no second layer (measured stacked share 0.0000 against a bound of 0.001)
             assert_eq!(m.out["checks"]["unwelded_vertices"], json!(0), "{label}");
+            assert!(m.out["checks"]["stacked_share"].as_f64().unwrap() <= 0.001, "{label}");
             assert_eq!(m.out["after"]["pieces"], json!(1), "{label}");
             assert_eq!(m.out["after"]["loops"], json!(0), "{label}");
             assert_eq!(m.out["after"]["genus"], json!(0), "{label}");

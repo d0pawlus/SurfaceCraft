@@ -62,6 +62,9 @@ pub const MISALIGNED_SHARE: f64 = 0.1;
 pub const MIN_SHARED_SAMPLES: usize = 50;
 /// Below this share of the removed area within the tolerance of the result, `RemovedUncovered` is raised.
 pub const COVERED_SHARE: f64 = 0.99;
+/// Above this share of the scans' area in the result lying on another scan's surface,
+/// `Stacked` is raised.
+pub const STACKED_SHARE: f64 = 0.005;
 /// Triangles of all scans together at most.
 pub const MAX_TRIANGLES: usize = 40_000_000;
 
@@ -102,6 +105,8 @@ pub enum Issue {
     Unoriented { edges: usize },
     /// Vertices of different scans left unwelded at (nearly) one point.
     Unwelded { vertices: usize },
+    /// More than [`STACKED_SHARE`] of the scans' area in the result lies on another scan's surface.
+    Stacked { share: f64 },
     /// A closed piece of a scan has a negative volume: turned inside out (refused).
     Inverted { scan: usize, pieces: usize },
     /// Exact duplicate triangles and triangles on edges of three or more triangles were left out of a
@@ -170,6 +175,9 @@ pub struct Checks {
     /// Vertices of the result with a vertex of another scan closer than [`DUPLICATE_SHARE`] median
     /// edges and no edge between them (copies of one point left unwelded).
     pub unwelded_vertices: usize,
+    /// Share of the area of the scans' triangles in the result that lies within the tolerance of facing
+    /// surface of another scan's triangles: two layers left (should be near 0).
+    pub stacked_share: f64,
 }
 
 /// The stages of [`merge`], announced to the caller as they start (for timing).
@@ -380,7 +388,7 @@ fn build(
     u.weld_front(scans, weld);
     let cell = RADII_EDGES.iter().fold(0.0_f64, |m, k| m.max(*k)) * 2.0 * scale(scans);
     let mut guard = seam::Guard::new(scans, &u, tol, cell);
-    rep.seam.restored = union::restore(&mut u, scans, (&removed, &lost), &mut |pts, t| guard.record(pts, t));
+    rep.seam.restored = union::restore(&mut u, scans, (&removed, &lost), &mut |pts, t| guard.restorable(pts, t));
     stage(Stage::Seam);
     seam::close(&mut u, scans, &mut guard, &mut rep.seam, cancel).ok_or(MergeError::Cancelled)?;
     rep.seam.recovered = recover::recover(&mut u, scans, &removed, &mut guard, tol);
@@ -458,6 +466,7 @@ fn finish(
     fill_rows(scans, removed, &u, &mut rep.scans);
     rep.checks.added_crossings = check::added_crossings(&u);
     rep.checks.unwelded_vertices = check::unwelded(&u, DUPLICATE_SHARE * scale(scans));
+    rep.checks.stacked_share = check::stacked_share(&u, tol);
     rep.checks.moved_vertices = u.welded;
     rep.checks.max_vertex_move = u.max_move;
     let mut mesh = Mesh { positions: u.positions.clone(), triangles: u.triangles.clone() };
@@ -483,6 +492,9 @@ fn result_issues(rep: &mut Report) {
     let cov = rep.checks.removed;
     if cov.share() < COVERED_SHARE {
         rep.issues.push(Issue::RemovedUncovered { share: cov.share(), worst: cov.worst });
+    }
+    if rep.checks.stacked_share > STACKED_SHARE {
+        rep.issues.push(Issue::Stacked { share: rep.checks.stacked_share });
     }
     if rep.checks.unwelded_vertices > 0 {
         rep.issues.push(Issue::Unwelded { vertices: rep.checks.unwelded_vertices });

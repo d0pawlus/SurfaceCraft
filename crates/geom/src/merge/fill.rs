@@ -54,10 +54,16 @@ fn seam_loops(u: &Union, scans: &[Scan]) -> Vec<Vec<u32>> {
 fn simple(walk: Vec<u32>) -> Vec<Vec<u32>> {
     let mut out = Vec::new();
     let mut stack: Vec<u32> = Vec::with_capacity(walk.len());
+    let mut at: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
     for v in walk {
-        if let Some(pos) = stack.iter().position(|&w| w == v) {
-            out.push(stack.split_off(pos));
+        if let Some(&pos) = at.get(&v) {
+            let part = stack.split_off(pos);
+            for w in &part {
+                at.remove(w);
+            }
+            out.push(part);
         }
+        at.insert(v, stack.len());
         stack.push(v);
     }
     out.push(stack);
@@ -130,21 +136,30 @@ fn patch_for(
 
 /// The fans of triangles `tris` around vertex `v` (triangles joined across the edges through `v`).
 fn fans(u: &Union, v: u32, tris: &[usize]) -> usize {
-    let mut parent: Vec<usize> = (0..tris.len()).collect();
     fn root(p: &mut [usize], mut x: usize) -> usize {
         while let Some(&up) = p.get(x).filter(|&&up| up != x) {
-            x = up;
+            let grand = p.get(up).copied().unwrap_or(up);
+            if let Some(slot) = p.get_mut(x) {
+                *slot = grand;
+            }
+            x = grand;
         }
         x
     }
-    let others = |i: usize| u.triangles.get(i).map(|t| t.iter().copied().filter(|&w| w != v).collect::<Vec<u32>>());
-    for i in 0..tris.len() {
-        for j in i + 1..tris.len() {
-            let (Some(a), Some(b)) = (others(tris[i]), others(tris[j])) else { continue };
-            if a.iter().any(|w| b.contains(w)) {
-                let (ri, rj) = (root(&mut parent, i), root(&mut parent, j));
-                if let Some(s) = parent.get_mut(ri) {
-                    *s = rj;
+    let mut parent: Vec<usize> = (0..tris.len()).collect();
+    // two triangles of the fan are joined when they share a vertex besides `v` (an edge through `v`)
+    let mut first: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    for (i, &t) in tris.iter().enumerate() {
+        for &w in u.triangles.get(t).into_iter().flatten().filter(|&&w| w != v) {
+            match first.get(&w) {
+                Some(&j) => {
+                    let (ri, rj) = (root(&mut parent, i), root(&mut parent, j));
+                    if let Some(slot) = parent.get_mut(ri) {
+                        *slot = rj;
+                    }
+                }
+                None => {
+                    first.insert(w, i);
                 }
             }
         }
