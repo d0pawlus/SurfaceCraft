@@ -114,6 +114,8 @@ impl Session {
         let before = spec.undoable.then(|| self.doc.clone());
         self.unchanged = false;
         let result = run_guarded(spec, self, params.clone());
+        // a picked file the command did not read (it failed first) is not held any longer
+        self.picked.release_named_in(&params);
         let mapped = match result {
             Ok(v) => {
                 if let Some(b) = before.filter(|_| !self.unchanged) {
@@ -175,8 +177,10 @@ impl Session {
     }
 
     /// Records that command `id` was started with `params` and cancelled before it finished: a
-    /// failed entry in the log and nothing else (the document and the history are untouched).
+    /// failed entry in the log and nothing else (the document and the history are untouched). A
+    /// picked file it names is released.
     pub fn note_cancelled(&mut self, id: &str, params: Value) {
+        self.picked.release_named_in(&params);
         let outcome = serde_json::to_value(EngineError::Failed(cmd::CANCELLED.into())).unwrap_or(Value::Null);
         self.push_log(LogEntry { command: id.to_string(), params, ok: false, outcome });
     }

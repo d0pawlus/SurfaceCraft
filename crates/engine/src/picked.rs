@@ -61,6 +61,17 @@ impl PickedFiles {
         self.store().files.remove(path);
     }
 
+    /// Drops the picked file the command parameters `params` name in `path`, when it is still
+    /// held: a command that failed before reading it, or was cancelled before it ran, leaves
+    /// nothing behind.
+    pub fn release_named_in(&self, params: &serde_json::Value) {
+        if let Some(path) = params.get("path").and_then(serde_json::Value::as_str)
+            && Self::is_picked(path)
+        {
+            self.discard(path);
+        }
+    }
+
     /// Bytes of every file held.
     #[must_use]
     pub fn held_bytes(&self) -> usize {
@@ -93,6 +104,19 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(shared.take(&b), Some(vec![2]));
         shared.discard(&a);
+        assert_eq!(picked.held_bytes(), 0);
+    }
+
+    #[test]
+    fn the_file_named_in_parameters_is_released_and_nothing_else() {
+        let picked = PickedFiles::default();
+        let named = picked.put("a.stl", vec![1]);
+        let other = picked.put("b.stl", vec![2]);
+        picked.release_named_in(&serde_json::json!({"path": "/tmp/a.stl"}));
+        picked.release_named_in(&serde_json::json!({"path": 7}));
+        assert_eq!(picked.held_bytes(), 2);
+        picked.release_named_in(&serde_json::json!({"path": named}));
+        assert_eq!(picked.take(&other), Some(vec![2]));
         assert_eq!(picked.held_bytes(), 0);
     }
 
