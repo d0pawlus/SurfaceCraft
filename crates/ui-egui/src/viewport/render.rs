@@ -16,10 +16,12 @@ impl Renderer {
             m.used = false;
         }
         self.draw_list.clear();
-        let o = [f.origin.x, f.origin.y, f.origin.z];
         for item in &f.items {
             let k = item.key;
-            let fresh = self.meshes.get(&k).is_none_or(|g| g.origin != o || g.vertices != item.mesh.positions.len());
+            let fresh = self
+                .meshes
+                .get(&k)
+                .is_none_or(|g| g.vertices != item.mesh.positions.len() || origin_too_far(&g.origin, f));
             if fresh {
                 let g = Self::upload(device, &self.model_layout, item, &f.origin);
                 self.meshes.insert(k, g);
@@ -31,7 +33,7 @@ impl Renderer {
                 queue.write_buffer(
                     &g.model_buf,
                     0,
-                    bytemuck::bytes_of(&object_uniform(&rows, &f.origin, back_of(item))),
+                    bytemuck::bytes_of(&object_uniform(&rows, &g.origin, &f.origin, back_of(item))),
                 );
                 if colors_need_upload(g.color_state, item) {
                     queue.write_buffer(&g.cb, 0, bytemuck::cast_slice(&colors_of(item)));

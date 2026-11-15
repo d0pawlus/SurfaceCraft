@@ -82,7 +82,7 @@ impl Renderer {
         });
         let model_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("mesh model"),
-            contents: bytemuck::bytes_of(&object_uniform(&identity_rows(), origin, back_of(item))),
+            contents: bytemuck::bytes_of(&object_uniform(&identity_rows(), origin, origin, back_of(item))),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         let model_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -98,7 +98,7 @@ impl Renderer {
             ib,
             count: indices.len() as u32,
             vertices: verts.len(),
-            origin: [origin.x, origin.y, origin.z],
+            origin: *origin,
             color_state: color_state(&item.color, item.colors.is_some(), item.colors_key),
             hl_ids: Vec::new(),
             hl_ib: None,

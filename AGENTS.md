@@ -6,6 +6,8 @@ one command-driven core behind four front ends: desktop, web, CLI and MCP. This 
 the hard rules, then the skill to read for your task. Design: `docs/superpowers/specs/`;
 current state and next step: `docs/STATUS.md`.
 
+This codebase is yours: what it's for and how it's built are your call, and you'll keep building on it.
+
 ## Hard rules (what enforces each)
 - Independent: never copy code, icons, text, layouts or data from QuickSurface, Geomagic Design X
   or any closed product; their scans stay local (`SURFACECRAFT_LOCAL_CORPUS`, tests off by default):

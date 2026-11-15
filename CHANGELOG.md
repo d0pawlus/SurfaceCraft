@@ -25,11 +25,31 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
 
 ### Changed
 
+- `scan.to_solid` on a scan of many parts models every piece that is a solid, not only those with
+  `part_share` of the largest: a watertight, consistently oriented piece of positive volume with at
+  least 100 triangles and 50 tolerances across is a *small part*, modelled with its own verdict
+  (`components[].co_equal` tells the kinds apart). Co-equal is decided by area alone. A small part
+  never fails the call; small parts that did not pass, pieces left out and parts beyond the cap keep
+  it at `review` when together they hold more than 2 % of the surface (`unmodelled_pieces`, new
+  `parts_not_passed`), and below that the parts that did not pass are still counted
+  (`small_parts_not_passed`) and named in a next step. Pieces left out carry a reason (`debris`,
+  `open`, `not_oriented`, `inside_out`); the 16 largest are listed in `pieces_left_out`.
+  `minor_and_debris_*` now count the pieces left out and `debris_pieces` those with reason `debris`
+  only. The cap of parts per call rises from 24 to 128, the cleaning protects small parts below its
+  default by identity, and small parts are never rebuilt.
 - `surface.patch`: a patch whose sides are all soft now starts from a 6 by 6 control net and
   grows it only until the scan data are within `tolerance`; before, the start net came from the
   number of data points and followed the fine texture of a dense scan, which made its curvature
   useless as a G2 reference for a neighbouring patch. Such a patch is smoother and its `rms` is
   larger than before; pass a smaller `tolerance` for a closer fit. [#139]
+
+### Fixed
+
+- `scan.to_solid` on a split scan: a part whose `auto` freeform attempt was refused because the call's
+  two extra attempts were spent, and whose primitives did not pass, is now wrapped once as its own
+  wrap and the better result is kept (twelve small parts of the scan of many parts ended without a
+  pass before; each passes now). The solid kept has the part's name and the losing attempt leaves no
+  object behind.
 
 ## [0.2.0] - 2026-11-13
 
