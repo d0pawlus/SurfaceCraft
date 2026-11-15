@@ -52,11 +52,11 @@ const UNIFORM_ROUNDS: usize = 3;
 /// Rounds at most of the adaptive layout.
 const ADAPTIVE_ROUNDS: usize = 7;
 /// The adaptive rounds stop (below the cap) once the share within the tolerance reaches
-/// `min_within` plus this share of what `min_within` leaves out (99.5 % for 99 %): the wrap measures
+/// `min_within` plus this share of what `min_within` leaves out (99.75 % for 99 %): the wrap measures
 /// a stride of the scan against a coarse tessellation of the patches, so a network that only just
 /// meets `min_within` there can miss it against the scan. Only the stop uses it; whether the
 /// tolerance is met is still judged by `min_within`.
-const STOP_MARGIN: f64 = 0.5;
+const STOP_MARGIN: f64 = 0.75;
 /// A round cut to the cap must raise the best share within the tolerance by this much for the
 /// rounds to go on at the cap (0.1 percentage points of the samples).
 const MIN_GAIN_AT_CAP: f64 = 0.001;

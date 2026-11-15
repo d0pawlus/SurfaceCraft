@@ -23,8 +23,8 @@
 //! [`crate::patch::eval`] (the listed APP-GEOMETRY file).
 use crate::mls::ScanSurface;
 use crate::patch::{
-    PatchSet, WRAP_FACING_COS, bern, bezier_tangent, cross_weights, eval, normal, tensor_weights, weighted_sum,
-    wrap_curve, wrap_net,
+    PatchSet, WRAP_FACING_COS, bern, bezier_tangent, chord_curve, cross_weights, eval, interpolated_net, normal,
+    tensor_weights, weighted_sum, wrap_curve, wrap_net,
 };
 pub use crate::patch_jumps::{JumpStats, jump_stats};
 use crate::wrap_normals::{EdgeKey, Layout, LayoutNormals, edge_faces, edge_slot, key, layout_normals};
@@ -423,8 +423,10 @@ fn edge_curves(l: &Layer, edges: &BTreeMap<EdgeKey, Vec<usize>>, build: &mut Bui
             None
         };
         let Some(t) = tangents else {
-            build.curves.insert((a, m), wrap_curve(pa, pm, &on_edge));
-            build.curves.insert((b, m), wrap_curve(pb, pm, &on_edge));
+            // the tangent construction is tuned to the plain curves (see [`patch_net`])
+            let curve = if l.g1 { chord_curve } else { wrap_curve };
+            build.curves.insert((a, m), curve(pa, pm, &on_edge));
+            build.curves.insert((b, m), curve(pb, pm, &on_edge));
             continue;
         };
         let [na, nb, nm] = t.normals.map_or([None; 3], |n| n.map(Some));
@@ -511,10 +513,12 @@ fn scan_rms(net: &crate::patch::Net, project: &dyn Fn(Vec3) -> Vec3) -> f64 {
 fn patch_net(l: &Layer, tri: &Triangle, k: usize, curves: [Curve; 4], ng: Vec3, nf: Vec3) -> (crate::patch::Net, bool) {
     let [bot, right, top, left] = curves;
     let on_face = |at: Vec3| l.project(at, &[nf]);
-    let free = wrap_net(&bot, &right, &top, &left, &on_face);
     if !l.g1 {
-        return (free, true);
+        return (wrap_net(&bot, &right, &top, &left, &on_face), true);
     }
+    // the tangent patches are judged against, and fall back to, the plain interpolating patch: the
+    // least-squares refit of the unconstrained wrap made the tangent ones fail their smoothness gates
+    let free = interpolated_net(&bot, &right, &top, &left, &on_face);
     let (nc, mb, ml) =
         (l.corner_normal(tri.f, tri.corners[k]), l.mid_normal(tri.f, k), l.mid_normal(tri.f, (k + 2) % 3));
     let edge = |e: usize| l.coarse.triangles.get(tri.f).map(|t| key(t[e], t[(e + 1) % 3]));

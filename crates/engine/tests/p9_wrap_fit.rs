@@ -116,9 +116,13 @@ fn rounds_at_the_cap_go_on_while_they_gain_and_never_lose_the_best() {
     assert_eq!(within(&w), best, "{levels:?}");
 }
 
+/// Share of the samples out of the tolerance on main for the body at the default cap (1614 patches,
+/// 99.66 % within).
+const MAIN_DEFAULT_MISSED: f64 = 0.0034;
+
 #[test]
-fn an_organic_scan_that_already_passes_still_passes_with_no_more_patches() {
-    // Arrange: the default cap is far above what the body needs (main: 1614 patches, 99.66 %)
+fn an_organic_scan_that_already_passes_passes_closer_than_before() {
+    // Arrange: the default cap is far above what the body needs
     let scan = organic_scan(7);
 
     // Act
@@ -130,6 +134,5 @@ fn an_organic_scan_that_already_passes_still_passes_with_no_more_patches() {
     eprintln!("default cap: patches {} within {:.5} capped {}", w["patches"], within(&w), w["capped"]);
     assert_eq!(w["within_tolerance"], true, "{w}");
     assert_eq!(w["capped"], false, "{w}");
-    assert!(1.0 - within(&w) <= GATE_MISSED, "{w}");
-    assert!(patches(&w) <= 2400, "{} patches", patches(&w));
+    assert!(1.0 - within(&w) <= MAIN_DEFAULT_MISSED / 1.5, "{w}");
 }

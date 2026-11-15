@@ -15,7 +15,11 @@ patch network over a whole scan.
 - `refine` (default `adaptive`): the layout is refined only around the scan points the patches
   miss, so smooth areas keep large patches; `uniform` halves the budget of the whole scan each
   round (more patches for the same tolerance). `levels` lists the patches and the share within
-  the tolerance of every round, `refine` the layout used.
+  the tolerance of every round, `refine` the layout used. The adaptive rounds stop once the share
+  reaches `min_within` plus three quarters of what it leaves out (99.75 % for the default 99 %):
+  the wrap measures a stride of the scan against a coarse tessellation, so a network that only just
+  met `min_within` there could miss it against the scan. `within_tolerance` is still judged by
+  `min_within`.
 - `max_patches` is a hard bound of every round, the first included (`cap_used` echoes it): no
   network has more patches. A round that would exceed it is not dropped. Adaptive: it is cut to the
   cap by the decimation, and while such rounds raise the share within the tolerance by at least 0.1
