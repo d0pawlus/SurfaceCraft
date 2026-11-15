@@ -13,6 +13,14 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
 
 ### Added
 
+- `mesh.merge`: merges aligned scans of one part into one new mesh. Where scans overlap one layer is
+  kept (the scan in which the surface lies farthest from its own border), the seam is closed by ball
+  pivoting on scanned surface only, and no kept vertex moves. Scans that disagree in their overlap
+  by more than the tolerance, whose normals oppose, or that are wound both ways or turned inside out
+  are refused with the numbers; the report gives per scan what was kept and removed, the residual
+  of every pair, the seam, the topology before and after and how far the removed surface lies from
+  the result.
+
 - `mesh.close_handles`: closes the small handles of a scan (tunnels, bridges and the sponge of tiny
   tunnels where the two sides of a thin wall run together) as a new mesh, keeping the rim and every
   vertex away from them; `scan.to_solid` takes it as the option `close_handles` (with `handle_size`),

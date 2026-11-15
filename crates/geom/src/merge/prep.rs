@@ -248,20 +248,41 @@ pub(super) fn median_edge(mesh: &Mesh) -> f64 {
     *l.select_nth_unstable_by(k, f64::total_cmp).1
 }
 
-/// Closed pieces with a negative volume (measured about the centre of their box).
-fn inverted_pieces(mesh: &Mesh) -> usize {
-    pieces::pieces(mesh)
+/// A closed piece smaller than this share of its scan's area is not judged for being inside out
+/// (debris).
+pub const INVERTED_MIN_SHARE: f64 = 0.01;
+
+/// Signed volume of a piece, measured about the centre of its box.
+fn volume(mesh: &Mesh, p: &pieces::Piece) -> f64 {
+    let o = p.bbox.center();
+    p.triangles
         .iter()
-        .filter(|p| p.closed())
-        .filter(|p| {
-            let o = p.bbox.center();
-            let vol: f64 = p
-                .triangles
-                .iter()
-                .filter_map(|&t| mesh.triangle(t as usize))
-                .map(|[a, b, c]| (a - o).dot(&(b - o).cross(&(c - o))))
-                .sum();
-            vol < 0.0
+        .filter_map(|&t| mesh.triangle(t as usize))
+        .map(|[a, b, c]| (a - o).dot(&(b - o).cross(&(c - o))))
+        .sum()
+}
+
+/// Does piece `k` lie inside the other closed pieces (an inner skin, whose volume is negative)?
+fn nested(mesh: &Mesh, closed: &[&pieces::Piece], k: usize) -> bool {
+    let others: Vec<u32> =
+        closed.iter().enumerate().filter(|(j, _)| *j != k).flat_map(|(_, q)| q.triangles.iter().copied()).collect();
+    let probe = closed.get(k).and_then(|p| p.triangles.first()).and_then(|&t| mesh.triangles.get(t as usize));
+    let (Some(tri), false) = (probe, others.is_empty()) else { return false };
+    let Some(&p) = mesh.positions.get(tri[0] as usize) else { return false };
+    let bvh = Bvh::build(&mesh.submesh(&others));
+    crate::nesting::point_inside(&bvh, &p, 1e-9 * mesh.bbox().diagonal().max(f64::MIN_POSITIVE))
+}
+
+/// Closed pieces turned inside out: a negative volume, not inside another closed piece of the scan
+/// (an inner skin), and at least [`INVERTED_MIN_SHARE`] of the scan's area.
+fn inverted_pieces(mesh: &Mesh) -> usize {
+    let all = pieces::pieces(mesh);
+    let closed: Vec<&pieces::Piece> = all.iter().filter(|p| p.closed()).collect();
+    let area = mesh.area();
+    (0..closed.len())
+        .filter(|&k| {
+            closed.get(k).is_some_and(|p| p.area >= INVERTED_MIN_SHARE * area && volume(mesh, p) < 0.0)
+                && !nested(mesh, &closed, k)
         })
         .count()
 }

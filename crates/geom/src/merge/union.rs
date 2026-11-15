@@ -172,19 +172,84 @@ fn bits(p: &Point3) -> [u64; 3] {
     [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()]
 }
 
-/// The union vertex of corner `v` of scan `s`: its own when kept, else one of another scan at exactly
-/// its position.
-fn corner(u: &Union, at: &HashMap<[u64; 3], u32>, scans: &[Scan], s: usize, v: u32) -> Option<u32> {
-    let own = u.vertex_of.get(s).and_then(|m| m.get(v as usize)).copied().filter(|&x| x != NONE);
-    own.or_else(|| at.get(&bits(scans.get(s)?.mesh.positions.get(v as usize)?)).copied())
+/// Where corner `v` of a removed triangle of scan `s` is in the union.
+#[derive(Clone, Copy)]
+enum Corner {
+    /// The scan's own vertex, kept.
+    Own(u32),
+    /// A vertex of another scan at exactly its position.
+    Other(u32),
+    /// The scan's own vertex, not lost to another scan, but in no kept triangle: added if needed.
+    Unused(u32),
 }
 
-/// Restores the removed triangles whose corners all exist in the union at exactly their positions,
-/// when that uses no directed edge twice and `guard` accepts them. Returns how many.
+fn corner(
+    u: &Union,
+    at: &HashMap<[u64; 3], u32>,
+    scans: &[Scan],
+    lost: &[Vec<bool>],
+    s: usize,
+    v: u32,
+) -> Option<Corner> {
+    if let Some(x) = u.vertex_of.get(s).and_then(|m| m.get(v as usize)).copied().filter(|&x| x != NONE) {
+        return Some(Corner::Own(x));
+    }
+    let p = scans.get(s)?.mesh.positions.get(v as usize)?;
+    if let Some(&x) = at.get(&bits(p)) {
+        return Some(if u.scan_of.get(x as usize) == Some(&(s as u32)) { Corner::Own(x) } else { Corner::Other(x) });
+    }
+    let owned = !lost.get(s).and_then(|l| l.get(v as usize)).copied().unwrap_or(true);
+    owned.then_some(Corner::Unused(v))
+}
+
+/// Gives the unused vertex `v` of scan `s` a place in the union.
+fn add_vertex(u: &mut Union, at: &mut HashMap<[u64; 3], u32>, scans: &[Scan], s: usize, v: u32) -> Option<u32> {
+    let scan = scans.get(s)?;
+    let p = *scan.mesh.positions.get(v as usize)?;
+    let x = u.positions.len() as u32;
+    u.positions.push(p);
+    u.normals.push(scan.normals.get(v as usize).copied().unwrap_or_else(Vec3::zeros));
+    u.scan_of.push(s as u32);
+    if let Some(slot) = u.vertex_of.get_mut(s).and_then(|m| m.get_mut(v as usize)) {
+        *slot = x;
+    }
+    at.entry(bits(&p)).or_insert(x);
+    Some(x)
+}
+
+/// The union vertices of the corners of a removed triangle, when it can come back: every corner is
+/// in the union (or an unused own vertex, added now) and at least one is another scan's vertex at
+/// exactly its place (a triangle removed for redundancy, with all its corners its own, stays out).
+fn corners_of(
+    u: &mut Union,
+    at: &mut HashMap<[u64; 3], u32>,
+    scans: &[Scan],
+    lost: &[Vec<bool>],
+    s: usize,
+    tri: [u32; 3],
+) -> Option<[u32; 3]> {
+    let c = tri.map(|v| corner(u, at, scans, lost, s, v));
+    let c = [c[0]?, c[1]?, c[2]?];
+    if !c.iter().any(|k| matches!(k, Corner::Other(_))) {
+        return None;
+    }
+    let mut m = [0u32; 3];
+    for (k, x) in c.iter().enumerate() {
+        m[k] = match *x {
+            Corner::Own(i) | Corner::Other(i) => i,
+            Corner::Unused(v) => add_vertex(u, at, scans, s, v)?,
+        };
+    }
+    (m[0] != m[1] && m[1] != m[2] && m[0] != m[2]).then_some(m)
+}
+
+/// Restores the removed triangles whose corners all exist in the union at exactly their positions
+/// (see [`corners_of`]), when that uses no directed edge twice and `guard` accepts them. Returns how
+/// many.
 pub(super) fn restore(
     u: &mut Union,
     scans: &[Scan],
-    removed: &[Vec<bool>],
+    (removed, lost): (&[Vec<bool>], &[Vec<bool>]),
     guard: &mut dyn FnMut(&[Point3], [u32; 3]) -> bool,
 ) -> usize {
     // only vertices still in use (a welded vertex lives on as the one it was welded into)
@@ -202,17 +267,12 @@ pub(super) fn restore(
         let before = restored;
         for (s, scan) in scans.iter().enumerate() {
             let gone = removed.get(s).map_or(&[][..], Vec::as_slice);
-            for (t, tri) in scan.mesh.triangles.iter().enumerate() {
+            for (t, &tri) in scan.mesh.triangles.iter().enumerate() {
                 if !gone.get(t).copied().unwrap_or(false) || done.contains(&(s as u32, t as u32)) {
                     continue;
                 }
-                let Some(m) = tri.iter().map(|&v| corner(u, &at, scans, s, v)).collect::<Option<Vec<u32>>>() else {
-                    continue;
-                };
-                let m = [m[0], m[1], m[2]];
-                let fresh = m[0] != m[1] && m[1] != m[2] && m[0] != m[2];
-                if !fresh || (0..3).any(|k| edges.contains(&directed(m[k], m[(k + 1) % 3]))) || !guard(&u.positions, m)
-                {
+                let Some(m) = corners_of(u, &mut at, scans, lost, s, tri) else { continue };
+                if (0..3).any(|k| edges.contains(&directed(m[k], m[(k + 1) % 3]))) || !guard(&u.positions, m) {
                     continue;
                 }
                 edges.extend((0..3).map(|k| directed(m[k], m[(k + 1) % 3])));

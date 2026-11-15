@@ -124,3 +124,53 @@ fn many_views_of_the_blob_merge_into_one_closed_piece() {
         assert_eq!(rep.after.unoriented_edges, 0, "{n}");
     }
 }
+
+#[test]
+fn hostile_input_is_an_error_not_a_panic() {
+    let a = view(0, Vec3::x(), 8.0);
+    let cancel = Cancel::new();
+    let go = |scans: &[Mesh], tol: f64| merge(scans, &Params { tolerance: tol }, &cancel, &mut |_| {});
+    assert!(matches!(go(&[a.clone()], TOL), Err(MergeError::Params(_))), "one scan");
+    assert!(matches!(go(&[], TOL), Err(MergeError::Params(_))), "none");
+    assert!(matches!(go(&[a.clone(), Mesh::default()], TOL), Err(MergeError::Params(_))), "empty");
+    for tol in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        assert!(matches!(go(&[a.clone(), a.clone()], tol), Err(MergeError::Params(_))), "{tol}");
+    }
+    let mut nan = a.clone();
+    nan.positions[3] = Point3::new(0.0, f64::NAN, 0.0);
+    assert!(matches!(go(&[a.clone(), nan], TOL), Err(MergeError::Invalid(1, _))));
+    let mut bad = a.clone();
+    bad.triangles.push([0, 1, 1_000_000]);
+    assert!(matches!(go(&[a.clone(), bad], TOL), Err(MergeError::Invalid(1, _))));
+    // degenerate but valid: collapsed triangles, a scan of one triangle, coincident points
+    let mut collapsed = a.clone();
+    collapsed.triangles.extend([[0, 0, 1], [2, 2, 2]]);
+    let one = Mesh {
+        positions: vec![Point3::origin(), Point3::new(1.0, 0.0, 0.0), Point3::new(0.0, 1.0, 0.0)],
+        triangles: vec![[0, 1, 2]],
+    };
+    let dot = Mesh { positions: vec![Point3::origin(); 3], triangles: vec![[0, 1, 2]] };
+    for scans in [
+        vec![a.clone(), collapsed],
+        vec![one.clone(), one],
+        vec![dot.clone(), dot],
+        vec![a.clone(), a.transformed(&Transform::translation(Vec3::new(1e8, 0.0, 0.0)))],
+    ] {
+        assert!(go(&scans, TOL).is_ok());
+    }
+}
+
+#[test]
+fn a_cancelled_merge_returns_cancelled() {
+    let cancel = Cancel::new();
+    cancel.cancel();
+    let r = merge(&views_of(2), &Params { tolerance: TOL }, &cancel, &mut |_| {});
+    assert!(matches!(r, Err(MergeError::Cancelled)), "{r:?}");
+}
+
+#[test]
+fn the_stages_are_announced_in_order() {
+    let mut seen = Vec::new();
+    merge(&views_of(2), &Params { tolerance: TOL }, &Cancel::new(), &mut |s| seen.push(s)).unwrap();
+    assert_eq!(seen, vec![Stage::Prepare, Stage::Overlap, Stage::Ownership, Stage::Union, Stage::Seam, Stage::Check]);
+}

@@ -11,7 +11,7 @@ const MAX_SPLIT: usize = 64;
 /// Samples measured between two looks at the cancellation flag.
 const CHUNK: usize = 1 << 15;
 /// Triangles near an added one tested for a crossing at most (the rest counts as a crossing).
-const MAX_NEAR: usize = 4096;
+const MAX_NEAR: usize = 1 << 16;
 
 /// How well the result covers what was removed.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

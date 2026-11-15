@@ -256,7 +256,12 @@ fn issue(code: &str, severity: &str, scans: Vec<usize>, message: String) -> Merg
 
 /// The issue in the form of the command.
 fn issue_out(i: &Issue) -> MergeIssueOut {
-    match i {
+    refusal_out(i).unwrap_or_else(|| notice_out(i))
+}
+
+/// An issue that refuses, in the form of the command.
+fn refusal_out(i: &Issue) -> Option<MergeIssueOut> {
+    Some(match i {
         Issue::Misaligned { a, b, near, beyond_share, rms, p95 } => issue(
             "scans_misaligned",
             "refusal",
@@ -290,6 +295,13 @@ fn issue_out(i: &Issue) -> MergeIssueOut {
                 "{pieces} closed piece(s) of scan {scan} have a negative volume: turned inside out; orient it outward and merge again"
             ),
         ),
+        _ => return None,
+    })
+}
+
+/// An issue that does not refuse, in the form of the command.
+fn notice_out(i: &Issue) -> MergeIssueOut {
+    match i {
         Issue::NonManifold { scan, dropped } => issue(
             "non_manifold_input",
             "warning",
@@ -336,6 +348,7 @@ fn issue_out(i: &Issue) -> MergeIssueOut {
             Vec::new(),
             format!("the result has {after} pinched vertices (the scans had {before})"),
         ),
+        other => issue("other", "warning", Vec::new(), format!("{other:?}")),
     }
 }
 

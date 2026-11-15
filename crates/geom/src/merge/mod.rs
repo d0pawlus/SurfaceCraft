@@ -348,14 +348,14 @@ fn build(
     stage: &mut dyn FnMut(Stage),
 ) -> Result<Mesh, MergeError> {
     stage(Stage::Ownership);
-    let mut removed = own::removed_by_owner(scans, tol, scale(scans), cancel).ok_or(MergeError::Cancelled)?;
+    let (mut removed, lost) = own::removed_by_owner(scans, tol, scale(scans), cancel).ok_or(MergeError::Cancelled)?;
     rep.eaten = own::eat_back(scans, &mut removed, tol, cancel).ok_or(MergeError::Cancelled)?;
     stage(Stage::Union);
     let mut u = union::assemble(scans, &removed);
     u.weld_front(scans, WELD_SHARE * scale(scans));
     let cell = RADII_EDGES.iter().fold(0.0_f64, |m, k| m.max(*k)) * 2.0 * scale(scans);
     let mut guard = seam::Guard::new(scans, &u, tol, cell);
-    rep.seam.restored = union::restore(&mut u, scans, &removed, &mut |pts, t| guard.accept(pts, t, false));
+    rep.seam.restored = union::restore(&mut u, scans, (&removed, &lost), &mut |pts, t| guard.record(pts, t));
     stage(Stage::Seam);
     seam::close(&mut u, scans, &mut guard, &mut rep.seam, cancel).ok_or(MergeError::Cancelled)?;
     rep.seam.unsupported = guard.unsupported;

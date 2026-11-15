@@ -56,10 +56,17 @@ fn lost(scans: &[Scan], a: usize, v: usize, tol: f64, tie: f64) -> bool {
     winner(&cands, tie).is_some_and(|w| w != a)
 }
 
-/// Per scan and triangle: removed because another scan keeps one of its corners. `None` when cancelled.
-pub(super) fn removed_by_owner(scans: &[Scan], tol: f64, scale: f64, cancel: &Cancel) -> Option<Vec<Vec<bool>>> {
+/// Per scan and triangle: removed because another scan keeps one of its corners; and per scan and
+/// vertex: kept by another scan (lost). `None` when cancelled.
+pub(super) fn removed_by_owner(
+    scans: &[Scan],
+    tol: f64,
+    scale: f64,
+    cancel: &Cancel,
+) -> Option<(Vec<Vec<bool>>, Vec<Vec<bool>>)> {
     let tie = TIE_EDGES * scale;
     let mut out = Vec::with_capacity(scans.len());
+    let mut lost_all = Vec::with_capacity(scans.len());
     for (a, scan) in scans.iter().enumerate() {
         let n = scan.mesh.positions.len();
         let mut lost_v = Vec::with_capacity(n);
@@ -73,8 +80,9 @@ pub(super) fn removed_by_owner(scans: &[Scan], tol: f64, scale: f64, cancel: &Ca
         let removed =
             scan.mesh.triangles.iter().map(|t| t.iter().any(|&v| lost_v.get(v as usize).copied().unwrap_or(false)));
         out.push(removed.collect());
+        lost_all.push(lost_v);
     }
-    Some(out)
+    Some((out, lost_all))
 }
 
 /// Is `q` within `tol` of facing surface that a scan other than `a` keeps?

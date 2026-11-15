@@ -17,7 +17,7 @@ pub const SUPPORT_SLOPE: f64 = 0.1;
 /// Rounds of taking back the seam triangles at a pinched vertex and filling the holes again.
 const UNPINCH_ROUNDS: usize = 4;
 /// Triangles near a new one tested for a crossing at most (the rest is taken as crossing).
-const MAX_NEAR: usize = 4096;
+const MAX_NEAR: usize = 1 << 16;
 
 /// What the seam step did.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -121,7 +121,7 @@ impl<'a> Guard<'a> {
         if more {
             return true;
         }
-        let slab = self.tol.max(SUPPORT_SLOPE * longest_edge(c));
+        let slab = self.tol;
         let clash = |x: &[u32; 3]| {
             corners(x).is_some_and(|y| {
                 if shares(x) {
@@ -162,7 +162,7 @@ impl<'a> Guard<'a> {
         let mark = (self.unsupported, self.crossing);
         let mut added: Vec<[u32; 3]> = Vec::with_capacity(p.len());
         for &t in p {
-            if !self.accept(pts, t, true) {
+            if !self.accept(pts, t) {
                 for a in added {
                     self.forget(pts, a);
                 }
@@ -191,12 +191,20 @@ impl<'a> Guard<'a> {
         }
     }
 
+    /// Records a restored triangle (a triangle of a scan, at exactly its place) without tests: later
+    /// seam triangles are tested against it.
+    pub(super) fn record(&mut self, pts: &[Point3], t: [u32; 3]) -> bool {
+        let c = t.map(|v| pts.get(v as usize).copied().unwrap_or_else(Point3::origin));
+        self.add(t, &c);
+        true
+    }
+
     /// Tests the new triangle `t` (support, crossings) and records it when it passes.
-    pub(super) fn accept(&mut self, pts: &[Point3], t: [u32; 3], need_support: bool) -> bool {
+    pub(super) fn accept(&mut self, pts: &[Point3], t: [u32; 3]) -> bool {
         let c = t.map(|v| pts.get(v as usize).copied());
         let [Some(a), Some(b), Some(d)] = c else { return false };
         let c = [a, b, d];
-        if need_support && !self.supported(t, &c) {
+        if !self.supported(t, &c) {
             self.unsupported += 1;
             return false;
         }
@@ -207,10 +215,6 @@ impl<'a> Guard<'a> {
         self.add(t, &c);
         true
     }
-}
-
-fn longest_edge(c: &[Point3; 3]) -> f64 {
-    (c[1] - c[0]).norm().max((c[2] - c[1]).norm()).max((c[0] - c[2]).norm())
 }
 
 /// Does triangle `outer` (vertices `oi`) cover a corner of `inner` (vertices `ii`) that it does not
@@ -267,7 +271,7 @@ pub(super) fn close(
     }
     let rule = Corners::new(u, scans, &front);
     let pts = &u.positions;
-    let mut accept = |t: [u32; 3]| rule.allows(u, t) && guard.accept(pts, t, true);
+    let mut accept = |t: [u32; 3]| rule.allows(u, t) && guard.accept(pts, t);
     let input = BandInput { points: &u.positions, normals: &u.normals, triangles: &u.triangles, front: &front };
     let built = pivot_band(&input, &rep.radii, &mut accept, cancel)?;
     rep.built = built.len();
