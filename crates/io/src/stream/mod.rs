@@ -13,6 +13,7 @@ use std::io::{Read, Seek, SeekFrom};
 use surfacecraft_geom::Point3;
 
 mod ply;
+pub mod reduce;
 mod stl;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -118,6 +119,18 @@ pub fn detect<R: Read + Seek>(r: &mut R, hint: Option<MeshFormat>) -> Result<Str
             "streaming import reads STL and binary PLY; use mesh.import for OBJ and point lists".into(),
         )),
         None => Err(IoError::Unsupported("cannot tell the mesh format; pass `format`".into())),
+    }
+}
+
+/// Triangles (PLY: faces) the header of `bytes` declares, when the format has such a header.
+pub(crate) fn declared(bytes: &[u8], format: StreamFormat) -> Option<u64> {
+    match format {
+        StreamFormat::StlBinary => stl::declared(bytes),
+        StreamFormat::StlAscii => None,
+        StreamFormat::PlyBinary => {
+            let header = crate::ply::parse_header(bytes.get(..bytes.len().min(ply::HEADER_LIMIT as usize))?).ok()?;
+            header.elements.iter().find(|e| e.name == "face").map(|e| e.count as u64)
+        }
     }
 }
 
