@@ -25,6 +25,9 @@ pub struct SurfaceCraftApp {
     pub palette_command: Option<&'static str>,
     /// The palette's parameter editor (JSON).
     pub palette_params: String,
+    /// The last entry of the command log when the open tool was chosen: what ran before the tool
+    /// was opened is not a result of this use of it (see `align_proposal`).
+    pub(crate) tool_opened_on: Option<std::sync::Arc<surfacecraft_engine::LogEntry>>,
     /// The stage whose tools the ribbon shows.
     pub stage: crate::workflow::Stage,
     /// The text of the ribbon's tool search.
@@ -130,6 +133,7 @@ impl SurfaceCraftApp {
             selected_object: None,
             palette_command: None,
             palette_params: "{}".into(),
+            tool_opened_on: None,
             stage: crate::workflow::Stage::default(),
             tool_search: String::new(),
             focus_search: false,
@@ -292,6 +296,7 @@ impl SurfaceCraftApp {
     /// command's stage.
     pub fn choose_command(&mut self, id: &'static str) {
         self.palette_command = Some(id);
+        self.tool_opened_on = self.session.log.last().cloned();
         self.field_pick = None;
         if let Some(stage) = crate::workflow::Stage::of(id) {
             self.stage = stage;
@@ -313,6 +318,7 @@ impl SurfaceCraftApp {
     /// Closes the open tool without running it: the tool panel shows the guide again.
     pub fn close_tool(&mut self) {
         self.palette_command = None;
+        self.tool_opened_on = None;
         self.field_pick = None;
         self.cmd_panel.cancel_preview();
     }

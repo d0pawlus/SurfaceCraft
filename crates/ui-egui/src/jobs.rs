@@ -69,6 +69,12 @@ pub(crate) struct Busy {
     how: How,
 }
 
+/// Did the command only propose (an alignment run with `apply: false` answers `applied: false`)?
+/// Its tool stays open on the proposal: nothing changed in the document yet.
+fn only_proposed(result: &Value) -> bool {
+    result.get("applied").and_then(Value::as_bool) == Some(false)
+}
+
 impl SurfaceCraftApp {
     /// The session, for whatever changes it: refused (with the reason on the status line) while
     /// a command runs, because the session the app holds then is only what it draws, and the
@@ -100,6 +106,10 @@ impl SurfaceCraftApp {
                 if had == 0 && !self.session.doc.summaries().is_empty() {
                     self.fit_pending = true;
                 }
+                if let Some(pose) = crate::align_proposal::framed_box(self) {
+                    // a proposal just arrived: look at where it puts the scan
+                    self.camera.fit(&pose);
+                }
                 if id == "deviation.compute" {
                     // a new map is what the Deviation tab shows
                     crate::dock::show_tab(&mut self.workspace, crate::dock::Panel::Deviation);
@@ -114,7 +124,8 @@ impl SurfaceCraftApp {
 
     /// Runs the open tool with its edited parameters. A command that changed the document closes
     /// its tool (the guide shows what comes next); a failed one, or one that only reports
-    /// (statistics, information), stays open with its message or result. Returns whether it ran
+    /// (statistics, information) or only proposes (an alignment without `apply`), stays open with
+    /// its message or result. Returns whether it ran
     /// without an error, or was started in the background.
     pub fn run_palette(&mut self) -> bool {
         self.field_pick = None;
@@ -258,7 +269,8 @@ impl SurfaceCraftApp {
         match after {
             After::Nothing => {}
             After::CloseTool => {
-                if result.is_ok() && cmd::find(id).is_some_and(|c| c.undoable) {
+                let changed = result.as_ref().is_ok_and(|v| !only_proposed(v));
+                if changed && cmd::find(id).is_some_and(|c| c.undoable) {
                     self.close_tool();
                 }
             }

@@ -6,6 +6,7 @@
 //! discards the copy, so a preview never changes the document, its history or its log. Commands
 //! the engine marks heavy are never previewed, and a preview waits for the parameters to stop
 //! changing (debounce) so the UI thread is not blocked on every drag step.
+use crate::align_proposal;
 use crate::app::SurfaceCraftApp;
 use crate::fieldpick::PickRequest;
 use crate::forms::{self, FormCtx, ObjInfo};
@@ -404,6 +405,12 @@ fn messages(app: &SurfaceCraftApp, panel: &CommandPanel, ui: &mut egui::Ui, id: 
         ui.colored_label(app.tokens.color(Token::StatusWarning), text);
     }
     preview_status(app, panel, ui);
+    if let Some(proposal) = align_proposal::current(app) {
+        ui.weak(t("form.proposal_shown"));
+        if !proposal.confident {
+            ui.colored_label(app.tokens.color(Token::StatusWarning), t("form.proposal_low_confidence"));
+        }
+    }
     if let Some(last) = app.session.log.last().filter(|e| e.command == id && !e.ok) {
         let text = crate::i18n::engine_message(&failure_text(&last.outcome));
         ui.colored_label(app.tokens.color(Token::StatusError), tf("form.failed", &[("error", &text)]));
@@ -517,9 +524,10 @@ fn action_buttons(app: &mut SurfaceCraftApp, panel: &mut CommandPanel, ui: &mut 
         }
         // OK is the last button on the right, Cancel beside it
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let ok = crate::theme::primary_button(&app.tokens, t("form.ok"));
-            if ui.add(ok).on_hover_text(t("form.apply_hint")).clicked() || confirm {
-                app.run_palette();
+            let (label, hint) = confirm_texts(app, id);
+            let ok = crate::theme::primary_button(&app.tokens, t(label));
+            if ui.add(ok).on_hover_text(t(hint)).clicked() || confirm {
+                confirm_tool(app, id);
                 panel.cancel_preview();
             }
             if ui.button(t("form.cancel")).on_hover_text(t("form.cancel_hint")).clicked() || close {
@@ -528,6 +536,36 @@ fn action_buttons(app: &mut SurfaceCraftApp, panel: &mut CommandPanel, ui: &mut 
             }
         });
     });
+}
+
+/// The words on the confirming button and its hint. Auto-align proposes first: its button says
+/// which of the two steps the next press is.
+fn confirm_texts(app: &SurfaceCraftApp, id: &str) -> (&'static str, &'static str) {
+    if id != align_proposal::COMMAND {
+        return ("form.ok", "form.apply_hint");
+    }
+    let asked = serde_json::from_str::<Value>(&app.palette_params).is_ok_and(|v| align_proposal::asks_to_apply(&v));
+    if asked || align_proposal::current(app).is_some() {
+        ("form.apply", "form.apply_proposal_hint")
+    } else {
+        ("form.propose", "form.propose_hint")
+    }
+}
+
+/// Runs the open tool. With an auto-align proposal on screen the run applies that proposal (the
+/// same settings with `apply` on); any other tool runs with its parameters as they are. The form
+/// keeps its own `apply`: when applying fails, the next press proposes again instead of moving
+/// the scan unseen.
+fn confirm_tool(app: &mut SurfaceCraftApp, id: &str) {
+    if id == align_proposal::COMMAND
+        && align_proposal::current(app).is_some()
+        && let Ok(params) = serde_json::from_str::<Value>(&app.palette_params)
+    {
+        app.field_pick = None;
+        app.launch(id, align_proposal::with_apply(&params, true), crate::jobs::After::CloseTool);
+        return;
+    }
+    app.run_palette();
 }
 
 fn preview_status(app: &SurfaceCraftApp, panel: &CommandPanel, ui: &mut egui::Ui) {

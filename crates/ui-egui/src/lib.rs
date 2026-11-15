@@ -12,6 +12,7 @@
     clippy::unreachable
 )]
 
+pub mod align_proposal;
 pub mod app;
 pub mod assistant;
 pub mod brep;
