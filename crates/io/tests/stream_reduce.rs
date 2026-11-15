@@ -87,9 +87,10 @@ fn formats_that_cannot_be_streamed_and_hostile_files_are_errors_not_panics() {
     assert_eq!(declared_triangles(&obj, Some(MeshFormat::Obj)), None);
     let bad_scale = StreamOptions { scale: f64::NAN, ..options() };
     assert!(read_reduced(&write_mesh(&m, MeshFormat::Stl), None, &bad_scale, 10).is_err());
-    // every triangle degenerate (no area): still an answer, never a panic or an endless loop
+    // every triangle degenerate (no area): an error, never an empty mesh, a panic or an endless loop
     let flat = Mesh { positions: vec![Point3::origin(); 3], triangles: vec![[0, 1, 2]; 500] };
-    let _ = read_reduced(&write_mesh(&flat, MeshFormat::Stl), Some(MeshFormat::Stl), &options(), 10);
+    let reduced = read_reduced(&write_mesh(&flat, MeshFormat::Stl), Some(MeshFormat::Stl), &options(), 10);
+    assert!(matches!(reduced, Err(IoError::Malformed { .. })), "{reduced:?}");
     // truncated and random bytes
     let stl = write_mesh(&m, MeshFormat::Stl);
     for cut in [0, 10, 83, 84, 100, stl.len() / 2, stl.len() - 1] {

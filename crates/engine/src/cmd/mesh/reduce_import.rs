@@ -68,8 +68,10 @@ pub(crate) fn check_target(target: usize) -> CmdResult<()> {
 /// is to be read the ordinary way: it has no more than `target` triangles, or its format cannot
 /// be streamed (the caller then reduces what it read with [`reduce_in_memory`]).
 pub(crate) fn read(bytes: &[u8], fmt: MeshFormat, scale: f64, target: usize) -> CmdResult<Option<ReducedMesh>> {
-    // the file is never held as a mesh, so its size is bounded by the desktop limits everywhere
-    let opts = StreamOptions { limits: Limits::default(), scale };
+    // the file is never held as a mesh, so no count bounds it: the readers still check every
+    // declared count against the length of the file
+    let limits = Limits { max_triangles: usize::MAX, max_vertices: usize::MAX, ..Limits::default() };
+    let opts = StreamOptions { limits, scale };
     match read_reduced(bytes, Some(fmt), &opts, target) {
         Ok(Some(r)) => {
             let max_error = 3f64.sqrt() * r.cell_size;

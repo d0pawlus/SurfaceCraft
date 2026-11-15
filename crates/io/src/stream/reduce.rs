@@ -125,7 +125,10 @@ pub fn read_reduced(
         )));
     };
     let reached = best.triangle_count();
-    if reached > 0 && (reached as f64) < REFINE_BELOW * target as f64 {
+    if reached == 0 {
+        return Err(bad("mesh", "no triangle is left after the reduction (the triangles of the file have no area)"));
+    }
+    if (reached as f64) < REFINE_BELOW * target as f64 {
         let finer = cell_size * (reached as f64 / target as f64).sqrt() * REFINE_MARGIN;
         if let Some(c) = pass(bytes, format, opts, s.bbox.min, finer, target)? {
             best = c;

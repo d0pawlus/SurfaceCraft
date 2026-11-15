@@ -277,6 +277,7 @@
   "no surface of revolution fits these scan points": "żadna powierzchnia obrotowa nie pasuje do tych punktów skanu",
   "no surface {}": "nie ma powierzchni {}",
   "no symmetry plane found": "nie znaleziono płaszczyzny symetrii",
+  "no triangle is left after the reduction (the triangles of the file have no area)": "po redukcji nie został żaden trójkąt (trójkąty w pliku nie mają pola)",
   "no triangles given": "nie podano trójkątów",
   "noise must be ≥ 0": "szum musi być ≥ 0",
   "noise_sigma must be finite and not negative": "„Szum skanu” musi być liczbą skończoną i nieujemną",

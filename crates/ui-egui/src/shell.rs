@@ -215,6 +215,7 @@ impl SurfaceCraftApp {
         // decided before anything is drawn, so a key that ends a pick or leaves a text field
         // this frame does not also confirm or close the tool
         self.keys_free = !(self.is_busy()
+            || self.pending_import.is_some()
             || ui.memory(|m| m.focused().is_some())
             || egui::Popup::is_any_open(ui.ctx())
             || ui.input(|i| i.pointer.any_down())

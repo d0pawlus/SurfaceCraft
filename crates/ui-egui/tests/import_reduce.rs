@@ -51,6 +51,18 @@ fn a_large_file_waits_for_the_answer_and_cancel_drops_it() {
 }
 
 #[test]
+fn a_file_picked_while_another_waits_does_not_replace_it() {
+    let mut app = SurfaceCraftApp::headless();
+    app.import_picked_bytes("scan.stl", large_header());
+    app.import_picked_bytes("ball.stl", small_file());
+    assert_eq!(app.import_offer().map(|o| o.triangles), Some(u64::from(DECLARED)));
+    assert!(app.session.log.is_empty(), "the second file was not imported behind the dialog");
+    app.answer_import_offer(ImportChoice::Cancel);
+    app.import_picked_bytes("ball.stl", small_file());
+    assert_eq!(app.session.doc.meshes.len(), 1);
+}
+
+#[test]
 fn the_answer_decides_how_the_import_runs() {
     for (choice, reduce_to) in [(ImportChoice::Reduce(750_000), Some(750_000)), (ImportChoice::Full, None)] {
         let mut app = SurfaceCraftApp::headless();

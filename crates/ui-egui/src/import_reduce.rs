@@ -115,6 +115,11 @@ impl SurfaceCraftApp {
     }
 
     fn import_or_offer(&mut self, params: Value, bytes: Option<Vec<u8>>, declared: Option<u64>) {
+        // the file already waiting for its answer is never replaced: this one is refused, in words
+        if self.pending_import.is_some() {
+            self.status = tf("status.busy", &[("name", t("reduce.title"))]);
+            return;
+        }
         let pending = PendingImport {
             params,
             bytes,

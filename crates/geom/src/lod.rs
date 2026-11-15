@@ -157,13 +157,16 @@ pub fn cluster_on_grid(mesh: &Mesh, origin: &Point3, h: f64) -> Lod {
     Lod { mesh: Mesh { positions, triangles }, vertex_map, triangle_map }
 }
 
+/// Fewest cells a [`SoupClusterer`] may hold before it counts as over its cap.
+const MIN_CELL_CAP: usize = 64;
+
 /// Vertex clustering of a triangle soup that arrives in batches (a file read as a stream): the
 /// grid of [`cluster_on_grid`], fed corner by corner, so the memory it takes follows the coarse
 /// mesh and not the input. Each coarse vertex is the mean of the corners that fell in its cell;
 /// a triangle whose corners fall in fewer than three cells disappears and equal coarse triangles
 /// are kept once. The error bound is that of [`cluster_on_grid`]: `√3·h`.
 ///
-/// `max_triangles` caps the coarse mesh (and three times it the cells): once it is passed the
+/// `max_triangles` caps the coarse mesh (and one and a half times it the cells): once it is passed the
 /// clusterer is [`SoupClusterer::is_over`] and takes nothing more, so a cell size that turns out
 /// too small costs no more memory than the cap.
 #[derive(Clone, Debug)]
@@ -235,8 +238,10 @@ impl SoupClusterer {
                     self.triangles.push(m);
                 }
             }
-            self.over = self.triangles.len() > self.max_triangles
-                || self.sum.len() > self.max_triangles.saturating_mul(3).max(64);
+            // a surface has about half as many vertices as triangles: more cells than this means
+            // the cell is far too small, whatever the triangles kept so far
+            let max_cells = self.max_triangles.saturating_add(self.max_triangles / 2).max(MIN_CELL_CAP);
+            self.over = self.triangles.len() > self.max_triangles || self.sum.len() > max_cells;
         }
         !self.over
     }
