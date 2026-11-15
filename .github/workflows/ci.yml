@@ -231,8 +231,10 @@ jobs:
         run: cargo xtask assets
 
   # The tests of the full suite on the three systems, each split into parts that run at the same
-  # time (`cargo xtask test --partition count:K/N`: every test runs in exactly one part, part 1
-  # also runs the doc tests). macOS is here because the work is done on macOS and results differ
+  # time (`cargo xtask test --partition balanced:K/N`: every test runs in exactly one part, part 1
+  # also runs the doc tests; the heaviest tests, listed with their measured time in
+  # xtask/src/heavy_tests.rs, are spread over the parts by time, the rest by count, because equal
+  # numbers of tests gave parts of 22 and 46 minutes). macOS is here because the work is done on macOS and results differ
   # between the systems' math libraries: a test that passes on one of the three has failed on
   # another more than once. The number of parts follows the measured times (2026-11-15, one
   # part: Windows 68 min of tests, Linux 48, macOS 45); a public repository pays nothing for the
@@ -286,7 +288,7 @@ jobs:
           tool: cargo-nextest
       - name: cargo xtask test (part ${{ matrix.part }} of ${{ matrix.parts }})
         if: env.DOCS_ONLY != 'true'
-        run: cargo xtask test --partition count:${{ matrix.part }}/${{ matrix.parts }}
+        run: cargo xtask test --partition balanced:${{ matrix.part }}/${{ matrix.parts }}
       - name: Nothing to test (documentation-only change)
         if: env.DOCS_ONLY == 'true'
         run: echo "documentation-only change"
