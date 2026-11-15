@@ -221,17 +221,21 @@ fn a_deep_bore_through_a_thick_wall_is_not_capped() {
     assert_eq!(m.triangles, before.triangles);
 }
 
-/// Two sheets joined only by tunnels: the last tunnel holds them together and is never cut.
+/// Two sheets joined only by three tunnels: cutting all three at once would part the sheets, so they
+/// are taken back one by one; two are closed and the last one, which holds the sheets together, stays.
 #[test]
-fn the_surface_is_never_cut_in_two() {
-    let mut m = wall(&Wall { size: 30.0, cells: 30, gap: 0.6, bend: 0.0, tubes: vec![(8, 8, 1), (20, 20, 1)] });
+fn the_surface_is_never_cut_in_two_but_all_tunnels_but_one_close() {
+    let tubes = vec![(6, 6, 1), (14, 14, 1), (22, 22, 1)];
+    let mut m = wall(&Wall { size: 30.0, cells: 30, gap: 0.6, bend: 0.0, tubes });
     let positions = m.positions.clone();
     m.triangles.retain(|t| !t.iter().all(|&v| positions[v as usize].x == 0.0));
-    assert_eq!(pieces::pieces(&m)[0].genus(), Some(1));
+    assert_eq!(pieces::pieces(&m)[0].genus(), Some(2));
     let rep = close_handles(&mut m, &params(8.0), &Cancel::new()).unwrap();
+    eprintln!("{:?} closed {}", rep.refused, rep.handles_closed);
     assert_eq!(pieces::pieces(&m).len(), 1, "{:?}", rep.refused);
-    assert!(rep.handles_closed <= 1);
-    assert!(rep.refused.splits > 0 || rep.handles_closed == 1);
+    assert_eq!(rep.handles_closed, 2);
+    assert_eq!(rep.genus_after, Some(0));
+    assert!(rep.refused.splits > 0, "the last tunnel was refused");
 }
 
 /// A small closed torus that a ball covers whole: cutting it would delete it, so every candidate is

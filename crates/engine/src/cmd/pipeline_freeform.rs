@@ -331,6 +331,7 @@ fn wrap_mesh(s: &mut Session, set: &Settings, mesh: ObjectId, max_patches: Optio
             refine: None,
             crease_deg: None,
             continuity: None,
+            coarse_start: Some(set.close_handles),
             name: Some(set.name.clone()),
         },
     )

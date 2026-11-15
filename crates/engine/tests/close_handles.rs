@@ -153,3 +153,36 @@ fn scan_handles_closed_is_raised_exactly_when_something_was_cut() {
     assert!(codes(&cut).contains(&"scan_handles_closed".to_string()), "{:?}", codes(&cut));
     assert_ne!(cut["verdict"], json!("pass"));
 }
+
+/// A smooth panel with one rough corner, wrapped under a cap its first round does not fit: the coarse
+/// start (`coarse_start`) begins with larger patches where it is smooth and spends the rest of the cap
+/// on the corner, so more of the scan is within the tolerance than when the first round is cut to the
+/// cap and the wrap stops there.
+#[test]
+fn gate_m4_the_coarse_start_spends_the_patch_cap_where_the_patches_miss() {
+    let mut m = synth::wave(Point3::origin(), 120.0, 120.0, 3.0, 240, 240);
+    for p in &mut m.positions {
+        if p.x < 30.0 && p.y < 30.0 {
+            p.z += 0.8 * (p.x * 1.3).sin() * (p.y * 1.1).cos();
+        }
+    }
+    let run = |coarse: bool| {
+        let mut s = Session::new();
+        s.doc.add_mesh("scan", m.clone());
+        let out =
+            s.execute("surface.wrap", json!({"mesh": "scan", "max_patches": 300, "coarse_start": coarse})).unwrap();
+        eprintln!(
+            "coarse {coarse}: patches {} within {} levels {}",
+            out["patches"], out["deviation"]["within"], out["levels"]
+        );
+        out
+    };
+    let (plain, coarse) = (run(false), run(true));
+    let within = |o: &Value| o["deviation"]["within"].as_f64().unwrap();
+    assert!(plain["levels"][0]["partial"] == json!("first_round_over_cap"), "{}", plain["levels"]);
+    assert!(coarse["levels"].as_array().unwrap().len() > 1, "the coarse start refines: {}", coarse["levels"]);
+    // measured: 1.78 % of the scan outside the tolerance with the first round cut to the cap, 0.74 %
+    // with the coarse start (2.4 times fewer); the bound asks for 1.5 times fewer
+    let (miss_plain, miss_coarse) = (1.0 - within(&plain), 1.0 - within(&coarse));
+    assert!(1.5 * miss_coarse < miss_plain, "{miss_coarse} vs {miss_plain}");
+}
