@@ -15,17 +15,19 @@ pub struct Overlay {
     pub models: Vec<(usize, [[f64; 4]; 4])>,
 }
 
-/// A world-space model matrix as the shader takes it for vertices stored relative to `origin`:
-/// column-major, with the shift folded in (`p' = M (q + o) - o`).
-pub(super) fn shifted_model(rows: &[[f64; 4]; 4], o: &Point3) -> [[f32; 4]; 4] {
-    let oo = [o.x, o.y, o.z];
+/// A world-space model matrix as the shader takes it: for vertices stored relative to their mesh's
+/// own origin `m`, giving positions relative to the frame's origin `o` (`p' = M (q + m) - o`),
+/// column-major. The mesh keeps its origin while the frame's follows the camera, so a pan
+/// rewrites this matrix and not the vertices.
+pub(super) fn shifted_model(rows: &[[f64; 4]; 4], m: &Point3, o: &Point3) -> [[f32; 4]; 4] {
+    let (mm, oo) = ([m.x, m.y, m.z], [o.x, o.y, o.z]);
     let mut out = [[0f32; 4]; 4];
     for r in 0..3 {
         for c in 0..3 {
             out[c][r] = rows[r][c] as f32;
         }
-        let rot_o = rows[r][0] * oo[0] + rows[r][1] * oo[1] + rows[r][2] * oo[2];
-        out[3][r] = (rot_o + rows[r][3] - oo[r]) as f32;
+        let rot_m = rows[r][0] * mm[0] + rows[r][1] * mm[1] + rows[r][2] * mm[2];
+        out[3][r] = (rot_m + rows[r][3] - oo[r]) as f32;
     }
     out[3][3] = 1.0;
     out

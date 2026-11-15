@@ -16,10 +16,9 @@ impl Renderer {
             m.used = false;
         }
         self.draw_list.clear();
-        let o = [f.origin.x, f.origin.y, f.origin.z];
         for item in &f.items {
             let k = item.key;
-            let fresh = self.meshes.get(&k).is_none_or(|g| g.origin != o || g.vertices != item.mesh.positions.len());
+            let fresh = self.meshes.get(&k).is_none_or(|g| g.vertices != item.mesh.positions.len());
             if fresh {
                 let g = Self::upload(device, &self.model_layout, item, &f.origin);
                 self.meshes.insert(k, g);
@@ -28,7 +27,7 @@ impl Renderer {
             if let Some(g) = self.meshes.get_mut(&k) {
                 g.used = true;
                 let rows = f.overlay.models.iter().find(|(mk, _)| *mk == k).map_or_else(identity_rows, |(_, m)| *m);
-                queue.write_buffer(&g.model_buf, 0, bytemuck::cast_slice(&shifted_model(&rows, &f.origin)));
+                queue.write_buffer(&g.model_buf, 0, bytemuck::cast_slice(&shifted_model(&rows, &g.origin, &f.origin)));
                 if colors_need_upload(g.color_state, item) {
                     queue.write_buffer(&g.cb, 0, bytemuck::cast_slice(&colors_of(item)));
                     g.color_state = color_state(&item.color, item.colors.is_some(), item.colors_key);
