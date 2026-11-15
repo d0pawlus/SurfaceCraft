@@ -423,8 +423,9 @@ fn edge_curves(l: &Layer, edges: &BTreeMap<EdgeKey, Vec<usize>>, build: &mut Bui
             None
         };
         let Some(t) = tangents else {
-            // the tangent construction is tuned to the plain curves (see [`patch_net`])
-            let curve = if l.g1 { chord_curve } else { wrap_curve };
+            // the tangent construction is tuned to the plain curves (see [`patch_net`]), and a curve
+            // along the open border of the scan is not refitted (its samples would be pulled onto the rim)
+            let curve = if l.g1 || l.free.contains(&(a, b)) { chord_curve } else { wrap_curve };
             build.curves.insert((a, m), curve(pa, pm, &on_edge));
             build.curves.insert((b, m), curve(pb, pm, &on_edge));
             continue;
@@ -514,7 +515,12 @@ fn patch_net(l: &Layer, tri: &Triangle, k: usize, curves: [Curve; 4], ng: Vec3, 
     let [bot, right, top, left] = curves;
     let on_face = |at: Vec3| l.project(at, &[nf]);
     if !l.g1 {
-        return (wrap_net(&bot, &right, &top, &left, &on_face), true);
+        // a patch of a triangle on the open border of the scan is not refitted: samples beyond the
+        // rim are pulled onto it and would lean the patch
+        let on_rim =
+            (0..3).any(|e| l.coarse.triangles.get(tri.f).is_some_and(|t| l.free.contains(&key(t[e], t[(e + 1) % 3]))));
+        let net = if on_rim { interpolated_net } else { wrap_net };
+        return (net(&bot, &right, &top, &left, &on_face), true);
     }
     // the tangent patches are judged against, and fall back to, the plain interpolating patch: the
     // least-squares refit of the unconstrained wrap made the tangent ones fail their smoothness gates

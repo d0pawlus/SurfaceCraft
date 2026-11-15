@@ -89,7 +89,7 @@ fn run_one(number: usize, path: &std::path::Path) -> Result<String, String> {
         out["next_steps"].as_array().into_iter().flatten().filter_map(|x| x["command"].as_str()).collect::<Vec<_>>(),
     );
     eprintln!(
-        "C{number:02} within {} not facing {} patches {} retry {} attempts {}",
+        "C{number:02} within {} not facing {} analytic faces {} patches {} retry {} attempts {}",
         out["deviation"]["within"], out["deviation"]["not_facing"], out["patches"], out["retry"], out["attempts"]
     );
     for p in out["preparation"].as_array().into_iter().flatten() {
