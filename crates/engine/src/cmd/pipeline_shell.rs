@@ -193,6 +193,7 @@ fn wrap_shell(s: &mut Session, set: &Settings, mesh: ObjectId, max_patches: Opti
             refine: None,
             crease_deg: None,
             continuity: None,
+            coarse_start: None,
             name: Some(set.name.clone()),
         },
     )

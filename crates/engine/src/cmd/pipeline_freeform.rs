@@ -378,6 +378,7 @@ pub(super) fn wrap_mesh_at(
             refine: None,
             crease_deg: None,
             continuity: None,
+            coarse_start: Some(set.close_handles),
             name: Some(set.name.clone()),
         },
     )

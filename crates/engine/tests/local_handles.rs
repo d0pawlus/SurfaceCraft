@@ -570,7 +570,105 @@ fn diagnose_handles() {
         if std::env::var("SURFACECRAFT_LOCAL_TO_SOLID").is_ok_and(|v| v == "1") {
             to_solid_and_misses(&mut s, &zone);
         }
+        if std::env::var("SURFACECRAFT_LOCAL_LEFT").is_ok_and(|v| v == "1") {
+            left_diagnosis(&mut s, &scan);
+        }
     }
+}
+
+/// After `close_handles` (default size): why the handles left were refused (a second run on the
+/// result), where they are, how far the first network is over the cap, and where the vertices out of
+/// 0.2 mm lie against the wrap of the closed copy.
+fn left_diagnosis(s: &mut Session, scan: &Mesh) {
+    use surfacecraft_geom::handles::{Params, close_handles};
+    let size = 12.0 * median_edge(scan);
+    let p = Params { max_size: size, tolerance: 0.2 };
+    let mut m = scan.clone();
+    let t0 = std::time::Instant::now();
+    let rep = close_handles(&mut m, &p, &surfacecraft_geom::Cancel::new()).unwrap();
+    eprintln!(
+        "    first closing: {} handles closed, refused {:?} in {:.0} s",
+        rep.handles_closed,
+        rep.refused,
+        t0.elapsed().as_secs_f64()
+    );
+    let coarse = std::env::var("SURFACECRAFT_LOCAL_COARSE").is_ok_and(|v| v == "1");
+    if !coarse {
+        let mut again = m.clone();
+        let rep2 = close_handles(&mut again, &p, &surfacecraft_geom::Cancel::new()).unwrap();
+        eprintln!(
+            "    second run on the result: {} more closed, refused {:?} (the handles left)",
+            rep2.handles_closed, rep2.refused
+        );
+    }
+    let zone = report_handles(&m);
+    if !coarse {
+        stall_census(&m, &zone);
+        coarse_density(&m, &zone, 1.6);
+    }
+    s.doc.add_mesh("closed", m.clone());
+    let t1 = std::time::Instant::now();
+    let w = s.execute("surface.wrap", json!({"mesh": "closed", "max_patches": 60000, "coarse_start": coarse})).unwrap();
+    eprintln!(
+        "    wrap of the closed copy at 60000: patches {} coarse {} capped {} clustered {} within (of the copy) {} in {:.0} s; levels {}",
+        w["patches"],
+        w["coarse_triangles"],
+        w["capped"],
+        w["clustered"],
+        w["deviation"]["within"],
+        t1.elapsed().as_secs_f64(),
+        w["levels"]
+    );
+    let body = w["body"]["id"].as_u64().unwrap();
+    let dev = s.execute("deviation.compute", json!({"object": "scan", "against": body, "tolerance": 0.2})).unwrap();
+    eprintln!(
+        "    against the scan: within {} not facing {} count {}",
+        dev["stats"]["within"], dev["stats"]["not_facing"], dev["stats"]["count"]
+    );
+    let id = s.doc.find_by_name("scan").map(|(id, _)| id).unwrap();
+    let values = s.live_map(id).unwrap().values.clone();
+    classify_left(scan, &m, &values, &zone);
+}
+
+/// The vertices of the scan out of 0.2 mm, by class: not measured, rim, fold, cut out by the closing,
+/// in the zone of the handles left, thin wall (other side within 1 mm), elsewhere.
+fn classify_left(scan: &Mesh, closed: &Mesh, values: &[f32], zone_closed: &[bool]) {
+    let nb = neighbours(scan);
+    let h = median_edge(scan);
+    let rim = rim_distance(scan, &nb);
+    let fold = folded(scan);
+    let tree = KdTree::build(&closed.positions);
+    let bvh_closed = Bvh::build(closed);
+    let bvh = Bvh::build(scan);
+    let normals = scan.vertex_normals();
+    let mut c = BTreeMap::<&str, usize>::new();
+    for (i, v) in values.iter().enumerate() {
+        if v.is_finite() && v.abs() <= 0.2 {
+            continue;
+        }
+        let p = scan.positions[i];
+        let cut = bvh_closed.closest(&p, 1.0).is_none_or(|hit| hit.distance > 1e-6);
+        let in_zone = tree.nearest(&p).is_some_and(|(k, _)| zone_closed[k]);
+        let n = normals[i].try_normalize(1e-12).unwrap_or(Vec3::zeros());
+        let thin = [-1.0, 1.0].iter().any(|&d| partner(&bvh, &p, &n, d).is_some_and(|(t, opp)| opp && t < 1.0));
+        let class = if !v.is_finite() {
+            "not measured"
+        } else if rim[i] < 10.0 * h {
+            "rim"
+        } else if fold[i] {
+            "fold"
+        } else if cut {
+            "cut out by the closing"
+        } else if in_zone {
+            "zone of the handles left"
+        } else if thin {
+            "thin wall (other side within 1 mm)"
+        } else {
+            "elsewhere"
+        };
+        *c.entry(class).or_default() += 1;
+    }
+    eprintln!("    out of 0.2 mm or not measured, by class: {c:?} (of {} vertices)", values.len());
 }
 
 /// `scan.to_solid` on the scan with its handles closed, and that solid measured against the scan.

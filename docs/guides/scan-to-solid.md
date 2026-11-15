@@ -63,6 +63,13 @@ Freeform (`surface.wrap` inside):
   `tolerance`, or 12000 patches. Smooth, well fitted areas keep large patches. Every round lays
   the patches on a new conforming triangle mesh, so neighbours always share their boundary curves
   (no T-junctions, no gaps). `levels` of the result lists patches and fit per round.
+- When the first coarse mesh is already bigger than the patch limit allows, it is cut to the limit
+  and the wrap stops there (`levels[0].partial: first_round_over_cap`). `surface.wrap` with
+  `coarse_start: true` (used by `scan.to_solid` whenever `close_handles` is asked for, also when no
+  handle could be closed and the scan itself is wrapped; off otherwise) reduces the scan
+  again with a larger budget instead, in proportion to how far over the limit it was (at most four
+  times), so that the first mesh takes about half of the limit, and the adaptive rounds spend the rest
+  where the patches miss. It costs one more reduction of the scan.
 - A scan without open boundaries gives a solid; one with holes gives a sheet (`open_surface`).
 - Patches meet in position (`continuity: g0`, what `scan.to_solid` uses). Tangent patches
   (`surface.wrap` with `continuity: g1`) are experimental: on 13 real scans they reached the
@@ -417,7 +424,9 @@ modelled as it is).
     points sampled over its triangles farther than the tolerance, or one farther than a quarter of the
     ball; the samples are the corners, edge midpoints, centres and a lattice of the triangles, so the
     wall of a bore made of long triangles counts), or the fill leaves a pinched vertex. A part that
-    fails is grown by a ring of triangles (twice at most) before it is left. The passes stop when no
+    fails is grown by a ring of triangles (twice at most) before it is left. Candidates refused because
+    cutting all of them at once would part the surface are taken back one by one (up to 32 per pass)
+    when cutting them with the others does not. The passes stop when no
     handle is left, and `handle_size` is never more than the diagonal of the scan.
   - What is reported: a `close_handles` step in `preparation` with the handles before and after (from
     the Euler characteristic), the handles closed, the parts and what each scale closed, the refusals,
@@ -427,9 +436,11 @@ modelled as it is).
     tunnel walls that went). Anything cut raises `scan_handles_closed` (verdict at most `review`). The
     deviation is measured against the scan as it was, so what was cut out counts against the solid.
   - A freeform result that is not a pass on a scan with at least 64 handles offers it as a next step.
-  - On a real scan with about 2600 handles (open, three rims) it closed about four fifths of them,
-    cutting out under 3 % of the area, and the verdict went from `fail` to `review`; about 10 % of the
-    scan stays out of the tolerance, so it is no pass. In a dense sponge a part is cut out whole, so
+  - On a real scan with about 2600 handles (open, three rims) it closed about six sevenths of them,
+    cutting out under 3 % of the area, and the verdict went from `fail` to `review`; about 8 % of the
+    scan stays out of the tolerance, so it is no pass: the reduction of the repaired copy still stops at
+    about 15 000 triangles (the handles left and folded flaps), three quarters of what the largest
+    patch limit allows. In a dense sponge a part is cut out whole, so
     the area cut out can be large where tunnels are close together. Closing takes minutes on a million
     triangles of real scan. A scan without small handles is returned as it is, bit for bit.
 - A scan that already works is not touched: no preparation step, the same result as before. The

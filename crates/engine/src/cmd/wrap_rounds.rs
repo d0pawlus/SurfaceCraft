@@ -39,6 +39,10 @@ const FIRST_BUDGET: f64 = 4.0;
 /// The adaptive layout starts coarser (in tolerances): a patch follows a smooth surface much better
 /// than a flat triangle, and the rounds refine only where it does not.
 const ADAPTIVE_FIRST_BUDGET: f64 = 8.0;
+/// With the coarse start the first round aims at this share of the cap...
+const COARSE_SHARE: f64 = 0.5;
+/// ... with a budget at most this many times the usual first one.
+const MAX_COARSE: f64 = 4.0;
 /// Rounds at most of the uniform layout; each one halves the budget.
 const UNIFORM_ROUNDS: usize = 3;
 /// Rounds at most of the adaptive layout.
@@ -159,12 +163,19 @@ pub(super) struct Target<'a> {
     pub(super) min_within: f64,
     max_triangles: usize,
     max_patches: usize,
+    /// Start coarser when the first round would not fit the cap (see [`first_round`]).
+    coarse_start: bool,
     /// The clustered first round (keyed by the triangles of the mesh it was made from and the cap): the clustering
     /// is paid once per call, however many searches ask for the first round.
     cluster_cache: RefCell<Option<((usize, usize), Mesh)>>,
 }
 
 impl<'a> Target<'a> {
+    /// The target with the coarse start on or off (see [`first_round`]).
+    pub(super) fn with_coarse_start(self, on: bool) -> Self {
+        Self { coarse_start: on, ..self }
+    }
+
     pub(super) fn new(scan: &'a Mesh, tolerance: f64, min_within: f64, max_patches: usize, options: G1Options) -> Self {
         let normals: Vec<Vec3> = scan.vertex_normals().into_iter().map(|n| n.try_normalize(0.0).unwrap_or(n)).collect();
         let stride = scan.positions.len().div_ceil(MAX_SAMPLES).max(1);
@@ -178,6 +189,7 @@ impl<'a> Target<'a> {
             tolerance,
             min_within,
             max_triangles: (max_patches / PATCHES_PER_TRIANGLE).max(4),
+            coarse_start: false,
             max_patches,
             cluster_cache: RefCell::new(None),
         }
@@ -479,6 +491,21 @@ fn next_round_over(t: &Target, run: &mut Run, a: &Adaptive, raw: Mesh, budget: f
     })
 }
 
+/// With the coarse start, a first round bigger than the cap is reduced again with a larger budget
+/// (proportional to how far over it is, at most [`MAX_COARSE`] times) so that it takes about
+/// [`COARSE_SHARE`] of the cap and the adaptive rounds can spend the rest where the patches miss. The
+/// round as it was when the start is off, it already fits, or the coarser one does not fit either.
+fn first_round(t: &Target, raw: Mesh, budget: f64) -> (Mesh, f64) {
+    let count = raw.triangle_count();
+    if !t.coarse_start || count <= t.max_triangles {
+        return (raw, budget);
+    }
+    let factor = (count as f64 / (COARSE_SHARE * t.max_triangles as f64)).clamp(1.0, MAX_COARSE);
+    let coarser = budget * factor;
+    let again = reduce_scan(t.scan, coarser, &[]);
+    if again.triangle_count() <= t.max_triangles { (again, coarser) } else { (raw, budget) }
+}
+
 /// The adaptive layout: detail levels are raised around the scan points the patches miss, the
 /// coarse mesh is reduced again from the scan with the new levels. A round whose mesh would not
 /// fit `max_patches` is built with as many of the worst missed vertices refined as fit.
@@ -489,9 +516,12 @@ fn adaptive_rounds(t: &Target, g1: bool) -> CmdResult<Wrapped> {
     let mut base = levels.clone();
     let mut ranked: Vec<u32> = Vec::new();
     let mut last = 0;
-    let budget = ADAPTIVE_FIRST_BUDGET * t.tolerance;
+    let mut budget = ADAPTIVE_FIRST_BUDGET * t.tolerance;
     for round in 1..=ADAPTIVE_ROUNDS {
-        let raw = reduce_scan(t.scan, budget, &scale_of(&levels));
+        let mut raw = reduce_scan(t.scan, budget, &scale_of(&levels));
+        if round == 1 {
+            (raw, budget) = first_round(t, raw, budget);
+        }
         let laid = if raw.triangle_count() <= t.max_triangles {
             Laid {
                 mesh: raw,
