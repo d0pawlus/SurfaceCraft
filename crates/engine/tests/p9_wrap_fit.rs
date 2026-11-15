@@ -84,36 +84,37 @@ const GATE_CAP: usize = 1200;
 /// Largest share of the samples out of the tolerance the gate allows.
 const GATE_MISSED: f64 = 0.005;
 
+/// The wrap of [`organic_scan`] at [`GATE_CAP`], made once for the tests that read it.
+fn gate_wrap() -> &'static Value {
+    static WRAP: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    WRAP.get_or_init(|| wrap(organic_scan(7), GATE_CAP))
+}
+
 #[test]
 fn gate_m4_an_organic_scan_held_at_its_cap_is_within_the_tolerance() {
-    // Arrange
-    let scan = organic_scan(7);
-
-    // Act
-    let w = wrap(scan, GATE_CAP);
+    // Arrange / Act
+    let w = gate_wrap();
 
     // Assert
-    eprintln!("cap {GATE_CAP}: patches {} within {:.5} levels {}", w["patches"], within(&w), w["levels"]);
-    assert!(patches(&w) <= GATE_CAP, "{} patches over the cap", patches(&w));
-    assert!(1.0 - within(&w) <= GATE_MISSED, "{:.3} % out of {TOLERANCE} mm", 100.0 * (1.0 - within(&w)));
-    assert!(within(&w) >= 0.99, "the wrap reports the tolerance as met");
+    eprintln!("cap {GATE_CAP}: patches {} within {:.5} levels {}", w["patches"], within(w), w["levels"]);
+    assert!(patches(w) <= GATE_CAP, "{} patches over the cap", patches(w));
+    assert!(1.0 - within(w) <= GATE_MISSED, "{:.3} % out of {TOLERANCE} mm", 100.0 * (1.0 - within(w)));
     let levels = w["levels"].as_array().unwrap();
     assert!(levels.iter().all(|l| l["patches"].as_u64().unwrap() <= GATE_CAP as u64), "{levels:?}");
 }
 
 #[test]
 fn rounds_at_the_cap_go_on_while_they_gain_and_never_lose_the_best() {
-    // Arrange
-    let scan = organic_scan(7);
+    // Arrange / Act
+    let w = gate_wrap();
 
-    // Act
-    let w = wrap(scan, GATE_CAP);
-
-    // Assert: more than one round was cut to the cap, and the result is the best round
+    // Assert: the rounds went on after the first round cut to the cap (measured: three rounds cut
+    // to it, the first gaining 1.6 points; the rule needs only that one more round followed), and
+    // the result is the best round
     let levels = w["levels"].as_array().unwrap();
     let best = levels.iter().map(|l| l["within"].as_f64().unwrap()).fold(0.0, f64::max);
-    assert!(rounds_at_cap(&w) >= 2, "{levels:?}");
-    assert_eq!(within(&w), best, "{levels:?}");
+    assert!(rounds_at_cap(w) >= 2, "{levels:?}");
+    assert_eq!(within(w), best, "{levels:?}");
 }
 
 /// Share of the samples out of the tolerance on main for the body at the default cap (1614 patches,

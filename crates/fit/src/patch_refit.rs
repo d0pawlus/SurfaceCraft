@@ -11,14 +11,22 @@
 //! boundary stay, so neighbours still share their curves). A curve gives its projected samples
 //! the parameters of their spacing along it (chord length), so the refit also corrects where along
 //! the curve a point lies, not only how far off it is (a 100 degree arc: largest gap 0.52 mm by
-//! the chord interpolant, 0.05 mm refitted); a patch keeps the parameters of its samples. This is
-//! repeated, and of all the curves (or patches) measured the one whose samples lie closest to the
-//! scan is kept, so a refit never makes the fit at the samples worse. On a real organic scan held
-//! at 60 000 patches it about halves the points out of 0.2 mm for the same number of patches.
+//! the chord interpolant, 0.05 mm refitted); a patch keeps the parameters of its samples.
+//!
+//! A sample with no scan point within the reach is left out, of the fit and of the measurement;
+//! too few valid samples leave the input as it is. Each refit is measured against the best so far
+//! over the samples valid in both, and kept only when its samples lie closer to the scan there. So
+//! the claim is about the samples only: between them nothing is measured, which is why a refitted
+//! patch must also face like its input everywhere on a grid that includes its border (no fold, no
+//! patch turned against the scan). On a real organic scan held at 60 000 patches the refit about
+//! halves the points out of 0.2 mm for the same number of patches.
 //!
 //! Evaluation goes through [`crate::patch`] (the listed APP-GEOMETRY file).
-use crate::patch::{Net, bern, eval, tensor_weights};
+use crate::patch::{Net, bern, eval, normal, tensor_weights};
 use surfacecraft_geom::Vec3;
+
+/// A projection onto the scan: `None` where no scan point is within the reach.
+pub(crate) type Project<'a> = &'a dyn Fn(Vec3) -> Option<Vec3>;
 
 /// Parameters a curve is sampled at when it is refitted.
 const CURVE_T: [f64; 6] = [0.07, 0.22, 0.4, 0.6, 0.78, 0.93];
@@ -30,9 +38,43 @@ const PASSES: usize = 2;
 const INNER: [(usize, usize); 4] = [(1, 1), (1, 2), (2, 1), (2, 2)];
 /// A 2 × 2 system with a smaller determinant than this (relative) is singular.
 const SINGULAR: f64 = 1e-12;
+/// Fewest valid samples (of 6) a curve is refitted with: its two inner control points need two,
+/// and a third makes the fit average instead of pass through the points; with fewer the plain
+/// curve stays.
+const MIN_CURVE_SAMPLES: usize = 3;
+/// Fewest valid samples (of 36) a patch is refitted with: half the grid. Its four inner control
+/// points need four, but when the samples of one side are lost (past a hole or beyond the reach)
+/// nothing holds that side and the fit could swing it; with fewer the plain patch stays.
+const MIN_NET_SAMPLES: usize = 18;
+/// A refitted patch must face like its input to within this cosine at every point of [`GUARD_T`]
+/// (the facing limit of the wrap's projections).
+const MIN_TURN_COS: f64 = 0.3;
+/// Where (in u and in v) a refitted patch's normals are checked against its input, borders included.
+const GUARD_T: [f64; 7] = [0.0, 1.0 / 6.0, 1.0 / 3.0, 0.5, 2.0 / 3.0, 5.0 / 6.0, 1.0];
+
+/// The scan point under a sample and its squared distance from the sample; `None` when there is
+/// no scan point within the reach.
+type Sample = Option<(Vec3, f64)>;
 
 fn v3(p: [f64; 3]) -> Vec3 {
     Vec3::new(p[0], p[1], p[2])
+}
+
+fn sample(p: Vec3, project: Project) -> Sample {
+    let q = project(p)?;
+    let d = (q - p).norm_squared();
+    (d.is_finite() && q.iter().all(|x| x.is_finite())).then_some((q, d))
+}
+
+fn valid(s: &[Sample]) -> usize {
+    s.iter().flatten().count()
+}
+
+/// Is `new` closer to the scan than `old` over the samples valid in both (at least `min` of them)?
+fn closer(old: &[Sample], new: &[Sample], min: usize) -> bool {
+    let both: Vec<(f64, f64)> = old.iter().zip(new).filter_map(|(a, b)| Some(((*a)?.1, (*b)?.1))).collect();
+    let (o, n) = both.iter().fold((0.0, 0.0), |(o, n), (a, b)| (o + a, n + b));
+    both.len() >= min && n < o
 }
 
 fn curve_point(c: &[Vec3; 4], t: f64) -> Vec3 {
@@ -40,44 +82,39 @@ fn curve_point(c: &[Vec3; 4], t: f64) -> Vec3 {
     c[0] * b[0] + c[1] * b[1] + c[2] * b[2] + c[3] * b[3]
 }
 
-/// The scan points under the samples of `c` and their mean squared distance from them.
-fn curve_targets(c: &[Vec3; 4], project: &dyn Fn(Vec3) -> Vec3) -> ([Vec3; 6], f64) {
-    let mut q = [Vec3::zeros(); 6];
-    let mut sum = 0.0;
-    for (slot, &t) in q.iter_mut().zip(&CURVE_T) {
-        let p = curve_point(c, t);
-        *slot = project(p);
-        sum += (*slot - p).norm_squared();
-    }
-    (q, sum / CURVE_T.len() as f64)
+/// The samples of `c` at [`CURVE_T`].
+fn curve_samples(c: &[Vec3; 4], project: Project) -> Vec<Sample> {
+    CURVE_T.iter().map(|&t| sample(curve_point(c, t), project)).collect()
 }
 
 /// Parameters of the points `q` between the ends of `c` by the length of the polyline through them
 /// (the points of a curve that follows the scan are spaced like its parameter); `None` for a
 /// polyline of no length.
-fn chord_parameters(c: &[Vec3; 4], q: &[Vec3; 6]) -> Option<[f64; 6]> {
-    let mut t = [0.0; 6];
+fn chord_parameters(c: &[Vec3; 4], q: &[Vec3]) -> Option<Vec<f64>> {
+    let mut t = Vec::with_capacity(q.len());
     let mut prev = c[0];
     let mut run = 0.0;
-    for (slot, p) in t.iter_mut().zip(q) {
+    for p in q {
         run += (p - prev).norm();
-        *slot = run;
+        t.push(run);
         prev = *p;
     }
     let total = run + (c[3] - prev).norm();
-    if !(total.is_finite() && total > 0.0) {
-        return None;
-    }
-    Some(t.map(|x| x / total))
+    (total.is_finite() && total > 0.0).then(|| t.iter().map(|x| x / total).collect())
 }
 
-/// The cubic with the ends of `c` closest (least squares) to the points `q` at their chord-length
-/// parameters; `None` when the system is singular or the result is not finite.
-fn curve_through(c: &[Vec3; 4], q: &[Vec3; 6]) -> Option<[Vec3; 4]> {
-    let params = chord_parameters(c, q)?;
+/// The cubic with the ends of `c` closest (least squares) to the valid samples `s` at their
+/// chord-length parameters; `None` with fewer than [`MIN_CURVE_SAMPLES`], or when the system is
+/// singular or the result is not finite.
+fn curve_through(c: &[Vec3; 4], s: &[Sample]) -> Option<[Vec3; 4]> {
+    let q: Vec<Vec3> = s.iter().flatten().map(|(q, _)| *q).collect();
+    if q.len() < MIN_CURVE_SAMPLES {
+        return None;
+    }
+    let params = chord_parameters(c, &q)?;
     let (mut m11, mut m12, mut m22) = (0.0, 0.0, 0.0);
     let (mut r1, mut r2) = (Vec3::zeros(), Vec3::zeros());
-    for (&t, p) in params.iter().zip(q) {
+    for (&t, p) in params.iter().zip(&q) {
         let b = bern(t);
         let res = p - c[0] * b[0] - c[3] * b[3];
         m11 += b[1] * b[1];
@@ -95,36 +132,30 @@ fn curve_through(c: &[Vec3; 4], q: &[Vec3; 6]) -> Option<[Vec3; 4]> {
     c1.iter().chain(c2.iter()).all(|x| x.is_finite()).then_some([c[0], c1, c2, c[3]])
 }
 
-/// `c` refitted to the scan (see the module documentation); `c` itself when no refit lies closer.
-pub(crate) fn refit_curve(c: [Vec3; 4], project: &dyn Fn(Vec3) -> Vec3) -> [Vec3; 4] {
-    let (mut q, mut best_err) = curve_targets(&c, project);
-    let (mut best, mut cur) = (c, c);
+/// `c` refitted to the scan (see the module documentation); `c` itself when fewer than
+/// [`MIN_CURVE_SAMPLES`] samples reach the scan or no refit lies closer.
+pub(crate) fn refit_curve(c: [Vec3; 4], project: Project) -> [Vec3; 4] {
+    let first = curve_samples(&c, project);
+    if valid(&first) < MIN_CURVE_SAMPLES {
+        return c;
+    }
+    let (mut best, mut best_s) = (c, first.clone());
+    let (mut cur, mut cur_s) = (c, first);
     for _ in 0..PASSES {
-        let Some(next) = curve_through(&cur, &q) else { break };
-        let (nq, err) = curve_targets(&next, project);
-        if err < best_err {
-            (best, best_err) = (next, err);
+        let Some(next) = curve_through(&cur, &cur_s) else { break };
+        let next_s = curve_samples(&next, project);
+        if closer(&best_s, &next_s, MIN_CURVE_SAMPLES) {
+            (best, best_s) = (next, next_s.clone());
         }
-        (cur, q) = (next, nq);
+        (cur, cur_s) = (next, next_s);
     }
     best
 }
 
-/// The scan points under the samples of `net` (at [`NET_T`] in u and v) and their mean squared
-/// distance from them.
-fn net_targets(net: &Net, project: &dyn Fn(Vec3) -> Vec3) -> (Vec<Vec3>, f64) {
-    let mut q = Vec::with_capacity(NET_T.len() * NET_T.len());
-    let mut sum = 0.0;
-    for &u in &NET_T {
-        for &v in &NET_T {
-            let (p, _, _) = eval(net, u, v);
-            let at = project(p);
-            sum += (at - p).norm_squared();
-            q.push(at);
-        }
-    }
-    let n = q.len().max(1) as f64;
-    (q, sum / n)
+/// The samples of `net` at [`NET_T`] in u and v (u outer).
+fn net_samples(net: &Net, project: Project) -> Vec<Sample> {
+    let params = NET_T.iter().flat_map(|&u| NET_T.iter().map(move |&v| (u, v)));
+    params.map(|(u, v)| sample(eval(net, u, v).0, project)).collect()
 }
 
 /// The part of the point of `net` at weights `w` that the boundary control points give.
@@ -140,13 +171,17 @@ fn boundary_part(net: &Net, w: &[[f64; 4]; 4]) -> Vec3 {
     fixed
 }
 
-/// `net` with its four inner control points fitted (least squares) to `q`, the targets of
-/// [`net_targets`]; `None` when the system is singular or the result is not finite.
-fn net_through(net: &Net, q: &[Vec3]) -> Option<Net> {
+/// `net` with its four inner control points fitted (least squares) to the valid samples `s` of
+/// [`net_samples`]; `None` with fewer than [`MIN_NET_SAMPLES`], or when the system is singular or
+/// the result is not finite.
+fn net_through(net: &Net, s: &[Sample]) -> Option<Net> {
+    if valid(s) < MIN_NET_SAMPLES {
+        return None;
+    }
     let mut m = nalgebra::Matrix4::<f64>::zeros();
     let mut r = nalgebra::Matrix4x3::<f64>::zeros();
     let params = NET_T.iter().flat_map(|&u| NET_T.iter().map(move |&v| (u, v)));
-    for ((u, v), target) in params.zip(q) {
+    for ((u, v), target) in params.zip(s).filter_map(|(uv, s)| Some((uv, (*s)?.0))) {
         let w = tensor_weights(u, v);
         let res = target - boundary_part(net, &w);
         let a: [f64; 4] = INNER.map(|(i, j)| w.get(i).and_then(|row| row.get(j)).copied().unwrap_or(0.0));
@@ -173,143 +208,40 @@ fn net_through(net: &Net, q: &[Vec3]) -> Option<Net> {
     Some(out)
 }
 
+/// Does `new` face like `old` everywhere on [`GUARD_T`] × [`GUARD_T`] (normals within
+/// [`MIN_TURN_COS`]; where `old` has a normal, `new` must have one)? A refit that folds or turns a
+/// patch fails it.
+fn keeps_facing(old: &Net, new: &Net) -> bool {
+    GUARD_T.iter().all(|&u| {
+        GUARD_T.iter().all(|&v| match (normal(old, u, v), normal(new, u, v)) {
+            (Some(a), Some(b)) => a.dot(&b) >= MIN_TURN_COS,
+            (None, _) => true,
+            (Some(_), None) => false,
+        })
+    })
+}
+
 /// `net` with its inner control points refitted to the scan like [`refit_curve`] refits a curve
-/// (its boundary is left as it is); `net` itself when no refit lies closer.
-pub(crate) fn refit_net(net: Net, project: &dyn Fn(Vec3) -> Vec3) -> Net {
-    let (mut q, mut best_err) = net_targets(&net, project);
-    let (mut best, mut cur) = (net, net);
+/// (its boundary is left as it is), keeping only refits that face like `net` ([`keeps_facing`]);
+/// `net` itself when fewer than [`MIN_NET_SAMPLES`] samples reach the scan or no refit qualifies.
+pub(crate) fn refit_net(net: Net, project: Project) -> Net {
+    let first = net_samples(&net, project);
+    if valid(&first) < MIN_NET_SAMPLES {
+        return net;
+    }
+    let (mut best, mut best_s) = (net, first.clone());
+    let (mut cur, mut cur_s) = (net, first);
     for _ in 0..PASSES {
-        let Some(next) = net_through(&cur, &q) else { break };
-        let (nq, err) = net_targets(&next, project);
-        if err < best_err {
-            (best, best_err) = (next, err);
+        let Some(next) = net_through(&cur, &cur_s) else { break };
+        let next_s = net_samples(&next, project);
+        if closer(&best_s, &next_s, MIN_NET_SAMPLES) && keeps_facing(&net, &next) {
+            (best, best_s) = (next, next_s.clone());
         }
-        (cur, q) = (next, nq);
+        (cur, cur_s) = (next, next_s);
     }
     best
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::patch::{chord_curve, interpolated_net};
-
-    const R: f64 = 10.0;
-    /// Points along a curve or across a patch at which the true surface is checked.
-    const CHECK: usize = 60;
-
-    /// The closest point on the cylinder of radius [`R`] about the z axis.
-    fn on_cylinder(p: Vec3) -> Vec3 {
-        let r = p.x.hypot(p.y);
-        Vec3::new(p.x * R / r, p.y * R / r, p.z)
-    }
-
-    /// The point on the sphere of radius [`R`] about the origin under `p`, moved along the normal by
-    /// a deterministic noise of amplitude `sigma` (it varies over a fraction of a millimetre).
-    fn on_noisy_sphere(p: Vec3, sigma: f64) -> Vec3 {
-        let n = p.normalize();
-        let noise = (37.1 * p.x + 11.3 * p.y + 5.7 * p.z).sin() * (23.9 * p.y - 13.1 * p.z).cos();
-        n * (R + sigma * noise * std::f64::consts::SQRT_2)
-    }
-
-    fn curve_gap(c: &[Vec3; 4]) -> f64 {
-        (0..=CHECK).map(|k| (curve_point(c, k as f64 / CHECK as f64).xy().norm() - R).abs()).fold(0.0, f64::max)
-    }
-
-    fn net_rms(net: &Net) -> f64 {
-        let mut sum = 0.0;
-        for i in 0..=CHECK {
-            for j in 0..=CHECK {
-                let (p, _, _) = eval(net, i as f64 / CHECK as f64, j as f64 / CHECK as f64);
-                sum += (p.norm() - R).powi(2);
-            }
-        }
-        (sum / ((CHECK + 1) * (CHECK + 1)) as f64).sqrt()
-    }
-
-    fn at_angle(deg: f64, z: f64) -> Vec3 {
-        let a = deg.to_radians();
-        Vec3::new(R * a.cos(), R * a.sin(), z)
-    }
-
-    #[test]
-    fn a_curve_over_a_strongly_curved_arc_is_refitted_much_closer_to_it() {
-        // Arrange: a 100 degree arc of a cylinder of radius 10, rising 3 mm
-        let (a, b) = (at_angle(0.0, 0.0), at_angle(100.0, 3.0));
-
-        // Act
-        let chord = chord_curve(a, b, &on_cylinder);
-        let refit = refit_curve(chord, &on_cylinder);
-
-        // Assert
-        let (before, after) = (curve_gap(&chord), curve_gap(&refit));
-        eprintln!("largest gap from the arc: chord interpolant {before:.4} mm, refitted {after:.4} mm");
-        assert!(after < 0.25 * before, "{before} -> {after}");
-        assert_eq!((refit[0], refit[3]), (a, b), "the ends stay where they are");
-    }
-
-    fn sphere_corner(lat: f64, lon: f64) -> Vec3 {
-        let (la, lo) = (lat.to_radians(), lon.to_radians());
-        Vec3::new(R * la.cos() * lo.cos(), R * la.cos() * lo.sin(), R * la.sin())
-    }
-
-    #[test]
-    fn a_patch_over_a_noisy_sphere_is_refitted_closer_to_the_sphere() {
-        // Arrange: a 40 x 40 degree patch whose boundary lies on the sphere, the inside taken from
-        // a scan with noise 0.05 mm
-        let c = [
-            sphere_corner(-20.0, -20.0),
-            sphere_corner(-20.0, 20.0),
-            sphere_corner(20.0, 20.0),
-            sphere_corner(20.0, -20.0),
-        ];
-        let exact = |p: Vec3| on_noisy_sphere(p, 0.0);
-        let curve = |x: Vec3, y: Vec3| refit_curve(chord_curve(x, y, &exact), &exact);
-        let (bot, right, top, left) = (curve(c[0], c[1]), curve(c[1], c[2]), curve(c[3], c[2]), curve(c[0], c[3]));
-        let noisy = |p: Vec3| on_noisy_sphere(p, 0.05);
-
-        // Act
-        let interpolated = interpolated_net(&bot, &right, &top, &left, &noisy);
-        let refit = refit_net(interpolated, &noisy);
-
-        // Assert
-        let (before, after) = (net_rms(&interpolated), net_rms(&refit));
-        eprintln!("RMS distance from the sphere: interpolated {before:.4} mm, refitted {after:.4} mm");
-        assert!(after < 0.6 * before, "{before} -> {after}");
-        let boundary_kept = (0..4).all(|k| refit[k][0] == interpolated[k][0] && refit[3][k] == interpolated[3][k]);
-        assert!(boundary_kept, "the boundary is shared with the neighbours and stays");
-    }
-
-    #[test]
-    fn a_projection_that_gives_nothing_usable_leaves_the_curve_and_the_patch_as_they_were() {
-        // Arrange
-        let (a, b) = (at_angle(0.0, 0.0), at_angle(60.0, 1.0));
-        let c = chord_curve(a, b, &on_cylinder);
-        let net = interpolated_net(&c, &c, &c, &c, &on_cylinder);
-
-        for project in [&(|_: Vec3| Vec3::repeat(f64::NAN)) as &dyn Fn(Vec3) -> Vec3, &|p: Vec3| p] {
-            // Act
-            let curve = refit_curve(c, project);
-            let patch = refit_net(net, project);
-
-            // Assert
-            assert_eq!(curve, c);
-            assert_eq!(patch, net);
-        }
-    }
-
-    #[test]
-    fn a_refit_never_puts_its_samples_farther_from_the_scan() {
-        for (deg, sigma) in [(20.0, 0.0), (90.0, 0.02), (150.0, 0.1)] {
-            // Arrange
-            let project = |p: Vec3| on_noisy_sphere(p, sigma);
-            let c = chord_curve(sphere_corner(0.0, 0.0), sphere_corner(10.0, deg), &project);
-
-            // Act
-            let refit = refit_curve(c, &project);
-
-            // Assert
-            assert!(curve_targets(&refit, &project).1 <= curve_targets(&c, &project).1, "{deg} {sigma}");
-        }
-    }
-}
+#[path = "patch_refit_tests.rs"]
+mod tests;

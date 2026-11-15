@@ -19,7 +19,8 @@ patch network over a whole scan.
   reaches `min_within` plus three quarters of what it leaves out (99.75 % for the default 99 %):
   the wrap measures a stride of the scan against a coarse tessellation, so a network that only just
   met `min_within` there could miss it against the scan. `within_tolerance` is still judged by
-  `min_within`.
+  `min_within`. A low `min_within` raises the refinement target too: 0.5 refines up to 87.5 %, 0 up
+  to 75 %.
 - `max_patches` is a hard bound of every round, the first included (`cap_used` echoes it): no
   network has more patches. A round that would exceed it is not dropped. Adaptive: it is cut to the
   cap by the decimation, and while such rounds raise the share within the tolerance by at least 0.1

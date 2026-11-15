@@ -26,7 +26,8 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
 ### Changed
 
 - `surface.wrap` fits closer to organic scans: every patch edge and patch is refitted to the scan
-  by least squares (edges with the parameters of their spacing along the curve), and the adaptive
+  by least squares (edges with the parameters of their spacing along the curve; not on the open rim
+  of a scan, not with `continuity: g1`, and only when it faces like the plain patch), and the adaptive
   rounds held at `max_patches` go on at the cap while each raises the share within the tolerance by
   at least 0.1 percentage point, past `min_within` too, instead of stopping at the first round cut
   to the cap. Below the cap the adaptive rounds stop once the share reaches `min_within` plus three

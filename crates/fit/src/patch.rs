@@ -209,23 +209,24 @@ pub(crate) fn chord_curve(a: Vec3, b: Vec3, project: &dyn Fn(Vec3) -> Vec3) -> [
 }
 
 /// The wrap curve from `a` to `b`: [`chord_curve`] refitted to the scan by least squares
-/// ([`crate::patch_refit`]).
-pub(crate) fn wrap_curve(a: Vec3, b: Vec3, project: &dyn Fn(Vec3) -> Vec3) -> [Vec3; 4] {
-    let c = chord_curve(a, b, project);
+/// ([`crate::patch_refit`]). `project` gives `None` where no scan point is within reach: such a
+/// point stays where it is in the plain construction and is left out of the refit.
+pub(crate) fn wrap_curve(a: Vec3, b: Vec3, project: &dyn Fn(Vec3) -> Option<Vec3>) -> [Vec3; 4] {
+    let c = chord_curve(a, b, &|p| project(p).unwrap_or(p));
     crate::patch_refit::refit_curve(c, project)
 }
 
 /// The wrap patch with the boundary curves `bot` (c0 → c1), `right` (c1 → c2), `top` (c3 → c2),
 /// `left` (c0 → c3): [`interpolated_net`] with its inner points refitted to the scan by least squares
-/// ([`crate::patch_refit`]).
+/// ([`crate::patch_refit`]); `project` as in [`wrap_curve`].
 pub(crate) fn wrap_net(
     bot: &[Vec3; 4],
     right: &[Vec3; 4],
     top: &[Vec3; 4],
     left: &[Vec3; 4],
-    project: &dyn Fn(Vec3) -> Vec3,
+    project: &dyn Fn(Vec3) -> Option<Vec3>,
 ) -> Net {
-    let net = interpolated_net(bot, right, top, left, project);
+    let net = interpolated_net(bot, right, top, left, &|p| project(p).unwrap_or(p));
     crate::patch_refit::refit_net(net, project)
 }
 
@@ -319,8 +320,8 @@ pub fn wrap_patches(coarse: &Mesh, scan: &Bvh, reach: f64) -> PatchSet {
         let pm = on_edge((pa + pb) * 0.5);
         vertices.push(pm);
         mid.insert((a, b), m);
-        curves.insert((a, m), wrap_curve(pa, pm, &on_edge));
-        curves.insert((b, m), wrap_curve(pb, pm, &on_edge));
+        curves.insert((a, m), chord_curve(pa, pm, &on_edge));
+        curves.insert((b, m), chord_curve(pb, pm, &on_edge));
     }
     let side = |curves: &BTreeMap<(u32, u32), [Vec3; 4]>, a: u32, b: u32| -> Option<[Vec3; 4]> {
         let c = curves.get(&(a.min(b), a.max(b)))?;
@@ -340,7 +341,7 @@ pub fn wrap_patches(coarse: &Mesh, scan: &Bvh, reach: f64) -> PatchSet {
         vertices.push(pg);
         for &mk in &[m0, m1, m2] {
             if let Some(&pm) = vertices.get(mk as usize) {
-                curves.insert((mk, g), wrap_curve(pm, pg, &on_face));
+                curves.insert((mk, g), chord_curve(pm, pg, &on_face));
             }
         }
         // quad k: corner k, the midpoint after it, the centre, the midpoint before it
@@ -350,7 +351,7 @@ pub fn wrap_patches(coarse: &Mesh, scan: &Bvh, reach: f64) -> PatchSet {
             else {
                 continue;
             };
-            set.nets.push(wrap_net(&bot, &right, &top, &left, &on_face));
+            set.nets.push(interpolated_net(&bot, &right, &top, &left, &on_face));
             set.corners.push([c0, c1, g, c3]);
         }
     }
