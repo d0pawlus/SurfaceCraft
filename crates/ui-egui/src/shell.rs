@@ -227,6 +227,7 @@ impl SurfaceCraftApp {
         egui::Panel::top("ribbon").frame(chrome(6, 3)).show(ui, |ui| self.ribbon(ui));
         egui::Panel::bottom("status").frame(chrome(8, 3)).show(ui, |ui| self.status_bar(ui));
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.dock_area(ui));
+        self.import_offer_dialog(ui.ctx());
         self.busy_overlay(ui.ctx());
     }
 
@@ -352,8 +353,9 @@ impl SurfaceCraftApp {
     #[cfg(not(target_arch = "wasm32"))]
     fn poll_dialogs(&mut self) {
         use craft_dialogs::Answer;
-        // an answer that arrives while a command runs waits for it (it is not dropped)
-        if self.is_busy() {
+        // an answer that arrives while a command runs (or a large import waits for its answer)
+        // waits for it (it is not dropped)
+        if self.is_busy() || self.pending_import.is_some() {
             return;
         }
         for (then, answer) in self.dialogs.take_answers() {
@@ -376,9 +378,7 @@ impl SurfaceCraftApp {
                 DialogThen::SaveProject => {
                     let _ = self.run_command("doc.save", json!({"path": p}));
                 }
-                DialogThen::ImportMesh => {
-                    self.import_mesh_file(json!({"path": p}));
-                }
+                DialogThen::ImportMesh => self.import_picked_path(&p),
                 DialogThen::ImportStep => {
                     self.launch("import.step", json!({"path": p}), After::Fit);
                 }

@@ -4,7 +4,7 @@
 //! to the coarse ones, so per-vertex colours (deviation maps, regions) and triangle selections
 //! carry over without recomputing anything on the coarse mesh.
 use crate::{Mesh, Point3, Vec3};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// A coarse display mesh and how the original maps onto it.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -157,6 +157,114 @@ pub fn cluster_on_grid(mesh: &Mesh, origin: &Point3, h: f64) -> Lod {
     Lod { mesh: Mesh { positions, triangles }, vertex_map, triangle_map }
 }
 
+/// Vertex clustering of a triangle soup that arrives in batches (a file read as a stream): the
+/// grid of [`cluster_on_grid`], fed corner by corner, so the memory it takes follows the coarse
+/// mesh and not the input. Each coarse vertex is the mean of the corners that fell in its cell;
+/// a triangle whose corners fall in fewer than three cells disappears and equal coarse triangles
+/// are kept once. The error bound is that of [`cluster_on_grid`]: `√3·h`.
+///
+/// `max_triangles` caps the coarse mesh (and three times it the cells): once it is passed the
+/// clusterer is [`SoupClusterer::is_over`] and takes nothing more, so a cell size that turns out
+/// too small costs no more memory than the cap.
+#[derive(Clone, Debug)]
+pub struct SoupClusterer {
+    origin: Point3,
+    inv: f64,
+    max_triangles: usize,
+    cell_id: HashMap<[i64; 3], u32>,
+    sum: Vec<(Vec3, u32)>,
+    seen: HashSet<[u32; 3]>,
+    triangles: Vec<[u32; 3]>,
+    over: bool,
+}
+
+impl SoupClusterer {
+    /// A clusterer on the grid of cell size `h` anchored at `origin`.
+    #[must_use]
+    pub fn new(origin: Point3, h: f64, max_triangles: usize) -> Self {
+        Self {
+            origin,
+            inv: 1.0 / h.max(1e-12),
+            max_triangles,
+            cell_id: HashMap::new(),
+            sum: Vec::new(),
+            seen: HashSet::new(),
+            triangles: Vec::new(),
+            over: false,
+        }
+    }
+
+    /// Did the coarse mesh pass its cap? (Nothing is taken after that.)
+    #[must_use]
+    pub fn is_over(&self) -> bool {
+        self.over
+    }
+
+    /// Coarse triangles so far.
+    #[must_use]
+    pub fn triangle_count(&self) -> usize {
+        self.triangles.len()
+    }
+
+    fn cell(&mut self, p: &Point3) -> u32 {
+        let d = (p - self.origin) * self.inv;
+        let key = [d.x.floor() as i64, d.y.floor() as i64, d.z.floor() as i64];
+        let next = self.sum.len() as u32;
+        let id = *self.cell_id.entry(key).or_insert(next);
+        if id == next {
+            self.sum.push((Vec3::zeros(), 0));
+        }
+        if let Some(s) = self.sum.get_mut(id as usize) {
+            s.0 += p.coords;
+            s.1 += 1;
+        }
+        id
+    }
+
+    /// Takes a batch of triangles; returns whether the coarse mesh is still within its cap.
+    pub fn push(&mut self, batch: &[[Point3; 3]]) -> bool {
+        for t in batch {
+            if self.over {
+                break;
+            }
+            let m = [self.cell(&t[0]), self.cell(&t[1]), self.cell(&t[2])];
+            if m[0] != m[1] && m[1] != m[2] && m[0] != m[2] {
+                // the same coarse triangle from several fine ones is kept once (rotation-invariant key)
+                let r = m.iter().enumerate().min_by_key(|(_, v)| **v).map_or(0, |(i, _)| i);
+                if self.seen.insert([m[r], m[(r + 1) % 3], m[(r + 2) % 3]]) {
+                    self.triangles.push(m);
+                }
+            }
+            self.over = self.triangles.len() > self.max_triangles
+                || self.sum.len() > self.max_triangles.saturating_mul(3).max(64);
+        }
+        !self.over
+    }
+
+    /// The coarse mesh: the cells some triangle uses, as vertices, and the triangles.
+    #[must_use]
+    pub fn finish(self) -> Mesh {
+        let mut new_index = vec![u32::MAX; self.sum.len()];
+        let mut positions = Vec::new();
+        let mut triangles = Vec::with_capacity(self.triangles.len());
+        for t in &self.triangles {
+            let mut out = [0u32; 3];
+            for (o, &v) in out.iter_mut().zip(t) {
+                let (Some(slot), Some((s, n))) = (new_index.get_mut(v as usize), self.sum.get(v as usize)) else {
+                    continue;
+                };
+                if *slot == u32::MAX {
+                    *slot = positions.len() as u32;
+                    positions.push(Point3::from(s / f64::from((*n).max(1))));
+                }
+                *o = *slot;
+            }
+            triangles.push(out);
+        }
+        Mesh { positions, triangles }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,5 +324,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn soup(m: &Mesh) -> Vec<[Point3; 3]> {
+        (0..m.triangle_count()).map(|i| m.triangle(i).unwrap()).collect()
+    }
+
+    #[test]
+    fn a_soup_fed_in_batches_clusters_like_the_mesh_on_the_same_grid() {
+        let mut s = synth::torus(Point3::origin(), Vec3::z(), 30.0, 8.0, 96, 48);
+        s.weld(1e-9);
+        let origin = s.bbox().min;
+        let reference = cluster_on_grid(&s, &origin, 2.5);
+        let mut c = SoupClusterer::new(origin, 2.5, usize::MAX);
+        for batch in soup(&s).chunks(100) {
+            assert!(c.push(batch));
+        }
+        assert_eq!(c.triangle_count(), reference.mesh.triangle_count());
+        let coarse = c.finish();
+        coarse.validate().unwrap();
+        assert_eq!(coarse.triangle_count(), reference.mesh.triangle_count());
+        // every vertex is used, and the coarse surface is within the bound of the original
+        let used: HashSet<u32> = coarse.triangles.iter().flatten().copied().collect();
+        assert_eq!(used.len(), coarse.vertex_count());
+        let bvh = crate::Bvh::build(&s);
+        let bound = 3f64.sqrt() * 2.5;
+        for p in &coarse.positions {
+            assert!(bvh.closest(p, f64::INFINITY).unwrap().distance <= bound + 1e-9);
+        }
+    }
+
+    #[test]
+    fn a_clusterer_past_its_cap_stops_taking_triangles() {
+        let s = synth::sphere(Point3::origin(), 20.0, 128, 64);
+        let mut c = SoupClusterer::new(s.bbox().min, 0.01, 500);
+        assert!(!c.push(&soup(&s)));
+        assert!(c.is_over());
+        let held = c.triangle_count();
+        assert!(held <= 501, "{held}");
+        assert!(!c.push(&soup(&s)));
+        assert_eq!(c.triangle_count(), held);
     }
 }
