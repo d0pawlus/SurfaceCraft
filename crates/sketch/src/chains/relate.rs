@@ -32,125 +32,199 @@ fn shared_points(sk: &Sketch, e1: usize, e2: usize) -> Vec<usize> {
     v
 }
 
+/// The fitted geometry and thresholds the candidate relations are proposed from.
+struct CandCtx<'a> {
+    sk: &'a Sketch,
+    tol: f64,
+    /// Angle tolerance (radians).
+    ang: f64,
+    /// Angle tolerance of tangency (radians).
+    tan_ang: f64,
+    prims: Vec<Option<Prim>>,
+}
+
+impl CandCtx<'_> {
+    /// Unit direction of entity `e` when it is a line.
+    fn dir(&self, e: usize) -> Option<P2> {
+        match self.prims.get(e) {
+            Some(Some(Prim::Line { d, .. })) => Some(*d),
+            _ => None,
+        }
+    }
+
+    /// Centre and radius of entity `e` when it is an arc or circle.
+    fn circ(&self, e: usize) -> Option<(P2, f64)> {
+        match self.prims.get(e) {
+            Some(Some(Prim::Circle { c, r })) => Some((*c, *r)),
+            _ => None,
+        }
+    }
+
+    /// Sketch point `i`, if it exists.
+    fn pt(&self, i: usize) -> Option<P2> {
+        self.sk.points.get(i).copied()
+    }
+
+    /// Index of the centre point of entity `e` when it is an arc or circle.
+    fn center_of(&self, e: usize) -> Option<usize> {
+        match self.sk.entities.get(e) {
+            Some(Entity::Arc { center, .. } | Entity::Circle { center, .. }) => Some(*center),
+            _ => None,
+        }
+    }
+}
+
+/// The proposed relations by kind, concatenated in priority order by [`CandLists::into_all`].
+#[derive(Default)]
+struct CandLists {
+    hv: Vec<Cand>,
+    tangent: Vec<Cand>,
+    concentric: Vec<Cand>,
+    collinear: Vec<Cand>,
+    equal: Vec<Cand>,
+    parallel: Vec<Cand>,
+    perpendicular: Vec<Cand>,
+}
+
+impl CandLists {
+    /// All candidates, most important kind first.
+    fn into_all(self) -> Vec<Cand> {
+        let mut all = self.hv;
+        all.extend(self.tangent);
+        all.extend(self.concentric);
+        all.extend(self.collinear);
+        all.extend(self.equal);
+        all.extend(self.parallel);
+        all.extend(self.perpendicular);
+        all
+    }
+}
+
+/// A candidate of one constraint.
+fn single(kind: RelationKind, entities: Vec<usize>, c: Constraint) -> Cand {
+    Cand { kind, entities, cons: vec![c], fallback: None }
+}
+
 /// Relations the fitted geometry suggests, most important first.
 fn candidates(sk: &Sketch, tol: f64, opts: &ChainOptions) -> Vec<Cand> {
     let ne = sk.entities.len();
     let prims: Vec<Option<Prim>> = (0..ne).map(|e| entity_prim(sk, e)).collect();
     let ang = opts.angle_tolerance_degrees.to_radians();
     let tan_ang = (3.0 * ang).min(0.5);
-    let dir = |e: usize| match prims.get(e) {
-        Some(Some(Prim::Line { d, .. })) => Some(*d),
-        _ => None,
-    };
-    let circ = |e: usize| match prims.get(e) {
-        Some(Some(Prim::Circle { c, r })) => Some((*c, *r)),
-        _ => None,
-    };
-    let pt = |i: usize| sk.points.get(i).copied();
-    let center_of = |e: usize| match sk.entities.get(e) {
-        Some(Entity::Arc { center, .. } | Entity::Circle { center, .. }) => Some(*center),
-        _ => None,
-    };
-    let (mut hv, mut tangent, mut concentric, mut collinear) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    let (mut equal, mut parallel, mut perpendicular) = (Vec::new(), Vec::new(), Vec::new());
-    let single = |kind, entities: Vec<usize>, c: Constraint| Cand { kind, entities, cons: vec![c], fallback: None };
+    let cx = CandCtx { sk, tol, ang, tan_ang, prims };
+    let mut lists = CandLists::default();
     for e in 0..ne {
-        if let Some(d) = dir(e) {
-            if d[1].abs().asin() <= ang {
-                hv.push(single(RelationKind::Horizontal, vec![e], Constraint::Horizontal { line: e }));
-            } else if d[0].abs().asin() <= ang {
-                hv.push(single(RelationKind::Vertical, vec![e], Constraint::Vertical { line: e }));
-            }
-        }
+        add_axis_relation(&cx, e, &mut lists);
     }
     for e1 in 0..ne {
         for e2 in e1 + 1..ne {
-            // tangency at a shared end point
-            let shared = shared_points(sk, e1, e2);
-            let tangent_at = |j: P2| -> bool {
-                match (dir(e1), dir(e2), circ(e1), circ(e2)) {
-                    (Some(d), _, _, Some((c, _))) | (_, Some(d), Some((c, _)), _) => {
-                        unit(sub(j, c)).is_some_and(|u| dot(d, u).abs().asin() <= tan_ang)
-                    }
-                    (_, _, Some((c1, r1)), Some((c2, r2))) => {
-                        dist(c1, c2) > 4.0 * tol
-                            && r1.min(r2) > tol
-                            && unit(sub(j, c1))
-                                .zip(unit(sub(j, c2)))
-                                .is_some_and(|(u1, u2)| cross(u1, u2).abs().asin() <= tan_ang)
-                    }
-                    _ => false,
-                }
-            };
-            if shared.iter().filter_map(|&i| pt(i)).any(tangent_at) {
-                // the line (or, between two arcs, the first arc) goes first
-                let (first, second) = if dir(e2).is_some() && dir(e1).is_none() { (e2, e1) } else { (e1, e2) };
-                tangent.push(single(
-                    RelationKind::Tangent,
-                    vec![first, second],
-                    Constraint::Tangent { line: first, entity: second },
-                ));
-            }
-            // concentric and equal radius
-            if let (Some((c1, r1)), Some((c2, r2))) = (circ(e1), circ(e2)) {
-                if let (Some(i1), Some(i2)) = (center_of(e1), center_of(e2))
-                    && i1 != i2
-                    && dist(c1, c2) <= tol
-                {
-                    concentric.push(single(
-                        RelationKind::Concentric,
-                        vec![e1, e2],
-                        Constraint::Coincident { a: i1, b: i2 },
-                    ));
-                }
-                if (r1 - r2).abs() <= tol + 0.02 * r1.min(r2) {
-                    equal.push(single(RelationKind::EqualRadius, vec![e1, e2], Constraint::Equal { a: e1, b: e2 }));
-                }
-            }
-            // lines
-            if let (Some(d1), Some(d2), Some((_, _)), Some((a2, b2))) =
-                (dir(e1), dir(e2), sk.endpoints(e1), sk.endpoints(e2))
-            {
-                if cross(d1, d2).abs().asin() <= ang {
-                    let offset = pt(a1_of(sk, e1)).zip(pt(a2)).zip(pt(b2)).map(|((p1, q1), q2)| {
-                        let line1 = Prim::Line { o: p1, d: d1 };
-                        line1.dist(q1).max(line1.dist(q2))
-                    });
-                    if offset.is_some_and(|dv| dv <= 2.0 * tol) && shared.is_empty() {
-                        collinear.push(Cand {
-                            kind: RelationKind::Collinear,
-                            entities: vec![e1, e2],
-                            cons: vec![
-                                Constraint::Parallel { a: e1, b: e2 },
-                                Constraint::PointOnLine { point: a2, line: e1 },
-                            ],
-                            fallback: Some(vec![Constraint::PointOnLine { point: a2, line: e1 }]),
-                        });
-                    } else {
-                        parallel.push(single(
-                            RelationKind::Parallel,
-                            vec![e1, e2],
-                            Constraint::Parallel { a: e1, b: e2 },
-                        ));
-                    }
-                } else if dot(d1, d2).abs().asin() <= ang {
-                    perpendicular.push(single(
-                        RelationKind::Perpendicular,
-                        vec![e1, e2],
-                        Constraint::Perpendicular { a: e1, b: e2 },
-                    ));
-                }
-            }
+            add_pair_relations(&cx, e1, e2, &mut lists);
         }
     }
-    let mut all = hv;
-    all.extend(tangent);
-    all.extend(concentric);
-    all.extend(collinear);
-    all.extend(equal);
-    all.extend(parallel);
-    all.extend(perpendicular);
-    all
+    lists.into_all()
+}
+
+/// Horizontal or vertical, for a line within the angle tolerance of an axis.
+fn add_axis_relation(cx: &CandCtx<'_>, e: usize, lists: &mut CandLists) {
+    if let Some(d) = cx.dir(e) {
+        if d[1].abs().asin() <= cx.ang {
+            lists.hv.push(single(RelationKind::Horizontal, vec![e], Constraint::Horizontal { line: e }));
+        } else if d[0].abs().asin() <= cx.ang {
+            lists.hv.push(single(RelationKind::Vertical, vec![e], Constraint::Vertical { line: e }));
+        }
+    }
+}
+
+/// All relations the pair of entities `e1` < `e2` suggests.
+fn add_pair_relations(cx: &CandCtx<'_>, e1: usize, e2: usize, lists: &mut CandLists) {
+    let shared = shared_points(cx.sk, e1, e2);
+    add_tangent(cx, e1, e2, &shared, lists);
+    add_circle_relations(cx, e1, e2, lists);
+    add_line_relations(cx, e1, e2, &shared, lists);
+}
+
+/// Does the pair touch tangentially at the junction `j`?
+fn tangent_at(cx: &CandCtx<'_>, e1: usize, e2: usize, j: P2) -> bool {
+    match (cx.dir(e1), cx.dir(e2), cx.circ(e1), cx.circ(e2)) {
+        (Some(d), _, _, Some((c, _))) | (_, Some(d), Some((c, _)), _) => {
+            unit(sub(j, c)).is_some_and(|u| dot(d, u).abs().asin() <= cx.tan_ang)
+        }
+        (_, _, Some((c1, r1)), Some((c2, r2))) => {
+            dist(c1, c2) > 4.0 * cx.tol
+                && r1.min(r2) > cx.tol
+                && unit(sub(j, c1))
+                    .zip(unit(sub(j, c2)))
+                    .is_some_and(|(u1, u2)| cross(u1, u2).abs().asin() <= cx.tan_ang)
+        }
+        _ => false,
+    }
+}
+
+/// Tangency at a shared end point.
+fn add_tangent(cx: &CandCtx<'_>, e1: usize, e2: usize, shared: &[usize], lists: &mut CandLists) {
+    if shared.iter().filter_map(|&i| cx.pt(i)).any(|j| tangent_at(cx, e1, e2, j)) {
+        // the line (or, between two arcs, the first arc) goes first
+        let (first, second) = if cx.dir(e2).is_some() && cx.dir(e1).is_none() { (e2, e1) } else { (e1, e2) };
+        lists.tangent.push(single(
+            RelationKind::Tangent,
+            vec![first, second],
+            Constraint::Tangent { line: first, entity: second },
+        ));
+    }
+}
+
+/// Concentric and equal radius.
+fn add_circle_relations(cx: &CandCtx<'_>, e1: usize, e2: usize, lists: &mut CandLists) {
+    if let (Some((c1, r1)), Some((c2, r2))) = (cx.circ(e1), cx.circ(e2)) {
+        if let (Some(i1), Some(i2)) = (cx.center_of(e1), cx.center_of(e2))
+            && i1 != i2
+            && dist(c1, c2) <= cx.tol
+        {
+            lists.concentric.push(single(
+                RelationKind::Concentric,
+                vec![e1, e2],
+                Constraint::Coincident { a: i1, b: i2 },
+            ));
+        }
+        if (r1 - r2).abs() <= cx.tol + 0.02 * r1.min(r2) {
+            lists.equal.push(single(RelationKind::EqualRadius, vec![e1, e2], Constraint::Equal { a: e1, b: e2 }));
+        }
+    }
+}
+
+/// Collinear, parallel and perpendicular lines.
+fn add_line_relations(cx: &CandCtx<'_>, e1: usize, e2: usize, shared: &[usize], lists: &mut CandLists) {
+    let sk = cx.sk;
+    if let (Some(d1), Some(d2), Some((_, _)), Some((a2, b2))) =
+        (cx.dir(e1), cx.dir(e2), sk.endpoints(e1), sk.endpoints(e2))
+    {
+        if cross(d1, d2).abs().asin() <= cx.ang {
+            let offset = cx.pt(a1_of(sk, e1)).zip(cx.pt(a2)).zip(cx.pt(b2)).map(|((p1, q1), q2)| {
+                let line1 = Prim::Line { o: p1, d: d1 };
+                line1.dist(q1).max(line1.dist(q2))
+            });
+            if offset.is_some_and(|dv| dv <= 2.0 * cx.tol) && shared.is_empty() {
+                lists.collinear.push(Cand {
+                    kind: RelationKind::Collinear,
+                    entities: vec![e1, e2],
+                    cons: vec![Constraint::Parallel { a: e1, b: e2 }, Constraint::PointOnLine { point: a2, line: e1 }],
+                    fallback: Some(vec![Constraint::PointOnLine { point: a2, line: e1 }]),
+                });
+            } else {
+                lists.parallel.push(single(
+                    RelationKind::Parallel,
+                    vec![e1, e2],
+                    Constraint::Parallel { a: e1, b: e2 },
+                ));
+            }
+        } else if dot(d1, d2).abs().asin() <= cx.ang {
+            lists.perpendicular.push(single(
+                RelationKind::Perpendicular,
+                vec![e1, e2],
+                Constraint::Perpendicular { a: e1, b: e2 },
+            ));
+        }
+    }
 }
 
 /// Outcome of the relations of one chain.

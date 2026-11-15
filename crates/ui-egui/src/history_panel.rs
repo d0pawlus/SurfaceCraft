@@ -52,10 +52,8 @@ fn row_of(f: &FeatureObject, rolled_back: bool) -> Row {
     Row {
         id: f.id,
         name: f.name.clone(),
-        kind: serde_json::to_value(&f.op)
-            .ok()
-            .and_then(|v| v.get("kind").and_then(Value::as_str).map(str::to_string))
-            .unwrap_or_default(),
+        // the operation's serde tag, without serialising the operation (a base feature holds a whole B-rep)
+        kind: f.op.label().to_string(),
         suppressed: f.suppressed,
         error: f.error.clone(),
         base: matches!(f.op, FeatureOp::Base { .. }),

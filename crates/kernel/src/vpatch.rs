@@ -94,7 +94,10 @@ pub enum Row {
         /// Normal the derivative must be orthogonal to.
         normal: [f64; 3],
     },
-    /// `S_dd(uv) · normal = value`, `S_dd = dir0²·S_uu + 2·dir0·dir1·S_uv + dir1²·S_vv` (1 scalar row).
+    /// `S_dd(uv) · normal + S_d(uv) · tangent = value`, `S_dd = dir0²·S_uu + 2·dir0·dir1·S_uv +
+    /// dir1²·S_vv` and `S_d = dir0·S_u + dir1·S_v` (1 scalar row). With `tangent` zero it states the
+    /// projection of the second derivative; a caller that linearises `S_dd · n = κ |S_d|²` about a
+    /// known surface passes `tangent = −2κ·S_d` and `value = −κ |S_d|²` of that surface.
     Curvature {
         /// Parameters.
         uv: [f64; 2],
@@ -102,7 +105,9 @@ pub enum Row {
         dir: [f64; 2],
         /// Normal the second derivative is projected on.
         normal: [f64; 3],
-        /// Required value of the projection.
+        /// Vector the first derivative is projected on (may be zero).
+        tangent: [f64; 3],
+        /// Required value of the sum.
         value: f64,
     },
 }
@@ -188,9 +193,15 @@ fn check_row(dom: &[[f64; 2]; 2], row: &Row) -> Result<()> {
                 return Err(arg("tangent row: direction and normal must be finite and not zero"));
             }
         }
-        Row::Curvature { uv, dir, normal, value } => {
+        Row::Curvature { uv, dir, normal, tangent, value } => {
             check_uv(dom, *uv, "curvature row")?;
-            if !bounded(dir) || !bounded(normal) || !nonzero(dir) || !nonzero(normal) || !bounded(&[*value]) {
+            if !bounded(dir)
+                || !bounded(normal)
+                || !bounded(tangent)
+                || !nonzero(dir)
+                || !nonzero(normal)
+                || !bounded(&[*value])
+            {
                 return Err(arg(
                     "curvature row: direction, normal and value must be finite, direction and normal not zero",
                 ));
@@ -463,13 +474,20 @@ fn build_rows(g: &Grid, scale: &Scale, row: &Row, coupled: bool) -> Result<Vec<L
             let coef: [f64; 16] = std::array::from_fn(|i| dir[0] * su[i] + dir[1] * sv[i]);
             Ok(vec![directional_row(g, &st, &coef, *normal, 0.0)])
         }
-        Row::Curvature { uv, dir, normal, value } => {
+        Row::Curvature { uv, dir, normal, tangent, value } => {
             let st = Stencil::new(g, g.clamp(*uv))?;
             let (suu, suv, svv) = (st.coefficient(2, 0), st.coefficient(1, 1), st.coefficient(0, 2));
-            let coef: [f64; 16] = std::array::from_fn(|i| {
+            let second: [f64; 16] = std::array::from_fn(|i| {
                 dir[0] * dir[0] * suu[i] + 2.0 * dir[0] * dir[1] * suv[i] + dir[1] * dir[1] * svv[i]
             });
-            Ok(vec![directional_row(g, &st, &coef, *normal, value * scale.factor)])
+            let (su, sv) = (st.coefficient(1, 0), st.coefficient(0, 1));
+            let first: [f64; 16] = std::array::from_fn(|i| dir[0] * su[i] + dir[1] * sv[i]);
+            let mut row = directional_row(g, &st, &second, *normal, value * scale.factor);
+            let slope = directional_row(g, &st, &first, *tangent, 0.0);
+            for (col, add) in row.cols.iter_mut().zip(&slope.cols) {
+                col.1 += add.1;
+            }
+            Ok(vec![row])
         }
     }
 }

@@ -569,6 +569,9 @@ fn corners(lp: &Loop) -> Result<Vec<Corner>> {
         let off_plane = |t: Option<V3>, n: V3| t.map_or(0.0, |t| dot(t, n).abs().min(1.0).asin().to_degrees());
         let mismatch = match (normal(a)?, normal(b)?) {
             (Some(na), Some(nb)) => dot(na, nb).abs().min(1.0).acos().to_degrees(),
+            // a soft side follows the patch, not the other way round: it is no conflict
+            (Some(_), None) if b.soft => 0.0,
+            (None, Some(_)) if a.soft => 0.0,
             (Some(na), None) => off_plane(b.end_tangent(false), na),
             (None, Some(nb)) => off_plane(a.end_tangent(true), nb),
             (None, None) => 0.0,

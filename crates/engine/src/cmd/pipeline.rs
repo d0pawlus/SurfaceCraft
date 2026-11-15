@@ -254,6 +254,29 @@ pub(super) fn coverage_issue(d: &DeviationSummary, what: &str) -> Option<Issue> 
     Some(issue("low_coverage", msg))
 }
 
+/// Why a loop is counted in `fill_inside_out`.
+const FILL_INSIDE_OUT_WHY: &str = "the fill would have closed the scan inside out: the scanned face would point into the volume the patch encloses, so the solid would be the space in front of the scanned surface. Such a loop is the open edge of a sheet, not a hole: the sheet was scanned from its hollow side, or its normals are stored inward";
+/// What to do about a loop counted in `fill_inside_out`.
+const FILL_INSIDE_OUT_ADVICE: &str = "check which way the scan's normals face (flip them if they point into the part), then model it as a sheet or give it a `thickness` for a solid; `mesh.fill_holes` with `allow_inward: true` caps it anyway (e.g. for a mould)";
+
+/// The issues of the holes left open: `scan_defects` for those too large to fill, `fill_inside_out` for the
+/// loops whose fill would have closed the scan inside out (see `mesh.clean`): a larger fill limit does not
+/// help those, so `scan_defects` (and its offer of `mesh.fill_holes`) counts only the others.
+pub(super) fn defects_issue(left: usize, inward: usize) -> Vec<Issue> {
+    let inward = inward.min(left);
+    let mut list = Vec::new();
+    if left > inward {
+        list.push(issue("scan_defects", format!("{} holes of the scan were too large to fill", left - inward)));
+    }
+    if inward > 0 {
+        let msg = format!(
+            "{inward} boundary loops of the scan were not filled: {FILL_INSIDE_OUT_WHY}. What to do: {FILL_INSIDE_OUT_ADVICE}"
+        );
+        list.push(issue("fill_inside_out", msg));
+    }
+    list
+}
+
 fn issue(code: &str, message: String) -> Issue {
     Issue { code: code.to_string(), message }
 }
@@ -364,12 +387,13 @@ fn prepare(s: &mut Session, i: &ToSolidIn, scan: ObjectId) -> CmdResult<ScanSumm
     if let Some(f) = qa.findings.iter().find(|f| BLOCKING_FINDINGS.contains(&f.code.as_str())) {
         return Err(CmdError::Failed(format!("the scan cannot be modelled: {}", f.message)));
     }
-    let (mut filled, mut left, mut non_manifold) = (0, qa.holes, qa.non_manifold_edges);
+    let (mut filled, mut left, mut inward, mut non_manifold) = (0, qa.holes, 0, qa.non_manifold_edges);
     if i.clean && !i.reuse_regions {
         let fill = i.fill_holes_max_edges.unwrap_or(FILL_HOLES_MAX_EDGES);
         let edit = parts::clean_keeping_small_parts(s, scan, i.tolerance.unwrap_or(TOLERANCE), fill)?;
         filled = edit.holes_filled.unwrap_or(0);
         left = edit.holes_left.unwrap_or(0);
+        inward = edit.holes_inward.unwrap_or(0);
         if non_manifold > 0 {
             // cleaning removes debris and spikes, which is where most such edges are
             non_manifold = scan_qa(s, QaIn { object: ObjRef::Id(scan.0) })?.non_manifold_edges;
@@ -382,6 +406,7 @@ fn prepare(s: &mut Session, i: &ToSolidIn, scan: ObjectId) -> CmdResult<ScanSumm
         holes_before: qa.holes,
         holes_filled: filled,
         holes_left: left,
+        holes_inward: inward,
         non_manifold_edges: non_manifold,
         noise_sigma: noise,
         noise_used: None,
@@ -514,6 +539,7 @@ fn primitives_solid(s: &mut Session, i: &ToSolidIn, set: &Settings, scan_report:
         left_out: left,
         unassigned,
         holes_left: scan_report.holes_left,
+        holes_inward: scan_report.holes_inward,
         non_manifold: scan_report.non_manifold_edges,
     };
     build(s, set, &mut o)?;
@@ -604,6 +630,30 @@ mod coverage_tests {
         assert_eq!(code(0.05, 0.95), "scan_inside_out");
         assert_eq!(code(0.10, 0.90), "scan_inside_out");
         assert_eq!(code(0.20, 0.80), "inconsistent_orientation");
+    }
+
+    fn defect_codes(left: usize, inward: usize) -> Vec<String> {
+        defects_issue(left, inward).into_iter().map(|i| i.code).collect()
+    }
+
+    #[test]
+    fn holes_left_open_are_scan_defects_unless_their_fill_would_close_the_scan_inside_out() {
+        assert!(defect_codes(0, 0).is_empty());
+        assert_eq!(defect_codes(3, 0), ["scan_defects"]);
+        assert_eq!(defect_codes(1, 1), ["fill_inside_out"]);
+        assert_eq!(defect_codes(4, 1), ["scan_defects", "fill_inside_out"]);
+        let both = defects_issue(4, 1);
+        assert!(both[0].message.starts_with("3 holes"), "{}", both[0].message);
+        assert!(both[1].message.starts_with("1 boundary loops") && both[1].message.contains("allow_inward"));
+    }
+
+    #[test]
+    fn more_inward_loops_than_holes_left_count_as_the_holes_left() {
+        // a report can never have more inward loops than holes left; if it did, nothing is invented
+        let list = defects_issue(2, 5);
+        assert_eq!(list.iter().map(|i| i.code.as_str()).collect::<Vec<_>>(), ["fill_inside_out"]);
+        assert!(list[0].message.starts_with("2 boundary loops"), "{}", list[0].message);
+        assert!(defects_issue(0, 5).is_empty());
     }
 
     #[test]
