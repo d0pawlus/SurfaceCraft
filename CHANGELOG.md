@@ -11,17 +11,115 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-15
+
+Two days and ten merged feature and fix pull requests after 0.2.0. The release is about harder real
+scans: several scans of one part are brought into one pose without picked points, `scan.to_solid`
+can put analytic faces into a freeform wrap, an n-sided opening gets one smooth trimmed patch, and
+scans with small handles, self-crossing folds or thin shells get through to a solid more often.
+
+### Highlights
+
+- **Several scans, one pose.** `align.pair_coarse` aligns two overlapping scans and `align.global`
+  2 to 24 scans of one part, with no picked points and a verdict that says when the pose is not
+  unique (#108, #116, #117).
+- **Hybrid solids from one call.** `scan.to_solid` with `method: hybrid` replaces the patches that
+  lie on a plane, cylinder, cone or sphere by one analytic face each, inside the freeform wrap (#112).
+- **One patch over an n-sided loop.** `surface.patch` fits a single trimmed patch with G0, G1 or G2
+  per side against the neighbouring faces (#114).
+- **Scan repair.** `mesh.close_handles` closes small tunnels and bridges, `mesh.clean` can remove
+  self-crossing folds, and thickened shells no longer cross themselves (#107, #115, #120).
+
 ### Added
+
+#### Alignment
+
+- `align.pair_coarse`: brings a scan onto an overlapping scan or body without picked points, then
+  refines with ICP. It returns the motion, the overlap of both scans, the residual, a verdict
+  (`unique`, `ambiguous` with the near-tied `alternatives`, `no_match`) and a confidence. It
+  proposes by default; `apply: true` moves the scan as one undo step only for a `unique` pose, an
+  ambiguous one needs `choose` (#108).
+- `align.global`: 2 to 24 scans of one part into one common pose. Pairs are solved by
+  `align.pair_coarse`, pairs that disagree with the rest are rejected, and all poses are relaxed
+  together. The report gives the pose of every scan, the loop closure error before and after, and a
+  verdict (`aligned`, `partial`, `failed`); scans that cannot be connected are listed and never
+  moved (#116).
+
+#### Scan to solid
+
+- `method: hybrid` of `scan.to_solid`: each group of patches that lies on a protected primitive
+  region (plane, cylinder, cone, sphere) becomes one analytic face that shares its boundary edges
+  with the neighbouring patches. A group that cannot be merged safely stays patches, with the reason
+  in `left_as_patches`; the merged body replaces the wrap only when it is not worse
+  (`hybrid_merge_rejected`, `hybrid_snap_skipped`) (#112).
+- Option `close_handles` (with `handle_size`): wraps a copy of the scan with its small handles
+  closed, measures the solid against the scan as it was and raises `scan_handles_closed` (#120).
+- With `thickness`, self-crossing folds are removed after the holes are filled; the report
+  `thickened.folds` lists what was removed and what was left (#115).
+
+#### Scan preparation and mesh editing
 
 - `mesh.close_handles`: closes the small handles of a scan (tunnels, bridges and the sponge of tiny
   tunnels where the two sides of a thin wall run together) as a new mesh, keeping the rim and every
-  vertex away from them; `scan.to_solid` takes it as the option `close_handles` (with `handle_size`),
-  wraps the repaired copy, measures the solid against the scan as it was and raises
-  `scan_handles_closed` (#120).
-- `surface.wrap` option `coarse_start`: a first coarse mesh too big for `max_patches` is made coarser
-  and the adaptive rounds spend the rest of the limit where the patches miss; `scan.to_solid` with
-  `close_handles` uses it. `mesh.close_handles` takes candidates refused for splitting the surface
-  back one by one.
+  vertex away from them. Candidates refused because cutting all of them at once would split the
+  surface are taken back one by one (#120, #122).
+- `mesh.clean` option `remove_folds` (off by default): removes small groups of triangles that face
+  against the surface around them and pass through it, and fills the hole smoothly. Thin ribs, fins
+  and sharp edges are left; a fold that cannot be filled is put back and reported (#115).
+
+#### Surfaces
+
+- `surface.patch`: one trimmed bicubic patch over a closed n-sided loop, with G0, G1 or G2 per side
+  against a neighbouring face, optional interior points and curves, and scan data. It returns a
+  sheet (#114).
+- `surface.from_curves` option `ngon: split | patch`: `patch` covers a region of more than four
+  sides with one trimmed patch instead of splitting it into quads. `split` stays the default (#114).
+- `surface.wrap` option `coarse_start`: a first coarse mesh too big for `max_patches` is made
+  coarser and the adaptive rounds spend the rest of the limit where the patches miss.
+  `scan.to_solid` with `close_handles` uses it (#122).
+
+### Changed
+
+- `align.pair_coarse` answers `ambiguous` instead of `unique` when either scan contradicts the pose
+  (surface of one scan in front of the other); the result carries `conflict_moving` and
+  `conflict_fixed` (#117).
+- `mesh.thicken` and `scan.to_solid` with `thickness` bound the offset by the local feature size and
+  report `self_intersections_local`, `self_intersections` and `limited_vertices`. Only crossings
+  between parts of the scan that are far apart along the surface raise `self_intersection` (#107).
+- Point-cloud reconstruction rounds coordinates to a fine power-of-two lattice (about 1e-9 of the
+  extent) first, so the result no longer depends on the unit the file was saved in or on the
+  platform (#110).
+
+### Performance
+
+- `body.compare` and the verdict step of `scan.to_solid` tessellate the body straight into the
+  display mesh and build the search tree on it: a third of the memory per triangle on networks of
+  10 000 to 60 000 patches (#104).
+- STEP re-import of a large open sheet written by SurfaceCraft is built from the topology the file
+  states instead of being stitched by geometry, which was quadratic in the number of faces (#104).
+
+### Fixed
+
+- `align.pair_coarse` no longer returns a wrong pose as `unique` (28 of 219 synthetic pairs before,
+  none after) (#117).
+- Thickened shells no longer have crossings between neighbouring offset triangles, between the two
+  sheets of a narrow bead or along the rim strip; what cannot be resolved is counted in
+  `unresolved_vertices` instead of being returned as a crossing shell (#107).
+- Importing or reconstructing a point cloud saved in metres or inches gives the same mesh as the
+  same cloud in millimetres (#110).
+
+### Known limitations
+
+- Builds are not code-signed. Windows SmartScreen and macOS Gatekeeper warn on first start; check
+  downloads against `SHA256SUMS.txt`.
+- macOS builds are for Apple silicon only.
+- `method: hybrid` does not merge torus regions, sphere caps of 90 degrees or more, or bores in an
+  open sheet, and takes 4 to 6 times as long as the freeform call.
+- `surface.patch` and `ngon: patch` return sheets; no command yet sews trimmed patches into a solid.
+- A scan with `close_handles` gets `review` at best, because the solid is built from a repaired copy.
+- `mesh.merge` (several aligned scans into one mesh) is not in this release.
+- On real scans `scan.to_solid` often answers `review` rather than `pass`. The verdict lists the
+  reason and the next step.
 
 ## [0.2.0] - 2026-11-13
 
@@ -267,5 +365,6 @@ fitting and freeform patch networks, sketches with a constraint solver, a parame
 history, hybrid solids from primitives and freeform patches, STEP and IGES export, the desktop and
 web applications, the CLI, and the MCP server.
 
+[0.3.0]: https://github.com/d0pawlus/SurfaceCraft/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/d0pawlus/SurfaceCraft/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/d0pawlus/SurfaceCraft/releases/tag/v0.1.0
