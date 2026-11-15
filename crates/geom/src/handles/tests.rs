@@ -45,7 +45,7 @@ fn a_wall_with_hundreds_of_small_tunnels_loses_them_and_keeps_its_rim_and_its_sm
     let rep = close_handles(&mut m, &params(8.0), &Cancel::new()).unwrap();
 
     // Assert
-    let within = rep.removed_within as f64 / rep.removed_vertices.max(1) as f64;
+    let within = rep.removed_within as f64 / rep.removed_samples.max(1) as f64;
     eprintln!(
         "tunnels {tunnels}: genus {:?} -> {:?}, closed {} in {} parts, refused {:?}, area cut out {:.3}, removed within 0.2 mm {within:.3} (max {:.3})",
         rep.genus_before,
@@ -202,4 +202,126 @@ fn a_million_triangles() {
         t0.elapsed().as_secs_f64()
     );
     assert_eq!(rep.genus_after, Some(0));
+}
+
+fn single_tunnel() -> Mesh {
+    wall(&Wall { size: 20.0, cells: 20, gap: 0.6, bend: 0.0, tubes: vec![(10, 10, 1)] })
+}
+
+/// A bore of 2 x 2 mm through a wall 8 mm thick, whose walls are long triangles without a vertex inside:
+/// the cut-out wall is not covered by the caps, so it is refused (it would have read as 0 by vertices).
+#[test]
+fn a_deep_bore_through_a_thick_wall_is_not_capped() {
+    let mut m = wall(&Wall { size: 30.0, cells: 30, gap: 8.0, bend: 0.0, tubes: vec![(13, 13, 2)] });
+    let before = m.clone();
+    let rep = close_handles(&mut m, &params(14.0), &Cancel::new()).unwrap();
+    eprintln!("{:?} closed {} {:?} far {}", rep.refused, rep.handles_closed, rep.closed, rep.removed_max_distance);
+    assert_eq!(rep.handles_closed, 0);
+    assert!(rep.refused.uncovered + rep.refused.fill_far > 0, "{:?}", rep.refused);
+    assert_eq!(m.triangles, before.triangles);
+}
+
+/// Two sheets joined only by tunnels: the last tunnel holds them together and is never cut.
+#[test]
+fn the_surface_is_never_cut_in_two() {
+    let mut m = wall(&Wall { size: 30.0, cells: 30, gap: 0.6, bend: 0.0, tubes: vec![(8, 8, 1), (20, 20, 1)] });
+    let positions = m.positions.clone();
+    m.triangles.retain(|t| !t.iter().all(|&v| positions[v as usize].x == 0.0));
+    assert_eq!(pieces::pieces(&m)[0].genus(), Some(1));
+    let rep = close_handles(&mut m, &params(8.0), &Cancel::new()).unwrap();
+    assert_eq!(pieces::pieces(&m).len(), 1, "{:?}", rep.refused);
+    assert!(rep.handles_closed <= 1);
+    assert!(rep.refused.splits > 0 || rep.handles_closed == 1);
+}
+
+/// A small closed torus that a ball covers whole: cutting it would delete it, so every candidate is
+/// refused explicitly and the mesh comes back bit for bit.
+#[test]
+fn a_whole_closed_piece_with_genus_is_refused_not_emptied() {
+    let mut torus = synth::torus(Point3::origin(), crate::Vec3::z(), 1.5, 0.5, 60, 20);
+    // a large sheet far away, so that the balls may be as wide as the torus
+    torus.append(&synth::wave(Point3::new(20.0, 0.0, 0.0), 40.0, 30.0, 1.0, 40, 30));
+    let mut m = torus.clone();
+    let rep = close_handles(&mut m, &params(50.0), &Cancel::new()).unwrap();
+    assert!(rep.refused.whole_pieces > 0, "{rep:?}");
+    assert!(!rep.changed);
+    assert_eq!((m.positions, m.triangles), (torus.positions, torus.triangles));
+}
+
+#[test]
+fn a_piece_that_vanishes_whole_is_a_loose_piece() {
+    let mut both = synth::sphere(Point3::origin(), 1.0, 12, 6);
+    let far = synth::sphere(Point3::new(5.0, 0.0, 0.0), 1.0, 12, 6);
+    let n = both.triangles.len();
+    both.append(&far);
+    let mut out = both.clone();
+    out.triangles.truncate(n);
+    let verts: Vec<u32> = (both.positions.len() as u32 / 2..both.positions.len() as u32).collect();
+    let tris: Vec<u32> = (n as u32..both.triangles.len() as u32).collect();
+    let c = cells::Candidate { triangles: tris, vertices: verts, genus: 1, loops: vec![0] };
+    assert_eq!(cut::loosened(&both, &out, &[c], &[false]), vec![0]);
+}
+
+#[test]
+fn a_fill_far_from_what_it_replaced_is_refused() {
+    let m = single_tunnel();
+    let topo = Topo::new(&m);
+    let (found, _) = cells::candidates(&m, &topo, 6.0, 0);
+    let cands = cells::pick(&topo, found, m.positions.len());
+    assert!(!cands.is_empty());
+    let tight = cut::Bounds { tolerance: 1e-9, far_limit: 10.0 };
+    let a = cut::attempt(&m, &cands, &vec![false; cands.len()], tight, &Cancel::new()).unwrap();
+    assert!(a.failed.iter().any(|f| f.1 == Refusal::FillFar), "{:?}", a.failed);
+    let fair = cut::Bounds { tolerance: 0.2, far_limit: 1.5 };
+    let a = cut::attempt(&m, &cands, &vec![false; cands.len()], fair, &Cancel::new()).unwrap();
+    assert!(a.failed.is_empty(), "{:?}", a.failed);
+    let cancel = Cancel::new();
+    cancel.cancel();
+    assert!(cut::attempt(&m, &cands, &vec![false; cands.len()], fair, &cancel).is_none());
+}
+
+#[test]
+fn a_hole_that_stays_open_is_unfillable() {
+    let mut m = synth::sphere(Point3::origin(), 1.0, 12, 6);
+    let t = m.triangles.remove(20);
+    let mut owner = vec![u32::MAX; m.positions.len()];
+    for v in t {
+        owner[v as usize] = 0;
+    }
+    assert!(cut::unfilled(&m, &owner).contains(&(0, Refusal::Unfillable)));
+}
+
+#[test]
+fn a_failed_candidate_grows_by_a_ring_and_keeps_its_handle() {
+    let m = single_tunnel();
+    let topo = Topo::new(&m);
+    let (found, _) = cells::candidates(&m, &topo, 6.0, 0);
+    let c = cells::pick(&topo, found, m.positions.len()).remove(0);
+    let g = cells::grow(&m, &topo, &c).unwrap();
+    assert!(g.triangles.len() > c.triangles.len());
+    assert!(c.triangles.iter().all(|t| g.triangles.binary_search(t).is_ok()));
+    assert_eq!(g.handles(), c.handles());
+}
+
+/// One vertex with 50 000 triangles around it: the fans are counted at once (a quadratic count would hang).
+#[test]
+fn fans_of_a_vertex_of_huge_valence_are_counted() {
+    let k = 50_000u32;
+    let mut positions = vec![Point3::origin()];
+    for i in 0..k {
+        let a = std::f64::consts::TAU * f64::from(i) / f64::from(k);
+        positions.push(Point3::new(a.cos(), a.sin(), 0.0));
+    }
+    let mut triangles: Vec<[u32; 3]> = (0..k).map(|i| [0, 1 + i, 1 + (i + 1) % k]).collect();
+    let fans = cut::Fans::new(&Mesh { positions: positions.clone(), triangles: triangles.clone() });
+    assert_eq!(fans.count(&Mesh { positions: positions.clone(), triangles: triangles.clone() }, 0), 1);
+    // a second disk on the same centre vertex: two fans
+    let base = positions.len() as u32;
+    for i in 0..8u32 {
+        let a = std::f64::consts::TAU * f64::from(i) / 8.0;
+        positions.push(Point3::new(a.cos(), 0.0, a.sin() + 3.0));
+    }
+    triangles.extend((0..8).map(|i| [0, base + i, base + (i + 1) % 8]));
+    let m = Mesh { positions, triangles };
+    assert_eq!(cut::Fans::new(&m).count(&m, 0), 2);
 }

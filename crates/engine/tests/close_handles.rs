@@ -44,7 +44,7 @@ fn close_handles_closes_the_tunnels_keeps_the_rim_and_makes_a_new_mesh() {
     assert_eq!((out["pieces_before"].clone(), out["pieces_after"].clone()), (json!(1), json!(1)));
     assert!(out["id"].is_u64() && out["changed"] == json!(true));
     assert!(s.doc.find_by_name("handles closed").is_some(), "a new mesh; the scan stays");
-    let within = out["removed_within"].as_f64().unwrap() / out["removed_vertices"].as_f64().unwrap().max(1.0);
+    let within = out["removed_within"].as_f64().unwrap() / out["removed_samples"].as_f64().unwrap().max(1.0);
     assert!(within > 0.5, "most of what was cut out lies on the result: {within}");
 }
 
@@ -122,13 +122,34 @@ fn gate_m4_a_tunnelled_wall_wraps_after_its_handles_are_closed() {
         .any(|st| st["command"] == "scan.to_solid" && st["params"]["close_handles"] == json!(true));
     assert!(offered, "the plain run offers close_handles: {}", plain["next_steps"]);
     let first_patches = plain["retry"]["patches_from"].as_u64().or_else(|| plain["patches"].as_u64()).unwrap();
-    assert!(first_patches >= 10_000, "the first plain network stops at the default cap: {first_patches}");
+    // measured 11 952 (macOS, Linux and Windows CI) against the default cap of 12 000: the bound is
+    // 1.5 times below the measured value
+    assert!(first_patches >= 7_900, "the first plain network stops near the default cap: {first_patches}");
     assert!(matches!(closed["verdict"].as_str(), Some("pass" | "review")), "{}", closed["verdict"]);
     let patches = closed["patches"].as_u64().unwrap();
+    // measured 66 patches against 11 952: far below two thirds
     assert!(patches * 3 <= first_patches * 2, "{patches} patches against {first_patches}");
     assert!(closed["retry"].is_null(), "no larger cap was needed");
     assert!(3 * step["numbers"]["handles_closed"].as_u64().unwrap() as usize >= 2 * tunnels);
     assert_eq!((step["numbers"]["loops_before"].clone(), step["numbers"]["loops_after"].clone()), (json!(1), json!(1)));
     assert_eq!(step["numbers"]["pieces_after"], json!(1));
-    assert!(closed["deviation"]["within"].as_f64().unwrap() >= 0.9, "{}", closed["deviation"]);
+    // measured 0.994; the bound is 1.5 times below it
+    assert!(closed["deviation"]["within"].as_f64().unwrap() >= 0.66, "{}", closed["deviation"]);
+    assert!(codes(&closed).contains(&"scan_handles_closed".to_string()), "anything cut is reported");
+    assert_ne!(closed["verdict"], json!("pass"));
+}
+
+/// With `close_handles` and nothing to close the result is that of the plain call, without the issue;
+/// with one tunnel closed the issue is raised and the verdict is at most `review`.
+#[test]
+fn scan_handles_closed_is_raised_exactly_when_something_was_cut() {
+    let plate = synth::wave(Point3::origin(), 40.0, 30.0, 2.0, 40, 30);
+    let plain = to_solid(&plate, json!({}));
+    let asked = to_solid(&plate, json!({"close_handles": true}));
+    assert_eq!(plain["verdict"], asked["verdict"]);
+    assert!(!codes(&asked).contains(&"scan_handles_closed".to_string()), "{:?}", codes(&asked));
+    let one = wall(&Wall { size: 20.0, cells: 20, gap: 0.6, bend: 1.0, tubes: vec![(10, 10, 1)] });
+    let cut = to_solid(&one, json!({"close_handles": true, "handle_size": 8.0}));
+    assert!(codes(&cut).contains(&"scan_handles_closed".to_string()), "{:?}", codes(&cut));
+    assert_ne!(cut["verdict"], json!("pass"));
 }

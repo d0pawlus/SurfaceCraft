@@ -11,12 +11,15 @@
 //! of a ball that is not a disk (genus above zero, or several boundary loops that are joined
 //! outside it) is cut out and each of its loops filled with the smooth hole fill. Each such part
 //! closes `genus + loops - 1` handles. Nothing else moves: vertices outside the cut parts keep
-//! their positions, the rim of an open mesh is never touched (a part that reaches the rim or an
-//! edge of three or more triangles is left), a part is cut only when at most a quarter of its fill
-//! lies farther than `tolerance` from the surface it replaces (the mouth of a tunnel had no
-//! surface), and a mesh where nothing is cut is returned unchanged, bit for bit. The size is a
-//! property of the neighbourhood, not of the hole: a real hole through a thin wall narrower than
-//! `max_size` is a tunnel and is closed too, a wider one is kept.
+//! their positions and the rim of an open mesh is never touched (a part that reaches the rim, an
+//! edge of three or more triangles or a pinched vertex is left). A part is refused when cutting it
+//! would split the surface or leave a piece loose, when it is a whole closed piece, when a hole stays
+//! open, when more than a quarter of one patch of its fill lies farther than `tolerance` from what
+//! it replaced (a cap over the mouth of a real opening), or when what it removed is not covered by
+//! the result: more than a quarter of the points sampled over its triangles farther than
+//! `tolerance`, or any farther than a quarter of the ball. A mesh where nothing is cut is returned
+//! unchanged, bit for bit. The size is a property of the neighbourhood, not of the hole: a real hole
+//! through a thin wall narrower than `max_size` is a tunnel and is closed too, a wider one is kept.
 mod cells;
 mod cut;
 
@@ -42,7 +45,8 @@ const PASSES: usize = 6;
 /// Settings of [`close_handles`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Params {
-    /// Handles in patches of the surface at most this wide (mm) are closed.
+    /// Handles in patches of the surface at most this wide (mm) are looked for (at most the diagonal of
+    /// the mesh).
     pub max_size: f64,
     /// A fill of which more than a quarter lies farther than this (mm) from the surface it replaces is
     /// refused; removed vertices are measured against the result with it.
@@ -93,8 +97,11 @@ pub struct Refused {
     /// More than a quarter of the fill lay farther than the tolerance from what it replaced.
     pub fill_far: usize,
     /// More than a quarter of what was cut out lay farther than the tolerance from the result (the fill
-    /// did not cover it), or the fill left a pinched vertex.
+    /// did not cover it), a point of it lay farther than a quarter of the ball, or the fill left a
+    /// pinched vertex.
     pub uncovered: usize,
+    /// Whole closed pieces with genus that fit in a ball: cutting one out would delete the piece.
+    pub whole_pieces: usize,
 }
 
 /// What [`close_handles`] did.
@@ -122,19 +129,21 @@ pub struct Report {
     pub closed: Vec<Closed>,
     /// Candidates left.
     pub refused: Refused,
-    /// Triangles cut out.
+    /// Triangles of the mesh given that were cut out.
     pub removed_triangles: usize,
-    /// Area cut out (mm²) and its share of the area of the mesh.
+    /// Area of the mesh given that was cut out (mm²).
     pub removed_area: f64,
     /// Share of the area cut out.
     pub removed_area_share: f64,
     /// Triangles the fills added.
     pub added_triangles: usize,
-    /// Vertices of the mesh that were cut out.
-    pub removed_vertices: usize,
+    /// Points sampled over the triangles of the mesh given that were cut out (corners, edge midpoints,
+    /// centres and a lattice of steps of at most two tolerances): the walls of a tunnel count even when
+    /// they are long triangles without a vertex inside.
+    pub removed_samples: usize,
     /// Of them, within `tolerance` of the result.
     pub removed_within: usize,
-    /// Largest distance of a removed vertex from the result (mm).
+    /// Largest distance of such a point from the result (mm).
     pub removed_max_distance: f64,
     /// Did the mesh change?
     pub changed: bool,
@@ -179,11 +188,22 @@ fn scales(h: f64, max_size: f64) -> Vec<f64> {
     out
 }
 
-/// Genus (when every piece has one), boundary loops and pieces.
-fn topology(mesh: &Mesh) -> (Option<usize>, usize, usize) {
+/// Genus (when every piece has one), boundary loops, pieces, and the handles from the Euler
+/// characteristic of every piece (what is left to close, also on a mesh with pinches).
+fn topology(mesh: &Mesh) -> (Option<usize>, usize, usize, i64) {
     let ps = pieces::pieces(mesh);
     let genus = ps.iter().map(pieces::Piece::genus).sum::<Option<usize>>();
-    (genus, ps.iter().map(|p| p.loops.len()).sum(), ps.len())
+    let estimate = ps.iter().map(|p| (2 - p.euler - p.loops.len() as i64).max(0) / 2).sum();
+    (genus, ps.iter().map(|p| p.loops.len()).sum(), ps.len(), estimate)
+}
+
+/// The mesh as the passes change it.
+struct Work {
+    mesh: Mesh,
+    /// Per triangle: it is a triangle of the mesh given (not a fill).
+    origin: Vec<bool>,
+    /// Points sampled over the triangles of the mesh given that were cut out.
+    removed: Vec<Point3>,
 }
 
 /// Closes the handles of `mesh` that lie in patches at most `max_size` wide (see the module). The
@@ -191,11 +211,13 @@ fn topology(mesh: &Mesh) -> (Option<usize>, usize, usize) {
 pub fn close_handles(mesh: &mut Mesh, p: &Params, cancel: &Cancel) -> Result<Report, HandleError> {
     check(p)?;
     mesh.validate().map_err(|e| HandleError::Invalid(e.to_string()))?;
-    let (genus_before, loops_before, pieces_before) = topology(mesh);
+    let (genus_before, loops_before, pieces_before, estimate) = topology(mesh);
     let h = median_edge(mesh);
+    // no neighbourhood is wider than the mesh
+    let max_size = p.max_size.min(mesh.bbox().diagonal().max(f64::MIN_POSITIVE));
     let mut rep = Report {
         median_edge: h,
-        scales: scales(h, p.max_size),
+        scales: scales(h, max_size),
         genus_before,
         genus_after: genus_before,
         loops_before,
@@ -204,24 +226,15 @@ pub fn close_handles(mesh: &mut Mesh, p: &Params, cancel: &Cancel) -> Result<Rep
         pieces_after: pieces_before,
         ..Report::default()
     };
-    if genus_before == Some(0) || rep.scales.is_empty() {
+    if genus_before == Some(0) || estimate == 0 || rep.scales.is_empty() {
         return Ok(rep);
     }
-    let mut work = mesh.clone();
+    let mut work = Work { mesh: mesh.clone(), origin: vec![true; mesh.triangles.len()], removed: Vec::new() };
     for scale in rep.scales.clone() {
-        let mut idle = 0;
-        for k in 0..PASSES {
-            if cancel.is_cancelled() {
-                return Err(HandleError::Cancelled);
-            }
-            let first = k * work.positions.len() / PASSES;
-            let (next, cut) = pass(work, (scale, first), p.tolerance, &mut rep);
-            work = next;
-            idle = if cut { 0 } else { idle + 1 };
-            if idle >= 2 {
-                break;
-            }
+        if rep.handles_closed as i64 >= estimate {
+            break;
         }
+        work = scale_passes(work, scale, p.tolerance, &mut rep, cancel)?;
     }
     if rep.closed.is_empty() {
         return Ok(rep);
@@ -230,60 +243,122 @@ pub fn close_handles(mesh: &mut Mesh, p: &Params, cancel: &Cancel) -> Result<Rep
     Ok(rep)
 }
 
+/// The passes at one scale, until two in a row cut nothing or no handle is left.
+fn scale_passes(
+    mut work: Work,
+    scale: f64,
+    tolerance: f64,
+    rep: &mut Report,
+    cancel: &Cancel,
+) -> Result<Work, HandleError> {
+    let mut idle = 0;
+    for k in 0..PASSES {
+        if cancel.is_cancelled() {
+            return Err(HandleError::Cancelled);
+        }
+        let first = k * work.mesh.positions.len() / PASSES;
+        let bounds = cut::Bounds { tolerance, far_limit: (0.25 * scale).max(tolerance) };
+        let (next, cut) = pass(work, (scale, first), bounds, rep, cancel)?;
+        work = next;
+        idle = if cut { 0 } else { idle + 1 };
+        if idle >= 2 {
+            break;
+        }
+    }
+    Ok(work)
+}
+
 /// One pass at one scale: the candidates that are apart, cut and filled. A candidate that fails is
 /// grown by a ring (up to [`MAX_GROWTH`] times: its ball may have cut a tunnel in two) or left out, and
 /// the rest is cut again. Returns the mesh as it is after the pass and whether anything was cut.
-fn pass(work: Mesh, (scale, first): (f64, usize), bound: f64, rep: &mut Report) -> (Mesh, bool) {
-    let topo = Topo::new(&work);
-    let mut cands = cells::pick(&topo, cells::candidates(&work, &topo, scale, first), work.positions.len());
-    if cands.is_empty() {
-        return (work, false);
-    }
+fn pass(
+    work: Work,
+    (scale, first): (f64, usize),
+    bounds: cut::Bounds,
+    rep: &mut Report,
+    cancel: &Cancel,
+) -> Result<(Work, bool), HandleError> {
+    let topo = Topo::new(&work.mesh);
+    let (found, whole) = cells::candidates(&work.mesh, &topo, scale, first);
+    rep.refused.whole_pieces += whole.len();
+    let mut cands = cells::pick(&topo, found, work.mesh.positions.len());
     let mut skip = vec![false; cands.len()];
     let mut grown = vec![0usize; cands.len()];
-    for g in cut::splitting(&work, &cands, &skip) {
+    for g in cut::splitting(&work.mesh, &cands, &skip) {
         refuse(rep, Refusal::Loosens);
-        if let Some(s) = skip.get_mut(g) {
-            *s = true;
-        }
+        set(&mut skip, g);
     }
     for _ in 0..ATTEMPTS {
         if skip.iter().all(|&s| s) {
-            return (work, false);
+            return Ok((work, false));
         }
-        let mut a = cut::attempt(&work, &cands, &skip, bound);
+        let Some(mut a) = cut::attempt(&work.mesh, &cands, &skip, bounds, cancel) else {
+            return Err(HandleError::Cancelled);
+        };
         if a.failed.is_empty() {
             a.failed =
-                cut::loosened(&work, &a.mesh, &cands, &skip).into_iter().map(|g| (g, Refusal::Loosens)).collect();
+                cut::loosened(&work.mesh, &a.mesh, &cands, &skip).into_iter().map(|g| (g, Refusal::Loosens)).collect();
         }
         if a.failed.is_empty() {
             record(&work, &cands, &skip, &a, scale, rep);
-            return (a.mesh, true);
+            return Ok((accepted(work, a, bounds.tolerance), true));
         }
-        let live: Vec<bool> = skip.iter().map(|s| !s).collect();
-        let owner = cells::claims(&topo, &cands, &live, work.positions.len());
-        for &(g, why) in &a.failed {
-            let bigger = (why != Refusal::Loosens && grown.get(g).is_some_and(|&n| n < MAX_GROWTH))
-                .then(|| cands.get(g).and_then(|c| cells::grow(&work, &topo, c)))
-                .flatten()
-                .filter(|c| {
-                    c.vertices.iter().all(|&v| owner.get(v as usize).is_some_and(|&o| o == u32::MAX || o == g as u32))
-                });
-            match (bigger, cands.get_mut(g), grown.get_mut(g)) {
-                (Some(c), Some(slot), Some(n)) => {
-                    *slot = c;
-                    *n += 1;
-                }
-                _ => {
-                    refuse(rep, why);
-                    if let Some(s) = skip.get_mut(g) {
-                        *s = true;
-                    }
-                }
+        retry_or_skip(&work.mesh, &topo, (&mut cands, &mut skip, &mut grown), &a.failed, rep);
+    }
+    Ok((work, false))
+}
+
+fn set(flags: &mut [bool], g: usize) {
+    if let Some(s) = flags.get_mut(g) {
+        *s = true;
+    }
+}
+
+/// Each failed candidate is grown by a ring when it may grow and stays apart from the others, else it
+/// is left out and its refusal counted.
+fn retry_or_skip(
+    mesh: &Mesh,
+    topo: &Topo,
+    (cands, skip, grown): (&mut [Candidate], &mut [bool], &mut [usize]),
+    failed: &[(usize, Refusal)],
+    rep: &mut Report,
+) {
+    let live: Vec<bool> = skip.iter().map(|s| !s).collect();
+    let owner = cells::claims(topo, cands, &live, mesh.positions.len());
+    for &(g, why) in failed {
+        let bigger = (why != Refusal::Loosens && grown.get(g).is_some_and(|&n| n < MAX_GROWTH))
+            .then(|| cands.get(g).and_then(|c| cells::grow(mesh, topo, c)))
+            .flatten()
+            .filter(|c| {
+                c.vertices.iter().all(|&v| owner.get(v as usize).is_some_and(|&o| o == u32::MAX || o == g as u32))
+            });
+        match (bigger, cands.get_mut(g), grown.get_mut(g)) {
+            (Some(c), Some(slot), Some(n)) => {
+                *slot = c;
+                *n += 1;
+            }
+            _ => {
+                refuse(rep, why);
+                set(skip, g);
             }
         }
     }
-    (work, false)
+}
+
+/// The mesh of an accepted attempt, with the origin of its triangles and the points sampled over the
+/// triangles of the mesh given that it cut out.
+fn accepted(work: Work, a: cut::Attempt, tolerance: f64) -> Work {
+    let mut removed = work.removed;
+    let mut origin = Vec::with_capacity(a.mesh.triangles.len());
+    for (t, (&dead, &orig)) in a.dead.iter().zip(&work.origin).enumerate() {
+        if !dead {
+            origin.push(orig);
+        } else if orig && let Some(tri) = work.mesh.triangle(t) {
+            removed.extend(cut::samples(tri, 2.0 * tolerance));
+        }
+    }
+    origin.resize(a.mesh.triangles.len(), false);
+    Work { mesh: a.mesh, origin, removed }
 }
 
 fn refuse(rep: &mut Report, why: Refusal) {
@@ -295,66 +370,55 @@ fn refuse(rep: &mut Report, why: Refusal) {
     }
 }
 
-/// Adds the parts cut in an accepted attempt to the report.
-fn record(work: &Mesh, cands: &[Candidate], skip: &[bool], a: &cut::Attempt, scale: f64, rep: &mut Report) {
+/// Adds the parts cut in an accepted attempt to the report; only triangles of the mesh given count as
+/// cut out (fills of earlier passes do not).
+fn record(work: &Work, cands: &[Candidate], skip: &[bool], a: &cut::Attempt, scale: f64, rep: &mut Report) {
+    let m = &work.mesh;
     for (g, c) in cands.iter().enumerate().filter(|(g, _)| !skip.get(*g).copied().unwrap_or(true)) {
-        let area: f64 = c.triangles.iter().map(|&t| work.face_area(t as usize)).sum();
+        let own: Vec<u32> =
+            c.triangles.iter().copied().filter(|&t| work.origin.get(t as usize).copied().unwrap_or(false)).collect();
+        let area: f64 = own.iter().map(|&t| m.face_area(t as usize)).sum();
         let n = c.triangles.len().max(1) as f64;
         let sum = c
             .triangles
             .iter()
-            .filter_map(|&t| work.face_centroid(t as usize))
+            .filter_map(|&t| m.face_centroid(t as usize))
             .fold(Point3::origin().coords, |s, q| s + q.coords);
         rep.closed.push(Closed {
             scale,
             handles: c.handles(),
             loops: c.loops.len(),
-            triangles: c.triangles.len(),
+            triangles: own.len(),
             area,
             centre: Point3::from(sum / n),
             fill_distance: a.fill_distance.get(g).copied().unwrap_or(0.0),
         });
         rep.handles_closed += c.handles();
-        rep.removed_triangles += c.triangles.len();
+        rep.removed_triangles += own.len();
         rep.removed_area += area;
     }
     rep.added_triangles += a.added;
 }
 
-/// Measures the vertices that were cut out against the result, drops them, and puts the result in place.
-fn finish(mesh: &mut Mesh, mut work: Mesh, tolerance: f64, rep: &mut Report) {
-    let n0 = mesh.positions.len();
-    let mut used = vec![false; work.positions.len()];
-    for &v in work.triangles.iter().flatten() {
-        if let Some(u) = used.get_mut(v as usize) {
-            *u = true;
-        }
-    }
-    let mut was_used = vec![false; n0];
-    for &v in mesh.triangles.iter().flatten() {
-        if let Some(u) = was_used.get_mut(v as usize) {
-            *u = true;
-        }
-    }
-    let gone: Vec<Point3> = (0..n0)
-        .filter(|&i| was_used.get(i).copied().unwrap_or(false) && !used.get(i).copied().unwrap_or(true))
-        .filter_map(|i| mesh.positions.get(i).copied())
-        .collect();
-    let bvh = Bvh::build(&work);
+/// Measures the points sampled over what was cut out against the result, drops the unused vertices,
+/// and puts the result in place.
+fn finish(mesh: &mut Mesh, work: Work, tolerance: f64, rep: &mut Report) {
+    let mut result = work.mesh;
+    let bvh = Bvh::build(&result);
     let d: Vec<f64> =
-        par::map_slice(&gone, |q| bvh.closest(q, f64::INFINITY).map_or(f64::INFINITY, |hit| hit.distance));
-    rep.removed_vertices = gone.len();
+        par::map_slice(&work.removed, |q| bvh.closest(q, f64::INFINITY).map_or(f64::INFINITY, |hit| hit.distance));
+    rep.removed_samples = d.len();
     rep.removed_within = d.iter().filter(|&&x| x <= tolerance).count();
     rep.removed_max_distance = d.iter().copied().fold(0.0, f64::max);
     let area = mesh.area();
     rep.removed_area_share = if area > 0.0 { rep.removed_area / area } else { 0.0 };
-    edit::compact(&mut work);
-    let (genus_after, loops_after, pieces_after) = topology(&work);
+    edit::compact(&mut result);
+    let (genus_after, loops_after, pieces_after, _) = topology(&result);
     rep.genus_after = genus_after;
     rep.loops_after = loops_after;
     rep.pieces_after = pieces_after;
     rep.changed = true;
-    *mesh = work;
+    *mesh = result;
 }
 
 #[cfg(test)]

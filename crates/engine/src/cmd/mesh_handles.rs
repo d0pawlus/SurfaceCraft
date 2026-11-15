@@ -21,7 +21,7 @@ const TOLERANCE: f64 = 0.2;
 pub struct CloseHandlesIn {
     /// Scan mesh id or name (open or closed).
     pub object: ObjRef,
-    /// Handles in neighbourhoods of the surface at most this wide are closed (mm, default 12 median edges of the scan). A tunnel or bridge narrower than about half of it is always found; a real hole through a thin wall narrower than it is a tunnel too and is closed, a wider one is kept.
+    /// Handles in neighbourhoods of the surface at most this wide are closed (mm, default 12 median edges of the scan). A tunnel or bridge narrower than about half of it is looked for (a check may still refuse to close it); a real hole through a thin wall narrower than it is a tunnel too and is closed, a wider one is kept.
     #[serde(default)]
     pub max_size: Option<f64>,
     /// A fill of which more than a quarter lies farther than this from the surface it replaces is refused; what was cut out is measured against the result with it (mm, default 0.2).
@@ -50,10 +50,12 @@ pub struct HandlesRefused {
     pub splits: usize,
     /// A hole the part left could not be filled.
     pub unfillable: usize,
-    /// More than a quarter of the fill lay farther than the tolerance from the surface it replaced.
+    /// More than a quarter of a patch of the fill (one per hole) lay farther than the tolerance from the surface it replaced: a cap over the mouth of a real opening.
     pub fill_far: usize,
-    /// More than a quarter of what was cut out lay farther than the tolerance from the result, or the fill left a pinched vertex.
+    /// What was cut out is not covered by the result (more than a quarter of the points sampled over it farther than the tolerance, or one farther than a quarter of the neighbourhood), or the fill left a pinched vertex.
     pub uncovered: usize,
+    /// Whole closed pieces with genus small enough to be cut out whole: left, never deleted.
+    pub whole_pieces: usize,
 }
 
 /// Result of `mesh.close_handles`.
@@ -95,11 +97,11 @@ pub struct CloseHandlesOut {
     pub removed_area_share: f64,
     /// Triangles the fills added.
     pub added_triangles: usize,
-    /// Vertices of the scan that were cut out.
-    pub removed_vertices: usize,
+    /// Points sampled over the triangles of the scan that were cut out (corners, edge midpoints, centres and a lattice), so that a tunnel wall of long triangles counts.
+    pub removed_samples: usize,
     /// Of them, within the tolerance of the result.
     pub removed_within: usize,
-    /// Largest distance of a vertex that was cut out from the result (mm): the tunnel walls that went.
+    /// Largest distance of such a point from the result (mm): the tunnel walls that went.
     pub removed_max_distance: f64,
     /// Triangles of the result.
     pub triangles: usize,
@@ -112,15 +114,16 @@ pub(crate) fn handle_estimate(mesh: &Mesh) -> (i64, usize) {
     (handles, ps.iter().map(|p| p.loops.len()).sum())
 }
 
-/// The largest size: given, or [`DEFAULT_SIZE_EDGES`] median edges.
-pub(crate) fn size_of(given: Option<f64>, median_edge: f64) -> CmdResult<f64> {
-    let size = given.unwrap_or(DEFAULT_SIZE_EDGES * median_edge);
-    if size.is_finite() && size > 0.0 {
-        Ok(size)
-    } else if given.is_some() {
-        Err(CmdError::Params(format!("max_size must be a positive number of mm, not {size}")))
-    } else {
-        Err(CmdError::Failed("the mesh has no edges to measure".into()))
+/// The largest size: given, or [`DEFAULT_SIZE_EDGES`] median edges; `None` when it is not given and the
+/// mesh has no edge length to take it from (nothing can be closed).
+pub(crate) fn size_of(given: Option<f64>, median_edge: f64) -> CmdResult<Option<f64>> {
+    match given {
+        Some(size) if size.is_finite() && size > 0.0 => Ok(Some(size)),
+        Some(size) => Err(CmdError::Params(format!("max_size must be a positive number of mm, not {size}"))),
+        None => {
+            let size = DEFAULT_SIZE_EDGES * median_edge;
+            Ok((size.is_finite() && size > 0.0).then_some(size))
+        }
     }
 }
 
@@ -166,12 +169,13 @@ fn out_of(id: Option<ObjectId>, rep: &Report, max_size: f64, (before, after): (i
             unfillable: rep.refused.unfillable,
             fill_far: rep.refused.fill_far,
             uncovered: rep.refused.uncovered,
+            whole_pieces: rep.refused.whole_pieces,
         },
         removed_triangles: rep.removed_triangles,
         removed_area: rep.removed_area,
         removed_area_share: rep.removed_area_share,
         added_triangles: rep.added_triangles,
-        removed_vertices: rep.removed_vertices,
+        removed_samples: rep.removed_samples,
         removed_within: rep.removed_within,
         removed_max_distance: rep.removed_max_distance,
         triangles: m.triangle_count(),
@@ -186,7 +190,9 @@ pub(crate) fn close_handles_cmd(s: &mut Session, i: CloseHandlesIn) -> CmdResult
     let scan = s.doc.mesh(id).map(|m| m.mesh.clone()).ok_or_else(|| CmdError::Params(format!("no mesh {id}")))?;
     let tolerance = super::deviation::positive(i.tolerance.unwrap_or(TOLERANCE), "tolerance")?;
     let h = surfacecraft_geom::quality::edge_census(&scan).lengths.median;
-    let max_size = size_of(i.max_size, h)?;
+    let Some(max_size) = size_of(i.max_size, h)? else {
+        return Err(CmdError::Failed("the mesh has no edges to measure".into()));
+    };
     let (before, _) = handle_estimate(&scan);
     let (mesh, rep) = close(&scan, max_size, tolerance, s)?;
     let (after, _) = handle_estimate(&mesh);

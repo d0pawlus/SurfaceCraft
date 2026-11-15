@@ -16,8 +16,6 @@ use surfacecraft_geom::quality::edge_census;
 /// A scan with at least this many handles (estimated from its Euler characteristic) is offered the
 /// step when a freeform result is not a pass.
 pub(super) const HANDLE_HINT: i64 = 64;
-/// Cutting out more than this share of the area of the scan is not small: the verdict is at most `review`.
-const SMALL_AREA_SHARE: f64 = 0.002;
 
 fn median_edge(mesh: &Mesh) -> f64 {
     edge_census(mesh).lengths.median
@@ -37,30 +35,30 @@ fn prep_step(rep: &Report, size: f64, (before, after): (i64, i64), ms: u64) -> P
     let numbers = json!({
         "max_size": size, "median_edge": rep.median_edge, "handles_before": before, "handles_after": after,
         "handles_closed": rep.handles_closed, "parts": rep.closed.len(), "by_scale": by_scale(rep),
-        "refused": {"splits": rep.refused.splits, "unfillable": rep.refused.unfillable, "fill_far": rep.refused.fill_far, "uncovered": rep.refused.uncovered},
+        "refused": {"splits": rep.refused.splits, "unfillable": rep.refused.unfillable, "fill_far": rep.refused.fill_far, "uncovered": rep.refused.uncovered, "whole_pieces": rep.refused.whole_pieces},
         "loops_before": rep.loops_before, "loops_after": rep.loops_after,
         "pieces_before": rep.pieces_before, "pieces_after": rep.pieces_after,
         "removed_triangles": rep.removed_triangles, "removed_area": rep.removed_area, "removed_area_share": rep.removed_area_share,
-        "added_triangles": rep.added_triangles, "removed_vertices": rep.removed_vertices, "removed_within": rep.removed_within,
+        "added_triangles": rep.added_triangles, "removed_samples": rep.removed_samples, "removed_within": rep.removed_within,
         "removed_max_distance": rep.removed_max_distance, "ms": ms,
     });
     PrepStep { step: "close_handles".into(), reason, numbers }
 }
 
-/// The issue of a closing that was not small against the tolerance, if it was not.
+/// The issue of a closing: raised whenever anything was cut, so the verdict is at most `review`. The
+/// option changes the topology of the scan, and the deviation is measured from scan vertices, which
+/// cannot see material added over a real opening.
 fn removal_issue(rep: &Report, tolerance: f64) -> Option<Issue> {
-    let far = rep.removed_max_distance > tolerance;
-    let large = rep.removed_area_share > SMALL_AREA_SHARE;
-    (rep.changed && (far || large)).then(|| {
+    rep.changed.then(|| {
         issue(
             "scan_handles_closed",
             format!(
-                "{} handles of the scan were closed before it was wrapped: {} parts cut out ({:.2} % of the area, {} vertices, of which {} lie farther than {tolerance} mm from the repaired scan, up to {:.3} mm) and filled; the solid follows the repaired scan and is measured against the scan as it was, so what was cut out counts against it",
+                "{} handles of the scan were closed before it was wrapped: {} parts cut out ({:.2} % of the area) and their holes filled; of {} points sampled over what was cut out, {} lie farther than {tolerance} mm from the repaired scan, the farthest {:.3} mm; the topology of the solid is not that of the scan, and material added over an opening is not seen by the deviation, so look at the parts closed before relying on it",
                 rep.handles_closed,
                 rep.closed.len(),
                 100.0 * rep.removed_area_share,
-                rep.removed_vertices,
-                rep.removed_vertices.saturating_sub(rep.removed_within),
+                rep.removed_samples,
+                rep.removed_samples.saturating_sub(rep.removed_within),
                 rep.removed_max_distance
             ),
         )
@@ -79,8 +77,12 @@ pub(super) fn wrap_closed(
     let Some(mesh) = s.doc.mesh(set.scan).map(|m| m.mesh.clone()) else {
         return Err(crate::cmd::CmdError::Params(format!("no mesh {}", set.scan)));
     };
-    let size = size_of(set.handle_size, median_edge(&mesh))?;
     let (before, _) = handle_estimate(&mesh);
+    let Some(size) = size_of(set.handle_size, median_edge(&mesh))? else {
+        // no edge length to take a size from: nothing can be closed, the scan is wrapped as it is
+        let nothing = Report::default();
+        return Ok(Err(prep_step(&nothing, 0.0, (before, before), watch.ms())));
+    };
     let (closed, rep) = close(&mesh, size, set.tolerance, s)?;
     if !rep.changed {
         return Ok(Err(prep_step(&rep, size, (before, before), watch.ms())));

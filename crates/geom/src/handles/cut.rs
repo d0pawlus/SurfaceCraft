@@ -1,8 +1,14 @@
 //! Cutting the candidates out and filling every loop they leave with the smooth hole fill. A candidate
-//! is refused when cutting it would split the surface (its loops are not joined outside it), when one
-//! of its holes stays open, or when its fill strays from the surface it replaced by more than the bound.
+//! is refused when cutting it would split the surface (its loops are not joined outside it) or leave a
+//! piece loose, when one of its holes stays open, when its fill strays from the surface it replaced, or
+//! when what it removed is not covered by the result. What was removed is judged by points sampled
+//! over its triangles (corners, edge midpoints, centres and a lattice by size), not by its vertices:
+//! the wall of a tunnel can be long triangles without a vertex inside.
 use super::cells::{Candidate, join, root, sets};
-use crate::{Bvh, Mesh, edit, holes};
+use crate::{Bvh, Cancel, Mesh, Point3, edit, holes};
+
+/// The lattice on a removed triangle has at most this many steps along an edge.
+const MAX_LATTICE: usize = 8;
 
 /// Longest loop a candidate leaves that is filled (boundary edges).
 pub(super) const FILL_MAX_EDGES: usize = 4000;
@@ -32,6 +38,39 @@ pub(super) struct Attempt {
     /// Largest distance of the fill of each candidate from the surface it replaced (0 when not cut).
     pub fill_distance: Vec<f64>,
     pub added: usize,
+    /// The triangles of the mesh before that were cut out.
+    pub dead: Vec<bool>,
+}
+
+/// The distances an attempt is judged by (mm).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Bounds {
+    /// A point of a fill or of what was removed farther than this from the other side counts as far.
+    pub tolerance: f64,
+    /// No point of what was removed may lie farther than this from the result (a quarter of the ball).
+    pub far_limit: f64,
+}
+
+/// Points over a triangle: its corners, edge midpoints and centre, and a lattice of steps no longer than
+/// `spacing` (at most [`MAX_LATTICE`] along an edge).
+pub(super) fn samples(t: [Point3; 3], spacing: f64) -> Vec<Point3> {
+    let [a, b, c] = t;
+    let longest = (b - a).norm().max((c - b).norm()).max((a - c).norm());
+    let steps = if spacing > 0.0 && longest.is_finite() {
+        ((longest / spacing).ceil() as usize).clamp(2, MAX_LATTICE)
+    } else {
+        2
+    };
+    let n = steps as f64;
+    let mut out = Vec::with_capacity((steps + 1) * (steps + 2) / 2 + 1);
+    for i in 0..=steps {
+        for j in 0..=steps - i {
+            let (u, v) = (i as f64 / n, j as f64 / n);
+            out.push(a + (b - a) * u + (c - a) * v);
+        }
+    }
+    out.push(Point3::from((a.coords + b.coords + c.coords) / 3.0));
+    out
 }
 
 /// The owner (candidate index) of every vertex of a candidate that is cut, `u32::MAX` elsewhere, and
@@ -73,8 +112,9 @@ pub(super) fn splitting(mesh: &Mesh, cands: &[Candidate], skip: &[bool]) -> Vec<
     out
 }
 
-/// The mesh with the candidates not in `skip` cut out and their loops filled, and what failed.
-pub(super) fn attempt(mesh: &Mesh, cands: &[Candidate], skip: &[bool], bound: f64) -> Attempt {
+/// The mesh with the candidates not in `skip` cut out and their loops filled, and what failed; `None`
+/// when the caller cancelled.
+pub(super) fn attempt(mesh: &Mesh, cands: &[Candidate], skip: &[bool], b: Bounds, cancel: &Cancel) -> Option<Attempt> {
     let (owner, dead) = mark(mesh, cands, skip);
     let mut out = mesh.clone();
     let mut k = dead.iter();
@@ -83,14 +123,21 @@ pub(super) fn attempt(mesh: &Mesh, cands: &[Candidate], skip: &[bool], bound: f6
     let owned = |v: &u32| owner.get(*v as usize).is_some_and(|&o| o != u32::MAX);
     let accept = |_: &Mesh, lp: &[u32]| lp.iter().all(owned);
     holes::fill_holes_filtered(&mut out, FILL_MAX_EDGES, true, true, &accept);
+    if cancel.is_cancelled() {
+        return None;
+    }
     let added = out.triangles.len() - before;
     let mut failed = unfilled(&out, &owner);
-    let (fill_distance, far) = fill_distances(mesh, &out, before, (&owner, &dead), (cands.len(), bound));
+    let (fill_distance, far) = fill_distances(mesh, &out, before, (&owner, &dead), (cands.len(), b.tolerance));
     failed.extend(far.iter().enumerate().filter(|(_, f)| **f > FILL_FAR_SHARE).map(|(g, _)| (g, Refusal::FillFar)));
-    failed.extend(uncovered(mesh, &out, cands, skip, bound).into_iter().map(|g| (g, Refusal::Uncovered)));
-    failed.sort_unstable_by_key(|f| f.0);
+    if cancel.is_cancelled() {
+        return None;
+    }
+    failed.extend(uncovered(mesh, &out, cands, skip, b).into_iter().map(|g| (g, Refusal::Uncovered)));
+    // stable: the first reason found for a candidate (unfillable, fill far, uncovered) is the one kept
+    failed.sort_by_key(|f| f.0);
     failed.dedup_by_key(|f| f.0);
-    Attempt { mesh: out, failed, fill_distance, added }
+    Some(Attempt { mesh: out, failed, fill_distance, added, dead })
 }
 
 /// Components of the triangles of `m` (through shared vertices), as a union-find to read with [`root`].
@@ -107,7 +154,8 @@ fn components(m: &Mesh) -> Vec<u32> {
 }
 
 /// The candidates (not skipped) that left a piece of the surface loose: a vertex of theirs that is still
-/// used lies in a component of `out` that is not the largest of the component of `work` it came from.
+/// used lies in a component of `out` that is not the largest of the component of `work` it came from,
+/// or the component of `work` they lay in has no triangle left in `out`.
 pub(super) fn loosened(work: &Mesh, out: &Mesh, cands: &[Candidate], skip: &[bool]) -> Vec<usize> {
     let mut before = components(work);
     let mut after = components(out);
@@ -132,10 +180,13 @@ pub(super) fn loosened(work: &Mesh, out: &Mesh, cands: &[Candidate], skip: &[boo
     out.triangles.iter().flatten().for_each(|&v| used.get_mut(v as usize).map_or((), |u| *u = true));
     let mut culprits = Vec::new();
     for (g, c) in cands.iter().enumerate().filter(|(g, _)| !skip.get(*g).copied().unwrap_or(true)) {
-        let loose = c.vertices.iter().filter(|&&v| used.get(v as usize).copied().unwrap_or(false)).any(|&v| {
-            let r = root(&mut after, v);
-            origin.get(&r).and_then(|b| main.get(b)).is_some_and(|&(_, m)| m != r)
-        });
+        // a component of the mesh before that has no triangle left was deleted whole
+        let vanished = c.vertices.first().is_some_and(|&v| !main.contains_key(&root(&mut before, v)));
+        let loose = vanished
+            || c.vertices.iter().filter(|&&v| used.get(v as usize).copied().unwrap_or(false)).any(|&v| {
+                let r = root(&mut after, v);
+                origin.get(&r).and_then(|b| main.get(b)).is_some_and(|&(_, m)| m != r)
+            });
         if loose {
             culprits.push(g);
         }
@@ -144,7 +195,7 @@ pub(super) fn loosened(work: &Mesh, out: &Mesh, cands: &[Candidate], skip: &[boo
 }
 
 /// The candidates with a vertex on a loop that stayed open.
-fn unfilled(out: &Mesh, owner: &[u32]) -> Vec<(usize, Refusal)> {
+pub(super) fn unfilled(out: &Mesh, owner: &[u32]) -> Vec<(usize, Refusal)> {
     let mut failed = Vec::new();
     for lp in edit::boundary_loops(out) {
         for &v in &lp {
@@ -156,41 +207,41 @@ fn unfilled(out: &Mesh, owner: &[u32]) -> Vec<(usize, Refusal)> {
     failed
 }
 
-/// The candidates (not skipped) of which more than [`FILL_FAR_SHARE`] of the vertices that were cut out
-/// lie farther than `bound` from `out`, or with a vertex that stayed and is pinched (its triangles
-/// form more than one fan).
-fn uncovered(mesh: &Mesh, out: &Mesh, cands: &[Candidate], skip: &[bool], bound: f64) -> Vec<usize> {
-    let mut used = vec![false; mesh.positions.len().max(out.positions.len())];
-    for &v in out.triangles.iter().flatten() {
-        if let Some(u) = used.get_mut(v as usize) {
-            *u = true;
-        }
-    }
+/// The candidates (not skipped) of which more than [`FILL_FAR_SHARE`] of the points sampled over the
+/// triangles they removed lie farther than the tolerance from `out`, or any farther than the far limit,
+/// or with a vertex that stayed and is pinched (its triangles form more than one fan).
+fn uncovered(mesh: &Mesh, out: &Mesh, cands: &[Candidate], skip: &[bool], b: Bounds) -> Vec<usize> {
     let live: Vec<usize> = (0..cands.len()).filter(|g| !skip.get(*g).copied().unwrap_or(true)).collect();
     let bvh = Bvh::build(out);
     let fans = Fans::new(out);
     let bad = crate::par::map_slice(&live, |&g| {
         let Some(c) = cands.get(g) else { return false };
-        let (gone, kept): (Vec<u32>, Vec<u32>) =
-            c.vertices.iter().partition(|&&v| !used.get(v as usize).copied().unwrap_or(false));
-        let far = gone
+        let points: Vec<Point3> = c
+            .triangles
             .iter()
-            .filter_map(|&v| mesh.positions.get(v as usize))
-            .filter(|p| bvh.closest(p, bound).is_none())
-            .count();
-        far as f64 > FILL_FAR_SHARE * gone.len() as f64 || kept.iter().any(|&v| fans.count(out, v) > 1)
+            .filter_map(|&t| mesh.triangle(t as usize))
+            .flat_map(|t| samples(t, 2.0 * b.tolerance))
+            .collect();
+        let (mut far, mut beyond) = (0usize, false);
+        for p in &points {
+            let d = bvh.closest(p, b.far_limit.max(b.tolerance) * 1.01).map_or(f64::INFINITY, |h| h.distance);
+            far += usize::from(d > b.tolerance);
+            beyond |= d > b.far_limit;
+        }
+        let kept = c.vertices.iter().filter(|&&v| fans.used(v));
+        beyond || far as f64 > FILL_FAR_SHARE * points.len() as f64 || kept.into_iter().any(|&v| fans.count(out, v) > 1)
     });
     live.into_iter().zip(bad).filter(|(_, b)| *b).map(|(g, _)| g).collect()
 }
 
 /// The triangles around every vertex, to count the fans a vertex has.
-struct Fans {
+pub(super) struct Fans {
     start: Vec<usize>,
     tris: Vec<u32>,
 }
 
 impl Fans {
-    fn new(m: &Mesh) -> Self {
+    pub(super) fn new(m: &Mesh) -> Self {
         let mut start = vec![0usize; m.positions.len() + 1];
         for &v in m.triangles.iter().flatten() {
             if let Some(s) = start.get_mut(v as usize + 1) {
@@ -218,30 +269,85 @@ impl Fans {
         Self { start, tris }
     }
 
-    /// Fans of triangles around `v` (joined through the edges at `v`).
-    fn count(&self, m: &Mesh, v: u32) -> usize {
+    /// Does a triangle use `v`?
+    fn used(&self, v: u32) -> bool {
+        matches!((self.start.get(v as usize), self.start.get(v as usize + 1)), (Some(a), Some(b)) if b > a)
+    }
+
+    /// Fans of triangles around `v` (joined through the edges at `v`), in O(d log d) for d triangles:
+    /// the (other corner, triangle) pairs are sorted, and triangles that share an other corner share an
+    /// edge at `v`.
+    pub(super) fn count(&self, m: &Mesh, v: u32) -> usize {
         let (Some(&a), Some(&b)) = (self.start.get(v as usize), self.start.get(v as usize + 1)) else { return 0 };
         let around = self.tris.get(a..b).unwrap_or(&[]);
-        let others = |t: u32| -> Vec<u32> {
-            m.triangles.get(t as usize).map(|c| c.iter().copied().filter(|&x| x != v).collect()).unwrap_or_default()
-        };
+        let mut pairs: Vec<(u32, u32)> = Vec::with_capacity(2 * around.len());
+        for (i, &t) in around.iter().enumerate() {
+            for &x in m.triangles.get(t as usize).into_iter().flatten().filter(|&&x| x != v) {
+                pairs.push((x, i as u32));
+            }
+        }
+        pairs.sort_unstable();
         let mut s = sets(around.len());
-        for i in 0..around.len() {
-            for j in i + 1..around.len() {
-                let (Some(&ti), Some(&tj)) = (around.get(i), around.get(j)) else { continue };
-                let (oi, oj) = (others(ti), others(tj));
-                if oi.iter().any(|x| oj.contains(x)) {
-                    join(&mut s, i as u32, j as u32);
-                }
+        for w in pairs.windows(2) {
+            if let [(x, i), (y, j)] = w
+                && x == y
+            {
+                join(&mut s, *i, *j);
             }
         }
         (0..around.len() as u32).filter(|&i| root(&mut s, i) == i).count()
     }
 }
 
-/// Per candidate, the largest distance of a point (vertex or triangle centre) of its fill (the
-/// triangles of `out` from `from` on) from the triangles it replaced, and the share of those points
-/// farther than `bound`. A point belongs to the candidate whose removed triangle is nearest to it.
+/// The patches of a fill (the triangles of `out` from `from` on), joined through shared edges: the
+/// patch of every fill triangle (indices from 0).
+fn patches(out: &Mesh, from: usize) -> Vec<u32> {
+    let n = out.triangles.len().saturating_sub(from);
+    let mut edges: Vec<((u32, u32), u32)> = Vec::with_capacity(3 * n);
+    for (k, t) in out.triangles.iter().skip(from).enumerate() {
+        for e in 0..3 {
+            let (a, b) = (t[e], t[(e + 1) % 3]);
+            edges.push(((a.min(b), a.max(b)), k as u32));
+        }
+    }
+    edges.sort_unstable();
+    let mut s = sets(n);
+    for w in edges.windows(2) {
+        if let [(x, i), (y, j)] = w
+            && x == y
+        {
+            join(&mut s, *i, *j);
+        }
+    }
+    (0..n as u32).map(|k| root(&mut s, k)).collect()
+}
+
+/// For every patch of the fill, the candidate that owns a corner of it, and room for two counts.
+fn patch_owners(
+    out: &Mesh,
+    from: usize,
+    patch: &[u32],
+    owner: &[u32],
+) -> std::collections::BTreeMap<u32, (u32, usize, usize)> {
+    let mut counts = std::collections::BTreeMap::new();
+    for (t, &p) in (from..out.triangles.len()).zip(patch) {
+        let g = out
+            .triangles
+            .get(t)
+            .into_iter()
+            .flatten()
+            .find_map(|&v| owner.get(v as usize).copied().filter(|&o| o != u32::MAX));
+        if let Some(g) = g {
+            counts.entry(p).or_insert((g, 0, 0)).0 = g;
+        }
+    }
+    counts
+}
+
+/// Per candidate, the largest distance of a point (vertex or triangle centre) of its fill from the
+/// triangles it replaced, and the largest share, over the patches of its fill (one per loop), of the
+/// points farther than `bound`: a patch that is mostly far is a cap over the mouth of a real opening.
+/// A patch belongs to the candidate that owns a corner of it.
 fn fill_distances(
     mesh: &Mesh,
     out: &Mesh,
@@ -252,32 +358,37 @@ fn fill_distances(
     let removed: Vec<u32> =
         (0..dead.len() as u32).filter(|&t| dead.get(t as usize).copied().unwrap_or(false)).collect();
     let mut largest = vec![0.0f64; n];
-    let mut counts = vec![(0usize, 0usize); n];
+    let mut share = vec![0.0f64; n];
     if removed.is_empty() {
-        return (largest, vec![0.0; n]);
+        return (largest, share);
     }
-    let cut = mesh.submesh(&removed);
-    let tag: Vec<u32> = removed
-        .iter()
-        .map(|&t| mesh.triangles.get(t as usize).and_then(|c| owner.get(c[0] as usize)).copied().unwrap_or(u32::MAX))
-        .collect();
-    let bvh = Bvh::build(&cut);
-    let probes: Vec<crate::Point3> = (from..out.triangles.len())
-        .flat_map(|t| {
-            let c = out.face_centroid(t);
-            let corners = out.triangle(t).map(|p| p.to_vec()).unwrap_or_default();
-            c.into_iter().chain(corners)
+    let bvh = Bvh::build(&mesh.submesh(&removed));
+    let patch = patches(out, from);
+    let mut counts = patch_owners(out, from, &patch, owner);
+    let probes: Vec<(u32, Point3)> = (from..out.triangles.len())
+        .zip(&patch)
+        .flat_map(|(t, &p)| {
+            let corners = out.triangle(t).map(|c| c.to_vec()).unwrap_or_default();
+            out.face_centroid(t).into_iter().chain(corners).map(move |q| (p, q))
         })
         .collect();
-    let hits = crate::par::map_slice(&probes, |p| bvh.closest(p, f64::INFINITY).map(|h| (h.triangle, h.distance)));
-    for (t, d) in hits.into_iter().flatten() {
-        let Some(&g) = tag.get(t) else { continue };
-        if let (Some(f), Some(c)) = (largest.get_mut(g as usize), counts.get_mut(g as usize)) {
-            *f = f.max(d);
-            c.0 += 1;
-            c.1 += usize::from(d > bound);
+    let hits =
+        crate::par::map_slice(&probes, |(_, q)| bvh.closest(q, f64::INFINITY).map_or(f64::INFINITY, |h| h.distance));
+    for ((p, _), d) in probes.iter().zip(hits) {
+        if let Some(c) = counts.get_mut(p) {
+            c.1 += 1;
+            c.2 += usize::from(d > bound);
+            if let Some(f) = largest.get_mut(c.0 as usize) {
+                *f = f.max(d);
+            }
         }
     }
-    let share = counts.iter().map(|&(all, far)| if all == 0 { 0.0 } else { far as f64 / all as f64 }).collect();
+    for &(g, all, far) in counts.values() {
+        if let Some(s) = share.get_mut(g as usize)
+            && all > 0
+        {
+            *s = s.max(far as f64 / all as f64);
+        }
+    }
     (largest, share)
 }

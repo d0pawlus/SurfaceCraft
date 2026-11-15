@@ -287,19 +287,30 @@ fn parts_of(mesh: &Mesh, tris: &[u32]) -> Vec<Part> {
     by_root.into_values().collect()
 }
 
+/// What a part of a ball is.
+pub(super) enum Judged {
+    /// A part that is not a disk and may be cut out.
+    Candidate(Candidate),
+    /// A whole closed piece of the mesh with genus (its smallest vertex): cutting it out would delete
+    /// the piece, so it is refused.
+    WholePiece(u32),
+    /// A disk, or a part that may not be touched.
+    No,
+}
+
 /// A part that is a disk, touches a fixed vertex, meets the rest of the mesh at a vertex that is not on
 /// its boundary (a pinch: cutting it out would leave what hangs there loose), or has a count that no
-/// oriented surface has, is no candidate.
-fn judge(mesh: &Mesh, topo: &Topo, p: Part) -> Option<Candidate> {
+/// oriented surface has, is no candidate; a part without boundary is a whole closed piece.
+fn judge(mesh: &Mesh, topo: &Topo, p: Part) -> Judged {
     if p.verts.iter().any(|&v| topo.fixed.get(v as usize).copied().unwrap_or(true)) {
-        return None;
+        return Judged::No;
     }
     let mut on_boundary: Vec<u32> = p.boundary.iter().flat_map(|&(a, b)| [a, b]).collect();
     on_boundary.sort_unstable();
     // a vertex on two loops (a pinch on the boundary) would merge them and make the count lie
     let pinched_rim = on_boundary.chunk_by(|a, b| a == b).any(|run| run.len() != 2);
     if pinched_rim {
-        return None;
+        return Judged::No;
     }
     on_boundary.dedup();
     let mut inside: Vec<u32> =
@@ -309,16 +320,20 @@ fn judge(mesh: &Mesh, topo: &Topo, p: Part) -> Option<Candidate> {
     let pinched =
         p.verts.iter().any(|&v| on_boundary.binary_search(&v).is_err() && count_in(v) != topo.tri.of(v).len());
     if pinched {
-        return None;
+        return Judged::No;
     }
     let loops = loop_seeds(&p.verts, &p.boundary);
     let chi = p.verts.len() as i64 - p.edges as i64 + p.tris.len() as i64;
     let twice = 2 - chi - loops.len() as i64;
     if twice < 0 || twice % 2 != 0 {
-        return None;
+        return Judged::No;
     }
     let c = Candidate { triangles: p.tris, vertices: p.verts, genus: (twice / 2) as usize, loops };
-    (c.handles() > 0).then_some(c)
+    match (c.handles() > 0, c.loops.is_empty()) {
+        (false, _) => Judged::No,
+        (true, true) => Judged::WholePiece(c.vertices.first().copied().unwrap_or(0)),
+        (true, false) => Judged::Candidate(c),
+    }
 }
 
 /// One vertex (the smallest) of every loop of the boundary edges.
@@ -345,16 +360,25 @@ fn loop_seeds(verts: &[u32], boundary: &[(u32, u32)]) -> Vec<u32> {
 
 /// The candidates of the whole mesh at `scale`: the parts of the balls of diameter `scale` around
 /// seeds a quarter of the scale apart (taken from vertex `first` on) that are not disks (in the order
-/// of the seeds; balls in parallel).
-pub(super) fn candidates(mesh: &Mesh, topo: &Topo, scale: f64, first: usize) -> Vec<Candidate> {
+/// of the seeds; balls in parallel), and the whole closed pieces with genus that a ball held (their
+/// smallest vertices, each once).
+pub(super) fn candidates(mesh: &Mesh, topo: &Topo, scale: f64, first: usize) -> (Vec<Candidate>, Vec<u32>) {
     let centres = seeds(mesh, topo, 0.25 * scale, first);
-    par::map_slice(&centres, |&s| {
+    let judged = par::map_slice(&centres, |&s| {
         let tris = ball(mesh, topo, s, 0.5 * scale);
-        parts_of(mesh, &tris).into_iter().filter_map(|p| judge(mesh, topo, p)).collect::<Vec<_>>()
-    })
-    .into_iter()
-    .flatten()
-    .collect()
+        parts_of(mesh, &tris).into_iter().map(|p| judge(mesh, topo, p)).collect::<Vec<_>>()
+    });
+    let (mut cands, mut whole) = (Vec::new(), Vec::new());
+    for j in judged.into_iter().flatten() {
+        match j {
+            Judged::Candidate(c) => cands.push(c),
+            Judged::WholePiece(v) => whole.push(v),
+            Judged::No => {}
+        }
+    }
+    whole.sort_unstable();
+    whole.dedup();
+    (cands, whole)
 }
 
 /// Candidates that are apart: smallest first (a ball that holds little more than its handle is least
@@ -389,7 +413,10 @@ pub(super) fn grow(mesh: &Mesh, topo: &Topo, c: &Candidate) -> Option<Candidate>
     tris.sort_unstable();
     tris.dedup();
     let part = parts_of(mesh, &tris).into_iter().find(|p| p.tris.binary_search(&first).is_ok())?;
-    judge(mesh, topo, part)
+    match judge(mesh, topo, part) {
+        Judged::Candidate(c) => Some(c),
+        Judged::WholePiece(_) | Judged::No => None,
+    }
 }
 
 /// For every vertex, the candidate (index) whose vertices or their neighbours hold it, `u32::MAX` for none.

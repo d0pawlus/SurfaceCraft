@@ -159,6 +159,15 @@ pub(super) fn next_steps(w: &WrapOut, issues: &[super::Issue], set: &Settings, r
     steps
 }
 
+/// [`failed`], with the step that closes the handles of a scan that has many.
+fn failed_with_offer(s: &Session, set: &Settings, report: ScanSummary, why: &str) -> ToSolidOut {
+    let mut out = failed(set, report, why);
+    if let Some(offer) = super::handles::offer(s, set, &out.issues) {
+        out.next_steps.insert(0, offer);
+    }
+    out
+}
+
 /// The result of a run in which nothing could be wrapped.
 fn failed(set: &Settings, report: ScanSummary, why: &str) -> ToSolidOut {
     let issues = vec![issue("no_solid", format!("the scan could not be wrapped in patches: {why}"))];
@@ -365,7 +374,7 @@ fn freeform_with_mesh(
     let first = match wrap_fn(s, set.max_patches) {
         Ok(w) => w,
         Err(e) if crate::cmd::is_cancelled(&e) => return Err(e),
-        Err(e) => return Ok(failed(set, report, message_of(&e))),
+        Err(e) => return Ok(failed_with_offer(s, set, report, message_of(&e))),
     };
     let (w, retry) = retry_larger_on(s, set, wrapped, first, |s, cap| wrap_fn(s, Some(cap)))?;
     super::prepare::check_cancel(s)?;

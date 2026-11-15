@@ -601,7 +601,7 @@ fn closed_handles(scan: &Mesh, size: f64) -> Mesh {
     let rep =
         close_handles(&mut m, &Params { max_size: size, tolerance: 0.2 }, &surfacecraft_geom::Cancel::new()).unwrap();
     eprintln!(
-        "    close_handles max_size {size} mm in {:.1} s: genus {:?} -> {:?}, loops {} -> {}, {} handles in {} parts, refused {:?}; removed {} triangles, {:.2} % of the area, added {}; removed vertices {} ({} within 0.2 mm, max {:.3} mm)",
+        "    close_handles max_size {size} mm in {:.1} s: genus {:?} -> {:?}, loops {} -> {}, {} handles in {} parts, refused {:?}; removed {} triangles, {:.2} % of the area, added {}; removed samples {} ({} within 0.2 mm, max {:.3} mm)",
         t0.elapsed().as_secs_f64(),
         rep.genus_before,
         rep.genus_after,
@@ -613,7 +613,7 @@ fn closed_handles(scan: &Mesh, size: f64) -> Mesh {
         rep.removed_triangles,
         100.0 * rep.removed_area_share,
         rep.added_triangles,
-        rep.removed_vertices,
+        rep.removed_samples,
         rep.removed_within,
         rep.removed_max_distance
     );

@@ -209,10 +209,11 @@ kernel refuses sheets of many faces. Give the wall thickness instead:
   `open_result`, `failed`, `budget_spent`) and the `error` of a failed second wrap. `budget_spent`: the retry was due but the call had used its extra attempts, so no second network was made (a call that needed no retry has no `retry`). A `max_patches` you give is
   never exceeded. Beyond that, `surface.wrap` with a larger `max_patches` (up to 60000); the STEP
   file grows with the patch count.
-- `scan_handles_closed` (with `close_handles`): small handles were closed before the wrap and what was
-  cut out is not small (more than 0.2 % of the area, or a vertex cut out lies farther than the tolerance
-  from the repaired scan); the `close_handles` step of `preparation` says how much. The solid is
-  measured against the scan as it was.
+- `scan_handles_closed` (with `close_handles`): small handles were closed before the wrap. It is
+  raised whenever anything was cut, so the verdict is at most `review`: the solid has the topology of
+  the repaired scan, not of the scan, and the deviation (measured from the points of the scan) cannot
+  see material added over a real opening. The message and the `close_handles` step of `preparation`
+  say how many parts, how much area, and how far what was cut out lies from the repaired scan.
 - `non_manifold_edges`: edges shared by three or more triangles are left after cleaning; the
   regions and holes next to them are unreliable. `mesh.reconstruct` builds a new mesh from the
   points of the file.
@@ -296,18 +297,22 @@ modelled as it is).
   - What is never touched: the rim of the scan and every vertex away from the parts cut out; a part
     that reaches the rim or an edge of three or more triangles, or meets the rest at a pinched vertex.
     A part is left, and counted in `refused`, when cutting it would split the surface or leave a piece
-    loose (`splits`), a hole stays open (`unfillable`), more than a quarter of its fill lies farther
-    than the tolerance from what it replaced (`fill_far`), or more than a quarter of what it removed
-    lies farther than the tolerance from the result or the fill leaves a pinched vertex (`uncovered`).
-    A part that fails is grown by a ring of triangles (twice at most) before it is left.
+    loose (`splits`), it is a whole closed piece that a ball holds (`whole_pieces`: it would be
+    deleted), a hole stays open (`unfillable`), more than a quarter of one patch of its fill lies
+    farther than the tolerance from what it replaced (`fill_far`: a cap over the mouth of a real
+    opening), or what it removed is not covered by the result (`uncovered`: more than a quarter of the
+    points sampled over its triangles farther than the tolerance, or one farther than a quarter of the
+    ball; the samples are the corners, edge midpoints, centres and a lattice of the triangles, so the
+    wall of a bore made of long triangles counts), or the fill leaves a pinched vertex. A part that
+    fails is grown by a ring of triangles (twice at most) before it is left. The passes stop when no
+    handle is left, and `handle_size` is never more than the diagonal of the scan.
   - What is reported: a `close_handles` step in `preparation` with the handles before and after (from
     the Euler characteristic), the handles closed, the parts and what each scale closed, the refusals,
     the boundary loops and pieces before and after (the same), the triangles and area cut out and their
-    share, the triangles the fills added, and the vertices cut out: how many, how many lie within the
-    tolerance of the repaired scan, and the farthest (the tunnel walls that went). More than 0.2 % of
-    the area cut out, or a vertex cut out farther than the tolerance, raises `scan_handles_closed`
-    (verdict at most `review`). The deviation is measured against the scan as it was, so what was cut
-    out counts against the solid.
+    share (triangles of the scan only), the triangles the fills added, and the points sampled over what
+    was cut out: how many, how many lie within the tolerance of the repaired scan, and the farthest (the
+    tunnel walls that went). Anything cut raises `scan_handles_closed` (verdict at most `review`). The
+    deviation is measured against the scan as it was, so what was cut out counts against the solid.
   - A freeform result that is not a pass on a scan with at least 64 handles offers it as a next step.
   - On a real scan with about 2600 handles (open, three rims) it closed about four fifths of them,
     cutting out under 3 % of the area, and the verdict went from `fail` to `review`; about 10 % of the
