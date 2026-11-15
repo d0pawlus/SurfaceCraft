@@ -125,118 +125,129 @@ pub(super) fn find_relations(
     out
 }
 
-/// Snaps the primitives so that every found relation holds exactly.
-pub(super) fn snap(prims: &mut [(ObjectId, Primitive)], rels: &[(usize, usize, Relation)]) {
+/// The primitives that have `prop`, grouped by the components of the `kind` relations (root, members).
+fn components(
+    prims: &[(ObjectId, Primitive)],
+    rels: &[(usize, usize, Relation)],
+    kind: RelationKind,
+    prop: fn(&Primitive) -> bool,
+) -> Vec<(usize, Vec<usize>)> {
     let n = prims.len();
-    // 1. directions: parallel classes get their mean, perpendicular classes are orthogonalised
     let mut parent: Vec<usize> = (0..n).collect();
     for (i, j, r) in rels {
-        if r.kind == RelationKind::Parallel {
+        if r.kind == kind {
             union(&mut parent, *i, *j);
         }
     }
-    let mut classes: Vec<(usize, Vec<usize>)> = Vec::new();
+    let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
     for i in 0..n {
-        if prims.get(i).and_then(|p| direction(&p.1)).is_none() {
+        if !prims.get(i).is_some_and(|p| prop(&p.1)) {
             continue;
         }
         let r = find(&mut parent, i);
-        match classes.iter_mut().find(|c| c.0 == r) {
-            Some(c) => c.1.push(i),
-            None => classes.push((r, vec![i])),
+        match groups.iter_mut().find(|g| g.0 == r) {
+            Some(g) => g.1.push(i),
+            None => groups.push((r, vec![i])),
         }
     }
+    groups
+}
+
+/// The index of the parallel class that contains primitive `i`, if any.
+fn class_of(i: usize, classes: &[(usize, Vec<usize>)]) -> Option<usize> {
+    classes.iter().position(|c| c.1.contains(&i))
+}
+
+/// Whether a perpendicular relation joins the parallel classes `a` and `b`.
+fn joined_perpendicular(
+    rels: &[(usize, usize, Relation)],
+    classes: &[(usize, Vec<usize>)],
+    a: usize,
+    b: usize,
+) -> bool {
+    rels.iter().any(|(i, j, r)| {
+        r.kind == RelationKind::Perpendicular
+            && ((class_of(*i, classes) == Some(a) && class_of(*j, classes) == Some(b))
+                || (class_of(*j, classes) == Some(a) && class_of(*i, classes) == Some(b)))
+    })
+}
+
+/// The mean direction of a parallel class, its signs aligned with the first member, normalised.
+fn class_mean(prims: &[(ObjectId, Primitive)], members: &[usize]) -> Option<V3> {
+    let first = members.first().and_then(|&m| prims.get(m)).and_then(|p| direction(&p.1))?;
+    let mut mean = V3::zeros();
+    for &m in members {
+        if let Some(d) = prims.get(m).and_then(|p| direction(&p.1)) {
+            mean += if d.dot(&first) < 0.0 { -d } else { d };
+        }
+    }
+    Some(surfacecraft_geom::normalize(mean).unwrap_or(first))
+}
+
+/// Sets every member of a parallel class to direction `d`, flipped where it points against `d`.
+fn set_class_direction(prims: &mut [(ObjectId, Primitive)], members: &[usize], d: V3) {
+    for &m in members {
+        if let Some(p) = prims.get_mut(m)
+            && let Some(orig) = direction(&p.1)
+        {
+            set_direction(&mut p.1, if orig.dot(&d) < 0.0 { -d } else { d });
+        }
+    }
+}
+
+/// Phase 1 of [`snap`]: parallel classes get their mean direction, perpendicular ones are orthogonalised.
+fn snap_directions(prims: &mut [(ObjectId, Primitive)], rels: &[(usize, usize, Relation)]) {
+    let mut classes = components(prims, rels, RelationKind::Parallel, |p| direction(p).is_some());
     // largest class first, ties by lowest member
     classes.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.1.first().cmp(&b.1.first())));
-    let class_of = |i: usize, classes: &[(usize, Vec<usize>)]| classes.iter().position(|c| c.1.contains(&i));
     let mut fixed: Vec<(usize, V3)> = Vec::new(); // class index → direction
     for (ci, (_, members)) in classes.iter().enumerate() {
-        let Some(first) = members.first().and_then(|&m| prims.get(m)).and_then(|p| direction(&p.1)) else { continue };
-        let mut mean = V3::zeros();
-        for &m in members {
-            if let Some(d) = prims.get(m).and_then(|p| direction(&p.1)) {
-                mean += if d.dot(&first) < 0.0 { -d } else { d };
-            }
-        }
-        let mut d = surfacecraft_geom::normalize(mean).unwrap_or(first);
+        let Some(mut d) = class_mean(prims, members) else { continue };
         for (fc, fd) in &fixed {
-            let perpendicular = rels.iter().any(|(i, j, r)| {
-                r.kind == RelationKind::Perpendicular
-                    && ((class_of(*i, &classes) == Some(ci) && class_of(*j, &classes) == Some(*fc))
-                        || (class_of(*j, &classes) == Some(ci) && class_of(*i, &classes) == Some(*fc)))
-            });
-            if perpendicular {
+            if joined_perpendicular(rels, &classes, ci, *fc) {
                 d = surfacecraft_geom::normalize(d - fd * d.dot(fd)).unwrap_or(d);
             }
         }
         fixed.push((ci, d));
-        for &m in members {
-            if let Some(p) = prims.get_mut(m)
-                && let Some(orig) = direction(&p.1)
-            {
-                set_direction(&mut p.1, if orig.dot(&d) < 0.0 { -d } else { d });
-            }
+        set_class_direction(prims, members, d);
+    }
+}
+
+/// Moves the axes of one coaxial group onto a common line: the mean of their perpendicular offsets.
+fn snap_axis_group(prims: &mut [(ObjectId, Primitive)], members: &[usize]) {
+    let Some((o, d)) = members.first().and_then(|&m| prims.get(m)).and_then(|p| axis_point(&p.1).zip(direction(&p.1)))
+    else {
+        return;
+    };
+    let offs: Vec<(usize, V3)> = members
+        .iter()
+        .filter_map(|&m| {
+            let q = prims.get(m).and_then(|p| axis_point(&p.1))?;
+            let w = q - o;
+            Some((m, w - d * w.dot(&d)))
+        })
+        .collect();
+    let mean = offs.iter().fold(V3::zeros(), |a, (_, w)| a + w) / offs.len().max(1) as f64;
+    for (m, w) in offs {
+        if let Some(p) = prims.get_mut(m)
+            && let Some(q) = axis_point(&p.1)
+        {
+            set_axis_point(&mut p.1, q - w + mean);
         }
     }
-    // 2. coaxial groups share one axis line (the mean of their perpendicular offsets)
-    let mut parent: Vec<usize> = (0..n).collect();
-    for (i, j, r) in rels {
-        if r.kind == RelationKind::Coaxial {
-            union(&mut parent, *i, *j);
-        }
-    }
-    let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
-    for i in 0..n {
-        if prims.get(i).and_then(|p| axis_point(&p.1)).is_none() {
-            continue;
-        }
-        let r = find(&mut parent, i);
-        match groups.iter_mut().find(|g| g.0 == r) {
-            Some(g) => g.1.push(i),
-            None => groups.push((r, vec![i])),
-        }
-    }
+}
+
+/// Phase 2 of [`snap`]: the axes of each coaxial group share one axis line.
+fn snap_axes(prims: &mut [(ObjectId, Primitive)], rels: &[(usize, usize, Relation)]) {
+    let groups = components(prims, rels, RelationKind::Coaxial, |p| axis_point(p).is_some());
     for (_, members) in groups.iter().filter(|g| g.1.len() > 1) {
-        let Some((o, d)) =
-            members.first().and_then(|&m| prims.get(m)).and_then(|p| axis_point(&p.1).zip(direction(&p.1)))
-        else {
-            continue;
-        };
-        let offs: Vec<(usize, V3)> = members
-            .iter()
-            .filter_map(|&m| {
-                let q = prims.get(m).and_then(|p| axis_point(&p.1))?;
-                let w = q - o;
-                Some((m, w - d * w.dot(&d)))
-            })
-            .collect();
-        let mean = offs.iter().fold(V3::zeros(), |a, (_, w)| a + w) / offs.len().max(1) as f64;
-        for (m, w) in offs {
-            if let Some(p) = prims.get_mut(m)
-                && let Some(q) = axis_point(&p.1)
-            {
-                set_axis_point(&mut p.1, q - w + mean);
-            }
-        }
+        snap_axis_group(prims, members);
     }
-    // 3. equal radii share their mean
-    let mut parent: Vec<usize> = (0..n).collect();
-    for (i, j, r) in rels {
-        if r.kind == RelationKind::EqualRadius {
-            union(&mut parent, *i, *j);
-        }
-    }
-    let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
-    for i in 0..n {
-        if prims.get(i).and_then(|p| radius_of(&p.1)).is_none() {
-            continue;
-        }
-        let r = find(&mut parent, i);
-        match groups.iter_mut().find(|g| g.0 == r) {
-            Some(g) => g.1.push(i),
-            None => groups.push((r, vec![i])),
-        }
-    }
+}
+
+/// Phase 3 of [`snap`]: the radii of each equal-radius group become their mean.
+fn snap_radii(prims: &mut [(ObjectId, Primitive)], rels: &[(usize, usize, Relation)]) {
+    let groups = components(prims, rels, RelationKind::EqualRadius, |p| radius_of(p).is_some());
     for (_, members) in groups.iter().filter(|g| g.1.len() > 1) {
         let radii: Vec<f64> =
             members.iter().filter_map(|&m| prims.get(m).and_then(|p| radius_of(&p.1)).map(|r| r.1)).collect();
@@ -247,6 +258,16 @@ pub(super) fn snap(prims: &mut [(ObjectId, Primitive)], rels: &[(usize, usize, R
             }
         }
     }
+}
+
+/// Snaps the primitives so that every found relation holds exactly.
+pub(super) fn snap(prims: &mut [(ObjectId, Primitive)], rels: &[(usize, usize, Relation)]) {
+    // 1. directions: parallel classes get their mean, perpendicular classes are orthogonalised
+    snap_directions(prims, rels);
+    // 2. coaxial groups share one axis line (the mean of their perpendicular offsets)
+    snap_axes(prims, rels);
+    // 3. equal radii share their mean
+    snap_radii(prims, rels);
 }
 
 /// Residual of an angular / coaxial / equal-radius relation on two primitives: (degrees, mm).
