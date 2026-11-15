@@ -90,7 +90,12 @@ fn run_one(number: usize, path: &std::path::Path) -> Result<String, String> {
     );
     eprintln!(
         "C{number:02} within {} not facing {} analytic faces {} patches {} retry {} attempts {}",
-        out["deviation"]["within"], out["deviation"]["not_facing"], out["patches"], out["retry"], out["attempts"]
+        out["deviation"]["within"],
+        out["deviation"]["not_facing"],
+        out["analytic"]["faces"],
+        out["patches"],
+        out["retry"],
+        out["attempts"]
     );
     for p in out["preparation"].as_array().into_iter().flatten() {
         eprintln!("C{number:02} preparation {}: {}", p["step"], p["numbers"]);
