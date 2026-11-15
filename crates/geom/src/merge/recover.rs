@@ -1,8 +1,9 @@
 //! Putting back scanned surface the seam could not cover. A removed triangle whose centre has no
 //! facing surface of the result within the tolerance (the seam stayed open there, or a long
 //! triangle was removed and nothing replaced it) comes back on its own scan's vertices (each corner
-//! the scan's vertex in the result, or that vertex added at exactly its place: nothing moves and no
-//! two scans are joined here). It crosses and covers nothing, uses no directed edge twice and
+//! the scan's vertex in the result, or that vertex added at exactly its place: nothing moves, and a
+//! recovered triangle has the corners of one scan only; it joins another scan only where a corner was
+//! welded to that scan before). It crosses and covers nothing, uses no directed edge twice and
 //! repeats no triangle's corners; the vertices a refused one needed are taken back. Then the small
 //! holes are filled again.
 use super::guard::{Guard, Pts};
@@ -12,8 +13,9 @@ use super::union::{Origin, Union, directed, sorted};
 use crate::{Bvh, Cancel, Mesh};
 use std::collections::HashSet;
 
-/// Triangles put back between two looks at the cancellation flag.
-const CANCEL_EVERY: usize = 1 << 12;
+/// Triangles tried between two looks at the cancellation flag (each try compares at most
+/// `MAX_NEAR` triangles, so the work between two looks is bounded).
+const CANCEL_EVERY: usize = 64;
 
 /// What the recovery did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -24,10 +26,18 @@ pub struct Recovered {
     pub triangles: usize,
     /// Of those, taken back again: pieces of recovered triangles only that joined nothing.
     pub specks_dropped: usize,
+    /// Rounds of recovery that put something back.
+    pub rounds: usize,
 }
 
 /// The removed triangles (not restored) whose centre has no facing result surface within `tol`.
-fn uncovered(u: &Union, scans: &[Scan], removed: &[Vec<bool>], tol: f64) -> Vec<(usize, usize)> {
+fn uncovered(
+    u: &Union,
+    scans: &[Scan],
+    removed: &[Vec<bool>],
+    tol: f64,
+    cancel: &Cancel,
+) -> Option<Vec<(usize, usize)>> {
     let back: HashSet<(u32, u32)> = u
         .origin
         .iter()
@@ -36,6 +46,9 @@ fn uncovered(u: &Union, scans: &[Scan], removed: &[Vec<bool>], tol: f64) -> Vec<
     let bvh = Bvh::build(&Mesh { positions: u.positions.clone(), triangles: u.triangles.clone() });
     let mut out = Vec::new();
     for (s, scan) in scans.iter().enumerate() {
+        if cancel.is_cancelled() {
+            return None;
+        }
         let gone = removed.get(s).map_or(&[][..], Vec::as_slice);
         for t in (0..scan.mesh.triangles.len()).filter(|&t| gone.get(t).copied().unwrap_or(false)) {
             if back.contains(&(s as u32, t as u32)) {
@@ -47,7 +60,7 @@ fn uncovered(u: &Union, scans: &[Scan], removed: &[Vec<bool>], tol: f64) -> Vec<
             }
         }
     }
-    out
+    Some(out)
 }
 
 /// The union vertex of corner `v` of scan `s`: its own in the result, or added at its place (and
@@ -69,7 +82,7 @@ pub(super) fn recover(
     guard: &mut Guard<'_>,
     (tol, cancel): (f64, &Cancel),
 ) -> Option<Recovered> {
-    let todo = uncovered(u, scans, removed, tol);
+    let todo = uncovered(u, scans, removed, tol, cancel)?;
     let mut rep = Recovered { uncovered: todo.len(), ..Recovered::default() };
     let (mut edges, mut sets) = (u.directed_edges(), u.vertex_sets());
     for (n, (s, t)) in todo.into_iter().enumerate() {

@@ -41,7 +41,8 @@ impl<'p> Pts<'p> {
 /// has at least one cut vertex, two rim vertices only when they are the two ends of one rim edge
 /// (the seam closes that edge; it never bridges two rims), and a rim vertex only where its normal
 /// faces like the triangle (a boss standing on a face, a sphere sitting in a hole: their rims are
-/// not joined to the face around them).
+/// not joined to the face around them). A vertex added after the rule was made (by the recovery: a
+/// scan's own vertex next to the seam) counts as cut.
 pub(super) struct Corners {
     cut: Vec<bool>,
     rims: HashSet<u64>,
@@ -74,8 +75,7 @@ impl Corners {
 
     /// May a seam triangle have the corners `t`?
     pub(super) fn allows(&self, p: Pts<'_>, t: [u32; 3]) -> bool {
-        let rim: Vec<u32> =
-            t.iter().copied().filter(|&v| !self.cut.get(v as usize).copied().unwrap_or(false)).collect();
+        let rim: Vec<u32> = t.iter().copied().filter(|&v| !self.cut.get(v as usize).copied().unwrap_or(true)).collect();
         let joined = match rim.as_slice() {
             [] | [_] => true,
             [a, b] => self.rims.contains(&undirected(*a, *b)),
@@ -94,15 +94,26 @@ pub(super) struct Guard<'a> {
     /// BVH over the triangles of the union when the guard was made, and those triangles.
     kept: Bvh,
     kept_tris: Vec<[u32; 3]>,
-    /// New triangles by cell of a uniform grid, and those too large for it.
-    cells: HashMap<[i64; 3], Vec<[u32; 3]>>,
-    large: Vec<[u32; 3]>,
+    /// New triangles (each once; `None` when taken back), by cell of a uniform grid (indices), and
+    /// those too large for it.
+    added: Vec<Option<[u32; 3]>>,
+    index_of: HashMap<[u32; 3], u32>,
+    cells: HashMap<[i64; 3], Vec<u32>>,
+    large: Vec<u32>,
     cell: f64,
+    /// Comparisons of the last crossing test.
+    compared: std::cell::Cell<usize>,
     /// The corner rule of the seam, once the seam is being closed.
     pub(super) corners: Option<Corners>,
     pub(super) unsupported: usize,
     pub(super) crossing: usize,
     pub(super) bad_corners: usize,
+}
+
+/// `b` grown by `d` on every side.
+fn grown(b: &Aabb, d: f64) -> Aabb {
+    let g = Vec3::new(d, d, d);
+    Aabb { min: b.min - g, max: b.max + g }
 }
 
 fn cell_of(p: &Point3, cell: f64) -> [i64; 3] {
@@ -119,9 +130,12 @@ impl<'a> Guard<'a> {
             tol,
             kept,
             kept_tris,
+            added: Vec::new(),
+            index_of: HashMap::new(),
             cells: HashMap::new(),
             large: Vec::new(),
             cell,
+            compared: std::cell::Cell::new(0),
             corners: None,
             unsupported: 0,
             crossing: 0,
@@ -152,20 +166,35 @@ impl<'a> Guard<'a> {
         })
     }
 
-    /// Does triangle `t` (corners `c`) cross or cover a kept or a new triangle?
+    /// Does triangle `t` (corners `c`) cross or cover a kept or a new triangle? Triangles near it are
+    /// found with its box grown by the tolerance (a parallel layer within the tolerance has a box of
+    /// its own that the exact one does not meet). At most [`MAX_NEAR`] triangles are compared; a
+    /// test that would need more counts as crossing.
     fn crosses(&self, p: Pts<'_>, t: [u32; 3], c: &[Point3; 3]) -> bool {
-        let bx = Aabb::from_points(c.iter());
+        let bx = grown(&Aabb::from_points(c.iter()), self.tol);
         let (near, more) = self.kept.overlapping_up_to(&bx, MAX_NEAR, &|_| true);
         if more {
             return true;
         }
         let clash = |x: &[u32; 3]| p.corners(x).is_some_and(|y| clashes((c, &t), (&y, x), self.tol));
-        // a candidate too large for the grid is tested against every new triangle
-        let new_clash =
-            if self.too_large(&bx) { self.cells.values().flatten().any(clash) } else { self.cells_of(&bx).any(clash) };
-        near.iter().filter_map(|&i| self.kept_tris.get(i as usize)).any(clash)
-            || new_clash
-            || self.large.iter().any(clash)
+        if near.iter().filter_map(|&i| self.kept_tris.get(i as usize)).any(clash) {
+            return true;
+        }
+        // the new triangles near it: those of its cells (or all, for a candidate too large for the
+        // grid) and the large ones, each once, within the budget left
+        let mut ids: Vec<u32> = if self.too_large(&bx) {
+            (0..self.added.len() as u32).collect()
+        } else {
+            self.cells_of(&bx).copied().collect()
+        };
+        ids.extend(self.large.iter().copied());
+        ids.sort_unstable();
+        ids.dedup();
+        self.compared.set(near.len() + ids.len());
+        if near.len() + ids.len() > MAX_NEAR {
+            return true;
+        }
+        ids.iter().filter_map(|&i| self.added.get(i as usize).copied().flatten()).any(|x| clash(&x))
     }
 
     /// The cells the box `bx` spans along each axis.
@@ -178,8 +207,9 @@ impl<'a> Guard<'a> {
         (0..3).any(|a| hi[a].saturating_sub(lo[a]) > MAX_CELL_SPAN)
     }
 
-    /// The new triangles in the cells the box `bx` touches (a box within [`MAX_CELL_SPAN`]).
-    fn cells_of<'s>(&'s self, bx: &Aabb) -> impl Iterator<Item = &'s [u32; 3]> + 's {
+    /// The new triangles (indices into `added`) in the cells the box `bx` touches (a box within
+    /// [`MAX_CELL_SPAN`]).
+    fn cells_of<'s>(&'s self, bx: &Aabb) -> impl Iterator<Item = &'s u32> + 's {
         let (lo, hi) = self.span(bx);
         let span = move |a: usize| lo[a]..=hi[a].min(lo[a].saturating_add(MAX_CELL_SPAN));
         span(0)
@@ -205,27 +235,39 @@ impl<'a> Guard<'a> {
         out
     }
 
-    /// Records the new triangle `t`.
+    /// Records the new triangle `t` (once, with its cells or in the list of large ones).
     fn add(&mut self, t: [u32; 3], c: &[Point3; 3]) {
         let bx = Aabb::from_points(c.iter());
+        let i = self.added.len() as u32;
+        self.added.push(Some(t));
+        self.index_of.insert(t, i);
         if self.too_large(&bx) {
-            self.large.push(t);
+            self.large.push(i);
         }
         for k in self.keys(&bx) {
-            self.cells.entry(k).or_default().push(t);
+            self.cells.entry(k).or_default().push(i);
         }
     }
 
     /// Takes back the record of the new triangle `t`.
     pub(super) fn forget(&mut self, p: Pts<'_>, t: [u32; 3]) {
+        let Some(i) = self.index_of.remove(&t) else { return };
+        if let Some(slot) = self.added.get_mut(i as usize) {
+            *slot = None;
+        }
+        self.large.retain(|&x| x != i);
         let Some(c) = p.corners(&t) else { return };
-        let bx = Aabb::from_points(c.iter());
-        self.large.retain(|x| *x != t);
-        for k in self.keys(&bx) {
+        for k in self.keys(&Aabb::from_points(c.iter())) {
             if let Some(list) = self.cells.get_mut(&k) {
-                list.retain(|x| *x != t);
+                list.retain(|&x| x != i);
             }
         }
+    }
+
+    /// Comparisons the last crossing test made (or would have made).
+    #[cfg(test)]
+    pub(super) fn compared(&self) -> usize {
+        self.compared.get()
     }
 
     /// Tests a restored or recovered triangle (a triangle of a scan, at exactly its place, so on

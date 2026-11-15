@@ -32,7 +32,6 @@ pub(super) struct Scan {
     pub(super) non_manifold: usize,
     /// Triangles left out for being wound against the rest of their piece, and their share of the area.
     pub(super) flipped: (usize, f64),
-    /// Closed pieces with a negative volume (turned inside out).
     /// Closed pieces with a negative volume: (turned inside out, inner skins, debris).
     pub(super) negative: (usize, usize, usize),
     /// Topology of the scan as given to the merge (after the drop).
@@ -278,20 +277,26 @@ fn nested(mesh: &Mesh, closed: &[&pieces::Piece], k: usize) -> bool {
 
 /// Closed pieces with a negative volume, sorted: (turned inside out, inner skins, debris). An inner
 /// skin lies inside another closed piece of the scan (the inside of a hollow part faces inward); debris
-/// is a piece below [`INVERTED_MIN_SHARE`] of the scan's area. Only the first refuse the merge.
+/// is a piece below [`INVERTED_MIN_SHARE`] of the scan's area, as long as all such pieces together
+/// stay below it (many small inverted pieces are a scan turned inside out in parts: counted as
+/// turned inside out). Only the first refuse the merge.
 pub(super) fn negative_pieces(mesh: &Mesh) -> (usize, usize, usize) {
     let all = pieces::pieces(mesh);
     let closed: Vec<&pieces::Piece> = all.iter().filter(|p| p.closed()).collect();
     let area = mesh.area();
-    let (mut inverted, mut skins, mut debris) = (0, 0, 0);
+    let (mut inverted, mut skins, mut debris, mut debris_area) = (0, 0, 0, 0.0);
     for (k, p) in closed.iter().enumerate().filter(|(_, p)| volume(mesh, p) < 0.0) {
         if p.area < INVERTED_MIN_SHARE * area {
             debris += 1;
+            debris_area += p.area;
         } else if nested(mesh, &closed, k) {
             skins += 1;
         } else {
             inverted += 1;
         }
+    }
+    if debris_area >= INVERTED_MIN_SHARE * area {
+        return (inverted + debris, skins, 0);
     }
     (inverted, skins, debris)
 }

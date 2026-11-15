@@ -184,7 +184,7 @@ fn assert_clean(label: &str, m: &Measured) {
 }
 
 #[test]
-fn gate_m4_merge_blob_views_into_one_closed_piece() {
+fn gate_m4_merge_blob_views_into_one_piece_with_at_most_two_open_loops() {
     let truth = blob_at(240);
     for n in [2, 4, 8] {
         for perturbed in [false, true] {
@@ -202,11 +202,12 @@ fn gate_m4_merge_blob_views_into_one_closed_piece() {
             // the union of the views covers the whole blob: measured one closed piece of genus 0, no
             // point twice, no open seam edge, no second layer (stacked share 0.0000). Bounded, not
             // exact (the blob is made with sin and cos, whose last bit differs between the math
-            // libraries): at most 2 pieces and 2 loops, open seam edges at most 2 % of the cut edges,
-            // unwelded vertices at most 2, stacked share at most 0.001
+            // libraries): one piece, at most 2 open loops (the noise sweep below finds a loop left at
+            // the pole in a few draws), open seam edges at most 2 % of the cut edges, unwelded
+            // vertices at most 2, stacked share at most 0.001
             let at = |k: &str| m.out["after"][k].as_u64().unwrap();
             let seam = |k: &str| m.out["seam"][k].as_u64().unwrap();
-            assert!(at("pieces") <= 2 && at("loops") <= 2, "{label}: {}", m.out["after"]);
+            assert!(at("pieces") == 1 && at("loops") <= 2, "{label}: {}", m.out["after"]);
             assert!(seam("open_edges") * 50 <= seam("cut_edges").max(1), "{label}: {}", m.out["seam"]);
             assert!(m.out["checks"]["unwelded_vertices"].as_u64().unwrap() <= 2, "{label}");
             assert!(m.out["checks"]["stacked_share"].as_f64().unwrap() <= 0.001, "{label}");
@@ -249,10 +250,10 @@ fn gate_m4_merge_bracket_views_leave_what_the_union_leaves_open() {
             // the views themselves are 3 mm off the truth in places (coarse triangles over the cut
             // holes): the merge is measured against them. Measured: within 0.9983 to 0.9991 against
             // 0.9991 to 0.9995 of the views (bound: 0.01 below); worst 1.5 to 3.0 mm against 3.0
-            // (bound: 0.5 above); covered 0.9922 to 0.9979 (bound 0.95: a miss share 6 times the
+            // (bound: never worse than the views); covered 0.9922 to 0.9979 (bound 0.95: a miss share 6 times the
             // largest measured)
             assert!(m.within >= m.within_in - 0.01, "{label}: {} against {}", m.within, m.within_in);
-            assert!(m.worst <= m.worst_in + 0.5, "{label}: {} against {}", m.worst, m.worst_in);
+            assert!(m.worst <= m.worst_in, "{label}: {} against {}", m.worst, m.worst_in);
             assert!(m.covered >= 0.95, "{label}: {}", m.covered);
         }
     }
@@ -266,7 +267,9 @@ fn to_solid(mesh: &Mesh) -> Value {
 
 #[test]
 fn gate_m4_merged_blob_wraps_like_one_full_scan() {
-    let merged = run_case("blob 4 views for the wrap", &blob_views_n(4), &blob_at(240)).mesh;
+    let case = run_case("blob 4 views for the wrap", &blob_views_n(4), &blob_at(240));
+    assert_eq!(case.out["after"]["pieces"], json!(1), "the four views merge into one piece");
+    let merged = case.mesh;
     let single = noisy(blob_at(56), 900);
     let (a, b) = (to_solid(&merged), to_solid(&single));
     for (label, out) in [("merged", &a), ("single", &b)] {
@@ -293,18 +296,26 @@ fn gate_m4_merged_blob_wraps_like_one_full_scan() {
     );
 }
 
+/// Closed cases of the sweep below, measured 83 of 90 (88 before the round-1 review fixes, c0ef6b3;
+/// the open ones leave one loop at the pole of the blob where the views meet in a point).
+const SWEEP_CLOSED_FLOOR: usize = 83;
+
 /// The blob gate over thirty more noise series (local: the topology of the gate must not depend on
-/// the noise draw).
+/// the noise draw). Fails when fewer cases than the floor close.
 #[test]
 #[ignore = "sweep over noise series, run locally"]
 fn blob_gate_over_noise_series() {
     let truth = blob_at(240);
+    let mut closed_cases = 0;
     for series in 1..=30 {
         for n in [2, 4, 8] {
             let m = run_case(&format!("series {series} blob {n} views"), &blob_views_series(n, series), &truth);
             assert_clean("sweep", &m);
             let closed = m.out["after"]["pieces"] == json!(1) && m.out["after"]["loops"] == json!(0);
             eprintln!("SWEEP series {series} n {n}: {}", if closed { "closed" } else { "OPEN" });
+            closed_cases += usize::from(closed);
         }
     }
+    eprintln!("SWEEP closed {closed_cases} of 90");
+    assert!(closed_cases >= SWEEP_CLOSED_FLOOR, "{closed_cases} closed against a floor of {SWEEP_CLOSED_FLOOR}");
 }

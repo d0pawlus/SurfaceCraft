@@ -1,11 +1,11 @@
 //! A cancellation flag shared between whoever started a long computation and the loops doing it.
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// A flag a long computation checks between steps. Clones share the flag; a new token is not
 /// cancelled, and one that was cancelled stays so.
 #[derive(Clone, Debug, Default)]
-pub struct Cancel(Arc<AtomicBool>);
+pub struct Cancel(Arc<AtomicBool>, Arc<AtomicUsize>);
 
 impl Cancel {
     /// A token nobody has cancelled.
@@ -19,10 +19,30 @@ impl Cancel {
         self.0.store(true, Ordering::Release);
     }
 
-    /// Was the computation asked to stop?
+    /// Was the computation asked to stop? (Each look also counts down a token made by
+    /// [`Cancel::after_looks`].)
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
+        let left = self.1.load(Ordering::Acquire);
+        // a plain token reads 0 and pays one load; a countdown that loses a race to another thread
+        // just counts that look later
+        if left > 0 && self.1.compare_exchange(left, left - 1, Ordering::AcqRel, Ordering::Acquire) == Ok(1) {
+            self.0.store(true, Ordering::Release);
+        }
         self.0.load(Ordering::Acquire)
+    }
+
+    /// A token that cancels itself at its `n`-th look (`n` ≥ 1): for testing that a computation
+    /// polls and stops wherever the flag is set.
+    #[must_use]
+    pub fn after_looks(n: usize) -> Self {
+        Cancel(Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(n)))
+    }
+
+    /// Looks taken at a token from [`Cancel::after_looks`] that are still to come (0 once it fired).
+    #[must_use]
+    pub fn looks_left(&self) -> usize {
+        self.1.load(Ordering::Acquire)
     }
 }
 

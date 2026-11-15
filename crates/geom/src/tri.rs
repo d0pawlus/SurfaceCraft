@@ -70,6 +70,9 @@ pub fn closest_point(p: &Point3, a: &Point3, b: &Point3, c: &Point3) -> Point3 {
     a + ab * v + ac * w
 }
 
+/// Sine of the angle between a ray and a triangle's plane below which they are parallel.
+const RAY_PARALLEL: f64 = 1e-14;
+
 /// Ray/triangle intersection (Möller–Trumbore): the ray parameter `t ≥ 0` of the hit.
 #[must_use]
 pub fn ray_hit(origin: &Point3, dir: &Vec3, a: &Point3, b: &Point3, c: &Point3) -> Option<f64> {
@@ -77,7 +80,9 @@ pub fn ray_hit(origin: &Point3, dir: &Vec3, a: &Point3, b: &Point3, c: &Point3) 
     let e2 = c - a;
     let pv = dir.cross(&e2);
     let det = e1.dot(&pv);
-    if det.abs() < 1e-14 {
+    // parallel when the determinant is small against its own scale (a fixed bound would miss every
+    // triangle under about 1e-7 mm across)
+    if !(det.abs() > RAY_PARALLEL * e1.norm() * e2.norm() * dir.norm()) {
         return None;
     }
     let inv = 1.0 / det;
@@ -98,6 +103,15 @@ pub fn ray_hit(origin: &Point3, dir: &Vec3, a: &Point3, b: &Point3, c: &Point3) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_ray_hits_a_tiny_triangle_and_misses_a_parallel_one() {
+        let s = 1e-9;
+        let (a, b, c) = (Point3::new(0.0, 0.0, 0.0), Point3::new(s, 0.0, 0.0), Point3::new(0.0, s, 0.0));
+        let o = Point3::new(0.25 * s, 0.25 * s, 1.0);
+        assert!((ray_hit(&o, &-Vec3::z(), &a, &b, &c).unwrap() - 1.0).abs() < 1e-12);
+        assert_eq!(ray_hit(&o, &Vec3::x(), &a, &b, &c), None);
+    }
 
     #[test]
     fn closest_point_regions() {

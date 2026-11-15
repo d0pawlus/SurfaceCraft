@@ -9,6 +9,8 @@ use super::prep::{NONE, Scan};
 use crate::{Point3, Vec3};
 use std::collections::{HashMap, HashSet};
 
+/// Triangles looked at between two looks at the cancellation flag when restoring.
+const RESTORE_CANCEL_EVERY: usize = 1 << 10;
 /// Passes over the removed triangles when restoring (a triangle may need a neighbour restored first).
 const RESTORE_PASSES: usize = 3;
 
@@ -304,6 +306,9 @@ pub(super) fn restore(
             for (t, &tri) in scan.mesh.triangles.iter().enumerate() {
                 if !gone.get(t).copied().unwrap_or(false) || done.contains(&(s as u32, t as u32)) {
                     continue;
+                }
+                if t % RESTORE_CANCEL_EVERY == 0 && cancel.is_cancelled() {
+                    return None;
                 }
                 if st.try_one(u, (scans, lost), (s, t, tri), guard) {
                     done.insert((s as u32, t as u32));

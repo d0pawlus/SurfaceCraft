@@ -67,7 +67,7 @@ fn print(rep: &Report) {
 }
 
 #[test]
-fn two_views_of_the_blob_merge_into_one_closed_piece() {
+fn two_views_of_the_blob_merge_into_one_piece_with_at_most_two_open_loops() {
     let views = [view(0, Vec3::x(), 8.0), view(1, -Vec3::x(), 8.0)];
     let (mesh, rep) = run(&views, TOL);
     print(&rep);
@@ -78,7 +78,7 @@ fn two_views_of_the_blob_merge_into_one_closed_piece() {
     assert_eq!(rep.checks.added_crossings, 0);
     // measured 1 piece, 0 loops, 0 open seam edges: bounded, a last-bit difference of the math
     // library may move a triangle
-    assert!(rep.after.pieces <= 2 && rep.after.loops <= 2, "{:?}", rep.after);
+    assert!(rep.after.pieces == 1 && rep.after.loops <= 2, "{:?}", rep.after);
     assert!(rep.seam.open_edges * 50 <= rep.seam.front_edges.max(1), "{:?}", rep.seam);
     assert_rows(&rep, &mesh);
 }
@@ -136,7 +136,7 @@ fn views_of(n: usize) -> Vec<Mesh> {
 }
 
 #[test]
-fn many_views_of_the_blob_merge_into_one_closed_piece() {
+fn many_views_of_the_blob_merge_manifold_and_oriented() {
     for n in [4, 6, 8] {
         let (mesh, rep) = run(&views_of(n), TOL);
         eprintln!("== {n} views");
@@ -409,4 +409,26 @@ fn a_refused_recovery_leaves_no_vertex_behind() {
     let mut used = vec![false; u.positions.len()];
     u.triangles.iter().flatten().for_each(|&v| used[v as usize] = true);
     assert!(used[before..].iter().all(|&f| f), "every vertex added is used");
+    // the rollback leaves the per-vertex lists in step and no scan vertex pointing past them
+    assert_eq!(u.normals.len(), u.positions.len());
+    assert_eq!(u.scan_of.len(), u.positions.len());
+    assert!(u.vertex_of.iter().flatten().all(|&x| x == prep::NONE || (x as usize) < u.positions.len()));
+}
+
+#[test]
+fn a_cancellation_at_any_look_stops_the_merge() {
+    // a token that never fires within the run counts its looks: L in all
+    let views = views_of(2);
+    let big = 1usize << 40;
+    let counter = Cancel::after_looks(big);
+    merge(&views, &Params { tolerance: TOL }, &counter, &mut |_| {}).unwrap();
+    let looks = big - counter.looks_left();
+    eprintln!("{looks} looks at the flag in one merge of two views");
+    assert!(looks > 20, "{looks}");
+    // fired at its n-th look, for n spread over the whole run: every look that sees it stops the merge
+    for n in (1..=looks).step_by((looks / 60).max(1)).chain([looks]) {
+        let r = merge(&views, &Params { tolerance: TOL }, &Cancel::after_looks(n), &mut |_| {});
+        assert!(matches!(r, Err(MergeError::Cancelled)), "fired at look {n} of {looks}: {r:?}");
+    }
+    assert!(merge(&views, &Params { tolerance: TOL }, &Cancel::after_looks(looks + 1), &mut |_| {}).is_ok());
 }

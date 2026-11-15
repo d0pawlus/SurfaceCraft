@@ -176,7 +176,7 @@ fn a_weld_that_would_double_or_flip_a_triangle_is_found() {
     ];
     let u = union_of(pos.clone(), vec![0, 0, 0, 1, 1, 1], vec![[0, 1, 2], [3, 5, 4]]);
     let doubled = u.clashing(&[0, 1, 2, 0, 1, 2]);
-    assert_eq!(doubled, vec![3, 4, 5], "the same three corners in two triangles");
+    assert_eq!(doubled, vec![5], "the same three corners in two triangles: the culprit is the last welded corner");
     // a sliver whose apex welds across its base: flipped
     let pos = vec![
         Point3::new(0.0, 0.0, 0.0),

@@ -40,6 +40,8 @@ mod seam;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_round2;
+#[cfg(test)]
 mod tests_units;
 mod union;
 mod weld;
@@ -49,7 +51,7 @@ pub use fill::SMALL_LOOP_EDGES;
 pub use guard::{MAX_CELL_SPAN, SUPPORT_SLOPE};
 pub use orient::FLIPPED_REFUSE_SHARE;
 pub use overlap::{PAIR_SAMPLES, PairResidual};
-pub use prep::{Topology, topology};
+pub use prep::{INVERTED_MIN_SHARE, Topology, topology};
 pub use recover::Recovered;
 pub use seam::{RADII_EDGES, SeamReport};
 pub use weld::{AREA_KEEP, WELD_EDGE_SHARE, WELD_SHARE};
@@ -71,6 +73,8 @@ pub const COVERED_SHARE: f64 = 0.99;
 /// Above this share of the scans' area in the result lying on another scan's surface,
 /// `Stacked` is raised.
 pub const STACKED_SHARE: f64 = 0.005;
+/// Rounds of recovery and refill at most.
+pub const RECOVER_ROUNDS: usize = 3;
 /// The guard's grid cell, in largest ball diameters (two radii).
 const CELL_RADII: f64 = 2.0;
 /// Triangles of all scans together at most. The merge holds, per triangle of the input, about 300
@@ -110,7 +114,9 @@ pub enum MergeError {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Issue {
     /// The scans disagree in their overlap by more than the tolerance (refused).
-    /// `over`: samples lying over the other scan displaced beyond the reach.
+    /// `over`: samples lying over the other scan displaced beyond the reach. `beyond_share`: of the
+    /// near samples, the share beyond the tolerance; when the scans are displaced along their normals
+    /// (no near samples), the share of all samples lying over the other.
     Misaligned { a: usize, b: usize, near: usize, over: usize, beyond_share: f64, rms: f64, p95: f64 },
     /// The normals of two scans oppose where they meet: one is turned inside out (refused).
     Opposed { a: usize, b: usize, opposed: usize, facing: usize },
@@ -123,8 +129,9 @@ pub enum Issue {
     Unoriented { edges: usize },
     /// Vertices of different scans left unwelded at (nearly) one point.
     Unwelded { vertices: usize },
-    /// More than [`STACKED_SHARE`] of the scans' area in the result lies on another scan's surface.
-    Stacked { share: f64 },
+    /// More than [`STACKED_SHARE`] of the scans' area in the result lies on another scan's surface
+    /// (`triangles` of them).
+    Stacked { share: f64, triangles: usize },
     /// Closed pieces of a scan with a negative volume that are not refused: inner skins (inside another
     /// closed piece: the inside of a hollow part) and debris below [`prep::INVERTED_MIN_SHARE`].
     InnerSkins { scan: usize, skins: usize, debris: usize },
@@ -207,6 +214,8 @@ pub struct Checks {
     /// Share of the area of the scans' triangles in the result that lies within the tolerance of facing
     /// surface of another scan's triangles: two layers left (should be near 0).
     pub stacked_share: f64,
+    /// Scan triangles of the result counted in [`Checks::stacked_share`].
+    pub stacked_triangles: usize,
 }
 
 /// The stages of [`merge`], announced to the caller as they start (for timing).
@@ -314,7 +323,9 @@ fn pair_issues(n: usize, pairs: &[PairResidual]) -> Vec<Issue> {
             if let Some(r) = flipped {
                 out.push(Issue::Opposed { a, b, opposed: r.opposed, facing: r.within });
             }
-            if [x, y].into_iter().flatten().any(|r| r.near > 0 || r.over > 0) {
+            // scans are together in space when one lies on the other within the reach, or over it
+            // displaced (a stray ray hit of pieces that share nothing does not join them)
+            if [x, y].into_iter().flatten().any(|r| r.near > 0 || r.displaced(MIN_SHARED_SAMPLES)) {
                 let (ga, gb) = (group[a], group[b]);
                 group.iter_mut().filter(|g| **g == gb).for_each(|g| *g = ga);
             }
@@ -352,7 +363,9 @@ fn misaligned(a: usize, b: usize, x: Option<&PairResidual>, y: Option<&PairResid
     if let Some(r) = worse.filter(|r| r.beyond_share() > MISALIGNED_SHARE) {
         return Some(issue(r, r.beyond_share()));
     }
-    both().find(|r| r.displaced(MIN_SHARED_SAMPLES)).map(|r| issue(r, 1.0))
+    // displaced along the normal: every sample over the other lies beyond the tolerance; the share
+    // reported is that of the samples over the other (rms and p95 are of the few near ones, if any)
+    both().find(|r| r.displaced(MIN_SHARED_SAMPLES)).map(|r| issue(r, r.over as f64 / r.samples.max(1) as f64))
 }
 
 /// Median of the scans' median edges: the length scale of the tie band, the weld radius cap, the
@@ -422,36 +435,68 @@ fn build(
     let (mut removed, lost) = own::removed_by_owner(scans, tol, scale(scans), cancel).ok_or(MergeError::Cancelled)?;
     rep.eaten = own::eat_back(scans, &mut removed, tol, cancel).ok_or(MergeError::Cancelled)?;
     stage(Stage::Union);
+    let polled = || if cancel.is_cancelled() { Err(MergeError::Cancelled) } else { Ok(()) };
     let mut u = union::assemble(scans, &removed);
-    u.weld_front(scans, weld::weld_radius(tol, scale(scans)));
-    if cancel.is_cancelled() {
-        return Err(MergeError::Cancelled);
-    }
+    polled()?;
+    u.weld_front(scans, weld::weld_radius(tol, scale(scans)), cancel).ok_or(MergeError::Cancelled)?;
     let cell = RADII_EDGES.iter().fold(0.0_f64, |m, k| m.max(*k)) * CELL_RADII * scale(scans);
     let mut guard = guard::Guard::new(scans, &u, tol, cell);
+    polled()?;
     rep.seam.restored = union::restore(&mut u, scans, (&removed, &lost), &mut |p, t| guard.restorable(p, t), cancel)
         .ok_or(MergeError::Cancelled)?;
     stage(Stage::Seam);
     seam::close(&mut u, scans, &mut guard, &mut rep.seam, cancel).ok_or(MergeError::Cancelled)?;
-    rep.seam.recovered =
-        recover::recover(&mut u, scans, &removed, &mut guard, (tol, cancel)).ok_or(MergeError::Cancelled)?;
-    if rep.seam.recovered.triangles > 0 {
-        rep.seam.recovered.specks_dropped = fill::drop_specks(&mut u, &mut guard);
-        seam::refill(&mut u, scans, &mut guard, &mut rep.seam, cancel).ok_or(MergeError::Cancelled)?;
-    }
+    recover_rounds(&mut u, scans, &removed, &mut guard, tol, &mut rep.seam, cancel).ok_or(MergeError::Cancelled)?;
     rep.seam.unsupported = guard.unsupported;
     rep.seam.crossing = guard.crossing;
     rep.seam.bad_corners = guard.bad_corners;
-    let (dropped, count) = fill::drop_islands(&mut u, tol, cancel).ok_or(MergeError::Cancelled)?;
+    polled()?;
+    let (dropped, count, recovered) = fill::drop_islands(&mut u, tol, cancel).ok_or(MergeError::Cancelled)?;
     rep.seam.islands_dropped = count;
+    rep.seam.recovered.triangles = rep.seam.recovered.triangles.saturating_sub(recovered);
     for (s, t) in dropped {
         if let Some(r) = removed.get_mut(s as usize).and_then(|r| r.get_mut(t as usize)) {
             *r = true;
         }
     }
+    polled()?;
     seam::measure_open(&u, scans, &mut rep.seam);
+    polled()?;
     stage(Stage::Check);
     finish(scans, &removed, u, tol, rep, cancel)
+}
+
+/// Recovery, the specks it leaves taken back, and the holes filled again, until a round puts nothing
+/// back (the refill may take seam triangles back and uncover surface again), at most
+/// [`RECOVER_ROUNDS`] rounds. `None` when cancelled.
+fn recover_rounds(
+    u: &mut Union,
+    scans: &[Scan],
+    removed: &[Vec<bool>],
+    guard: &mut guard::Guard<'_>,
+    tol: f64,
+    rep: &mut SeamReport,
+    cancel: &Cancel,
+) -> Option<()> {
+    for _ in 0..RECOVER_ROUNDS {
+        let r = recover::recover(u, scans, removed, guard, (tol, cancel))?;
+        if r.triangles == 0 {
+            break;
+        }
+        let specks = fill::drop_specks(u, guard);
+        if cancel.is_cancelled() {
+            return None;
+        }
+        rep.recovered.rounds += 1;
+        rep.recovered.uncovered += r.uncovered;
+        rep.recovered.triangles += r.triangles;
+        rep.recovered.specks_dropped += specks;
+        seam::refill(u, scans, guard, rep, cancel)?;
+        if specks >= r.triangles {
+            break;
+        }
+    }
+    Some(())
 }
 
 /// The triangles of the scans that are not in the result as themselves: removed and not put back,
@@ -521,7 +566,9 @@ fn finish(
     rep.checks.added_crossings = check::added_crossings(&built, cancel).ok_or(MergeError::Cancelled)?;
     rep.checks.unwelded_vertices =
         check::unwelded(&built, DUPLICATE_SHARE * scale(scans), cancel).ok_or(MergeError::Cancelled)?;
-    rep.checks.stacked_share = check::stacked_share(&built, tol, cancel).ok_or(MergeError::Cancelled)?;
+    let (stacked_share, stacked_triangles) = check::stacked_share(&built, tol, cancel).ok_or(MergeError::Cancelled)?;
+    rep.checks.stacked_share = stacked_share;
+    rep.checks.stacked_triangles = stacked_triangles;
     let dropped: Vec<&[Point3; 3]> = scans.iter().flat_map(|s| s.dropped.iter()).collect();
     let tri_of = |i: usize| -> Option<[Point3; 3]> {
         match dropped.get(i) {
@@ -557,7 +604,7 @@ fn result_issues(rep: &mut Report) {
         rep.issues.push(Issue::RemovedUncovered { share: cov.share(), worst: cov.worst });
     }
     if rep.checks.stacked_share > STACKED_SHARE {
-        rep.issues.push(Issue::Stacked { share: rep.checks.stacked_share });
+        rep.issues.push(Issue::Stacked { share: rep.checks.stacked_share, triangles: rep.checks.stacked_triangles });
     }
     if rep.checks.unwelded_vertices > 0 {
         rep.issues.push(Issue::Unwelded { vertices: rep.checks.unwelded_vertices });

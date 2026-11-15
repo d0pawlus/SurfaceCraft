@@ -81,10 +81,16 @@ fn measure(r: &Built<'_>, pts: &[(Point3, Vec3, f64)], tol: f64, cov: &mut Cover
     }
 }
 
-/// Measures points sampled over the `n` removed triangles `gone(i)` against the result: the centres
-/// of a subdivision with spacing at most the tolerance when that stays within
-/// [`MAX_REMOVED_SAMPLES`], else exactly that many points spread by area. The points are made and
-/// measured in blocks, never all at once. `None` when cancelled.
+/// Measures points sampled over the `n` removed triangles `gone(i)` against the result, made and
+/// measured in blocks (never all at once), at most [`MAX_REMOVED_SAMPLES`] in all:
+/// - the centres of a subdivision with spacing at most the tolerance, when that stays within the
+///   budget (every triangle at least once);
+/// - else, when there are fewer triangles than the budget, one point in every triangle and the rest
+///   of the budget by area;
+/// - else exactly the budget spread by area (a triangle smaller than the share of one point may get
+///   none).
+///
+/// `None` when cancelled.
 pub(super) fn coverage(
     r: &Built<'_>,
     (n, gone): (usize, &dyn Fn(usize) -> Option<[Point3; 3]>),
@@ -94,46 +100,55 @@ pub(super) fn coverage(
     let area = |t: &[Point3; 3]| crate::tri::area(&t[0], &t[1], &t[2]);
     let total: f64 = (0..n).filter_map(gone).map(|t| area(&t)).sum();
     let each = tol * tol;
-    let estimate: f64 = (0..n).filter_map(gone).map(|t| (area(&t) / each).ceil().max(1.0)).sum();
+    let split =
+        |t: &[Point3; 3]| if each > 0.0 { ((area(t) / each).sqrt().ceil() as usize).clamp(1, MAX_SPLIT) } else { 1 };
+    // what the subdivision emits: k² points a triangle
+    let estimate: usize = (0..n).filter_map(gone).map(|t| split(&t).pow(2)).sum();
     let mut cov = Coverage::default();
     let mut buf: Vec<(Point3, Vec3, f64)> = Vec::with_capacity(CHUNK);
-    let flush = |buf: &mut Vec<(Point3, Vec3, f64)>, cov: &mut Coverage| -> Option<()> {
-        if cancel.is_cancelled() {
-            return None;
+    let mut emit = |p: (Point3, Vec3, f64)| -> Option<()> {
+        buf.push(p);
+        if buf.len() >= CHUNK {
+            if cancel.is_cancelled() {
+                return None;
+            }
+            measure(r, &buf, tol, &mut cov);
+            buf.clear();
         }
-        measure(r, buf, tol, cov);
-        buf.clear();
         Some(())
     };
-    if estimate <= MAX_REMOVED_SAMPLES as f64 && each > 0.0 {
+    if estimate <= MAX_REMOVED_SAMPLES {
+        let mut one = Vec::new();
         for t in (0..n).filter_map(gone) {
-            let k = ((area(&t) / each).sqrt().ceil() as usize).clamp(1, MAX_SPLIT);
-            subdivide(&t, k, &mut buf);
-            if buf.len() >= CHUNK {
-                flush(&mut buf, &mut cov)?;
-            }
+            one.clear();
+            subdivide(&t, split(&t), &mut one);
+            one.iter().try_for_each(|&p| emit(p))?;
+        }
+    } else if n < MAX_REMOVED_SAMPLES {
+        let rest = (MAX_REMOVED_SAMPLES - n) as f64;
+        for t in (0..n).filter_map(gone) {
+            let m = 1 + (area(&t) / total.max(f64::MIN_POSITIVE) * rest) as usize;
+            let nrm = crate::tri::normal(&t[0], &t[1], &t[2]).unwrap_or_else(Vec3::z);
+            (0..m).try_for_each(|k| emit((super::overlap::point_in(&t, k), nrm, area(&t) / m as f64)))?;
         }
     } else {
-        spread(n, gone, total, &mut |p| {
-            buf.push(p);
-            if buf.len() >= CHUNK { flush(&mut buf, &mut cov) } else { Some(()) }
-        })?;
+        spread(n, gone, total, &mut emit)?;
     }
-    flush(&mut buf, &mut cov)?;
+    if cancel.is_cancelled() {
+        return None;
+    }
+    measure(r, &buf, tol, &mut cov);
     Some(cov)
 }
 
 /// Exactly [`MAX_REMOVED_SAMPLES`] points spread over the removed triangles by area (the k-th at the
-/// area fraction `(k + ½) / count`, placed in its triangle by the plastic-number sequence), handed to
-/// `emit` one by one.
+/// area fraction `(k + ½) / count`), handed to `emit` one by one.
 fn spread(
     n: usize,
     gone: &dyn Fn(usize) -> Option<[Point3; 3]>,
     total: f64,
     emit: &mut dyn FnMut((Point3, Vec3, f64)) -> Option<()>,
 ) -> Option<()> {
-    const A1: f64 = 0.754_877_666_246_692_7;
-    const A2: f64 = 0.569_840_290_998_053_3;
     let count = MAX_REMOVED_SAMPLES;
     let step = total / count as f64;
     let (mut i, mut upto, mut k) = (0usize, 0.0, 0usize);
@@ -145,11 +160,7 @@ fn spread(
         let a = crate::tri::area(&t[0], &t[1], &t[2]);
         let nrm = crate::tri::normal(&t[0], &t[1], &t[2]).unwrap_or_else(Vec3::z);
         while k < count && (k as f64 + 0.5) * step < upto + a {
-            let (mut u, mut v) = ((0.5 + A1 * k as f64).fract(), (0.5 + A2 * k as f64).fract());
-            if u + v > 1.0 {
-                (u, v) = (1.0 - u, 1.0 - v);
-            }
-            emit((t[0] + (t[1] - t[0]) * u + (t[2] - t[0]) * v, nrm, step))?;
+            emit((super::overlap::point_in(&t, k), nrm, step))?;
             k += 1;
         }
         upto += a;
@@ -234,7 +245,8 @@ fn scan_of(o: Option<&Origin>) -> Option<u32> {
 /// Share of the area of the scan triangles in the result whose centre lies within `tol` of facing
 /// surface of a scan triangle of another scan that shares no vertex with it: two layers left where
 /// the scans overlapped (seam triangles are left out on both sides).
-pub(super) fn stacked_share(r: &Built<'_>, tol: f64, cancel: &Cancel) -> Option<f64> {
+/// Returns (share, triangles counted).
+pub(super) fn stacked_share(r: &Built<'_>, tol: f64, cancel: &Cancel) -> Option<(f64, usize)> {
     let ids: Vec<usize> = (0..r.mesh.triangles.len()).filter(|&i| scan_of(r.origin.get(i)).is_some()).collect();
     let mut flags: Vec<(f64, bool)> = Vec::with_capacity(ids.len());
     for chunk in ids.chunks(CHUNK) {
@@ -245,7 +257,8 @@ pub(super) fn stacked_share(r: &Built<'_>, tol: f64, cancel: &Cancel) -> Option<
     }
     let total = flags.iter().fold(0.0, |a, f| a + f.0);
     let stacked = flags.iter().filter(|f| f.1).fold(0.0, |a, f| a + f.0);
-    Some(if total > 0.0 { stacked / total } else { 0.0 })
+    let count = flags.iter().filter(|f| f.1).count();
+    Some((if total > 0.0 { stacked / total } else { 0.0 }, count))
 }
 
 /// (area, lies on another scan) for the triangles `ids`.

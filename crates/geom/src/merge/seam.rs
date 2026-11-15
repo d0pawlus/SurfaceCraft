@@ -33,6 +33,8 @@ pub struct SeamReport {
     pub restored: usize,
     /// Triangles built to close the seam by pivoting.
     pub built: usize,
+    /// Rounds of widening done (at most one per merge).
+    pub widen_rounds: usize,
     /// Small holes left by the pivoting that were filled, and the triangles that took.
     pub filled_loops: usize,
     pub fill_triangles: usize,
@@ -92,6 +94,9 @@ pub(super) fn close(
         return Some(());
     }
     guard.corners = Some(Corners::new(u, scans, &front));
+    if cancel.is_cancelled() {
+        return None;
+    }
     let pts = Pts::of(u);
     let mut accept = |t: [u32; 3]| guard.accept(pts, t);
     let input = BandInput { points: &u.positions, normals: &u.normals, triangles: &u.triangles, front: &front };
@@ -120,8 +125,17 @@ pub(super) fn refill(
         // a twisted corner is a hole of a few edges; widening it once may let it be filled, widening
         // again and again only opens the seam
         let tiny: Vec<Vec<u32>> = left.into_iter().filter(|l| l.len() <= WIDEN_EDGES).collect();
-        let widened = if round < WIDEN_ROUNDS { super::fill::widen(u, guard, &tiny) } else { 0 };
+        // once per merge: the refill after the recovery does not widen again
+        let widened = if round < WIDEN_ROUNDS && rep.widen_rounds == 0 {
+            rep.widen_rounds += 1;
+            super::fill::widen(u, guard, &tiny)
+        } else {
+            0
+        };
         let undone = super::fill::unpinch(u, guard) + widened;
+        if cancel.is_cancelled() {
+            return None;
+        }
         rep.unpinched += undone;
         if undone == 0 {
             break;

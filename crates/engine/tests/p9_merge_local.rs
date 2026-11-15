@@ -9,8 +9,9 @@
 //! vertex of one piece coincides with one of another and the seam must be built). The merge is
 //! compared with the whole scan: the share of the scan's vertices within the tolerance of the merge,
 //! the share found bit for bit (exact only), boundary loops and pieces against the scan's, open seam,
-//! issues and time. `SURFACECRAFT_LOCAL_SCAN=n` runs one scan only. Nothing is asserted beyond "no
-//! panic, an answer": the numbers are the result.
+//! issues and time. `SURFACECRAFT_LOCAL_SCAN=n` runs one scan only. Asserted: the exact pieces of a
+//! scan merge without an error, no merge is refused, and at least 0.66 of the scan's vertices lie
+//! within the tolerance of the merge; the rest of the numbers are the result.
 mod pair_common;
 use pair_common::cut;
 use serde_json::{Value, json};

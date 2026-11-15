@@ -270,12 +270,14 @@ pub const SPECK_SHARE: f64 = 0.01;
 
 /// Drops the pieces of the union other than the largest that lie wholly (the centre of every
 /// triangle) within `tol` of facing surface of the rest: a stray triangle of a scan left on the
-/// merged surface, a second layer. Returns the kept scan triangles dropped as `(scan, triangle)`.
-pub(super) fn drop_islands(u: &mut Union, tol: f64, cancel: &crate::Cancel) -> Option<(Vec<(u32, u32)>, usize)> {
+/// merged surface, a second layer. Returns the kept scan triangles dropped as `(scan, triangle)`, the
+/// number dropped and of them the recovered ones. Runs after the guard's last use: the guard is not
+/// told (nothing is accepted after it), the vertices left unused stay out of the result's mesh.
+pub(super) fn drop_islands(u: &mut Union, tol: f64, cancel: &crate::Cancel) -> Option<(Vec<(u32, u32)>, usize, usize)> {
     let mesh = Mesh { positions: u.positions.clone(), triangles: u.triangles.clone() };
     let parts = crate::edit::components(&mesh);
     if parts.len() < 2 {
-        return Some((Vec::new(), 0));
+        return Some((Vec::new(), 0, 0));
     }
     let bvh = crate::Bvh::build(&mesh);
     let mut drop = vec![false; u.triangles.len()];
@@ -310,9 +312,10 @@ pub(super) fn drop_islands(u: &mut Union, tol: f64, cancel: &crate::Cancel) -> O
         .filter_map(|(o, _)| if let Origin::Kept(s, t) = o { Some((*s, *t)) } else { None })
         .collect();
     let count = drop.iter().filter(|d| **d).count();
+    let recovered = u.origin.iter().zip(&drop).filter(|(o, d)| **d && matches!(o, Origin::Recovered(..))).count();
     let mut keep = drop.iter().map(|d| !d);
     u.triangles.retain(|_| keep.next().unwrap_or(true));
     let mut keep = drop.iter().map(|d| !d);
     u.origin.retain(|_| keep.next().unwrap_or(true));
-    Some((kept, count))
+    Some((kept, count, recovered))
 }

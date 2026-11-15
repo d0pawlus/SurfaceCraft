@@ -3,6 +3,7 @@
 //! the tolerance), the share of each scan that another one covers, and the evidence that one of two
 //! scans is turned inside out (their normals oppose where they meet).
 use super::prep::Scan;
+use crate::bvh::RayCast;
 use crate::{Cancel, Mesh, Point3, Vec3, par};
 
 /// Points sampled over each scan for the pair statistics.
@@ -11,6 +12,8 @@ pub const PAIR_SAMPLES: usize = 20_000;
 const CHUNK: usize = 4096;
 /// Two surfaces face the same way when the cosine of the angle of their normals is at least this.
 pub(super) const COS_FACING: f64 = 0.5;
+/// Triangle tests of one ray cast at most (a cast that runs out counts as no hit).
+const MAX_RAY_TESTS: usize = 1 << 16;
 /// A pair is displaced only when at least this share of the samples lies over the other scan.
 pub const OVER_SHARE: f64 = 0.05;
 /// The high quantile of the residual reported (percent).
@@ -23,6 +26,18 @@ const COS_OPPOSED: f64 = 0.5;
 pub(super) struct Sample {
     pub(super) point: Point3,
     pub(super) normal: Vec3,
+}
+
+/// The `k`-th point of a low-discrepancy sequence in triangle `t` (the plastic number's: every
+/// operation exactly rounded, so the same points everywhere).
+pub(super) fn point_in(t: &[Point3; 3], k: usize) -> Point3 {
+    const A1: f64 = 0.754_877_666_246_692_7; // 1 / plastic number
+    const A2: f64 = 0.569_840_290_998_053_3; // its square
+    let (mut u, mut v) = (frac(0.5 + A1 * k as f64), frac(0.5 + A2 * k as f64));
+    if u + v > 1.0 {
+        (u, v) = (1.0 - u, 1.0 - v);
+    }
+    t[0] + (t[1] - t[0]) * u + (t[2] - t[0]) * v
 }
 
 /// Fractional part (for the low-discrepancy sequence; exactly rounded operations only).
@@ -43,20 +58,14 @@ pub(super) fn area_samples(mesh: &Mesh, count: usize) -> Vec<Sample> {
     if !(total > 0.0) || count == 0 {
         return Vec::new();
     }
-    const A1: f64 = 0.754_877_666_246_692_7; // 1 / plastic number
-    const A2: f64 = 0.569_840_290_998_053_3; // its square
     let each = total / count as f64;
     (0..count)
         .filter_map(|k| {
             let at = (k as f64 + 0.5) * each;
             let t = prefix.partition_point(|&c| c < at).min(prefix.len() - 1);
-            let [a, b, c] = mesh.triangle(t)?;
-            let (mut u, mut v) = (frac(0.5 + A1 * k as f64), frac(0.5 + A2 * k as f64));
-            if u + v > 1.0 {
-                (u, v) = (1.0 - u, 1.0 - v);
-            }
+            let corners = mesh.triangle(t)?;
             let normal = mesh.face_normal(t)?;
-            Some(Sample { point: a + (b - a) * u + (c - a) * v, normal })
+            Some(Sample { point: point_in(&corners, k), normal })
         })
         .collect()
 }
@@ -106,22 +115,25 @@ impl PairResidual {
         if self.near == 0 { 0.0 } else { (self.near - self.within) as f64 / self.near as f64 }
     }
 
-    /// Do more samples lie over `b` displaced beyond the reach than agree with it within the tolerance,
-    /// and at least [`OVER_SHARE`] of all samples? (Rays along the normals of a part with many faces
+    /// Do at least [`OVER_SHARE`] of the samples (and `min`) lie over `b` displaced beyond the reach,
+    /// while (almost) none agrees with it within the tolerance? Scans that share surface somewhere are
+    /// aligned there: a shelf seen by one over a floor seen by the other is geometry, not a
+    /// displacement. (Rays along the normals of a part with many faces
     /// meet a facing surface of a piece that lies elsewhere now and then: a percent of the samples
     /// of pieces that share nothing was measured on a real scan.)
     /// (Scans offset by more than the reach: they share no surface within it but lie over each other.)
     #[must_use]
     pub fn displaced(&self, min: usize) -> bool {
-        self.over >= min && self.over as f64 >= OVER_SHARE * self.samples as f64 && self.over > self.within
+        self.over >= min && self.over as f64 >= OVER_SHARE * self.samples as f64 && self.within < min
     }
 }
 
 /// What sample `s` of one scan finds on `other` (reach `reach`, tolerance `tol`).
 fn look(s: &Sample, other: &Scan, reach: f64, tol: f64) -> Option<Seen> {
-    let grown = other.bbox.dist2(&s.point);
-    if !(grown <= reach * reach) {
-        return None;
+    // beyond the reach of the other scan's box no surface of it is near; it may still lie over the
+    // sample farther away (a flat sheet displaced along its normal has a box of no thickness)
+    if !(other.bbox.dist2(&s.point) <= reach * reach) {
+        return over(s, other, reach);
     }
     let facing = other.bvh.closest_facing(&s.point, reach, &[s.normal], COS_FACING);
     if let Some(h) = facing.filter(|h| other.interior(h.triangle, &h.point)) {
@@ -144,9 +156,14 @@ fn over(s: &Sample, other: &Scan, reach: f64) -> Option<Seen> {
     if !(other.bbox.dist2(&s.point) <= wide * wide) {
         return None;
     }
+    // a bounded cast: a pile of triangles at one place costs at most MAX_RAY_TESTS, and a cast that
+    // runs out says nothing
     let hit = [s.normal, -s.normal]
         .iter()
-        .filter_map(|d| other.bvh.ray_cast_where(&s.point, d, wide, &|_| true))
+        .filter_map(|d| match other.bvh.ray_cast_bounded(&s.point, d, wide, &|_| true, MAX_RAY_TESTS) {
+            RayCast::Hit(t, at) => Some((t, at)),
+            RayCast::Miss | RayCast::Exhausted => None,
+        })
         .min_by(|a, b| a.1.total_cmp(&b.1))?;
     (hit.1 > reach && other.face_normal(hit.0).dot(&s.normal) >= COS_FACING).then_some(Seen::Over)
 }

@@ -327,6 +327,13 @@ fn the_default_tolerance_comes_from_the_noise() {
     let given = merge(&mut s, 2, json!({"tolerance": 0.35}));
     assert_eq!(given["tolerance_source"], json!("given"));
     assert_eq!(given["tolerance"], json!(0.35));
+    // no estimate made: the field is absent, as the schema says
+    assert!(given["scans"].as_array().unwrap().iter().all(|r| r.get("noise").is_none()), "{}", given["scans"]);
+    // the seam length is half the length of the cut edges the seam closed (each seam has two sides),
+    // never more than the cut length
+    let seam = &given["seam"];
+    let length = seam["length"].as_f64().unwrap();
+    assert!(length > 0.0 && seam["cut_edges"].as_u64().unwrap() > 0, "{seam}");
 }
 
 /// Everything but the stage times.

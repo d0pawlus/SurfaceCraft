@@ -282,29 +282,33 @@ Normals, colours and per-vertex data go with the coordinates.
     of the other, up to 8 tolerances away) lies farther apart than the tolerance. Merging them would
     either stack two layers or average them into a surface neither scan saw. Align better
     (`align.icp`, `align.global`) or give a larger tolerance knowingly. Also refused: scans offset by
-    more than 8 tolerances, which share no surface within that reach but lie over each other. They
-    are found along each sample's normal: the first surface of the other scan, within its size, faces
-    the same way (`pairs[].over`), and more samples lie over it than agree with it. Scans that are apart
+    more than 8 tolerances, which share no surface within that reach but lie over each other (flat
+    scans too, whose boxes do not overlap within the reach). They are found along each sample's
+    normal: the first surface of the other scan faces the same way (`pairs[].over`), at least 5 % of
+    the samples lie over it and fewer than 50 agree with it. Scans that are apart
     in space are no refusal: they give a union of pieces and the notice `scans_disjoint`.
   - `opposed_normals`: the normals of two scans oppose where they meet. One is turned inside out.
   - `inconsistent_winding`: triangles wound against the rest of their piece cover more than 0.1 % of a
     scan's area (a patch turned inside out). Fewer are left out and reported as
     `flipped_triangles_dropped`, so the result never has a flipped part.
   - `inverted_scan`: a closed piece of a scan has a negative volume. Inner skins (inside another
-    closed piece, as the inside of a hollow part) and debris below 1 % of the scan's area are not
-    refused; they are reported as `inner_skins` with their counts.
+    closed piece, as the inside of a hollow part) and debris (small pieces below 1 % of the scan's
+    area all together) are not refused; they are reported as `inner_skins` with their counts.
 - Reported, not refused: `non_manifold_input` (exact duplicate triangles and triangles on edges of
   three or more triangles are left out and counted as removed), `flipped_triangles_dropped`, `scans_disjoint` (groups of scans that share no surface: the result is a
   union of separate pieces), `scan_fully_covered` (a scan lies wholly on others and adds nothing),
   `seam_open` (cut edges no triangle could close), `removed_not_covered` (less than 99 % of the removed
   area within the tolerance of the result), `layers_stacked` (more than 0.5 % of the scans' area in the
-  result lies on another scan's surface: two layers left), `unwelded_vertices` (vertices of different
+  result lies on another scan's surface: two layers left; with their triangle count), `unwelded_vertices` (vertices of different
   scans closer than 0.01 median edges with no edge between them), `unoriented_edges` and
   `pinched_vertices`.
 - The report:
-  - per scan: triangles `kept`, `removed`, `restored`, `overlap_share`;
+  - per scan: triangles `kept`, `removed`, `restored`, `collapsed` (two corners welded into one),
+    `dropped`, `overlap_share`, `noise` (absent when the tolerance was given);
   - per pair: the residual where one lies on the other (`rms`, `p95`, `worst`, `beyond_share`);
-  - `seam`: cut edges, length, triangles created, refusals by reason, open edges and their length;
+  - `seam`: cut edges, length, triangles created, refusals by reason (`refused_unsupported`,
+    `refused_crossing`, `refused_corners`), recovered triangles and the specks taken back again,
+    open edges and their length;
   - `before` (the scans together) and `after`: pieces, boundary loops, genus, non-manifold and
     unoriented edges, pinched vertices;
   - `checks`: the removed triangles are sampled by area (up to 2 million points; every triangle at
@@ -314,7 +318,8 @@ Normals, colours and per-vertex data go with the coordinates.
     within the tolerance of facing surface of another scan: two layers);
   - `stages` in milliseconds.
 - The result is what `scan.to_solid` (method `freeform`) wraps: four noisy views of the organic test
-  blob merge into one closed piece of genus 0 that wraps to `pass`, as one full scan of the blob does.
+  blob merge into one piece that wraps no worse than one full scan of the blob (in a few noise draws a
+  small loop stays open where all views meet in a point; it is reported).
 - Limits:
   - Two OPEN scans that are both turned inside out, consistently, cannot be told from right ones (as
     with `align.pair_coarse`).

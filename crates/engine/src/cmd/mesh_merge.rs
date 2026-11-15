@@ -67,6 +67,7 @@ pub struct MergeScanOut {
     /// The mesh.
     pub object: ObjectId,
     /// Noise estimate of the scan (σ, mm; 0 when it could not be measured; absent when the tolerance was given and no estimate was made).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub noise: Option<f64>,
     /// Triangles of the scan.
     pub triangles: usize,
@@ -144,6 +145,10 @@ pub struct MergeSeamOut {
     pub recovered: usize,
     /// Triangles of small stray pieces dropped because they lay wholly on the rest of the result.
     pub strays_dropped: usize,
+    /// Seam triangles refused for joining vertices of one piece of one scan that share no cut edge.
+    pub refused_corners: usize,
+    /// Recovered triangles taken back again as small specks the seam had cut off.
+    pub specks_dropped: usize,
     /// Cut edges left open.
     pub open_edges: usize,
     /// Their length (mm).
@@ -281,8 +286,9 @@ fn refusal_out(i: &Issue) -> Option<MergeIssueOut> {
             "refusal",
             vec![*a, *b],
             format!(
-                "scans {a} and {b} disagree where they overlap: {:.1} % of {near} shared points lie farther apart than the tolerance (rms {rms:.4} mm, 95th percentile {p95:.4} mm), and {over} points lie over the other scan farther away than 8 tolerances; they are not averaged or stacked: align them better (align.icp, align.global) or give a larger tolerance",
-                100.0 * beyond_share
+                "scans {a} and {b} disagree where they overlap: {:.1} % of {near} shared points lie farther apart than the tolerance (rms {rms:.4} mm, 95th percentile {p95:.4} mm), and {over} points lie over the other scan farther away than {} tolerances; they are not averaged or stacked: align them better (align.icp, align.global) or give a larger tolerance",
+                100.0 * beyond_share,
+                surfacecraft_geom::merge::REACH_TOLERANCES
             ),
         ),
         Issue::Opposed { a, b, opposed, facing } => issue(
@@ -330,7 +336,8 @@ fn scan_notice(i: &Issue) -> Option<MergeIssueOut> {
             "info",
             vec![*scan],
             format!(
-                "scan {scan} has {skins} closed inner skin(s) (inside another piece, facing inward as the inside of a hollow part does) and {debris} closed debris piece(s) below 1 % of its area with a negative volume; they are not taken as turned inside out"
+                "scan {scan} has {skins} closed inner skin(s) (inside another piece, facing inward as the inside of a hollow part does) and {debris} closed debris piece(s) below {:.0} % of its area together with a negative volume; they are not taken as turned inside out",
+                100.0 * surfacecraft_geom::merge::INVERTED_MIN_SHARE
             ),
         ),
         Issue::Disjoint { groups } => issue(
@@ -408,16 +415,27 @@ fn check_notice(i: &Issue) -> MergeIssueOut {
                 "{vertices} vertices of the result lie at (nearly) the point of a vertex of another scan without an edge between them"
             ),
         ),
-        Issue::Stacked { share } => issue(
+        Issue::Stacked { share, triangles } => issue(
             "layers_stacked",
             "warning",
             Vec::new(),
             format!(
-                "{:.2} % of the scans' area in the result lies on another scan's surface: two layers were left there",
+                "{triangles} triangles ({:.2} % of the scans' area in the result) lie on another scan's surface: two layers were left there",
                 100.0 * share
             ),
         ),
-        other => issue("other", "warning", Vec::new(), format!("{other:?}")),
+        // refusals, scan notices and notices are written by the functions above
+        other @ (Issue::Misaligned { .. }
+        | Issue::Opposed { .. }
+        | Issue::Winding { .. }
+        | Issue::Inverted { .. }
+        | Issue::InnerSkins { .. }
+        | Issue::NonManifold { .. }
+        | Issue::Disjoint { .. }
+        | Issue::FullyCovered { .. }
+        | Issue::SeamOpen { .. }
+        | Issue::RemovedUncovered { .. }
+        | Issue::Pinched { .. }) => issue("other", "warning", Vec::new(), format!("{other:?}")),
     }
 }
 
@@ -479,6 +497,8 @@ fn seam_out(r: &Report) -> MergeSeamOut {
         uncovered_after_seam: s.recovered.uncovered,
         recovered: s.recovered.triangles.saturating_sub(s.recovered.specks_dropped),
         strays_dropped: s.islands_dropped,
+        refused_corners: s.bad_corners,
+        specks_dropped: s.recovered.specks_dropped,
         open_edges: s.open_edges,
         open_length: s.open_length,
     }
