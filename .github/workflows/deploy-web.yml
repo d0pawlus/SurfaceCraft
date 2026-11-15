@@ -44,8 +44,9 @@ jobs:
         with:
           # the commit ci tested, not whatever main points at now
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.99.1" # rust-toolchain.toml
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
