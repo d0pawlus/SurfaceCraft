@@ -130,6 +130,8 @@ fn only_a_primitives_failure_without_a_body_is_wrapped_as_freeform() {
         allow_retry: true,
         budget: super::super::budget::CallBudget::default(),
         rebuild: true,
+        close_handles: false,
+        handle_size: None,
         name: "solid".into(),
     };
     let mut out = failure(&set, ObjectId(1), "x");

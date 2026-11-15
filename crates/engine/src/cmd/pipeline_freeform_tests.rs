@@ -29,6 +29,8 @@ fn session() -> (Session, Settings) {
         allow_retry: true,
         budget: super::super::budget::CallBudget::default(),
         rebuild: true,
+        close_handles: false,
+        handle_size: None,
         name: "w".into(),
     };
     (s, set)
@@ -435,4 +437,24 @@ fn a_part_refused_the_retry_by_the_spent_budget_says_so_in_its_component() {
     let note = done[1].0.retry.as_ref().unwrap();
     assert!(!note.kept && note.patches_to.is_none() && note.cap_to > note.cap_from, "{note:?}");
     assert!(done[1].1.next_steps.iter().any(|st| st.command == "surface.wrap"), "a larger cap is still advised");
+}
+
+/// A wrap that fails on a scan with many handles still offers to close them.
+#[test]
+fn a_failed_wrap_of_a_scan_with_many_handles_offers_close_handles() {
+    use surfacecraft_geom::synth_wall::{Wall, wall};
+    let tubes: Vec<(usize, usize, usize)> =
+        (2..30).step_by(3).flat_map(|j| (2..30).step_by(3).map(move |i| (i, j, 1))).collect();
+    let (mut s, mut set) = session();
+    set.scan = s.doc.add_mesh("sponge", wall(&Wall { size: 32.0, cells: 32, gap: 0.6, bend: 1.0, tubes }));
+    let out = freeform_with(&mut s, &set, empty_report(), |_, _| Err(CmdError::Failed("boom".into()))).unwrap();
+    assert_eq!(out.verdict, Verdict::Fail);
+    let offered = out
+        .next_steps
+        .iter()
+        .any(|st| st.command == "scan.to_solid" && st.params["close_handles"] == serde_json::json!(true));
+    assert!(offered, "{:?}", out.next_steps);
+    set.close_handles = true;
+    let out = freeform_with(&mut s, &set, empty_report(), |_, _| Err(CmdError::Failed("boom".into()))).unwrap();
+    assert!(out.next_steps.iter().all(|st| st.params["close_handles"] != serde_json::json!(true)), "not offered twice");
 }

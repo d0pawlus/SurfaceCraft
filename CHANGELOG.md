@@ -9,6 +9,16 @@ Every feature is a command (`area.verb`), so each entry below is available in th
 web app, the CLI, scripts and the MCP server alike, unless it says otherwise. Numbers in brackets
 are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
 
+## [Unreleased]
+
+### Added
+
+- `mesh.close_handles`: closes the small handles of a scan (tunnels, bridges and the sponge of tiny
+  tunnels where the two sides of a thin wall run together) as a new mesh, keeping the rim and every
+  vertex away from them; `scan.to_solid` takes it as the option `close_handles` (with `handle_size`),
+  wraps the repaired copy, measures the solid against the scan as it was and raises
+  `scan_handles_closed` (#120).
+
 ## [0.2.0] - 2026-11-13
 
 Four days and 60 merged pull requests after 0.1.0. The release is about real scans: one command now takes
