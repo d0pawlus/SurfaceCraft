@@ -354,7 +354,7 @@ kernel refuses sheets of many faces. Give the wall thickness instead:
   before and the issue is context. Check which way the normals face (flip them if they point into
   the part) before choosing the sign of `thickness`. To cap such a loop anyway (a mould of a dish),
   run `mesh.fill_holes` with `allow_inward: true`; by default it refuses it too and counts it in
-  `holes_inward`.
+  `holes_inward`, which counts loops (a ragged opening of 5 lobes counts 5).
 
 ## Messy scans: parts, handles, shells
 

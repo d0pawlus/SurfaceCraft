@@ -75,7 +75,8 @@ fn vertex_pieces(mesh: &Mesh) -> Vec<u32> {
 
 /// The openings the loops `ks` of `todo` belong to, as a root per entry of `ks`: loops that share a
 /// vertex are one opening (a ragged rim that `simple_loops` split at the vertices where it touches
-/// itself); separate holes share none.
+/// itself, and likewise two holes that touch at a single vertex, which are judged together);
+/// separate holes share none.
 fn openings(todo: &[Vec<u32>], ks: &[usize]) -> Vec<u32> {
     let mut roots = Roots::new(ks.len());
     let mut first: HashMap<u32, u32> = HashMap::new();
@@ -384,31 +385,88 @@ mod tests {
         }
     }
 
-    /// A hollow dish whose rim touches itself at one vertex in five places (five thin triangles from
-    /// the middle of its opening to the rim): the rim is split into five loops of about a fifth of
-    /// the opening each, below the share one by one; they are one opening and stay open together.
-    #[test]
-    fn the_lobes_of_a_rim_that_touches_itself_are_judged_as_one_opening() {
-        // Arrange
-        let mut m = dish(true);
+    /// The share of `m`'s area the smooth patch of each simple loop would add, each filled alone.
+    fn lobe_shares(m: &Mesh) -> Vec<f64> {
+        let lobes = crate::holes::simple_loops(boundary_loops(m));
+        let area = m.area();
+        lobes
+            .iter()
+            .map(|lobe| {
+                let mut one = m.clone();
+                let only = |_: &Mesh, lp: &[u32]| lp == lobe.as_slice();
+                let guard = crate::holes::Guard::AllowInward;
+                crate::holes::fill_holes_filtered(&mut one, 1000, (true, true), guard, &only);
+                (one.area() - area) / area
+            })
+            .collect()
+    }
+
+    /// Splits the one boundary loop of `m` into `count` lobes that touch at a new vertex in the
+    /// middle of the opening: a thin triangle from it to `count` rim edges spread around the loop.
+    fn touching_lobes(mut m: Mesh, count: usize) -> Mesh {
         let rim = boundary_loops(&m).remove(0);
         let n = rim.len();
         let centre = rim.iter().fold(Vec3::zeros(), |acc, &v| acc + m.positions[v as usize].coords) / n as f64;
         let c = m.positions.len() as u32;
         m.positions.push(Point3::from(centre));
-        for i in 0..5 {
-            let (a, b) = (rim[i * n / 5], rim[(i * n / 5 + 1) % n]);
+        for i in 0..count {
+            let (a, b) = (rim[i * n / count], rim[(i * n / count + 1) % n]);
             m.triangles.push([b, a, c]);
         }
-        let mut lobes = boundary_loops(&m);
-        assert!(!lobes.is_empty());
-        lobes = super::super::simple_loops(lobes);
-        assert_eq!(lobes.len(), 5, "five lobes through the middle vertex");
+        m
+    }
+
+    /// A hollow dish whose rim touches itself at one vertex in eight places: the rim is split into
+    /// eight loops, each well below the share on its own; together they are about as large as the
+    /// dish, one opening, and they stay open together.
+    #[test]
+    fn the_lobes_of_a_rim_that_touches_itself_are_judged_as_one_opening() {
+        // Arrange
+        let mut m = touching_lobes(dish(true), 8);
+        let shares = lobe_shares(&m);
+        assert_eq!(shares.len(), 8, "eight lobes through the middle vertex");
+        let share = super::INWARD_PATCH_SHARE;
+        assert!(shares.iter().all(|&x| x < share / 1.5), "{shares:?}");
+        assert!(shares.iter().sum::<f64>() > 1.5 * share, "{shares:?}");
 
         // Act
         let rep = fill_holes(&mut m, 1000, true);
 
         // Assert
-        assert_eq!((rep.filled, rep.inward), (0, 5));
+        assert_eq!((rep.filled, rep.inward), (0, 8));
+    }
+
+    /// Two holes of a closed ball stored inside out that touch at one vertex are one opening: small
+    /// together, both are filled and the ball stays inside out (to be reported so); together over
+    /// the share (each under it), both are refused and counted. Two holes each under a share of
+    /// 1/1.5 cannot sum to more than 1.33 times it, so the second case keeps that margin only.
+    #[test]
+    fn two_holes_touching_at_a_vertex_are_judged_together() {
+        let share = super::INWARD_PATCH_SHARE;
+        for (cut, refused) in [(12.5, false), (6.6, true)] {
+            // Arrange: a cap above `cut` removed, its opening split in two at its middle
+            let mut ball = touching_lobes(kept(&ball_inside_out(), |c| c.z < cut), 2);
+            let shares = lobe_shares(&ball);
+            assert_eq!(shares.len(), 2, "cut {cut}");
+            assert!(shares.iter().all(|&x| x < share / 1.5), "cut {cut}: {shares:?}");
+            let total: f64 = shares.iter().sum();
+            if refused {
+                assert!(total > share, "cut {cut}: {shares:?}");
+            } else {
+                assert!(total < share / 1.5, "cut {cut}: {shares:?}");
+            }
+
+            // Act
+            let rep = fill_holes(&mut ball, 1000, true);
+
+            // Assert
+            if refused {
+                assert_eq!((rep.filled, rep.inward), (0, 2), "cut {cut}: {shares:?}");
+            } else {
+                assert_eq!((rep.filled, rep.inward), (2, 0), "cut {cut}: {shares:?}");
+                assert!(boundary_loops(&ball).is_empty());
+                assert!(signed_volume(&ball) < 0.0, "still inside out, to be reported so");
+            }
+        }
     }
 }

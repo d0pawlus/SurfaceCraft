@@ -100,7 +100,8 @@ const WORKSPACE_RINGS: usize = 3;
 /// avoided, and a patch that would still overload an edge (with the mesh or with another patch) is
 /// not added; that hole stays open and is counted in `skipped`. Nor does a fill close a piece of the
 /// mesh inside out: of a piece its patches would close with the scanned face inward, every loop
-/// whose own patch is a large share of the piece stays open (`inward`, see `holes::inward`).
+/// whose patches, with those of the loops it shares vertices with, are a large share of the piece
+/// stays open (`inward`, see `holes::inward`).
 pub fn fill_holes(mesh: &mut Mesh, max_edges: usize, smooth: bool) -> FillReport {
     fill_holes_with(mesh, max_edges, smooth, smooth)
 }
