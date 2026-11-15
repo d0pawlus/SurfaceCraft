@@ -195,11 +195,16 @@ pub struct CleanIn {
     pub fold_tolerance: Option<f64>,
 }
 
+/// Components with fewer triangles than this share of the largest are removed by default.
+pub(crate) const CLEAN_COMPONENT_FRACTION: f64 = 0.01;
+/// Components with fewer triangles than this are removed by default.
+pub(crate) const CLEAN_COMPONENT_TRIANGLES: usize = 20;
+
 /// Default tolerance of the fold removal (mm): the one of `scan.to_solid`.
 const FOLD_TOLERANCE_MM: f64 = 0.2;
 
 pub(crate) fn clean(s: &mut Session, i: CleanIn) -> CmdResult<EditOut> {
-    let frac = fraction(i.min_component_fraction, "min_component_fraction", 0.01)?;
+    let frac = fraction(i.min_component_fraction, "min_component_fraction", CLEAN_COMPONENT_FRACTION)?;
     let ratio = i.outlier_ratio.unwrap_or(1.5);
     if !(ratio.is_finite() && ratio >= 0.0) {
         return Err(CmdError::Params("outlier_ratio must be ≥ 0".into()));
@@ -211,7 +216,8 @@ pub(crate) fn clean(s: &mut Session, i: CleanIn) -> CmdResult<EditOut> {
         if ratio > 0.0 {
             removed += edit::remove_outliers(m, ratio);
         }
-        removed += edit::remove_small_components(m, frac, i.min_component_triangles.unwrap_or(20));
+        removed +=
+            edit::remove_small_components(m, frac, i.min_component_triangles.unwrap_or(CLEAN_COMPONENT_TRIANGLES));
         o.removed_triangles = removed;
         // what the scan recorded: the triangles after this are patches of the hole filling
         let scan_triangles = m.triangle_count();

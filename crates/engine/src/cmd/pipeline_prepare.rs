@@ -2,42 +2,41 @@
 //! is split, and every part that counts is modelled on its own. A scan that already works takes
 //! exactly the path it took before: no preparation, an empty `preparation` list.
 //!
-//! What counts: a piece of the cleaned scan with at least `min_share` of the triangles or the area
-//! is a part (`scan.split`); a part with at least `part_share` (default 10 %) of the area of the
-//! largest piece is *co-equal*. Pieces between the two are minor, pieces below `min_share` are
-//! debris; neither is modelled, and when their area is more than [`UNMODELLED_REVIEW_SHARE`] of the
-//! scan the verdict is at most `review` and an issue says so.
+//! What counts (`pipeline_parts`): a co-equal part (at least `part_share` of the area of the largest
+//! piece) and a small part (a closed, consistently oriented solid that is no debris) are modelled;
+//! every other piece is left out with its reason. The result of the whole scan is put together in
+//! `pipeline_parts_report`.
 use super::freeform::RetryReason;
+use super::parts::{self, LeftOutReason, MAX_COMPONENTS, Pieces, Plan};
+use super::parts_report::{PieceOut, Tally, combine};
 use super::rebuild::Stopwatch;
 use super::{
-    CmdError, CmdResult, DeviationSummary, Issue, Method, NextStep, ScanSummary, Settings, ToSolidIn, ToSolidOut,
-    Verdict, issue, message_of, prepare, settings, solve,
+    CmdError, CmdResult, DeviationSummary, Issue, Method, ScanSummary, Settings, ToSolidIn, ToSolidOut, Verdict, issue,
+    message_of, prepare, settings, solve,
 };
 use crate::Session;
 use crate::cmd::body::BodyOut;
-use crate::cmd::scan_split::{self, Analysis, MIN_SHARE};
+use crate::cmd::scan_split::{self, MIN_SHARE};
 use crate::cmd::{ObjRef, cancelled, is_cancelled};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use surfacecraft_doc::ObjectId;
 
-/// Parts modelled in one run at most (the largest); the rest are reported.
-pub(super) const MAX_COMPONENTS: usize = 24;
-/// A part is co-equal when its area is at least this share of the largest piece's.
-pub(super) const PART_SHARE: f64 = 0.1;
-/// Unmodelled area above this share of the scan caps the verdict at `review`.
-const UNMODELLED_REVIEW_SHARE: f64 = 0.02;
-/// Parts (largest first) that may be rebuilt and wrapped again in one call.
+pub(super) use super::parts::{PART_SHARE, coequal_parts};
+
+/// Co-equal parts (largest first) that may be rebuilt and wrapped again in one call. Small parts are
+/// never rebuilt: on the scan of many parts the rebuild of a watertight non-manifold small part took
+/// 400 s and was discarded (the plain wrap passed in 6 s), or was refused.
 const REBUILD_PARTS: usize = 4;
 
 /// Which co-equal parts of a scan are modelled.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(untagged)]
 pub enum Components {
-    /// `all` (the largest 24) or `largest`.
+    /// `all` (every co-equal and small part, at most 128) or `largest`.
     Word(String),
-    /// The number of largest parts.
+    /// The number of largest co-equal parts (no small parts then).
     Count(usize),
 }
 
@@ -73,13 +72,18 @@ pub struct PrepOut {
     /// What was done to the scan before modelling it (`split`, `remesh`) and why; empty when the scan was modelled as it is.
     #[serde(default)]
     pub preparation: Vec<PrepStep>,
-    /// One result per modelled part when the scan was split (the fields above then describe the
-    /// largest part, `deviation` the area-weighted aggregate, `verdict` the worst part's); empty otherwise.
+    /// One result per modelled part when the scan was split, co-equal parts first (the fields above then
+    /// describe the largest part, `deviation` the area-weighted aggregate, `verdict` the worst co-equal
+    /// part's, at most `review` when small parts did not pass or pieces were left out); empty otherwise.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub components: Vec<ComponentOut>,
-    /// The solids of all modelled parts, largest first (empty unless the scan was split).
+    /// The solids of all modelled parts, in the order of `components` (empty unless the scan was split).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bodies: Vec<BodyOut>,
+    /// The largest pieces that were not modelled (at most 16), with the reason; the counts of all of
+    /// them are in the `split` step of `preparation`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pieces_left_out: Vec<PieceOut>,
 }
 
 /// The result for one part of a scan.
@@ -89,6 +93,9 @@ pub struct ComponentOut {
     pub mesh: ObjectId,
     /// Its name.
     pub name: String,
+    /// Co-equal (its verdict is the call's) or a small part (a solid below `part_share` of the largest).
+    #[serde(default = "crate::cmd::deviation::yes")]
+    pub co_equal: bool,
     /// Its triangles.
     pub triangles: usize,
     /// Its surface area (mm2).
@@ -115,18 +122,6 @@ pub struct ComponentOut {
     pub retry: Option<super::freeform::CapRetry>,
 }
 
-pub(super) fn rank(v: Verdict) -> u8 {
-    match v {
-        Verdict::Pass => 2,
-        Verdict::Review => 1,
-        Verdict::Fail => 0,
-    }
-}
-
-fn worst(a: Verdict, b: Verdict) -> Verdict {
-    if rank(a) <= rank(b) { a } else { b }
-}
-
 pub(super) fn check_cancel(s: &Session) -> CmdResult<()> {
     if s.cancel.is_cancelled() { Err(cancelled()) } else { Ok(()) }
 }
@@ -141,68 +136,65 @@ fn part_share_of(i: &ToSolidIn) -> CmdResult<f64> {
     }
 }
 
-/// The pieces of the scan by what becomes of them.
-struct Plan {
-    /// Co-equal parts to model, largest area first.
-    chosen: Vec<usize>,
-    /// Co-equal parts left out because the caller asked for fewer.
-    not_requested: Vec<usize>,
-    /// Co-equal parts left out by the cap of [`MAX_COMPONENTS`].
-    beyond_cap: Vec<usize>,
-    /// Parts that are neither co-equal nor the inner skin of one.
-    minor: Vec<usize>,
-    /// Inner skins of hollow parts.
-    cavities: Vec<usize>,
+/// `(pieces, share of the surface)` of the pieces `ks`.
+fn share_of(p: &Pieces, ks: &[usize]) -> (usize, f64) {
+    (ks.len(), ks.iter().map(|k| p.area(*k)).sum::<f64>() / p.total_area() + 0.0)
 }
 
-fn plan_of(a: &Analysis, part_share: f64, requested: Option<usize>) -> Plan {
-    let area = |k: &usize| a.parts.get(*k).map_or(0.0, |p| p.area);
-    let distinct = a.distinct();
-    // the yardstick is the largest piece that is not the inner skin of another: a cavity skin may have
-    // far more area than the shell around it and must not turn that shell into a "minor" piece
-    let largest = distinct.iter().map(area).fold(0.0, f64::max);
-    let cavities: Vec<usize> = (0..a.parts.len()).filter(|k| !distinct.contains(k)).collect();
-    let (mut equal, minor): (Vec<usize>, Vec<usize>) =
-        distinct.iter().copied().partition(|k| area(k) >= part_share * largest);
-    equal.sort_by(|x, y| area(y).total_cmp(&area(x)).then(x.cmp(y)));
-    if equal.is_empty() {
-        // never a result without a body: fall back to the largest outer piece (or the largest piece)
-        let pool = if distinct.is_empty() { (0..a.parts.len()).collect() } else { distinct };
-        equal.extend(pool.into_iter().max_by(|x, y| area(x).total_cmp(&area(y))));
-    }
-    let take = requested.unwrap_or(MAX_COMPONENTS).min(MAX_COMPONENTS);
-    let rest = equal.split_off(take.min(equal.len()));
-    let (not_requested, beyond_cap) = if requested.is_some() { (rest, Vec::new()) } else { (Vec::new(), rest) };
-    let minor = minor.into_iter().filter(|k| !equal.contains(k)).collect();
-    Plan { chosen: equal, not_requested, beyond_cap, minor, cavities }
+/// The pieces left out, by reason, in the order of the reasons.
+fn by_reason(p: &Pieces, plan: &Plan) -> Vec<(LeftOutReason, usize, f64)> {
+    let mut reasons: Vec<LeftOutReason> = plan.left_out.iter().map(|(_, r)| *r).collect();
+    reasons.sort();
+    reasons.dedup();
+    reasons
+        .into_iter()
+        .map(|r| {
+            let ks: Vec<usize> = plan.left_out.iter().filter(|(_, x)| *x == r).map(|(k, _)| *k).collect();
+            let (n, a) = share_of(p, &ks);
+            (r, n, a)
+        })
+        .collect()
+}
+
+/// The largest pieces left out, one by one.
+fn listed_pieces(p: &Pieces, plan: &Plan) -> Vec<PieceOut> {
+    let mut left = plan.left_out.clone();
+    left.sort_by(|x, y| p.area(y.0).total_cmp(&p.area(x.0)).then(x.0.cmp(&y.0)));
+    let total = p.total_area();
+    left.iter()
+        .take(super::parts_report::MAX_LISTED_PIECES)
+        .filter_map(|(k, r)| p.all.get(*k).map(|q| (q, *r)))
+        .map(|(q, reason)| PieceOut {
+            reason,
+            triangles: q.triangles.len(),
+            area: q.area,
+            share: q.area / total,
+            bbox_min: [q.bbox.min.x, q.bbox.min.y, q.bbox.min.z],
+            bbox_max: [q.bbox.max.x, q.bbox.max.y, q.bbox.max.z],
+        })
+        .collect()
 }
 
 /// What was left out, from the plan: pieces and share of the surface of the scan.
-fn tally_of(a: &Analysis, plan: &Plan, ms: u64) -> Tally {
-    let all_area: f64 = a.parts.iter().chain(&a.extra).chain(&a.rest).map(|p| p.area).sum::<f64>().max(1e-12);
-    let area_of =
-        |ks: &[usize]| ks.iter().filter_map(|k| a.parts.get(*k)).map(|p| p.area).sum::<f64>() / all_area + 0.0;
-    let (rest_area, extra_area) =
-        (a.rest.iter().map(|p| p.area).sum::<f64>() / all_area, a.extra.iter().map(|p| p.area).sum::<f64>() / all_area);
+fn tally_of(p: &Pieces, plan: &Plan, ms: u64) -> Tally {
+    let left: Vec<usize> = plan.left_out.iter().map(|(k, _)| *k).collect();
     Tally {
-        minor: (plan.minor.len() + a.rest.len(), area_of(&plan.minor) + rest_area),
-        cavities: (plan.cavities.len(), area_of(&plan.cavities)),
-        beyond_cap: (plan.beyond_cap.len() + a.extra.len(), area_of(&plan.beyond_cap) + extra_area),
-        not_requested: (plan.not_requested.len(), area_of(&plan.not_requested)),
+        left_out: share_of(p, &left),
+        by_reason: by_reason(p, plan),
+        cavities: share_of(p, &plan.cavities),
+        beyond_cap: share_of(p, &plan.beyond_cap),
+        not_requested: share_of(p, &plan.not_requested),
         modelled: plan.chosen.len(),
-        debris_pieces: a.rest.len(),
+        co_equal: plan.co_equal,
+        debris_pieces: plan.left_out.iter().filter(|(_, r)| *r == LeftOutReason::Debris).count(),
+        listed: listed_pieces(p, plan),
+        total_area: p.total_area(),
         ms,
     }
 }
 
-/// Number of co-equal parts of `mesh` (those a split run would model; 1 for a single piece).
-pub(super) fn coequal_parts(mesh: &surfacecraft_geom::Mesh) -> usize {
-    let a = scan_split::analyse(mesh, MIN_SHARE, true);
-    if a.parts.len() < 2 { a.parts.len() } else { plan_of(&a, PART_SHARE, None).chosen.len() }
-}
-
-/// Splits a scan with several parts and models each co-equal one. `None` for a scan with one piece
-/// that counts (the usual case: nothing changes).
+/// Splits a scan with several parts and models each co-equal and small part. `None` for a scan with
+/// one piece that counts (the usual case: nothing changes).
 pub(super) fn split_parts(
     s: &mut Session,
     i: &ToSolidIn,
@@ -217,25 +209,30 @@ pub(super) fn split_parts(
     let Some(mesh) = s.doc.mesh(set.scan).map(|m| m.mesh.clone()) else { return Ok(None) };
     let watch = Stopwatch::start();
     let a = scan_split::analyse(&mesh, MIN_SHARE, true);
-    if a.parts.len() < 2 {
+    let listed = a.parts.len();
+    let pieces = Pieces::of(&mesh, a);
+    let plan = parts::plan_of(&pieces, listed, (part_share, set.tolerance), requested);
+    if listed < 2 && !parts::worth_splitting(&plan) {
         return Ok(None);
     }
-    let plan = plan_of(&a, part_share, requested);
     let base = s.doc.mesh(set.scan).map_or_else(|| "scan".to_string(), |m| m.name.clone());
     let total_tris = mesh.triangle_count() as f64;
     let mut done: Vec<(ComponentOut, ToSolidOut)> = Vec::new();
     for (n, &k) in plan.chosen.iter().enumerate() {
         check_cancel(s)?;
-        let Some(piece) = a.parts.get(k) else { continue };
+        let Some(piece) = pieces.all.get(k) else { continue };
         let part = scan_split::add_part(s, &base, k, piece, &mesh, total_tris);
-        let allow = (i.rebuild && n < REBUILD_PARTS, retry_allowed(i.allow_retry, &done));
-        done.push(run_part(s, i, set, (&part.name, part.id, piece.area), n + 1, allow)?);
+        let co_equal = n < plan.co_equal;
+        let allow = (i.rebuild && co_equal && n < REBUILD_PARTS, retry_allowed(i.allow_retry, &done));
+        let mut one = run_part(s, i, set, (&part.name, part.id, piece.area), n + 1, allow)?;
+        one.0.co_equal = co_equal;
+        done.push(one);
         #[cfg(test)]
         after_part_hook(n);
     }
     check_cancel(s)?;
-    let tally = tally_of(&a, &plan, watch.ms());
-    Ok(Some(combine(set, report.clone(), done, &tally)))
+    let tally = tally_of(&pieces, &plan, watch.ms());
+    Ok(Some(combine(set, report.clone(), done, tally)))
 }
 
 /// Test hook: called after each part of a split run (index from 0), so that a test can cancel at a
@@ -250,17 +247,6 @@ fn after_part_hook(n: usize) {
     {
         f(n);
     }
-}
-
-/// What was left unmodelled, as `(pieces, share of the area)`.
-struct Tally {
-    minor: (usize, f64),
-    cavities: (usize, f64),
-    beyond_cap: (usize, f64),
-    not_requested: (usize, f64),
-    modelled: usize,
-    debris_pieces: usize,
-    ms: u64,
 }
 
 /// The larger-cap retry is made once per call: for the first part, in area order, whose first result
@@ -313,6 +299,7 @@ fn run_part(
     let comp = ComponentOut {
         mesh: id,
         name: name.to_string(),
+        co_equal: true,
         triangles,
         area,
         verdict: out.verdict,
@@ -375,6 +362,7 @@ pub(super) fn component_for_tests(out: &ToSolidOut) -> ComponentOut {
     ComponentOut {
         mesh: out.scan,
         name: String::new(),
+        co_equal: true,
         triangles: 0,
         area: 0.0,
         verdict: out.verdict,
@@ -394,7 +382,7 @@ pub(super) fn failure_for_tests(set: &Settings, id: ObjectId) -> ToSolidOut {
     failure(set, id, "test")
 }
 
-fn failure(set: &Settings, id: ObjectId, why: &str) -> ToSolidOut {
+pub(super) fn failure(set: &Settings, id: ObjectId, why: &str) -> ToSolidOut {
     let report = ScanSummary {
         triangles_before: 0,
         triangles: 0,
@@ -433,150 +421,6 @@ fn failure(set: &Settings, id: ObjectId, why: &str) -> ToSolidOut {
         thickened: None,
         analytic: None,
     }
-}
-
-/// The deviation over all modelled parts: shares and RMS weighted by the area of the part, the largest maximum.
-fn aggregate(parts: &[(ComponentOut, ToSolidOut)]) -> Option<DeviationSummary> {
-    let with: Vec<(&ComponentOut, &DeviationSummary)> =
-        parts.iter().filter_map(|(c, _)| c.deviation.as_ref().map(|d| (c, d))).collect();
-    let total: f64 = with.iter().map(|(c, _)| c.area).sum();
-    if with.is_empty() || total <= 0.0 {
-        return with.first().map(|(_, d)| (*d).clone());
-    }
-    let w = |f: &dyn Fn(&DeviationSummary) -> f64| with.iter().map(|(c, d)| c.area * f(d)).sum::<f64>() / total;
-    Some(DeviationSummary {
-        count: with.iter().map(|(_, d)| d.count).sum(),
-        coverage: w(&|d| d.coverage),
-        not_facing: w(&|d| d.not_facing),
-        within: w(&|d| d.within),
-        rms: w(&|d| d.rms * d.rms).sqrt(),
-        max_abs: with.iter().map(|(_, d)| d.max_abs).fold(0.0, f64::max),
-        mean: w(&|d| d.mean),
-    })
-}
-
-/// The issues of the parts (named by part when there are several) and of what was left unmodelled;
-/// whether the verdict must come down to `review` for them.
-fn collect_issues(parts: &[(ComponentOut, ToSolidOut)], tally: &Tally) -> (Vec<Issue>, bool) {
-    let mut issues: Vec<Issue> = Vec::new();
-    let several = parts.len() > 1;
-    for (n, (c, _)) in parts.iter().enumerate() {
-        for x in &c.issues {
-            let message =
-                if several { format!("part {} ({}): {}", n + 1, c.name, x.message) } else { x.message.clone() };
-            issues.push(Issue { code: x.code.clone(), message });
-        }
-    }
-    let pct = |share: f64| 100.0 * share;
-    let mut cap = false;
-    if tally.minor.1 > UNMODELLED_REVIEW_SHARE {
-        let msg = format!(
-            "{} pieces ({} of them debris), {:.1} % of the surface of the scan, were not modelled (each is below `part_share` of the largest part); lower `part_share` to model them with the rest, or run `scan.split` and model a piece on its own with `scan.to_solid`",
-            tally.minor.0,
-            tally.debris_pieces,
-            pct(tally.minor.1)
-        );
-        issues.push(issue("unmodelled_pieces", msg));
-        cap = true;
-    }
-    if tally.cavities.1 > UNMODELLED_REVIEW_SHARE {
-        let msg = format!(
-            "{} inner shells (cavity skins of hollow parts, {:.1} % of the surface) were not modelled: the solids are the outer shells; `scan.split` makes a mesh of each shell if a cavity has to be modelled on its own",
-            tally.cavities.0,
-            pct(tally.cavities.1)
-        );
-        issues.push(issue("nested_shell_skipped", msg));
-        cap = true;
-    }
-    if tally.beyond_cap.0 > 0 {
-        let msg = format!(
-            "{} more parts ({:.1} % of the surface) were not modelled: at most {MAX_COMPONENTS} are per call, the largest first; run `scan.split` and model the others on their own (`scan.to_solid` on each mesh), or raise `part_share` to leave the small ones out",
-            tally.beyond_cap.0,
-            pct(tally.beyond_cap.1)
-        );
-        issues.push(issue("parts_beyond_limit", msg));
-        cap = true;
-    }
-    (issues, cap)
-}
-
-/// The next steps of a split result: every part passed and nothing left out: one export of all the
-/// solids; else the steps of each part that did not pass, each labelled with its part, an export of
-/// the solids that did, and (when pieces were left out) the split that makes them meshes of their own.
-fn next_steps_of(parts: &[(ComponentOut, ToSolidOut)], scan: ObjectId, left_out: bool) -> Vec<NextStep> {
-    let passed: Vec<u64> = parts
-        .iter()
-        .filter(|(c, _)| c.verdict == Verdict::Pass)
-        .filter_map(|(c, _)| c.body.as_ref().map(|b| b.id.0))
-        .collect();
-    let mut next = Vec::new();
-    let export =
-        |ids: &[u64], why: String| NextStep { command: "export.step".into(), params: json!({"objects": ids}), why };
-    if passed.len() == parts.len() {
-        let why = if left_out {
-            format!(
-                "the {} solids that were modelled passed (see the issues for what was left out): export them",
-                passed.len()
-            )
-        } else {
-            "every part passed: export all the solids".to_string()
-        };
-        next.push(export(&passed, why));
-    } else {
-        for (n, (c, o)) in parts.iter().enumerate().filter(|(_, (c, _))| c.verdict != Verdict::Pass) {
-            for st in o.next_steps.iter().take(3) {
-                let why = format!("part {} ({}): {}", n + 1, c.name, st.why);
-                next.push(NextStep { why, ..st.clone() });
-            }
-        }
-        if !passed.is_empty() {
-            next.push(export(&passed, format!("export the {} parts that passed", passed.len())));
-        }
-    }
-    if left_out {
-        let why = "makes a mesh of every piece, so that what was left out can be modelled on its own";
-        next.push(NextStep {
-            command: "scan.split".into(),
-            params: json!({"object": scan.0, "keep_debris": true}),
-            why: why.into(),
-        });
-    }
-    next
-}
-
-/// One result for the whole scan: the worst co-equal part's verdict (at most `review` with unmodelled
-/// surface), the largest part's body, the aggregate deviation, every body in `bodies`.
-fn combine(set: &Settings, report: ScanSummary, parts: Vec<(ComponentOut, ToSolidOut)>, tally: &Tally) -> ToSolidOut {
-    let (issues, capped) = collect_issues(&parts, tally);
-    let mut verdict = parts.iter().fold(Verdict::Pass, |v, c| worst(v, c.0.verdict));
-    if capped && verdict == Verdict::Pass {
-        verdict = Verdict::Review;
-    }
-    let deviation = aggregate(&parts);
-    let next = next_steps_of(&parts, set.scan, capped);
-    let largest = parts.iter().enumerate().max_by(|a, b| a.1.0.area.total_cmp(&b.1.0.area)).map_or(0, |(k, _)| k);
-    let bodies: Vec<BodyOut> = parts.iter().filter_map(|(c, _)| c.body.clone()).collect();
-    let step = PrepStep {
-        step: "split".into(),
-        reason: format!("the scan holds {} co-equal parts, modelled one by one", tally.modelled),
-        numbers: json!({
-            "modelled": tally.modelled, "minor_and_debris_pieces": tally.minor.0, "minor_and_debris_area_share": tally.minor.1,
-            "debris_pieces": tally.debris_pieces, "cavity_shells": tally.cavities.0, "cavity_area_share": tally.cavities.1,
-            "beyond_limit": tally.beyond_cap.0, "beyond_limit_area_share": tally.beyond_cap.1,
-            "not_requested": tally.not_requested.0, "not_requested_area_share": tally.not_requested.1,
-            "limit": MAX_COMPONENTS, "ms": tally.ms,
-        }),
-    };
-    let comps: Vec<ComponentOut> = parts.iter().map(|p| p.0.clone()).collect();
-    let mut out = parts.into_iter().nth(largest).map_or_else(|| failure(set, set.scan, "no part"), |p| p.1);
-    out.verdict = verdict;
-    out.scan = set.scan;
-    out.scan_report = report;
-    out.deviation = deviation;
-    out.issues = issues;
-    out.next_steps = next;
-    out.prep = PrepOut { preparation: vec![step], components: comps, bodies };
-    out
 }
 
 #[cfg(test)]

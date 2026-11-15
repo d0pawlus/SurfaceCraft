@@ -1,4 +1,5 @@
 //! Tests of `pipeline_prepare.rs`.
+use super::super::parts_report::Tally;
 use super::*;
 use serde_json::json;
 use surfacecraft_geom::{Mesh, Point3, synth};
@@ -14,25 +15,41 @@ fn balls(n: usize) -> Mesh {
     all
 }
 
-#[test]
-fn only_the_cap_leaves_co_equal_parts_beyond_the_limit_and_a_request_does_not() {
-    let a = scan_split::analyse(&balls(26), MIN_SHARE, false);
-    let capped = plan_of(&a, PART_SHARE, None);
-    assert_eq!((capped.chosen.len(), capped.beyond_cap.len(), capped.not_requested.len()), (24, 2, 0));
-    let asked = plan_of(&a, PART_SHARE, Some(1));
-    assert_eq!((asked.chosen.len(), asked.beyond_cap.len(), asked.not_requested.len()), (1, 0, 25));
-    let tally = Tally {
-        minor: (0, 0.0),
+use super::super::parts::{PART_SHARE, plan_of};
+use super::super::parts_report::{UNMODELLED_REVIEW_SHARE, collect_issues};
+use crate::cmd::scan_split::Analysis;
+
+const TOL: f64 = 0.2;
+
+fn tally(left: (usize, f64)) -> Tally {
+    Tally {
+        left_out: left,
+        by_reason: vec![(LeftOutReason::Debris, left.0, left.1)],
         cavities: (0, 0.0),
         beyond_cap: (0, 0.0),
-        not_requested: (25, 0.96),
+        not_requested: (0, 0.0),
         modelled: 1,
-        debris_pieces: 0,
+        co_equal: 1,
+        debris_pieces: left.0,
+        listed: Vec::new(),
+        total_area: 1.0,
         ms: 0,
-    };
-    let (issues, capped_verdict) = collect_issues(&[], &tally);
+    }
+}
+
+fn plan(a: Analysis) -> super::super::parts::Plan {
+    let listed = a.parts.len();
+    let mesh = Mesh::default();
+    plan_of(&Pieces::of(&mesh, a), listed, (PART_SHARE, TOL), None)
+}
+
+#[test]
+fn a_requested_subset_is_no_issue_and_parts_beyond_the_cap_are() {
+    let none = tally((0, 0.0));
+    let asked = Tally { not_requested: (25, 0.96), ..tally((0, 0.0)) };
+    let (issues, capped_verdict) = collect_issues(&[], &asked);
     assert!(issues.is_empty() && !capped_verdict, "a requested subset is no issue");
-    let over = Tally { beyond_cap: (2, 0.07), ..tally };
+    let over = Tally { beyond_cap: (2, 0.007), ..none };
     let (issues, capped_verdict) = collect_issues(&[], &over);
     assert!(
         issues.iter().any(|i| i.code == "parts_beyond_limit" && i.message.contains("2 more parts")) && capped_verdict
@@ -40,14 +57,20 @@ fn only_the_cap_leaves_co_equal_parts_beyond_the_limit_and_a_request_does_not() 
 }
 
 #[test]
-fn a_piece_below_a_tenth_of_the_largest_is_minor_and_the_components_word_is_checked() {
-    let mut m = balls(1);
-    let mut small = synth::sphere(Point3::new(60.0, 0.0, 0.0), 1.2, 16, 8);
+fn a_small_ball_is_a_small_part_and_the_components_word_is_checked() {
+    let mut m = synth::sphere(Point3::new(0.0, 0.0, 0.0), 20.0, 64, 32);
+    m.weld(1e-9);
+    let mut small = synth::sphere(Point3::new(60.0, 0.0, 0.0), 4.0, 16, 8);
     small.weld(1e-9);
     m.append(&small);
     let a = scan_split::analyse(&m, MIN_SHARE, false);
-    let p = plan_of(&a, PART_SHARE, None);
-    assert_eq!((p.chosen.len(), p.minor.len()), (1, 1));
+    let listed = a.parts.len();
+    let p = plan_of(&Pieces::of(&m, a), listed, (PART_SHARE, TOL), None);
+    assert_eq!(
+        (p.chosen.len(), p.co_equal, p.left_out.len()),
+        (2, 1, 0),
+        "4 % of the largest, 13.9 mm across: a small part"
+    );
     assert_eq!(Components::requested(&Some(Components::Word("largest".into()))).unwrap(), Some(1));
     assert_eq!(Components::requested(&None).unwrap(), None);
     assert!(Components::requested(&Some(Components::Word("some".into()))).is_err());
@@ -80,42 +103,27 @@ fn a_cavity_skin_larger_than_its_shell_does_not_turn_the_shell_into_a_minor_piec
         rest: Vec::new(),
         nests: vec![None, Some((0, true))],
     };
-    let p = plan_of(&a, PART_SHARE, None);
+    let p = plan(a);
     assert_eq!(p.chosen, vec![0], "the shell is modelled");
     assert_eq!(p.cavities, vec![1]);
-    assert!(p.minor.is_empty());
-    let none = Analysis { nests: vec![Some((1, true)), Some((0, true))], ..a };
-    assert_eq!(plan_of(&none, PART_SHARE, None).chosen.len(), 1, "never an empty choice");
-}
-
-#[test]
-fn pieces_beyond_the_listed_parts_stay_in_the_tally() {
-    let a = scan_split::analyse(&balls(80), MIN_SHARE, false);
-    assert_eq!((a.parts.len(), a.extra.len()), (scan_split::MAX_PARTS, 16));
-    let plan = plan_of(&a, PART_SHARE, None);
-    let tally = tally_of(&a, &plan, 0);
-    assert_eq!(tally.beyond_cap.0, 56, "40 past the cap of 24, 16 past the listed parts");
-    assert!((tally.beyond_cap.1 - 56.0 / 80.0).abs() < 1e-9, "{}", tally.beyond_cap.1);
-    let (issues, capped) = collect_issues(&[], &tally);
-    assert!(capped && issues.iter().any(|i| i.code == "parts_beyond_limit" && i.message.contains("56 more parts")));
+    assert!(p.left_out.is_empty());
+    let none = Analysis {
+        parts: vec![piece(1000.0), piece(12_000.0)],
+        extra: Vec::new(),
+        rest: Vec::new(),
+        nests: vec![Some((1, true)), Some((0, true))],
+    };
+    assert_eq!(plan(none).chosen.len(), 1, "never an empty choice");
 }
 
 #[test]
 fn two_percent_of_unmodelled_surface_is_the_boundary_of_the_review_cap() {
-    let tally = |share: f64| Tally {
-        minor: (3, share),
-        cavities: (0, 0.0),
-        beyond_cap: (0, 0.0),
-        not_requested: (0, 0.0),
-        modelled: 1,
-        debris_pieces: 3,
-        ms: 0,
-    };
-    let (issues, capped) = collect_issues(&[], &tally(UNMODELLED_REVIEW_SHARE));
+    let (issues, capped) = collect_issues(&[], &tally((3, UNMODELLED_REVIEW_SHARE)));
     assert!(issues.is_empty() && !capped, "exactly 2 % is not above 2 %");
-    let (issues, capped) = collect_issues(&[], &tally(UNMODELLED_REVIEW_SHARE + 1e-4));
+    let (issues, capped) = collect_issues(&[], &tally((3, UNMODELLED_REVIEW_SHARE + 1e-4)));
     assert!(capped && issues[0].code == "unmodelled_pieces" && issues[0].message.contains("part_share"));
-    let (issues, capped) = collect_issues(&[], &tally(UNMODELLED_REVIEW_SHARE - 1e-4));
+    assert!(issues[0].message.contains("3 debris"), "{}", issues[0].message);
+    let (issues, capped) = collect_issues(&[], &tally((3, UNMODELLED_REVIEW_SHARE - 1e-4)));
     assert!(issues.is_empty() && !capped);
 }
 
@@ -171,7 +179,8 @@ fn a_cancel_between_parts_leaves_no_body_and_no_part_mesh() {
     assert!(s.doc.bodies.is_empty() && s.doc.meshes.len() == 1);
 }
 
-/// Exactly a tenth of the largest piece is co-equal; a hair less is a minor piece.
+/// Exactly a tenth of the largest piece is co-equal; a hair less is not (and with no mesh behind it
+/// it is left out as debris).
 #[test]
 fn the_co_equal_boundary_is_exactly_a_tenth_of_the_largest_area() {
     let at = |small: f64| Analysis {
@@ -180,10 +189,10 @@ fn the_co_equal_boundary_is_exactly_a_tenth_of_the_largest_area() {
         rest: Vec::new(),
         nests: vec![None, None],
     };
-    let on = plan_of(&at(100.0), PART_SHARE, None);
-    assert_eq!((on.chosen.len(), on.minor.len()), (2, 0), "exactly 0.1 x the largest is co-equal");
-    let below = plan_of(&at(99.99), PART_SHARE, None);
-    assert_eq!((below.chosen.len(), below.minor.len()), (1, 1), "just below is minor");
+    let on = plan(at(100.0));
+    assert_eq!((on.chosen.len(), on.left_out.len()), (2, 0), "exactly 0.1 x the largest is co-equal");
+    let below = plan(at(99.99));
+    assert_eq!((below.chosen.len(), below.left_out.len()), (1, 1), "just below is not");
 }
 
 /// A failed part takes back what its run added (a body, a mesh), a cancellation does not touch
