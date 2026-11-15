@@ -245,6 +245,12 @@ impl Bvh {
         })
     }
 
+    /// [`Bvh::closest`] among the triangles (indices of the mesh it was built over) that `keep` accepts.
+    #[must_use]
+    pub fn closest_filtered(&self, q: &Point3, max_dist: f64, keep: &dyn Fn(usize) -> bool) -> Option<SurfaceHit> {
+        self.closest_where(q, max_dist, keep)
+    }
+
     /// Closest point among the triangles `keep` accepts.
     fn closest_where(&self, q: &Point3, max_dist: f64, keep: &dyn Fn(usize) -> bool) -> Option<SurfaceHit> {
         if self.nodes.is_empty() || !crate::finite(q) {

@@ -28,6 +28,7 @@ pub mod handles;
 mod holes;
 pub mod kdtree;
 pub mod lod;
+pub mod merge;
 pub mod mesh;
 pub mod nesting;
 pub mod par;
