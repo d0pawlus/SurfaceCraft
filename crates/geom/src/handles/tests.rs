@@ -215,23 +215,25 @@ fn a_deep_bore_through_a_thick_wall_is_not_capped() {
     let mut m = wall(&Wall { size: 30.0, cells: 30, gap: 8.0, bend: 0.0, tubes: vec![(13, 13, 2)] });
     let before = m.clone();
     let rep = close_handles(&mut m, &params(14.0), &Cancel::new()).unwrap();
-    eprintln!("{:?} closed {} {:?} far {}", rep.refused, rep.handles_closed, rep.closed, rep.removed_max_distance);
     assert_eq!(rep.handles_closed, 0);
     assert!(rep.refused.uncovered + rep.refused.fill_far > 0, "{:?}", rep.refused);
     assert_eq!(m.triangles, before.triangles);
 }
 
-/// Two sheets joined only by tunnels: the last tunnel holds them together and is never cut.
+/// Two sheets joined only by three tunnels: cutting all three at once would part the sheets, so they
+/// are taken back one by one; two are closed and the last one, which holds the sheets together, stays.
 #[test]
-fn the_surface_is_never_cut_in_two() {
-    let mut m = wall(&Wall { size: 30.0, cells: 30, gap: 0.6, bend: 0.0, tubes: vec![(8, 8, 1), (20, 20, 1)] });
+fn the_surface_is_never_cut_in_two_but_all_tunnels_but_one_close() {
+    let tubes = vec![(6, 6, 1), (14, 14, 1), (22, 22, 1)];
+    let mut m = wall(&Wall { size: 30.0, cells: 30, gap: 0.6, bend: 0.0, tubes });
     let positions = m.positions.clone();
     m.triangles.retain(|t| !t.iter().all(|&v| positions[v as usize].x == 0.0));
-    assert_eq!(pieces::pieces(&m)[0].genus(), Some(1));
+    assert_eq!(pieces::pieces(&m)[0].genus(), Some(2));
     let rep = close_handles(&mut m, &params(8.0), &Cancel::new()).unwrap();
     assert_eq!(pieces::pieces(&m).len(), 1, "{:?}", rep.refused);
-    assert!(rep.handles_closed <= 1);
-    assert!(rep.refused.splits > 0 || rep.handles_closed == 1);
+    assert_eq!(rep.handles_closed, 2);
+    assert_eq!(rep.genus_after, Some(0));
+    assert!(rep.refused.splits > 0, "the last tunnel was refused");
 }
 
 /// A small closed torus that a ball covers whole: cutting it would delete it, so every candidate is
@@ -324,4 +326,34 @@ fn fans_of_a_vertex_of_huge_valence_are_counted() {
     triangles.extend((0..8).map(|i| [0, base + i, base + (i + 1) % 8]));
     let m = Mesh { positions, triangles };
     assert_eq!(cut::Fans::new(&m).count(&m, 0), 2);
+}
+
+/// Three candidates on two sheets joined only by their tunnels, all refused together: `readmit` takes
+/// back at most `max`, clears `skip` only for those it returns, and stops when cancelled.
+#[test]
+fn readmission_is_limited_per_pass_and_stops_when_cancelled() {
+    let tubes = vec![(6, 6, 1), (14, 14, 1), (22, 22, 1)];
+    let mut m = wall(&Wall { size: 30.0, cells: 30, gap: 0.6, bend: 0.0, tubes });
+    let positions = m.positions.clone();
+    m.triangles.retain(|t| !t.iter().all(|&v| positions[v as usize].x == 0.0));
+    let topo = Topo::new(&m);
+    let (found, _) = cells::candidates(&m, &topo, 6.0, 0);
+    let cands = cells::pick(&topo, found, m.positions.len());
+    let refused = cut::splitting(&m, &cands, &vec![false; cands.len()]);
+    assert!(refused.len() >= 3, "{refused:?}");
+    for max in [1, 2] {
+        let mut skip = vec![false; cands.len()];
+        refused.iter().for_each(|&g| skip[g] = true);
+        let back = cut::readmit(&m, &cands, (&mut skip, &refused), max, &Cancel::new()).unwrap();
+        assert!(!back.is_empty() && back.len() <= max, "{back:?}");
+        for &g in &refused {
+            assert_eq!(skip[g], !back.contains(&g), "skip is cleared exactly for those taken back");
+        }
+    }
+    let cancel = Cancel::new();
+    cancel.cancel();
+    let mut skip = vec![false; cands.len()];
+    refused.iter().for_each(|&g| skip[g] = true);
+    assert!(cut::readmit(&m, &cands, (&mut skip, &refused), 32, &cancel).is_none());
+    assert!(refused.iter().all(|&g| skip[g]), "a cancelled readmission takes nothing back");
 }

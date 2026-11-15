@@ -28,6 +28,10 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
   vertex away from them; `scan.to_solid` takes it as the option `close_handles` (with `handle_size`),
   wraps the repaired copy, measures the solid against the scan as it was and raises
   `scan_handles_closed` (#120).
+- `surface.wrap` option `coarse_start`: a first coarse mesh too big for `max_patches` is made coarser
+  and the adaptive rounds spend the rest of the limit where the patches miss; `scan.to_solid` with
+  `close_handles` uses it. `mesh.close_handles` takes candidates refused for splitting the surface
+  back one by one.
 
 ## [0.2.0] - 2026-11-13
 

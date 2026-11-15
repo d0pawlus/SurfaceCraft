@@ -35,6 +35,9 @@ pub const SMALLEST_EDGES: f64 = 4.0;
 const SCALE_STEP: f64 = std::f64::consts::SQRT_2;
 /// Attempts per pass: the candidates that failed are grown or left out and the rest is cut again.
 const ATTEMPTS: usize = 5;
+/// Candidates refused for splitting the surface that are tried again one by one, per pass (each try is
+/// one pass over the mesh).
+const READMIT: usize = 32;
 /// A candidate that failed is grown by a ring of triangles at most this many times.
 const MAX_GROWTH: usize = 2;
 /// Passes per scale at most: a pass cuts candidates that are apart; the next one, with seeds taken
@@ -284,10 +287,12 @@ fn pass(
     let mut cands = cells::pick(&topo, found, work.mesh.positions.len());
     let mut skip = vec![false; cands.len()];
     let mut grown = vec![0usize; cands.len()];
-    for g in cut::splitting(&work.mesh, &cands, &skip) {
-        refuse(rep, Refusal::Loosens);
-        set(&mut skip, g);
-    }
+    let apart = cut::splitting(&work.mesh, &cands, &skip);
+    apart.iter().for_each(|&g| set(&mut skip, g));
+    let Some(back) = cut::readmit(&work.mesh, &cands, (&mut skip, &apart), READMIT, cancel) else {
+        return Err(HandleError::Cancelled);
+    };
+    (0..apart.len().saturating_sub(back.len())).for_each(|_| refuse(rep, Refusal::Loosens));
     for _ in 0..ATTEMPTS {
         if skip.iter().all(|&s| s) {
             return Ok((work, false));

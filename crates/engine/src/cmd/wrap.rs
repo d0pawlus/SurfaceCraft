@@ -63,6 +63,9 @@ pub struct WrapIn {
     /// Continuity across the smooth edges: `g0` (default, positions only) or `g1` (experimental: tangent patches; costs patches and time and can miss the tolerance on real scans).
     #[serde(default)]
     pub continuity: Option<String>,
+    /// When the first coarse mesh is bigger than `max_patches` allows, reduce the scan again with a larger budget (up to four times) so that it takes about half of the limit, and let the adaptive rounds spend the rest where the patches miss, instead of cutting the first mesh to the limit and stopping there (default false; adaptive layout only).
+    #[serde(default)]
+    pub coarse_start: Option<bool>,
     /// Name of the body (default "wrap").
     #[serde(default)]
     pub name: Option<String>,
@@ -272,12 +275,26 @@ fn orientation_warning(closed: bool, volume: Option<f64>) -> Option<String> {
     })
 }
 
+/// The warnings of a wrap: tolerance missed, a tolerance large against the part, a closed network
+/// without positive volume.
+fn warnings_of(round: &Round, set: &Settings, (scan, closed, volume): (&Mesh, bool, Option<f64>)) -> Vec<String> {
+    [
+        (round.deviation.within < set.min_within).then(|| advice(round, set.tolerance)),
+        scale_warning(set.tolerance, robust_diagonal(scan)),
+        orientation_warning(closed, volume),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
 pub(crate) fn wrap(s: &mut Session, i: WrapIn) -> CmdResult<WrapOut> {
     let id = i.mesh.resolve(s, ObjectKind::Mesh)?;
     let set = settings(&i)?;
     let scan = prepared_scan(s, id)?;
     let options = G1Options { g1: set.g1, crease_deg: set.crease_deg };
-    let target = Target::new(&scan, set.tolerance, set.min_within, set.max_patches, options);
+    let target = Target::new(&scan, set.tolerance, set.min_within, set.max_patches, options)
+        .with_coarse_start(i.coarse_start.unwrap_or(false));
     let wrapped = wrap_rounds(&target, set.refine)?;
     let round = wrapped.best;
     if round.set.nets.is_empty() {
@@ -291,14 +308,7 @@ pub(crate) fn wrap(s: &mut Session, i: WrapIn) -> CmdResult<WrapOut> {
     let (smooth, sharp) = jump_stats(&round.set, &round.creases);
     let body = s.doc.add_body(i.name.as_deref().unwrap_or("wrap"), sheet);
     let body_info = body_out(s, body)?;
-    let warnings: Vec<String> = [
-        (round.deviation.within < set.min_within).then(|| advice(&round, set.tolerance)),
-        scale_warning(set.tolerance, robust_diagonal(&scan)),
-        orientation_warning(closed, body_info.volume),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    let warnings = warnings_of(&round, &set, (&scan, closed, body_info.volume));
     let within_tolerance = round.deviation.within >= set.min_within;
     Ok(WrapOut {
         body: body_info,

@@ -155,3 +155,87 @@ fn scan_handles_closed_is_raised_exactly_when_something_was_cut() {
     assert!(codes(&cut).contains(&"scan_handles_closed".to_string()), "{:?}", codes(&cut));
     assert_ne!(cut["verdict"], json!("pass"));
 }
+
+/// A smooth 120 mm panel with one rough corner.
+fn rough_corner_panel() -> Mesh {
+    let mut m = synth::wave(Point3::origin(), 120.0, 120.0, 3.0, 240, 240);
+    for p in &mut m.positions {
+        if p.x < 30.0 && p.y < 30.0 {
+            p.z += 0.8 * (p.x * 1.3).sin() * (p.y * 1.1).cos();
+        }
+    }
+    m
+}
+
+/// `surface.wrap` of `m` with `extra` parameters added.
+fn wrap_of(m: &Mesh, extra: Value) -> Result<Value, surfacecraft_engine::EngineError> {
+    let mut s = Session::new();
+    s.doc.add_mesh("scan", m.clone());
+    let mut params = json!({"mesh": "scan"});
+    if let (Some(p), Some(e)) = (params.as_object_mut(), extra.as_object()) {
+        p.extend(e.clone());
+    }
+    s.execute("surface.wrap", params)
+}
+
+/// What two wraps must share to be the same result.
+fn same_wrap(a: &Value, b: &Value) {
+    assert_eq!(a["levels"], b["levels"]);
+    assert_eq!(a["patches"], b["patches"]);
+    assert_eq!(a["deviation"]["within"], b["deviation"]["within"]);
+}
+
+/// The panel wrapped under a cap its first round does not fit: the coarse start (`coarse_start`)
+/// begins with larger patches where it is smooth and spends the rest of the cap on the corner, so more
+/// of the scan is within the tolerance than when the first round is cut to the cap and the wrap stops
+/// there, and it never goes over the cap.
+#[test]
+fn gate_m4_the_coarse_start_spends_the_patch_cap_where_the_patches_miss() {
+    let m = rough_corner_panel();
+    let run = |coarse: bool| {
+        let out = wrap_of(&m, json!({"max_patches": 300, "coarse_start": coarse})).unwrap();
+        eprintln!(
+            "coarse {coarse}: patches {} within {} levels {}",
+            out["patches"], out["deviation"]["within"], out["levels"]
+        );
+        out
+    };
+    let (plain, coarse) = (run(false), run(true));
+    let within = |o: &Value| o["deviation"]["within"].as_f64().unwrap();
+    assert!(plain["levels"][0]["partial"] == json!("first_round_over_cap"), "{}", plain["levels"]);
+    assert!(coarse["levels"].as_array().unwrap().len() > 1, "the coarse start refines: {}", coarse["levels"]);
+    assert!(coarse["patches"].as_u64().unwrap() <= 300, "within the cap: {}", coarse["patches"]);
+    // measured: 1.78 % of the scan outside the tolerance with the first round cut to the cap, 0.74 %
+    // with the coarse start (2.4 times fewer); the bound asks for 1.5 times fewer
+    let (miss_plain, miss_coarse) = (1.0 - within(&plain), 1.0 - within(&coarse));
+    assert!(1.5 * miss_coarse < miss_plain, "{miss_coarse} vs {miss_plain}");
+}
+
+/// A first round that fits the cap: the coarse start changes nothing.
+#[test]
+fn the_coarse_start_does_nothing_when_the_first_round_fits() {
+    let m = rough_corner_panel();
+    let plain = wrap_of(&m, json!({"max_patches": 3000, "coarse_start": false})).unwrap();
+    assert!(plain["levels"][0]["partial"].is_null(), "the first round fits: {}", plain["levels"]);
+    same_wrap(&plain, &wrap_of(&m, json!({"max_patches": 3000, "coarse_start": true})).unwrap());
+}
+
+/// The default path: `coarse_start` absent or null is `false`.
+#[test]
+fn coarse_start_absent_or_null_is_false() {
+    let m = rough_corner_panel();
+    let off = wrap_of(&m, json!({"max_patches": 300, "coarse_start": false})).unwrap();
+    same_wrap(&off, &wrap_of(&m, json!({"max_patches": 300})).unwrap());
+    same_wrap(&off, &wrap_of(&m, json!({"max_patches": 300, "coarse_start": null})).unwrap());
+}
+
+/// Values of `coarse_start` that are not booleans are a parameter error, never a panic.
+#[test]
+fn hostile_coarse_start_values_are_refused() {
+    let m = synth::wave(Point3::origin(), 40.0, 30.0, 2.0, 40, 30);
+    for bad in [json!("yes"), json!(1), json!([]), json!({})] {
+        let r = wrap_of(&m, json!({"coarse_start": bad.clone()}));
+        assert!(matches!(r, Err(surfacecraft_engine::EngineError::InvalidParams(_))), "{bad}: {r:?}");
+    }
+    assert!(wrap_of(&m, json!({"coarse_start": null})).is_ok());
+}
