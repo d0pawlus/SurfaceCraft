@@ -341,10 +341,11 @@ kernel refuses sheets of many faces. Give the wall thickness instead:
   the regions), then `scan.to_solid` again without `reuse_regions`.
 - `fill_inside_out`: boundary loops that were not filled because the fill would have closed the scan
   inside out: the scanned face would point into the volume the patch encloses, so the solid would be
-  the space in front of the scanned surface. Such a loop is the open edge of a sheet seen from its
-  hollow side (a panel scanned from inside), not a hole, and a larger `fill_holes_max_edges` does
-  not change it (`mesh.fill_holes` refuses it too, `holes_inward` in its result). The scan is
-  modelled as a sheet; give it a `thickness` for a solid. Small holes of a closed scan stored inside
+  the space in front of the scanned surface. Such a loop is the open edge of a sheet, not a hole:
+  either the sheet was scanned from its hollow side or its normals are stored inward (the mesh
+  cannot tell which). A larger `fill_holes_max_edges` does not change it (`mesh.fill_holes` refuses
+  it too, `holes_inward` in its result). The scan is modelled as a sheet; check which way its
+  normals face (flip them if they point into the part) before choosing the sign of `thickness`. Small holes of a closed scan stored inside
   out are still filled, and that scan is still reported as `scan_inside_out`.
 
 ## Messy scans: parts, handles, shells

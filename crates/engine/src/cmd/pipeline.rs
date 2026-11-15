@@ -260,7 +260,7 @@ pub(super) fn defects_issue(left: usize, inward: usize) -> Vec<Issue> {
     }
     if inward > 0 {
         let msg = format!(
-            "{inward} boundary loops of the scan were not filled: the fill would have closed the scan inside out (the scanned face would point into the volume the patch encloses, so the solid would be the space in front of the scanned surface); such a loop is the open edge of a sheet seen from its hollow side, not a hole: the scan is modelled as a sheet, give it a `thickness` for a solid"
+            "{inward} boundary loops of the scan were not filled: the fill would have closed the scan inside out (the scanned face would point into the volume the patch encloses, so the solid would be the space in front of the scanned surface); such a loop is the open edge of a sheet, not a hole: either the sheet was scanned from its hollow side or its normals are stored inward. The scan is modelled as a sheet; check which way its normals face (flip them if they point into the part) and give it a `thickness` for a solid"
         );
         list.push(issue("fill_inside_out", msg));
     }

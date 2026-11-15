@@ -31,7 +31,8 @@ pub struct EditOut {
     pub holes_left: Option<usize>,
     /// Of the holes left, those whose fill would have closed the mesh inside out: the scanned face would point
     /// into the volume the patches enclose, which then cap the space in front of it (the loop is the open edge
-    /// of a sheet seen from its hollow side, not a hole). Absent when there are none.
+    /// of a sheet seen from its hollow side, or of one whose normals are stored inward, not a hole). Absent when
+    /// there are none.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub holes_inward: Option<usize>,
     /// Folds removed by `mesh.clean` (see `remove_folds`); absent when the step did not run.

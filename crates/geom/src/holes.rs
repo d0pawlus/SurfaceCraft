@@ -73,8 +73,7 @@ pub struct FillReport {
     pub skipped: usize,
     /// Of the holes left, those whose patches would have closed their piece of the mesh inside out:
     /// the scanned face would point into the volume the patches enclose (the loop is the open edge of
-    /// a sheet seen from its hollow side, not a hole), and the patches would be a large share of the
-    /// piece.
+    /// a sheet, not a hole), and the patches would be a large share of the piece.
     pub inward: usize,
     /// Triangles added.
     pub added_triangles: usize,

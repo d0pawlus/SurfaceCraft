@@ -4,8 +4,10 @@
 //! the material. When the fills of a piece close it, the closed piece encloses a volume, and a solid
 //! made of it is turned outward (positive volume). If the piece, closed by its patches, has a
 //! clearly negative volume, the scanned face points into what was enclosed: the patches cap the
-//! space in front of the scanned face (an open sheet seen from its hollow side, whose rim is its
-//! open edge, not a hole), and every scan point would face away from the solid. Such a fill is
+//! space in front of the scanned face, and every scan point would face away from the solid. The
+//! mesh cannot tell why: an open sheet seen from its hollow side, or a sheet whose normals were
+//! stored inward; either way the loop is its open edge, not a hole, and the closed solid would be
+//! invented material. Such a fill is
 //! refused when the patches are a large share of the piece: they invent a face rather than repair a
 //! hole. A closed scan stored inside out with small holes is still filled (its patches are small),
 //! so that it is still told to be inside out, not left open.
@@ -14,14 +16,16 @@ use crate::{Mesh, Point3};
 use std::collections::{HashMap, HashSet};
 
 /// The patches that close a piece inside out are refused when their area is at least this share of
-/// the area of the piece's own triangles. Holes in a scan are a few percent of it; the cap over the
-/// open edge of a sheet is about as large as the sheet's outline (on the local scans that closed
-/// inside out it was 95 % and 145 % of the scan's area).
+/// the area of the piece's own triangles. A hole in a scan is a few percent of it; the cap over the
+/// open edge of a sheet is about as large as the sheet's outline (about 90 % for the square cap of a
+/// sphere in the tests).
 const INWARD_PATCH_SHARE: f64 = 0.25;
 
-/// A closed piece whose six-fold volume is not below this share of its area to the power 3/2 (a
-/// flat or nearly flat piece capped flat) encloses no volume worth an orientation: it is filled.
-const NO_VOLUME_SHARE: f64 = 1e-6;
+/// A closed piece whose six-fold volume is below this share of its area to the power 3/2 is a
+/// nearly flat sheet capped nearly flat: it encloses no volume worth an orientation (its sign is the
+/// scanner noise) and it is filled. The square cap of a sphere in the tests reads about 0.4, a
+/// sphere 0.56.
+const NO_VOLUME_SHARE: f64 = 1e-3;
 
 /// Connected pieces of `mesh`: the root vertex of each vertex (vertices joined through triangles).
 /// The mesh is valid (every index in range).
