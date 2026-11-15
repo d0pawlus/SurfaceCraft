@@ -33,7 +33,8 @@ pub(super) struct Scan {
     /// Triangles left out for being wound against the rest of their piece, and their share of the area.
     pub(super) flipped: (usize, f64),
     /// Closed pieces with a negative volume (turned inside out).
-    pub(super) inverted_pieces: usize,
+    /// Closed pieces with a negative volume: (turned inside out, inner skins, debris).
+    pub(super) negative: (usize, usize, usize),
     /// Topology of the scan as given to the merge (after the drop).
     pub(super) topology: Topology,
 }
@@ -251,6 +252,8 @@ pub(super) fn median_edge(mesh: &Mesh) -> f64 {
 /// A closed piece smaller than this share of its scan's area is not judged for being inside out
 /// (debris).
 pub const INVERTED_MIN_SHARE: f64 = 0.01;
+/// Rays of the inside test ignore crossings closer than this share of the scan's diagonal.
+const NEST_EPS_SHARE: f64 = 1e-9;
 
 /// Signed volume of a piece, measured about the centre of its box.
 fn volume(mesh: &Mesh, p: &pieces::Piece) -> f64 {
@@ -270,21 +273,27 @@ fn nested(mesh: &Mesh, closed: &[&pieces::Piece], k: usize) -> bool {
     let (Some(tri), false) = (probe, others.is_empty()) else { return false };
     let Some(&p) = mesh.positions.get(tri[0] as usize) else { return false };
     let bvh = Bvh::build(&mesh.submesh(&others));
-    crate::nesting::point_inside(&bvh, &p, 1e-9 * mesh.bbox().diagonal().max(f64::MIN_POSITIVE))
+    crate::nesting::point_inside(&bvh, &p, NEST_EPS_SHARE * mesh.bbox().diagonal().max(f64::MIN_POSITIVE))
 }
 
-/// Closed pieces turned inside out: a negative volume, not inside another closed piece of the scan
-/// (an inner skin), and at least [`INVERTED_MIN_SHARE`] of the scan's area.
-fn inverted_pieces(mesh: &Mesh) -> usize {
+/// Closed pieces with a negative volume, sorted: (turned inside out, inner skins, debris). An inner
+/// skin lies inside another closed piece of the scan (the inside of a hollow part faces inward); debris
+/// is a piece below [`INVERTED_MIN_SHARE`] of the scan's area. Only the first refuse the merge.
+pub(super) fn negative_pieces(mesh: &Mesh) -> (usize, usize, usize) {
     let all = pieces::pieces(mesh);
     let closed: Vec<&pieces::Piece> = all.iter().filter(|p| p.closed()).collect();
     let area = mesh.area();
-    (0..closed.len())
-        .filter(|&k| {
-            closed.get(k).is_some_and(|p| p.area >= INVERTED_MIN_SHARE * area && volume(mesh, p) < 0.0)
-                && !nested(mesh, &closed, k)
-        })
-        .count()
+    let (mut inverted, mut skins, mut debris) = (0, 0, 0);
+    for (k, p) in closed.iter().enumerate().filter(|(_, p)| volume(mesh, p) < 0.0) {
+        if p.area < INVERTED_MIN_SHARE * area {
+            debris += 1;
+        } else if nested(mesh, &closed, k) {
+            skins += 1;
+        } else {
+            inverted += 1;
+        }
+    }
+    (inverted, skins, debris)
 }
 
 /// `mesh` without the triangles `drop` flags, and the corners of those dropped.
@@ -304,6 +313,9 @@ fn without(mesh: Mesh, drop: &[bool]) -> (Mesh, Vec<[Point3; 3]>) {
 /// on edges of three or more triangles and triangles wound against the rest of their piece are left
 /// out (and counted).
 pub(super) fn prepare(given: &Mesh, cancel: &Cancel) -> Option<Scan> {
+    if cancel.is_cancelled() {
+        return None;
+    }
     let area = given.area();
     let dups = super::orient::duplicates(given);
     let (mesh, mut dropped) = without(given.clone(), &dups);
@@ -318,13 +330,16 @@ pub(super) fn prepare(given: &Mesh, cancel: &Cancel) -> Option<Scan> {
     let flipped = (wrong.len(), if area > 0.0 { flipped_area / area } else { 0.0 });
     dropped.extend(wrong);
     let across = if flipped.0 > 0 { adjacency(&mesh).0 } else { across };
+    if cancel.is_cancelled() {
+        return None;
+    }
     let border_distance = border_distance(&mesh, &across, cancel)?;
     Some(Scan {
         normals: vertex_normals(&mesh),
         bvh: Bvh::build(&mesh),
         bbox: mesh.bbox(),
         median_edge: median_edge(&mesh),
-        inverted_pieces: inverted_pieces(&mesh),
+        negative: negative_pieces(&mesh),
         topology: topology(&mesh),
         mesh,
         dropped,

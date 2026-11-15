@@ -265,12 +265,14 @@ Normals, colours and per-vertex data go with the coordinates.
   of its longest edge, if that is larger) of a scan, facing the same way. It also crosses or covers no
   triangle already there. So no surface is made up over an opening nobody scanned, and the rims of two
   separate pieces are never joined. Small holes the pivoting leaves (up to 64 edges, with no edge of a
-  scan's own border) are filled by ear clipping or a fan through the same checks. Where the band has a
-  twisted corner (a hole of a few edges no triangle can fill facing the right way), the seam triangles
+  scan's own border) are filled by ear clipping or a fan through the same checks, the corner rule
+  included. Where the band has a twisted corner (a hole of a few edges no triangle can fill facing the right way), the seam triangles
   around it are taken back once and the larger hole is filled. Seam triangles that meet another fan
   at one vertex only (a pinch) are taken back the same way. No vertex is added to the scans' vertices
-  and no kept vertex moves, except that seam vertices of different scans closer than a quarter of the
-  tolerance (and a tenth of the median edge) are welded. Removed triangles whose corners all exist in
+  and kept vertices stay where they are, except that a seam vertex of a later scan moves onto a
+  coinciding seam vertex of an earlier scan, by at most a quarter of the tolerance (and a tenth of
+  the median edge), measured from its own position (welds never chain). A weld that would flip,
+  fold or double a triangle is undone (`checks.welds_undone`). Removed triangles whose corners all exist in
   the result at exactly their places are put back: pieces cut from one scan share their tessellation,
   and there the seam is a re-weld (a restored triangle must cross and cover nothing either). Removed
   triangles whose centre the seam leaves without result surface within the tolerance come back on their
@@ -279,12 +281,18 @@ Normals, colours and per-vertex data go with the coordinates.
   - `scans_misaligned`: more than 10 % of the surface two scans share (where one lies on facing surface
     of the other, up to 8 tolerances away) lies farther apart than the tolerance. Merging them would
     either stack two layers or average them into a surface neither scan saw. Align better
-    (`align.icp`, `align.global`) or give a larger tolerance knowingly.
+    (`align.icp`, `align.global`) or give a larger tolerance knowingly. Also refused: scans offset by
+    more than 8 tolerances, which share no surface within that reach but lie over each other. They
+    are found along each sample's normal: the first surface of the other scan, within its size, faces
+    the same way (`pairs[].over`), and more samples lie over it than agree with it. Scans that are apart
+    in space are no refusal: they give a union of pieces and the notice `scans_disjoint`.
   - `opposed_normals`: the normals of two scans oppose where they meet. One is turned inside out.
   - `inconsistent_winding`: triangles wound against the rest of their piece cover more than 0.1 % of a
     scan's area (a patch turned inside out). Fewer are left out and reported as
     `flipped_triangles_dropped`, so the result never has a flipped part.
-  - `inverted_scan`: a closed piece of a scan has a negative volume.
+  - `inverted_scan`: a closed piece of a scan has a negative volume. Inner skins (inside another
+    closed piece, as the inside of a hollow part) and debris below 1 % of the scan's area are not
+    refused; they are reported as `inner_skins` with their counts.
 - Reported, not refused: `non_manifold_input` (exact duplicate triangles and triangles on edges of
   three or more triangles are left out and counted as removed), `flipped_triangles_dropped`, `scans_disjoint` (groups of scans that share no surface: the result is a
   union of separate pieces), `scan_fully_covered` (a scan lies wholly on others and adds nothing),
@@ -320,7 +328,7 @@ Normals, colours and per-vertex data go with the coordinates.
   - Meshes with triangles far longer than their median edge (CAD exports, heavy decimation): where such
     a triangle was removed the gap can be wider than the pivoting reaches, and the seam stays partly
     open (`seam_open`, `removed_not_covered`). A uniform tessellation first helps.
-  - The work is O(T log T) in the triangles of all scans (40 million at most); the pair statistics
+  - The work is O(T log T) in the triangles of all scans (20 million at most natively, 2 million in the browser); the pair statistics
     use 20 000 points per scan.
 
 ## Parameters common to all align commands

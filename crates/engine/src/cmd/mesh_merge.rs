@@ -66,8 +66,8 @@ pub struct MergeIn {
 pub struct MergeScanOut {
     /// The mesh.
     pub object: ObjectId,
-    /// Noise estimate of the scan (σ, mm; 0 when it could not be measured).
-    pub noise: f64,
+    /// Noise estimate of the scan (σ, mm; 0 when it could not be measured; absent when the tolerance was given and no estimate was made).
+    pub noise: Option<f64>,
     /// Triangles of the scan.
     pub triangles: usize,
     /// Kept in the result as they were.
@@ -99,6 +99,8 @@ pub struct MergePairOut {
     pub samples: usize,
     /// Of them, on facing surface of `b` (not past its border) within the search reach.
     pub shared: usize,
+    /// Points with no surface of `b` within the reach that lie over facing surface of `b` farther away (along their normal, within the size of `b`): `b` is there, displaced.
+    pub over: usize,
     /// Of those, within the tolerance.
     pub within: usize,
     /// Points on opposed surface of `b` within the tolerance (one of the two is turned inside out).
@@ -191,7 +193,7 @@ pub struct MergeChecksOut {
 /// Something to know, with its numbers.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 pub struct MergeIssueOut {
-    /// `scans_misaligned`, `opposed_normals`, `inconsistent_winding`, `inverted_scan` (these refuse), `non_manifold_input`, `flipped_triangles_dropped`, `scans_disjoint`, `scan_fully_covered`, `seam_open`, `removed_not_covered`, `layers_stacked`, `unwelded_vertices`, `unoriented_edges`, `pinched_vertices`.
+    /// `scans_misaligned`, `opposed_normals`, `inconsistent_winding`, `inverted_scan` (these refuse), `non_manifold_input`, `flipped_triangles_dropped`, `inner_skins`, `scans_disjoint`, `scan_fully_covered`, `seam_open`, `removed_not_covered`, `layers_stacked`, `unwelded_vertices`, `unoriented_edges`, `pinched_vertices`.
     pub code: String,
     /// `refusal`, `warning` or `info`.
     pub severity: String,
@@ -270,12 +272,12 @@ fn issue_out(i: &Issue) -> MergeIssueOut {
 /// An issue that refuses, in the form of the command.
 fn refusal_out(i: &Issue) -> Option<MergeIssueOut> {
     Some(match i {
-        Issue::Misaligned { a, b, near, beyond_share, rms, p95 } => issue(
+        Issue::Misaligned { a, b, near, over, beyond_share, rms, p95 } => issue(
             "scans_misaligned",
             "refusal",
             vec![*a, *b],
             format!(
-                "scans {a} and {b} disagree where they overlap: {:.1} % of {near} shared points lie farther apart than the tolerance (rms {rms:.4} mm, 95th percentile {p95:.4} mm); they are not averaged or stacked: align them better (align.icp, align.global) or give a larger tolerance",
+                "scans {a} and {b} disagree where they overlap: {:.1} % of {near} shared points lie farther apart than the tolerance (rms {rms:.4} mm, 95th percentile {p95:.4} mm), and {over} points lie over the other scan farther away than 8 tolerances; they are not averaged or stacked: align them better (align.icp, align.global) or give a larger tolerance",
                 100.0 * beyond_share
             ),
         ),
@@ -317,6 +319,14 @@ fn scan_notice(i: &Issue) -> Option<MergeIssueOut> {
             vec![*scan],
             format!(
                 "{dropped} triangles of scan {scan} are exact duplicates or lie on edges of three or more triangles and were left out (they count as removed in the checks)"
+            ),
+        ),
+        Issue::InnerSkins { scan, skins, debris } => issue(
+            "inner_skins",
+            "info",
+            vec![*scan],
+            format!(
+                "scan {scan} has {skins} closed inner skin(s) (inside another piece, facing inward as the inside of a hollow part does) and {debris} closed debris piece(s) below 1 % of its area with a negative volume; they are not taken as turned inside out"
             ),
         ),
         Issue::Disjoint { groups } => issue(
@@ -417,7 +427,7 @@ fn default_tolerance(meshes: &[Mesh]) -> (Vec<f64>, f64) {
     (noise, NOISE_SIGMAS * pair + CHORD_SHARE * coarse)
 }
 
-fn scan_out(object: ObjectId, noise: f64, r: &surfacecraft_geom::merge::ScanRow) -> MergeScanOut {
+fn scan_out(object: ObjectId, noise: Option<f64>, r: &surfacecraft_geom::merge::ScanRow) -> MergeScanOut {
     MergeScanOut {
         object,
         noise,
@@ -439,6 +449,7 @@ fn pair_out(p: &surfacecraft_geom::merge::PairResidual) -> MergePairOut {
         b: p.b,
         samples: p.samples,
         shared: p.near,
+        over: p.over,
         within: p.within,
         opposed: p.opposed,
         rms: p.rms,
@@ -452,7 +463,7 @@ fn seam_out(r: &Report) -> MergeSeamOut {
     let s = &r.seam;
     MergeSeamOut {
         cut_edges: s.front_edges,
-        length: 0.5 * (s.front_length - s.open_length).max(0.0),
+        length: 0.5 * s.closed_length,
         radii: s.radii.clone(),
         triangles_created: s.built + s.fill_triangles,
         restored: s.restored,
@@ -461,7 +472,7 @@ fn seam_out(r: &Report) -> MergeSeamOut {
         refused_crossing: s.crossing,
         unpinched: s.unpinched,
         uncovered_after_seam: s.recovered.uncovered,
-        recovered: s.recovered.triangles,
+        recovered: s.recovered.triangles.saturating_sub(s.recovered.specks_dropped),
         strays_dropped: s.islands_dropped,
         open_edges: s.open_edges,
         open_length: s.open_length,
@@ -551,21 +562,31 @@ fn note_of(rep: &Report, triangles: usize) -> String {
     )
 }
 
+/// Checks the meshes, then the tolerance: given, or (only then is the noise estimated) from the scans.
+fn tolerance_of(meshes: &[Mesh], given: Option<f64>) -> CmdResult<(Vec<Option<f64>>, f64, &'static str)> {
+    for (k, m) in meshes.iter().enumerate() {
+        m.validate().map_err(|e| CmdError::Params(format!("scan {k} is invalid: {e}")))?;
+        if m.triangles.is_empty() {
+            return Err(CmdError::Params(format!("scan {k} has no triangles")));
+        }
+    }
+    if let Some(t) = given {
+        return Ok((vec![None; meshes.len()], t, "given"));
+    }
+    let (noise, by_noise) = default_tolerance(meshes);
+    if !(by_noise.is_finite() && by_noise > 0.0) {
+        return Err(CmdError::Failed("no tolerance can be taken from the scans (no noise, no edges): give one".into()));
+    }
+    Ok((noise.into_iter().map(Some).collect(), by_noise, "noise"))
+}
+
 pub(crate) fn merge_cmd(s: &mut Session, i: MergeIn) -> CmdResult<MergeOut> {
     if s.cancel.is_cancelled() {
         return Err(super::cancelled());
     }
+    let given = i.tolerance.map(|t| super::deviation::positive(t, "tolerance")).transpose()?;
     let (ids, meshes) = meshes_of(s, &i.objects)?;
-    let (noise, by_noise) = default_tolerance(&meshes);
-    let (tolerance, source) = match i.tolerance {
-        Some(t) => (super::deviation::positive(t, "tolerance")?, "given"),
-        None if by_noise.is_finite() && by_noise > 0.0 => (by_noise, "noise"),
-        None => {
-            return Err(CmdError::Failed(
-                "no tolerance can be taken from the scans (no noise, no edges): give one".into(),
-            ));
-        }
-    };
+    let (noise, tolerance, source) = tolerance_of(&meshes, given)?;
     let (mesh, rep, stages) = run(&meshes, tolerance, s)?;
     let triangles = mesh.as_ref().map_or(0, Mesh::triangle_count);
     let out = MergeOut {
@@ -600,7 +621,7 @@ pub static COMMANDS: &[CommandSpec] = &[command!(
     "Merge scans",
     "Mesh",
     true,
-    "Merges aligned scans (`objects`, 2 to 64 meshes in one frame, e.g. after `align.global`) into one new mesh. Where scans overlap within `tolerance` one layer is kept: the scan in which that surface lies farthest from its own border keeps it (borders are the least reliable part of a scan), the others lose it. The seam between the kept regions is closed by ball pivoting, only with triangles that lie on surface a scan saw, so no surface is made up over an opening nobody scanned. No kept vertex moves. Scans that disagree in their overlap by more than the tolerance, or whose normals oppose, are refused with the numbers (nothing is made). Reports per scan what was kept and removed, the residual of every pair, the seam, the topology before and after, and how far the removed surface lies from the result.",
+    "Merges aligned scans (`objects`, 2 to 64 meshes in one frame, e.g. after `align.global`) into one new mesh. Where scans overlap within `tolerance` one layer is kept: the scan in which that surface lies farthest from its own border keeps it (borders are the least reliable part of a scan), the others lose it. The seam between the kept regions is closed by ball pivoting, only with triangles that lie on surface a scan saw, so no surface is made up over an opening nobody scanned. Kept vertices stay where they are, except that seam vertices of later scans move onto coinciding seam vertices of earlier scans, by at most a quarter of the tolerance (and a tenth of the median edge). Scans that disagree in their overlap by more than the tolerance (also when they lie over each other farther apart than 8 tolerances), or whose normals oppose, are refused with the numbers (nothing is made). Reports per scan what was kept and removed, the residual of every pair, the seam, the topology before and after, and how far the removed surface lies from the result.",
     MergeIn,
     MergeOut,
     merge_cmd

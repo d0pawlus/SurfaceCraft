@@ -77,6 +77,23 @@ fn scans_misaligned_by_several_tolerances_are_refused() {
     }
 }
 
+/// Offsets beyond the reach of the comparison (8 tolerances): the scans share no surface within it,
+/// but they lie over each other; refused, not merged as a union of pieces.
+#[test]
+fn scans_misaligned_beyond_the_reach_are_refused() {
+    let tol = 0.1;
+    for times in [10.0, 30.0, 100.0] {
+        let mut views = halves();
+        views[1] = views[1].transformed(&Transform::translation(Vec3::new(0.0, 0.0, times * tol)));
+        let mut s = session(&views);
+        let out = merge(&mut s, 2, json!({"tolerance": tol}));
+        let over: Vec<u64> = out["pairs"].as_array().unwrap().iter().map(|p| p["over"].as_u64().unwrap()).collect();
+        eprintln!("{times} tolerances: over {over:?}, issues {:?}", codes(&out));
+        assert_refused(&s, &out, "scans_misaligned", 2);
+        assert!(!codes(&out).contains(&"scans_disjoint".to_string()));
+    }
+}
+
 #[test]
 fn an_inverted_open_scan_is_refused() {
     let mut views = halves();
@@ -103,7 +120,10 @@ fn a_scan_wound_both_ways_is_refused() {
 /// The `count` triangles of view 0 nearest to the point of the blob farthest along +x, flipped: a
 /// patch turned inside out where only view 0 sees the surface.
 fn with_flipped_patch(count: usize) -> Vec<Mesh> {
-    let mut views = halves();
+    with_flipped_patch_in(halves(), count)
+}
+
+fn with_flipped_patch_in(mut views: Vec<Mesh>, count: usize) -> Vec<Mesh> {
     let m = &mut views[0];
     let tip = m.positions.iter().copied().max_by(|a, b| a.x.total_cmp(&b.x)).unwrap();
     let away = |i: usize| (m.face_centroid(i).unwrap() - tip).norm();
@@ -127,8 +147,11 @@ fn a_patch_turned_inside_out_is_refused() {
 
 #[test]
 fn a_few_flipped_triangles_are_left_out_and_reported() {
-    // one triangle (0.07 % of the area, below the 0.1 % that refuses) is left out; no flipped part remains
-    let mut s = session(&with_flipped_patch(1));
+    // one triangle of a fine view (0.006 % of its area, 16 times below the 0.1 % that refuses) is left
+    // out; no flipped part remains. (The refusal case flips 60 triangles of a coarse view: 4 %, 40
+    // times above.)
+    let fine = vec![cut(&noisy(blob_at(160), 200), |p| p.x >= -8.0), view(1, -Vec3::x(), 8.0)];
+    let mut s = session(&with_flipped_patch_in(fine, 1));
     let out = merge(&mut s, 2, json!({}));
     assert!(codes(&out).contains(&"flipped_triangles_dropped".to_string()), "{:?}", codes(&out));
     assert_eq!(out["after"]["unoriented_edges"], json!(0));
@@ -260,9 +283,15 @@ fn bad_parameters_are_refused_without_a_panic() {
     ] {
         let r = s.execute("mesh.merge", bad.clone());
         assert!(r.is_err(), "{bad}: {r:?}");
+        assert!(!matches!(r, Err(surfacecraft_engine::EngineError::Internal(_))), "{bad} panicked: {r:?}");
     }
     // absurd but valid numbers: an answer or an error, never a panic
-    for odd in [1e300, 1e-300, f64::MIN_POSITIVE] {
+    let mut huge = halves()[0].clone();
+    huge.positions.iter_mut().for_each(|p| *p = Point3::from(p.coords * 1e198));
+    s.doc.add_mesh("huge", huge);
+    let r = s.execute("mesh.merge", json!({"objects": ["v0", "huge"]}));
+    assert!(!matches!(r, Err(surfacecraft_engine::EngineError::Internal(_))), "coordinates near 1e200: {r:?}");
+    for odd in [1e300, 1e200, 1e-300, f64::MIN_POSITIVE] {
         let r = s.execute("mesh.merge", json!({"objects": ["v0", "v1"], "tolerance": odd}));
         assert!(!matches!(r, Err(surfacecraft_engine::EngineError::Internal(_))), "{odd}: {r:?}");
     }

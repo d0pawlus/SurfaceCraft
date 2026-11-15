@@ -11,6 +11,8 @@ pub const PAIR_SAMPLES: usize = 20_000;
 const CHUNK: usize = 4096;
 /// Two surfaces face the same way when the cosine of the angle of their normals is at least this.
 pub(super) const COS_FACING: f64 = 0.5;
+/// The high quantile of the residual reported (percent).
+const PERCENTILE: usize = 95;
 /// Two surfaces oppose when that cosine is at most minus this.
 const COS_OPPOSED: f64 = 0.5;
 
@@ -64,6 +66,9 @@ enum Seen {
     Facing(f64),
     /// Opposed surface of the other scan within the tolerance (and no facing one within it).
     Opposed,
+    /// No surface within the reach, but along the sample's normal (either way) the first surface of
+    /// the other scan, within its size, faces the same way: the two lie over each other, apart.
+    Over,
 }
 
 /// The agreement of scan `a`'s samples with scan `b`.
@@ -81,6 +86,9 @@ pub struct PairResidual {
     pub within: usize,
     /// Samples on opposed surface of `b` within the tolerance.
     pub opposed: usize,
+    /// Samples with no surface of `b` within the reach that lie over facing surface of `b` farther away
+    /// (along their normal, within the size of `b`): `b` is there, but displaced.
+    pub over: usize,
     /// Root mean square of the distances of the near samples (mm).
     pub rms: f64,
     /// 95th percentile of those distances (mm).
@@ -94,6 +102,13 @@ impl PairResidual {
     #[must_use]
     pub fn beyond_share(&self) -> f64 {
         if self.near == 0 { 0.0 } else { (self.near - self.within) as f64 / self.near as f64 }
+    }
+
+    /// Do more samples lie over `b` displaced beyond the reach than agree with it within the tolerance?
+    /// (Scans offset by more than the reach: they share no surface within it but lie over each other.)
+    #[must_use]
+    pub fn displaced(&self, min: usize) -> bool {
+        self.over >= min && self.over > self.within
     }
 }
 
@@ -112,7 +127,23 @@ fn look(s: &Sample, other: &Scan, reach: f64, tol: f64) -> Option<Seen> {
         let opposed = other.bvh.closest(&s.point, tol).filter(|o| opposes(other, s, o));
         return Some(opposed.map_or(Seen::Facing(h.distance), |_| Seen::Opposed));
     }
-    other.bvh.closest(&s.point, tol).filter(|o| opposes(other, s, o)).map(|_| Seen::Opposed)
+    let opposed = other.bvh.closest(&s.point, tol).filter(|o| opposes(other, s, o)).map(|_| Seen::Opposed);
+    opposed.or_else(|| over(s, other, reach))
+}
+
+/// Is the first surface of `other` along the normal of `s` (either way, beyond `reach` and within
+/// the size of `other`) facing the same way? Two copies of one surface displaced along it are; scans
+/// side by side are not (the first surface met is the other's back, facing the other way).
+fn over(s: &Sample, other: &Scan, reach: f64) -> Option<Seen> {
+    let wide = other.bbox.diagonal();
+    if !(other.bbox.dist2(&s.point) <= wide * wide) {
+        return None;
+    }
+    let hit = [s.normal, -s.normal]
+        .iter()
+        .filter_map(|d| other.bvh.ray_cast_where(&s.point, d, wide, &|_| true))
+        .min_by(|a, b| a.1.total_cmp(&b.1))?;
+    (hit.1 > reach && other.face_normal(hit.0).dot(&s.normal) >= COS_FACING).then_some(Seen::Over)
 }
 
 fn opposes(other: &Scan, s: &Sample, hit: &crate::SurfaceHit) -> bool {
@@ -151,13 +182,14 @@ fn summary(a: usize, b: usize, samples: usize, seen: &[Option<Seen>], tol: f64) 
     let mut d: Vec<f64> =
         seen.iter().filter_map(|s| if let Some(Seen::Facing(x)) = s { Some(*x) } else { None }).collect();
     let opposed = seen.iter().filter(|s| matches!(s, Some(Seen::Opposed))).count();
+    let over = seen.iter().filter(|s| matches!(s, Some(Seen::Over))).count();
     let near = d.len();
     let within = d.iter().filter(|&&x| x <= tol).count();
     let rms = if near == 0 { 0.0 } else { (d.iter().map(|x| x * x).sum::<f64>() / near as f64).sqrt() };
     d.sort_by(f64::total_cmp);
-    let p95 = d.get((near * 95 / 100).min(near.saturating_sub(1))).copied().unwrap_or(0.0);
+    let p95 = d.get((near * PERCENTILE / 100).min(near.saturating_sub(1))).copied().unwrap_or(0.0);
     let worst = d.last().copied().unwrap_or(0.0);
-    PairResidual { a, b, samples, near, within, opposed, rms, p95, worst }
+    PairResidual { a, b, samples, near, within, opposed, over, rms, p95, worst }
 }
 
 /// The pair residuals (every ordered pair with something near) and, per scan, the share of its
@@ -181,7 +213,7 @@ pub(super) fn residuals(
         covered.push(if samples.is_empty() { 0.0 } else { hit as f64 / samples.len() as f64 });
         for (b, seen) in per_other.iter().enumerate().filter(|(b, _)| *b != a) {
             let r = summary(a, b, samples.len(), seen, tol);
-            if r.near > 0 || r.opposed > 0 {
+            if r.near > 0 || r.opposed > 0 || r.over > 0 {
                 pairs.push(r);
             }
         }

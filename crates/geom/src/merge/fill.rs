@@ -3,12 +3,14 @@
 //! filled by ear clipping in their mean plane (no new vertex), each triangle through the same guard
 //! as the pivoting (on scanned surface, crossing nothing). Loops with an edge of a scan's own border
 //! are openings of the part and are never filled.
+use super::guard::{Guard, Pts};
 use super::prep::Scan;
-use super::seam::Guard;
 use super::union::{Origin, Union, directed};
 use crate::Mesh;
 use std::collections::HashSet;
 
+/// Loops (or pieces) handled between two looks at the cancellation flag.
+const CANCEL_EVERY: usize = 256;
 /// Loops of open seam edges up to this many edges are filled.
 pub const SMALL_LOOP_EDGES: usize = 64;
 
@@ -73,17 +75,25 @@ fn simple(walk: Vec<u32>) -> Vec<Vec<u32>> {
 
 /// Fills the small seam loops of `u` through `guard`. Returns (loops filled, triangles added, the
 /// small loops left open).
-pub(super) fn fill_small(u: &mut Union, scans: &[Scan], guard: &mut Guard<'_>) -> (usize, usize, Vec<Vec<u32>>) {
+pub(super) fn fill_small(
+    u: &mut Union,
+    scans: &[Scan],
+    guard: &mut Guard<'_>,
+    cancel: &crate::Cancel,
+) -> Option<(usize, usize, Vec<Vec<u32>>)> {
     let loops: Vec<Vec<u32>> = seam_loops(u, scans).into_iter().filter(|l| l.len() <= SMALL_LOOP_EDGES).collect();
     let mut left = Vec::new();
     if loops.is_empty() {
-        return (0, 0, left);
+        return Some((0, 0, left));
     }
     let mut taken: HashSet<u64> =
         u.triangles.iter().flat_map(|t| (0..3).map(move |k| undirected(t[k], t[(k + 1) % 3]))).collect();
     let mut work = Mesh { positions: u.positions.clone(), triangles: Vec::new() };
     let (mut filled, mut added) = (0, 0);
-    for lp in loops {
+    for (n, lp) in loops.into_iter().enumerate() {
+        if n % CANCEL_EVERY == 0 && cancel.is_cancelled() {
+            return None;
+        }
         let rev: Vec<u32> = lp.iter().rev().copied().collect();
         let Some(patch) = patch_for(&mut work, &rev, &taken, u, guard) else {
             left.push(lp);
@@ -95,7 +105,7 @@ pub(super) fn fill_small(u: &mut Union, scans: &[Scan], guard: &mut Guard<'_>) -
         u.origin.extend(std::iter::repeat_n(Origin::Seam, patch.len()));
         u.triangles.extend(patch);
     }
-    (filled, added, left)
+    Some((filled, added, left))
 }
 
 /// A fan of the loop `lp` from its vertex `k`.
@@ -131,7 +141,7 @@ fn patch_for(
         }
         count.iter().all(|(e, &n)| if boundary.contains(e) { n == 1 } else { n == 2 && !taken.contains(e) })
     };
-    tries.into_iter().find(|p| diagonal_free(p) && guard.accept_all(&u.positions, p))
+    tries.into_iter().find(|p| diagonal_free(p) && guard.accept_all(Pts::of(u), p))
 }
 
 /// The fans of triangles `tris` around vertex `v` (triangles joined across the edges through `v`).
@@ -181,7 +191,13 @@ pub(super) fn unpinch(u: &mut Union, guard: &mut Guard<'_>) -> usize {
     let seam = |i: &usize| matches!(u.origin.get(*i), Some(Origin::Seam));
     let mut drop = vec![false; u.triangles.len()];
     for (v, tris) in at.iter().enumerate() {
-        if tris.iter().any(seam) && fans(u, v as u32, tris) > 1 {
+        if !tris.iter().any(seam) {
+            continue;
+        }
+        // a pinch the scans already had (their own triangles alone form several fans) is not the
+        // seam's: it is left as it is
+        let own: Vec<usize> = tris.iter().copied().filter(|i| !seam(i)).collect();
+        if fans(u, v as u32, tris) > fans(u, v as u32, &own).max(1) {
             for &i in tris.iter().filter(|i| seam(i)) {
                 if let Some(d) = drop.get_mut(i) {
                     *d = true;
@@ -215,7 +231,7 @@ pub(super) fn widen(u: &mut Union, guard: &mut Guard<'_>, left: &[Vec<u32>]) -> 
 fn take_back(u: &mut Union, guard: &mut Guard<'_>, drop: &[bool]) -> usize {
     let gone: Vec<[u32; 3]> = u.triangles.iter().zip(drop).filter(|(_, d)| **d).map(|(t, _)| *t).collect();
     for &t in &gone {
-        guard.forget(&u.positions, t);
+        guard.forget(Pts::of(u), t);
     }
     let mut keep = drop.iter().map(|d| !d);
     u.triangles.retain(|_| keep.next().unwrap_or(true));
@@ -224,18 +240,49 @@ fn take_back(u: &mut Union, guard: &mut Guard<'_>, drop: &[bool]) -> usize {
     gone.len()
 }
 
+/// A piece the recovery put back that joined nothing: only recovered triangles, less than
+/// [`SPECK_SHARE`] of the area of the result. A floating fragment helps no wrap; its surface counts
+/// as removed (and uncovered) in the checks.
+fn recovered_speck(u: &Union, mesh: &Mesh, part: &[u32]) -> bool {
+    let all_recovered = part.iter().all(|&t| matches!(u.origin.get(t as usize), Some(Origin::Recovered(..))));
+    let area: f64 = part.iter().map(|&t| mesh.face_area(t as usize)).sum();
+    all_recovered && area < SPECK_SHARE * mesh.area()
+}
+
+/// Takes back the pieces made only of recovered triangles that joined nothing (see
+/// [`recovered_speck`]), before the holes are filled again (a speck in a hole keeps the fill out).
+/// Returns how many triangles.
+pub(super) fn drop_specks(u: &mut Union, guard: &mut Guard<'_>) -> usize {
+    let mesh = Mesh { positions: u.positions.clone(), triangles: u.triangles.clone() };
+    let mut drop = vec![false; u.triangles.len()];
+    for part in crate::edit::components(&mesh).iter().filter(|p| recovered_speck(u, &mesh, p)) {
+        for &t in part {
+            if let Some(d) = drop.get_mut(t as usize) {
+                *d = true;
+            }
+        }
+    }
+    take_back(u, guard, &drop)
+}
+
+/// Pieces made only of recovered triangles below this share of the result's area are dropped.
+pub const SPECK_SHARE: f64 = 0.01;
+
 /// Drops the pieces of the union other than the largest that lie wholly (the centre of every
 /// triangle) within `tol` of facing surface of the rest: a stray triangle of a scan left on the
 /// merged surface, a second layer. Returns the kept scan triangles dropped as `(scan, triangle)`.
-pub(super) fn drop_islands(u: &mut Union, tol: f64) -> (Vec<(u32, u32)>, usize) {
+pub(super) fn drop_islands(u: &mut Union, tol: f64, cancel: &crate::Cancel) -> Option<(Vec<(u32, u32)>, usize)> {
     let mesh = Mesh { positions: u.positions.clone(), triangles: u.triangles.clone() };
     let parts = crate::edit::components(&mesh);
     if parts.len() < 2 {
-        return (Vec::new(), 0);
+        return Some((Vec::new(), 0));
     }
     let bvh = crate::Bvh::build(&mesh);
     let mut drop = vec![false; u.triangles.len()];
-    for part in parts.iter().skip(1) {
+    for (n, part) in parts.iter().skip(1).enumerate() {
+        if n % CANCEL_EVERY == 0 && cancel.is_cancelled() {
+            return None;
+        }
         let mine: HashSet<u32> = part.iter().copied().collect();
         let on_rest = part.iter().all(|&t| {
             let (Some(c), Some(n)) = (mesh.face_centroid(t as usize), mesh.face_normal(t as usize)) else {
@@ -267,5 +314,5 @@ pub(super) fn drop_islands(u: &mut Union, tol: f64) -> (Vec<(u32, u32)>, usize) 
     u.triangles.retain(|_| keep.next().unwrap_or(true));
     let mut keep = drop.iter().map(|d| !d);
     u.origin.retain(|_| keep.next().unwrap_or(true));
-    (kept, count)
+    Some((kept, count))
 }

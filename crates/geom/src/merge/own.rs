@@ -1,8 +1,12 @@
 //! Which scan keeps the surface where several cover it.
 //!
 //! The rule: of the scans that cover a point (facing surface within the tolerance, not past its
-//! border), the one in which the point lies farthest from its own border keeps it; equal distances
-//! (two copies of one scan, two closed scans) go to the scan listed first. A scan is least reliable
+//! border), the one in which the point lies farthest from its own border keeps it; distances within
+//! one median edge of the largest (two copies of one scan, two closed scans) go to the scan listed
+//! first. Each vertex applies the rule to the scans that cover it, with their distances interpolated
+//! at its projection onto them; two neighbouring vertices of different scans can therefore decide
+//! differently near a tie (a gap or a narrow double strip), and what that leaves is caught by the
+//! eating back below and measured by `RemovedUncovered` and `Stacked`. A scan is least reliable
 //! at its border (the scanner sees the surface at a grazing angle there, and the border is ragged),
 //! so this puts the seam midway between the borders, as far from both as the overlap allows. A
 //! vertex another scan keeps is lost, and a triangle with a lost corner is removed, so each side
@@ -16,6 +20,10 @@ use super::overlap::COS_FACING;
 use super::prep::{NONE, Scan};
 use crate::{Cancel, Point3, Vec3, par};
 
+/// A point closer than this share of the tolerance to a kept triangle lies on it (also on its edge).
+const ON_SURFACE_SHARE: f64 = 0.01;
+/// A closest point within this barycentric share of an edge of the kept region lies on it.
+const KEPT_EDGE_SNAP: f64 = 1e-9;
 /// Vertices handled between two looks at the cancellation flag.
 const CHUNK: usize = 1 << 15;
 /// Rounds of eating back per scan at most.
@@ -88,10 +96,25 @@ pub(super) fn removed_by_owner(
 /// Is `q` within `tol` of facing surface that a scan other than `a` keeps?
 fn on_kept(scans: &[Scan], removed: &[Vec<bool>], a: usize, q: &Point3, n: &Vec3, tol: f64) -> bool {
     scans.iter().enumerate().filter(|(x, o)| *x != a && o.bbox.dist2(q) <= tol * tol).any(|(x, o)| {
-        let gone = removed.get(x);
-        let keep =
-            |t: usize| !gone.and_then(|g| g.get(t)).copied().unwrap_or(true) && o.face_normal(t).dot(n) >= COS_FACING;
-        o.bvh.closest_filtered(q, tol, &keep).is_some()
+        let gone = removed.get(x).map_or(&[][..], Vec::as_slice);
+        let keep = |t: usize| !gone.get(t).copied().unwrap_or(true) && o.face_normal(t).dot(n) >= COS_FACING;
+        // on the surface (its edge included) or over its inside; not beyond its edge
+        o.bvh
+            .closest_filtered(q, tol, &keep)
+            .is_some_and(|h| h.distance <= ON_SURFACE_SHARE * tol || inside_kept(o, gone, h.triangle, &h.point))
+    })
+}
+
+/// Is the closest point `hit` on kept triangle `t` of scan `o` inside its kept surface: not on an edge
+/// of the kept region (the scan's border, or an edge to a removed triangle)? A point beyond the kept
+/// region finds its closest point on such an edge and is not covered by it.
+fn inside_kept(o: &Scan, gone: &[bool], t: usize, hit: &Point3) -> bool {
+    let (Some(tri), Some(across)) = (o.mesh.triangle(t), o.across.get(t)) else { return false };
+    let w = super::prep::barycentric(&tri, hit);
+    (0..3).all(|k| {
+        let edge = across[k] == NONE || gone.get(across[k] as usize).copied().unwrap_or(true);
+        // the barycentric coordinate opposite edge k is that of corner k + 2
+        !(edge && w[(k + 2) % 3] <= KEPT_EDGE_SNAP)
     })
 }
 

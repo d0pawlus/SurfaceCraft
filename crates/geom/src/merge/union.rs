@@ -1,18 +1,14 @@
 //! The kept triangles of all scans as one vertex and triangle list, before the seam is closed:
 //! every kept vertex once, at its own position; seam vertices of different scans that coincide
-//! (closer than [`WELD_SHARE`] of the tolerance) welded into the one of the scan listed first;
+//! (see [`super::weld`]) welded into the one of the scan listed first;
 //! removed triangles whose corners all exist in the union at exactly their positions restored
 //! (pieces cut from one scan share their vertices and triangles where they overlap: there the seam
 //! is a re-weld, not new surface).
+use super::guard::Pts;
 use super::prep::{NONE, Scan};
-use crate::{KdTree, Point3, Vec3};
+use crate::{Point3, Vec3};
 use std::collections::{HashMap, HashSet};
 
-/// Seam vertices of different scans closer than this share of the tolerance (and a tenth of the
-/// median edge) are one vertex: two copies of one point a scan pair left on either side of the seam.
-pub const WELD_SHARE: f64 = 0.25;
-/// Rounds of undoing welds that would make an edge run the same way twice.
-const WELD_PASSES: usize = 4;
 /// Passes over the removed triangles when restoring (a triangle may need a neighbour restored first).
 const RESTORE_PASSES: usize = 3;
 
@@ -42,6 +38,12 @@ pub(super) struct Union {
     /// Vertices moved by the weld and the largest move (mm).
     pub(super) welded: usize,
     pub(super) max_move: f64,
+    /// Welds undone because they would have flipped, folded or doubled a triangle.
+    pub(super) welds_undone: usize,
+    /// Kept triangles `(scan, triangle)` a weld collapsed (two corners welded into one).
+    pub(super) collapsed: Vec<(u32, u32)>,
+    /// The cut edges `a → b` the seam started from.
+    pub(super) initial_front: Vec<[u32; 2]>,
 }
 
 pub(super) fn directed(a: u32, b: u32) -> u64 {
@@ -59,6 +61,9 @@ pub(super) fn assemble(scans: &[Scan], removed: &[Vec<bool>]) -> Union {
         vertex_of: Vec::with_capacity(scans.len()),
         welded: 0,
         max_move: 0.0,
+        welds_undone: 0,
+        collapsed: Vec::new(),
+        initial_front: Vec::new(),
     };
     for (s, scan) in scans.iter().enumerate() {
         let gone = removed.get(s).map_or(&[][..], Vec::as_slice);
@@ -116,132 +121,6 @@ impl Union {
         }
         out
     }
-
-    /// Welds front vertices of different scans that coincide (within `eps`) into the vertex of the
-    /// scan listed first, drops the triangles that collapse, and returns the front again.
-    pub(super) fn weld_front(&mut self, scans: &[Scan], eps: f64) {
-        let front = self.front(scans);
-        let mut ends: Vec<u32> = front.iter().flat_map(|f| [f[0], f[1]]).collect();
-        ends.sort_unstable();
-        ends.dedup();
-        if ends.is_empty() || !(eps > 0.0) {
-            return;
-        }
-        let mut to = self.weld_targets(&ends, eps);
-        // a weld that would make two triangles run one edge the same way (or put three on it) is undone
-        for _ in 0..WELD_PASSES {
-            let bad = self.clashing(&to);
-            if bad.is_empty() {
-                break;
-            }
-            for v in bad {
-                if let Some(slot) = to.get_mut(v as usize) {
-                    *slot = v;
-                }
-            }
-        }
-        for (v, &w) in to.iter().enumerate().filter(|(v, w)| *v as u32 != **w) {
-            let moved = match (self.positions.get(v), self.positions.get(w as usize)) {
-                (Some(p), Some(q)) => (q - p).norm(),
-                _ => 0.0,
-            };
-            self.max_move = self.max_move.max(moved);
-            self.welded += 1;
-        }
-        self.remap(&to);
-    }
-
-    /// For every front vertex in `ends`, the vertex of a scan listed earlier within `eps` it is welded
-    /// into (itself when none).
-    fn weld_targets(&self, ends: &[u32], eps: f64) -> Vec<u32> {
-        let pts: Vec<Point3> = ends.iter().filter_map(|&v| self.positions.get(v as usize).copied()).collect();
-        let tree = KdTree::build(&pts);
-        let mut to: Vec<u32> = (0..self.positions.len() as u32).collect();
-        for (i, &v) in ends.iter().enumerate() {
-            let (Some(p), Some(&sv)) = (pts.get(i), self.scan_of.get(v as usize)) else { continue };
-            let best = tree
-                .within(p, eps)
-                .into_iter()
-                .filter_map(|j| ends.get(j).copied())
-                .filter(|&w| w < v && self.scan_of.get(w as usize).is_some_and(|&sw| sw < sv))
-                .min();
-            if let Some(w) = best {
-                let target = to.get(w as usize).copied().unwrap_or(w);
-                if let Some(slot) = to.get_mut(v as usize) {
-                    *slot = target;
-                }
-            }
-        }
-        to
-    }
-
-    /// The welded vertices (`to[v] != v`) on an edge that the weld would leave with two triangles running
-    /// it the same way, or with three triangles.
-    fn clashing(&self, to: &[u32]) -> Vec<u32> {
-        let map = |v: u32| to.get(v as usize).copied().unwrap_or(v);
-        // only edges at a welded vertex or a vertex welded into can change
-        let mut moved = vec![false; self.positions.len()];
-        for (v, &w) in to.iter().enumerate().filter(|(v, w)| *v as u32 != **w) {
-            for x in [v, w as usize] {
-                if let Some(f) = moved.get_mut(x) {
-                    *f = true;
-                }
-            }
-        }
-        let touched: Vec<&[u32; 3]> = self
-            .triangles
-            .iter()
-            .filter(|t| t.iter().any(|&v| moved.get(v as usize).copied().unwrap_or(false)))
-            .collect();
-        let mut count: HashMap<u64, u32> = HashMap::new();
-        let mut undirected: HashMap<u64, u32> = HashMap::new();
-        for t in &touched {
-            let m = t.map(map);
-            if m[0] == m[1] || m[1] == m[2] || m[0] == m[2] {
-                continue;
-            }
-            for k in 0..3 {
-                let (a, b) = (m[k], m[(k + 1) % 3]);
-                *count.entry(directed(a, b)).or_default() += 1;
-                *undirected.entry(directed(a.min(b), a.max(b))).or_default() += 1;
-            }
-        }
-        let mut bad: Vec<u32> = Vec::new();
-        for t in &touched {
-            let m = t.map(map);
-            let clash = (0..3).any(|k| {
-                let (a, b) = (m[k], m[(k + 1) % 3]);
-                count.get(&directed(a, b)).copied().unwrap_or(0) > 1
-                    || undirected.get(&directed(a.min(b), a.max(b))).copied().unwrap_or(0) > 2
-            });
-            if clash {
-                bad.extend(t.iter().copied().filter(|&v| map(v) != v));
-            }
-        }
-        bad.sort_unstable();
-        bad.dedup();
-        bad
-    }
-
-    /// Points every triangle at the vertices `to` gives and drops those that collapse.
-    fn remap(&mut self, to: &[u32]) {
-        let mut tris = Vec::with_capacity(self.triangles.len());
-        let mut origin = Vec::with_capacity(self.triangles.len());
-        for (t, o) in self.triangles.iter().zip(&self.origin) {
-            let m = t.map(|v| to.get(v as usize).copied().unwrap_or(v));
-            if m[0] != m[1] && m[1] != m[2] && m[0] != m[2] {
-                tris.push(m);
-                origin.push(*o);
-            }
-        }
-        for map in &mut self.vertex_of {
-            for v in map.iter_mut().filter(|v| **v != NONE) {
-                *v = to.get(*v as usize).copied().unwrap_or(*v);
-            }
-        }
-        self.triangles = tris;
-        self.origin = origin;
-    }
 }
 
 /// Exact position of a point as a key.
@@ -279,8 +158,8 @@ fn corner(
     owned.then_some(Corner::Unused(v))
 }
 
-/// Gives the unused vertex `v` of scan `s` a place in the union.
-fn add_vertex(u: &mut Union, at: &mut HashMap<[u64; 3], u32>, scans: &[Scan], s: usize, v: u32) -> Option<u32> {
+/// Gives vertex `v` of scan `s` a place in the union (at its own position, with its normal).
+pub(super) fn add_vertex(u: &mut Union, scans: &[Scan], s: usize, v: u32) -> Option<u32> {
     let scan = scans.get(s)?;
     let p = *scan.mesh.positions.get(v as usize)?;
     let x = u.positions.len() as u32;
@@ -290,20 +169,45 @@ fn add_vertex(u: &mut Union, at: &mut HashMap<[u64; 3], u32>, scans: &[Scan], s:
     if let Some(slot) = u.vertex_of.get_mut(s).and_then(|m| m.get_mut(v as usize)) {
         *slot = x;
     }
-    at.entry(bits(&p)).or_insert(x);
     Some(x)
 }
 
+impl Union {
+    /// Takes back the vertices added since the union had `len` of them (those of scan vertices
+    /// `added`): a triangle that needed them was refused.
+    pub(super) fn rollback(&mut self, len: usize, added: &[(usize, u32)]) {
+        self.positions.truncate(len);
+        self.normals.truncate(len);
+        self.scan_of.truncate(len);
+        for &(s, v) in added {
+            if let Some(slot) = self.vertex_of.get_mut(s).and_then(|m| m.get_mut(v as usize)) {
+                *slot = NONE;
+            }
+        }
+    }
+
+    /// The vertex sets of the triangles (any winding).
+    pub(super) fn vertex_sets(&self) -> HashSet<[u32; 3]> {
+        self.triangles.iter().map(|t| sorted(*t)).collect()
+    }
+}
+
+pub(super) fn sorted(mut t: [u32; 3]) -> [u32; 3] {
+    t.sort_unstable();
+    t
+}
+
 /// The union vertices of the corners of a removed triangle, when it can come back: every corner is
-/// in the union (or an unused own vertex, added now) and at least one is another scan's vertex at
-/// exactly its place (a triangle removed for redundancy, with all its corners its own, stays out).
+/// in the union (or an unused own vertex, added now and listed in `added`) and at least one is
+/// another scan's vertex at exactly its place (a triangle removed for redundancy, with all its
+/// corners its own, stays out).
 fn corners_of(
     u: &mut Union,
-    at: &mut HashMap<[u64; 3], u32>,
-    scans: &[Scan],
-    lost: &[Vec<bool>],
+    at: &HashMap<[u64; 3], u32>,
+    (scans, lost): (&[Scan], &[Vec<bool>]),
     s: usize,
     tri: [u32; 3],
+    added: &mut Vec<(usize, u32)>,
 ) -> Option<[u32; 3]> {
     let c = tri.map(|v| corner(u, at, scans, lost, s, v));
     let c = [c[0]?, c[1]?, c[2]?];
@@ -314,22 +218,58 @@ fn corners_of(
     for (k, x) in c.iter().enumerate() {
         m[k] = match *x {
             Corner::Own(i) | Corner::Other(i) => i,
-            Corner::Unused(v) => add_vertex(u, at, scans, s, v)?,
+            Corner::Unused(v) => {
+                added.push((s, v));
+                add_vertex(u, scans, s, v)?
+            }
         };
     }
     (m[0] != m[1] && m[1] != m[2] && m[0] != m[2]).then_some(m)
 }
 
-/// Restores the removed triangles whose corners all exist in the union at exactly their positions
-/// (see [`corners_of`]), when that uses no directed edge twice and `guard` accepts them. Returns how
-/// many.
-pub(super) fn restore(
-    u: &mut Union,
-    scans: &[Scan],
-    (removed, lost): (&[Vec<bool>], &[Vec<bool>]),
-    guard: &mut dyn FnMut(&[Point3], [u32; 3]) -> bool,
-) -> usize {
-    // only vertices still in use (a welded vertex lives on as the one it was welded into)
+/// What the restoring keeps between triangles: used positions, directed edges, vertex sets.
+struct Restoring {
+    at: HashMap<[u64; 3], u32>,
+    edges: HashSet<u64>,
+    sets: HashSet<[u32; 3]>,
+}
+
+impl Restoring {
+    /// Restores triangle `t` (corners `tri`) of scan `s` if it can come back (see [`restore`]).
+    fn try_one(
+        &mut self,
+        u: &mut Union,
+        (scans, lost): (&[Scan], &[Vec<bool>]),
+        (s, t, tri): (usize, usize, [u32; 3]),
+        guard: &mut dyn FnMut(Pts<'_>, [u32; 3]) -> bool,
+    ) -> bool {
+        let (len, mut added) = (u.positions.len(), Vec::new());
+        let Some(m) = corners_of(u, &self.at, (scans, lost), s, tri, &mut added) else {
+            u.rollback(len, &added);
+            return false;
+        };
+        let taken =
+            (0..3).any(|k| self.edges.contains(&directed(m[k], m[(k + 1) % 3]))) || self.sets.contains(&sorted(m));
+        if taken || !guard(Pts::of(u), m) {
+            u.rollback(len, &added);
+            return false;
+        }
+        for &(sv, v) in &added {
+            let x = u.vertex_of.get(sv).and_then(|map| map.get(v as usize)).copied();
+            if let (Some(p), Some(x)) = (scans.get(sv).and_then(|sc| sc.mesh.positions.get(v as usize)), x) {
+                self.at.entry(bits(p)).or_insert(x);
+            }
+        }
+        self.edges.extend((0..3).map(|k| directed(m[k], m[(k + 1) % 3])));
+        self.sets.insert(sorted(m));
+        u.triangles.push(m);
+        u.origin.push(Origin::Restored(s as u32, t as u32));
+        true
+    }
+}
+
+/// The union vertex of every used scan vertex by exact position (the lowest index of a position).
+fn positions_in_use(u: &Union) -> HashMap<[u64; 3], u32> {
     let mut at: HashMap<[u64; 3], u32> = HashMap::new();
     for &i in u.vertex_of.iter().flatten().filter(|&&i| i != NONE) {
         if let Some(p) = u.positions.get(i as usize) {
@@ -337,31 +277,43 @@ pub(super) fn restore(
             *slot = (*slot).min(i);
         }
     }
-    let mut edges = u.directed_edges();
+    at
+}
+
+/// Restores the removed triangles whose corners all exist in the union at exactly their positions
+/// (see [`corners_of`]), when that uses no directed edge twice, repeats no triangle's corners and
+/// `guard` accepts them; the vertices a refused one needed are taken back. Returns how many, or
+/// `None` when `cancel` was set.
+pub(super) fn restore(
+    u: &mut Union,
+    scans: &[Scan],
+    (removed, lost): (&[Vec<bool>], &[Vec<bool>]),
+    guard: &mut dyn FnMut(Pts<'_>, [u32; 3]) -> bool,
+    cancel: &crate::Cancel,
+) -> Option<usize> {
+    let mut st = Restoring { at: positions_in_use(u), edges: u.directed_edges(), sets: u.vertex_sets() };
     let mut done: HashSet<(u32, u32)> = HashSet::new();
     let mut restored = 0;
     for _ in 0..RESTORE_PASSES {
         let before = restored;
         for (s, scan) in scans.iter().enumerate() {
+            if cancel.is_cancelled() {
+                return None;
+            }
             let gone = removed.get(s).map_or(&[][..], Vec::as_slice);
             for (t, &tri) in scan.mesh.triangles.iter().enumerate() {
                 if !gone.get(t).copied().unwrap_or(false) || done.contains(&(s as u32, t as u32)) {
                     continue;
                 }
-                let Some(m) = corners_of(u, &mut at, scans, lost, s, tri) else { continue };
-                if (0..3).any(|k| edges.contains(&directed(m[k], m[(k + 1) % 3]))) || !guard(&u.positions, m) {
-                    continue;
+                if st.try_one(u, (scans, lost), (s, t, tri), guard) {
+                    done.insert((s as u32, t as u32));
+                    restored += 1;
                 }
-                edges.extend((0..3).map(|k| directed(m[k], m[(k + 1) % 3])));
-                u.triangles.push(m);
-                u.origin.push(Origin::Restored(s as u32, t as u32));
-                done.insert((s as u32, t as u32));
-                restored += 1;
             }
         }
         if restored == before {
             break;
         }
     }
-    restored
+    Some(restored)
 }

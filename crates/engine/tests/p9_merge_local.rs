@@ -128,10 +128,14 @@ fn run(number: usize, kind: &str, whole: &Mesh, parts: &[Mesh]) {
     let out = match out {
         Ok(v) => v,
         Err(e) => {
+            assert!(kind != "exact", "scan {number}: pieces of one scan must merge: {e}");
             eprintln!("| {number} | {kind} | error: {e} | | | | | | {secs:.1} |");
             return;
         }
     };
+    if kind == "exact" {
+        assert_eq!(out["refused"], json!(false), "scan {number}: {:?}", codes(&out));
+    }
     let tol = out["tolerance"].as_f64().unwrap_or(0.0);
     let topo = surfacecraft_geom::merge::topology(whole);
     let own = own_faults(whole, tol);
@@ -139,6 +143,10 @@ fn run(number: usize, kind: &str, whole: &Mesh, parts: &[Mesh]) {
         Some(id) => compare(whole, s.doc.mesh(surfacecraft_doc::ObjectId(id)).unwrap().mesh.as_ref(), tol),
         None => (0.0, 0.0),
     };
+    if kind == "exact" {
+        // measured 0.9996 to 1.0000 of the scan's vertices within the tolerance of the merge
+        assert!(near >= 0.66, "scan {number}: {near}");
+    }
     eprintln!(
         "| {number} | {kind} | {} | {tol:.4} | {near:.4} | {same:.4} | {}/{} | {}/{} | {} ({:.1} mm) | {:.4} | {} ({}) | {} ({}) | {:.4} ({:.4}) | {secs:.1} | {:?} |",
         whole.triangle_count(),

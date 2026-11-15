@@ -78,6 +78,10 @@ pub(super) fn ball_center(p0: &Point3, p1: &Point3, p2: &Point3, rho: f64) -> Op
     Some((cc + nhat * h2.sqrt(), nhat))
 }
 
+/// In band mode a point counts for the empty-ball test only when its normal and the triangle's make
+/// at least this cosine.
+const BAND_FACING: f64 = 0.5;
+
 /// Tolerance of the pivot angle below zero, 1e-7 rad (near zero the pseudo angle equals the angle).
 const PSEUDO_EPS: f64 = 1e-7;
 
@@ -141,8 +145,8 @@ impl<'a> Bpa<'a> {
         let r2 = (rho * 0.97) * (rho * 0.97);
         let mut empty = true;
         grid.visit(center, rho, |q| {
-            let counts =
-                facing.is_none_or(|f| self.n(q).dot(&f) >= 0.5 && self.open.get(q as usize).is_some_and(|&o| o > 0));
+            let counts = facing
+                .is_none_or(|f| self.n(q).dot(&f) >= BAND_FACING && self.open.get(q as usize).is_some_and(|&o| o > 0));
             if counts && !skip.contains(&q) && (self.p(q) - center).norm_squared() < r2 {
                 empty = false;
                 return true;
@@ -247,19 +251,16 @@ impl<'a> Bpa<'a> {
         false
     }
 
-    /// Pivots the ball around the front edge `a → b` to the next point it touches.
-    pub(super) fn pivot(&mut self, grid: &Grid, rho: f64, f: &FrontEdge, front: &mut VecDeque<FrontEdge>) {
+    /// The points the ball pivoting around the front edge `f` can reach, with the pivot angle and the
+    /// ball centre, in `out` (cleared first), sorted by angle.
+    fn candidates(&self, grid: &Grid, rho: f64, f: &FrontEdge, out: &mut Vec<(f64, u32, Point3)>) {
+        out.clear();
         let (a, b, c) = (f.a, f.b, f.c);
-        if self.edges.contains_key(&key(b, a)) {
-            return;
-        }
         let (pa, pb) = (self.p(a), self.p(b));
         let m = Point3::from((pa.coords + pb.coords) * 0.5);
         let Some(u) = crate::normalize(pb - pa) else { return };
         let v0 = f.center - m;
         let lim2 = 4.0 * rho * rho;
-        let mut cands = std::mem::take(&mut self.scratch);
-        cands.clear();
         grid.visit(&m, 2.0 * rho, |d| {
             if d == a || d == b || d == c {
                 return false;
@@ -279,33 +280,44 @@ impl<'a> Bpa<'a> {
                 ang += 4.0;
             }
             if ang <= 2.0 {
-                cands.push((ang.max(0.0), d, cen));
+                out.push((ang.max(0.0), d, cen));
             }
             false
         });
-        cands.sort_by(|x, y| x.0.total_cmp(&y.0));
-        let mut found: Option<(u32, Point3)> = None;
-        for &(_, d, cen) in &cands {
-            if self.used.get(d as usize).copied().unwrap_or(true)
-                && self.open.get(d as usize).copied().unwrap_or(0) == 0
-            {
-                continue; // an interior vertex
-            }
-            if self.edges.contains_key(&key(a, d)) || self.edges.contains_key(&key(d, b)) {
-                continue;
-            }
-            let facing = if self.accept.is_some() { crate::tri::normal(&pb, &pa, &self.p(d)) } else { None };
-            if !self.ball_empty_facing(grid, &cen, rho, [a, b, d], facing) {
-                continue;
-            }
-            if let Some(accept) = self.accept.as_mut()
-                && !accept([b, a, d])
-            {
-                continue;
-            }
-            found = Some((d, cen));
-            break;
+        out.sort_by(|x, y| x.0.total_cmp(&y.0));
+    }
+
+    /// May the pivot over `a → b` end at `d` with the ball at `cen`? Not at an inner vertex (nor, in
+    /// band mode, at a point no triangle uses), not on an edge that exists, with the ball empty and
+    /// the caller's test passed.
+    fn takes(&mut self, grid: &Grid, rho: f64, (a, b, d): (u32, u32, u32), cen: &Point3) -> bool {
+        let used = self.used.get(d as usize).copied().unwrap_or(true);
+        if used && self.open.get(d as usize).copied().unwrap_or(0) == 0 {
+            return false; // an inner vertex
         }
+        if self.accept.is_some() && !used {
+            return false; // band mode: only points of the surface that is there
+        }
+        if self.edges.contains_key(&key(a, d)) || self.edges.contains_key(&key(d, b)) {
+            return false;
+        }
+        let facing = if self.accept.is_some() { crate::tri::normal(&self.p(b), &self.p(a), &self.p(d)) } else { None };
+        if !self.ball_empty_facing(grid, cen, rho, [a, b, d], facing) {
+            return false;
+        }
+        self.accept.as_mut().is_none_or(|accept| accept([b, a, d]))
+    }
+
+    /// Pivots the ball around the front edge `a → b` to the next point it touches.
+    pub(super) fn pivot(&mut self, grid: &Grid, rho: f64, f: &FrontEdge, front: &mut VecDeque<FrontEdge>) {
+        let (a, b) = (f.a, f.b);
+        if self.edges.contains_key(&key(b, a)) {
+            return;
+        }
+        let mut cands = std::mem::take(&mut self.scratch);
+        self.candidates(grid, rho, f, &mut cands);
+        let found =
+            cands.iter().find(|&&(_, d, cen)| self.takes(grid, rho, (a, b, d), &cen)).map(|&(_, d, cen)| (d, cen));
         self.scratch = cands;
         if let Some((d, cen)) = found {
             let t = [b, a, d];
