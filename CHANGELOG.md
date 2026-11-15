@@ -47,6 +47,11 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
 
 ### Fixed
 
+- `mesh.fill_holes` and `mesh.clean` (smooth fill), and so `scan.to_solid`: a smooth patch that
+  would pass through the mesh or through itself (the thin-plate fairing continued a curved rim past
+  itself) is faired again as a membrane, which stays within its loop's convex hull, when that one
+  does not cross. On the square cap of a sphere the crossing cap made the wrapped solid read a
+  negative `body.volume` (the kernel's healer turned the self-crossing solid inside out) (#158).
 - `surface.patch`, G2 to a neighbouring patch on real scans: the curvature condition is now a Newton
   step (it was a fixed-point step whose error was of first order in the speed of the
   parametrisation); a round that halves the miss of the side conditions is kept even when the scan
