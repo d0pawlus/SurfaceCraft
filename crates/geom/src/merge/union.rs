@@ -179,9 +179,23 @@ impl Union {
     /// it the same way, or with three triangles.
     fn clashing(&self, to: &[u32]) -> Vec<u32> {
         let map = |v: u32| to.get(v as usize).copied().unwrap_or(v);
+        // only edges at a welded vertex or a vertex welded into can change
+        let mut moved = vec![false; self.positions.len()];
+        for (v, &w) in to.iter().enumerate().filter(|(v, w)| *v as u32 != **w) {
+            for x in [v, w as usize] {
+                if let Some(f) = moved.get_mut(x) {
+                    *f = true;
+                }
+            }
+        }
+        let touched: Vec<&[u32; 3]> = self
+            .triangles
+            .iter()
+            .filter(|t| t.iter().any(|&v| moved.get(v as usize).copied().unwrap_or(false)))
+            .collect();
         let mut count: HashMap<u64, u32> = HashMap::new();
         let mut undirected: HashMap<u64, u32> = HashMap::new();
-        for t in &self.triangles {
+        for t in &touched {
             let m = t.map(map);
             if m[0] == m[1] || m[1] == m[2] || m[0] == m[2] {
                 continue;
@@ -193,7 +207,7 @@ impl Union {
             }
         }
         let mut bad: Vec<u32> = Vec::new();
-        for t in &self.triangles {
+        for t in &touched {
             let m = t.map(map);
             let clash = (0..3).any(|k| {
                 let (a, b) = (m[k], m[(k + 1) % 3]);
