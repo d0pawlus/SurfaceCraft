@@ -60,8 +60,15 @@ const SCAN: &[Entry] = &[
     Cmd("mesh.smooth"),
     Cmd("mesh.decimate"),
 ];
-const ALIGN: &[Entry] =
-    &[Cmd("align.principal"), Cmd("align.datum"), Cmd("align.n_point"), Gap, Cmd("align.icp"), Cmd("align.center")];
+const ALIGN: &[Entry] = &[
+    Cmd("align.auto"),
+    Cmd("align.principal"),
+    Cmd("align.datum"),
+    Cmd("align.n_point"),
+    Gap,
+    Cmd("align.icp"),
+    Cmd("align.center"),
+];
 const SEGMENT: &[Entry] = &[
     Cmd("region.auto_segment"),
     Cmd("region.create"),
@@ -285,6 +292,7 @@ pub fn icon_of(id: &str) -> &'static str {
         "mesh.synth" => "sample",
         "mesh.transform" => "tool-move",
         "mesh.info" | "primitive.info" | "surface.info" => "info",
+        "align.auto" => "align-auto",
         "align.principal" => "align-axes",
         "align.datum" => "align-321",
         "align.n_point" => "align-points",

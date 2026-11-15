@@ -49,8 +49,9 @@ jobs:
   # wasm check) and `changed-tests` (the unit tests of the crates it changes and the
   # integration tests whose files it changes, on Linux, Windows and macOS), about a quarter of
   # an hour. Marking the pull request ready, a push to a ready pull request and a push to main
-  # run the full suite below on the three systems (40 to 65 minutes). Work in a draft, mark it
-  # ready when the fast jobs are green, merge only with the full suite green.
+  # run the full suite below on the three systems, its tests split into parts that run at the
+  # same time. Work in a draft, mark it ready when the fast jobs are green, merge only with the
+  # full suite green.
   gate:
     name: fast gate (static checks, clippy, wasm)
     needs: changes
@@ -74,7 +75,7 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: full-Linux
+          shared-key: static-Linux
           cache-all-crates: true
           save-if: false
       - name: cargo xtask quick (static checks)
@@ -177,14 +178,16 @@ jobs:
         if: steps.select.outputs.any != 'true'
         run: echo "no crate or test file changed"
 
+  # The full suite is `cargo xtask ci` split over machines that run at the same time: this job runs
+  # its static checks, clippy and the wasm check; the `tests` jobs below run its tests in parts.
   ci:
-    name: cargo xtask ci
+    name: static checks, clippy, wasm
     needs: changes
     # runs even when detection failed: only an explicit docs_only == 'true' skips steps;
     # not for a draft pull request (the fast jobs above run instead)
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 45
     env:
       DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
     steps:
@@ -209,37 +212,47 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: env.DOCS_ONLY != 'true'
         with:
-          # one cache per system, shared with the fast jobs; pull requests restore the cache of
+          # clippy and the wasm check, shared with the fast gate; pull requests restore the cache of
           # main and never write their own, so the cache quota is not churned by every branch
-          shared-key: full-Linux
+          shared-key: static-Linux
           cache-all-crates: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+      - name: cargo xtask quick (static checks)
         if: env.DOCS_ONLY != 'true'
-        with:
-          tool: cargo-nextest
-      - name: cargo xtask ci
+        run: cargo xtask quick
+      - name: cargo xtask clippy
         if: env.DOCS_ONLY != 'true'
-        run: cargo xtask ci
+        run: cargo xtask clippy
+      - name: cargo xtask wasm
+        if: env.DOCS_ONLY != 'true'
+        run: cargo xtask wasm
       - name: cargo xtask assets (documentation-only change)
         if: env.DOCS_ONLY == 'true'
         run: cargo xtask assets
 
-  # The full test suite on the two systems the Linux job does not cover. macOS is here because
-  # the work is done on macOS and results differ between the systems' math libraries: a test
-  # that passes on one of the three has failed on another more than once.
-  os-tests:
-    name: tests (${{ matrix.name }})
+  # The tests of the full suite on the three systems, each split into parts that run at the same
+  # time (`cargo xtask test --partition count:K/N`: every test runs in exactly one part, part 1
+  # also runs the doc tests). macOS is here because the work is done on macOS and results differ
+  # between the systems' math libraries: a test that passes on one of the three has failed on
+  # another more than once. The number of parts follows the measured times (2026-11-15, one
+  # part: Windows 68 min of tests, Linux 48, macOS 45); a public repository pays nothing for the
+  # extra machines, but more parts mean more jobs waiting for a runner when many pull requests
+  # are ready at once.
+  tests:
+    name: tests (${{ matrix.name }} ${{ matrix.part }}/${{ matrix.parts }})
     needs: changes
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: windows
-            os: windows-latest
-          - name: macos
-            os: macos-latest
+          - { name: linux, os: ubuntu-latest, part: 1, parts: 2 }
+          - { name: linux, os: ubuntu-latest, part: 2, parts: 2 }
+          - { name: windows, os: windows-latest, part: 1, parts: 3 }
+          - { name: windows, os: windows-latest, part: 2, parts: 3 }
+          - { name: windows, os: windows-latest, part: 3, parts: 3 }
+          - { name: macos, os: macos-latest, part: 1, parts: 2 }
+          - { name: macos, os: macos-latest, part: 2, parts: 2 }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
@@ -247,21 +260,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         if: env.DOCS_ONLY != 'true'
+      - name: System libraries for eframe/rfd
+        if: env.DOCS_ONLY != 'true' && runner.os == 'Linux'
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          sudo rm -f /var/lib/man-db/auto-update
+          apt_get() { sudo timeout 120 apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 "$@"; }
+          apt_get update || echo "::warning::apt-get update failed or timed out"
+          apt_get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev \
+            || echo "::warning::system libraries not installed; using the runner image as it is"
       - uses: dtolnay/rust-toolchain@stable
         if: env.DOCS_ONLY != 'true'
       - uses: Swatinem/rust-cache@v2
         if: env.DOCS_ONLY != 'true'
         with:
+          # one cache per system, shared with the fast `changed-tests`; every part builds the same
+          # test binaries, so only part 1 of a push to main writes it
           shared-key: full-${{ runner.os }}
           cache-all-crates: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.part == 1 }}
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         if: env.DOCS_ONLY != 'true'
         with:
           tool: cargo-nextest
-      - name: cargo xtask test
+      - name: cargo xtask test (part ${{ matrix.part }} of ${{ matrix.parts }})
         if: env.DOCS_ONLY != 'true'
-        run: cargo xtask test
+        run: cargo xtask test --partition count:${{ matrix.part }}/${{ matrix.parts }}
       - name: Nothing to test (documentation-only change)
         if: env.DOCS_ONLY == 'true'
         run: echo "documentation-only change"

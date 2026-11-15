@@ -76,7 +76,10 @@ impl SurfaceCraftApp {
         let alt = mods.alt;
         let primary_drag = resp.dragged_by(Primary);
         let pos = resp.interact_pointer_pos().map(local);
-        let tool = if alt || picking { Tool::Navigate } else { self.tools.tool };
+        // a proposed alignment draws the scan where it is not: the tools that work on what is
+        // under the pointer wait until it is applied or dropped
+        let previewing = crate::align_proposal::current(self).is_some();
+        let tool = if alt || picking || previewing { Tool::Navigate } else { self.tools.tool };
 
         // hover feedback
         if picking {

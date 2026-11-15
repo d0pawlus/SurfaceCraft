@@ -11,6 +11,7 @@ mod dist;
 mod file_size;
 mod layers;
 mod licences;
+mod partition;
 mod ui_containers;
 mod web;
 
@@ -76,9 +77,14 @@ fn wasm() -> Result<(), String> {
 /// Runs every test of the workspace. With cargo-nextest installed (`cargo install cargo-nextest
 /// --locked`; CI installs it) the test binaries run in parallel, one process per test, and the
 /// doc tests, which nextest does not run, follow with `cargo test --doc`; without it this is a
-/// plain `cargo test`. Both run the same tests and leave `#[ignore]` tests ignored.
-fn test() -> Result<(), String> {
+/// plain `cargo test`. Both run the same tests and leave `#[ignore]` tests ignored. With a
+/// `partition` (`--partition count:K/N`, needs nextest) only part K of N runs; CI runs the parts
+/// on separate machines, and part 1 also runs the doc tests.
+fn test(partition: Option<&partition::Partition>) -> Result<(), String> {
     if !has_nextest() {
+        if partition.is_some() {
+            return Err("--partition needs cargo-nextest (cargo install cargo-nextest --locked)".into());
+        }
         let mut c = cargo();
         c.args(["test", "--workspace", "--profile", "ci"]);
         return run(c, "tests (cargo test; install cargo-nextest to run them in parallel)");
@@ -90,7 +96,15 @@ fn test() -> Result<(), String> {
     };
     run(nextest(&["--no-run"]), "test build")?;
     // every failure is reported, not only the first one
-    run(nextest(&["--no-fail-fast"]), "tests (nextest)")?;
+    match partition {
+        Some(p) => {
+            run(nextest(&["--no-fail-fast", "--partition", p.spec()]), &format!("tests (nextest, part {})", p.spec()))?
+        }
+        None => run(nextest(&["--no-fail-fast"]), "tests (nextest)")?,
+    }
+    if partition.is_some_and(|p| !p.runs_doc_tests()) {
+        return Ok(());
+    }
     let mut d = cargo();
     d.args(["test", "--workspace", "--doc", "--profile", "ci"]);
     run(d, "doc tests")
@@ -200,7 +214,7 @@ fn ci() -> Result<(), String> {
     file_size::check()?;
     clippy()?;
     wasm()?;
-    test()?;
+    test(None)?;
     eprintln!("==> ci passed");
     Ok(())
 }
@@ -258,7 +272,7 @@ fn main() -> ExitCode {
             "file-size" => file_size::check(),
             "clippy" => clippy(),
             "wasm" => wasm(),
-            "test" => test(),
+            "test" => partition::from_args(args.get(1..).unwrap_or(&[])).and_then(|p| test(p.as_ref())),
             "web" if check => web::check(),
             "web" => web::build(!args.iter().any(|a| a == "--no-threads")),
             "web-toolchain" => {
@@ -266,7 +280,7 @@ fn main() -> ExitCode {
                 Ok(())
             }
             "dist" => dist::run(&args),
-            _ => Err("tasks: ci, quick [--tests] [packages], fmt, assets, licences [--check], layers, ui-containers, app-geometry, file-size, clippy, wasm, test, web [--no-threads | --check], web-toolchain, dist [--tag vX.Y.Z]"
+            _ => Err("tasks: ci, quick [--tests] [packages], fmt, assets, licences [--check], layers, ui-containers, app-geometry, file-size, clippy, wasm, test [--partition count:K/N], web [--no-threads | --check], web-toolchain, dist [--tag vX.Y.Z]"
                 .into()),
         };
     match r {

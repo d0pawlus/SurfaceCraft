@@ -6,8 +6,9 @@ description: Writing and running SurfaceCraft tests and the accuracy gates of de
 # Tests
 
 - `cargo xtask ci` runs everything CI runs: fmt, assets, licences, layers, app-geometry, clippy
-  `-D warnings`, wasm check, tests. It runs on GitHub Actions for every pull request (Linux, plus
-  Windows tests); merge only when every check is green.
+  `-D warnings`, wasm check, tests. It runs on GitHub Actions for every ready pull request (static
+  checks on Linux; the tests on Linux, Windows and macOS, each split into parts that run at the same
+  time with `cargo xtask test --partition count:K/N`); merge only when every check is green.
 - Locally, before each commit: `cargo xtask quick <changed packages>` (the static steps plus clippy,
   which type-checks; add `--tests` only when you need a test result to continue). Several parallel full builds of solidcore exhaust the RAM of a
   workstation; the pull request runs the whole suite.
