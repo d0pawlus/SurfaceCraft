@@ -36,10 +36,15 @@ description: Driving SurfaceCraft from an agent — MCP server, bridged mode, CL
   `screenshot`, answered by the app (`crates/ui-egui/src/camera_control.rs`; a headless server refuses them).
   `camera_get` returns `{projection, target, distance, yaw_rad, pitch_rad, fov_rad}` (mm and radians, Z up,
   perspective only); `camera_set` takes the same fields, all optional (a partial call changes only those), plus
-  `view` (`front`, `back`, `left`, `right`, `top`, `bottom`, `iso`) and `fit` (fit-all), applied in this order:
-  view, explicit fields, fit (which replaces target and distance). It returns the camera like `camera_get`, and a
-  refused request changes nothing. The numbers are not rounded, so a camera read before a `screenshot` puts the
-  view back exactly for the next one. On the control channel they are `ui.camera_get` and `ui.camera_set`.
+  `view` (`front`, `back`, `left`, `right`, `top`, `bottom`, `iso`) and `fit`, applied in this order:
+  view, explicit fields, fit (which replaces target and distance). `fit` frames the document as `screenshot`
+  draws it (the document's bounding box, never the pose an alignment proposal shows, which a screenshot omits).
+  It returns the camera like `camera_get`, and a refused request changes nothing. Accepted ranges: distance
+  0.001 to 1e7 (the zoom limits), target coordinates within 1e12, yaw within 1e6 rad, pitch within the poles,
+  fov 0.01 to 3 rad; what `camera_get` reports is always accepted back. `camera_get`, `camera_set` and
+  `screenshot` first finish a pending fit-all or view animation, so a screenshot draws the camera `camera_get`
+  reported. The numbers are not rounded, so a camera read before a `screenshot` puts the view back exactly for
+  the next one. On the control channel they are `ui.camera_get` and `ui.camera_set`.
 - Scripts: `surfacecraft-cli run script.json` with `{"commands": [{"command": ..., "params": ...}]}`; the GUI log
   exports the same format ("Copy as script").
 - The AI assistant (`surfacecraft-cli assist align|workflow "<goal>"`, GUI panel "Assistant") calls the program in

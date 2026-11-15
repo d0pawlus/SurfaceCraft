@@ -318,6 +318,7 @@ impl SurfaceCraftApp {
                     continue;
                 }
                 "ui.screenshot" => {
+                    crate::camera_control::settle(self);
                     let dim = |k: &str, d: u64| r.params.get(k).and_then(Value::as_u64).unwrap_or(d) as u32;
                     let cam = self.camera.clone();
                     let (w, h) = (dim("width", 800), dim("height", 600));

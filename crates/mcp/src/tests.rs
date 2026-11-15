@@ -151,9 +151,16 @@ fn the_camera_tools_need_a_viewport_and_keep_every_digit() {
         assert_eq!(got["result"]["isError"], false, "{got}");
         assert_eq!(structured(&got)["distance"], json!(123.456_789_012_345));
         assert_eq!(structured(&got)["yaw_rad"], json!(-1.234_567_890_123_4e-5));
+        // the text an agent reads carries every digit too, and is the same value
+        let text = got["result"]["content"][0]["text"].as_str().expect("text content");
+        assert!(text.contains("123.456789012345"), "{text}");
+        assert_eq!(serde_json::from_str::<Value>(text).expect("JSON text"), *structured(&got));
         let args = json!({"distance": 0.123_456_789_012_345, "target": [1.0, 2.0, 3.0]});
         let set = call(&mut s, "camera_set", args.clone());
         assert_eq!(structured(&set), &args);
+        let text = set["result"]["content"][0]["text"].as_str().expect("text content");
+        assert!(text.contains("0.123456789012345"), "{text}");
+        assert_eq!(serde_json::from_str::<Value>(text).expect("JSON text"), args);
         let refused = call(&mut s, "camera_set", json!({"fit": true}));
         assert_eq!(refused["result"]["isError"], true, "{refused}");
     }

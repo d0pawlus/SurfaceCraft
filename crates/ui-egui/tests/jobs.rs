@@ -242,6 +242,7 @@ use serde_json::Value;
 use std::sync::mpsc::{Sender, channel};
 use surfacecraft_ui_egui::camera::{Camera, POLE_PITCH, StandardView};
 use surfacecraft_ui_egui::control::Request;
+use surfacecraft_ui_egui::shell::AppAction;
 
 /// A headless app with a scan, and the way to send it control requests like the desktop app gets.
 struct Remote {
@@ -435,6 +436,9 @@ fn fit_frames_the_document_after_the_view_and_the_explicit_fields() {
     let mut want = Camera { yaw, pitch, fov: 1.0, ..far };
     want.fit(&bbox);
     assert_same(&c, &as_json(&want));
+    // what get reports after a fit, set takes back
+    let reported = r.camera();
+    r.set_ok(reported);
 }
 
 #[test]
@@ -451,6 +455,119 @@ fn the_camera_requests_answer_with_what_the_next_frame_draws() {
     assert!(same_angle(r.app.camera.yaw, yaw), "the app's camera is the one answered");
 }
 
+/// A camera far from the scan: what a fit-all has to bring back.
+fn far_from_the_scan(r: &mut Remote) -> Camera {
+    r.set_ok(json!({"target": [5e4, -3e4, 1e4], "distance": 9e5}));
+    r.app.camera.clone()
+}
+
+#[test]
+fn a_pending_fit_all_is_carried_out_before_the_camera_is_read_or_set() {
+    let mut r = Remote::new();
+    let far = far_from_the_scan(&mut r);
+    let bbox = r.app.session.doc.bbox();
+    let mut fitted = far.clone();
+    fitted.fit(&bbox);
+
+    // the UI asked for a fit-all (an import, the Fit button): the next frame would carry it out,
+    // and so does the request, so the camera it reports is the fitted one
+    r.app.perform(AppAction::FitAll);
+    let c = r.camera();
+    assert_same(&c, &as_json(&fitted));
+    assert!(c["distance"].as_f64().unwrap() < 9e5, "{c}");
+
+    // a set starts from the settled camera, and the explicit fields go on top of it
+    let moved_away = far_from_the_scan(&mut r);
+    assert!(moved_away != fitted);
+    r.app.perform(AppAction::FitAll);
+    let c = r.set_ok(json!({"distance": 77.0}));
+    let mut want = fitted.clone();
+    want.distance = 77.0;
+    assert_same(&c, &as_json(&want));
+
+    // the fit-all was carried out once: a later read does not fit again
+    r.set_ok(json!({"target": [1.0, 2.0, 3.0]}));
+    assert_eq!(r.camera()["target"], json!([1.0, 2.0, 3.0]));
+}
+
+#[test]
+fn the_reported_camera_is_always_one_set_accepts() {
+    let mut r = Remote::new();
+    // the ends of every range
+    let ends = [
+        json!({"distance": 0.001}),
+        json!({"distance": 1e7}),
+        json!({"target": [1e12, -1e12, 0]}),
+        json!({"yaw_rad": 1e6}),
+        json!({"yaw_rad": -1e6}),
+        json!({"fov_rad": 0.01}),
+        json!({"fov_rad": 3}),
+        json!({"pitch_rad": 1.569797}),
+        json!({"pitch_rad": -1.5697963}),
+    ];
+    for params in ends {
+        r.set_ok(params);
+        let reported = r.camera();
+        assert_same(&r.set_ok(reported.clone()), &reported);
+    }
+    // just outside them
+    let outside = [
+        json!({"distance": 0.0009}),
+        json!({"distance": 1.1e7}),
+        json!({"target": [1.1e12, 0, 0]}),
+        json!({"yaw_rad": 1.1e6}),
+        json!({"fov_rad": 0.009}),
+        json!({"fov_rad": 3.1}),
+        json!({"pitch_rad": 1.5698}),
+    ];
+    for params in outside {
+        assert!(r.set(params.clone()).get("err").is_some(), "{params} was accepted");
+    }
+    // a camera turned beyond the range of yaw is reported as the same direction, wrapped
+    r.app.camera.yaw = 2.5e6;
+    let turned = r.app.camera.yaw;
+    let c = r.camera();
+    let yaw = c["yaw_rad"].as_f64().unwrap();
+    assert!(yaw > -std::f64::consts::PI - 1e-12 && yaw <= std::f64::consts::PI + 1e-12, "{c}");
+    assert!((yaw.sin() - turned.sin()).abs() < 1e-6 && (yaw.cos() - turned.cos()).abs() < 1e-6, "{c}");
+    r.set_ok(c);
+}
+
+/// A screenshot draws the camera `ui.camera_get` reports, also while a fit-all or a view animation is
+/// pending. It renders on a GPU device, so it is opt-in like the viewport tests
+/// (`SURFACECRAFT_GPU_TESTS=1`); without a renderer the request answers "no renderer" and the camera
+/// is checked all the same.
+#[test]
+fn a_screenshot_draws_the_camera_camera_get_reports() {
+    if std::env::var_os("SURFACECRAFT_GPU_TESTS").is_none_or(|v| v.is_empty() || v == "0") {
+        eprintln!("skipping: set SURFACECRAFT_GPU_TESTS=1 to run GPU tests");
+        return;
+    }
+    let mut r = Remote::new();
+    let far = far_from_the_scan(&mut r);
+    let mut fitted = far.clone();
+    fitted.fit(&r.app.session.doc.bbox());
+    let shot = json!({"width": 32, "height": 32});
+
+    // pending fit: get, screenshot, get report the same camera, the fitted one
+    r.app.perform(AppAction::FitAll);
+    let before = r.camera();
+    let reply = r.ask("ui.screenshot", shot.clone());
+    assert!(reply.get("png").is_some() || reply["err"] == "no renderer", "{reply}");
+    let after = r.camera();
+    assert_same(&before, &after);
+    assert_same(&after, &as_json(&fitted));
+
+    // the screenshot itself settles a pending fit-all and a running view animation
+    far_from_the_scan(&mut r);
+    r.app.perform(AppAction::FitAll);
+    r.ask("ui.screenshot", shot.clone());
+    assert_same(&as_json(&r.app.camera), &as_json(&fitted));
+    r.app.set_standard_view(StandardView::Top);
+    r.ask("ui.screenshot", shot);
+    assert!((r.app.camera.pitch - POLE_PITCH).abs() < 1e-9, "{:?}", r.app.camera);
+}
+
 #[test]
 fn hostile_camera_parameters_are_refused_and_change_nothing() {
     let mut r = moved_camera();
@@ -461,6 +578,8 @@ fn hostile_camera_parameters_are_refused_and_change_nothing() {
         json!({"distance": 0}),
         json!({"distance": 1e300}),
         json!({"distance": 1e-12}),
+        json!({"distance": 0.0005}),
+        json!({"distance": 2e7}),
         json!({"distance": "far"}),
         json!({"distance": [1]}),
         json!({"target": [0, 0]}),

@@ -18,7 +18,7 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
   before and after screenshots and put a view back exactly: target, distance, yaw, pitch and field of view
   (perspective; the viewport has no orthographic camera) in mm and radians. `camera_set` takes any of these
   fields, a standard view (`front`, `back`, `left`, `right`, `top`, `bottom`, `iso`) and `fit`, applied in that
-  order (view, fields, fit-all), and refuses bad numbers, unknown fields and unknown views without changing
+  order (view, fields, fit to the document as a screenshot draws it), and refuses bad numbers, unknown fields and unknown views without changing
   anything. These are requests of the app, not engine commands: the camera is state of the viewport, so they
   exist in the desktop app only (#153).
 - `mesh.close_handles`: closes the small handles of a scan (tunnels, bridges and the sponge of tiny

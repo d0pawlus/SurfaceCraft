@@ -1,6 +1,11 @@
 //! The one orbit camera of the viewport.
 use surfacecraft_geom::{Aabb, Mat4, Point3, Vec3};
 
+/// Closest the eye comes to the target (model units): the limit of zooming in.
+pub const MIN_DISTANCE: f64 = 1e-3;
+/// Farthest the eye gets from the target (model units): the limit of zooming out.
+pub const MAX_DISTANCE: f64 = 1e7;
+
 /// Orbit camera around a target point (Z up).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Camera {
@@ -100,7 +105,7 @@ impl Camera {
 
     /// Zooms by scroll `amount` (positive = closer).
     pub fn zoom(&mut self, amount: f64) {
-        self.distance = (self.distance * (-amount * 0.002).exp()).clamp(1e-3, 1e7);
+        self.distance = (self.distance * (-amount * 0.002).exp()).clamp(MIN_DISTANCE, MAX_DISTANCE);
     }
 
     /// The world-space ray through viewport pixel `(x, y)` of a `w × h` viewport.

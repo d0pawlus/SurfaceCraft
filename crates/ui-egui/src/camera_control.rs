@@ -14,9 +14,9 @@
 //! | field | meaning |
 //! |---|---|
 //! | `projection` | `"perspective"` (the only one the viewport has) |
-//! | `target` | `[x, y, z]`, the point the camera orbits and looks at, in model units (mm) |
-//! | `distance` | from the target to the eye, model units, in 1e-9 to 1e12 |
-//! | `yaw_rad` | azimuth around +Z in radians, in -1e6 to 1e6: the eye is at `target + distance * (cos(pitch) cos(yaw), cos(pitch) sin(yaw), sin(pitch))`, Z is up |
+//! | `target` | `[x, y, z]`, the point the camera orbits and looks at, in model units (mm), each coordinate within 1e12 |
+//! | `distance` | from the target to the eye, model units, in 1e-3 to 1e7 (the limits of zooming) |
+//! | `yaw_rad` | azimuth around +Z in radians, in -1e6 to 1e6 (a camera turned further than that is reported wrapped into (-pi, pi], the same view): the eye is at `target + distance * (cos(pitch) cos(yaw), cos(pitch) sin(yaw), sin(pitch))`, Z is up |
 //! | `pitch_rad` | elevation in radians, within the poles (at most `POLE_PITCH` either way, a thousandth of a radian short of pi/2) |
 //! | `fov_rad` | vertical field of view in radians, in 0.01 to 3 |
 //!
@@ -29,9 +29,11 @@
 //! 1. `view` turns the orientation (`yaw_rad`, `pitch_rad`) to the standard view at once, without
 //!    the animation of the view cube; target, distance and field of view stay;
 //! 2. the explicit fields (`target`, `distance`, `yaw_rad`, `pitch_rad`, `fov_rad`) are written;
-//! 3. `fit` frames everything shown (the same fit-all as the navigation bar: the objects, or a
-//!    proposed alignment), which replaces `target` and `distance` and keeps the orientation and the
-//!    field of view as they are by then. On an empty document it changes nothing.
+//! 3. `fit` frames the document as `ui.screenshot` draws it: the bounding box of the document, even
+//!    while the auto-align tool shows a proposed pose (a screenshot does not draw the proposal, so the
+//!    navigation bar's fit-all, which frames the proposal, would frame empty space). It replaces
+//!    `target` and `distance` (the distance stays within the limits of zooming) and keeps the
+//!    orientation and the field of view as they are by then. On an empty document it changes nothing.
 //!
 //! The whole request is checked before anything changes: a number that is not finite or out of its
 //! range, a wrong type, an unknown field, an unknown view or `projection` (`orthographic` is
@@ -39,17 +41,23 @@
 //!
 //! Both requests first complete what the app has pending for the camera: a running view animation
 //! jumps to its end and a fit-all requested by the UI (after an import, say) is carried out, so the
-//! answer is the camera the next frame draws.
+//! answer is the camera the next frame draws. `ui.screenshot` does the same first, so it draws the
+//! camera `ui.camera_get` reports. A fit-all the UI requested is carried out as the frame carries it
+//! out (a proposed alignment is framed in its proposed pose).
+//!
+//! What `ui.camera_get` reports is always accepted by `ui.camera_set`: the ranges above hold every
+//! camera the UI can produce (zoom, pan, orbit, view animation, fit), which is why fit keeps the
+//! distance within the zoom limits.
 use crate::app::SurfaceCraftApp;
-use crate::camera::{ANIM_SECONDS, Camera, POLE_PITCH, StandardView};
+use crate::camera::{ANIM_SECONDS, Camera, MAX_DISTANCE, MIN_DISTANCE, POLE_PITCH, StandardView};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use surfacecraft_geom::Point3;
+use surfacecraft_geom::{Aabb, Point3};
 
 /// Largest magnitude of a target coordinate (model units).
 const MAX_COORD: f64 = 1e12;
-/// Range of the distance from target to eye (model units).
-const DISTANCE: (f64, f64) = (1e-9, 1e12);
+/// Range of the distance from target to eye (model units): the range zooming keeps it in.
+const DISTANCE: (f64, f64) = (MIN_DISTANCE, MAX_DISTANCE);
 /// Range of the vertical field of view (radians).
 const FOV: (f64, f64) = (0.01, 3.0);
 /// Largest magnitude of the azimuth (radians): thousands of turns, far beyond any orbiting.
@@ -131,26 +139,54 @@ fn camera_json(c: &Camera) -> Value {
         "projection": "perspective",
         "target": [c.target.x, c.target.y, c.target.z],
         "distance": c.distance,
-        "yaw_rad": c.yaw,
+        "yaw_rad": reported_yaw(c.yaw),
         "pitch_rad": c.pitch,
         "fov_rad": c.fov,
     })
 }
 
-/// Completes what the app has pending for the camera: a view animation and a requested fit-all.
-fn settle(app: &mut SurfaceCraftApp) {
+/// The azimuth as reported: as it is, or, past the range `ui.camera_set` takes (a hundred thousand
+/// turns of dragging), the same direction wrapped into (-pi, pi].
+fn reported_yaw(yaw: f64) -> f64 {
+    if yaw.abs() <= MAX_YAW {
+        return yaw;
+    }
+    let turned = yaw.rem_euclid(std::f64::consts::TAU);
+    if turned > std::f64::consts::PI { turned - std::f64::consts::TAU } else { turned }
+}
+
+/// Completes what the app has pending for the camera, as the next frame would: a running view
+/// animation jumps to its end and a requested fit-all is carried out (a proposed alignment is
+/// framed in its proposed pose, otherwise the document). `ui.screenshot` calls it too, so that it
+/// draws the camera `ui.camera_get` reports.
+pub(crate) fn settle(app: &mut SurfaceCraftApp) {
     app.tick_view_animation(ANIM_SECONDS);
     if app.fit_pending {
-        fit_all(app);
+        let shown = crate::align_proposal::framed_box(app).unwrap_or_else(|| app.session.doc.bbox());
+        frame(app, &shown);
         app.fit_pending = false;
     }
 }
 
-/// Frames what the viewport shows, as the frame does for a pending fit: a proposed alignment in
-/// its proposed pose, otherwise the whole document.
-fn fit_all(app: &mut SurfaceCraftApp) {
-    let shown = crate::align_proposal::framed_box(app).unwrap_or_else(|| app.session.doc.bbox());
-    app.camera.fit(&shown);
+/// `ui.camera_set` with `fit`: frames the document, which is what `ui.screenshot` draws (never the
+/// box of a proposed alignment, which a screenshot does not show).
+fn fit_document(app: &mut SurfaceCraftApp) {
+    let shown = app.session.doc.bbox();
+    frame(app, &shown);
+}
+
+/// Frames `shown`. The distance stays within the limits of zooming and a result that is not a
+/// camera `ui.camera_set` takes (a box at the end of the number range) leaves the camera as it was.
+fn frame(app: &mut SurfaceCraftApp, shown: &Aabb) {
+    let before = app.camera.clone();
+    app.camera.fit(shown);
+    let cam = &mut app.camera;
+    let near_enough = cam.target.coords.iter().all(|v| v.abs() <= MAX_COORD);
+    if near_enough && cam.distance.is_finite() {
+        cam.distance = cam.distance.clamp(MIN_DISTANCE, MAX_DISTANCE);
+    } else {
+        *cam = before;
+    }
 }
 
 /// Writes a validated update: the view, then the explicit fields, then the fit.
@@ -175,7 +211,7 @@ fn apply(app: &mut SurfaceCraftApp, update: &Update) {
         cam.fov = fov;
     }
     if update.fit {
-        fit_all(app);
+        fit_document(app);
     }
 }
 

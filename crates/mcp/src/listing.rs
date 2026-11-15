@@ -59,7 +59,7 @@ pub(crate) fn general_tools() -> Vec<Value> {
         ),
         general(
             "camera_get",
-            "The camera of the desktop app: target, distance, yaw_rad, pitch_rad, fov_rad, projection. Bridged mode only; values are exact.",
+            "The camera of the desktop app: target, distance, yaw_rad, pitch_rad, fov_rad, projection. Bridged mode only; values are exact and camera_set takes them back.",
             obj(json!({}), &[]),
         ),
         general(
@@ -68,13 +68,13 @@ pub(crate) fn general_tools() -> Vec<Value> {
             obj(
                 json!({
                     "view": {"type": "string", "enum": ["front", "back", "left", "right", "top", "bottom", "iso"], "description": "A standard view: turns the orientation, keeps target, distance and fov."},
-                    "target": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3, "description": "Point [x, y, z] the camera looks at, in mm."},
-                    "distance": {"type": "number", "description": "Distance from target to eye in mm, positive."},
-                    "yaw_rad": {"type": "number", "description": "Azimuth around Z in radians."},
-                    "pitch_rad": {"type": "number", "description": "Elevation in radians, within the poles (about plus or minus 1.5698)."},
-                    "fov_rad": {"type": "number", "description": "Vertical field of view in radians, 0.01 to 3."},
+                    "target": {"type": "array", "items": {"type": "number", "minimum": -1e12, "maximum": 1e12}, "minItems": 3, "maxItems": 3, "description": "Point [x, y, z] the camera looks at, in mm; each coordinate within 1e12."},
+                    "distance": {"type": "number", "minimum": 0.001, "maximum": 1e7, "description": "Distance from target to eye in mm, 0.001 to 1e7 (the zoom limits)."},
+                    "yaw_rad": {"type": "number", "minimum": -1e6, "maximum": 1e6, "description": "Azimuth around Z in radians, within 1e6 either way."},
+                    "pitch_rad": {"type": "number", "minimum": -1.569797, "maximum": 1.569797, "description": "Elevation in radians, within the poles (at most 1.5697963 either way)."},
+                    "fov_rad": {"type": "number", "minimum": 0.01, "maximum": 3, "description": "Vertical field of view in radians, 0.01 to 3."},
                     "projection": {"type": "string", "enum": ["perspective"], "description": "The viewport camera is perspective only."},
-                    "fit": {"type": "boolean", "description": "Frame everything last: replaces target and distance."}
+                    "fit": {"type": "boolean", "description": "Frame the document as screenshot draws it, last: replaces target and distance."}
                 }),
                 &[],
             ),
