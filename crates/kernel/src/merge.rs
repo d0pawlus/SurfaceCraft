@@ -628,8 +628,8 @@ mod tests {
     /// `rejudged` on three groups of a flat sheet: the first is the first batch's (its body is the fallback), the
     /// second's face held up in its batch but not in the final body (it is judged against three times the area of its
     /// patches), the third is sound. With two rounds the second is dropped with the reason and the body rebuilt with
-    /// the first and the third; with one round the rebuilt body is not judged again, so the first batch's body comes
-    /// back and the third is given back too.
+    /// the first and the third; with one round no round is left to judge a rebuilt body, so the first batch's body
+    /// comes back and the third is given back too.
     #[test]
     fn a_face_that_fails_in_the_final_body_is_dropped_within_the_rounds() {
         let body = flat_sheet(4);
@@ -660,7 +660,7 @@ mod tests {
                 assert_eq!(map[9], None);
             } else {
                 let why = verdicts[2].as_ref().unwrap_err();
-                assert!(why.contains("taken back") && why.contains("within 1 rounds"), "{why}");
+                assert!(why.contains("taken back") && why.ends_with("within 1 round"), "{why}");
                 assert!(map[8].is_some() && map[9].is_some(), "the third group is patches again");
             }
         }

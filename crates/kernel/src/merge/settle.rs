@@ -347,7 +347,7 @@ pub(super) fn rejudged(
     let (rounds, run) = limits;
     let (mut taken, mut verdicts) = state;
     let (mut brep, mut map) = rebuilt;
-    for _ in 0..rounds {
+    for round in 0..rounds {
         let v = areas_agree(body, &brep, &map, &taken.groups, run)?;
         if passed(&v) {
             return Ok((brep, map, verdicts));
@@ -369,6 +369,10 @@ pub(super) fn rejudged(
         if kept.groups.is_empty() {
             return Ok(fall_back(fallback, verdicts, "no face held up in the body with all the batches"));
         }
+        if round + 1 == rounds {
+            // the body rebuilt without them would not be judged again
+            break;
+        }
         match apply(body, volume, &kept.groups) {
             Ok(r) => (brep, map) = r,
             Err(e) => {
@@ -378,7 +382,8 @@ pub(super) fn rejudged(
         }
         taken = kept;
     }
-    let why = format!("the faces of the batches did not all hold up together within {rounds} rounds");
+    let plural = if rounds == 1 { "" } else { "s" };
+    let why = format!("the faces of the batches did not all hold up together within {rounds} round{plural}");
     Ok(fall_back(fallback, verdicts, &why))
 }
 
