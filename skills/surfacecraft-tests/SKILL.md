@@ -36,3 +36,8 @@ description: Writing and running SurfaceCraft tests and the accuracy gates of de
   Gate tests are named `gate_m<N>_*` so they can be listed with `cargo test gate_`.
 - Synthetic scans come from `surfacecraft_geom::synth` (exact ground truth). Local realism tests on
   third-party scans are `#[ignore]` and read `SURFACECRAFT_LOCAL_CORPUS`; never commit their output.
+- Real scans whose results may be named and committed: the open Artec corpus (car rim, engine,
+  industrial part, water pump). `xtask/fetch-artec-corpus.sh <dir>` once, then
+  `SURFACECRAFT_ARTEC_CORPUS=<dir>` for `#[ignore]` tests such as
+  `crates/engine/tests/artec_corpus.rs`; the same directory also serves as
+  `SURFACECRAFT_LOCAL_CORPUS`. Prefer it over closed scans for any new measurement on real data.
