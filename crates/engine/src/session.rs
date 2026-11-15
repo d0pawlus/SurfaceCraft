@@ -244,7 +244,10 @@ impl Session {
         if cmd::is_heavy(id) {
             return Err(EngineError::Unavailable(format!("{id} is too heavy to preview")));
         }
-        let mut copy = Session { doc: self.doc.clone(), allow_files: false, ..Session::default() };
+        // the copy starts from this session's display cache: what the command leaves unchanged is
+        // not tessellated (or reduced to a level of detail) again for the preview
+        let mut copy =
+            Session { doc: self.doc.clone(), allow_files: false, tess: self.tess.clone(), ..Session::default() };
         copy.execute(id, params)?;
         Ok(copy)
     }

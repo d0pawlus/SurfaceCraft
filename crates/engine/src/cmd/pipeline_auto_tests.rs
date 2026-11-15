@@ -36,6 +36,7 @@ pub(in crate::cmd::pipeline) fn result(
             holes_before: 0,
             holes_filled: 0,
             holes_left: 0,
+            holes_inward: 0,
             non_manifold_edges: 0,
             noise_sigma: None,
             noise_used: None,

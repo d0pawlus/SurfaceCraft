@@ -178,6 +178,48 @@ fn dir(x: &[f64], a: usize, b: usize) -> (f64, f64) {
     (pb.0 - pa.0, pb.1 - pa.1)
 }
 
+/// Does point `i` exist?
+fn check_point(s: &Sketch, i: usize) -> Result<(), String> {
+    if i < s.points.len() { Ok(()) } else { Err(format!("point {i} does not exist")) }
+}
+
+/// Is entity `e` a line?
+fn check_line(s: &Sketch, e: usize) -> Result<(), String> {
+    line(s, e).map(|_| ()).ok_or_else(|| format!("entity {e} is not a line"))
+}
+
+/// Is entity `e` an arc or a circle?
+fn check_circle(s: &Sketch, e: usize) -> Result<(), String> {
+    match s.entities.get(e) {
+        Some(Entity::Arc { .. } | Entity::Circle { .. }) => Ok(()),
+        _ => Err(format!("entity {e} is not an arc or circle")),
+    }
+}
+
+/// Is the value finite?
+fn check_finite(v: f64) -> Result<(), String> {
+    if v.is_finite() { Ok(()) } else { Err("value is not finite".to_string()) }
+}
+
+/// Validation of an equal constraint: two lines, or two arcs or circles.
+fn validate_equal(s: &Sketch, a: usize, b: usize) -> Result<(), String> {
+    if line(s, a).is_some() {
+        check_line(s, a).and(check_line(s, b))
+    } else {
+        check_circle(s, a).and(check_circle(s, b))
+    }
+}
+
+/// Validation of a tangent constraint: a line and a circle, or two different circles.
+fn validate_tangent(s: &Sketch, e: usize, entity: usize) -> Result<(), String> {
+    if line(s, e).is_some() {
+        check_circle(s, entity)
+    } else {
+        check_circle(s, e).and(check_circle(s, entity))?;
+        if e == entity { Err("a circle cannot be tangent to itself".into()) } else { Ok(()) }
+    }
+}
+
 impl Constraint {
     /// Number of equations.
     #[must_use]
@@ -215,58 +257,41 @@ impl Constraint {
     }
 
     pub(crate) fn validate(&self, s: &Sketch) -> Result<(), String> {
-        let np = s.points.len();
-        let pt = |i: usize| if i < np { Ok(()) } else { Err(format!("point {i} does not exist")) };
-        let ln = |e: usize| line(s, e).map(|_| ()).ok_or_else(|| format!("entity {e} is not a line"));
-        let cir = |e: usize| match s.entities.get(e) {
-            Some(Entity::Arc { .. } | Entity::Circle { .. }) => Ok(()),
-            _ => Err(format!("entity {e} is not an arc or circle")),
-        };
-        let fin = |v: f64| if v.is_finite() { Ok(()) } else { Err("value is not finite".to_string()) };
         match self {
             Constraint::Fix { point, at } => {
-                pt(*point)?;
-                fin(at[0])?;
-                fin(at[1])
+                check_point(s, *point)?;
+                check_finite(at[0])?;
+                check_finite(at[1])
             }
-            Constraint::Coincident { a, b } => pt(*a).and(pt(*b)),
-            Constraint::Horizontal { line } | Constraint::Vertical { line } => ln(*line),
+            Constraint::Coincident { a, b } => check_point(s, *a).and(check_point(s, *b)),
+            Constraint::Horizontal { line } | Constraint::Vertical { line } => check_line(s, *line),
             Constraint::Distance { a, b, value } => {
-                pt(*a)?;
-                pt(*b)?;
-                fin(*value)
+                check_point(s, *a)?;
+                check_point(s, *b)?;
+                check_finite(*value)
             }
             Constraint::Length { line, value } => {
-                ln(*line)?;
-                fin(*value)
+                check_line(s, *line)?;
+                check_finite(*value)
             }
-            Constraint::Parallel { a, b } | Constraint::Perpendicular { a, b } => ln(*a).and(ln(*b)),
-            Constraint::Equal { a, b } => {
-                if line(s, *a).is_some() {
-                    ln(*a).and(ln(*b))
-                } else {
-                    cir(*a).and(cir(*b))
-                }
+            Constraint::Parallel { a, b } | Constraint::Perpendicular { a, b } => {
+                check_line(s, *a).and(check_line(s, *b))
             }
+            Constraint::Equal { a, b } => validate_equal(s, *a, *b),
             Constraint::Angle { a, b, degrees } => {
-                ln(*a)?;
-                ln(*b)?;
-                fin(*degrees)
+                check_line(s, *a)?;
+                check_line(s, *b)?;
+                check_finite(*degrees)
             }
             Constraint::Radius { entity, value } => {
-                cir(*entity)?;
+                check_circle(s, *entity)?;
                 if value.is_finite() && *value > 0.0 { Ok(()) } else { Err("radius must be positive".into()) }
             }
-            Constraint::PointOnLine { point, line } | Constraint::Midpoint { point, line } => pt(*point).and(ln(*line)),
-            Constraint::PointOnCircle { point, entity } => pt(*point).and(cir(*entity)),
-            Constraint::Tangent { line: e, entity } => {
-                if line(s, *e).is_some() {
-                    cir(*entity)
-                } else {
-                    cir(*e).and(cir(*entity))?;
-                    if e == entity { Err("a circle cannot be tangent to itself".into()) } else { Ok(()) }
-                }
+            Constraint::PointOnLine { point, line } | Constraint::Midpoint { point, line } => {
+                check_point(s, *point).and(check_line(s, *line))
             }
+            Constraint::PointOnCircle { point, entity } => check_point(s, *point).and(check_circle(s, *entity)),
+            Constraint::Tangent { line: e, entity } => validate_tangent(s, *e, *entity),
         }
     }
 
@@ -296,113 +321,150 @@ impl Constraint {
 
     /// Residuals at unknowns `x` (zero when satisfied), appended to `out`.
     pub(crate) fn residuals(&self, s: &Sketch, l: &Layout, x: &[f64], out: &mut Vec<f64>) {
-        let norm = |d: (f64, f64)| d.0.hypot(d.1).max(1e-12);
         match self {
-            Constraint::Fix { point, at } => {
-                let q = p(x, *point);
-                out.push(q.0 - at[0]);
-                out.push(q.1 - at[1]);
-            }
-            Constraint::Coincident { a, b } => {
-                let (qa, qb) = (p(x, *a), p(x, *b));
-                out.push(qa.0 - qb.0);
-                out.push(qa.1 - qb.1);
-            }
-            Constraint::Horizontal { line: e } => {
-                let (a, b) = line(s, *e).unwrap_or((0, 0));
-                out.push(dir(x, a, b).1);
-            }
-            Constraint::Vertical { line: e } => {
-                let (a, b) = line(s, *e).unwrap_or((0, 0));
-                out.push(dir(x, a, b).0);
-            }
+            Constraint::Fix { point, at } => fix_residuals(x, *point, *at, out),
+            Constraint::Coincident { a, b } => coincident_residuals(x, *a, *b, out),
+            Constraint::Horizontal { line: e } => out.push(line_dir(s, x, *e).1),
+            Constraint::Vertical { line: e } => out.push(line_dir(s, x, *e).0),
             Constraint::Distance { a, b, value } => out.push(norm(dir(x, *a, *b)) - value),
-            Constraint::Length { line: e, value } => {
-                let (a, b) = line(s, *e).unwrap_or((0, 0));
-                out.push(norm(dir(x, a, b)) - value);
-            }
+            Constraint::Length { line: e, value } => out.push(norm(line_dir(s, x, *e)) - value),
             Constraint::Parallel { a, b } | Constraint::Perpendicular { a, b } | Constraint::Angle { a, b, .. } => {
-                let (la, lb) = (line(s, *a).unwrap_or((0, 0)), line(s, *b).unwrap_or((0, 0)));
-                let (da, db) = (dir(x, la.0, la.1), dir(x, lb.0, lb.1));
-                let (na, nb) = (norm(da), norm(db));
-                let cross = (da.0 * db.1 - da.1 * db.0) / (na * nb);
-                let dot = (da.0 * db.0 + da.1 * db.1) / (na * nb);
-                out.push(match self {
-                    Constraint::Parallel { .. } => cross,
-                    Constraint::Perpendicular { .. } => dot,
-                    Constraint::Angle { degrees, .. } => {
-                        let t = degrees.to_radians();
-                        cross * t.cos() - dot * t.sin()
-                    }
-                    _ => 0.0,
-                });
+                out.push(line_pair_residual(self, s, x, *a, *b));
             }
-            Constraint::Equal { a, b } => {
-                if let (Some(la), Some(lb)) = (line(s, *a), line(s, *b)) {
-                    out.push(norm(dir(x, la.0, la.1)) - norm(dir(x, lb.0, lb.1)));
-                } else {
-                    out.push(match (circle(s, l, x, *a), circle(s, l, x, *b)) {
-                        (Some((_, ra)), Some((_, rb))) => ra - rb,
-                        _ => 0.0,
-                    });
-                }
-            }
+            Constraint::Equal { a, b } => out.push(equal_residual(s, l, x, *a, *b)),
             Constraint::Radius { entity, value } => {
                 out.push(circle(s, l, x, *entity).map_or(0.0, |(_, r)| r - value));
             }
-            Constraint::PointOnLine { point, line: e } => {
-                let (a, b) = line(s, *e).unwrap_or((0, 0));
-                let d = dir(x, a, b);
-                let (pa, q) = (p(x, a), p(x, *point));
-                out.push((d.0 * (q.1 - pa.1) - d.1 * (q.0 - pa.0)) / norm(d));
-            }
+            Constraint::PointOnLine { point, line: e } => out.push(point_on_line_residual(s, x, *point, *e)),
             Constraint::PointOnCircle { point, entity } => {
                 let q = p(x, *point);
                 out.push(circle(s, l, x, *entity).map_or(0.0, |(c, r)| (q.0 - c.0).hypot(q.1 - c.1) - r));
             }
-            Constraint::Tangent { line: e, entity } => {
-                // entities that share an end point are tangent there when the radius is perpendicular to
-                // the line (or the centres are in line with the point); the distance form below is
-                // degenerate (a double root) when the end point lies on the line itself
-                let joint = shared_end(s, *e, *entity);
-                if let Some((a, b)) = line(s, *e) {
-                    let d = dir(x, a, b);
-                    if let (Some(j), Some(Entity::Arc { center, .. })) = (joint, s.entities.get(*entity)) {
-                        let (pj, c) = (p(x, j), p(x, *center));
-                        out.push(((pj.0 - c.0) * d.0 + (pj.1 - c.1) * d.1) / norm(d));
-                    } else {
-                        let pa = p(x, a);
-                        out.push(
-                            circle(s, l, x, *entity)
-                                .map_or(0.0, |(c, r)| ((d.0 * (c.1 - pa.1) - d.1 * (c.0 - pa.0)) / norm(d)).abs() - r),
-                        );
-                    }
-                } else {
-                    // two circles: the centre distance is r1 + r2 (outside) or |r1 − r2| (inside)
-                    out.push(match (circle(s, l, x, *e), circle(s, l, x, *entity)) {
-                        (Some((c1, r1)), Some((c2, r2))) => {
-                            let d = (c2.0 - c1.0).hypot(c2.1 - c1.1);
-                            if let (Some(j), Some(Entity::Arc { .. })) = (joint, s.entities.get(*entity)) {
-                                let pj = p(x, j);
-                                (c2.0 - c1.0) * (pj.1 - c1.1) / d.max(1e-12)
-                                    - (c2.1 - c1.1) * (pj.0 - c1.0) / d.max(1e-12)
-                            } else {
-                                let (outside, inside) = (d - (r1 + r2), d - (r1 - r2).abs());
-                                if outside.abs() <= inside.abs() { outside } else { inside }
-                            }
-                        }
-                        _ => 0.0,
-                    });
-                }
-            }
-            Constraint::Midpoint { point, line: e } => {
-                let (a, b) = line(s, *e).unwrap_or((0, 0));
-                let (pa, pb, q) = (p(x, a), p(x, b), p(x, *point));
-                out.push(q.0 - 0.5 * (pa.0 + pb.0));
-                out.push(q.1 - 0.5 * (pa.1 + pb.1));
-            }
+            Constraint::Tangent { line: e, entity } => out.push(tangent_residual(s, l, x, *e, *entity)),
+            Constraint::Midpoint { point, line: e } => midpoint_residuals(s, x, *point, *e, out),
         }
     }
+}
+
+/// Length of a direction, kept away from zero.
+fn norm(d: (f64, f64)) -> f64 {
+    d.0.hypot(d.1).max(1e-12)
+}
+
+/// Direction of line entity `e` (zero when `e` is not a line).
+fn line_dir(s: &Sketch, x: &[f64], e: usize) -> (f64, f64) {
+    let (a, b) = line(s, e).unwrap_or((0, 0));
+    dir(x, a, b)
+}
+
+/// Residuals of a fixed point.
+fn fix_residuals(x: &[f64], point: usize, at: [f64; 2], out: &mut Vec<f64>) {
+    let q = p(x, point);
+    out.push(q.0 - at[0]);
+    out.push(q.1 - at[1]);
+}
+
+/// Residuals of two coincident points.
+fn coincident_residuals(x: &[f64], a: usize, b: usize, out: &mut Vec<f64>) {
+    let (qa, qb) = (p(x, a), p(x, b));
+    out.push(qa.0 - qb.0);
+    out.push(qa.1 - qb.1);
+}
+
+/// Residual of parallel, perpendicular or angle between lines `a` and `b` (`c` is the constraint).
+fn line_pair_residual(c: &Constraint, s: &Sketch, x: &[f64], a: usize, b: usize) -> f64 {
+    let (la, lb) = (line(s, a).unwrap_or((0, 0)), line(s, b).unwrap_or((0, 0)));
+    let (da, db) = (dir(x, la.0, la.1), dir(x, lb.0, lb.1));
+    let (na, nb) = (norm(da), norm(db));
+    let cross = (da.0 * db.1 - da.1 * db.0) / (na * nb);
+    let dot = (da.0 * db.0 + da.1 * db.1) / (na * nb);
+    match c {
+        Constraint::Parallel { .. } => cross,
+        Constraint::Perpendicular { .. } => dot,
+        Constraint::Angle { degrees, .. } => {
+            let t = degrees.to_radians();
+            cross * t.cos() - dot * t.sin()
+        }
+        _ => 0.0,
+    }
+}
+
+/// Residual of equal length (lines) or equal radius (arcs and circles).
+fn equal_residual(s: &Sketch, l: &Layout, x: &[f64], a: usize, b: usize) -> f64 {
+    if let (Some(la), Some(lb)) = (line(s, a), line(s, b)) {
+        norm(dir(x, la.0, la.1)) - norm(dir(x, lb.0, lb.1))
+    } else {
+        match (circle(s, l, x, a), circle(s, l, x, b)) {
+            (Some((_, ra)), Some((_, rb))) => ra - rb,
+            _ => 0.0,
+        }
+    }
+}
+
+/// Residual of a point on the infinite line of line entity `e`.
+fn point_on_line_residual(s: &Sketch, x: &[f64], point: usize, e: usize) -> f64 {
+    let (a, b) = line(s, e).unwrap_or((0, 0));
+    let d = dir(x, a, b);
+    let (pa, q) = (p(x, a), p(x, point));
+    (d.0 * (q.1 - pa.1) - d.1 * (q.0 - pa.0)) / norm(d)
+}
+
+/// Residual of a tangent between a line and a circle, or between two circles.
+fn tangent_residual(s: &Sketch, l: &Layout, x: &[f64], e: usize, entity: usize) -> f64 {
+    // entities that share an end point are tangent there when the radius is perpendicular to
+    // the line (or the centres are in line with the point); the distance form below is
+    // degenerate (a double root) when the end point lies on the line itself
+    let joint = shared_end(s, e, entity);
+    if let Some((a, b)) = line(s, e) {
+        tangent_line_residual(s, l, x, entity, joint, (a, b))
+    } else {
+        tangent_circles_residual(s, l, x, e, entity, joint)
+    }
+}
+
+/// Tangent residual of line `ab` and arc or circle `entity` (`joint` is their shared end point).
+fn tangent_line_residual(
+    s: &Sketch,
+    l: &Layout,
+    x: &[f64],
+    entity: usize,
+    joint: Option<usize>,
+    (a, b): (usize, usize),
+) -> f64 {
+    let d = dir(x, a, b);
+    if let (Some(j), Some(Entity::Arc { center, .. })) = (joint, s.entities.get(entity)) {
+        let (pj, c) = (p(x, j), p(x, *center));
+        ((pj.0 - c.0) * d.0 + (pj.1 - c.1) * d.1) / norm(d)
+    } else {
+        let pa = p(x, a);
+        circle(s, l, x, entity).map_or(0.0, |(c, r)| ((d.0 * (c.1 - pa.1) - d.1 * (c.0 - pa.0)) / norm(d)).abs() - r)
+    }
+}
+
+/// Tangent residual of two arcs or circles (`joint` is their shared end point).
+fn tangent_circles_residual(s: &Sketch, l: &Layout, x: &[f64], e: usize, entity: usize, joint: Option<usize>) -> f64 {
+    // two circles: the centre distance is r1 + r2 (outside) or |r1 − r2| (inside)
+    match (circle(s, l, x, e), circle(s, l, x, entity)) {
+        (Some((c1, r1)), Some((c2, r2))) => {
+            let d = (c2.0 - c1.0).hypot(c2.1 - c1.1);
+            if let (Some(j), Some(Entity::Arc { .. })) = (joint, s.entities.get(entity)) {
+                let pj = p(x, j);
+                (c2.0 - c1.0) * (pj.1 - c1.1) / d.max(1e-12) - (c2.1 - c1.1) * (pj.0 - c1.0) / d.max(1e-12)
+            } else {
+                let (outside, inside) = (d - (r1 + r2), d - (r1 - r2).abs());
+                if outside.abs() <= inside.abs() { outside } else { inside }
+            }
+        }
+        _ => 0.0,
+    }
+}
+
+/// Residuals of a point at the middle of line entity `e`.
+fn midpoint_residuals(s: &Sketch, x: &[f64], point: usize, e: usize, out: &mut Vec<f64>) {
+    let (a, b) = line(s, e).unwrap_or((0, 0));
+    let (pa, pb, q) = (p(x, a), p(x, b), p(x, point));
+    out.push(q.0 - 0.5 * (pa.0 + pb.0));
+    out.push(q.1 - 0.5 * (pa.1 + pb.1));
 }
 
 /// Built-in equations of entities: an arc's ends are equally far from its centre.

@@ -2,11 +2,14 @@
 //! colour), every visible body tessellated through the kernel, and every visible primitive's
 //! patch. Derived data is cached, so it is rebuilt only after the geometry changes.
 use crate::Session;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use surfacecraft_doc::{ObjectId, ObjectKind};
 use surfacecraft_fit::PrimitiveKind;
 use surfacecraft_geom::{Mesh, lod::Lod};
+use surfacecraft_kernel::record::brep::Brep;
+use surfacecraft_sketch::Sketch;
 
 /// Meshes with more triangles than this are drawn through a coarser level of detail (P2).
 pub const LOD_BUDGET: usize = 2_000_000;
@@ -113,22 +116,44 @@ impl DisplayItem {
     }
 }
 
-/// Caches of derived display data.
+/// Caches of derived display data. Every entry holds the geometry it was derived from, so an
+/// entry is reused only for that very geometry (an address alone could be handed to new geometry
+/// once the old one is freed), and entries of objects no longer in the document are dropped.
 #[derive(Clone, Debug, Default)]
 pub struct TessCache {
-    entries: HashMap<ObjectId, (usize, Arc<Mesh>, Arc<BodyTopo>)>,
-    region_colors: HashMap<ObjectId, (u64, Arc<Vec<[f32; 4]>>)>,
-    quads: HashMap<ObjectId, (u64, Arc<Mesh>)>,
-    /// Display level of detail per scan: (mesh pointer, budget, lod, lod mesh).
-    lods: HashMap<ObjectId, (usize, usize, Arc<Lod>, Arc<Mesh>)>,
-    /// Colours mapped onto the lod: (source colours, lod mesh pointer, mapped).
-    lod_colors: HashMap<ObjectId, (Arc<Vec<[f32; 4]>>, usize, Arc<Vec<[f32; 4]>>)>,
-    /// Identity of the colours last shown per mesh (the Arc is kept so its address cannot be
-    /// reused while it is the reference).
+    /// Display mesh and B-rep identities per body: (B-rep, mesh, topology).
+    entries: HashMap<ObjectId, (Arc<Brep>, Arc<Mesh>, Arc<BodyTopo>)>,
+    /// Region colours per mesh: (mesh, its visible regions, colours).
+    region_colors: HashMap<ObjectId, RegionColors>,
+    /// Display mesh per quad layout: (the layout's geometry, mesh).
+    quads: HashMap<ObjectId, (QuadShape, Arc<Mesh>)>,
+    /// Ribbons per sketch: (the sketch, ribbons).
+    sketches: HashMap<ObjectId, (Sketch, Arc<Mesh>)>,
+    /// Display level of detail per scan: (source mesh, budget, lod, lod mesh).
+    lods: HashMap<ObjectId, (Arc<Mesh>, usize, Arc<Lod>, Arc<Mesh>)>,
+    /// Colours mapped onto the lod: (source colours, lod mesh, mapped).
+    lod_colors: HashMap<ObjectId, (Arc<Vec<[f32; 4]>>, Arc<Mesh>, Arc<Vec<[f32; 4]>>)>,
+    /// Identity of the colours last shown per mesh.
     color_ident: HashMap<ObjectId, (Arc<Vec<[f32; 4]>>, u64)>,
-    counter: u64,
+    /// The display key of every drawn mesh, by its address (the entry holds the mesh, so the
+    /// address stays its own while the entry lives).
+    idents: HashMap<usize, (Arc<Mesh>, usize)>,
     /// Triangle budget for the level of detail (0 = [`LOD_BUDGET`]).
     pub budget: usize,
+}
+
+/// A mesh's region colours with what they were made from: (mesh, visible regions in order, colours).
+type RegionColors = (Arc<Mesh>, Vec<(Arc<Vec<u32>>, Option<PrimitiveKind>)>, Arc<Vec<[f32; 4]>>);
+
+/// What a quad layout's display mesh is made from: vertices, faces and the grid size.
+type QuadShape = (Vec<[f64; 3]>, Vec<[u32; 4]>, usize, usize);
+
+/// The source of display keys and colour stamps: one counter for every session (a preview copy
+/// shares the cache of its session, so the two must never hand out the same number).
+static NEXT_STAMP: AtomicUsize = AtomicUsize::new(1);
+
+fn next_stamp() -> usize {
+    NEXT_STAMP.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Colour of a region by its type (unclassified regions cycle a neutral palette).
@@ -151,31 +176,23 @@ pub fn region_color(kind: Option<PrimitiveKind>, index: usize) -> [f32; 4] {
 const MESH_GREY: [f32; 4] = [0.62, 0.66, 0.72, 1.0];
 
 impl Session {
-    fn region_overlay(&mut self, mesh_id: ObjectId, mesh: &Mesh, mesh_key: usize) -> Option<Arc<Vec<[f32; 4]>>> {
-        let regions: Vec<(usize, Arc<Vec<u32>>, Option<PrimitiveKind>)> = self
-            .doc
-            .regions_of(mesh_id)
-            .filter(|r| r.visible)
-            .enumerate()
-            .map(|(k, r)| (k, r.triangles.clone(), r.kind))
-            .collect();
+    fn region_overlay(&mut self, mesh_id: ObjectId, mesh: &Arc<Mesh>) -> Option<Arc<Vec<[f32; 4]>>> {
+        let regions: Vec<(Arc<Vec<u32>>, Option<PrimitiveKind>)> =
+            self.doc.regions_of(mesh_id).filter(|r| r.visible).map(|r| (r.triangles.clone(), r.kind)).collect();
         if regions.is_empty() {
             self.tess.region_colors.remove(&mesh_id);
             return None;
         }
-        let mut key = mesh_key as u64;
-        for (k, t, kind) in &regions {
-            key = key.wrapping_mul(1_099_511_628_211) ^ (Arc::as_ptr(t) as u64) ^ ((*k as u64) << 48);
-            key ^= kind.map_or(7, |k| k as u64 + 1);
-        }
-        if let Some((k, c)) = self.tess.region_colors.get(&mesh_id)
-            && *k == key
+        if let Some((m, rs, c)) = self.tess.region_colors.get(&mesh_id)
+            && Arc::ptr_eq(m, mesh)
+            && rs.len() == regions.len()
+            && rs.iter().zip(&regions).all(|((ta, ka), (tb, kb))| Arc::ptr_eq(ta, tb) && ka == kb)
         {
             return Some(c.clone());
         }
         let mut colors = vec![MESH_GREY; mesh.vertex_count()];
-        for (k, tris, kind) in &regions {
-            let c = region_color(*kind, *k);
+        for (k, (tris, kind)) in regions.iter().enumerate() {
+            let c = region_color(*kind, k);
             for &t in tris.iter() {
                 for &vi in mesh.triangles.get(t as usize).into_iter().flatten() {
                     if let Some(x) = colors.get_mut(vi as usize) {
@@ -185,15 +202,14 @@ impl Session {
             }
         }
         let c = Arc::new(colors);
-        self.tess.region_colors.insert(mesh_id, (key, c.clone()));
+        self.tess.region_colors.insert(mesh_id, (mesh.clone(), regions, c.clone()));
         Some(c)
     }
 
-    /// The level of detail of a large scan (cached by mesh pointer and budget).
+    /// The level of detail of a large scan (cached by mesh and budget).
     fn lod_of(&mut self, id: ObjectId, mesh: &Arc<Mesh>, budget: usize) -> Option<(Arc<Lod>, Arc<Mesh>)> {
-        let ptr = Arc::as_ptr(mesh) as usize;
-        if let Some((p, b, l, m)) = self.tess.lods.get(&id)
-            && *p == ptr
+        if let Some((src, b, l, m)) = self.tess.lods.get(&id)
+            && Arc::ptr_eq(src, mesh)
             && *b == budget
         {
             return Some((l.clone(), m.clone()));
@@ -201,20 +217,19 @@ impl Session {
         self.tess.lod_colors.remove(&id);
         let lod = Arc::new(surfacecraft_geom::lod::cluster(mesh, budget)?);
         let m = Arc::new(lod.mesh.clone());
-        self.tess.lods.insert(id, (ptr, budget, lod.clone(), m.clone()));
+        self.tess.lods.insert(id, (mesh.clone(), budget, lod.clone(), m.clone()));
         Some((lod, m))
     }
 
     fn lod_colors_of(&mut self, id: ObjectId, c: &Arc<Vec<[f32; 4]>>, l: &Lod, m: &Arc<Mesh>) -> Arc<Vec<[f32; 4]>> {
-        let mp = Arc::as_ptr(m) as usize;
-        if let Some((src, p, mapped)) = self.tess.lod_colors.get(&id)
+        if let Some((src, lm, mapped)) = self.tess.lod_colors.get(&id)
             && Arc::ptr_eq(src, c)
-            && *p == mp
+            && Arc::ptr_eq(lm, m)
         {
             return mapped.clone();
         }
         let mapped = Arc::new(l.map_colors(c));
-        self.tess.lod_colors.insert(id, (c.clone(), mp, mapped.clone()));
+        self.tess.lod_colors.insert(id, (c.clone(), m.clone(), mapped.clone()));
         mapped
     }
 
@@ -225,34 +240,83 @@ impl Session {
         {
             return *g;
         }
-        self.tess.counter += 1;
-        let g = self.tess.counter;
+        let g = next_stamp() as u64;
         self.tess.color_ident.insert(id, (c.clone(), g));
         g
     }
 
+    /// The display key of `mesh`: the same while it is the same mesh, never one used before.
+    fn ident(&mut self, mesh: &Arc<Mesh>) -> usize {
+        let ptr = Arc::as_ptr(mesh) as usize;
+        if let Some((m, k)) = self.tess.idents.get(&ptr)
+            && Arc::ptr_eq(m, mesh)
+        {
+            return *k;
+        }
+        let k = next_stamp();
+        self.tess.idents.insert(ptr, (mesh.clone(), k));
+        k
+    }
+
+    /// Drops what was derived from objects no longer in the document, and the keys of meshes
+    /// nothing but the cache holds any more.
+    fn prune_display_cache(&mut self) {
+        let ids = |v: &mut dyn Iterator<Item = ObjectId>| v.collect::<HashSet<ObjectId>>();
+        let meshes = ids(&mut self.doc.meshes.iter().map(|m| m.id));
+        let bodies = ids(&mut self.doc.bodies.iter().map(|b| b.id));
+        let quads = ids(&mut self.doc.quads.iter().map(|q| q.id));
+        let sketches = ids(&mut self.doc.sketches.iter().map(|k| k.id));
+        let t = &mut self.tess;
+        t.entries.retain(|id, _| bodies.contains(id));
+        t.region_colors.retain(|id, _| meshes.contains(id));
+        t.lods.retain(|id, _| meshes.contains(id));
+        t.lod_colors.retain(|id, _| meshes.contains(id));
+        t.color_ident.retain(|id, _| meshes.contains(id));
+        t.quads.retain(|id, _| quads.contains(id));
+        t.sketches.retain(|id, _| sketches.contains(id));
+        t.idents.retain(|_, (m, _)| Arc::strong_count(m) > 1);
+    }
+
     /// Everything visible: meshes, bodies, primitives.
     pub fn display_items(&mut self) -> Vec<DisplayItem> {
+        self.prune_display_cache();
+        let mut out = self.mesh_items();
+        self.body_items(&mut out);
+        for o in self.doc.surfaces.iter().filter(|o| o.visible) {
+            out.push(DisplayItem::plain(o.id, ObjectKind::Surface, o.display.clone()));
+        }
+        self.quad_items(&mut out);
+        self.sketch_items(&mut out);
+        for p in self.doc.primitives.iter().filter(|p| p.visible) {
+            out.push(DisplayItem::plain(p.id, ObjectKind::Primitive, p.patch.clone()));
+        }
+        for d in &mut out {
+            d.key = self.ident(&d.mesh);
+            d.pick_key = self.ident(&d.pick_mesh);
+        }
+        out
+    }
+
+    fn mesh_items(&mut self) -> Vec<DisplayItem> {
         let meshes: Vec<(ObjectId, Arc<Mesh>)> =
             self.doc.meshes.iter().filter(|m| m.visible).map(|m| (m.id, m.mesh.clone())).collect();
         let mut out = Vec::new();
         for (id, mesh) in meshes {
-            let pick_key = Arc::as_ptr(&mesh) as usize;
             let colors = match self.live_map(id) {
                 Some(map) if map.colours.len() == mesh.vertex_count() => Some(map.colours.clone()),
-                _ => self.region_overlay(id, &mesh, pick_key),
+                _ => self.region_overlay(id, &mesh),
             };
             let budget = if self.tess.budget == 0 { LOD_BUDGET } else { self.tess.budget };
             let lod = if mesh.triangle_count() > budget { self.lod_of(id, &mesh, budget) } else { None };
-            let (drawn, key, drawn_colors) = match &lod {
+            let (drawn, drawn_colors) = match &lod {
                 Some((l, m)) => {
                     let c = colors.as_ref().map(|c| self.lod_colors_of(id, c, l, m));
-                    (m.clone(), Arc::as_ptr(m) as usize, c)
+                    (m.clone(), c)
                 }
                 None => {
                     self.tess.lods.remove(&id);
                     self.tess.lod_colors.remove(&id);
-                    (mesh.clone(), pick_key, colors.clone())
+                    (mesh.clone(), colors.clone())
                 }
             };
             let colors_key = match &colors {
@@ -262,30 +326,33 @@ impl Session {
                     0
                 }
             };
+            // keys are set from the meshes at the end of `display_items`
             out.push(DisplayItem {
                 id,
                 kind: ObjectKind::Mesh,
-                key,
+                key: 0,
                 mesh: drawn,
                 colors: drawn_colors,
                 colors_key,
                 pick_mesh: mesh,
-                pick_key,
+                pick_key: 0,
                 lod: lod.map(|(l, _)| l),
                 topo: None,
             });
         }
-        let live: Vec<ObjectId> = self.doc.bodies.iter().map(|b| b.id).collect();
-        self.tess.entries.retain(|id, _| live.contains(id));
-        for b in self.doc.bodies.iter().filter(|b| b.shown()) {
-            let key = Arc::as_ptr(&b.brep) as usize;
-            let (mesh, topo) = match self.tess.entries.get(&b.id) {
-                Some((k, m, t)) if *k == key => (m.clone(), t.clone()),
+        out
+    }
+
+    fn body_items(&mut self, out: &mut Vec<DisplayItem>) {
+        let (doc, tess) = (&self.doc, &mut self.tess);
+        for b in doc.bodies.iter().filter(|b| b.shown()) {
+            let (mesh, topo) = match tess.entries.get(&b.id) {
+                Some((brep, m, t)) if Arc::ptr_eq(brep, &b.brep) => (m.clone(), t.clone()),
                 _ => {
                     let tm = surfacecraft_kernel::tess::tessellate_topo(&b.brep, None).unwrap_or_default();
                     let topo = Arc::new(BodyTopo::new(tm.tri_face, tm.edges));
                     let m = Arc::new(tm.mesh);
-                    self.tess.entries.insert(b.id, (key, m.clone(), topo.clone()));
+                    tess.entries.insert(b.id, (b.brep.clone(), m.clone(), topo.clone()));
                     (m, topo)
                 }
             };
@@ -293,38 +360,40 @@ impl Session {
             item.topo = Some(topo);
             out.push(item);
         }
-        for o in self.doc.surfaces.iter().filter(|o| o.visible) {
-            out.push(DisplayItem::plain(o.id, ObjectKind::Surface, o.display.clone()));
-        }
-        let quads: Vec<_> =
-            self.doc.quads.iter().filter(|q| q.visible).map(|q| (q.id, q.vertices.clone(), q.clone())).collect();
-        for (id, verts, q) in quads {
-            let mut key = verts.len() as u64 ^ ((q.faces.len() as u64) << 40);
-            for v in &verts {
-                for c in v {
-                    key = key.wrapping_mul(1_099_511_628_211) ^ c.to_bits();
+    }
+
+    fn quad_items(&mut self, out: &mut Vec<DisplayItem>) {
+        let (doc, tess) = (&self.doc, &mut self.tess);
+        for q in doc.quads.iter().filter(|q| q.visible) {
+            let mesh = match tess.quads.get(&q.id) {
+                Some(((v, f, nu, nv), m)) if *v == q.vertices && *f == q.faces && *nu == q.nu && *nv == q.nv => {
+                    m.clone()
                 }
-            }
-            let mesh = match self.tess.quads.get(&id) {
-                Some((k, m)) if *k == key => m.clone(),
                 _ => {
                     let m = Arc::new(q.display_mesh());
-                    self.tess.quads.insert(id, (key, m.clone()));
+                    tess.quads.insert(q.id, ((q.vertices.clone(), q.faces.clone(), q.nu, q.nv), m.clone()));
                     m
                 }
             };
-            out.push(DisplayItem::plain(id, ObjectKind::Quad, mesh));
+            out.push(DisplayItem::plain(q.id, ObjectKind::Quad, mesh));
         }
-        for k in self.doc.sketches.iter().filter(|k| k.visible) {
-            let m = Arc::new(sketch_ribbons(&k.sketch));
-            if m.triangle_count() > 0 {
-                out.push(DisplayItem::plain(k.id, ObjectKind::Sketch, m));
+    }
+
+    fn sketch_items(&mut self, out: &mut Vec<DisplayItem>) {
+        let (doc, tess) = (&self.doc, &mut self.tess);
+        for k in doc.sketches.iter().filter(|k| k.visible) {
+            let mesh = match tess.sketches.get(&k.id) {
+                Some((s, m)) if *s == k.sketch => m.clone(),
+                _ => {
+                    let m = Arc::new(sketch_ribbons(&k.sketch));
+                    tess.sketches.insert(k.id, (k.sketch.clone(), m.clone()));
+                    m
+                }
+            };
+            if mesh.triangle_count() > 0 {
+                out.push(DisplayItem::plain(k.id, ObjectKind::Sketch, mesh));
             }
         }
-        for p in self.doc.primitives.iter().filter(|p| p.visible) {
-            out.push(DisplayItem::plain(p.id, ObjectKind::Primitive, p.patch.clone()));
-        }
-        out
     }
 }
 
@@ -381,4 +450,45 @@ fn sketch_ribbons(s: &surfacecraft_sketch::Sketch) -> Mesh {
         }
     }
     m
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Session;
+    use serde_json::json;
+    use surfacecraft_geom::{Point3, synth};
+
+    #[test]
+    fn derived_display_data_goes_with_its_object() {
+        let mut s = Session::new();
+        s.tess.budget = 500;
+        let scan = s.doc.add_mesh("scan", synth::sphere(Point3::origin(), 10.0, 40, 20));
+        s.execute("body.box", json!({"size": [20.0, 10.0, 5.0]})).unwrap();
+        s.execute(
+            "sketch.create",
+            json!({"name": "sq", "plane": {"origin": [0.0, 0.0, 0.0], "x": [1.0, 0.0, 0.0], "y": [0.0, 1.0, 0.0]}}),
+        )
+        .unwrap();
+        s.execute(
+            "sketch.add",
+            json!({"sketch": "sq", "entities": [{"polygon": {"points": [[0.0, 0.0], [5.0, 0.0], [5.0, 5.0]]}}]}),
+        )
+        .unwrap();
+        let shown = s.display_items();
+        assert_eq!(shown.len(), 3);
+        assert_eq!((s.tess.lods.len(), s.tess.entries.len(), s.tess.sketches.len()), (1, 1, 1));
+        drop(shown);
+        let ids: Vec<_> = s.doc.summaries().iter().map(|o| o.id).collect();
+        for id in ids {
+            assert!(s.doc.remove(id));
+        }
+        // undo history still holds the removed geometry: the display keys it had may stay, the
+        // cache entries of objects no longer in the document may not
+        s.history = surfacecraft_doc::History::default();
+        assert!(s.display_items().is_empty());
+        let t = &s.tess;
+        assert!(t.lods.is_empty() && t.entries.is_empty() && t.sketches.is_empty(), "{t:?}");
+        assert!(t.idents.is_empty(), "nothing holds the old meshes, so their keys are gone");
+        assert!(!s.doc.summaries().iter().any(|o| o.id == scan));
+    }
 }
