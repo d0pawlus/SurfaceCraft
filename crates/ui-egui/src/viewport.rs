@@ -61,7 +61,8 @@ struct GpuMesh {
     ib: wgpu::Buffer,
     count: u32,
     vertices: usize,
-    origin: [f64; 3],
+    /// The point the vertices are stored relative to (f32 precision): the frame origin at upload.
+    origin: Point3,
     /// Colour state last written to `cb`.
     color_state: u64,
     /// Highlighted triangles (indices into the mesh) and their index buffer.
@@ -155,7 +156,12 @@ impl Renderer {
         });
         let identity_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("identity model"),
-            contents: bytemuck::bytes_of(&object_uniform(&identity_rows(), &Point3::origin(), [0.0; 4])),
+            contents: bytemuck::bytes_of(&object_uniform(
+                &identity_rows(),
+                &Point3::origin(),
+                &Point3::origin(),
+                [0.0; 4],
+            )),
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let identity_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {

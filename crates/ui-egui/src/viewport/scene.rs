@@ -15,20 +15,36 @@ pub struct Overlay {
     pub models: Vec<(usize, [[f64; 4]; 4])>,
 }
 
-/// A world-space model matrix as the shader takes it for vertices stored relative to `origin`:
-/// column-major, with the shift folded in (`p' = M (q + o) - o`).
-pub(super) fn shifted_model(rows: &[[f64; 4]; 4], o: &Point3) -> [[f32; 4]; 4] {
-    let oo = [o.x, o.y, o.z];
+/// A world-space model matrix as the shader takes it: for vertices stored relative to their mesh's
+/// own origin `m`, giving positions relative to the frame's origin `o` (`p' = M (q + m) - o`),
+/// column-major. The mesh keeps the origin it was uploaded with while the frame's follows the
+/// camera, so a pan rewrites this matrix and not the vertices (until `origin_too_far`).
+pub(super) fn shifted_model(rows: &[[f64; 4]; 4], m: &Point3, o: &Point3) -> [[f32; 4]; 4] {
+    let (mm, oo) = ([m.x, m.y, m.z], [o.x, o.y, o.z]);
     let mut out = [[0f32; 4]; 4];
     for r in 0..3 {
         for c in 0..3 {
             out[c][r] = rows[r][c] as f32;
         }
-        let rot_o = rows[r][0] * oo[0] + rows[r][1] * oo[1] + rows[r][2] * oo[2];
-        out[3][r] = (rot_o + rows[r][3] - oo[r]) as f32;
+        let rot_m = rows[r][0] * mm[0] + rows[r][1] * mm[1] + rows[r][2] * mm[2];
+        out[3][r] = (rot_m + rows[r][3] - oo[r]) as f32;
     }
     out[3][3] = 1.0;
     out
+}
+
+/// Largest f32 rounding error of a drawn vertex, in pixels, before a mesh is uploaded again
+/// around the frame's origin.
+const MAX_ROUNDING_PX: f64 = 0.25;
+
+/// Whether vertices stored in f32 relative to `mesh_origin` are too coarse for this frame: the
+/// rounding step at the camera target (its distance from that origin times the f32 epsilon) is
+/// a visible part of a pixel. A pan moves the target by pixels and this takes millions of them,
+/// so panning keeps the upload; zooming far into a part far from the origin renews it once.
+pub(super) fn origin_too_far(mesh_origin: &Point3, f: &Frame) -> bool {
+    let step = (f.origin - mesh_origin).norm() * f64::from(f32::EPSILON);
+    let pixel = f.camera.world_per_pixel(f.camera.distance, f64::from(f.size[1]));
+    step > pixel * MAX_ROUNDING_PX
 }
 
 /// The identity as a world row-major matrix.
@@ -116,8 +132,14 @@ pub(super) fn back_of(item: &DrawItem) -> [f32; 4] {
 }
 
 /// The per-object uniform: where the object is drawn and the colour of its back side.
-pub(super) fn object_uniform(rows: &[[f64; 4]; 4], origin: &Point3, back: [f32; 4]) -> ObjectUniform {
-    ObjectUniform { model: shifted_model(rows, origin), back }
+/// `mesh_origin` and `frame_origin` are those of `shifted_model`.
+pub(super) fn object_uniform(
+    rows: &[[f64; 4]; 4],
+    mesh_origin: &Point3,
+    frame_origin: &Point3,
+    back: [f32; 4],
+) -> ObjectUniform {
+    ObjectUniform { model: shifted_model(rows, mesh_origin, frame_origin), back }
 }
 
 /// Per-object uniform of the mesh shader (`Object` in `mesh.wgsl`).

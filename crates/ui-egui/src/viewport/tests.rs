@@ -139,6 +139,105 @@ fn new_colours_with_the_same_geometry_key_are_uploaded() {
     }
 }
 
+/// The model matrix takes a vertex stored relative to its mesh's own origin to the frame's
+/// origin: `M (q + mesh origin) - frame origin`, for the identity and for a preview motion.
+#[test]
+fn model_matrix_takes_mesh_local_vertices_to_the_frame_origin() {
+    let mesh_origin = Point3::new(100.0, -20.0, 5.0);
+    let frame_origin = Point3::new(103.0, -18.0, 4.0);
+    let world = Point3::new(101.0, -19.0, 7.0);
+    let q = world - mesh_origin.coords;
+    let apply = |m: &[[f32; 4]; 4]| -> [f64; 3] {
+        std::array::from_fn(|r| {
+            f64::from(m[0][r]) * q.x + f64::from(m[1][r]) * q.y + f64::from(m[2][r]) * q.z + f64::from(m[3][r])
+        })
+    };
+    let near =
+        |a: [f64; 3], b: Point3| (a[0] - b.x).abs() < 1e-5 && (a[1] - b.y).abs() < 1e-5 && (a[2] - b.z).abs() < 1e-5;
+    let still = apply(&shifted_model(&identity_rows(), &mesh_origin, &frame_origin));
+    assert!(near(still, world - frame_origin.coords), "identity {still:?}");
+    // a quarter turn about Z and a shift: world (x, y, z) -> (-y + 1, x + 2, z + 3)
+    let rows = [[0.0, -1.0, 0.0, 1.0], [1.0, 0.0, 0.0, 2.0], [0.0, 0.0, 1.0, 3.0], [0.0, 0.0, 0.0, 1.0]];
+    let moved = apply(&shifted_model(&rows, &mesh_origin, &frame_origin));
+    let expect = Point3::new(-world.y + 1.0, world.x + 2.0, world.z + 3.0) - frame_origin.coords;
+    assert!(near(moved, expect), "moved {moved:?}");
+}
+
+/// Panning moves the frame's precision origin with the camera target: the geometry stays on the
+/// GPU (one upload) and the picture follows the pan. Opt-in (`SURFACECRAFT_GPU_TESTS=1`).
+#[test]
+fn panning_does_not_reupload_geometry() {
+    let Some(_gpu) = gpu_test_guard() else {
+        return;
+    };
+    let mesh = Arc::new(synth::sphere(Point3::origin(), 10.0, 32, 16));
+    let mut camera = Camera::default();
+    camera.fit(&mesh.bbox());
+    let frame = |camera: &Camera| Frame {
+        size: [64, 48],
+        origin: camera.target,
+        camera: camera.clone(),
+        items: vec![DrawItem { color: [1.0, 0.0, 0.0, 1.0], ..plain_item(&mesh) }],
+        background: [0.0, 0.0, 1.0],
+        overlay: Default::default(),
+    };
+    let Some((device, queue)) = headless_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+    let mut r = Renderer::new(&device, COLOR_FORMAT);
+    let mut draw = |f: &Frame| {
+        let mut enc = device.create_command_encoder(&Default::default());
+        r.prepare(&device, &queue, &mut enc, f);
+        queue.submit([enc.finish()]);
+        r.read_rgba(&device, &queue).unwrap_or_default()
+    };
+    let is_red = |px: &[u8], x: usize| px[(24 * 64 + x) * 4] > 60 && px[(24 * 64 + x) * 4 + 2] < 60;
+    let before = draw(&frame(&camera));
+    assert!(is_red(&before, 32) && !is_red(&before, 2), "the sphere starts in the middle");
+    // drag right by most of the half width, in steps as a drag does: the sphere leaves the centre
+    for _ in 0..7 {
+        camera.pan(4.0, 0.0, 48.0);
+        draw(&frame(&camera));
+    }
+    let after = draw(&frame(&camera));
+    assert!(!is_red(&after, 4) && is_red(&after, 60), "the sphere followed the pan to the right");
+    assert_eq!(r.uploads, 1, "geometry uploaded once");
+}
+
+/// A drag across the whole screen keeps the upload; zooming far into a part a long way from the
+/// upload origin renews it, and there the new origin keeps features apart that the old one merged.
+#[test]
+fn upload_origin_is_renewed_only_when_rounding_would_show() {
+    let frame = |camera: &Camera| Frame {
+        size: [1280, 800],
+        origin: camera.target,
+        camera: camera.clone(),
+        items: Vec::new(),
+        background: [0.0; 3],
+        overlay: Default::default(),
+    };
+    let mut camera = Camera { distance: 300.0, ..Camera::default() };
+    let uploaded_at = camera.target;
+    for _ in 0..4000 {
+        camera.pan(3.0, -2.0, 800.0);
+        assert!(!origin_too_far(&uploaded_at, &frame(&camera)), "panning keeps the upload");
+    }
+    // a detail a quarter of the screen away, magnified fifty times
+    let mut detail = Camera { distance: 300.0, ..Camera::default() };
+    detail.pan(200.0, 0.0, 800.0);
+    detail.zoom(2000.0);
+    assert!(!origin_too_far(&uploaded_at, &frame(&detail)), "zooming into a scan keeps the upload");
+    // a part 500 m from the upload origin, looked at from 5 mm: vertices 0.01 mm apart
+    let far = Camera { target: Point3::new(500_000.0, 0.0, 0.0), distance: 5.0, ..Camera::default() };
+    assert!(origin_too_far(&uploaded_at, &frame(&far)), "rounding would show");
+    assert!(!origin_too_far(&far.target, &frame(&far)), "the renewed upload is kept");
+    let stored = |x: f64, origin: &Point3| (x - origin.x) as f32;
+    let (a, b) = (far.target.x, far.target.x + 0.01);
+    assert_eq!(stored(a, &uploaded_at), stored(b, &uploaded_at), "merged around the old origin");
+    assert_ne!(stored(a, &far.target), stored(b, &far.target), "apart around the new one");
+}
+
 const FRONT: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
 const BACK: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
 
