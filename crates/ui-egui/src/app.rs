@@ -51,6 +51,8 @@ pub struct SurfaceCraftApp {
     pub background_jobs: bool,
     /// The command running now, if one is.
     pub(crate) busy: Option<crate::jobs::Busy>,
+    /// A large file picked for import, waiting for the user's answer (see [`crate::import_reduce`]).
+    pub(crate) pending_import: Option<crate::import_reduce::PendingImport>,
     /// A cancelled command whose thread has not finished yet.
     pub(crate) finishing: Option<surfacecraft_engine::Job>,
     /// Last status line.
@@ -141,6 +143,7 @@ impl SurfaceCraftApp {
             deviation: Default::default(),
             background_jobs: false,
             busy: None,
+            pending_import: None,
             finishing: None,
             status: t("status.ready").to_string(),
             picks: Vec::new(),

@@ -277,6 +277,7 @@
   "no surface of revolution fits these scan points": "żadna powierzchnia obrotowa nie pasuje do tych punktów skanu",
   "no surface {}": "nie ma powierzchni {}",
   "no symmetry plane found": "nie znaleziono płaszczyzny symetrii",
+  "no triangle is left after the reduction (the triangles of the file have no area)": "po redukcji nie został żaden trójkąt (trójkąty w pliku nie mają pola)",
   "no triangles given": "nie podano trójkątów",
   "noise must be ≥ 0": "szum musi być ≥ 0",
   "noise_sigma must be finite and not negative": "„Szum skanu” musi być liczbą skończoną i nieujemną",
@@ -336,6 +337,7 @@
   "ratio must be in (0, 1]": "współczynnik musi być w przedziale (0, 1]",
   "rational weight must be positive": "waga wymierna musi być dodatnia",
   "record validate": "sprawdzanie zapisu bryły",
+  "reduce_to must be between {} and {}": "„Redukuj do” musi mieścić się między {} a {}",
   "region of {} triangles: the boundary is all corners": "region (liczba trójkątów: {}): cały brzeg składa się z samych narożników",
   "region {} is not a region of the object being moved": "region {} nie należy do przesuwanego obiektu",
   "regions of different meshes cannot be merged": "nie można scalić regionów z różnych siatek",
@@ -415,6 +417,7 @@
   "the face cannot be raised: the extension meets other geometry ({})": "ściany nie można podnieść: przedłużenie trafia na inną geometrię ({})",
   "the face has no edge loop": "ściana nie ma pętli krawędzi",
   "the face has no vertices": "ściana nie ma wierzchołków",
+  "the file could not be reduced to {} triangles; give a larger `reduce_to` or reduce it elsewhere": "pliku nie udało się zredukować do {} trójkątów; podaj większą wartość „Redukuj do” albo zredukuj skan w innym programie",
   "the file has no bodies": "plik nie zawiera brył",
   "the fixed mesh {} is not in `objects`": "nieruchoma siatka {} nie występuje w „objects”",
   "the fixed scan has no extent": "nieruchomy skan nie ma rozmiaru",
@@ -440,6 +443,7 @@
   "the layout would exceed {} quads per direction": "układ przekroczyłby {} czworokątów w jednym kierunku",
   "the local fit failed ({}); use align.n_point with point pairs instead": "dopasowanie lokalne nie powiodło się ({}); użyj zamiast niego narzędzia „Wyrównanie N-punktowe” z parami punktów",
   "the mesh collapsed while preparing it": "siatka zapadła się podczas przygotowania",
+  "the mesh could not be reduced": "siatki nie udało się zredukować",
   "the mesh has no area": "siatka ma zerowe pole powierzchni",
   "the mesh has no triangles": "siatka nie ma trójkątów",
   "the mesh has too few triangles": "siatka ma za mało trójkątów",
@@ -641,5 +645,6 @@
   "{}: the constraint is gone": "{}: więz już nie istnieje",
   "{}: the feature is gone": "{}: cecha już nie istnieje",
   "{}: torus, minor radius {}": "{}: torus, mały promień {}",
-  "{}: {}": "{}: {}"
+  "{}: {}": "{}: {}",
+  "{}; import it with `reduce_to` (at most {}) to reduce it while it is read": "{}; zaimportuj z parametrem „Redukuj do” (najwyżej {}), żeby zredukować skan podczas wczytywania"
 }

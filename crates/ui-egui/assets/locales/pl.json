@@ -1018,5 +1018,15 @@
   "cmd.align.pair_coarse": "Wyrównanie dwóch skanów",
   "cmd.align.pair_coarse.hint": "Układa drugi skan tej samej części na pierwszym bez wskazywania punktów: próbuje osi głównych i dopasowania lokalnych kształtów, także gdy skany zachodzą na siebie tylko częściowo. Mówi, kiedy ułożenie jest niejednoznaczne albo skany do siebie nie pasują.",
   "cmd.align.global": "Wyrównanie wielu skanów",
-  "cmd.align.global.hint": "Układa kilka skanów tej samej części we wspólnym położeniu bez wskazywania punktów: wyrównuje pary, ocenia, którym parom można ufać, i poprawia wszystkie położenia razem, tak by błąd wzdłuż pętli się rozłożył. Skany, których nie da się połączyć, zostają na miejscu."
+  "cmd.align.global.hint": "Układa kilka skanów tej samej części we wspólnym położeniu bez wskazywania punktów: wyrównuje pary, ocenia, którym parom można ufać, i poprawia wszystkie położenia razem, tak by błąd wzdłuż pętli się rozłożył. Skany, których nie da się połączyć, zostają na miejscu.",
+  "param.reduce_to": "Redukuj do",
+  "reduce.title": "Duży skan",
+  "reduce.text": "Ten skan ma {triangles} trójkątów.",
+  "reduce.over_limit": "Import w tym miejscu przyjmuje najwyżej {limit} trójkątów, więc skan trzeba zredukować podczas wczytywania.",
+  "reduce.optional": "Możesz go zredukować podczas wczytywania: wczyta się szybciej i każdy kolejny krok będzie krótszy.",
+  "reduce.target": "Redukuj do (trójkątów)",
+  "reduce.confirm": "Zredukuj i importuj",
+  "reduce.full": "Importuj w całości",
+  "reduce.cancel": "Anuluj",
+  "reduce.done": "Zredukowano przy imporcie z {from} do {to} trójkątów (żaden wierzchołek nie przesunął się o więcej niż {error} mm)."
 }

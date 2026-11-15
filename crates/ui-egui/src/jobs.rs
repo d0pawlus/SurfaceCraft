@@ -247,10 +247,12 @@ impl SurfaceCraftApp {
         if let Ok(v) = &result
             && matches!(id, "mesh.import" | "mesh.set_units")
         {
-            let texts: Vec<String> = [crate::import_units::result_note(id, v), crate::import_units::warning_text(v)]
-                .into_iter()
-                .flatten()
-                .collect();
+            let reduced = crate::import_reduce::result_note(v);
+            let texts: Vec<String> =
+                [reduced, crate::import_units::result_note(id, v), crate::import_units::warning_text(v)]
+                    .into_iter()
+                    .flatten()
+                    .collect();
             if !texts.is_empty() {
                 self.status = texts.join(" ");
             }
@@ -321,7 +323,7 @@ impl SurfaceCraftApp {
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn poll_inbox(&mut self) {
         // one file at a time: an import may run in the background, and the next waits for it
-        while !self.is_busy() {
+        while !self.is_busy() && self.pending_import.is_none() {
             let mut inbox = self.inbox.borrow_mut();
             if inbox.is_empty() {
                 return;
@@ -330,12 +332,12 @@ impl SurfaceCraftApp {
             drop(inbox);
             let lower = name.to_lowercase();
             let ext = lower.rsplit('.').next().unwrap_or("").to_string();
-            let stem = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s).to_string();
-            let data = surfacecraft_doc::base64::encode(&bytes);
             if ext == "step" || ext == "stp" {
+                let stem = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s).to_string();
+                let data = surfacecraft_doc::base64::encode(&bytes);
                 self.launch("import.step", json!({"data": data, "name": stem}), After::Fit);
             } else {
-                self.import_mesh_file(json!({"data": data, "format": ext, "name": stem}));
+                self.import_picked_bytes(&name, bytes);
             }
         }
     }
