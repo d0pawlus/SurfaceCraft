@@ -13,7 +13,7 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
 
 ## [0.3.0] - 2026-11-15
 
-Two days and ten merged feature and fix pull requests after 0.2.0. The release is about harder real
+Two days and fourteen merged feature and fix pull requests after 0.2.0. The release is about harder real
 scans: several scans of one part are brought into one pose without picked points, `scan.to_solid`
 can put analytic faces into a freeform wrap, an n-sided opening gets one smooth trimmed patch, and
 scans with small handles, self-crossing folds or thin shells get through to a solid more often.
@@ -27,6 +27,8 @@ scans with small handles, self-crossing folds or thin shells get through to a so
   lie on a plane, cylinder, cone or sphere by one analytic face each, inside the freeform wrap (#112).
 - **One patch over an n-sided loop.** `surface.patch` fits a single trimmed patch with G0, G1 or G2
   per side against the neighbouring faces (#114).
+- **Large scans at import.** `mesh.import` with `reduce_to` reduces a scan above the triangle limit
+  while it is read, and the interface offers it when such a file is picked (#136).
 - **Scan repair.** `mesh.close_handles` closes small tunnels and bridges, `mesh.clean` can remove
   self-crossing folds, and thickened shells no longer cross themselves (#107, #115, #120).
 
@@ -59,6 +61,11 @@ scans with small handles, self-crossing folds or thin shells get through to a so
 
 #### Scan preparation and mesh editing
 
+- `mesh.import` option `reduce_to` (1000 to the platform limit): reduces a scan while it is
+  imported. STL and binary PLY are streamed and clustered on a grid, so memory follows the reduced
+  mesh, not the file; the result carries `reduced: {source_triangles, max_error}`. In the desktop
+  and web apps a picked file that declares more than 5 million triangles opens a dialog first:
+  reduce and import, import in full where the platform can hold it, or cancel (#136).
 - `mesh.close_handles`: closes the small handles of a scan (tunnels, bridges and the sponge of tiny
   tunnels where the two sides of a thin wall run together) as a new mesh, keeping the rim and every
   vertex away from them. Candidates refused because cutting all of them at once would split the
@@ -78,8 +85,18 @@ scans with small handles, self-crossing folds or thin shells get through to a so
   coarser and the adaptive rounds spend the rest of the limit where the patches miss.
   `scan.to_solid` with `close_handles` uses it (#122).
 
+#### Interface
+
+- Auto-align is the first tool of the Align tab. Propose runs `align.auto` without applying it and
+  draws the scan in the proposed pose, with rotation, translation and confidence; a proposal below
+  the confidence threshold is marked as a guess. Apply moves the scan as one undo step (#132).
+- The back side of a scan is drawn in its own colour (violet), so the inside of an open scan and
+  flipped triangles can be told from the outside (#131).
+
 ### Changed
 
+- An import refused for exceeding the triangle limit names `reduce_to` in its error (#136).
+- A tool whose command only proposed (`applied: false`) stays open instead of closing (#132).
 - `align.pair_coarse` answers `ambiguous` instead of `unique` when either scan contradicts the pose
   (surface of one scan in front of the other); the result carries `conflict_moving` and
   `conflict_fixed` (#117).
@@ -95,6 +112,8 @@ scans with small handles, self-crossing folds or thin shells get through to a so
 - `body.compare` and the verdict step of `scan.to_solid` tessellate the body straight into the
   display mesh and build the search tree on it: a third of the memory per triangle on networks of
   10 000 to 60 000 patches (#104).
+- Panning the view no longer uploads every mesh to the GPU again in each frame; pan is as smooth as
+  orbit and zoom on large scans (#133).
 - STEP re-import of a large open sheet written by SurfaceCraft is built from the topology the file
   states instead of being stitched by geometry, which was quadratic in the number of faces (#104).
 
@@ -117,6 +136,8 @@ scans with small handles, self-crossing folds or thin shells get through to a so
   open sheet, and takes 4 to 6 times as long as the freeform call.
 - `surface.patch` and `ngon: patch` return sheets; no command yet sews trimmed patches into a solid.
 - A scan with `close_handles` gets `review` at best, because the solid is built from a repaired copy.
+- `reduce_to` clusters vertices: it is coarser than `mesh.decimate`, keeps no sharp edges and can
+  leave non-manifold edges. ASCII PLY and OBJ files above the browser limit are still refused.
 - `mesh.merge` (several aligned scans into one mesh) is not in this release.
 - On real scans `scan.to_solid` often answers `review` rather than `pass`. The verdict lists the
   reason and the next step.
