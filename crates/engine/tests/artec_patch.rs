@@ -1,6 +1,7 @@
 //! `surface.patch` on the open Artec corpus (see `artec_corpus.rs`): fit quality and G0/G1/G2
-//! continuity on real scans. Measurement first: the figures are printed per model and site; the
-//! assertions are only those that held on every model.
+//! continuity on real scans. The figures are printed per model and site. Asserted: soft fits
+//! succeed unfolded, and G2 holds wherever the neighbour is a usable reference (no feature of the
+//! part across the shared side, see `SMOOTH_NEIGHBOUR`).
 //!
 //! On each model three sites are chosen without randomness: candidate vertices at even index
 //! steps, kept when the scan around them is a height field over its mean plane, then ranked by how
@@ -35,6 +36,14 @@ const EDGE_SAMPLE: usize = 20_000;
 /// Points per side of the grid that checks the scan covers the inside of the largest outline.
 const COVER_GRID: usize = 15;
 const NEIGHBOUR_MAX_CONTROL: u64 = 24;
+/// A neighbour whose normal curvature across the shared side varies along it by less than this
+/// (standard deviation, 1/mm) is a usable G2 reference. Measured 2026-11-15: the eight sites where G2
+/// held had at most 0.019, the four where a feature of the part crosses the side at least 0.048.
+const SMOOTH_NEIGHBOUR: f64 = 0.03;
+/// Bounds of the gate on smooth neighbours, 1.5 times the targets of the command (5 % and 0.05
+/// degrees; measured at most 4.8 % and 0.046 degrees).
+const G2_GATE: f64 = 0.075;
+const G1_GATE_DEG: f64 = 0.075;
 
 type V3 = [f64; 3];
 type V2 = [f64; 2];
@@ -314,6 +323,12 @@ struct Row {
     within_tolerance: bool,
     within_targets: bool,
     folded: bool,
+    /// Control net of the patch and the id of its sheet.
+    control: String,
+    surface: Option<u64>,
+    /// Standard deviation along the shared side of this patch's normal curvature across it (1/mm):
+    /// how usable the patch is as a G2 reference.
+    spread: Option<f64>,
 }
 
 fn largest(sides: &[Value], field: &str, keep: impl Fn(&Value) -> bool) -> Option<f64> {
@@ -341,7 +356,38 @@ fn patch(session: &mut Session, label: &str, params: Value) -> Row {
         within_tolerance: r["within_tolerance"] == true,
         within_targets: r["within_targets"] == true,
         folded: r["folded"] == true,
+        control: r["control"].to_string(),
+        surface: r["surface"].as_u64(),
+        spread: None,
     }
+}
+
+/// Spread of the normal curvature of sheet `id` across `side`, sampled at the side's points.
+fn curvature_spread(session: &Session, id: u64, side: &[V3]) -> Option<f64> {
+    let face = session.doc.surface(surfacecraft_doc::ObjectId(id))?.sheet.faces.first()?;
+    let mut across = Vec::new();
+    for i in 1..side.len().saturating_sub(1) {
+        let along = sub(side[i + 1], side[i - 1]);
+        let Ok((normal, _)) = surfacecraft_kernel::patch_fit::face_normal_curvature(face, side[i], along) else {
+            continue;
+        };
+        if let Ok((_, kappa)) =
+            surfacecraft_kernel::patch_fit::face_normal_curvature(face, side[i], cross(normal, along))
+        {
+            across.push(kappa);
+        }
+    }
+    let n = across.len() as f64;
+    let mean = across.iter().sum::<f64>() / n.max(1.0);
+    (n > 1.0).then(|| (across.iter().map(|k| (k - mean).powi(2)).sum::<f64>() / n).sqrt())
+}
+
+/// `params` with the smoothing of `ARTEC_SMOOTHING`, when that is set (soft fits only).
+fn with_smoothing(mut params: Value) -> Value {
+    if let Some(s) = std::env::var("ARTEC_SMOOTHING").ok().and_then(|s| s.parse::<f64>().ok()) {
+        params["smoothing"] = json!(s);
+    }
+    params
 }
 
 fn polylines(sides: &[Vec<V3>], soft: bool) -> Vec<Value> {
@@ -354,8 +400,15 @@ fn measure_site(session: &mut Session, tag: &str, case: &Case, shapes: &Outlines
     rows.push(patch(
         session,
         "octagon soft",
-        json!({"sides": polylines(&case.octagon, true), "mesh": "scan", "triangles": data(&shapes.octagon)}),
+        with_smoothing(
+            json!({"sides": polylines(&case.octagon, true), "mesh": "scan", "triangles": data(&shapes.octagon)}),
+        ),
     ));
+    // the pentagon's first side runs inside the octagon: the octagon's curvature spread along it
+    let spread = rows.last().and_then(|r| r.surface).and_then(|id| curvature_spread(session, id, &case.pentagon[0]));
+    if let Some(octagon) = rows.last_mut() {
+        octagon.spread = spread;
+    }
     let pentagon = data(&shapes.pentagon);
     rows.push(patch(
         session,
@@ -366,11 +419,13 @@ fn measure_site(session: &mut Session, tag: &str, case: &Case, shapes: &Outlines
     rows.push(patch(
         session,
         "quad soft",
-        json!({"sides": polylines(&case.quad, true), "mesh": "scan", "triangles": data(&shapes.quad),
-               "name": neighbour, "max_control": NEIGHBOUR_MAX_CONTROL}),
+        with_smoothing(json!({"sides": polylines(&case.quad, true), "mesh": "scan", "triangles": data(&shapes.quad),
+               "name": neighbour, "max_control": NEIGHBOUR_MAX_CONTROL})),
     ));
-    if rows.last().is_some_and(|r| r.error.is_some()) {
-        return rows;
+    let Some(id) = rows.last().and_then(|r| r.surface) else { return rows };
+    let spread = curvature_spread(session, id, &case.pentagon[0]);
+    if let Some(quad) = rows.last_mut() {
+        quad.spread = spread;
     }
     for continuity in ["g1", "g2"] {
         let mut sides = polylines(&case.pentagon, true);
@@ -390,8 +445,10 @@ fn print(tag: &str, sag: f64, row: &Row) {
     match &row.error {
         Some(e) => eprintln!("{tag} sag {sag:.4} {:<24} ERROR {e}", row.label),
         None => eprintln!(
-            "{tag} sag {sag:.4} {:<24} rms {:.4} max {:.4} gap {} angle {} curvature {} tol {} targets {} folded {} {:.1} s",
+            "{tag} sag {sag:.4} {:<24} net {} spread {} rms {:.4} max {:.4} gap {} angle {} curvature {} tol {} targets {} folded {} {:.1} s",
             row.label,
+            row.control,
+            show(row.spread),
             row.rms,
             row.max,
             show(row.gap),
@@ -431,8 +488,20 @@ fn artec_patch_fit_and_continuity() {
         }
         for (k, case) in found.iter().enumerate() {
             let tag = format!("{}#{}", file.split('.').next().unwrap_or(file), k + 1);
-            for row in measure_site(&mut session, &tag, case, &shapes) {
+            let rows = measure_site(&mut session, &tag, case, &shapes);
+            let smooth = rows.iter().filter_map(|r| r.spread).next_back().is_some_and(|s| s <= SMOOTH_NEIGHBOUR);
+            for row in rows {
                 print(&tag, case.site.sag, &row);
+                // G2 to a neighbour without a feature across the shared side holds
+                if smooth && row.label.contains("g2") {
+                    let held = row.error.is_none()
+                        && !row.folded
+                        && row.curvature.is_some_and(|c| c <= G2_GATE)
+                        && row.angle.is_some_and(|a| a <= G1_GATE_DEG);
+                    if !held {
+                        failures.push(format!("{tag} {}: {row:?}", row.label));
+                    }
+                }
                 // soft sides follow the scan: the fit must succeed and stay unfolded
                 if row.label.ends_with("soft") && (row.error.is_some() || row.folded) {
                     failures.push(format!("{tag} {}: {:?}", row.label, row.error));

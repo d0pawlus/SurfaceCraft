@@ -110,6 +110,17 @@ impl Measure {
                 .all(|(s, rest)| s.soft || (*rest && !s.folded && s.gap_max <= G0_TARGET))
     }
 
+    /// Every hard side is within its gap and angle targets and unfolded (the curvature aside).
+    pub fn g1_ok(&self, frozen: &[bool]) -> bool {
+        self.sides.iter().enumerate().all(|(k, s)| {
+            let lenient = frozen.get(k).copied().unwrap_or(false) && s.gap_max < 10.0 * G0_TARGET;
+            s.soft
+                || (!s.folded
+                    && (s.gap_max <= G0_TARGET || lenient)
+                    && s.angle_max_deg.is_none_or(|a| a <= G1_TARGET_DEG))
+        })
+    }
+
     /// Whether the rounds can stop: every side within its targets and the interior on the patch,
     /// where the gap of a `frozen` side (as close as its own accuracy allows) may be up to ten times
     /// the target. This steers the stopping only; [`Measure::targets_met`] is what is reported.
