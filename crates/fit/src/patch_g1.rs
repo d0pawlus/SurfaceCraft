@@ -344,6 +344,9 @@ impl Layer<'_> {
     /// is none within the reach.
     fn try_project(&self, at: Vec3, facing: &[Vec3]) -> Option<Vec3> {
         let hit = self.scan.closest_facing(&Point3::from(at), self.reach, facing, WRAP_FACING_COS);
+        if std::env::var("TMP_M1").is_ok_and(|v| v == "0") {
+            return Some(hit.map_or(at, |h| h.point.coords));
+        }
         hit.map(|h| h.point.coords)
     }
 
@@ -363,7 +366,8 @@ impl Layer<'_> {
     /// scan and not when either end lies on it: samples beyond the rim, or next to it, are pulled onto
     /// the rim and would lean the curve.
     fn refits_edge(&self, a: u32, b: u32) -> bool {
-        self.refit && !self.g1 && !self.free.contains(&key(a, b)) && !self.rim.contains(&a) && !self.rim.contains(&b)
+        let narrow = std::env::var("TMP_RIM").is_ok_and(|v| v == "0");
+        self.refit && !self.g1 && !self.free.contains(&key(a, b)) && (narrow || (!self.rim.contains(&a) && !self.rim.contains(&b)))
     }
 
     /// Are the spokes and the patches of triangle `f` refitted? Not with tangent patches, and not when
@@ -496,7 +500,7 @@ struct Triangle {
 fn add_spokes(l: &Layer, tri: &Triangle, nf: Vec3, build: &mut Build) -> u32 {
     let on_face = |at: Vec3| l.project(at, &[nf]);
     let try_face = |at: Vec3| l.try_project(at, &[nf]);
-    let refit = l.refits_triangle(tri.f);
+    let refit = l.refits_triangle(tri.f) || (std::env::var("TMP_RIM").is_ok_and(|v| v == "0") && l.refit && !l.g1);
     let p = |v: u32| build.vertices.get(v as usize).copied().unwrap_or_else(Vec3::zeros);
     let pg = on_face((p(tri.corners[0]) + p(tri.corners[1]) + p(tri.corners[2])) / 3.0);
     let g = build.vertices.len() as u32;
@@ -604,7 +608,7 @@ fn add_triangle(l: &Layer, tri: &Triangle, build: &mut Build) {
 /// [`crate::patch::wrap_patches`] numbers them.
 #[must_use]
 pub fn wrap_patches_g1(coarse: &Mesh, scan: &Bvh, surface: &ScanSurface, reach: f64, options: &G1Options) -> G1Wrap {
-    wrap_with(coarse, (scan, surface), reach, options, true)
+    wrap_with(coarse, (scan, surface), reach, options, !std::env::var("TMP_REFIT").is_ok_and(|v| v == "0"))
 }
 
 /// The vertices of the free edges.

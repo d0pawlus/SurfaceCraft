@@ -203,7 +203,7 @@ impl<'a> Target<'a> {
             samples: scan.positions.iter().step_by(stride).copied().collect(),
             tolerance,
             min_within,
-            stop_within: min_within + STOP_MARGIN * (1.0 - min_within),
+            stop_within: if std::env::var("TMP_STOP").is_ok_and(|v| v == "0") { min_within } else { min_within + STOP_MARGIN * (1.0 - min_within) },
             max_triangles: (max_patches / PATCHES_PER_TRIANGLE).max(4),
             coarse_start: false,
             max_patches,
