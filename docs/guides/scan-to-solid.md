@@ -344,9 +344,11 @@ kernel refuses sheets of many faces. Give the wall thickness instead:
   scan inside out: the scanned face would point into the volume the patch encloses, so the solid
   would be the space in front of the scanned surface. Such a loop is the open edge of a sheet, not
   a hole: the sheet was scanned from its hollow side, or its normals are stored inward (the mesh
-  cannot tell which). Only a loop whose own patch is at least a quarter of the scan's area is
-  refused; smaller holes are filled, so a closed scan stored inside out with small holes, however
-  many, is still filled and reported as `scan_inside_out`. A larger `fill_holes_max_edges` does
+  cannot tell which). Only an opening whose patches are at least a quarter of the scan's area is
+  refused (an opening is a loop, or the loops of a ragged rim that touches itself at vertices);
+  smaller holes are filled, so a closed scan stored inside out with small holes, however many, is
+  still filled and reported as `scan_inside_out`. Separate openings below a quarter each are filled
+  even when together they close a sheet inside out; that scan is then reported `scan_inside_out`. A larger `fill_holes_max_edges` does
   not change it. With method `freeform` or `hybrid` the scan is then wrapped as a sheet (`review`
   with `open_surface`); with method `primitives` the solid is built from the fitted primitives as
   before and the issue is context. Check which way the normals face (flip them if they point into

@@ -6,9 +6,11 @@
 //! clearly negative volume, the scanned face points into what was enclosed: the patches cap the
 //! space in front of the scanned face, and every scan point would face away from the solid. The
 //! mesh cannot tell why: an open sheet seen from its hollow side, or a sheet whose normals were
-//! stored inward; either way a loop whose patch alone is a large share of the piece is an open edge,
-//! not a hole, and its patch would invent material. Every such loop of an inside-out piece is
-//! refused, so no open edge is capped on one side and left open on the other (a tube's two ends).
+//! stored inward; either way an opening whose patches alone are a large share of the piece is an
+//! open edge, not a hole, and its patches would invent material. Every such opening of an
+//! inside-out piece is refused, so no open edge is capped on one side and left open on the other (a
+//! tube's two ends). An opening is a loop, or the loops that share vertices: a ragged rim touching
+//! itself is split into several loops, which are judged together.
 //! Smaller patches repair holes and are added: a closed scan stored inside out with small holes,
 //! however many, is filled, so that it is still told to be inside out, not left open.
 use super::Patch;
@@ -16,8 +18,8 @@ use super::patch::volume_and_area;
 use crate::{Mesh, Point3};
 use std::collections::{HashMap, HashSet};
 
-/// A loop of a piece its patches would close inside out is refused when its own patch is at least
-/// this share of the area of the piece's own triangles. A hole in a scan is a few percent of it;
+/// An opening of a piece its patches would close inside out is refused when its own patches are at
+/// least this share of the area of the piece's own triangles. A hole in a scan is a few percent of it;
 /// the cap over the open edge of a sheet is about as large as the sheet's outline (about 90 % for
 /// the square cap of a sphere in the tests).
 const INWARD_PATCH_SHARE: f64 = 0.25;
@@ -28,36 +30,70 @@ const INWARD_PATCH_SHARE: f64 = 0.25;
 /// sphere 0.56.
 const NO_VOLUME_SHARE: f64 = 1e-3;
 
-/// Connected pieces of `mesh`: the root vertex of each vertex (vertices joined through triangles).
-/// The mesh is valid (every index in range).
-fn vertex_pieces(mesh: &Mesh) -> Vec<u32> {
-    fn find(parent: &mut [u32], mut x: u32) -> u32 {
-        while parent[x as usize] != x {
-            let up = parent[parent[x as usize] as usize];
-            parent[x as usize] = up;
-            x = up;
+/// Union-find over `0..n`. A number past the end is its own root, so no lookup can go out of range.
+struct Roots(Vec<u32>);
+
+impl Roots {
+    fn new(n: usize) -> Self {
+        Self((0..n as u32).collect())
+    }
+
+    fn find(&mut self, mut x: u32) -> u32 {
+        while let Some(&up) = self.0.get(x as usize) {
+            if up == x {
+                break;
+            }
+            // path halving: point at the grandparent and go on from there
+            let grand = self.0.get(up as usize).copied().unwrap_or(up);
+            if let Some(slot) = self.0.get_mut(x as usize) {
+                *slot = grand;
+            }
+            x = grand;
         }
         x
     }
-    let mut parent: Vec<u32> = (0..mesh.positions.len() as u32).collect();
-    for t in &mesh.triangles {
-        let a = find(&mut parent, t[0]);
-        for &v in &t[1..] {
-            let b = find(&mut parent, v);
-            if a != b {
-                parent[b as usize] = a;
-            }
+
+    fn join(&mut self, a: u32, b: u32) {
+        let (a, b) = (self.find(a), self.find(b));
+        if a != b
+            && let Some(slot) = self.0.get_mut(b as usize)
+        {
+            *slot = a;
         }
     }
-    (0..parent.len() as u32).map(|v| find(&mut parent, v)).collect()
+}
+
+/// Connected pieces of `mesh`: the root vertex of each vertex (vertices joined through triangles).
+fn vertex_pieces(mesh: &Mesh) -> Vec<u32> {
+    let mut roots = Roots::new(mesh.positions.len());
+    for t in &mesh.triangles {
+        roots.join(t[0], t[1]);
+        roots.join(t[0], t[2]);
+    }
+    (0..mesh.positions.len() as u32).map(|v| roots.find(v)).collect()
+}
+
+/// The openings the loops `ks` of `todo` belong to, as a root per entry of `ks`: loops that share a
+/// vertex are one opening (a ragged rim that `simple_loops` split at the vertices where it touches
+/// itself); separate holes share none.
+fn openings(todo: &[Vec<u32>], ks: &[usize]) -> Vec<u32> {
+    let mut roots = Roots::new(ks.len());
+    let mut first: HashMap<u32, u32> = HashMap::new();
+    for (i, &k) in ks.iter().enumerate() {
+        for &v in todo.get(k).map_or(&[][..], Vec::as_slice) {
+            let owner = *first.entry(v).or_insert(i as u32);
+            roots.join(owner, i as u32);
+        }
+    }
+    (0..ks.len() as u32).map(|i| roots.find(i)).collect()
 }
 
 /// For every loop of `todo` (whose patches are `patches`): is it left open because, with all the
-/// patches in, its piece would be closed inside out, and its own patch is a large share of the piece
-/// (see the module)? A piece with a loop in `left` (not filled) stays open and is not judged. The
+/// patches in, its piece would be closed inside out, and the patches of its opening are a large share
+/// of the piece (see the module)? A piece with a loop in `left` (not filled) stays open and is not judged. The
 /// judgement takes every patch of the piece as added; one that `append_if_admitted` drops later would
 /// leave the piece open anyway, so the only effect is a large patch refused on a piece that was not
-/// going to close: conservative, never an inside-out solid. The mesh is valid.
+/// going to close: conservative, never an inside-out solid.
 pub(super) fn refused(mesh: &Mesh, todo: &[Vec<u32>], patches: &[Patch], left: &[Vec<u32>]) -> Vec<bool> {
     let mut refused = vec![false; todo.len()];
     let piece = vertex_pieces(mesh);
@@ -99,9 +135,15 @@ pub(super) fn refused(mesh: &Mesh, todo: &[Vec<u32>], patches: &[Patch], left: &
         if !inside_out(volume, scan_area, &measured) {
             continue;
         }
-        for &(k, _, area) in &measured {
-            if area >= INWARD_PATCH_SHARE * scan_area
-                && let Some(slot) = refused.get_mut(k)
+        // an opening's patches together: the lobes of one ragged rim invent as much as its one cap
+        let opening = openings(todo, &measured.iter().map(|m| m.0).collect::<Vec<_>>());
+        let mut area_of: HashMap<u32, f64> = HashMap::new();
+        for (m, o) in measured.iter().zip(&opening) {
+            *area_of.entry(*o).or_insert(0.0) += m.2;
+        }
+        for (m, o) in measured.iter().zip(&opening) {
+            if area_of.get(o).is_some_and(|&a| a >= INWARD_PATCH_SHARE * scan_area)
+                && let Some(slot) = refused.get_mut(m.0)
             {
                 *slot = true;
             }
@@ -273,13 +315,16 @@ mod tests {
         assert_eq!(tube, before);
     }
 
-    /// A ball stored inside out with a hole of about 30 % of it: that patch would invent as much as a
-    /// sheet's cap, so it is refused and counted in `inward` (the caller reports it).
+    /// A ball stored inside out with its upper half missing: the patch (a disc of radius 15) is half
+    /// the area that is left (a hemisphere), twice the share that is refused, so it invents as much as
+    /// a sheet's cap and is refused and counted in `inward` (the caller reports it).
     #[test]
-    fn a_hole_of_a_third_of_a_ball_stored_inside_out_is_refused_and_counted() {
+    fn a_hole_of_half_a_ball_stored_inside_out_is_refused_and_counted() {
         // Arrange
-        let mut ball = kept(&ball_inside_out(), |c| c.z < 6.0);
+        let mut ball = kept(&ball_inside_out(), |c| c.z < 0.0);
         assert_eq!(boundary_loops(&ball).len(), 1);
+        let share = std::f64::consts::PI * 15.0 * 15.0 / ball.area();
+        assert!(share > 1.5 * super::INWARD_PATCH_SHARE, "share {share}");
 
         // Act
         let rep = fill_holes(&mut ball, 1000, true);
@@ -337,5 +382,33 @@ mod tests {
             // Assert
             assert_eq!(rep.inward, 0, "{name}");
         }
+    }
+
+    /// A hollow dish whose rim touches itself at one vertex in five places (five thin triangles from
+    /// the middle of its opening to the rim): the rim is split into five loops of about a fifth of
+    /// the opening each, below the share one by one; they are one opening and stay open together.
+    #[test]
+    fn the_lobes_of_a_rim_that_touches_itself_are_judged_as_one_opening() {
+        // Arrange
+        let mut m = dish(true);
+        let rim = boundary_loops(&m).remove(0);
+        let n = rim.len();
+        let centre = rim.iter().fold(Vec3::zeros(), |acc, &v| acc + m.positions[v as usize].coords) / n as f64;
+        let c = m.positions.len() as u32;
+        m.positions.push(Point3::from(centre));
+        for i in 0..5 {
+            let (a, b) = (rim[i * n / 5], rim[(i * n / 5 + 1) % n]);
+            m.triangles.push([b, a, c]);
+        }
+        let mut lobes = boundary_loops(&m);
+        assert!(!lobes.is_empty());
+        lobes = super::super::simple_loops(lobes);
+        assert_eq!(lobes.len(), 5, "five lobes through the middle vertex");
+
+        // Act
+        let rep = fill_holes(&mut m, 1000, true);
+
+        // Assert
+        assert_eq!((rep.filled, rep.inward), (0, 5));
     }
 }
