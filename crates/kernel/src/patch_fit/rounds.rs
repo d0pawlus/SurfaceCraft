@@ -6,8 +6,8 @@ use super::measure::{self, Goal, Measure};
 use super::rows::{self, Inputs, Layout, SideSamples, Zone};
 use super::start::{Interior, Loop};
 use super::{
-    Continuity, G0_TARGET, G2_TARGET_REL, MAX_G2_ROUNDS, MAX_ROUNDS, MIN_IMPROVEMENT, Request, Round, Summary, grow,
-    grow_other, prefer,
+    Continuity, FAIRNESS_STEPS, G0_TARGET, G2_TARGET_REL, MAX_G2_ROUNDS, MAX_ROUNDS, MIN_IMPROVEMENT, Request, Round,
+    Summary, grow, grow_other, prefer,
 };
 use crate::nurbs::SurfaceProbe;
 use crate::record::brep::Surface;
@@ -64,6 +64,8 @@ struct State {
     grew: bool,
     /// Whether the last round already was a retry.
     retried: bool,
+    /// Index of the round's weight in [`FAIRNESS_STEPS`] (patches whose sides are all soft).
+    fairness: usize,
     /// G2 rows are linearised about the previous round's surface: the curvature error of the last
     /// round that had them.
     prev_curv: Option<f64>,
@@ -81,6 +83,10 @@ fn arg(msg: impl Into<String>) -> KernelError {
 }
 
 impl Context<'_> {
+    fn all_soft(&self) -> bool {
+        self.lp.sides.iter().all(|s| s.soft)
+    }
+
     /// Most rounds: a G2 side needs rounds on the same net for its curvature rows to converge.
     fn round_limit(&self) -> u32 {
         if self.lp.sides.iter().any(|s| s.continuity == Continuity::G2) { MAX_G2_ROUNDS } else { MAX_ROUNDS }
@@ -99,6 +105,7 @@ impl Context<'_> {
             from: self.start_net,
             grew: false,
             retried: false,
+            fairness: 0,
             prev_curv: None,
             rounds: 0,
             stop: None,
@@ -163,9 +170,14 @@ impl Context<'_> {
     /// The net of the next round: `None` ends the rounds.
     fn next_net(&self, st: &mut State, improved: bool, miss: [f64; 2], refine: bool) -> Option<[usize; 2]> {
         let max = self.req.max_control;
-        // nothing but the data steers a patch whose sides are all soft: its net grows evenly until
-        // the data are within the tolerance
-        if self.lp.sides.iter().all(|s| s.soft) {
+        // nothing but the data steers a patch whose sides are all soft: it is fitted as smooth as the
+        // tolerance allows (the curvature-variation energy is relaxed step by step), and only then
+        // does its net grow, evenly
+        if self.all_soft() {
+            if st.fairness + 1 < FAIRNESS_STEPS.len() {
+                st.fairness += 1;
+                return Some(st.net);
+            }
             let next = [super::grown(st.net[0], max), super::grown(st.net[1], max)];
             return (next != st.net).then_some(next);
         }
@@ -200,6 +212,7 @@ impl Context<'_> {
             zones: self.zones,
             prev: st.prev.as_ref(),
             smoothing: self.smoothing,
+            fairness: if self.all_soft() { FAIRNESS_STEPS.get(st.fairness).copied().unwrap_or(0.0) } else { 0.0 },
         })
     }
 

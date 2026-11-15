@@ -37,11 +37,12 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
   `minor_and_debris_*` now count the pieces left out and `debris_pieces` those with reason `debris`
   only. The cap of parts per call rises from 24 to 128, the cleaning protects small parts below its
   default by identity, and small parts are never rebuilt.
-- `surface.patch`: a patch whose sides are all soft now starts from a 6 by 6 control net and
-  grows it only until the scan data are within `tolerance`; before, the start net came from the
-  number of data points and followed the fine texture of a dense scan, which made its curvature
-  useless as a G2 reference for a neighbouring patch. Such a patch is smoother and its `rms` is
-  larger than before; pass a smaller `tolerance` for a closer fit. [#139]
+- `surface.patch`: a patch whose sides are all soft is fitted with a curvature-variation energy
+  (third derivatives) that damps the fine texture of a scan without flattening the curvature of
+  the shape; the energy is relaxed in steps only as far as the scan data need to come within
+  `tolerance`. Before, such a patch followed the texture of a dense scan, which made its curvature
+  useless as a G2 reference for a neighbouring patch. Its `rms` is a little larger than before;
+  pass a smaller `tolerance` for a closer fit. [#139, this change]
 - `surface.patch` with a G2 side may take up to 18 rounds instead of 6: the curvature conditions
   are iterated on the same control net until they converge, and only then is the net refined. [#139]
 

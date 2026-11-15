@@ -136,6 +136,10 @@ pub struct Problem {
     /// but soft rows the trace of the soft rows' normal matrix is used instead; with neither the
     /// energy weight is 1.
     pub smoothing: f64,
+    /// Relative weight (>= 0, 0 = off) of the curvature-variation energy `∫∫ S_uuu² + 3 S_uuv² +
+    /// 3 S_uvv² + S_vvv²`, scaled like `smoothing`. It is zero on quadratic shapes: it damps the
+    /// fine texture of a scan without flattening the curvature of the shape.
+    pub fairness: f64,
 }
 
 /// The fitted patch and how the hard rows fared.
@@ -224,6 +228,9 @@ fn validate(p: &Problem) -> Result<()> {
     }
     if !p.smoothing.is_finite() || p.smoothing <= 0.0 || p.smoothing > WEIGHT_LIMIT {
         return Err(arg("the smoothing must be finite and positive"));
+    }
+    if !p.fairness.is_finite() || p.fairness < 0.0 || p.fairness > WEIGHT_LIMIT {
+        return Err(arg("the fairness must be finite and not negative"));
     }
     if p.data.len() > MAX_DATA {
         return Err(arg(format!("at most {MAX_DATA} data points are accepted, not {}", p.data.len())));
@@ -329,14 +336,14 @@ struct Local {
     /// Index of the control point of the first non-vanishing function.
     first: usize,
     /// `d[k][r]`: `k`-th derivative of the function `first + r`.
-    d: [[f64; 4]; 3],
+    d: [[f64; 4]; 4],
 }
 
 fn local_basis(knots: &[f64], t: f64) -> Result<Local> {
     let kv = KnotVector::from_slice(knots).map_err(|e| op_err("KnotVector::from_slice", format!("{e:?}")))?;
-    let bd = basis_derivs(&kv, DEGREE, t, Side::Left, 2).map_err(|e| op_err("basis_derivs", format!("{e:?}")))?;
+    let bd = basis_derivs(&kv, DEGREE, t, Side::Left, 3).map_err(|e| op_err("basis_derivs", format!("{e:?}")))?;
     let first = bd.span.checked_sub(DEGREE).ok_or_else(|| arg("knot span index below the degree"))?;
-    let mut d = [[0.0; 4]; 3];
+    let mut d = [[0.0; 4]; 4];
     for (k, row) in d.iter_mut().enumerate() {
         for (r, slot) in row.iter_mut().enumerate() {
             *slot = bd
@@ -522,9 +529,18 @@ fn gauss_tables(knots: &[f64], cell_bounds: &[f64]) -> Result<Vec<Vec<(Local, f6
     Ok(out)
 }
 
-/// Scalar bending-energy matrix `K` (`∫∫ S_uu² + 2 S_uv² + S_vv²` per coordinate) over the active
-/// cells, and the control points that belong to an inactive cell.
-fn energy_matrix(g: &Grid, outline: &[[f64; 2]]) -> Result<(DMatrix<f64>, Vec<bool>)> {
+/// The scalar energy matrices over the active cells.
+struct Energy {
+    /// Bending: `∫∫ S_uu² + 2 S_uv² + S_vv²` per coordinate.
+    bending: DMatrix<f64>,
+    /// Variation of the curvature: `∫∫ S_uuu² + 3 S_uuv² + 3 S_uvv² + S_vvv²` per coordinate. It is
+    /// zero on every quadratic shape, so it damps ripples without flattening the shape's curvature.
+    variation: DMatrix<f64>,
+    /// The control points that belong to an inactive cell.
+    inactive: Vec<bool>,
+}
+
+fn energy_matrix(g: &Grid, outline: &[[f64; 2]]) -> Result<Energy> {
     let [cu, cv] = g.cells;
     let m = g.control[1];
     let nn = g.count();
@@ -535,6 +551,7 @@ fn energy_matrix(g: &Grid, outline: &[[f64; 2]]) -> Result<(DMatrix<f64>, Vec<bo
     let gu = gauss_tables(&g.knots[0], &g.bounds[0])?;
     let gv = gauss_tables(&g.knots[1], &g.bounds[1])?;
     let mut k = DMatrix::<f64>::zeros(nn, nn);
+    let mut k3 = DMatrix::<f64>::zeros(nn, nn);
     let mut inactive = vec![false; nn];
     for a in 0..cu {
         for b in 0..cv {
@@ -553,11 +570,22 @@ fn energy_matrix(g: &Grid, outline: &[[f64; 2]]) -> Result<(DMatrix<f64>, Vec<bo
                     let guu: [f64; 16] = std::array::from_fn(|i| lu.d[2][i / 4] * lv.d[0][i % 4]);
                     let guv: [f64; 16] = std::array::from_fn(|i| lu.d[1][i / 4] * lv.d[1][i % 4]);
                     let gvv: [f64; 16] = std::array::from_fn(|i| lu.d[0][i / 4] * lv.d[2][i % 4]);
+                    let third: [[f64; 16]; 4] = [
+                        std::array::from_fn(|i| lu.d[3][i / 4] * lv.d[0][i % 4]),
+                        std::array::from_fn(|i| lu.d[2][i / 4] * lv.d[1][i % 4]),
+                        std::array::from_fn(|i| lu.d[1][i / 4] * lv.d[2][i % 4]),
+                        std::array::from_fn(|i| lu.d[0][i / 4] * lv.d[3][i % 4]),
+                    ];
+                    // multiplicities of the mixed third derivatives in the squared norm of the tensor
+                    let fold = [1.0, 3.0, 3.0, 1.0];
                     let idx: [usize; 16] = std::array::from_fn(|i| (lu.first + i / 4) * m + lv.first + i % 4);
                     for (p, &ip) in idx.iter().enumerate() {
                         for (q, &iq) in idx.iter().enumerate() {
                             if let Some(slot) = k.get_mut((ip, iq)) {
                                 *slot += w * (guu[p] * guu[q] + 2.0 * guv[p] * guv[q] + gvv[p] * gvv[q]);
+                            }
+                            if let Some(slot) = k3.get_mut((ip, iq)) {
+                                *slot += w * third.iter().zip(fold).map(|(t, f)| f * t[p] * t[q]).sum::<f64>();
                             }
                         }
                     }
@@ -565,7 +593,7 @@ fn energy_matrix(g: &Grid, outline: &[[f64; 2]]) -> Result<(DMatrix<f64>, Vec<bo
             }
         }
     }
-    Ok((k, inactive))
+    Ok(Energy { bending: k, variation: k3, inactive })
 }
 
 /// Fits the patch.
@@ -589,7 +617,8 @@ pub fn solve_cancellable(p: &Problem, cancel: &Cancel) -> Result<Solution> {
     let scale = Scale::new(p)?;
     let coupled = p.is_coupled();
 
-    let (kmat, inactive) = energy_matrix(&g, &p.outline)?;
+    let Energy { bending, variation, inactive } = energy_matrix(&g, &p.outline)?;
+    let mut kmat = bending;
     poll(cancel)?;
     let tr_k: f64 = (0..nn).filter_map(|i| kmat.get((i, i))).sum();
     if !tr_k.is_finite() || tr_k <= 0.0 {
@@ -601,6 +630,12 @@ pub fn solve_cancellable(p: &Problem, cancel: &Cancel) -> Result<Solution> {
     let lambda = if tr_scale > 0.0 { p.smoothing * tr_scale / (3.0 * tr_k) } else { 1.0 };
     if !lambda.is_finite() {
         return Err(arg("the smoothing weight is not finite"));
+    }
+    let fairness = p.fairness;
+    let tr_k3: f64 = (0..nn).filter_map(|i| variation.get((i, i))).sum();
+    if fairness > 0.0 && tr_k3 > 0.0 && tr_scale > 0.0 && lambda > 0.0 {
+        let lambda3 = fairness * tr_scale / (3.0 * tr_k3);
+        kmat += variation * (lambda3 / lambda);
     }
     let h_s = stiffness(&soft.a, &kmat, lambda, &inactive);
     let mut hard_rows: Vec<LinRow> = Vec::new();

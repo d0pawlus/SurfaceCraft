@@ -68,6 +68,7 @@ fn plane_problem(hard: Vec<Row>) -> Problem {
         data: Vec::new(),
         outline: Vec::new(),
         smoothing: 1.0,
+        fairness: 0.0,
     }
 }
 
@@ -94,8 +95,16 @@ fn recovers_known_surface() {
             hard.push(Row::Position { uv, at: sample(&known, uv) });
         }
     }
-    let p =
-        Problem { domain: UNIT, control: [8, 8], hard, soft: Vec::new(), data, outline: Vec::new(), smoothing: 1e-9 };
+    let p = Problem {
+        domain: UNIT,
+        control: [8, 8],
+        hard,
+        soft: Vec::new(),
+        data,
+        outline: Vec::new(),
+        smoothing: 1e-9,
+        fairness: 0.0,
+    };
     let sol = solve(&p).unwrap();
     let (got, want) = (net(&sol.surface), net(&known));
     for i in 0..8 {
@@ -198,6 +207,7 @@ fn noise_stays_smooth() {
         data: data.clone(),
         outline: Vec::new(),
         smoothing: 1e-3,
+        fairness: 0.0,
     };
     let sol = solve(&p).unwrap();
     let mut sum = 0.0;
@@ -252,6 +262,7 @@ fn soft_rows_do_not_stiffen_the_fit() {
         data: data.clone(),
         outline: Vec::new(),
         smoothing: 1e-3,
+        fairness: 0.0,
     };
     let pinned = Problem { soft, ..free.clone() };
     let rms_free = data_rms(&solve(&free).unwrap().surface, &data);
@@ -288,6 +299,7 @@ fn empty_area_is_filled_by_energy() {
         data,
         outline: Vec::new(),
         smoothing: 1e-3,
+        fairness: 0.0,
     };
     let sol = solve(&p).unwrap();
     assert!(net(&sol.surface).iter().flatten().all(|c| c.iter().all(|v| v.is_finite())));
@@ -330,6 +342,7 @@ fn nonconvex_outline_decouples_arms() {
         data,
         outline: outline.clone(),
         smoothing: 1e-3,
+        fairness: 0.0,
     };
     let s1 = solve(&make(a_only)).unwrap();
     let s2 = solve(&make(both)).unwrap();
@@ -416,7 +429,16 @@ fn scaled_problem(k: f64) -> Problem {
             data.push(DataPoint { uv: scaled(uv), at: place(uv), weight: 1.0 });
         }
     }
-    Problem { domain: [[0.0, k], [0.0, k]], control: [8, 8], hard, soft, data, outline: Vec::new(), smoothing: 1e-3 }
+    Problem {
+        domain: [[0.0, k], [0.0, k]],
+        control: [8, 8],
+        hard,
+        soft,
+        data,
+        outline: Vec::new(),
+        smoothing: 1e-3,
+        fairness: 0.0,
+    }
 }
 
 #[test]
@@ -474,7 +496,16 @@ fn coupled_problem(n: usize, extra: usize) -> Problem {
             data.push(DataPoint { uv, at: on_plane(uv), weight: 1.0 });
         }
     }
-    Problem { domain: UNIT, control: [n, n], hard, soft, data, outline: PENTAGON.to_vec(), smoothing: 1e-3 }
+    Problem {
+        domain: UNIT,
+        control: [n, n],
+        hard,
+        soft,
+        data,
+        outline: PENTAGON.to_vec(),
+        smoothing: 1e-3,
+        fairness: 0.0,
+    }
 }
 
 #[test]
