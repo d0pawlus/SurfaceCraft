@@ -223,6 +223,55 @@ fn check_scan(m: &Mesh, what: &str) -> Result<f64, AlignError> {
     Ok(area)
 }
 
+/// The coarse samples of the moving and of the fixed scan (`areas` are their surface areas).
+fn sample_scans(
+    moving: &Mesh,
+    fixed: &Mesh,
+    areas: (f64, f64),
+    spacing: f64,
+    cancel: &Cancel,
+) -> Result<(Samples, Samples), AlignError> {
+    let (am, af) = areas;
+    let few = || {
+        if cancel.is_cancelled() {
+            AlignError::Cancelled
+        } else {
+            AlignError::NotEnough("a scan has too few usable triangles to sample".into())
+        }
+    };
+    let mov = sample::sample(moving, sample::count_for(am, spacing, SAMPLE_CAP), spacing, 1, cancel).ok_or_else(few)?;
+    let fix = sample::sample(fixed, sample::count_for(af, spacing, SAMPLE_CAP), spacing, 2, cancel).ok_or_else(few)?;
+    Ok((mov, fix))
+}
+
+/// The noise of the pair: the given estimates, or the ones taken from the scans (cancellable).
+fn scan_pair_noise(
+    moving: &Mesh,
+    fixed: &Mesh,
+    noises: Option<(ScanNoise, ScanNoise)>,
+    cancel: &Cancel,
+) -> Result<Option<f64>, AlignError> {
+    let (nm, nf) = match noises {
+        Some(n) => n,
+        None => {
+            let m = ScanNoise::of(moving);
+            if cancel.is_cancelled() {
+                return Err(AlignError::Cancelled);
+            }
+            (m, ScanNoise::of(fixed))
+        }
+    };
+    if cancel.is_cancelled() {
+        return Err(AlignError::Cancelled);
+    }
+    Ok(noise::pair_noise(&nm, &nf))
+}
+
+/// Area-uniform samples of `m` for the conflict test, drawn from the stream `stream`.
+fn conflict_samples(m: &Mesh, stream: u64) -> Vec<Point3> {
+    m.sample_points(CONFLICT_SAMPLES, &mut Rng::new(CONFLICT_SEED ^ stream)).into_iter().map(|(p, _)| p).collect()
+}
+
 impl<'a> Scene<'a> {
     fn new(
         moving: &'a Mesh,
@@ -236,38 +285,9 @@ impl<'a> Scene<'a> {
             return Err(AlignError::Degenerate("the fixed scan has no extent".into()));
         }
         let spacing = (am.max(af) / SAMPLE_CAP as f64).sqrt();
-        let few = || {
-            if cancel.is_cancelled() {
-                AlignError::Cancelled
-            } else {
-                AlignError::NotEnough("a scan has too few usable triangles to sample".into())
-            }
-        };
-        let mov =
-            sample::sample(moving, sample::count_for(am, spacing, SAMPLE_CAP), spacing, 1, cancel).ok_or_else(few)?;
-        let fix =
-            sample::sample(fixed, sample::count_for(af, spacing, SAMPLE_CAP), spacing, 2, cancel).ok_or_else(few)?;
+        let (mov, fix) = sample_scans(moving, fixed, (am, af), spacing, cancel)?;
         let mov_cloud = Mesh { positions: mov.pts.clone(), triangles: Vec::new() };
-        let (nm, nf) = match noises {
-            Some(n) => n,
-            None => {
-                let m = ScanNoise::of(moving);
-                if cancel.is_cancelled() {
-                    return Err(AlignError::Cancelled);
-                }
-                (m, ScanNoise::of(fixed))
-            }
-        };
-        if cancel.is_cancelled() {
-            return Err(AlignError::Cancelled);
-        }
-        let noise = noise::pair_noise(&nm, &nf);
-        let conflict_samples = |m: &Mesh, stream: u64| -> Vec<Point3> {
-            m.sample_points(CONFLICT_SAMPLES, &mut Rng::new(CONFLICT_SEED ^ stream))
-                .into_iter()
-                .map(|(p, _)| p)
-                .collect()
-        };
+        let noise = scan_pair_noise(moving, fixed, noises, cancel)?;
         Ok(Scene {
             moving,
             mov,
@@ -628,6 +648,29 @@ fn conclude(
     if !best.cand.t.to_rows().iter().flatten().all(|v| v.is_finite()) {
         return Err(AlignError::Degenerate("the pose is not finite".into()));
     }
+    let judged = judge_pose(best, others, tau, fixed, &evidence, refined, stable, probes);
+    Ok(pair_result(best, tau, judged, evidence, refined, stable))
+}
+
+/// What the verdict step of [`conclude`] decided.
+struct Judged {
+    verdict: PairVerdict,
+    confidence: f64,
+    overlap_fixed: f64,
+    alternatives: Vec<PairCandidate>,
+}
+
+/// The verdict, its confidence and the alternatives for the best pose and the other distinct ones.
+fn judge_pose(
+    best: &Ranked,
+    others: &[Ranked],
+    tau: f64,
+    fixed: &[Fit],
+    evidence: &((f64, f64), Option<String>),
+    refined: usize,
+    stable: f64,
+    probes: verdict::ProbeFacts,
+) -> Judged {
     let fixed_fit = fixed.first().copied().unwrap_or(Fit { share: 0.0, conflict: 0.0, rms: f64::INFINITY, msac: 0.0 });
     let (conflicts, orientation) = evidence;
     let overlap_fixed = fixed_fit.share;
@@ -648,7 +691,14 @@ fn conclude(
         probes,
     };
     let (verdict, confidence) = verdict::judge(&facts);
-    let alternatives: Vec<PairCandidate> = others
+    let alternatives = alternatives_of(verdict, best, others, fixed);
+    Judged { verdict, confidence, overlap_fixed, alternatives }
+}
+
+/// The other poses that fit about as well as the best one (listed only when the verdict is
+/// ambiguous), best first, at most [`MAX_ALTERNATIVES`].
+fn alternatives_of(verdict: PairVerdict, best: &Ranked, others: &[Ranked], fixed: &[Fit]) -> Vec<PairCandidate> {
+    others
         .iter()
         .zip(fixed.iter().skip(1))
         .filter(|(r, _)| {
@@ -656,22 +706,34 @@ fn conclude(
         })
         .take(MAX_ALTERNATIVES)
         .map(|(r, s)| alternative(r, s))
-        .collect();
-    Ok(PairResult {
+        .collect()
+}
+
+/// The [`PairResult`] of the best pose; the fields that `solve` fills in later are left at zero.
+fn pair_result(
+    best: &Ranked,
+    tau: f64,
+    judged: Judged,
+    evidence: ((f64, f64), Option<String>),
+    refined: usize,
+    stable: f64,
+) -> PairResult {
+    let (conflicts, orientation) = evidence;
+    PairResult {
         transform: best.cand.t,
-        verdict,
-        confidence,
+        verdict: judged.verdict,
+        confidence: judged.confidence,
         tolerance: tau,
         noise: 0.0,
         overlap_moving: best.fit.share,
-        overlap_fixed,
+        overlap_fixed: judged.overlap_fixed,
         conflict_moving: conflicts.0,
         conflict_fixed: conflicts.1,
         contradicted: !(conflicts.0.max(conflicts.1) <= UNIQUE_MAX_CONFLICT),
         orientation_issue: orientation,
         rms: finite_or_zero(best.fit.rms),
         method: best.cand.method,
-        alternatives,
+        alternatives: judged.alternatives,
         candidates: 0,
         refined,
         stability: stable,
@@ -685,7 +747,7 @@ fn conclude(
         probe_return_gap: 0.0,
         icp_iterations: 0,
         icp_converged: false,
-    })
+    }
 }
 
 #[cfg(test)]

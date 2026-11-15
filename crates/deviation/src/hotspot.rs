@@ -105,20 +105,8 @@ fn triangle_value(mesh: &Mesh, samples: &[Sample], t: usize) -> Option<TriValue>
 #[must_use]
 pub fn hotspots(mesh: &Mesh, samples: &[Sample], in_scope: &[bool], tolerance: f64, min_area: f64) -> HotspotReport {
     let nt = mesh.triangle_count();
-    let tri: Vec<Option<TriValue>> = (0..nt)
-        .map(|t| if in_scope.get(t).copied().unwrap_or(false) { triangle_value(mesh, samples, t) } else { None })
-        .collect();
-    let mut volume = Volume::default();
-    for v in tri.iter().flatten() {
-        volume.area_mm2 += v.area;
-        volume.triangles += 1;
-        if v.d > 0.0 {
-            volume.excess_mm3 += v.area * v.d;
-        } else if v.d < 0.0 {
-            volume.missing_mm3 += v.area * v.d;
-        }
-    }
-    volume.net_mm3 = volume.excess_mm3 + volume.missing_mm3;
+    let tri = triangle_values(mesh, samples, in_scope);
+    let volume = volume_of(&tri);
     let neighbours = mesh.triangle_neighbours();
     let mut seen = vec![false; nt];
     let mut groups = Vec::new();
@@ -132,55 +120,97 @@ pub fn hotspots(mesh: &Mesh, samples: &[Sample], in_scope: &[bool], tolerance: f
         if let Some(s) = seen.get_mut(start) {
             *s = true;
         }
-        let mut stack = vec![start];
-        let mut members: Vec<TriValue> = Vec::new();
-        while let Some(t) = stack.pop() {
-            let Some(v) = tri.get(t).copied().flatten() else { continue };
-            members.push(v);
-            for &nb in neighbours.get(t).into_iter().flatten() {
-                let nb = nb as usize;
-                // boundary edges hold u32::MAX, which is out of range
-                let Some(mark) = seen.get_mut(nb) else { continue };
-                if *mark {
-                    continue;
-                }
-                let Some(w) = tri.get(nb).copied().flatten() else { continue };
-                if w.d.abs() <= tolerance || (w.d > 0.0) != positive {
-                    continue;
-                }
-                *mark = true;
-                stack.push(nb);
-            }
-        }
-        let n = members.len();
-        let (mut area, mut surface, mut area_d, mut sum_d, mut area_c, mut sum_c) =
-            (0.0, 0.0, 0.0, 0.0, Vec3::zeros(), Vec3::zeros());
-        let mut max = first.d;
-        for v in &members {
-            area += v.area;
-            surface += v.surface;
-            area_d += v.area * v.d;
-            sum_d += v.d;
-            area_c += v.centre.coords * v.area;
-            sum_c += v.centre.coords;
-            if v.d.abs() > max.abs() {
-                max = v.d;
-            }
-        }
-        let (mean, centre) =
-            if area > 0.0 { (area_d / area, area_c / area) } else { (sum_d / n as f64, sum_c / n as f64) };
-        if area >= min_area {
-            groups.push(Hotspot {
-                triangles: n,
-                area,
-                surface_area: surface,
-                max,
-                mean,
-                centroid: [centre.x, centre.y, centre.z],
-                sign: if positive { Sign::Positive } else { Sign::Negative },
-            });
+        let members = flood_group(&tri, &neighbours, &mut seen, (start, positive), tolerance);
+        let group = group_hotspot(&members, first.d, positive);
+        if group.area >= min_area {
+            groups.push(group);
         }
     }
     groups.sort_by(|a, b| b.area.total_cmp(&a.area));
     HotspotReport { groups, volume }
+}
+
+/// The value of every triangle: `None` for those out of scope or not fully counted.
+fn triangle_values(mesh: &Mesh, samples: &[Sample], in_scope: &[bool]) -> Vec<Option<TriValue>> {
+    (0..mesh.triangle_count())
+        .map(|t| if in_scope.get(t).copied().unwrap_or(false) { triangle_value(mesh, samples, t) } else { None })
+        .collect()
+}
+
+/// The volume error over the measured triangles.
+fn volume_of(tri: &[Option<TriValue>]) -> Volume {
+    let mut volume = Volume::default();
+    for v in tri.iter().flatten() {
+        volume.area_mm2 += v.area;
+        volume.triangles += 1;
+        if v.d > 0.0 {
+            volume.excess_mm3 += v.area * v.d;
+        } else if v.d < 0.0 {
+            volume.missing_mm3 += v.area * v.d;
+        }
+    }
+    volume.net_mm3 = volume.excess_mm3 + volume.missing_mm3;
+    volume
+}
+
+/// The triangles of the group grown from `seed.0` (its sign is `seed.1`: positive or not) through
+/// shared edges, in visit order; every triangle that joins is marked in `seen`.
+fn flood_group(
+    tri: &[Option<TriValue>],
+    neighbours: &[[u32; 3]],
+    seen: &mut [bool],
+    seed: (usize, bool),
+    tolerance: f64,
+) -> Vec<TriValue> {
+    let (start, positive) = seed;
+    let mut stack = vec![start];
+    let mut members: Vec<TriValue> = Vec::new();
+    while let Some(t) = stack.pop() {
+        let Some(v) = tri.get(t).copied().flatten() else { continue };
+        members.push(v);
+        for &nb in neighbours.get(t).into_iter().flatten() {
+            let nb = nb as usize;
+            // boundary edges hold u32::MAX, which is out of range
+            let Some(mark) = seen.get_mut(nb) else { continue };
+            if *mark {
+                continue;
+            }
+            let Some(w) = tri.get(nb).copied().flatten() else { continue };
+            if w.d.abs() <= tolerance || (w.d > 0.0) != positive {
+                continue;
+            }
+            *mark = true;
+            stack.push(nb);
+        }
+    }
+    members
+}
+
+/// The [`Hotspot`] of a group; `first_d` is the deviation of the triangle it grew from.
+fn group_hotspot(members: &[TriValue], first_d: f64, positive: bool) -> Hotspot {
+    let n = members.len();
+    let (mut area, mut surface, mut area_d, mut sum_d, mut area_c, mut sum_c) =
+        (0.0, 0.0, 0.0, 0.0, Vec3::zeros(), Vec3::zeros());
+    let mut max = first_d;
+    for v in members {
+        area += v.area;
+        surface += v.surface;
+        area_d += v.area * v.d;
+        sum_d += v.d;
+        area_c += v.centre.coords * v.area;
+        sum_c += v.centre.coords;
+        if v.d.abs() > max.abs() {
+            max = v.d;
+        }
+    }
+    let (mean, centre) = if area > 0.0 { (area_d / area, area_c / area) } else { (sum_d / n as f64, sum_c / n as f64) };
+    Hotspot {
+        triangles: n,
+        area,
+        surface_area: surface,
+        max,
+        mean,
+        centroid: [centre.x, centre.y, centre.z],
+        sign: if positive { Sign::Positive } else { Sign::Negative },
+    }
 }

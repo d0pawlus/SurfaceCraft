@@ -100,62 +100,16 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 /// # Errors
 /// Returns a message when the options are out of range (bins, range, bands).
 pub fn report(samples: &[Sample], opts: &ReportOptions) -> Result<Report, String> {
-    if opts.bins == 0 || opts.bins > MAX_BINS {
-        return Err(format!("bins must be between 1 and {MAX_BINS}"));
-    }
-    if opts.bands.len() > MAX_BANDS {
-        return Err(format!("at most {MAX_BANDS} bands"));
-    }
-    if let Some(t) = opts.bands.iter().find(|t| !(t.is_finite() && **t > 0.0)) {
-        return Err(format!("band tolerance {t} must be positive"));
-    }
-    if let Some([lo, hi]) = opts.range
-        && !(lo.is_finite() && hi.is_finite() && lo < hi)
-    {
-        return Err(format!("range {lo} to {hi} must be finite with lower < upper"));
-    }
+    check_options(opts)?;
     let mut vals: Vec<f64> = samples.iter().filter(|s| s.counted()).map(|s| s.d).collect();
     vals.sort_by(f64::total_cmp);
     let count = vals.len();
     let mut abs: Vec<f64> = vals.iter().map(|d| d.abs()).collect();
     abs.sort_by(f64::total_cmp);
-    let (min, max, mean, rms) = if count == 0 {
-        (0.0, 0.0, 0.0, 0.0)
-    } else {
-        let n = count as f64;
-        let sum: f64 = vals.iter().sum();
-        let sq: f64 = vals.iter().map(|d| d * d).sum();
-        let min = vals.first().copied().unwrap_or(0.0);
-        let max = vals.last().copied().unwrap_or(0.0);
-        (min, max, sum / n, (sq / n).sqrt())
-    };
-    let (lo, hi) = match opts.range {
-        Some([lo, hi]) => (lo, hi),
-        None => {
-            let p99 = percentile(&abs, 99.0);
-            let half = if p99 > 0.0 { p99 } else { abs.last().copied().unwrap_or(0.0) };
-            let half = if half > 0.0 { half } else { 1.0 };
-            (-half, half)
-        }
-    };
-    let width = (hi - lo) / opts.bins as f64;
-    let last = (opts.bins - 1) as f64;
-    let mut counts = vec![0usize; opts.bins];
-    for d in &vals {
-        let k = ((d - lo) / width).floor();
-        let idx = if k.is_nan() { 0 } else { k.clamp(0.0, last) as usize };
-        if let Some(c) = counts.get_mut(idx) {
-            *c += 1;
-        }
-    }
-    let bands = opts
-        .bands
-        .iter()
-        .map(|&tolerance| {
-            let n = abs.partition_point(|&a| a <= tolerance);
-            Band { tolerance, count: n, share: if count > 0 { n as f64 / count as f64 } else { 0.0 } }
-        })
-        .collect();
+    let (min, max, mean, rms) = moments(&vals);
+    let (lo, hi) = histogram_range(opts.range, &abs);
+    let counts = bin_counts(&vals, (lo, hi), opts.bins);
+    let bands = band_shares(&abs, &opts.bands, count);
     Ok(Report {
         count,
         not_facing: samples.iter().filter(|s| s.not_facing()).count(),
@@ -174,4 +128,78 @@ pub fn report(samples: &[Sample], opts: &ReportOptions) -> Result<Report, String
         histogram: Histogram { lo, hi, counts },
         bands,
     })
+}
+
+/// Checks the bins, the bands and the range of `opts`; the message says which is out of range.
+fn check_options(opts: &ReportOptions) -> Result<(), String> {
+    if opts.bins == 0 || opts.bins > MAX_BINS {
+        return Err(format!("bins must be between 1 and {MAX_BINS}"));
+    }
+    if opts.bands.len() > MAX_BANDS {
+        return Err(format!("at most {MAX_BANDS} bands"));
+    }
+    if let Some(t) = opts.bands.iter().find(|t| !(t.is_finite() && **t > 0.0)) {
+        return Err(format!("band tolerance {t} must be positive"));
+    }
+    if let Some([lo, hi]) = opts.range
+        && !(lo.is_finite() && hi.is_finite() && lo < hi)
+    {
+        return Err(format!("range {lo} to {hi} must be finite with lower < upper"));
+    }
+    Ok(())
+}
+
+/// Minimum, maximum, mean and RMS of the sorted values (all 0 when there are none).
+fn moments(vals: &[f64]) -> (f64, f64, f64, f64) {
+    let count = vals.len();
+    if count == 0 {
+        (0.0, 0.0, 0.0, 0.0)
+    } else {
+        let n = count as f64;
+        let sum: f64 = vals.iter().sum();
+        let sq: f64 = vals.iter().map(|d| d * d).sum();
+        let min = vals.first().copied().unwrap_or(0.0);
+        let max = vals.last().copied().unwrap_or(0.0);
+        (min, max, sum / n, (sq / n).sqrt())
+    }
+}
+
+/// The histogram range: the given one, or ±p99 of the sorted |deviations| `abs` (±1 mm when all are zero).
+fn histogram_range(range: Option<[f64; 2]>, abs: &[f64]) -> (f64, f64) {
+    match range {
+        Some([lo, hi]) => (lo, hi),
+        None => {
+            let p99 = percentile(abs, 99.0);
+            let half = if p99 > 0.0 { p99 } else { abs.last().copied().unwrap_or(0.0) };
+            let half = if half > 0.0 { half } else { 1.0 };
+            (-half, half)
+        }
+    }
+}
+
+/// Counts of `vals` in `bins` equal bins over `range`; values outside fall in the end bins.
+fn bin_counts(vals: &[f64], range: (f64, f64), bins: usize) -> Vec<usize> {
+    let (lo, hi) = range;
+    let width = (hi - lo) / bins as f64;
+    let last = (bins - 1) as f64;
+    let mut counts = vec![0usize; bins];
+    for d in vals {
+        let k = ((d - lo) / width).floor();
+        let idx = if k.is_nan() { 0 } else { k.clamp(0.0, last) as usize };
+        if let Some(c) = counts.get_mut(idx) {
+            *c += 1;
+        }
+    }
+    counts
+}
+
+/// The share of the `count` counted points within each tolerance of the sorted |deviations| `abs`.
+fn band_shares(abs: &[f64], tolerances: &[f64], count: usize) -> Vec<Band> {
+    tolerances
+        .iter()
+        .map(|&tolerance| {
+            let n = abs.partition_point(|&a| a <= tolerance);
+            Band { tolerance, count: n, share: if count > 0 { n as f64 / count as f64 } else { 0.0 } }
+        })
+        .collect()
 }
