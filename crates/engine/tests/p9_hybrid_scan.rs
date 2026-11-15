@@ -24,10 +24,11 @@ const NOISE: f64 = 0.03;
 const GEOMETRY_TOLERANCE: f64 = 0.1;
 
 /// The most a merged face can reach past its part's face over a tangent round, where the surface stays within the
-/// tolerance of the primitive: a strip of this width (mm) along the face's border, the root of twice the round's
-/// radius times the tolerance (0.89 for the part's rounds of 2 and the tolerance 0.2).
-fn overhang() -> f64 {
-    (2.0 * ROUND * 0.2_f64).sqrt()
+/// tolerance of the primitive: a strip of this width (mm) along the face's border. The round (radius 2) and the face
+/// leave each other by `1/2 - k` of curvature, `k` the face's own (0 for the cylinder wall, 1/12 for the sphere cap),
+/// so a strip of `sqrt(2 tol / (1/2 - k))`: 0.89 on the wall, 0.98 on the cap (tolerance 0.2).
+fn overhang(own_curvature: f64) -> f64 {
+    (2.0 * 0.2 / (1.0 / ROUND - own_curvature)).sqrt()
 }
 
 /// The true area of the cap and of the wall of the part, and the ceilings of what merged faces of them can cover (the
@@ -39,7 +40,17 @@ fn ceilings() -> ((f64, f64), (f64, f64)) {
     let cap_border = TAU * CAP_RADIUS * elevation.cos();
     let wall = TAU * RADIUS * (WALL_TOP - ROUND);
     let wall_borders = 2.0 * TAU * RADIUS;
-    ((cap, cap + cap_border * overhang()), (wall, wall + wall_borders * overhang()))
+    ((cap, cap + cap_border * overhang(1.0 / CAP_RADIUS)), (wall, wall + wall_borders * overhang(0.0)))
+}
+
+/// The ceiling of the wall's area on the open part, which keeps the triangles whose centroid has `x < 1`: the angles
+/// with `cos a < 1/8` of the turn of the wall, so the fraction `(TAU - 2 acos(1/8)) / TAU` of it, with the strip along
+/// the two circles of that length and along the two cut edges of the wall's height.
+fn open_wall_ceiling() -> f64 {
+    let kept = (TAU - 2.0 * (1.0 / RADIUS).acos()) / TAU;
+    let wall = TAU * RADIUS * (WALL_TOP - ROUND);
+    let borders = 2.0 * kept * TAU * RADIUS + 2.0 * (WALL_TOP - ROUND);
+    kept * wall + borders * overhang(0.0)
 }
 
 /// The profile of the part from the centre of the base to the pole of the cap: (distance from the axis, height).
@@ -330,9 +341,26 @@ fn an_open_scan_gives_a_sheet_with_analytic_faces() {
         })
         .map(|m| m["area"].as_f64().unwrap())
         .sum();
-    let (_, (_, wall_ceiling)) = ceilings();
-    assert!(wall <= wall_ceiling, "the wall's analytic area {wall} mm2 (at most {wall_ceiling:.0})");
-    assert!(walls == 0 || wall >= 110.0, "the wall's analytic area {wall} mm2");
+    let wall_ceiling = open_wall_ceiling();
+    assert!(
+        wall <= wall_ceiling,
+        "the wall's analytic area {wall} mm2 (at most {wall_ceiling:.0} of the part it keeps)"
+    );
+    // the area of the part's own analytic faces (base and wall): measured 259 mm2, so 100 is 2.6 times under; asked
+    // whatever the platform gives (the wall alone may have none), it still fails if no analytic face is the part's
+    let own_area: f64 = r["analytic"]["merged"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| {
+            matches!(&brep.faces[m["face"].as_u64().unwrap() as usize].surface,
+                Surface::Cylinder { radius, .. } if (radius - RADIUS).abs() < GEOMETRY_TOLERANCE)
+                || matches!(&brep.faces[m["face"].as_u64().unwrap() as usize].surface,
+                    Surface::Plane { origin, .. } if origin[2].abs() < GEOMETRY_TOLERANCE)
+        })
+        .map(|m| m["area"].as_f64().unwrap())
+        .sum();
+    assert!(own_area >= 100.0, "the part's own analytic faces cover {own_area} mm2");
     let freeform = to_solid_open(&mut s, "freeform");
     assert_eq!(freeform["verdict"], r["verdict"], "the verdict freeform gives for the open scan");
 }

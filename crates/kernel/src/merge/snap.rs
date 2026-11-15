@@ -43,8 +43,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// Alternating projections that put a point on every primitive of its edge or vertex. Two primitives that meet at an
 /// angle `t` converge by a factor of `cos(t)^2` a round: from 0.2 mm to [`ON_SURFACE`] in 200 rounds takes `t` of about
-/// 8 degrees or more. A set of primitives that does not converge by then (nearly parallel, parallel, or with no
-/// common point near the point) is reported as not converged, never settled with a point that is not on them all.
+/// 8 degrees or more. A set of primitives that does not converge by then (shallower than that, or with no common
+/// point near the point) is reported as not converged by [`put_on_all`]; [`placed`] (and so the snap) then takes the
+/// point nearest to all of them and says it is not on them all, which the 0.1-gap check of a snapped group and the
+/// face checks judge. Parallel or offset primitives place nothing.
 const MAX_ALTERNATIONS: usize = 200;
 /// A point lies on a primitive when it is this close (mm): a nanometre. A looser bound (3 micrometres) stops the
 /// alternation of a shallow crease early, where the points of one crease then scatter along it by that over the sine
@@ -68,7 +70,7 @@ const MIN_SIN_BETWEEN_TANGENTS: f64 = 0.4;
 /// The fewest points of the grid at which a moved patch's normal must be readable before and after to say it has not
 /// turned over (of 25).
 const MIN_JUDGED: usize = 4;
-/// A patch with fewer judged points passes if no point moved more than this share of the patch's extent: a patch
+/// A patch with fewer judged points passes if no point moved more than this share of the patch's width: a patch
 /// turns over only when it moves by about its own size.
 const MAX_UNJUDGED_MOVE: f64 = 0.25;
 /// Cells a side of the grid a moved patch is compared with itself on.
@@ -545,8 +547,8 @@ fn normals_at_grid(body: &Brep, face: usize, n: usize) -> Option<Vec<Option<V>>>
     Some(out)
 }
 
-/// The diagonal of the box of `points` (mm).
-fn extent(points: &[V]) -> f64 {
+/// The width of the box of `points` (mm): its second largest side (a long thin patch is as wide as it is thin).
+fn width(points: &[V]) -> f64 {
     let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
     for p in points {
         for k in 0..3 {
@@ -554,7 +556,9 @@ fn extent(points: &[V]) -> f64 {
             hi[k] = hi[k].max(p[k]);
         }
     }
-    norm(sub(hi, lo))
+    let mut sides = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
+    sides.sort_by(f64::total_cmp);
+    sides[1]
 }
 
 /// A patch that moved: no point of it farther than `max_move` from where it was, still facing the way it did,
@@ -566,13 +570,14 @@ fn moved_patch_ok(before: &Brep, after: &Brep, changed: &Changed, max_move: f64)
         return false;
     };
     let far = a.iter().zip(&b).map(|(p, q)| norm(sub(*p, *q))).fold(0.0_f64, f64::max);
-    let near = a.len() == b.len() && far <= max_move * (1.0 + 1e-9);
+    // (a NaN displacement is no displacement `max` would see: every one is checked)
+    let near = a.len() == b.len() && a.iter().zip(&b).all(|(p, q)| norm(sub(*p, *q)) <= max_move * (1.0 + 1e-9));
     let facing = match (normals_at_grid(before, face, MOVED_GRID), normals_at_grid(after, face, MOVED_GRID)) {
         (Some(n0), Some(n1)) => {
             let pairs: Vec<(V, V)> = n0.iter().zip(&n1).filter_map(|(a, b)| Some(((*a)?, (*b)?))).collect();
             // a patch whose normal can be read at too few points of the grid (a sliver, a collapsed side) cannot be
             // shown not to have turned over: it passes only when it moved too little to turn
-            let judged = pairs.len() >= MIN_JUDGED || far <= MAX_UNJUDGED_MOVE * extent(&a);
+            let judged = pairs.len() >= MIN_JUDGED || far <= MAX_UNJUDGED_MOVE * width(&a);
             judged && pairs.iter().all(|(a, b)| dot(*a, *b) >= MIN_TURN_DOT)
         }
         _ => false,

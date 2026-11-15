@@ -716,3 +716,32 @@ fn a_border_slightly_beyond_the_gap_is_snapped_and_a_far_one_is_refused() {
         }
     }
 }
+
+/// The slack of 1.25 gaps admits a group to the snap only: a group with its border between 1.0 and 1.25 gaps off the
+/// plane (1.1 here) whose snap cannot be made (one boundary edge is two spans, the same quadratic cut at its middle)
+/// is held to the gap itself and refused, not merged as it was.
+#[test]
+fn a_border_beyond_the_gap_whose_snap_is_refused_is_not_merged_unsnapped() {
+    use surfacecraft_kernel::merge::{GroupSpec, merge_faces_onto_shapes};
+    use surfacecraft_kernel::record::brep::Curve;
+    let net = box_with_saddle_top(0.0352);
+    let mut body = sheet_from_bezier_network(&net.patches, &net.corners).unwrap();
+    let top: Vec<usize> = (0..9).collect();
+    let e = body
+        .edges
+        .iter()
+        .position(|e| e.uses.iter().any(|u| (u.face as usize) < 9) && e.uses.iter().any(|u| (u.face as usize) >= 9))
+        .expect("a boundary edge of the top");
+    let Curve::Spline { points: p, .. } = body.edges[e].curve.clone() else { panic!("a spline") };
+    assert_eq!(p.len(), 3, "a quadratic edge");
+    let mid = |a: [f64; 3], b: [f64; 3]| [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0, (a[2] + b[2]) / 2.0];
+    // knot insertion at the middle: the same curve in two spans
+    body.edges[e].curve = Curve::Spline {
+        knots: vec![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
+        points: vec![p[0], mid(p[0], p[1]), mid(p[1], p[2]), p[2]],
+    };
+    let plane = plane_through([0.0, 0.0, 10.0], [0.0, 0.0, 1.0]);
+    let batch = merge_faces_onto_shapes(&body, &[GroupSpec { faces: &top, shape: &plane }], 0.04, &|| false).unwrap();
+    let why = batch.groups[0].as_ref().expect_err("refused, not merged unsnapped");
+    assert!(why.contains("from the surface (limit 0.0400)"), "{why}");
+}

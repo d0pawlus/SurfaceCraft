@@ -1,8 +1,8 @@
 //! The prepared copy of the scan that the hybrid method wraps (P9-O6b): the vertices of every
 //! protected region that lie within a distance of their primitive are put exactly on it (projected by the
-//! kernel's `put_on_all`, which the merge's snap uses too, never pushed beyond), so the patches fitted over
-//! the region lie on the primitive and can be merged into one analytic face. The rest of the scan is untouched. The judge never sees this copy:
-//! the body is measured against the original scan.
+//! kernel's `placed`, which the merge's snap uses too, never pushed beyond), so the patches fitted over the
+//! region lie on the primitive and can be merged into one analytic face. The rest of the scan is untouched. The
+//! judge never sees this copy: the body is measured against the original scan.
 use surfacecraft_fit::Primitive;
 use surfacecraft_geom::{Mesh, Point3};
 use surfacecraft_kernel::hybrid::Shape;

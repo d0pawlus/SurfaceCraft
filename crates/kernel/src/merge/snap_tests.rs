@@ -116,6 +116,11 @@ fn a_patch_that_moved_too_far_or_turned_over_is_not_sound() {
         points[1][1] = a;
     }
     assert!(!changed(&turned), "folded over");
+    let mut nan = before.clone();
+    if let Some(Surface::Spline { points, .. }) = nan.faces.get_mut(1).map(|f| &mut f.surface) {
+        points[1][1][2] = f64::NAN;
+    }
+    assert!(!changed(&nan), "a NaN displacement is no displacement a maximum would see");
 }
 
 /// A border collapsed to a point runs along a collapsed edge either way round: the side the loop says it is
