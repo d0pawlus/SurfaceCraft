@@ -143,7 +143,7 @@ fn tangent_rows_hold() {
 fn curvature_rows_hold() {
     let mut hard = pentagon_rows();
     let uv = [0.5, 0.5];
-    hard.push(Row::Curvature { uv, dir: [1.0, 0.0], normal: [0.0, 0.0, 1.0], value: 0.02 });
+    hard.push(Row::Curvature { uv, dir: [1.0, 0.0], normal: [0.0, 0.0, 1.0], tangent: [0.0; 3], value: 0.02 });
     let sol = solve(&plane_problem(hard)).unwrap();
     let d = derivatives(&sol.surface, uv).unwrap();
     assert!((d[3][2] - 0.02).abs() <= 1e-9, "S_uu · n = {}", d[3][2]);
@@ -400,7 +400,13 @@ fn scaled_problem(k: f64) -> Problem {
         soft.push((Row::Tangent { uv: scaled(uv), dir: [0.0, 1.0], normal: [0.0, 0.6, 0.8] }, 5.0));
     }
     soft.push((
-        Row::Curvature { uv: scaled([0.5, 0.5]), dir: [1.0, 0.0], normal: [0.0, 0.0, 1.0], value: 10.0 / k },
+        Row::Curvature {
+            uv: scaled([0.5, 0.5]),
+            dir: [1.0, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            tangent: [0.0; 3],
+            value: 10.0 / k,
+        },
         3.0,
     ));
     let mut data = Vec::new();

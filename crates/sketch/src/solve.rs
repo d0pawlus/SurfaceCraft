@@ -130,86 +130,107 @@ fn overflow() -> SketchError {
     SketchError::Value("a constraint overflows: the sketch coordinates are too large to solve".into())
 }
 
-/// Solves the sketch in place and reports its state.
-pub fn solve(s: &mut Sketch) -> Result<SolveReport, SketchError> {
-    s.validate()?;
-    let l = Layout::of(s);
-    let mut x = unknowns(s, &l);
-    let (mut f, _) = residuals(s, &l, &x);
-    if !f.iter().all(|v| v.is_finite()) {
-        return Err(overflow());
-    }
-    let m = f.len();
-    let mut cost: f64 = f.iter().map(|v| v * v).sum();
-    let mut lambda = 1e-6;
-    let mut it = 0;
-    while it < 200 && max_abs(&f) > TOL && m > 0 {
-        it += 1;
-        let j = jacobian(s, &l, &x, m);
-        let jt = j.transpose();
-        let a = &jt * &j;
-        let g = &jt * DVector::from_vec(f.clone());
-        let mut improved = false;
-        for _ in 0..20 {
-            let mut d = a.clone();
-            for k in 0..x.len() {
-                d[(k, k)] += lambda * (1.0 + a[(k, k)]);
-            }
-            let Some(step) = d.lu().solve(&(-&g)) else {
-                lambda *= 10.0;
-                continue;
-            };
-            let xn: Vec<f64> = x.iter().zip(step.iter()).map(|(a, b)| a + b).collect();
-            let (fnew, _) = residuals(s, &l, &xn);
-            let c: f64 = fnew.iter().map(|v| v * v).sum();
-            if c.is_finite() && c < cost {
-                x = xn;
-                f = fnew;
-                cost = c;
-                lambda = (lambda * 0.1).max(1e-15);
-                improved = true;
+/// State of the Levenberg–Marquardt iteration: unknowns, their residuals, the cost and the damping.
+struct Lm {
+    x: Vec<f64>,
+    f: Vec<f64>,
+    cost: f64,
+    lambda: f64,
+}
+
+impl Lm {
+    /// Iterates (at most 200 times) until the residuals are within `TOL` or no step helps;
+    /// returns the number of iterations.
+    fn run(&mut self, s: &Sketch, l: &Layout) -> usize {
+        let m = self.f.len();
+        let mut it = 0;
+        while it < 200 && max_abs(&self.f) > TOL && m > 0 {
+            it += 1;
+            if !self.step(s, l, m) {
                 break;
             }
-            lambda *= 10.0;
         }
-        if !improved {
-            break;
+        it
+    }
+
+    /// One iteration: tries up to 20 damped steps; true when one lowered the cost.
+    fn step(&mut self, s: &Sketch, l: &Layout, m: usize) -> bool {
+        let j = jacobian(s, l, &self.x, m);
+        let jt = j.transpose();
+        let a = &jt * &j;
+        let g = &jt * DVector::from_vec(self.f.clone());
+        for _ in 0..20 {
+            let mut d = a.clone();
+            for k in 0..self.x.len() {
+                d[(k, k)] += self.lambda * (1.0 + a[(k, k)]);
+            }
+            let Some(step) = d.lu().solve(&(-&g)) else {
+                self.lambda *= 10.0;
+                continue;
+            };
+            let xn: Vec<f64> = self.x.iter().zip(step.iter()).map(|(a, b)| a + b).collect();
+            let (fnew, _) = residuals(s, l, &xn);
+            let c: f64 = fnew.iter().map(|v| v * v).sum();
+            if c.is_finite() && c < self.cost {
+                self.x = xn;
+                self.f = fnew;
+                self.cost = c;
+                self.lambda = (self.lambda * 0.1).max(1e-15);
+                return true;
+            }
+            self.lambda *= 10.0;
         }
+        false
     }
-    let residual = max_abs(&f);
-    if !residual.is_finite() || !x.iter().all(|v| v.is_finite()) {
-        return Err(overflow());
-    }
-    write_back(s, &l, &x);
-    // rank analysis: rows in order, a constraint is redundant when its rows add no rank
-    let (f2, ranges) = residuals(s, &l, &x);
-    let j = jacobian(s, &l, &x, f2.len());
-    let scale = j.iter().fold(0.0f64, |m, v| m.max(v.abs())).max(1.0);
-    let mut basis: Vec<DVector<f64>> = Vec::new();
-    let mut add_row = |row: DVector<f64>| -> bool {
+}
+
+/// Orthonormal basis of the Jacobian rows seen so far.
+struct RowBasis {
+    basis: Vec<DVector<f64>>,
+    scale: f64,
+}
+
+impl RowBasis {
+    /// Adds a row; false when it lies in the span of the rows already added.
+    fn add_row(&mut self, row: DVector<f64>) -> bool {
         let mut r = row;
-        for b in &basis {
+        for b in &self.basis {
             let c = r.dot(b);
             r -= b * c;
         }
         let n = r.norm();
-        if n > 1e-7 * scale {
-            basis.push(r / n);
+        if n > 1e-7 * self.scale {
+            self.basis.push(r / n);
             true
         } else {
             false
         }
-    };
+    }
+}
+
+/// Rank of the Jacobian and the constraints that add no rank.
+struct RankInfo {
+    rank: usize,
+    redundant: Vec<usize>,
+    conflicting: Vec<usize>,
+}
+
+/// Rank analysis at `x`: rows in order, a constraint is redundant when its rows add no rank.
+fn rank_analysis(s: &Sketch, l: &Layout, x: &[f64]) -> RankInfo {
+    let (f2, ranges) = residuals(s, l, x);
+    let j = jacobian(s, l, x, f2.len());
+    let scale = j.iter().fold(0.0f64, |m, v| m.max(v.abs())).max(1.0);
+    let mut rows = RowBasis { basis: Vec::new(), scale };
     let entity_rows = ranges.first().map_or(f2.len(), |r| r.0);
     for r in 0..entity_rows {
-        add_row(j.row(r).transpose());
+        rows.add_row(j.row(r).transpose());
     }
     let mut redundant = Vec::new();
     let mut conflicting = Vec::new();
     for (ci, (a, b)) in ranges.iter().enumerate() {
         let mut all = true;
         for r in *a..*b {
-            if !add_row(j.row(r).transpose()) {
+            if !rows.add_row(j.row(r).transpose()) {
                 all = false;
             }
         }
@@ -220,9 +241,12 @@ pub fn solve(s: &mut Sketch) -> Result<SolveReport, SketchError> {
             }
         }
     }
-    let rank = basis.len();
-    let dof = x.len().saturating_sub(rank);
-    let (status, message) = if !conflicting.is_empty() {
+    RankInfo { rank: rows.basis.len(), redundant, conflicting }
+}
+
+/// Status and message of a solve from its rank analysis, final residual and remaining freedom.
+fn classify(conflicting: &[usize], redundant: &[usize], residual: f64, dof: usize) -> (SolveStatus, String) {
+    if !conflicting.is_empty() {
         (
             SolveStatus::OverDefined,
             format!("sketch is overdefined: constraints {conflicting:?} conflict with the others"),
@@ -235,8 +259,125 @@ pub fn solve(s: &mut Sketch) -> Result<SolveReport, SketchError> {
         (SolveStatus::FullyDefined, "fully defined".into())
     } else {
         (SolveStatus::UnderDefined, format!("{dof} degrees of freedom left"))
-    };
+    }
+}
+
+/// Solves the sketch in place and reports its state.
+pub fn solve(s: &mut Sketch) -> Result<SolveReport, SketchError> {
+    s.validate()?;
+    let l = Layout::of(s);
+    let x = unknowns(s, &l);
+    let (f, _) = residuals(s, &l, &x);
+    if !f.iter().all(|v| v.is_finite()) {
+        return Err(overflow());
+    }
+    let cost: f64 = f.iter().map(|v| v * v).sum();
+    let mut lm = Lm { x, f, cost, lambda: 1e-6 };
+    let it = lm.run(s, &l);
+    let residual = max_abs(&lm.f);
+    if !residual.is_finite() || !lm.x.iter().all(|v| v.is_finite()) {
+        return Err(overflow());
+    }
+    write_back(s, &l, &lm.x);
+    let RankInfo { rank, redundant, conflicting } = rank_analysis(s, &l, &lm.x);
+    let dof = lm.x.len().saturating_sub(rank);
+    let (status, message) = classify(&conflicting, &redundant, residual, dof);
     Ok(SolveReport { status, dof, residual, iterations: it, redundant, conflicting, message })
+}
+
+/// Sum of squares.
+fn sumsq(v: &[f64]) -> f64 {
+    v.iter().map(|a| a * a).sum::<f64>()
+}
+
+/// State of [`polish`]: unknowns, the data residuals at them and their sum of squares.
+struct PolishState {
+    x: Vec<f64>,
+    r: Vec<f64>,
+    cost: f64,
+}
+
+/// Central-difference Jacobian of the data residuals (`m` rows) at `x`.
+fn data_jacobian(x: &[f64], m: usize, eval: &mut impl FnMut(&[f64]) -> Vec<f64>) -> DMatrix<f64> {
+    let n = x.len();
+    let mut jd = DMatrix::<f64>::zeros(m, n);
+    let mut xp = x.to_vec();
+    for k in 0..n {
+        let h = 1e-6 * (1.0 + x.get(k).map_or(0.0, |v| v.abs()));
+        let orig = xp.get(k).copied().unwrap_or(0.0);
+        if let Some(v) = xp.get_mut(k) {
+            *v = orig + h;
+        }
+        let rp = eval(&xp);
+        if let Some(v) = xp.get_mut(k) {
+            *v = orig - h;
+        }
+        let rm = eval(&xp);
+        if let Some(v) = xp.get_mut(k) {
+            *v = orig;
+        }
+        for (i, (a, b)) in rp.iter().zip(&rm).enumerate().take(m) {
+            jd[(i, k)] = (a - b) / (2.0 * h);
+        }
+    }
+    jd
+}
+
+/// The Gauss–Newton step (and multipliers) of the KKT system of the data Jacobian `jd` and the
+/// constraints at the state; `None` when the system is singular.
+fn kkt_solution(s: &Sketch, l: &Layout, st: &PolishState, jd: &DMatrix<f64>) -> Option<DVector<f64>> {
+    let n = st.x.len();
+    let (f, _) = residuals(s, l, &st.x);
+    let mc = f.len();
+    let jc = jacobian(s, l, &st.x, mc);
+    let jt = jd.transpose();
+    let mut a = &jt * jd;
+    let mu = 1e-9 * (1.0 + a.trace() / n as f64);
+    for k in 0..n {
+        a[(k, k)] += mu;
+    }
+    let g = &jt * DVector::from_column_slice(&st.r);
+    let mut kkt = DMatrix::<f64>::zeros(n + mc, n + mc);
+    kkt.view_mut((0, 0), (n, n)).copy_from(&a);
+    kkt.view_mut((0, n), (n, mc)).copy_from(&jc.transpose());
+    kkt.view_mut((n, 0), (mc, n)).copy_from(&jc);
+    for i in 0..mc {
+        kkt[(n + i, n + i)] = -1e-12;
+    }
+    let mut rhs = DVector::<f64>::zeros(n + mc);
+    rhs.rows_mut(0, n).copy_from(&(-g));
+    rhs.rows_mut(n, mc).copy_from(&(-DVector::from_vec(f)));
+    kkt.lu().solve(&rhs)
+}
+
+/// Backtracking along `sol`, each trial projected back onto the constraints; true when a step
+/// lowered the cost by enough to go on.
+fn polish_search(
+    s: &Sketch,
+    l: &Layout,
+    st: &mut PolishState,
+    sol: &DVector<f64>,
+    eval: &mut impl FnMut(&[f64]) -> Vec<f64>,
+) -> bool {
+    let mut t = 1.0;
+    let mut accepted = false;
+    for _ in 0..10 {
+        let mut xn: Vec<f64> = st.x.iter().enumerate().map(|(k, v)| v + t * sol[k]).collect();
+        restore(s, l, &mut xn);
+        let rn = eval(&xn);
+        let cn = sumsq(&rn);
+        if cn.is_finite() && cn < st.cost {
+            let gain = st.cost - cn;
+            (st.x, st.r, st.cost) = (xn, rn, cn);
+            accepted = true;
+            if gain < 1e-10 * st.cost.max(1e-30) {
+                accepted = false;
+            }
+            break;
+        }
+        t *= 0.5;
+    }
+    accepted
 }
 
 /// Moves the unknowns (points and radii) of a solved sketch to minimise the sum of squares of
@@ -247,86 +388,28 @@ pub fn solve(s: &mut Sketch) -> Result<SolveReport, SketchError> {
 pub fn polish(s: &mut Sketch, data: &dyn Fn(&Sketch) -> Vec<f64>) -> Result<f64, SketchError> {
     s.validate()?;
     let l = Layout::of(s);
-    let mut x = unknowns(s, &l);
+    let x = unknowns(s, &l);
     let n = x.len();
     let mut scratch = s.clone();
     let mut eval = |x: &[f64]| {
         write_back(&mut scratch, &l, x);
         data(&scratch)
     };
-    let sumsq = |v: &[f64]| v.iter().map(|a| a * a).sum::<f64>();
-    let mut r = eval(&x);
-    let mut cost = sumsq(&r);
+    let r = eval(&x);
+    let cost = sumsq(&r);
     if !cost.is_finite() || r.is_empty() || n == 0 {
         return Ok(cost);
     }
+    let mut st = PolishState { x, r, cost };
     for _ in 0..40 {
-        let m = r.len();
-        let mut jd = DMatrix::<f64>::zeros(m, n);
-        let mut xp = x.clone();
-        for k in 0..n {
-            let h = 1e-6 * (1.0 + x.get(k).map_or(0.0, |v| v.abs()));
-            let orig = xp.get(k).copied().unwrap_or(0.0);
-            if let Some(v) = xp.get_mut(k) {
-                *v = orig + h;
-            }
-            let rp = eval(&xp);
-            if let Some(v) = xp.get_mut(k) {
-                *v = orig - h;
-            }
-            let rm = eval(&xp);
-            if let Some(v) = xp.get_mut(k) {
-                *v = orig;
-            }
-            for (i, (a, b)) in rp.iter().zip(&rm).enumerate().take(m) {
-                jd[(i, k)] = (a - b) / (2.0 * h);
-            }
-        }
-        let (f, _) = residuals(s, &l, &x);
-        let mc = f.len();
-        let jc = jacobian(s, &l, &x, mc);
-        let jt = jd.transpose();
-        let mut a = &jt * &jd;
-        let mu = 1e-9 * (1.0 + a.trace() / n as f64);
-        for k in 0..n {
-            a[(k, k)] += mu;
-        }
-        let g = &jt * DVector::from_column_slice(&r);
-        let mut kkt = DMatrix::<f64>::zeros(n + mc, n + mc);
-        kkt.view_mut((0, 0), (n, n)).copy_from(&a);
-        kkt.view_mut((0, n), (n, mc)).copy_from(&jc.transpose());
-        kkt.view_mut((n, 0), (mc, n)).copy_from(&jc);
-        for i in 0..mc {
-            kkt[(n + i, n + i)] = -1e-12;
-        }
-        let mut rhs = DVector::<f64>::zeros(n + mc);
-        rhs.rows_mut(0, n).copy_from(&(-g));
-        rhs.rows_mut(n, mc).copy_from(&(-DVector::from_vec(f)));
-        let Some(sol) = kkt.lu().solve(&rhs) else { break };
-        let mut t = 1.0;
-        let mut accepted = false;
-        for _ in 0..10 {
-            let mut xn: Vec<f64> = x.iter().enumerate().map(|(k, v)| v + t * sol[k]).collect();
-            restore(s, &l, &mut xn);
-            let rn = eval(&xn);
-            let cn = sumsq(&rn);
-            if cn.is_finite() && cn < cost {
-                let gain = cost - cn;
-                (x, r, cost) = (xn, rn, cn);
-                accepted = true;
-                if gain < 1e-10 * cost.max(1e-30) {
-                    accepted = false;
-                }
-                break;
-            }
-            t *= 0.5;
-        }
-        if !accepted {
+        let jd = data_jacobian(&st.x, st.r.len(), &mut eval);
+        let Some(sol) = kkt_solution(s, &l, &st, &jd) else { break };
+        if !polish_search(s, &l, &mut st, &sol, &mut eval) {
             break;
         }
     }
-    write_back(s, &l, &x);
-    Ok(cost)
+    write_back(s, &l, &st.x);
+    Ok(st.cost)
 }
 
 /// Newton steps of least norm that bring `x` back onto the constraints.

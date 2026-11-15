@@ -160,13 +160,6 @@ pub(crate) struct Analysis {
     pub nests: Vec<Option<(usize, bool)>>,
 }
 
-impl Analysis {
-    /// Parts that are not the cavity skin of another, in order.
-    pub(crate) fn distinct(&self) -> Vec<usize> {
-        (0..self.parts.len()).filter(|k| !self.nests.get(*k).is_some_and(|n| n.is_some_and(|n| n.1))).collect()
-    }
-}
-
 /// Splits `mesh` into parts and debris.
 pub(crate) fn analyse(mesh: &Mesh, share: f64, with_nesting: bool) -> Analysis {
     let all = pieces(mesh);

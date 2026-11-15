@@ -44,6 +44,10 @@ pub struct ScanSummary {
     pub holes_filled: usize,
     /// Holes left open (above the size limit, not triangulable, or whose fill would put three triangles on one edge).
     pub holes_left: usize,
+    /// Of the holes left, those whose fill would have closed the scan inside out: the open edge of a sheet, not a
+    /// hole (see `mesh.clean`).
+    #[serde(default)]
+    pub holes_inward: usize,
     /// Edges shared by three or more triangles, after cleaning.
     pub non_manifold_edges: usize,
     /// Estimated scanner noise sigma after cleaning (mm); null when it cannot be estimated.

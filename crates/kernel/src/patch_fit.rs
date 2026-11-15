@@ -99,7 +99,8 @@ pub struct Request {
     pub tolerance: f64,
     /// Relative stiffness of the bending energy against the data (default 1e-3).
     pub smoothing: Option<f64>,
-    /// Start control net; default from the number of data points.
+    /// Start control net; default from the number of data points, or 6 by 6 when every side is
+    /// soft (the rounds then grow it only until the data are within the tolerance).
     pub control: Option<[usize; 2]>,
     /// Most control points per direction, at most [`crate::vpatch::MAX_CONTROL`].
     pub max_control: usize,
@@ -131,6 +132,10 @@ pub struct SideReport {
     /// The side meets its targets: gap, and for G1/G2 angle, curvature and no fold. Always true for
     /// a soft side, which has none.
     pub met: bool,
+    /// A feature of the reference face crosses the side (G1/G2 sides): the face's normal curvature
+    /// across the side varies along it by more than [`FEATURE_SPREAD`] times the smallest curvature
+    /// the G2 error is taken against. One patch cannot continue such a face along the whole side.
+    pub feature_across: bool,
 }
 
 /// A corner whose sides ask for tangent planes that disagree.
@@ -206,12 +211,18 @@ pub struct Patch {
 pub const G0_TARGET: f64 = 1e-3;
 /// Target of the angle between normals along a G1/G2 side, degrees.
 pub const G1_TARGET_DEG: f64 = 0.05;
+/// Spread (standard deviation along a side) of the reference face's normal curvature across the
+/// side, in units of `1 / (4 diag)`, above which a feature of the face is taken to cross the side.
+/// Measured on four real scans: at most 0.82 on the sides where G2 held, at least 3.2 where it did not.
+pub const FEATURE_SPREAD: f64 = 1.6;
 /// Target of the relative normal curvature error along a G2 side.
 pub const G2_TARGET_REL: f64 = 0.05;
 /// Corners whose tangent planes differ by more than this (degrees) are in conflict.
 pub const CORNER_MISMATCH_DEG: f64 = 0.5;
 
 const MAX_ROUNDS: u32 = 6;
+/// Most rounds of a patch with a G2 side.
+const MAX_G2_ROUNDS: u32 = 18;
 /// A hard row missed by more than this share of the loop's diagonal (as control point motion, in the
 /// units of the input) means the hard conditions contradict each other. Relative, so that a part
 /// scaled by any factor gets the same verdict: 1e-5 of a 30 mm outline is 3e-4 mm.
@@ -219,6 +230,8 @@ const HARD_RESIDUAL_REL: f64 = 1e-5;
 /// The default start net of a call with G1/G2 sides (coupled solve) stays at this size; growth goes on
 /// within the cost bound of [`crate::vpatch::MAX_SOLVE_SECONDS`].
 const COUPLED_START_MAX: usize = 16;
+/// Smallest start net per direction; the start net of a patch whose sides are all soft.
+const MIN_START: usize = 6;
 const DEFAULT_SMOOTHING: f64 = 1e-3;
 /// Share of a side's length around a conflicting corner where its G1/G2 rows are relaxed.
 const RELAX_SPAN: f64 = 0.15;
@@ -227,6 +240,9 @@ const RELAX_SPAN: f64 = 0.15;
 const MIN_IMPROVEMENT: f64 = 0.05;
 /// Growth never replaces the kept round by one whose data deviation is this share larger.
 const MAX_DATA_GROWTH: f64 = 0.10;
+/// Share of the kept round's miss of the hard conditions below which a round within the data
+/// tolerance is kept whatever its data deviation.
+const SIDE_GAIN: f64 = 0.5;
 /// Corners of the trimming outline (the trimmer takes 8000).
 const MAX_TRIM_CORNERS: usize = 6_000;
 
@@ -260,13 +276,17 @@ struct Round {
 /// it. Among rounds on the same side of the tolerance the smaller miss of the hard conditions wins
 /// (rounds that meet them all tie and the smaller data deviation wins), but a round whose data
 /// deviation is more than [`MAX_DATA_GROWTH`] larger never does, unless it brings the hard
-/// conditions from missed to met.
+/// conditions from missed to met or, within the tolerance, lowers their miss to [`SIDE_GAIN`] of
+/// the kept round's.
 fn prefer(new: &Summary, kept: &Summary) -> bool {
     if new.data_ok != kept.data_ok {
         return new.data_ok;
     }
     let brings_met = kept.side_miss > 1.0 && new.side_miss <= 1.0;
-    if new.data_max > (1.0 + MAX_DATA_GROWTH) * kept.data_max && !brings_met {
+    // within the tolerance a round that at least halves the miss of the hard conditions is worth
+    // any growth of the data deviation (a curvature round against the one before its rows existed)
+    let halves = new.data_ok && new.side_miss <= SIDE_GAIN * kept.side_miss;
+    if new.data_max > (1.0 + MAX_DATA_GROWTH) * kept.data_max && !brings_met && !halves {
         return false;
     }
     let (n, k) = (new.side_miss.max(1.0), kept.side_miss.max(1.0));
@@ -363,9 +383,10 @@ fn conflict_list(corners: &[start::Corner]) -> String {
 /// samples follow a cubic interpolant through them, not the chords (a warning names a side that
 /// could not be interpolated). A round is kept by `prefer`; a side whose gap a growth step along it
 /// no longer lowers is reported (with a warning) as being as close as its own accuracy allows, but
-/// is not excused from `within_targets`. G2 rows are linearised about the previous round, so with
-/// a G2 side a net that cannot grow still gets a second round, and more while the curvature error
-/// falls by 5 %. Soft points are soft position rows that need an outline to lie inside (`Err`
+/// is not excused from `within_targets`. The curvature rows of a G2 side are a Newton step
+/// about the previous round's surface: once the net holds G0 and G1 (or cannot grow) the rounds
+/// repeat on the same net while the curvature error falls by 5 %, then the net grows; such a patch
+/// may take [`MAX_G2_ROUNDS`] rounds. A soft side next to a referenced one is no corner conflict. Soft points are soft position rows that need an outline to lie inside (`Err`
 /// otherwise); the largest distance of one from the patch is reported. When the trimmer refuses
 /// the outline of closest points, it is tried with the start parameters of the sides (a warning).
 pub fn fit_patch(req: &Request) -> Result<Patch> {
@@ -426,7 +447,13 @@ fn start_net_and_domain(req: &Request, lp: &start::Loop, interior: &start::Inter
     let n_data = interior.data.iter().filter(|p| !p.out).count();
     let coupled = lp.sides.iter().any(|s| s.continuity != Continuity::G0);
     let start_net = req.control.unwrap_or_else(|| {
-        let k = ((n_data as f64 / 12.0).sqrt().round() as usize).max(6);
+        // nothing but the data tolerance asks for a dense net when every side is soft: start
+        // coarse and let the rounds grow it, so the patch does not follow the texture of the scan
+        if lp.sides.iter().all(|s| s.soft) {
+            let k = std::cmp::min(max, MIN_START);
+            return [k, k];
+        }
+        let k = ((n_data as f64 / 12.0).sqrt().round() as usize).max(MIN_START);
         let k = std::cmp::min(max, k);
         let k = if coupled { k.min(COUPLED_START_MAX) } else { k };
         [k, k]

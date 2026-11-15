@@ -19,6 +19,7 @@ fn side_report(gap: f64) -> SideReport {
         folded: false,
         snap_max: None,
         met: gap <= G0_TARGET,
+        feature_across: false,
     }
 }
 

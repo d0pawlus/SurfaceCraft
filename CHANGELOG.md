@@ -142,6 +142,55 @@ scans with small handles, self-crossing folds or thin shells get through to a so
 - On real scans `scan.to_solid` often answers `review` rather than `pass`. The verdict lists the
   reason and the next step.
 
+### Changed
+
+- `scan.to_solid` on a scan of many parts models every piece that is a solid, not only those with
+  `part_share` of the largest: a watertight, consistently oriented piece of positive volume with at
+  least 100 triangles and 50 tolerances across is a *small part*, modelled with its own verdict
+  (`components[].co_equal` tells the kinds apart). Co-equal is decided by area alone. A small part
+  never fails the call; small parts that did not pass, pieces left out and parts beyond the cap keep
+  it at `review` when together they hold more than 2 % of the surface (`unmodelled_pieces`, new
+  `parts_not_passed`), and below that the parts that did not pass are still counted
+  (`small_parts_not_passed`) and named in a next step. Pieces left out carry a reason (`debris`,
+  `open`, `not_oriented`, `inside_out`); the 16 largest are listed in `pieces_left_out`.
+  `minor_and_debris_*` now count the pieces left out and `debris_pieces` those with reason `debris`
+  only. The cap of parts per call rises from 24 to 128, the cleaning protects small parts below its
+  default by identity, and small parts are never rebuilt.
+- `surface.patch`: a patch whose sides are all soft now starts from a 6 by 6 control net and
+  grows it only until the scan data are within `tolerance`; before, the start net came from the
+  number of data points and followed the fine texture of a dense scan, which made its curvature
+  useless as a G2 reference for a neighbouring patch. Such a patch is smoother and its `rms` is
+  larger than before; pass a smaller `tolerance` for a closer fit. [#139]
+- `surface.patch` with a G2 side may take up to 18 rounds instead of 6: the curvature conditions
+  are iterated on the same control net until they converge, and only then is the net refined. [#139]
+
+### Fixed
+
+- `surface.patch`, G2 to a neighbouring patch on real scans: the curvature condition is now a Newton
+  step (it was a fixed-point step whose error was of first order in the speed of the
+  parametrisation); a round that halves the miss of the side conditions is kept even when the scan
+  deviation grows within the tolerance (the first round, which has no curvature condition yet, was
+  kept before); a soft side next to a side with a reference face is no longer a corner conflict
+  that relaxes the G1 and G2 conditions near the corner. On the Artec corpus G2 holds its 5 %
+  target at 8 of 12 sites (2 of 11 before), every site where no feature of the part crosses the
+  shared side. Where one does and the side misses its targets, a warning says so and advises to
+  split the side at the feature or to ask for G1 there. [#139]
+- `scan.to_solid` on a split scan: a part whose `auto` freeform attempt was refused because the call's
+  two extra attempts were spent, and whose primitives did not pass, is now wrapped once as its own
+  wrap and the better result is kept (twelve small parts of the scan of many parts ended without a
+  pass before; each passes now). The solid kept has the part's name and the losing attempt leaves no
+  object behind.
+- Hole filling (`mesh.clean`, `mesh.fill_holes`, `scan.to_solid` with a large
+  `fill_holes_max_edges`) no longer closes an open sheet inside out (one scanned from its hollow
+  side, or whose normals are stored inward). When the patches would close a piece of the mesh with
+  the scanned face pointing into the enclosed volume, every opening (a loop, or the loops of a
+  ragged rim that touch at vertices, judged by their patches together) whose patches are a quarter
+  of the piece's area or more stays open (`holes_inward`); smaller holes are filled, so a closed
+  scan stored inside out with small holes is still reported as `scan_inside_out`. `scan.to_solid`
+  raises the new issue `fill_inside_out` instead of failing with `scan_inside_out`, and
+  `mesh.fill_holes` takes `allow_inward: true` to cap such a loop anyway (a mould of a dish)
+  (#140).
+
 ## [0.2.0] - 2026-11-13
 
 Four days and 60 merged pull requests after 0.1.0. The release is about real scans: one command now takes

@@ -45,11 +45,21 @@ fn unmet(s: &SideReport) -> Vec<String> {
     out
 }
 
+/// The advice for a side that missed its targets where a feature of the reference face crosses it.
+pub(super) fn feature_warning(label: usize) -> String {
+    format!(
+        "side {label}: a feature of the reference face crosses the side (its curvature across the side varies along it): split the side at the feature or ask for G1 there"
+    )
+}
+
 fn side_warnings(lp: &Loop, m: &Measure, frozen: &[bool], out: &mut Vec<String>) {
     for (k, (s, sd)) in m.sides.iter().zip(&lp.sides).enumerate() {
         let missed = unmet(s);
         if !missed.is_empty() {
             out.push(format!("side {}: {:?} not met: {}", sd.label, s.continuity, missed.join(", ")));
+        }
+        if !missed.is_empty() && s.feature_across {
+            out.push(feature_warning(sd.label));
         }
         if frozen.get(k).copied().unwrap_or(false) && !s.soft && s.gap_max > G0_TARGET {
             out.push(format!("side {}: the gap of {:.4} mm is the accuracy of the side itself", sd.label, s.gap_max));

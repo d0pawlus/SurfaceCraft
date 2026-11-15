@@ -22,3 +22,9 @@ description: Licences, assets, clean-room and test data rules for SurfaceCraft.
   in `docs/STATUS.md`. Never depend on heavy application crates (e.g. `solidcraft-kernel`) by git.
 - **Test corpus.** In-repo data is synthetic (`surfacecraft_geom::synth`) or openly licensed
   (e.g. `tangency-labs/models`, CC0), each file with its licence in ATTRIBUTION.md.
+- **Open real scans.** Four Artec Group scans (car rim, four-cylinder engine, industrial part,
+  water pump; CC BY) are the real-scan corpus that may be named in results:
+  `xtask/fetch-artec-corpus.sh <dir>` downloads them (checked by SHA-256), tests read
+  `SURFACECRAFT_ARTEC_CORPUS`. The files stay outside the repository because of their size, not
+  their licence; whatever is derived from them and committed credits Artec Group and says it was
+  modified (ATTRIBUTION.md, "External test models").

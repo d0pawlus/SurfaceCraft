@@ -8,7 +8,9 @@ description: Writing and running SurfaceCraft tests and the accuracy gates of de
 - `cargo xtask ci` runs everything CI runs: fmt, assets, licences, layers, app-geometry, clippy
   `-D warnings`, wasm check, tests. It runs on GitHub Actions for every ready pull request (static
   checks on Linux; the tests on Linux, Windows and macOS, each split into parts that run at the same
-  time with `cargo xtask test --partition count:K/N`); merge only when every check is green.
+  time with `cargo xtask test --partition balanced:K/N`, which spreads the heaviest tests of
+  `xtask/src/heavy_tests.rs` by their measured time); merge only when every check is green. A new
+  test that takes minutes belongs on that list.
 - Locally, before each commit: `cargo xtask quick <changed packages>` (the static steps plus clippy,
   which type-checks; add `--tests` only when you need a test result to continue). Several parallel full builds of solidcore exhaust the RAM of a
   workstation; the pull request runs the whole suite.
@@ -36,3 +38,8 @@ description: Writing and running SurfaceCraft tests and the accuracy gates of de
   Gate tests are named `gate_m<N>_*` so they can be listed with `cargo test gate_`.
 - Synthetic scans come from `surfacecraft_geom::synth` (exact ground truth). Local realism tests on
   third-party scans are `#[ignore]` and read `SURFACECRAFT_LOCAL_CORPUS`; never commit their output.
+- Real scans whose results may be named and committed: the open Artec corpus (car rim, engine,
+  industrial part, water pump). `xtask/fetch-artec-corpus.sh <dir>` once, then
+  `SURFACECRAFT_ARTEC_CORPUS=<dir>` for `#[ignore]` tests such as
+  `crates/engine/tests/artec_corpus.rs` (import) and `artec_patch.rs` (`surface.patch`); the same directory also serves as
+  `SURFACECRAFT_LOCAL_CORPUS`. Prefer it over closed scans for any new measurement on real data.
