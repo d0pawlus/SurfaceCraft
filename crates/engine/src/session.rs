@@ -71,6 +71,9 @@ pub struct Session {
     pub log: Vec<Arc<LogEntry>>,
     /// Whether commands may touch the file system (false on the web and in sandboxed MCP).
     pub allow_files: bool,
+    /// Files the user picked, held until their command reads them (`picked:` paths, also where
+    /// `allow_files` is false). Shared with every fork.
+    pub picked: crate::PickedFiles,
     /// Body display meshes.
     pub tess: crate::display::TessCache,
     /// Deviation maps by mesh id. Only valid ones are kept: see [`Session::live_map`].
@@ -162,6 +165,7 @@ impl Session {
             history: self.history.clone(),
             log: self.log.clone(),
             allow_files: self.allow_files,
+            picked: self.picked.clone(),
             tess: self.tess.clone(),
             maps: self.maps.clone(),
             cancel: Cancel::new(),

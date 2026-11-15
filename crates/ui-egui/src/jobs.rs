@@ -348,8 +348,11 @@ impl SurfaceCraftApp {
             let ext = lower.rsplit('.').next().unwrap_or("").to_string();
             if ext == "step" || ext == "stp" {
                 let stem = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s).to_string();
-                let data = surfacecraft_doc::base64::encode(&bytes);
-                self.launch("import.step", json!({"data": data, "name": stem}), After::Fit);
+                // a picked file, not base64 data: held once, and the log keeps its path
+                let path = self.session.picked.put(&name, bytes);
+                if !self.launch("import.step", json!({"path": path, "name": stem}), After::Fit) {
+                    self.session.picked.discard(&path);
+                }
             } else {
                 self.import_picked_bytes(&name, bytes);
             }
