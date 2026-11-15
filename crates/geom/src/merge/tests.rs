@@ -188,3 +188,121 @@ fn a_cancellation_during_any_stage_is_honoured() {
         assert!(matches!(r, Err(MergeError::Cancelled)), "{at:?}: {r:?}");
     }
 }
+
+/// An icosphere of radius 20 subdivided `k` times, turned by `turn` (its own tessellation), with the
+/// lumps of the blob: an organic surface with near-equilateral triangles everywhere.
+fn ico_blob(k: usize, turn: &Transform) -> Mesh {
+    let t = (1.0 + 5f64.sqrt()) / 2.0;
+    let mut pos: Vec<Point3> = [
+        (-1.0, t, 0.0),
+        (1.0, t, 0.0),
+        (-1.0, -t, 0.0),
+        (1.0, -t, 0.0),
+        (0.0, -1.0, t),
+        (0.0, 1.0, t),
+        (0.0, -1.0, -t),
+        (0.0, 1.0, -t),
+        (t, 0.0, -1.0),
+        (t, 0.0, 1.0),
+        (-t, 0.0, -1.0),
+        (-t, 0.0, 1.0),
+    ]
+    .iter()
+    .map(|&(x, y, z)| Point3::new(x, y, z))
+    .collect();
+    let mut tris: Vec<[u32; 3]> = vec![
+        [0, 11, 5],
+        [0, 5, 1],
+        [0, 1, 7],
+        [0, 7, 10],
+        [0, 10, 11],
+        [1, 5, 9],
+        [5, 11, 4],
+        [11, 10, 2],
+        [10, 7, 6],
+        [7, 1, 8],
+        [3, 9, 4],
+        [3, 4, 2],
+        [3, 2, 6],
+        [3, 6, 8],
+        [3, 8, 9],
+        [4, 9, 5],
+        [2, 4, 11],
+        [6, 2, 10],
+        [8, 6, 7],
+        [9, 8, 1],
+    ];
+    for _ in 0..k {
+        let mut mid = std::collections::HashMap::new();
+        let mut out = Vec::with_capacity(tris.len() * 4);
+        let mut m = |a: u32, b: u32, pos: &mut Vec<Point3>| {
+            *mid.entry((a.min(b), a.max(b))).or_insert_with(|| {
+                pos.push(Point3::from((pos[a as usize].coords + pos[b as usize].coords) * 0.5));
+                (pos.len() - 1) as u32
+            })
+        };
+        for [a, b, c] in tris {
+            let (ab, bc, ca) = (m(a, b, &mut pos), m(b, c, &mut pos), m(c, a, &mut pos));
+            out.extend([[a, ab, ca], [b, bc, ab], [c, ca, bc], [ab, bc, ca]]);
+        }
+        tris = out;
+    }
+    let positions = pos
+        .iter()
+        .map(|p| {
+            let p = turn.apply(&Point3::from(p.coords.normalize() * 20.0));
+            let lump = 1.0 + 0.12 * (0.21 * p.x).sin() * (0.17 * p.y).cos() + 0.08 * (0.3 * p.z).sin();
+            Point3::new(p.x * 1.6 * lump, p.y * lump, p.z * 0.7 * lump)
+        })
+        .collect();
+    Mesh { positions, triangles: tris }
+}
+
+/// Two noisy halves (sigma 0.02) of the icosphere blob subdivided `k` times, each its own tessellation.
+fn ico_halves(k: usize) -> Vec<Mesh> {
+    [(1.0, 0u64), (-1.0, 1)]
+        .iter()
+        .map(|&(side, s)| {
+            let turn = Transform::rotation_axis_angle(&Rng::new(40 + s).unit_vector(), 0.3 + s as f64);
+            let mut m = ico_blob(k, &turn);
+            synth::add_noise(&mut m, 0.02, &mut Rng::new(300 + s));
+            cut(&m, |p| side * p.x >= -8.0)
+        })
+        .collect()
+}
+
+/// The fixtures' blob is a UV sphere whose poles are fans of slivers right on the seam; on a surface
+/// of near-equilateral triangles the merge is closed at every resolution tried (k = 5 to 7, 80 000
+/// to 330 000 triangles a half; 0 open seam edges measured).
+#[test]
+fn halves_of_an_even_organic_surface_merge_closed_at_fine_resolution() {
+    for k in [5, 6] {
+        let (mesh, rep) = run(&ico_halves(k), 0.15);
+        assert!(mesh.is_some(), "{k}");
+        assert_eq!((rep.after.pieces, rep.after.loops, rep.after.genus), (1, 0, Some(0)), "{k}: {:?}", rep.issues);
+        assert_eq!(rep.seam.open_edges, 0, "{k}");
+        assert_eq!((rep.after.non_manifold_edges, rep.after.unoriented_edges, rep.after.pinched_vertices), (0, 0, 0));
+        assert_eq!(rep.checks.unwelded_vertices, 0, "{k}");
+        assert_eq!(rep.checks.added_crossings, 0, "{k}");
+    }
+}
+
+/// Timing of a large merge (two halves of about 0.65 million triangles each), printed, not asserted.
+#[test]
+#[ignore = "timing run"]
+fn large_merge_timing() {
+    let halves = ico_halves(8);
+    let t0 = std::time::Instant::now();
+    let (_, rep) = run(&halves, 0.15);
+    eprintln!(
+        "{} + {} triangles: {:.1} s; pieces {} loops {} open {} unwelded {} removed within {:.4}",
+        halves[0].triangle_count(),
+        halves[1].triangle_count(),
+        t0.elapsed().as_secs_f64(),
+        rep.after.pieces,
+        rep.after.loops,
+        rep.seam.open_edges,
+        rep.checks.unwelded_vertices,
+        rep.checks.removed.share()
+    );
+}

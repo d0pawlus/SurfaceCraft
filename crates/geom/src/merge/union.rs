@@ -11,6 +11,8 @@ use std::collections::{HashMap, HashSet};
 /// Seam vertices of different scans closer than this share of the tolerance (and a tenth of the
 /// median edge) are one vertex: two copies of one point a scan pair left on either side of the seam.
 pub const WELD_SHARE: f64 = 0.25;
+/// Rounds of undoing welds that would make an edge run the same way twice.
+const WELD_PASSES: usize = 4;
 /// Passes over the removed triangles when restoring (a triangle may need a neighbour restored first).
 const RESTORE_PASSES: usize = 3;
 
@@ -125,6 +127,33 @@ impl Union {
         if ends.is_empty() || !(eps > 0.0) {
             return;
         }
+        let mut to = self.weld_targets(&ends, eps);
+        // a weld that would make two triangles run one edge the same way (or put three on it) is undone
+        for _ in 0..WELD_PASSES {
+            let bad = self.clashing(&to);
+            if bad.is_empty() {
+                break;
+            }
+            for v in bad {
+                if let Some(slot) = to.get_mut(v as usize) {
+                    *slot = v;
+                }
+            }
+        }
+        for (v, &w) in to.iter().enumerate().filter(|(v, w)| *v as u32 != **w) {
+            let moved = match (self.positions.get(v), self.positions.get(w as usize)) {
+                (Some(p), Some(q)) => (q - p).norm(),
+                _ => 0.0,
+            };
+            self.max_move = self.max_move.max(moved);
+            self.welded += 1;
+        }
+        self.remap(&to);
+    }
+
+    /// For every front vertex in `ends`, the vertex of a scan listed earlier within `eps` it is welded
+    /// into (itself when none).
+    fn weld_targets(&self, ends: &[u32], eps: f64) -> Vec<u32> {
         let pts: Vec<Point3> = ends.iter().filter_map(|&v| self.positions.get(v as usize).copied()).collect();
         let tree = KdTree::build(&pts);
         let mut to: Vec<u32> = (0..self.positions.len() as u32).collect();
@@ -141,12 +170,43 @@ impl Union {
                 if let Some(slot) = to.get_mut(v as usize) {
                     *slot = target;
                 }
-                let moved = self.positions.get(target as usize).map_or(0.0, |q| (q - p).norm());
-                self.max_move = self.max_move.max(moved);
-                self.welded += 1;
             }
         }
-        self.remap(&to);
+        to
+    }
+
+    /// The welded vertices (`to[v] != v`) on an edge that the weld would leave with two triangles running
+    /// it the same way, or with three triangles.
+    fn clashing(&self, to: &[u32]) -> Vec<u32> {
+        let map = |v: u32| to.get(v as usize).copied().unwrap_or(v);
+        let mut count: HashMap<u64, u32> = HashMap::new();
+        let mut undirected: HashMap<u64, u32> = HashMap::new();
+        for t in &self.triangles {
+            let m = t.map(map);
+            if m[0] == m[1] || m[1] == m[2] || m[0] == m[2] {
+                continue;
+            }
+            for k in 0..3 {
+                let (a, b) = (m[k], m[(k + 1) % 3]);
+                *count.entry(directed(a, b)).or_default() += 1;
+                *undirected.entry(directed(a.min(b), a.max(b))).or_default() += 1;
+            }
+        }
+        let mut bad: Vec<u32> = Vec::new();
+        for t in &self.triangles {
+            let m = t.map(map);
+            let clash = (0..3).any(|k| {
+                let (a, b) = (m[k], m[(k + 1) % 3]);
+                count.get(&directed(a, b)).copied().unwrap_or(0) > 1
+                    || undirected.get(&directed(a.min(b), a.max(b))).copied().unwrap_or(0) > 2
+            });
+            if clash {
+                bad.extend(t.iter().copied().filter(|&v| map(v) != v));
+            }
+        }
+        bad.sort_unstable();
+        bad.dedup();
+        bad
     }
 
     /// Points every triangle at the vertices `to` gives and drops those that collapse.
