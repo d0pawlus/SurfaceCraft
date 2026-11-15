@@ -46,8 +46,11 @@ use std::collections::{BTreeMap, BTreeSet};
 /// 8 degrees or more. A set of primitives that does not converge by then (nearly parallel, parallel, or with no
 /// common point near the point) is reported as not converged, never settled with a point that is not on them all.
 const MAX_ALTERNATIONS: usize = 200;
-/// A point lies on a primitive when it is this close (mm): 3 micrometres.
-const ON_SURFACE: f64 = 3e-3;
+/// A point lies on a primitive when it is this close (mm): a nanometre. A looser bound (3 micrometres) stops the
+/// alternation of a shallow crease early, where the points of one crease then scatter along it by that over the sine
+/// of half the angle between the primitives (0.07 mm at 5 degrees): measured on a prismatic part, the border of its
+/// largest planes then no longer matched and half of the area stayed patches.
+const ON_SURFACE: f64 = 1e-6;
 /// A round that moves the point by less than this (mm) without having reached every primitive has found a cycle
 /// (parallel primitives): there is nothing to wait for.
 const STALLED: f64 = 1e-9;
@@ -86,15 +89,28 @@ pub fn put_on_all(gauges: &[&Gauge], p: V, max_move: f64) -> Option<V> {
     put_on_all_with(&|i, q| gauges.get(i).and_then(|g| g.closest(q)), gauges.len(), p, max_move)
 }
 
-/// [`put_on_all`] for `count` surfaces whose closest point to `q` is `closest(i, q)` (the caller's own evaluator:
-/// the scan side of the hybrid method projects onto the fitted primitives with the fit's).
-#[must_use]
-pub fn put_on_all_with(closest: &dyn Fn(usize, V) -> Option<V>, count: usize, p: V, max_move: f64) -> Option<V> {
-    let q = onto_all(closest, count, p).filter(|_| count > 0)?;
-    (finite_all(&q) && max_move >= 0.0 && norm(sub(q, p)) <= max_move).then_some(q)
+/// [`placed`] for the gauges, without the flag: where they do not all meet, the point on the nearest one.
+fn put_near(gauges: &[&Gauge], p: V, max_move: f64) -> Option<V> {
+    placed(&|i, q| gauges.get(i).and_then(|g| g.closest(q)), gauges.len(), p, max_move).map(|(q, _)| q)
 }
 
-fn onto_all(closest: &dyn Fn(usize, V) -> Option<V>, count: usize, p: V) -> Option<V> {
+/// [`put_on_all`] for `count` surfaces whose closest point to `q` is `closest(i, q)`.
+#[must_use]
+pub fn put_on_all_with(closest: &dyn Fn(usize, V) -> Option<V>, count: usize, p: V, max_move: f64) -> Option<V> {
+    placed(closest, count, p, max_move).and_then(|(q, on_all)| on_all.then_some(q))
+}
+
+/// Where `p` goes onto `count` surfaces, and whether that is on all of them: `(q, true)` when the alternating
+/// projections meet; where they do not (surfaces that touch at a shallow angle, or are parallel) the point nearest to
+/// all of them among the last iterate and the projections of `p` onto each, `(q, false)`: the point is not on them
+/// all, and the groups are judged by their border checks. `None` when the point would move more than `max_move`, or is not finite.
+#[must_use]
+pub fn placed(closest: &dyn Fn(usize, V) -> Option<V>, count: usize, p: V, max_move: f64) -> Option<(V, bool)> {
+    let (q, on_all) = onto_all(closest, count, p)?;
+    (count > 0 && finite_all(&q) && max_move >= 0.0 && norm(sub(q, p)) <= max_move).then_some((q, on_all))
+}
+
+fn onto_all(closest: &dyn Fn(usize, V) -> Option<V>, count: usize, p: V) -> Option<(V, bool)> {
     let distance = |i: usize, q: V| closest(i, q).map(|c| norm(sub(c, q))).filter(|d| d.is_finite());
     let on_all = |q: V| (0..count).all(|i| distance(i, q).is_some_and(|d| d <= ON_SURFACE));
     let mut q = p;
@@ -104,14 +120,21 @@ fn onto_all(closest: &dyn Fn(usize, V) -> Option<V>, count: usize, p: V) -> Opti
             q = closest(i, q)?;
         }
         if on_all(q) {
-            return Some(q);
+            return Some((q, true));
         }
         if count == 1 || norm(sub(q, before)) < STALLED {
-            // one surface is reached by its first projection; several that stand still are parallel
-            return (count == 1).then_some(q);
+            break;
         }
     }
-    None
+    if count == 1 {
+        return Some((q, true));
+    }
+    // not on all of them: where the worst distance from them is least, the last iterate or the point on one alone
+    // (surfaces that meet at a shallow angle come close to all of them long before they meet)
+    let worst = |q: V| (0..count).filter_map(|i| distance(i, q)).fold(0.0_f64, f64::max);
+    let alone = closest(0, p).into_iter().chain(std::iter::once(q));
+    let best = alone.map(|c| (worst(c), c)).min_by(|a, b| a.0.total_cmp(&b.0))?;
+    Some((best.1, false))
 }
 
 /// The groups that touch each boundary edge and each end vertex of one, with the gauges of their primitives.
@@ -214,7 +237,7 @@ fn moved_vertices(body: &Brep, touch: &Touch, max_move: f64, refused: &mut Refus
     for (&v, who) in &touch.vertices {
         let Some(p) = body.vertices.get(v as usize).map(|x| x.point) else { continue };
         let gauges: Vec<&Gauge> = who.iter().map(|w| w.1).collect();
-        match put_on_all(&gauges, p, max_move) {
+        match put_near(&gauges, p, max_move) {
             Some(q) => {
                 out.insert(v, q);
             }
@@ -253,7 +276,7 @@ fn refit_edge(
         // the fit needs at least as many samples as control points (a record from outside can have any number)
         return Err(KernelError::Argument("a boundary edge has more control points than samples".into()));
     }
-    let Some(targets) = samples.iter().map(|p| put_on_all(gauges, *p, max_move)).collect::<Option<Vec<V>>>() else {
+    let Some(targets) = samples.iter().map(|p| put_near(gauges, *p, max_move)).collect::<Option<Vec<V>>>() else {
         return Ok(None);
     };
     let mut fit = least_squares(old.len().saturating_sub(1), &targets).unwrap_or_else(|| follow(old, ends));

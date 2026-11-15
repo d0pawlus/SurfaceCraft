@@ -21,6 +21,13 @@ const MOVE_PER_GAP: f64 = 1.5;
 /// that was not moved), which ends it whatever the earlier rounds refused.
 const MAX_ROUNDS: usize = 4;
 
+/// A group is snapped when its boundary is within this multiple of the gap of its primitive. The boundary samples the
+/// caller checked (a grid of the patches) lie within the gap; the edges are sampled more densely and between the grid
+/// points leave it by a little (measured on a plane of 1 342 patches: 0.2016 against the limit 0.2, 1.008 times), so the
+/// group would be lost by rounding. The snap brings the boundary onto the primitive (and a group left unsnapped is
+/// held to the gap itself), so the slack costs no accuracy; 1.25 leaves 30 times the measured excess.
+const NEAR_SLACK: f64 = 1.25;
+
 type Reasons = Vec<Option<String>>;
 
 /// One group as `group_of` sees it, or why not, for each of the first [`MAX_GROUPS`] specs.
@@ -54,7 +61,7 @@ fn snap_round(
         if refused.get(k).is_some_and(Option::is_some) || spec.faces.iter().any(|f| claimed.contains(f)) {
             continue;
         }
-        let near = group.gap(gauge).is_ok_and(|g| g <= max_gap);
+        let near = group.gap(gauge).is_ok_and(|g| g <= NEAR_SLACK * max_gap);
         if near && place(spec.shape, &group.points(), group.outward).is_ok_and(|p| closed || !p.flip) {
             claimed.extend(spec.faces.iter().copied());
             targets.push(Target { faces: spec.faces, group, gauge });

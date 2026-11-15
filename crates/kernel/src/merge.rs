@@ -49,7 +49,7 @@ pub use place::Gauge;
 use place::{Placement, place};
 pub use samples::{connected_groups, face_area, face_samples, grid_area, pinch_free_groups, split_round};
 use settle::Run;
-pub use snap::{put_on_all, put_on_all_with};
+pub use snap::{placed, put_on_all, put_on_all_with};
 use std::collections::BTreeSet;
 
 /// The largest edge-to-surface gap a merge accepts (mm); the caller passes its own, smaller one.

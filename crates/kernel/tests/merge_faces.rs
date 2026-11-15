@@ -694,3 +694,25 @@ fn a_single_group_whose_snap_does_not_hold_is_merged_as_it_was() {
     assert!(g.gap > 0.03 && g.gap < 0.05, "the border is where it was, a sagitta off the cylinder: {}", g.gap);
     assert_eq!(kinds(&batch.brep), vec!["cylinder"]);
 }
+
+/// A group whose border is a little farther from its plane than the gap (the border samples of the caller's grid are
+/// within it, the edges between them are not: 1.1 times here, 1.008 on a real plane of 1 342 patches) is snapped and
+/// merged, not lost by rounding; one that is far beyond the slack (1.9 times) is refused. The factors are the fixture's
+/// arithmetic: the saddle's border is 0.75 to 1.25 of `rise` off the plane.
+#[test]
+fn a_border_slightly_beyond_the_gap_is_snapped_and_a_far_one_is_refused() {
+    use surfacecraft_kernel::merge::{GroupSpec, merge_faces_onto_shapes};
+    let plane = plane_through([0.0, 0.0, 10.0], [0.0, 0.0, 1.0]);
+    let top: Vec<usize> = (0..9).collect();
+    for (rise, merged) in [(0.0352, true), (0.06, false)] {
+        let net = box_with_saddle_top(rise);
+        let body = sheet_from_bezier_network(&net.patches, &net.corners).unwrap();
+        let batch =
+            merge_faces_onto_shapes(&body, &[GroupSpec { faces: &top, shape: &plane }], 0.04, &|| false).unwrap();
+        match (&batch.groups[0], merged) {
+            (Ok(g), true) => assert!(g.gap < 1e-6 && g.snap_note.is_none(), "snapped: {g:?}"),
+            (Err(why), false) => assert!(why.contains("from the surface"), "{why}"),
+            (other, _) => panic!("rise {rise}: {other:?}"),
+        }
+    }
+}
