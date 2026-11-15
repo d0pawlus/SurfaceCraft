@@ -26,9 +26,9 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
 ### Fixed
 
 - Hole filling (`mesh.clean`, `mesh.fill_holes`, `scan.to_solid` with a large `fill_holes_max_edges`)
-  no longer closes an open sheet seen from its hollow side inside out: a fill whose patches would close
-  a piece of the mesh with the scanned face pointing into the enclosed volume, and are a quarter of
-  its area or more, is refused (`holes_inward`); `scan.to_solid` keeps such a scan at `review` as a
+  no longer closes an open sheet inside out (one scanned from its hollow side, or whose normals are
+  stored inward): a fill whose patches would close a piece of the mesh with the scanned face pointing
+  into the enclosed volume, and are a quarter of its area or more, is refused (`holes_inward`); `scan.to_solid` keeps such a scan at `review` as a
   sheet with the new issue `fill_inside_out` instead of `fail` with `scan_inside_out`.
 
 ## [0.2.0] - 2026-11-13
