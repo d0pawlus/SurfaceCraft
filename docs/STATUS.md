@@ -230,7 +230,7 @@ Szczegóły w planach milestone'ów.
 - solidcore: unia ≥ 3 obróconych kopii (dotyczy też starego `feature.pattern` z obrotem) oraz zdekodowanie zapisanego rekordu po `shell` filletowanej bryły z kieszenią (1 z 20 kroków bramki P5) kończy się `from_record: SM_ERR_INVALID_INPUT` — bryła jest zapisana i eksportowalna wynikiem operacji, ale kernel nie odczyta jej z rekordu (np. objętość = brak). Do zgłoszenia upstream (za zgodą).
 - Cechy P5: `sweep` wymaga profilu położonego na początku ścieżki i ścieżki z linii/łuków (ścieżka ze splajnu — brak); `loft` bierze zewnętrzny profil każdego szkicu (bez krzywych prowadzących i dopasowania punktów startowych); `split` zostawia jedną stronę (drugą uzyskuje się na kopii); wzór po ścieżce dotyczy łańcucha linii i łuków (krzywa dowolna — brak); `draft` odmawia ścian, których kernel nie umie pochylić (nie-płaszczyzna/nie-stożek).
 - Auto-więzy (§6.2): relacje równoległość, prostopadłość, współosiowość, równe promienie (płaszczyzna, walec, stożek, torus, kula) oraz od P8-B1 (#55) styczność, symetria i równe odległości.
-- **Asystent AI bez skonfigurowanego dostawcy LLM:** działa z dowolnym programem-dostawcą, ale żadna usługa nie jest wybrana ani podpięta (decyzja użytkownika: dostawca i klucz API).
+- **Asystent AI bez skonfigurowanego dostawcy LLM:** działa z dowolnym programem-dostawcą, ale żadna usługa nie jest jeszcze podpięta. Decyzja właściciela z 2026-11-15 (D4): asystent obsługuje najpopularniejsze aktualne standardy API (zgodny z OpenAI, Anthropic Messages, Google Gemini), nie jednego dostawcę; pakiet R2.
 - P3 (`kernel::hybrid`): obsługiwane cięcia to płaszczyzna, wypukły walec styczny do dwóch płaszczyzn (fillet), walec/stożek/sfera/torus
   obejmujące oś w całości, płat swobodny; `replace_face` (P3b/Z4) dodaje i odcina materiał (ściana wyciągnięta o wzniesienie płata, suma, cięcie;
   odmawia, gdy wyciągnięcie koliduje z bryłą; obrys tylko z odcinków i łuków, ściana bez otworów).
@@ -277,7 +277,7 @@ Szczegóły w planach milestone'ów.
 - Kanał sterowania zapisuje token w pliku tymczasowym (dostęp lokalnego użytkownika); jedna instancja aplikacji naraz.
 - P9, przeglądy Codexem (2026-11-12): żaden z 10 pierwszych PR-ów z zielonym CI nie przeszedł pierwszego przeglądu bez wady; poprawki też bywały wadliwe (#80: 3 rundy, #84: 5 rund). Reguła: rundy trwają, dopóki przegląd znajduje wady HIGH; runda z samymi MEDIUM/LOW jest naprawiana z testami i scalana po zielonym CI.
 - P9-O1 (#81): łaty adaptacyjne są potrzebne na prawdziwych skanach (2 skany osiągają 99 % tylko w tym układzie), ale na syntetycznych po H2 dają 0–20 % oszczędności; do 7 pełnych redukcji na skan zamiast 3. Trzy skany korpusu kończą na limicie 12 000 łat już po pierwszej rundzie — do zmierzenia z limitem 30 000 i 60 000 (po #80 sieć może mieć 120 000 łat, STEP jest 10 × mniejszy).
-- P9-O3 (#80): limit 120 000 łat wynika z ponadliniowego kosztu wstawiania ścian w solidcore (odczytane ze źródeł, nie z profilera); sieć z kilkoma zamkniętymi kawałkami (pustki) zachowuje podaną orientację — przypadek sprawdzony tylko na poziomie orientacji; kawałek o objętości bliskiej zera jest odrzucany; szkice zgłoszeń `docs/upstream/08`, `09` (healer ponadliniowy, limit walidacji) niewysłane (decyzja D5).
+- P9-O3 (#80): limit 120 000 łat wynika z ponadliniowego kosztu wstawiania ścian w solidcore (odczytane ze źródeł, nie z profilera); sieć z kilkoma zamkniętymi kawałkami (pustki) zachowuje podaną orientację — przypadek sprawdzony tylko na poziomie orientacji; kawałek o objętości bliskiej zera jest odrzucany; szkice zgłoszeń `docs/upstream/08`, `09` (healer ponadliniowy, limit walidacji) niewysłane; zgoda właściciela na zgłoszenia jest od 2026-11-15 (D5), wysyłka zgodnie z zasadami repozytoriów solidcore/solidcraft.
 - P9-O5 (#79): bryły z pustkami lub kilkoma powłokami idą eksporterem solidcore (bez `BREP_WITH_VOIDS`); indeks spoza rekordu w ścianie analitycznej daje „nieobsługiwane” zamiast błędu eksportu; plik nieotwierany w zewnętrznym programie CAD.
 - P8-H2 (#83): `mesh.decimate` z celem liczby trójkątów nie jest dzielony na części (tylko ścieżka tolerancji); dziury stykające się wierzchołkiem są wypełniane niezależnie (wynik inny niż dawniej); gładkie wypełnienie dziury o tysiącach krawędzi trwa dziesiątki sekund (łata ograniczona do ok. 400 tys. trójkątów); niezmierzone: redukcja 5 mln, `perf_scan_scale` 10 mln.
 - P8-H11 (#85): obszar wykluczony maską widać w pokryciu jako dziurę (brak osobnej klasy); maska działa po środku ciężkości trójkąta; duża maska psuje dopasowanie (dziura mostkowana lokalną kwadryką); maska usuwająca koniec regionu może uniemożliwić przycięcie (zgłaszane w `trim_error`); przy podziale siatka pokrycia dotyczy pierwszego kawałka; nowe pola nieoglądane w interfejsie.
@@ -328,7 +328,7 @@ ScanRuler jest na AGPL-3.0 — każdy punkt to wyłącznie reimplementacja clean
    narzędzi (dziś 104+), kolejka zadań, komenda kontroli skanu, raport ciało-vs-skan per ściana, wybór ścian/krawędzi
    po odcisku geometrycznym zamiast indeksu pozycyjnego (dług powyżej).
 
-Do decyzji użytkownika: czy SurfaceCraft dostaje warstwę inspekcji (wymiary, GD&T, grubość ścianek, pomiar 2D).
+Decyzja właściciela z 2026-11-15 (D1): SurfaceCraft dostaje pełną warstwę inspekcji (wymiary, GD&T, grubość ścianek, pomiar 2D) — etap I planu P9.
 
 ## Następny krok
 
@@ -445,3 +445,13 @@ MEDIUM; w poprawkach, potem 4. runda), #127 (małe zamknięte części skanu wie
 częściach niezamodelowanych), diagnoza skanu 2 na limicie łat. Kolejność: (1) #123; (2) #127 i skan 2; (3) wypełnienie
 dużej dziury odwracające bryłę (skany 5, 6); (4) M5 (kreator wielu skanów) po M4; (5) kody błędów (R4) po M4; (6) dług
 hybrydy (limit 64 grup, triangulacja większa od pola) i reszta fal 3–5 planu P9.
+
+Decyzje właściciela z 2026-11-15 (plan P9, D1–D6): D1 — pełna warstwa inspekcji (etap I, I1–I7; dokument projektowy §2
+dostał piątą funkcję); D2 — eksport drzewa cech dla zewnętrznego CAD w przyszłości (etap X czeka); D3 — certyfikaty
+podpisu w przyszłości (wydania nadal niepodpisane); D4 — asystent obsługuje najpopularniejsze aktualne standardy API
+(zgodny z OpenAI, Anthropic Messages, Google Gemini; R2); D5 — zgoda na zgłoszenia do solidcore/solidcraft zgodnie z
+zasadami ich repozytoriów (szkice `docs/upstream/08`–`12`); D6 — prawdziwe skany to 4 otwarte skany Artec Group (CC BY),
+pobierane skryptem i trzymane poza repo z uwagi na rozmiar; przebieg przez Geomagic i QuickSurface (V3) nie
+teraz. Kolejność po tym: (1) #123, #127, skan 2 (inna sesja); (2) wypełnienie dużej dziury odwracające bryłę
+(skany 5, 6; w toku); (3) zgłoszenia upstream; (4) M5 i R4 po M4; (5) dług hybrydy i skan 3; (6) R2 i etap I; (7) reszta
+fal 3–5 planu P9.
