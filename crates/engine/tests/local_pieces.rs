@@ -214,3 +214,58 @@ fn model_every_piece_alone() {
         }
     }
 }
+
+/// `scan.to_solid` with every default on the listed scans: verdict, parts by kind, what was not
+/// modelled to a pass, time, size of the result, and per part the extra attempts it used or was refused.
+#[test]
+#[ignore = "needs SURFACECRAFT_LOCAL_CORPUS (third-party scans, never committed)"]
+fn to_solid_of_many_parts() {
+    for (n, path) in corpus() {
+        let mut s = Session::new();
+        let mut import = json!({"path": path.to_string_lossy(), "name": "scan"});
+        if n == 8 {
+            import["units"] = json!("m");
+        }
+        s.execute("mesh.import", import).unwrap();
+        let started = std::time::Instant::now();
+        let out = s.execute("scan.to_solid", json!({"scan": "scan"})).unwrap();
+        let seconds = started.elapsed().as_secs_f64();
+        let codes: Vec<&str> =
+            out["issues"].as_array().into_iter().flatten().filter_map(|i| i["code"].as_str()).collect();
+        let comps = out["components"].as_array().cloned().unwrap_or_default();
+        let co = comps.iter().filter(|c| c["co_equal"] == true).count();
+        let not_pass: Vec<String> = comps
+            .iter()
+            .filter(|c| c["verdict"] != "pass")
+            .map(|c| format!("{}:{}", c["triangles"], c["verdict"]))
+            .collect();
+        eprintln!(
+            "C{n:02}: verdict {} in {seconds:.1} s; within {:.4}; parts {} ({co} co-equal); not passed {not_pass:?}; issues {codes:?}; result {} bytes",
+            out["verdict"],
+            out["deviation"]["within"].as_f64().unwrap_or(0.0),
+            comps.len(),
+            out.to_string().len(),
+        );
+        if let Some(p) = out["preparation"].as_array().and_then(|a| a.first()) {
+            eprintln!("    preparation {}: {}", p["step"], p["numbers"]);
+        }
+        for (k, c) in comps.iter().enumerate() {
+            let tried: Vec<String> = c["attempts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|a| format!("{}:{}:{:.1}", a["method"], a["verdict"], a["seconds"].as_f64().unwrap_or(0.0)))
+                .collect();
+            let prep: Vec<&str> =
+                c["preparation"].as_array().into_iter().flatten().filter_map(|x| x["step"].as_str()).collect();
+            eprintln!(
+                "    part {k:3} tris {:6} co-equal {} verdict {} within {:.4} retry {} prep {prep:?} attempts {tried:?}",
+                c["triangles"],
+                c["co_equal"],
+                c["verdict"],
+                c["deviation"]["within"].as_f64().unwrap_or(0.0),
+                c["retry"]["reason"],
+            );
+        }
+    }
+}

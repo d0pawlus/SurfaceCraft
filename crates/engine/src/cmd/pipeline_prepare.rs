@@ -24,6 +24,7 @@ use serde_json::{Value, json};
 use surfacecraft_doc::ObjectId;
 
 pub(super) use super::parts::{PART_SHARE, coequal_parts};
+use super::parts_report::rank;
 
 /// Co-equal parts (largest first) that may be rebuilt and wrapped again in one call. Small parts are
 /// never rebuilt: on the scan of many parts the rebuild of a watertight non-manifold small part took
@@ -277,24 +278,8 @@ fn run_part(
     };
     let triangles = s.doc.mesh(id).map_or(0, |m| m.mesh.triangle_count());
     let mut out = model_part(s, &part_in, set, id)?;
-    if needs_freeform(i.method, &out) {
-        // the primitives found no closed solid in this part: model it as freeform instead
-        let watch = Stopwatch::start();
-        let again = model_part(s, &ToSolidIn { method: Method::Freeform, ..part_in.clone() }, set, id)?;
-        if again.body.is_some() {
-            let step = PrepStep {
-                step: "freeform_fallback".into(),
-                reason: "the primitives built no solid for this part, so it was wrapped in patches".into(),
-                numbers: json!({"primitive_issues": out.issues.iter().map(|x| x.code.clone()).collect::<Vec<_>>(), "ms": watch.ms()}),
-            };
-            // the attempts that came before stay in the list (none of them is the returned one now)
-            let mut tried = std::mem::take(&mut out.attempts);
-            tried.iter_mut().for_each(|a| a.returned = false);
-            out = again;
-            tried.append(&mut out.attempts);
-            out.attempts = tried;
-            out.prep.preparation.insert(0, step);
-        }
+    if needs_freeform(i.method, &out, &set.budget.refusal()) {
+        out = freeform_fallback(s, &part_in, set, id, out)?;
     }
     let comp = ComponentOut {
         mesh: id,
@@ -315,15 +300,65 @@ fn run_part(
     Ok((comp, out))
 }
 
-/// Did the primitives (not a freeform wrap) leave this part without a solid, and has no freeform wrap
-/// been run for it yet (`auto` may have run one as its second method)? Then the part gets its one wrap.
-fn needs_freeform(method: Method, out: &ToSolidOut) -> bool {
-    let wrapped_already = out.attempts.iter().any(|a| a.method == Method::Freeform && a.skipped.is_none());
+/// Should this part get its one freeform wrap after the primitives? When they left it without a solid,
+/// or when they did not pass and `auto`'s freeform attempt was refused because the call's extra
+/// attempts were spent (`refusal`): a part's own wrap is no extra attempt. On the scan of many parts,
+/// twelve small parts ended without a pass that way; each passed as freeform on its own.
+fn needs_freeform(method: Method, out: &ToSolidOut, refusal: &str) -> bool {
+    let ran = |m: Method| out.attempts.iter().any(|a| a.method == m && a.skipped.is_none());
+    let starved = out
+        .attempts
+        .iter()
+        .any(|a| a.method == Method::Freeform && a.skipped.as_ref().is_some_and(|k| k.reason == refusal));
+    let primitives_failed = out.verdict == Verdict::Fail && out.body.is_none();
     method == Method::Auto
-        && out.verdict == Verdict::Fail
-        && out.body.is_none()
         && out.method != Method::Freeform
-        && !wrapped_already
+        && !ran(Method::Freeform)
+        && (primitives_failed || (starved && out.verdict != Verdict::Pass))
+}
+
+/// Does `again` explain the part better than `first`: a solid, and a better verdict or the same with
+/// more of the part within the tolerance?
+fn wins(again: &ToSolidOut, first: &ToSolidOut) -> bool {
+    let within = |o: &ToSolidOut| o.deviation.as_ref().map_or(0.0, |d| d.within);
+    let (a, f) = (rank(again.verdict), rank(first.verdict));
+    again.body.is_some() && (a > f || (a == f && within(again) > within(first)))
+}
+
+/// The part's one freeform wrap after a failed primitives result: the better of the two is kept (its
+/// attempts after the other's), the other's solid is removed.
+fn freeform_fallback(
+    s: &mut Session,
+    part_in: &ToSolidIn,
+    set: &Settings,
+    id: ObjectId,
+    mut out: ToSolidOut,
+) -> CmdResult<ToSolidOut> {
+    let watch = Stopwatch::start();
+    let mut again = model_part(s, &ToSolidIn { method: Method::Freeform, ..part_in.clone() }, set, id)?;
+    if !wins(&again, &out) {
+        if let Some(b) = &again.body {
+            s.doc.remove(b.id);
+        }
+        again.attempts.iter_mut().for_each(|a| a.returned = false);
+        out.attempts.append(&mut again.attempts);
+        return Ok(out);
+    }
+    if let Some(b) = &out.body {
+        s.doc.remove(b.id);
+    }
+    let step = PrepStep {
+        step: "freeform_fallback".into(),
+        reason: "the primitives did not model this part, so it was wrapped in patches as its one wrap".into(),
+        numbers: json!({"primitive_issues": out.issues.iter().map(|x| x.code.clone()).collect::<Vec<_>>(), "ms": watch.ms()}),
+    };
+    // the attempts that came before stay in the list (none of them is the returned one now)
+    let mut tried = std::mem::take(&mut out.attempts);
+    tried.iter_mut().for_each(|a| a.returned = false);
+    tried.append(&mut again.attempts);
+    again.attempts = tried;
+    again.prep.preparation.insert(0, step);
+    Ok(again)
 }
 
 /// Runs `run` on the document; a failure other than a cancellation takes back everything the run

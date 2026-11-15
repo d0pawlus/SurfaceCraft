@@ -23,6 +23,18 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
   `close_handles` uses it. `mesh.close_handles` takes candidates refused for splitting the surface
   back one by one.
 
+### Changed
+
+- `scan.to_solid` on a scan of many parts models every piece that is a solid, not only those with
+  `part_share` of the largest: a watertight, consistently oriented piece of positive volume with at
+  least 100 triangles and 50 tolerances across is a *small part*, modelled with its own verdict
+  (`components[].co_equal` tells the kinds apart). A small part that does not pass never fails the
+  call; with the pieces left out and the parts past the cap it counts against the 2 % bound of a
+  pass (`unmodelled_pieces`, new `parts_not_passed`). Pieces left out carry a reason (`debris`,
+  `open`, `not_oriented`, `inside_out`); the 16 largest are listed in `pieces_left_out`. The cap of
+  parts per call rises from 24 to 128, the cleaning keeps small parts below its default, and small
+  parts are never rebuilt.
+
 ## [0.2.0] - 2026-11-13
 
 Four days and 60 merged pull requests after 0.1.0. The release is about real scans: one command now takes

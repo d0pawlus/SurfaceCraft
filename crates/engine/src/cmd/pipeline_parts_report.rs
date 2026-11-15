@@ -61,7 +61,7 @@ pub(super) struct Tally {
     pub ms: u64,
 }
 
-fn rank(v: Verdict) -> u8 {
+pub(super) fn rank(v: Verdict) -> u8 {
     match v {
         Verdict::Pass => 2,
         Verdict::Review => 1,

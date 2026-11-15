@@ -128,7 +128,7 @@ fn two_percent_of_unmodelled_surface_is_the_boundary_of_the_review_cap() {
 }
 
 #[test]
-fn only_a_primitives_failure_without_a_body_is_wrapped_as_freeform() {
+fn a_failed_primitives_result_gets_the_one_freeform_wrap_and_the_better_is_kept() {
     let set = Settings {
         scan: ObjectId(0),
         tolerance: 0.2,
@@ -142,12 +142,42 @@ fn only_a_primitives_failure_without_a_body_is_wrapped_as_freeform() {
         handle_size: None,
         name: "solid".into(),
     };
+    let refusal = set.budget.refusal();
     let mut out = failure(&set, ObjectId(1), "x");
-    assert!(!needs_freeform(Method::Auto, &out), "a freeform failure is not repeated");
+    assert!(!needs_freeform(Method::Auto, &out, &refusal), "a freeform failure is not repeated");
     out.method = Method::Primitives;
-    assert!(needs_freeform(Method::Auto, &out));
-    assert!(!needs_freeform(Method::Freeform, &out));
-    assert!(!needs_freeform(Method::Primitives, &out));
+    assert!(needs_freeform(Method::Auto, &out, &refusal));
+    assert!(!needs_freeform(Method::Freeform, &out, &refusal));
+    assert!(!needs_freeform(Method::Primitives, &out, &refusal));
+    // a primitives solid under review whose freeform attempt was refused by the spent budget gets the
+    // part's wrap; refused for another reason (or not refused) it does not
+    let body = BodyOut { id: ObjectId(7), faces: 6, edges: 12, vertices: 8, volume: Some(1.0) };
+    out.body = Some(body.clone());
+    out.verdict = Verdict::Review;
+    assert!(!needs_freeform(Method::Auto, &out, &refusal));
+    let skipped = |reason: &str| super::super::auto::Attempt {
+        method: Method::Freeform,
+        verdict: None,
+        issues: Vec::new(),
+        seconds: 0.0,
+        returned: false,
+        error: None,
+        skipped: Some(super::super::auto::Skipped {
+            reason: reason.to_string(),
+            call: super::super::NextStep { command: "scan.to_solid".into(), params: json!({}), why: String::new() },
+        }),
+    };
+    out.attempts = vec![skipped("the caller asked for one method")];
+    assert!(!needs_freeform(Method::Auto, &out, &refusal));
+    out.attempts = vec![skipped(&refusal)];
+    assert!(needs_freeform(Method::Auto, &out, &refusal));
+    out.verdict = Verdict::Fail;
+    let mut wrapped = failure(&set, ObjectId(1), "y");
+    assert!(!wins(&wrapped, &out), "no solid never wins");
+    wrapped.body = Some(body);
+    wrapped.verdict = Verdict::Pass;
+    assert!(wins(&wrapped, &out));
+    assert!(!wins(&out, &wrapped), "a failed result does not beat a pass");
 }
 
 /// A cancellation between two parts (set by the hook after the first part has been modelled, so no

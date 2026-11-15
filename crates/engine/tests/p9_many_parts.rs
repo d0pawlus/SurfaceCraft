@@ -183,3 +183,32 @@ fn hostile_pieces_never_panic() {
         assert!(parts(&out).len() <= 2, "{out}");
     }
 }
+
+/// A block and three bosses that no primitive closes: under `auto` each boss is tried with
+/// primitives first and wrapped as freeform second. The first two bosses spend the call's two extra
+/// attempts; the third must still get its one wrap (it is not an extra attempt) and pass.
+#[test]
+fn gate_a_part_after_the_spent_budget_still_gets_its_freeform_wrap() {
+    let mut scan = synth::cuboid(Point3::new(0.0, 0.0, 0.0), Vec3::new(40.0, 30.0, 20.0), 16);
+    for k in 0..3 {
+        let mut boss = weld(synth::cylinder(Point3::origin(), Vec3::z(), 8.0, 31.0, 96, 24));
+        boss.positions.iter_mut().for_each(|p| p.x += 80.0 + 40.0 * f64::from(k));
+        scan.append(&boss);
+    }
+    let mut s = session_with(scan);
+    let out = s.execute("scan.to_solid", json!({"scan": "scan"})).unwrap();
+    let comps = parts(&out);
+    assert_eq!(comps.len(), 4, "{out}");
+    for c in &comps {
+        assert_eq!(c["verdict"], "pass", "{c}");
+    }
+    let skipped = comps.iter().filter(|c| {
+        c["attempts"].as_array().unwrap().iter().any(|a| a["method"] == "freeform" && a["skipped"].is_object())
+    });
+    assert!(
+        skipped.clone().all(|c| c["preparation"].as_array().unwrap().iter().any(|p| p["step"] == "freeform_fallback")),
+        "a part refused the second method gets its wrap: {out}"
+    );
+    assert!(skipped.count() >= 1, "the budget was spent before the last boss: {out}");
+    assert_eq!(out["verdict"], "pass", "{out}");
+}
