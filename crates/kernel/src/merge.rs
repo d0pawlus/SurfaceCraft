@@ -401,7 +401,9 @@ const MAX_BATCHES: usize = 4;
 /// of a merge is linear in its groups: the groups are settled a batch at a time, and where the kernel refuses a
 /// whole batch each group of it costs up to two rebuilds of the body, in each of the rounds. The bound is four
 /// batches: three times the most groups measured on a real scan (84), and four times the work of the single batch
-/// of 64 that was the bound before the groups were batched.
+/// of 64 that was the bound before the groups were batched. It counts the specs as they are given, in order (a spec
+/// that overlaps an earlier group or cannot be prepared uses a place too): the bound has to hold before anything is
+/// worked out of a spec, and the caller passes disjoint groups, the largest first.
 pub const MAX_GROUPS: usize = MAX_BATCHES * settle::BATCH;
 
 /// Merges the faces `group` of `body` into one face on `shape`, within `max_gap` of it.
@@ -524,14 +526,118 @@ mod tests {
             assert!(
                 faces.iter().all(|&f| r.brep.faces.get(f).is_some_and(|f| matches!(f.surface, Surface::Plane { .. })))
             );
+            // each group's face is where its patches were (the pairs differ by place), and the face map leads its lowest
+            // patch there and its other patch nowhere
             for (g, result) in many.iter().zip(&r.groups) {
-                let face = result.as_ref().map(|x| x.face).ok();
-                assert!(
-                    g.iter().all(|&f| r.face_map.get(f).copied().flatten().is_none()
-                        || r.face_map.get(f).copied().flatten() == face)
-                );
+                let face = result.as_ref().map(|x| x.face).unwrap();
+                assert_eq!(r.face_map[g[0]], Some(face), "all at once {all_at_once}: group {g:?}");
+                assert_eq!(r.face_map[g[1]], None, "all at once {all_at_once}: group {g:?}");
+                let (a, b) = (vertex_centroid(&r.brep, &[face]), vertex_centroid(&big, g));
+                assert!((0..3).all(|k| (a[k] - b[k]).abs() < 1e-6), "group {g:?}: {a:?} against {b:?}");
             }
         }
+    }
+
+    /// The mean of the vertices of the loops of `faces` of `b`.
+    fn vertex_centroid(b: &Brep, faces: &[usize]) -> [f64; 3] {
+        let mut vertices = BTreeSet::new();
+        for &f in faces {
+            for l in &b.faces[f].loops {
+                if let Loop::Edges { edges } = l {
+                    for e in edges {
+                        vertices.extend(b.edges[e.edge as usize].vertices.iter().copied());
+                    }
+                }
+            }
+        }
+        let n = vertices.len().max(1) as f64;
+        let mut c = [0.0; 3];
+        for v in &vertices {
+            let p = b.vertices[*v as usize].point;
+            for k in 0..3 {
+                c[k] += p[k] / n;
+            }
+        }
+        c
+    }
+
+    /// Each of `groups` of `body` prepared on `shape` (not snapped).
+    fn prepared_groups(body: &Brep, groups: &[Vec<usize>], shape: &Shape) -> Vec<Prepared> {
+        groups
+            .iter()
+            .map(|g| {
+                let spec = GroupSpec { faces: g, shape };
+                let group = geometry::group_of(body, g).unwrap();
+                prepare(body, &spec, &group, (0.05, 0.05)).unwrap()
+            })
+            .collect()
+    }
+
+    /// `p` with an edge of its outer loop dropped: a trim that leaves a corner out.
+    fn broken(p: &mut Prepared) {
+        if let Some(Loop::Edges { edges }) = p.face.loops.first_mut() {
+            edges.remove(1);
+        }
+    }
+
+    /// A group refused in a later batch leaves the batch before it as it was: its verdicts and its faces, each where its
+    /// patches were. The later batch is one sound group and one with a wrong trim, then the wrong one alone (the whole
+    /// batch refused).
+    #[test]
+    fn a_group_refused_in_a_later_batch_leaves_the_earlier_batch_as_it_was() {
+        let body = flat_sheet(16);
+        let shape = plane();
+        let groups: Vec<Vec<usize>> = pairs(16).into_iter().take(settle::BATCH + 2).collect();
+        let run = Run { cancel: &|| false, all_at_once: true, chord: 0.1 };
+        for (count, wrong) in [(settle::BATCH + 2, settle::BATCH + 1), (settle::BATCH + 1, settle::BATCH)] {
+            let mut prepared = prepared_groups(&body, &groups[..count], &shape);
+            broken(&mut prepared[wrong]);
+            let refs: Vec<&Prepared> = prepared.iter().collect();
+            let (brep, map, verdicts) = settle::settle(&body, None, &refs, &run).unwrap();
+            assert_eq!(verdicts.len(), count);
+            assert!(verdicts.iter().take(settle::BATCH).all(std::result::Result::is_ok), "{count}: the first batch");
+            assert!(verdicts[wrong].is_err(), "{count}: the wrong trim is refused");
+            let merged = verdicts.iter().filter(|v| v.is_ok()).count();
+            assert_eq!(brep.faces.len(), body.faces.len() - merged, "{count}: one face per merged pair");
+            for g in groups.iter().take(settle::BATCH) {
+                let face = map[g[0]].unwrap();
+                assert!(matches!(brep.faces[face].surface, Surface::Plane { .. }), "{count}: group {g:?}");
+                let (a, b) = (vertex_centroid(&brep, &[face]), vertex_centroid(&body, g));
+                assert!((0..3).all(|k| (a[k] - b[k]).abs() < 1e-6), "{count}: group {g:?}: {a:?} against {b:?}");
+            }
+        }
+    }
+
+    /// A new face the kernel gives back as a spline (its surface not recognised) is no analytic face: the group is
+    /// refused with that reason. The body itself stands for the rebuilt one: its face 0 is a spline patch.
+    #[test]
+    fn a_new_face_given_back_as_a_spline_is_refused_with_the_reason() {
+        let body = flat_sheet(4);
+        let shape = plane();
+        let p = prepared_groups(&body, &[vec![0, 1, 4, 5]], &shape).remove(0);
+        let why = settle::face_verdict(&body, &body, 0, &p, 0.1).unwrap().unwrap_err();
+        assert!(why.contains("spline"), "{why}");
+    }
+
+    /// The checks of the new faces poll the cancellation between faces: a merge cancelled after its rebuild stops
+    /// before it has judged them.
+    #[test]
+    fn the_checks_of_the_new_faces_are_cancelled_between_faces() {
+        let body = flat_sheet(4);
+        let shape = plane();
+        let prepared = prepared_groups(&body, &pairs(4), &shape);
+        let refs: Vec<&Prepared> = prepared.iter().collect();
+        let polls = std::cell::Cell::new(0);
+        let late = || {
+            polls.set(polls.get() + 1);
+            polls.get() > 1
+        };
+        let run = Run { cancel: &late, all_at_once: true, chord: 0.1 };
+        let r = settle::settle(&body, None, &refs, &run);
+        assert!(
+            r.as_ref().is_err_and(|e| e.to_string().contains("cancelled")),
+            "cancelled while the faces were judged"
+        );
     }
 
     /// The hard bound on hostile input: the specs past [`MAX_GROUPS`] stay patches and say why, the others are
