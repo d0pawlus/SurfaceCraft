@@ -114,3 +114,11 @@ fn a_round_that_halves_the_side_miss_within_the_tolerance_is_kept() {
     let new = Summary { data_ok: false, data_max: 0.9, side_miss: 8.0 };
     assert!(!prefer(&new, &kept));
 }
+
+#[test]
+fn a_smooth_reference_has_no_feature_across_the_side() {
+    // the cylinder's curvature across every side of the hole changes slowly along it
+    let patch = fit_patch(&cylinder_hole(Continuity::G2)).unwrap();
+    assert!(patch.report.sides.iter().all(|s| !s.feature_across), "{:?}", patch.report);
+    assert!(!patch.report.warnings.iter().any(|w| w.contains("feature")), "{:?}", patch.report);
+}

@@ -132,6 +132,10 @@ pub struct SideReport {
     /// The side meets its targets: gap, and for G1/G2 angle, curvature and no fold. Always true for
     /// a soft side, which has none.
     pub met: bool,
+    /// A feature of the reference face crosses the side (G1/G2 sides): the face's normal curvature
+    /// across the side varies along it by more than [`FEATURE_SPREAD`] times the smallest curvature
+    /// the G2 error is taken against. One patch cannot continue such a face along the whole side.
+    pub feature_across: bool,
 }
 
 /// A corner whose sides ask for tangent planes that disagree.
@@ -207,6 +211,10 @@ pub struct Patch {
 pub const G0_TARGET: f64 = 1e-3;
 /// Target of the angle between normals along a G1/G2 side, degrees.
 pub const G1_TARGET_DEG: f64 = 0.05;
+/// Spread (standard deviation along a side) of the reference face's normal curvature across the
+/// side, in units of `1 / (4 diag)`, above which a feature of the face is taken to cross the side.
+/// Measured on four real scans: at most 0.82 on the sides where G2 held, at least 3.2 where it did not.
+pub const FEATURE_SPREAD: f64 = 1.6;
 /// Target of the relative normal curvature error along a G2 side.
 pub const G2_TARGET_REL: f64 = 0.05;
 /// Corners whose tangent planes differ by more than this (degrees) are in conflict.

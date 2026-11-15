@@ -329,6 +329,8 @@ struct Row {
     /// Standard deviation along the shared side of this patch's normal curvature across it (1/mm):
     /// how usable the patch is as a G2 reference.
     spread: Option<f64>,
+    /// The command names a feature of the reference face across a side.
+    feature_warned: bool,
 }
 
 fn largest(sides: &[Value], field: &str, keep: impl Fn(&Value) -> bool) -> Option<f64> {
@@ -359,6 +361,9 @@ fn patch(session: &mut Session, label: &str, params: Value) -> Row {
         control: r["control"].to_string(),
         surface: r["surface"].as_u64(),
         spread: None,
+        feature_warned: r["warnings"].as_array().is_some_and(|w| {
+            w.iter().any(|x| x.as_str().is_some_and(|t| t.contains("a feature of the reference face")))
+        }),
     }
 }
 
@@ -498,9 +503,14 @@ fn artec_patch_fit_and_continuity() {
                         && !row.folded
                         && row.curvature.is_some_and(|c| c <= G2_GATE)
                         && row.angle.is_some_and(|a| a <= G1_GATE_DEG);
-                    if !held {
+                    if !held || row.feature_warned {
                         failures.push(format!("{tag} {}: {row:?}", row.label));
                     }
+                }
+                // a G2 side that missed across a feature says so
+                let missed = row.error.is_none() && row.curvature.is_some_and(|c| c > 0.05);
+                if !smooth && row.label.contains("g2") && missed && !row.feature_warned {
+                    failures.push(format!("{tag} {}: no feature warning: {row:?}", row.label));
                 }
                 // soft sides follow the scan: the fit must succeed and stay unfolded
                 if row.label.ends_with("soft") && (row.error.is_some() || row.folded) {

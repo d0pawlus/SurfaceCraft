@@ -54,7 +54,8 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
   kept before); a soft side next to a side with a reference face is no longer a corner conflict
   that relaxes the G1 and G2 conditions near the corner. On the Artec corpus G2 holds its 5 %
   target at 8 of 12 sites (2 of 11 before), every site where no feature of the part crosses the
-  shared side. [#139]
+  shared side. Where one does and the side misses its targets, a warning says so and advises to
+  split the side at the feature or to ask for G1 there. [#139]
 - `scan.to_solid` on a split scan: a part whose `auto` freeform attempt was refused because the call's
   two extra attempts were spent, and whose primitives did not pass, is now wrapped once as its own
   wrap and the better result is kept (twelve small parts of the scan of many parts ended without a
