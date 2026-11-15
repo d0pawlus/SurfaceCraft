@@ -42,7 +42,7 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
   the shape; the energy is relaxed in steps only as far as the scan data need to come within
   `tolerance`. Before, such a patch followed the texture of a dense scan, which made its curvature
   useless as a G2 reference for a neighbouring patch. Its `rms` is a little larger than before;
-  pass a smaller `tolerance` for a closer fit. [#139, this change]
+  pass a smaller `tolerance` for a closer fit. [#139, #167]
 - `surface.patch` with a G2 side may take up to 18 rounds instead of 6: the curvature conditions
   are iterated on the same control net until they converge, and only then is the net refined. [#139]
 
