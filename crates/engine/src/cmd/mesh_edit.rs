@@ -29,6 +29,11 @@ pub struct EditOut {
     /// Holes left open (above the size limit, not triangulable, or whose fill would put three triangles on one edge).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub holes_left: Option<usize>,
+    /// Of the holes left, those whose fill would have closed the mesh inside out: the scanned face would point
+    /// into the volume the patches enclose, which then cap the space in front of it (the loop is the open edge
+    /// of a sheet seen from its hollow side, not a hole). Absent when there are none.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub holes_inward: Option<usize>,
     /// Folds removed by `mesh.clean` (see `remove_folds`); absent when the step did not run.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub folds: Option<FoldsOut>,
@@ -127,6 +132,7 @@ fn edit_mesh(
         added_triangles: 0,
         holes_filled: None,
         holes_left: None,
+        holes_inward: None,
         folds: None,
         max_displacement: None,
         regions_dropped: 0,
@@ -221,6 +227,7 @@ pub(crate) fn clean(s: &mut Session, i: CleanIn) -> CmdResult<EditOut> {
             o.added_triangles += m.triangle_count() - before;
             o.holes_filled = Some(r.filled);
             o.holes_left = Some(r.skipped);
+            o.holes_inward = (r.inward > 0).then_some(r.inward);
         }
         // after the holes are filled: a patch can cross the sheet around it
         if i.remove_folds.unwrap_or(false) {
@@ -330,6 +337,7 @@ pub(crate) fn fill(s: &mut Session, i: FillIn) -> CmdResult<EditOut> {
         o.added_triangles = m.triangle_count() - before;
         o.holes_filled = Some(r.filled);
         o.holes_left = Some(r.skipped);
+        o.holes_inward = (r.inward > 0).then_some(r.inward);
         Ok(())
     })
 }

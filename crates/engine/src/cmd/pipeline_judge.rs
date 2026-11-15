@@ -20,6 +20,7 @@ pub(super) struct Outcome {
     pub(super) left_out: Vec<LeftOut>,
     pub(super) unassigned: usize,
     pub(super) holes_left: usize,
+    pub(super) holes_inward: usize,
     pub(super) non_manifold: usize,
 }
 
@@ -105,9 +106,7 @@ fn context_issues(o: &Outcome, total_triangles: usize) -> Vec<Issue> {
         let share = 100.0 * o.unassigned as f64 / total_triangles as f64;
         list.push(issue("unassigned_triangles", format!("{} triangles ({share:.1} %) are in no region", o.unassigned)));
     }
-    if o.holes_left > 0 {
-        list.push(issue("scan_defects", format!("{} holes of the scan were too large to fill", o.holes_left)));
-    }
+    list.extend(super::defects_issue(o.holes_left, o.holes_inward));
     if o.non_manifold > 0 {
         let msg = format!(
             "{} edges are shared by three or more triangles; regions and holes next to them are unreliable",

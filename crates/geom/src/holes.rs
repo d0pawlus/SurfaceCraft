@@ -5,6 +5,8 @@ use crate::ear::{ear_clip_avoiding, fan_fill};
 use crate::{Mesh, Point3, Vec3, par, tri};
 use std::collections::{HashMap, HashSet};
 
+mod inward;
+
 /// Closed boundary loops as vertex lists, each in the direction of its triangles' edges.
 #[must_use]
 pub fn boundary_loops(mesh: &Mesh) -> Vec<Vec<u32>> {
@@ -66,9 +68,14 @@ pub fn boundary_loops(mesh: &Mesh) -> Vec<Vec<u32>> {
 pub struct FillReport {
     /// Holes filled.
     pub filled: usize,
-    /// Holes left (longer than the limit, not triangulable, or whose fill would put three triangles
-    /// on one edge).
+    /// Holes left (longer than the limit, not triangulable, whose fill would put three triangles
+    /// on one edge, or counted in `inward`).
     pub skipped: usize,
+    /// Of the holes left, those whose patches would have closed their piece of the mesh inside out:
+    /// the scanned face would point into the volume the patches enclose (the loop is the open edge of
+    /// a sheet seen from its hollow side, not a hole), and the patches would be a large share of the
+    /// piece.
+    pub inward: usize,
     /// Triangles added.
     pub added_triangles: usize,
 }
@@ -90,7 +97,9 @@ const WORKSPACE_RINGS: usize = 3;
 /// A fill never adds an edge shared by three or more triangles: a loop that touches itself is
 /// filled as the simple loops it is made of, a diagonal that is an edge of the mesh already is
 /// avoided, and a patch that would still overload an edge (with the mesh or with another patch) is
-/// not added; that hole stays open and is counted in `skipped`.
+/// not added; that hole stays open and is counted in `skipped`. Nor does a fill close a piece of the
+/// mesh inside out with patches that are a large share of it (`inward`, see `holes::inward`): of such
+/// a piece the loop with the largest patch stays open.
 pub fn fill_holes(mesh: &mut Mesh, max_edges: usize, smooth: bool) -> FillReport {
     fill_holes_with(mesh, max_edges, smooth, smooth)
 }
@@ -119,7 +128,6 @@ pub(crate) fn fill_holes_filtered(
     let (todo, long): (Vec<Vec<u32>>, Vec<Vec<u32>>) =
         simple_loops(boundary_loops(mesh)).into_iter().partition(|lp| lp.len() <= max_edges && accept(mesh, lp));
     rep.skipped = long.len();
-    drop(long);
     if todo.is_empty() {
         return rep;
     }
@@ -130,7 +138,14 @@ pub(crate) fn fill_holes_filtered(
     // a single hole stays on this thread (the crease tests read a thread-local reason)
     let patches: Vec<Patch> =
         if todo.len() < 2 { todo.iter().map(fill).collect() } else { par::map_slice(&todo, fill) };
-    for (lp, patch) in todo.iter().zip(patches) {
+    let refused = inward::refused(mesh, &todo, &patches, &long);
+    drop(long);
+    for ((lp, patch), refused) in todo.iter().zip(patches).zip(refused) {
+        if refused {
+            rep.skipped += 1;
+            rep.inward += 1;
+            continue;
+        }
         // the patches were made against the mesh as it was; a refused one is made again against
         // the edges as they are now (the accepted patches included), refined first, then flat
         let mut added = append_if_admitted(mesh, &mut uses, patch);

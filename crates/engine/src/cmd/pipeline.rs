@@ -249,6 +249,24 @@ pub(super) fn coverage_issue(d: &DeviationSummary, what: &str) -> Option<Issue> 
     Some(issue("low_coverage", msg))
 }
 
+/// The issues of the holes left open: `scan_defects` for those too large to fill, `fill_inside_out` for the
+/// loops whose fill would have closed the scan inside out (see `mesh.clean`): a larger fill limit does not
+/// help those, so `scan_defects` (and its offer of `mesh.fill_holes`) counts only the others.
+pub(super) fn defects_issue(left: usize, inward: usize) -> Vec<Issue> {
+    let inward = inward.min(left);
+    let mut list = Vec::new();
+    if left > inward {
+        list.push(issue("scan_defects", format!("{} holes of the scan were too large to fill", left - inward)));
+    }
+    if inward > 0 {
+        let msg = format!(
+            "{inward} boundary loops of the scan were not filled: the fill would have closed the scan inside out (the scanned face would point into the volume the patch encloses, so the solid would be the space in front of the scanned surface); such a loop is the open edge of a sheet seen from its hollow side, not a hole: the scan is modelled as a sheet, give it a `thickness` for a solid"
+        );
+        list.push(issue("fill_inside_out", msg));
+    }
+    list
+}
+
 fn issue(code: &str, message: String) -> Issue {
     Issue { code: code.to_string(), message }
 }
@@ -359,7 +377,7 @@ fn prepare(s: &mut Session, i: &ToSolidIn, scan: ObjectId) -> CmdResult<ScanSumm
     if let Some(f) = qa.findings.iter().find(|f| BLOCKING_FINDINGS.contains(&f.code.as_str())) {
         return Err(CmdError::Failed(format!("the scan cannot be modelled: {}", f.message)));
     }
-    let (mut filled, mut left, mut non_manifold) = (0, qa.holes, qa.non_manifold_edges);
+    let (mut filled, mut left, mut inward, mut non_manifold) = (0, qa.holes, 0, qa.non_manifold_edges);
     if i.clean && !i.reuse_regions {
         let edit = clean(
             s,
@@ -375,6 +393,7 @@ fn prepare(s: &mut Session, i: &ToSolidIn, scan: ObjectId) -> CmdResult<ScanSumm
         )?;
         filled = edit.holes_filled.unwrap_or(0);
         left = edit.holes_left.unwrap_or(0);
+        inward = edit.holes_inward.unwrap_or(0);
         if non_manifold > 0 {
             // cleaning removes debris and spikes, which is where most such edges are
             non_manifold = scan_qa(s, QaIn { object: ObjRef::Id(scan.0) })?.non_manifold_edges;
@@ -387,6 +406,7 @@ fn prepare(s: &mut Session, i: &ToSolidIn, scan: ObjectId) -> CmdResult<ScanSumm
         holes_before: qa.holes,
         holes_filled: filled,
         holes_left: left,
+        holes_inward: inward,
         non_manifold_edges: non_manifold,
         noise_sigma: noise,
         noise_used: None,
@@ -519,6 +539,7 @@ fn primitives_solid(s: &mut Session, i: &ToSolidIn, set: &Settings, scan_report:
         left_out: left,
         unassigned,
         holes_left: scan_report.holes_left,
+        holes_inward: scan_report.holes_inward,
         non_manifold: scan_report.non_manifold_edges,
     };
     build(s, set, &mut o)?;
