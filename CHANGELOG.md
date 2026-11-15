@@ -13,6 +13,14 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
 
 ### Added
 
+- Desktop control channel and bridged MCP: `ui.camera_get` and `ui.camera_set` (MCP tools `camera_get` and
+  `camera_set`) read and set the viewport camera next to `ui.screenshot`, so an agent can take comparable
+  before and after screenshots and put a view back exactly: target, distance, yaw, pitch and field of view
+  (perspective; the viewport has no orthographic camera) in mm and radians. `camera_set` takes any of these
+  fields, a standard view (`front`, `back`, `left`, `right`, `top`, `bottom`, `iso`) and `fit`, applied in that
+  order (view, fields, fit-all), and refuses bad numbers, unknown fields and unknown views without changing
+  anything. These are requests of the app, not engine commands: the camera is state of the viewport, so they
+  exist in the desktop app only (#NNN).
 - `mesh.close_handles`: closes the small handles of a scan (tunnels, bridges and the sponge of tiny
   tunnels where the two sides of a thin wall run together) as a new mesh, keeping the rim and every
   vertex away from them; `scan.to_solid` takes it as the option `close_handles` (with `handle_size`),

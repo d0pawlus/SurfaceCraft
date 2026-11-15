@@ -58,6 +58,19 @@ impl Backend for BridgeBackend {
         let s = r.get("png")?.as_str()?;
         decode_b64(s)
     }
+    fn ui_request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        let r = self.request(method, params).map_err(|e| text_of(e.get("message").unwrap_or(&e)))?;
+        match (r.get("ok"), r.get("err")) {
+            (Some(v), _) => Ok(v.clone()),
+            (None, Some(e)) => Err(text_of(e)),
+            _ => Err("malformed reply".into()),
+        }
+    }
+}
+
+/// A message value as text: a string as it is, anything else as JSON.
+fn text_of(v: &Value) -> String {
+    v.as_str().map_or_else(|| v.to_string(), str::to_string)
 }
 
 fn decode_b64(s: &str) -> Option<Vec<u8>> {

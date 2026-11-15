@@ -58,6 +58,28 @@ pub(crate) fn general_tools() -> Vec<Value> {
             obj(json!({"width": {"type": "integer"}, "height": {"type": "integer"}}), &[]),
         ),
         general(
+            "camera_get",
+            "The camera of the desktop app: target, distance, yaw_rad, pitch_rad, fov_rad, projection. Bridged mode only; values are exact.",
+            obj(json!({}), &[]),
+        ),
+        general(
+            "camera_set",
+            "Changes the camera of the desktop app (bridged mode only) and returns it as camera_get does. Every field is optional; a partial call changes only those. Applied in the order view, explicit fields, fit.",
+            obj(
+                json!({
+                    "view": {"type": "string", "enum": ["front", "back", "left", "right", "top", "bottom", "iso"], "description": "A standard view: turns the orientation, keeps target, distance and fov."},
+                    "target": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3, "description": "Point [x, y, z] the camera looks at, in mm."},
+                    "distance": {"type": "number", "description": "Distance from target to eye in mm, positive."},
+                    "yaw_rad": {"type": "number", "description": "Azimuth around Z in radians."},
+                    "pitch_rad": {"type": "number", "description": "Elevation in radians, within the poles (about plus or minus 1.5698)."},
+                    "fov_rad": {"type": "number", "description": "Vertical field of view in radians, 0.01 to 3."},
+                    "projection": {"type": "string", "enum": ["perspective"], "description": "The viewport camera is perspective only."},
+                    "fit": {"type": "boolean", "description": "Frame everything last: replaces target and distance."}
+                }),
+                &[],
+            ),
+        ),
+        general(
             "set_tool_mode",
             "Choose the tool listing from now on: `mode` compact (one tool per area, with verb and params, plus the workflow commands; the default) or full (one tool per command); `areas` limits either to some areas (null or [] for all). Keeps what is not given. Returns the new listing; call tools/list again to read the schemas (no list-changed notification is sent).",
             obj(

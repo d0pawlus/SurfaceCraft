@@ -1,8 +1,9 @@
 //! The desktop control channel (spike §3.5 item 18, "bridged" MCP): the app listens on
 //! `127.0.0.1` (random port) and writes `{port, token, pid}` to a discovery file; clients send
 //! JSON lines `{"token", "id", "method", "params"}` with methods `engine.execute`
-//! (`{command, params}`) and `ui.screenshot` (`{width, height}`). Requests are executed on the
-//! UI thread between frames, so the agent sees exactly what the user sees.
+//! (`{command, params}`), `ui.screenshot` (`{width, height}`) and `ui.camera_get` /
+//! `ui.camera_set` (the viewport camera, see [`crate::camera_control`]). Requests are executed on
+//! the UI thread between frames, so the agent sees exactly what the user sees.
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};

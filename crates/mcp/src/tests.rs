@@ -109,9 +109,53 @@ fn hostile_messages_never_panic() {
         r#"{"id": 1, "method": "tools/call", "params": {"name": "execute", "arguments": {"command": "no.such"}}}"#,
         r#"{"id": 1, "method": "tools/call", "params": {"name": "batch", "arguments": {"commands": [1, 2]}}}"#,
         r#"{"id": 1, "method": "tools/call", "params": {"name": "screenshot", "arguments": {"width": -5}}}"#,
+        r#"{"id": 1, "method": "tools/call", "params": {"name": "camera_set", "arguments": {"distance": "far", "x": []}}}"#,
+        r#"{"id": 1, "method": "tools/call", "params": {"name": "camera_get", "arguments": 5}}"#,
         r#"[{"id": 1, "method": "ping"}, {"method": "x"}]"#,
     ] {
         let _ = s.handle_line(line);
+    }
+}
+
+/// A host with a viewport: `camera_get` answers it, `camera_set` passes its arguments on.
+struct CameraBackend;
+
+impl Backend for CameraBackend {
+    fn execute(&mut self, _id: &str, _params: Value) -> Result<Value, Value> {
+        Err(json!({"kind": "failed", "message": "no session"}))
+    }
+    fn ui_request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        match method {
+            "ui.camera_get" => Ok(json!({"distance": 123.456_789_012_345, "yaw_rad": -1.234_567_890_123_4e-5})),
+            "ui.camera_set" if params.get("distance").is_some() => Ok(params),
+            _ => Err("refused".into()),
+        }
+    }
+}
+
+/// The camera tools: a headless host refuses, a host with a viewport answers, and the numbers of
+/// the camera are not rounded (the other results are, to 6 decimals), so they restore a view exactly.
+#[test]
+fn the_camera_tools_need_a_viewport_and_keep_every_digit() {
+    let mut local = server();
+    for name in ["camera_get", "camera_set"] {
+        let r = call(&mut local, name, json!({}));
+        assert_eq!(r["result"]["isError"], true, "{r}");
+        assert!(structured(&r)["error"].as_str().is_some_and(|m| m.contains("no viewport")), "{r}");
+    }
+    for mode in [ToolConfig::full(), ToolConfig::default()] {
+        let mut s = Server::new(CameraBackend).with_tools(mode);
+        let listed = names(&mut s);
+        assert!(listed.iter().any(|n| n == "camera_get") && listed.iter().any(|n| n == "camera_set"), "{listed:?}");
+        let got = call(&mut s, "camera_get", json!({}));
+        assert_eq!(got["result"]["isError"], false, "{got}");
+        assert_eq!(structured(&got)["distance"], json!(123.456_789_012_345));
+        assert_eq!(structured(&got)["yaw_rad"], json!(-1.234_567_890_123_4e-5));
+        let args = json!({"distance": 0.123_456_789_012_345, "target": [1.0, 2.0, 3.0]});
+        let set = call(&mut s, "camera_set", args.clone());
+        assert_eq!(structured(&set), &args);
+        let refused = call(&mut s, "camera_set", json!({"fit": true}));
+        assert_eq!(refused["result"]["isError"], true, "{refused}");
     }
 }
 
