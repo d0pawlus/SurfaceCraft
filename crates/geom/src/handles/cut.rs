@@ -149,7 +149,7 @@ pub(super) fn attempt(mesh: &Mesh, cands: &[Candidate], skip: &[bool], b: Bounds
     let before = out.triangles.len();
     let owned = |v: &u32| owner.get(*v as usize).is_some_and(|&o| o != u32::MAX);
     let accept = |_: &Mesh, lp: &[u32]| lp.iter().all(owned);
-    holes::fill_holes_filtered(&mut out, FILL_MAX_EDGES, true, true, &accept);
+    holes::fill_holes_filtered(&mut out, FILL_MAX_EDGES, (true, true), holes::Guard::RefuseInward, &accept);
     if cancel.is_cancelled() {
         return None;
     }

@@ -45,6 +45,16 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
   wrap and the better result is kept (twelve small parts of the scan of many parts ended without a
   pass before; each passes now). The solid kept has the part's name and the losing attempt leaves no
   object behind.
+- Hole filling (`mesh.clean`, `mesh.fill_holes`, `scan.to_solid` with a large
+  `fill_holes_max_edges`) no longer closes an open sheet inside out (one scanned from its hollow
+  side, or whose normals are stored inward). When the patches would close a piece of the mesh with
+  the scanned face pointing into the enclosed volume, every opening (a loop, or the loops of a
+  ragged rim that touch at vertices, judged by their patches together) whose patches are a quarter
+  of the piece's area or more stays open (`holes_inward`); smaller holes are filled, so a closed
+  scan stored inside out with small holes is still reported as `scan_inside_out`. `scan.to_solid`
+  raises the new issue `fill_inside_out` instead of failing with `scan_inside_out`, and
+  `mesh.fill_holes` takes `allow_inward: true` to cap such a loop anyway (a mould of a dish)
+  (#140).
 
 ## [0.2.0] - 2026-11-13
 

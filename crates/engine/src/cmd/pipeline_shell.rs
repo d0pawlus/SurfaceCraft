@@ -136,9 +136,18 @@ pub(super) fn run(s: &mut Session, set: &Settings, i: &ToSolidIn) -> CmdResult<T
     let scan_triangles = s.doc.mesh(set.scan).map_or(0, |m| m.mesh.triangle_count());
     let fill_up_to = limit.min(rim.saturating_sub(1));
     if rim > 0 && fill_up_to > 0 {
-        let edit = fill(s, FillIn { object: ObjRef::Id(set.scan.0), max_edges: Some(fill_up_to), smooth: Some(true) })?;
+        let edit = fill(
+            s,
+            FillIn {
+                object: ObjRef::Id(set.scan.0),
+                max_edges: Some(fill_up_to),
+                smooth: Some(true),
+                allow_inward: None,
+            },
+        )?;
         report.holes_filled += edit.holes_filled.unwrap_or(0);
         report.holes_left = edit.holes_left.unwrap_or(report.holes_left);
+        report.holes_inward = edit.holes_inward.unwrap_or(report.holes_inward);
         report.triangles = edit.triangles;
     }
     // after the holes are filled: a patch can cross the sheet around it, and folds block a wall
@@ -382,7 +391,7 @@ fn wrap_and_judge(
     let d = judged_against_the_original(s, set, w.body.id, main, folds, shell_layer)?;
     let t = info(shell, i, None);
     // the rim stays open on purpose and the shell is closed over it: holes left are not a defect of the solid
-    let judged = super::ScanSummary { holes_left: 0, ..report.clone() };
+    let judged = super::ScanSummary { holes_left: 0, holes_inward: 0, ..report.clone() };
     let mut issues = issues_of(&w, &d, set, &judged, &t, face.vertex_count());
     issues.extend(folds.out.as_ref().and_then(|f| fold_issue(f, set.tolerance, folds.stats.get())));
     let tried = retry.as_ref().is_some_and(|r| r.reason != freeform::RetryReason::BudgetSpent);
