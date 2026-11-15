@@ -1,12 +1,13 @@
 //! The rounds of the driver (design doc §4.3): state the conditions, solve, measure, and grow the
 //! net where the misses are until every target holds, the worst miss stops improving, the cost
-//! bound of one solve is reached, or [`MAX_ROUNDS`] are done.
+//! bound of one solve is reached, or [`MAX_ROUNDS`] are done ([`MAX_G2_ROUNDS`] with a G2 side, whose
+//! curvature rows iterate on the same net before it grows).
 use super::measure::{self, Goal, Measure};
 use super::rows::{self, Inputs, Layout, SideSamples, Zone};
 use super::start::{Interior, Loop};
 use super::{
-    Continuity, G0_TARGET, G2_TARGET_REL, MAX_ROUNDS, MIN_IMPROVEMENT, Request, Round, Summary, grow, grow_other,
-    prefer,
+    Continuity, G0_TARGET, G2_TARGET_REL, MAX_G2_ROUNDS, MAX_ROUNDS, MIN_IMPROVEMENT, Request, Round, Summary, grow,
+    grow_other, prefer,
 };
 use crate::nurbs::SurfaceProbe;
 use crate::record::brep::Surface;
@@ -80,6 +81,11 @@ fn arg(msg: impl Into<String>) -> KernelError {
 }
 
 impl Context<'_> {
+    /// Most rounds: a G2 side needs rounds on the same net for its curvature rows to converge.
+    fn round_limit(&self) -> u32 {
+        if self.lp.sides.iter().any(|s| s.continuity == Continuity::G2) { MAX_G2_ROUNDS } else { MAX_ROUNDS }
+    }
+
     /// Runs the rounds; `interior` takes the closest points of every round.
     pub fn run(&self, interior: &mut Interior, #[cfg(test)] trace: &mut Vec<RoundTrace>) -> Result<Outcome> {
         let mut st = State {
@@ -97,7 +103,7 @@ impl Context<'_> {
             rounds: 0,
             stop: None,
         };
-        for round in 1..=MAX_ROUNDS {
+        for round in 1..=self.round_limit() {
             poll(self.cancel)?;
             let flow = self.round(
                 &mut st,
@@ -157,6 +163,12 @@ impl Context<'_> {
     /// The net of the next round: `None` ends the rounds.
     fn next_net(&self, st: &mut State, improved: bool, miss: [f64; 2], refine: bool) -> Option<[usize; 2]> {
         let max = self.req.max_control;
+        // nothing but the data steers a patch whose sides are all soft: its net grows evenly until
+        // the data are within the tolerance
+        if self.lp.sides.iter().all(|s| s.soft) {
+            let next = [super::grown(st.net[0], max), super::grown(st.net[1], max)];
+            return (next != st.net).then_some(next);
+        }
         // a round that did not help gets one retry in the direction(s) not grown last time
         let wanted = if improved {
             st.retried = false;
@@ -258,13 +270,21 @@ impl Context<'_> {
         let miss = m.miss;
         let improved = round == 1 || st.prev_worst - worst >= MIN_IMPROVEMENT * st.prev_worst;
         let summary = Summary { data_ok, data_max: m.max, side_miss: m.side_miss() };
-        // G2 on a net that cannot grow: the first round has no curvature rows, so another round at the
-        // same net states them; then rounds repeat while the curvature error still falls by 5 %
+        // the curvature rows of a G2 side are a Newton iteration about the previous round's surface
+        // (the first round has none): it repeats on the same net while the error still falls by 5 %
         let has_g2 = self.lp.sides.iter().any(|s| s.continuity == Continuity::G2);
         let curv = m.curvature_miss();
         let refine = has_g2
             && !done
             && (!had_rows || (curv > G2_TARGET_REL && st.prev_curv.is_none_or(|p| p - curv >= MIN_IMPROVEMENT * p)));
+        let max = self.req.max_control;
+        let can_grow = st.net[0] < max || st.net[1] < max;
+        let g1_ok = m.g1_ok(&st.frozen);
+        // the curvature iteration is worth its rounds only on a net that already holds G0 and G1
+        let stay = refine && (g1_ok || !can_grow);
+        // a curvature iteration that stalled above the target needs a finer net, whatever the
+        // other misses did
+        let stalled = has_g2 && had_rows && curv > G2_TARGET_REL && !stay && g1_ok;
         st.prev_curv = had_rows.then_some(curv);
         if st.best.as_ref().is_none_or(|b| prefer(&summary, &b.summary)) {
             st.best = Some(Round {
@@ -276,10 +296,26 @@ impl Context<'_> {
                 summary,
             });
         }
-        if done || round == MAX_ROUNDS {
+        if done || round == self.round_limit() {
             return Flow::Stop;
         }
-        let Some(next) = self.next_net(st, improved, miss, refine) else { return Flow::Stop };
+        // the curvature rows are a fixed-point iteration: it runs on the same net while it still
+        // converges, and the net grows only when it stalls above the target
+        let next = if stay {
+            st.net
+        } else if stalled {
+            let next = [super::grown(st.net[0], max), super::grown(st.net[1], max)];
+            if next == st.net {
+                return Flow::Stop;
+            }
+            next
+        } else {
+            let Some(next) = self.next_net(st, improved, miss, refine) else { return Flow::Stop };
+            next
+        };
+        if next != st.net {
+            st.prev_curv = None;
+        }
         st.prev_worst = st.prev_worst.min(worst);
         st.prev = Some(solution.surface);
         st.grew = next != st.net;

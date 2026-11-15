@@ -111,12 +111,8 @@ fn runs(poly: &[[f64; 2]], closed: bool) -> Vec<(usize, usize)> {
     out
 }
 
-/// Fits lines and arcs within `tol` to a polyline (sketch coordinates; `closed` joins the ends)
-/// and builds a sketch on `plane`: consecutive pieces share their end point; lines within 0.5°
-/// of an axis get a horizontal/vertical constraint.
-#[must_use]
-pub fn fit_polyline(plane: SketchPlane, pts: &[[f64; 2]], closed: bool, tol: f64) -> Sketch {
-    let mut s = Sketch { plane, ..Sketch::default() };
+/// The polyline with its first point appended when `closed` and the ends do not meet.
+fn closed_polyline(pts: &[[f64; 2]], closed: bool) -> Vec<[f64; 2]> {
     let mut poly: Vec<[f64; 2]> = pts.to_vec();
     if closed
         && poly.len() > 2
@@ -125,39 +121,46 @@ pub fn fit_polyline(plane: SketchPlane, pts: &[[f64; 2]], closed: bool, tol: f64
     {
         poly.push(a);
     }
-    if poly.len() < 2 {
-        return s;
+    poly
+}
+
+/// The closed polyline `poly` started at a sharp corner (else at a change between straight and
+/// curved), so no piece straddles the start.
+fn rotate_to_corner(poly: &[[f64; 2]]) -> Vec<[f64; 2]> {
+    let m = poly.len() - 1;
+    let turn = |k: usize| {
+        let (p, c, q) = (poly[(k + m - 1) % m], poly[k % m], poly[(k + 1) % m]);
+        let (u, v) = ((c[0] - p[0], c[1] - p[1]), (q[0] - c[0], q[1] - c[1]));
+        (u.0 * v.1 - u.1 * v.0).atan2(u.0 * v.0 + u.1 * v.1).abs()
+    };
+    // a sharp corner if there is one, else a change between straight and curved
+    let sharp = (0..m).max_by(|&a, &b| turn(a).total_cmp(&turn(b))).unwrap_or(0);
+    let bent = |k: usize| turn(k) >= 1f64.to_radians();
+    let curved_seg = |k: usize| bent(k) && bent((k + 1) % m);
+    let corner = if turn(sharp) > 30f64.to_radians() {
+        sharp
+    } else {
+        (0..m).find(|&k| curved_seg((k + m - 1) % m) != curved_seg(k)).unwrap_or(0)
+    };
+    let mut rot: Vec<[f64; 2]> = (0..m).map(|k| poly[(k + corner) % m]).collect();
+    if let Some(f) = rot.first().copied() {
+        rot.push(f);
     }
-    // start a closed loop at a sharp corner, so no piece straddles it
-    if closed && poly.len() > 4 {
-        let m = poly.len() - 1;
-        let turn = |k: usize| {
-            let (p, c, q) = (poly[(k + m - 1) % m], poly[k % m], poly[(k + 1) % m]);
-            let (u, v) = ((c[0] - p[0], c[1] - p[1]), (q[0] - c[0], q[1] - c[1]));
-            (u.0 * v.1 - u.1 * v.0).atan2(u.0 * v.0 + u.1 * v.1).abs()
-        };
-        // a sharp corner if there is one, else a change between straight and curved
-        let sharp = (0..m).max_by(|&a, &b| turn(a).total_cmp(&turn(b))).unwrap_or(0);
-        let bent = |k: usize| turn(k) >= 1f64.to_radians();
-        let curved_seg = |k: usize| bent(k) && bent((k + 1) % m);
-        let corner = if turn(sharp) > 30f64.to_radians() {
-            sharp
-        } else {
-            (0..m).find(|&k| curved_seg((k + m - 1) % m) != curved_seg(k)).unwrap_or(0)
-        };
-        let mut rot: Vec<[f64; 2]> = (0..m).map(|k| poly[(k + corner) % m]).collect();
-        if let Some(f) = rot.first().copied() {
-            rot.push(f);
-        }
-        poly = rot;
-    }
-    let tol = if tol.is_finite() && tol > 0.0 { tol } else { 0.05 };
-    // runs of straight and of curved samples (by turning angle), each then split to the tolerance
+    rot
+}
+
+/// Pieces of the runs of straight and of curved samples (by turning angle), each split to the
+/// tolerance.
+fn split_runs(poly: &[[f64; 2]], closed: bool, tol: f64) -> Vec<Piece> {
     let mut pieces = Vec::new();
-    for (i, j) in runs(&poly, closed) {
-        split(&poly, i, j, tol, &mut pieces, 0);
+    for (i, j) in runs(poly, closed) {
+        split(poly, i, j, tol, &mut pieces, 0);
     }
-    // merge consecutive collinear lines
+    pieces
+}
+
+/// The pieces with consecutive collinear lines merged into one.
+fn merge_lines(pieces: Vec<Piece>, poly: &[[f64; 2]], tol: f64) -> Vec<Piece> {
     let mut merged: Vec<Piece> = Vec::new();
     for p in pieces {
         if let (Some(Piece::Line(a, _)), Piece::Line(_, j)) = (merged.last().cloned(), &p)
@@ -170,44 +173,84 @@ pub fn fit_polyline(plane: SketchPlane, pts: &[[f64; 2]], closed: bool, tol: f64
         }
         merged.push(p);
     }
+    merged
+}
+
+/// Sketch points of the polyline samples, shared between consecutive pieces (the last sample of
+/// a closed loop is the first point).
+struct PointIds<'a> {
+    poly: &'a [[f64; 2]],
+    closed: bool,
+    index_of: std::collections::HashMap<usize, usize>,
+}
+
+impl PointIds<'_> {
+    /// Index in `s` of the point of sample `k`, added on first use.
+    fn id(&mut self, s: &mut Sketch, k: usize) -> usize {
+        let key = if self.closed && k == self.poly.len() - 1 { 0 } else { k };
+        let poly = self.poly;
+        *self.index_of.entry(key).or_insert_with(|| s.add_point(poly.get(key).copied().unwrap_or([0.0, 0.0])))
+    }
+}
+
+/// Adds the line between samples `i` and `j`, horizontal or vertical when within 0.5° of an axis.
+fn add_line_piece(s: &mut Sketch, ids: &mut PointIds<'_>, i: usize, j: usize) {
+    let (a, b) = (ids.id(s, i), ids.id(s, j));
+    if a != b {
+        s.entities.push(Entity::Line { a, b });
+        let e = s.entities.len() - 1;
+        let (pa, pb) = (s.points[a], s.points[b]);
+        let ang = (pb[1] - pa[1]).atan2(pb[0] - pa[0]).rem_euclid(TAU / 2.0).to_degrees();
+        if ang < 0.5 || ang > 179.5 {
+            s.constraints.push(Constraint::Horizontal { line: e });
+        } else if (ang - 90.0).abs() < 0.5 {
+            s.constraints.push(Constraint::Vertical { line: e });
+        }
+    }
+}
+
+/// Adds the arc (a circle when the ends coincide) of samples `i` to `j` around `c`.
+fn add_arc_piece(s: &mut Sketch, ids: &mut PointIds<'_>, i: usize, j: usize, c: [f64; 2]) {
+    let (a, b) = (ids.id(s, i), ids.id(s, j));
+    let seg = ids.poly.get(i..=j).unwrap_or(&[]);
+    // orientation: counter-clockwise when the middle sample turns left
+    let mid = seg.get(seg.len() / 2).copied().unwrap_or(c);
+    let (pa, pb) = (s.points[a], s.points[b]);
+    let ccw = (mid[0] - pa[0]) * (pb[1] - pa[1]) - (mid[1] - pa[1]) * (pb[0] - pa[0]) > 0.0;
+    let center = s.add_point(c);
+    let (sa, sb) = if ccw { (a, b) } else { (b, a) };
+    if a == b {
+        let rad = (pa[0] - c[0]).hypot(pa[1] - c[1]);
+        s.entities.push(Entity::Circle { center, radius: rad });
+    } else {
+        s.entities.push(Entity::Arc { center, a: sa, b: sb });
+    }
+}
+
+/// Fits lines and arcs within `tol` to a polyline (sketch coordinates; `closed` joins the ends)
+/// and builds a sketch on `plane`: consecutive pieces share their end point; lines within 0.5°
+/// of an axis get a horizontal/vertical constraint.
+#[must_use]
+pub fn fit_polyline(plane: SketchPlane, pts: &[[f64; 2]], closed: bool, tol: f64) -> Sketch {
+    let mut s = Sketch { plane, ..Sketch::default() };
+    let mut poly = closed_polyline(pts, closed);
+    if poly.len() < 2 {
+        return s;
+    }
+    // start a closed loop at a sharp corner, so no piece straddles it
+    if closed && poly.len() > 4 {
+        poly = rotate_to_corner(&poly);
+    }
+    let tol = if tol.is_finite() && tol > 0.0 { tol } else { 0.05 };
+    let pieces = split_runs(&poly, closed, tol);
+    // merge consecutive collinear lines
+    let merged = merge_lines(pieces, &poly, tol);
     // points shared between consecutive pieces
-    let mut index_of = std::collections::HashMap::new();
-    let mut pid = |s: &mut Sketch, k: usize| -> usize {
-        let key = if closed && k == poly.len() - 1 { 0 } else { k };
-        *index_of.entry(key).or_insert_with(|| s.add_point(poly.get(key).copied().unwrap_or([0.0, 0.0])))
-    };
+    let mut ids = PointIds { poly: &poly, closed, index_of: std::collections::HashMap::new() };
     for p in &merged {
         match p {
-            Piece::Line(i, j) => {
-                let (a, b) = (pid(&mut s, *i), pid(&mut s, *j));
-                if a != b {
-                    s.entities.push(Entity::Line { a, b });
-                    let e = s.entities.len() - 1;
-                    let (pa, pb) = (s.points[a], s.points[b]);
-                    let ang = (pb[1] - pa[1]).atan2(pb[0] - pa[0]).rem_euclid(TAU / 2.0).to_degrees();
-                    if ang < 0.5 || ang > 179.5 {
-                        s.constraints.push(Constraint::Horizontal { line: e });
-                    } else if (ang - 90.0).abs() < 0.5 {
-                        s.constraints.push(Constraint::Vertical { line: e });
-                    }
-                }
-            }
-            Piece::Arc(i, j, c, _) => {
-                let (a, b) = (pid(&mut s, *i), pid(&mut s, *j));
-                let seg = poly.get(*i..=*j).unwrap_or(&[]);
-                // orientation: counter-clockwise when the middle sample turns left
-                let mid = seg.get(seg.len() / 2).copied().unwrap_or(*c);
-                let (pa, pb) = (s.points[a], s.points[b]);
-                let ccw = (mid[0] - pa[0]) * (pb[1] - pa[1]) - (mid[1] - pa[1]) * (pb[0] - pa[0]) > 0.0;
-                let center = s.add_point(*c);
-                let (sa, sb) = if ccw { (a, b) } else { (b, a) };
-                if a == b {
-                    let rad = (pa[0] - c[0]).hypot(pa[1] - c[1]);
-                    s.entities.push(Entity::Circle { center, radius: rad });
-                } else {
-                    s.entities.push(Entity::Arc { center, a: sa, b: sb });
-                }
-            }
+            Piece::Line(i, j) => add_line_piece(&mut s, &mut ids, *i, *j),
+            Piece::Arc(i, j, c, _) => add_arc_piece(&mut s, &mut ids, *i, *j, *c),
         }
     }
     s

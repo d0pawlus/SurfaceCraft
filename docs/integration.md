@@ -13,6 +13,7 @@ An integration pass then checks several pull requests on one build:
    author; the pull requests themselves stay unchanged.
 3. **Build once.** One release build (sccache shares compiled dependencies with every worktree).
 4. **Run** every listed check: local corpora (`SURFACECRAFT_LOCAL_CORPUS`, data never committed),
+   the open Artec corpus (`SURFACECRAFT_ARTEC_CORPUS`, fetched by `xtask/fetch-artec-corpus.sh`),
    `perf_scan_scale`, GPU/offscreen rendering, GUI scenarios with screenshots for the owner.
 5. **Attribute.** A failure is bisected over the merged pull requests (`git bisect` on the
    integration branch, or re-running on each branch alone) and reported on that pull request with

@@ -118,17 +118,58 @@ pub fn path_samples(path: &[Segment3], count: usize) -> Option<Vec<([f64; 3], [f
     Some(out)
 }
 
+/// Point lookup and join tolerance shared by the chain search of a sketch.
+struct Joins<'a> {
+    s: &'a Sketch,
+    tol: f64,
+}
+
+impl Joins<'_> {
+    /// Sketch point `i`, the origin if it does not exist.
+    fn pt(&self, i: usize) -> [f64; 2] {
+        self.s.points.get(i).copied().unwrap_or([0.0, 0.0])
+    }
+
+    /// Do the points `a` and `b` lie within the join tolerance?
+    fn same(&self, a: [f64; 2], b: [f64; 2]) -> bool {
+        (a[0] - b[0]).hypot(a[1] - b[1]) <= self.tol
+    }
+}
+
 /// Every chain of the sketch with whether it closes (see [`profiles`] and [`open_paths`]).
 fn chains(s: &Sketch, tol: f64) -> Vec<(bool, Vec<Segment3>)> {
-    let pl = &s.plane;
-    let n = pl.normal();
-    let pt = |i: usize| s.points.get(i).copied().unwrap_or([0.0, 0.0]);
-    let same = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]) <= tol;
+    let j = Joins { s, tol };
     let mut out = Vec::new();
-    // circles
-    for e in &s.entities {
+    push_circle_loops(&j, &mut out);
+    // chains of lines and arcs
+    let curves: Vec<usize> =
+        (0..s.entities.len()).filter(|&k| !matches!(s.entities.get(k), Some(Entity::Circle { .. }) | None)).collect();
+    let mut used = vec![false; s.entities.len()];
+    for &first in &curves {
+        if used.get(first).copied().unwrap_or(true) {
+            continue;
+        }
+        let Some((a0, b0)) = s.endpoints(first) else { continue };
+        let start = j.pt(a0);
+        let mut chain: Vec<(usize, bool)> = vec![(first, true)];
+        mark_used(&mut used, first);
+        let closed = extend_forward(&j, &curves, &mut used, &mut chain, start, j.pt(b0));
+        if !closed {
+            // an open chain also grows backwards from where it started
+            extend_backward(&j, &curves, &mut used, &mut chain, start);
+        }
+        out.push((closed, chain_segments(&j, chain)));
+    }
+    out
+}
+
+/// Pushes every circle of the sketch as a closed loop of one full arc.
+fn push_circle_loops(j: &Joins<'_>, out: &mut Vec<(bool, Vec<Segment3>)>) {
+    let pl = &j.s.plane;
+    let n = pl.normal();
+    for e in &j.s.entities {
         if let Entity::Circle { center, radius } = e {
-            let c = pl.to_3d(pt(*center));
+            let c = pl.to_3d(j.pt(*center));
             out.push((
                 true,
                 vec![Segment3::Arc {
@@ -142,103 +183,128 @@ fn chains(s: &Sketch, tol: f64) -> Vec<(bool, Vec<Segment3>)> {
             ));
         }
     }
-    // chains of lines and arcs
-    let curves: Vec<usize> =
-        (0..s.entities.len()).filter(|&k| !matches!(s.entities.get(k), Some(Entity::Circle { .. }) | None)).collect();
-    let mut used = vec![false; s.entities.len()];
-    for &first in &curves {
-        if used.get(first).copied().unwrap_or(true) {
-            continue;
-        }
-        let Some((a0, b0)) = s.endpoints(first) else { continue };
-        let start = pt(a0);
-        let mut chain: Vec<(usize, bool)> = vec![(first, true)];
-        if let Some(u) = used.get_mut(first) {
-            *u = true;
-        }
-        let mut cur = pt(b0);
-        let mut closed = same(cur, start);
-        while !closed {
-            let next = curves.iter().copied().find_map(|k| {
-                if used.get(k).copied().unwrap_or(true) {
-                    return None;
-                }
-                let (a, b) = s.endpoints(k)?;
-                if same(pt(a), cur) {
-                    Some((k, true, pt(b)))
-                } else if same(pt(b), cur) {
-                    Some((k, false, pt(a)))
-                } else {
-                    None
-                }
-            });
-            let Some((k, fwd, end)) = next else { break };
-            if let Some(u) = used.get_mut(k) {
-                *u = true;
-            }
-            chain.push((k, fwd));
-            cur = end;
-            closed = same(cur, start);
-        }
-        if !closed {
-            // an open chain also grows backwards from where it started
-            let mut head = start;
-            loop {
-                let prev = curves.iter().copied().find_map(|k| {
-                    if used.get(k).copied().unwrap_or(true) {
-                        return None;
-                    }
-                    let (a, b) = s.endpoints(k)?;
-                    if same(pt(b), head) {
-                        Some((k, true, pt(a)))
-                    } else if same(pt(a), head) {
-                        Some((k, false, pt(b)))
-                    } else {
-                        None
-                    }
-                });
-                let Some((k, fwd, far)) = prev else { break };
-                if let Some(u) = used.get_mut(k) {
-                    *u = true;
-                }
-                chain.insert(0, (k, fwd));
-                head = far;
-            }
-        }
-        let mut segs = Vec::with_capacity(chain.len());
-        for (k, fwd) in chain {
-            match s.entities.get(k) {
-                Some(Entity::Line { a, b }) => {
-                    let (p, q) = if fwd { (pt(*a), pt(*b)) } else { (pt(*b), pt(*a)) };
-                    segs.push(Segment3::Line { start: pl.to_3d(p).into(), end: pl.to_3d(q).into() });
-                }
-                Some(Entity::Arc { center, a, b }) => {
-                    let c = pt(*center);
-                    let (pa, pb) = (pt(*a), pt(*b));
-                    let ang = |q: [f64; 2]| (q[1] - c[1]).atan2(q[0] - c[0]);
-                    let r = (pa[0] - c[0]).hypot(pa[1] - c[1]);
-                    // CCW sweep from a to b in the sketch
-                    let sweep = (ang(pb) - ang(pa)).rem_euclid(TAU);
-                    let sweep = if sweep < 1e-12 { TAU } else { sweep };
-                    // traversed from a (forward) about +n, or from b about −n
-                    let (from, axis) = if fwd { (pa, n) } else { (pb, -n) };
-                    let refd = pl.to_3d(from) - pl.to_3d(c);
-                    let reference = surfacecraft_geom::normalize(refd).unwrap_or_else(|| Vec3::from(pl.x));
-                    segs.push(Segment3::Arc {
-                        center: pl.to_3d(c).into(),
-                        axis: axis.into(),
-                        reference: reference.into(),
-                        radius: r,
-                        start: 0.0,
-                        end: sweep,
-                    });
-                }
-                _ => {}
-            }
-        }
-        out.push((closed, segs));
+}
+
+/// Marks entity `k` as taken by a chain.
+fn mark_used(used: &mut [bool], k: usize) {
+    if let Some(u) = used.get_mut(k) {
+        *u = true;
     }
-    out
+}
+
+/// The unused curve that continues a chain ending at `cur`: its index, whether it is traversed
+/// forward and its far end.
+fn find_forward(j: &Joins<'_>, curves: &[usize], used: &[bool], cur: [f64; 2]) -> Option<(usize, bool, [f64; 2])> {
+    curves.iter().copied().find_map(|k| {
+        if used.get(k).copied().unwrap_or(true) {
+            return None;
+        }
+        let (a, b) = j.s.endpoints(k)?;
+        if j.same(j.pt(a), cur) {
+            Some((k, true, j.pt(b)))
+        } else if j.same(j.pt(b), cur) {
+            Some((k, false, j.pt(a)))
+        } else {
+            None
+        }
+    })
+}
+
+/// The unused curve that precedes a chain starting at `head`: its index, whether it is traversed
+/// forward and its far end.
+fn find_backward(j: &Joins<'_>, curves: &[usize], used: &[bool], head: [f64; 2]) -> Option<(usize, bool, [f64; 2])> {
+    curves.iter().copied().find_map(|k| {
+        if used.get(k).copied().unwrap_or(true) {
+            return None;
+        }
+        let (a, b) = j.s.endpoints(k)?;
+        if j.same(j.pt(b), head) {
+            Some((k, true, j.pt(a)))
+        } else if j.same(j.pt(a), head) {
+            Some((k, false, j.pt(b)))
+        } else {
+            None
+        }
+    })
+}
+
+/// Appends curves to the end of `chain` until it returns to `start` (true) or runs out of
+/// continuations (false).
+fn extend_forward(
+    j: &Joins<'_>,
+    curves: &[usize],
+    used: &mut [bool],
+    chain: &mut Vec<(usize, bool)>,
+    start: [f64; 2],
+    mut cur: [f64; 2],
+) -> bool {
+    let mut closed = j.same(cur, start);
+    while !closed {
+        let Some((k, fwd, end)) = find_forward(j, curves, used, cur) else { break };
+        mark_used(used, k);
+        chain.push((k, fwd));
+        cur = end;
+        closed = j.same(cur, start);
+    }
+    closed
+}
+
+/// Prepends curves to the front of an open `chain` that starts at `start`.
+fn extend_backward(
+    j: &Joins<'_>,
+    curves: &[usize],
+    used: &mut [bool],
+    chain: &mut Vec<(usize, bool)>,
+    start: [f64; 2],
+) {
+    let mut head = start;
+    while let Some((k, fwd, far)) = find_backward(j, curves, used, head) {
+        mark_used(used, k);
+        chain.insert(0, (k, fwd));
+        head = far;
+    }
+}
+
+/// The 3-D segments of a chain of `(entity, traversed forward)` pairs.
+fn chain_segments(j: &Joins<'_>, chain: Vec<(usize, bool)>) -> Vec<Segment3> {
+    let mut segs = Vec::with_capacity(chain.len());
+    for (k, fwd) in chain {
+        match j.s.entities.get(k) {
+            Some(Entity::Line { a, b }) => {
+                let pl = &j.s.plane;
+                let (p, q) = if fwd { (j.pt(*a), j.pt(*b)) } else { (j.pt(*b), j.pt(*a)) };
+                segs.push(Segment3::Line { start: pl.to_3d(p).into(), end: pl.to_3d(q).into() });
+            }
+            Some(Entity::Arc { center, a, b }) => segs.push(arc_segment(j, *center, *a, *b, fwd)),
+            _ => {}
+        }
+    }
+    segs
+}
+
+/// The 3-D arc of a sketch arc, counter-clockwise from `a` to `b` or traversed backwards.
+fn arc_segment(j: &Joins<'_>, center: usize, a: usize, b: usize, fwd: bool) -> Segment3 {
+    let pl = &j.s.plane;
+    let n = pl.normal();
+    let c = j.pt(center);
+    let (pa, pb) = (j.pt(a), j.pt(b));
+    let ang = |q: [f64; 2]| (q[1] - c[1]).atan2(q[0] - c[0]);
+    let r = (pa[0] - c[0]).hypot(pa[1] - c[1]);
+    // CCW sweep from a to b in the sketch
+    let sweep = (ang(pb) - ang(pa)).rem_euclid(TAU);
+    let sweep = if sweep < 1e-12 { TAU } else { sweep };
+    // traversed from a (forward) about +n, or from b about −n
+    let (from, axis) = if fwd { (pa, n) } else { (pb, -n) };
+    let refd = pl.to_3d(from) - pl.to_3d(c);
+    let reference = surfacecraft_geom::normalize(refd).unwrap_or_else(|| Vec3::from(pl.x));
+    Segment3::Arc {
+        center: pl.to_3d(c).into(),
+        axis: axis.into(),
+        reference: reference.into(),
+        radius: r,
+        start: 0.0,
+        end: sweep,
+    }
 }
 
 #[cfg(test)]

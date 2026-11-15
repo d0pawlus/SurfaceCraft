@@ -15,18 +15,31 @@ pub(super) struct Built {
 }
 
 pub(super) fn build(sm: &Samples, pieces: &[Piece], plane: &SketchPlane, tol: f64) -> Option<Built> {
-    let n = pieces.len();
+    if sm.closed && pieces.len() == 1 {
+        return single_circle(sm, pieces, plane);
+    }
+    let mut sk = Sketch { plane: plane.clone(), ..Sketch::default() };
+    let pts = junction_points(sm, pieces, tol)?;
+    let ranges = add_entities(&mut sk, sm, pieces, &pts)?;
+    (!sk.entities.is_empty() && sk.validate().is_ok()).then_some(Built { sk, ranges })
+}
+
+/// A closed chain of one piece: a circle (`None` when the piece is not one).
+fn single_circle(sm: &Samples, pieces: &[Piece], plane: &SketchPlane) -> Option<Built> {
     let m = sm.q.len();
     let mut sk = Sketch { plane: plane.clone(), ..Sketch::default() };
     let mut ranges = Vec::new();
-    if sm.closed && n == 1 {
-        let p = pieces.first()?;
-        let Prim::Circle { c, r } = p.fit.prim else { return None };
-        let center = sk.add_point(c);
-        sk.entities.push(Entity::Circle { center, radius: r });
-        ranges.push((p.s, m));
-        return Some(Built { sk, ranges });
-    }
+    let p = pieces.first()?;
+    let Prim::Circle { c, r } = p.fit.prim else { return None };
+    let center = sk.add_point(c);
+    sk.entities.push(Entity::Circle { center, radius: r });
+    ranges.push((p.s, m));
+    Some(Built { sk, ranges })
+}
+
+/// The junction points between consecutive pieces; an open chain also gets its two free ends.
+fn junction_points(sm: &Samples, pieces: &[Piece], tol: f64) -> Option<Vec<P2>> {
+    let n = pieces.len();
     let limit = (10.0 * tol).max(1.0);
     let mut pts: Vec<P2> = Vec::with_capacity(n + 1);
     for k in 0..n {
@@ -45,6 +58,14 @@ pub(super) fn build(sm: &Samples, pieces: &[Piece], plane: &SketchPlane, tol: f6
         let last = pieces.last()?;
         pts.push(last.fit.prim.project(sm.at(last.s + last.len)));
     }
+    Some(pts)
+}
+
+/// Adds the points `pts` and one entity per piece between them (skipping degenerate ones) to
+/// `sk`; returns the sample range of each entity.
+fn add_entities(sk: &mut Sketch, sm: &Samples, pieces: &[Piece], pts: &[P2]) -> Option<Vec<(usize, usize)>> {
+    let n = pieces.len();
+    let mut ranges = Vec::new();
     let ids: Vec<usize> = pts.iter().map(|p| sk.add_point(*p)).collect();
     for (k, p) in pieces.iter().enumerate() {
         let k1 = if sm.closed { (k + 1) % n } else { k + 1 };
@@ -63,7 +84,7 @@ pub(super) fn build(sm: &Samples, pieces: &[Piece], plane: &SketchPlane, tol: f6
         }
         ranges.push((p.s, p.len));
     }
-    (!sk.entities.is_empty() && sk.validate().is_ok()).then_some(Built { sk, ranges })
+    Some(ranges)
 }
 
 pub(super) fn entity_prim(sk: &Sketch, e: usize) -> Option<Prim> {
