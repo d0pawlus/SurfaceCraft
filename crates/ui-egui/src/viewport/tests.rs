@@ -40,6 +40,7 @@ fn offscreen_render_shows_the_mesh() {
             colors: None,
             colors_key: 0,
             highlight: None,
+            back: None,
         }],
         background: [0.0, 0.0, 1.0],
         overlay: Default::default(),
@@ -74,6 +75,7 @@ fn colour_change_does_not_reupload_geometry() {
         colors: Some(Arc::new(vec![colors; n])),
         colors_key: key,
         highlight: None,
+        back: None,
     };
     let frame = |i: DrawItem| Frame {
         size: [64, 48],
@@ -103,7 +105,15 @@ fn colour_change_does_not_reupload_geometry() {
 }
 
 fn plain_item(mesh: &Arc<surfacecraft_geom::Mesh>) -> DrawItem {
-    DrawItem { key: 1, mesh: mesh.clone(), color: [0.6, 0.6, 0.6, 1.0], colors: None, colors_key: 0, highlight: None }
+    DrawItem {
+        key: 1,
+        mesh: mesh.clone(),
+        color: [0.6, 0.6, 0.6, 1.0],
+        colors: None,
+        colors_key: 0,
+        highlight: None,
+        back: None,
+    }
 }
 
 /// New colours with the same geometry key are uploaded: from none to the very first colour
@@ -127,4 +137,75 @@ fn new_colours_with_the_same_geometry_key_are_uploaded() {
     for key in 0..64u64 {
         assert!(colors_need_upload(color_state(&plain.color, false, 0), &with(key.max(1), [1.0; 4])));
     }
+}
+
+const FRONT: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+const BACK: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+
+/// The back colour reaches the shader only for a mesh drawn in its base colour: per-vertex
+/// colours (regions, deviation) are data and stay readable from both sides.
+#[test]
+fn back_colour_applies_only_without_vertex_colours() {
+    let mesh = Arc::new(synth::sphere(Point3::origin(), 10.0, 8, 4));
+    let n = mesh.vertex_count();
+    let two_sided = DrawItem { back: Some(BACK), ..plain_item(&mesh) };
+    assert_eq!(back_of(&two_sided), BACK);
+    assert_eq!(back_of(&plain_item(&mesh)), [0.0; 4], "no back colour: alpha 0 turns it off");
+    let coloured = DrawItem { colors: Some(Arc::new(vec![FRONT; n])), colors_key: 1, ..two_sided.clone() };
+    assert_eq!(back_of(&coloured), [0.0; 4]);
+    let wrong_length = DrawItem { colors: Some(Arc::new(vec![FRONT; n + 1])), colors_key: 1, ..two_sided };
+    assert_eq!(back_of(&wrong_length), BACK, "colours of the wrong length are not drawn");
+}
+
+/// A sphere seen from outside shows the front colour; the same sphere with every triangle
+/// reversed shows the back colour, and a selection on it keeps the highlight colour.
+/// Opt-in (`SURFACECRAFT_GPU_TESTS=1`); skipped without a GPU adapter.
+#[test]
+fn back_side_is_drawn_in_the_back_colour() {
+    let Some(_gpu) = gpu_test_guard() else {
+        return;
+    };
+    let outward = synth::sphere(Point3::origin(), 10.0, 32, 16);
+    let normals = outward.vertex_normals();
+    assert!(
+        outward.positions.iter().zip(normals.iter()).all(|(p, n)| p.coords.dot(n) > 0.0),
+        "the synthetic sphere is wound outward"
+    );
+    let mut inward = outward.clone();
+    for t in &mut inward.triangles {
+        t.swap(1, 2);
+    }
+    let mut camera = Camera::default();
+    camera.fit(&outward.bbox());
+    let centre = |mesh: surfacecraft_geom::Mesh, back: Option<[f32; 4]>, highlight: Option<Arc<Vec<u32>>>| {
+        let frame = Frame {
+            size: [64, 48],
+            origin: camera.target,
+            camera: camera.clone(),
+            items: vec![DrawItem {
+                key: 1,
+                mesh: Arc::new(mesh),
+                color: FRONT,
+                colors: None,
+                colors_key: 0,
+                highlight,
+                back,
+            }],
+            background: [0.0, 1.0, 0.0],
+            overlay: Default::default(),
+        };
+        render_offscreen(&frame).map(|px| px[(24 * 64 + 32) * 4..(24 * 64 + 32) * 4 + 3].to_vec())
+    };
+    let Some(front) = centre(outward.clone(), Some(BACK), None) else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+    assert!(front[0] > 60 && front[2] < 60, "outside {front:?} should be the red front colour");
+    let back = centre(inward.clone(), Some(BACK), None).unwrap_or_default();
+    assert!(back[2] > 60 && back[0] < 60, "inside-out {back:?} should be the blue back colour");
+    let one_colour = centre(inward.clone(), None, None).unwrap_or_default();
+    assert!(one_colour[0] > 60 && one_colour[2] < 60, "without a back colour {one_colour:?} stays red");
+    let all: Vec<u32> = (0..inward.triangles.len() as u32).collect();
+    let selected = centre(inward, Some(BACK), Some(Arc::new(all))).unwrap_or_default();
+    assert!(selected[0] > 100 && selected[2] < 100, "selection {selected:?} keeps the highlight colour");
 }

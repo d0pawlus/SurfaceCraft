@@ -120,7 +120,15 @@ impl CommandPanel {
             .map(|p| {
                 let mut color = tokens.object(p.kind);
                 color[3] = PREVIEW_ALPHA;
-                DrawItem { key: p.key, mesh: p.mesh.clone(), color, colors: None, colors_key: 0, highlight: None }
+                DrawItem {
+                    key: p.key,
+                    mesh: p.mesh.clone(),
+                    color,
+                    colors: None,
+                    colors_key: 0,
+                    highlight: None,
+                    back: None,
+                }
             })
             .collect()
     }
