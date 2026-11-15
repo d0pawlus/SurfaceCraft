@@ -236,8 +236,8 @@ fn load(s: &Session, path: &Option<String>, data: &Option<String>, format: Optio
 /// of at most 4 GiB that never shrinks, so the import may take about half of it and leave the rest
 /// to the commands that follow. Measured (`crates/ui-egui/tests/import_memory.rs`, binary STL picked
 /// in the interface): about 110 bytes per triangle at the peak, so 20 million take about 2.2 GB.
-/// The viewport asks the GPU for its largest buffer (the 12 bytes per triangle of the index buffer
-/// passed wgpu's default 256 MiB above about 22 million) and leaves out a mesh that does not fit.
+/// The viewport draws a scan through its display level of detail (2 million triangles), so the
+/// GPU buffers of a scan do not grow with it.
 const WEB_MAX_TRIANGLES: usize = 20_000_000;
 
 /// The browser has far less memory (design doc section 11): smaller meshes on the web.

@@ -1,8 +1,11 @@
 //! What the GPU can hold. A mesh is drawn from three buffers (geometry and colour per vertex,
-//! indices per triangle), and a buffer larger than the device allows is a wgpu validation error,
-//! which ends the app. egui-wgpu asks for wgpu's default limits, whose largest buffer is 256 MiB
-//! (about 22 million triangles of indices); the viewport asks the adapter for the largest it has
-//! instead, and a mesh that still does not fit is not drawn (the app says so) rather than crash.
+//! indices per triangle), and a buffer larger than the device allows is a wgpu validation error
+//! (by default a panic). A scan is drawn through its display level of detail (at most
+//! `LOD_BUDGET` triangles, `surfacecraft_engine::display`), but a command's preview draws its mesh
+//! whole, and so does a scan whose level of detail cannot be built. egui-wgpu asks for wgpu's
+//! default limits, whose largest buffer is 256 MiB (about 22 million triangles of indices); the
+//! viewport asks the adapter for the largest it has instead, and a mesh that still does not fit is
+//! not drawn (the app says so).
 use std::sync::Arc;
 use surfacecraft_geom::Mesh;
 
