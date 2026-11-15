@@ -1,6 +1,8 @@
 # Request: put the boundary of a group of patches on a primitive, and make an analytic face of the group (draft)
 
-Status: **draft only.** Nothing has been filed at tangency-labs/solidcore (filing needs the owner's consent).
+Status: not filed (2026-11-15). It is a request for new kernel operations, not a defect with a reproduction, and tangency-labs/solidcore
+CONTRIBUTING.md and AGENTS.md take reported failures with a reproduction from real use and say that what is not reported waits; whether a
+request without a failing case belongs in the issue tracker is a question for the owner, so it is held.
 Debt: exception accepted by the owner 2026-11-14 for exactly these three files (listed in `xtask/app-geometry.txt`); to be proposed upstream with the owner's consent, then removed.
 Pin: `solidcore` rev `4f2da85c26f7d608808d94cffcf06ebe867ef61d`.
 
