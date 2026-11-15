@@ -56,51 +56,53 @@ fn same_surface(pa: &Primitive, pb: &Primitive, angle_tol: f64, length_tol: f64)
     }
 }
 
-/// Chains of positions with equal steps: `pos[k+1] − pos[k]` is the same within `tol` along the
-/// chain. At least three members; sub-chains of a longer chain are left out.
-fn chains(pos: &[Vec3], tol: f64) -> Vec<Vec<usize>> {
-    let n = pos.len();
-    let min_step = (2.0 * tol).max(1e-9);
-    let mut found: Vec<(Vec<usize>, f64)> = Vec::new();
-    for i in 0..n {
-        for j in 0..n {
-            let (Some(pi), Some(pj)) = (pos.get(i), pos.get(j)) else { continue };
-            if i == j {
-                continue;
+/// Grows the chain `idx` from `pi` with the step `w`: each next member is the nearest unused
+/// position within `tol` of the predicted one. Returns the largest deviation of a member added.
+fn extend_chain(pos: &[Vec3], pi: &Vec3, w: Vec3, tol: f64, idx: &mut Vec<usize>) -> f64 {
+    let mut err = 0.0_f64;
+    while idx.len() < MAX_CHAIN {
+        let next = pi + w * (idx.len() as f64);
+        let hit = pos
+            .iter()
+            .enumerate()
+            .filter(|(k, _)| !idx.contains(k))
+            .map(|(k, q)| (k, (q - next).norm()))
+            .filter(|(_, e)| *e <= tol)
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        match hit {
+            Some((k, e)) => {
+                idx.push(k);
+                err = err.max(e);
             }
-            let w = pj - pi;
-            if w.norm() <= min_step || !canonical(&w) {
-                continue;
-            }
-            // a chain that goes on backwards from `i` starts elsewhere and is found from there
-            let back = pi - w;
-            if pos.iter().enumerate().any(|(k, q)| k != i && (q - back).norm() <= tol) {
-                continue;
-            }
-            let mut idx = vec![i, j];
-            let mut err = 0.0_f64;
-            while idx.len() < MAX_CHAIN {
-                let next = pi + w * (idx.len() as f64);
-                let hit = pos
-                    .iter()
-                    .enumerate()
-                    .filter(|(k, _)| !idx.contains(k))
-                    .map(|(k, q)| (k, (q - next).norm()))
-                    .filter(|(_, e)| *e <= tol)
-                    .min_by(|a, b| a.1.total_cmp(&b.1));
-                match hit {
-                    Some((k, e)) => {
-                        idx.push(k);
-                        err = err.max(e);
-                    }
-                    None => break,
-                }
-            }
-            if idx.len() >= 3 {
-                found.push((idx, err));
-            }
+            None => break,
         }
     }
+    err
+}
+
+/// The chain that starts with `pos[i]`, `pos[j]` (at least three members) and its largest
+/// deviation; `None` when the pair does not start one.
+fn chain_from(pos: &[Vec3], i: usize, j: usize, tol: f64, min_step: f64) -> Option<(Vec<usize>, f64)> {
+    let (Some(pi), Some(pj)) = (pos.get(i), pos.get(j)) else { return None };
+    if i == j {
+        return None;
+    }
+    let w = pj - pi;
+    if w.norm() <= min_step || !canonical(&w) {
+        return None;
+    }
+    // a chain that goes on backwards from `i` starts elsewhere and is found from there
+    let back = pi - w;
+    if pos.iter().enumerate().any(|(k, q)| k != i && (q - back).norm() <= tol) {
+        return None;
+    }
+    let mut idx = vec![i, j];
+    let err = extend_chain(pos, pi, w, tol, &mut idx);
+    if idx.len() >= 3 { Some((idx, err)) } else { None }
+}
+
+/// The longest chains first (then the straightest), without those contained in a chosen one.
+fn choose_chains(mut found: Vec<(Vec<usize>, f64)>) -> Vec<Vec<usize>> {
     found.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then(a.1.total_cmp(&b.1)));
     let mut chosen: Vec<Vec<usize>> = Vec::new();
     for (idx, _) in found {
@@ -114,6 +116,20 @@ fn chains(pos: &[Vec3], tol: f64) -> Vec<Vec<usize>> {
         }
     }
     chosen
+}
+
+/// Chains of positions with equal steps: `pos[k+1] − pos[k]` is the same within `tol` along the
+/// chain. At least three members; sub-chains of a longer chain are left out.
+fn chains(pos: &[Vec3], tol: f64) -> Vec<Vec<usize>> {
+    let n = pos.len();
+    let min_step = (2.0 * tol).max(1e-9);
+    let mut found: Vec<(Vec<usize>, f64)> = Vec::new();
+    for i in 0..n {
+        for j in 0..n {
+            found.extend(chain_from(pos, i, j, tol, min_step));
+        }
+    }
+    choose_chains(found)
 }
 
 /// A step vector is canonical when its first non-zero component is positive: each chain is then

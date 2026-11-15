@@ -129,50 +129,11 @@ impl ScanSurface {
         let mut cur = *q;
         let mut out: Option<(Point3, Vec3)> = None;
         for it in 0..3 {
-            let mut r = radius;
-            let mut idx = self.support(&cur, r, hint, filter);
-            let mut grow = 0;
-            while idx.len() < 12 && grow < 3 {
-                r *= 1.6;
-                idx = self.support(&cur, r, hint, filter);
-                grow += 1;
-            }
-            if idx.len() < 6 {
-                return out;
-            }
-            let (c, n, e1, e2) = local_frame(&self.pts, &idx, &cur, r, hint)?;
-            // quadric z(x, y) in the frame centred on c
-            let mut a = Matrix6::<f64>::zeros();
-            let mut b = Vector6::<f64>::zeros();
-            let s2 = (r * 0.5) * (r * 0.5);
-            for &i in &idx {
-                let Some(p) = self.pts.get(i) else { continue };
-                let d = p - c;
-                let (x, y, z) = (d.dot(&e1), d.dot(&e2), d.dot(&n));
-                let w = (-d.norm_squared() / s2).exp();
-                let row = Vector6::new(1.0, x, y, x * x, x * y, y * y);
-                a += row * row.transpose() * w;
-                b += row * (z * w);
-            }
-            for k in 0..6 {
-                a[(k, k)] += 1e-9 * (1.0 + a[(k, k)]);
-            }
-            let Some(coef) = a.lu().solve(&b) else { return out };
-            if !coef.iter().all(|v| v.is_finite()) {
-                return out;
-            }
-            // the surface point above the foot of `cur` (not above the centroid): evaluate at the
-            // in-plane position of `cur`
-            let d = cur - c;
-            let (x, y) = (d.dot(&e1), d.dot(&e2));
-            let z = coef[0] + coef[1] * x + coef[2] * y + coef[3] * x * x + coef[4] * x * y + coef[5] * y * y;
-            let (zx, zy) = (coef[1] + 2.0 * coef[3] * x + coef[4] * y, coef[2] + coef[4] * x + 2.0 * coef[5] * y);
-            let p = c + e1 * x + e2 * y + n * z;
-            let nn = normalize(n - e1 * zx - e2 * zy)?;
-            let nn = if nn.dot(hint) < 0.0 { -nn } else { nn };
-            if !surfacecraft_geom::finite(&p) || (p - q).norm() > MAX_MOVE_SUPPORTS * r {
-                return out;
-            }
+            let (p, nn) = match self.project_step(cur, q, radius, hint, filter) {
+                ProjectionStep::Fail => return None,
+                ProjectionStep::Stop => return out,
+                ProjectionStep::Hit(p, nn) => (p, nn),
+            };
             out = Some((p, nn));
             if (p - cur).norm() < 1e-9 * (1.0 + radius) && it > 0 {
                 break;
@@ -181,6 +142,94 @@ impl ScanSurface {
         }
         out
     }
+
+    /// The vertices within `radius` of `cur` that `filter` allows, the support grown (up to 3 times)
+    /// while fewer than 12 vertices are inside it; the radius reached and the vertices.
+    fn grown_support(&self, cur: &Point3, radius: f64, hint: &Vec3, filter: &Support) -> (f64, Vec<usize>) {
+        let mut r = radius;
+        let mut idx = self.support(cur, r, hint, filter);
+        let mut grow = 0;
+        while idx.len() < 12 && grow < 3 {
+            r *= 1.6;
+            idx = self.support(cur, r, hint, filter);
+            grow += 1;
+        }
+        (r, idx)
+    }
+
+    /// One step of [`ScanSurface::project_with`]: the point above the foot of `cur` on the local
+    /// quadric and its normal, as seen from `q`.
+    fn project_step(&self, cur: Point3, q: &Point3, radius: f64, hint: &Vec3, filter: &Support) -> ProjectionStep {
+        let (r, idx) = self.grown_support(&cur, radius, hint, filter);
+        if idx.len() < 6 {
+            return ProjectionStep::Stop;
+        }
+        let Some(frame) = local_frame(&self.pts, &idx, &cur, r, hint) else { return ProjectionStep::Fail };
+        let Some(coef) = quadric_coefficients(&self.pts, &idx, &frame, r) else { return ProjectionStep::Stop };
+        let Some((p, nn)) = quadric_point(&coef, &frame, cur, hint) else { return ProjectionStep::Fail };
+        if !surfacecraft_geom::finite(&p) || (p - q).norm() > MAX_MOVE_SUPPORTS * r {
+            return ProjectionStep::Stop;
+        }
+        ProjectionStep::Hit(p, nn)
+    }
+}
+
+/// The outcome of one step of [`ScanSurface::project_with`].
+enum ProjectionStep {
+    /// The projection fails (`None`): the local frame or the normal is degenerate.
+    Fail,
+    /// The iteration ends with the result so far.
+    Stop,
+    /// The projected point and its unit normal.
+    Hit(Point3, Vec3),
+}
+
+/// Coefficients of the quadric `z(x, y)` fitted with Gaussian weights to the vertices `idx` in the
+/// frame (centre, normal, tangent axes) of support radius `r`; `None` when the fit is singular or
+/// not finite.
+fn quadric_coefficients(
+    pts: &[Point3],
+    idx: &[usize],
+    frame: &(Point3, Vec3, Vec3, Vec3),
+    r: f64,
+) -> Option<Vector6<f64>> {
+    let &(c, n, e1, e2) = frame;
+    // quadric z(x, y) in the frame centred on c
+    let mut a = Matrix6::<f64>::zeros();
+    let mut b = Vector6::<f64>::zeros();
+    let s2 = (r * 0.5) * (r * 0.5);
+    for &i in idx {
+        let Some(p) = pts.get(i) else { continue };
+        let d = p - c;
+        let (x, y, z) = (d.dot(&e1), d.dot(&e2), d.dot(&n));
+        let w = (-d.norm_squared() / s2).exp();
+        let row = Vector6::new(1.0, x, y, x * x, x * y, y * y);
+        a += row * row.transpose() * w;
+        b += row * (z * w);
+    }
+    for k in 0..6 {
+        a[(k, k)] += 1e-9 * (1.0 + a[(k, k)]);
+    }
+    let coef = a.lu().solve(&b)?;
+    if coef.iter().all(|v| v.is_finite()) { Some(coef) } else { None }
+}
+
+/// The surface point above the foot of `cur` (not above the centroid: evaluated at the in-plane
+/// position of `cur`) and its unit normal oriented like `hint`; `None` when the normal vanishes.
+fn quadric_point(
+    coef: &Vector6<f64>,
+    frame: &(Point3, Vec3, Vec3, Vec3),
+    cur: Point3,
+    hint: &Vec3,
+) -> Option<(Point3, Vec3)> {
+    let &(c, n, e1, e2) = frame;
+    let d = cur - c;
+    let (x, y) = (d.dot(&e1), d.dot(&e2));
+    let z = coef[0] + coef[1] * x + coef[2] * y + coef[3] * x * x + coef[4] * x * y + coef[5] * y * y;
+    let (zx, zy) = (coef[1] + 2.0 * coef[3] * x + coef[4] * y, coef[2] + coef[4] * x + 2.0 * coef[5] * y);
+    let p = c + e1 * x + e2 * y + n * z;
+    let nn = normalize(n - e1 * zx - e2 * zy)?;
+    Some((p, if nn.dot(hint) < 0.0 { -nn } else { nn }))
 }
 
 /// Weighted centroid, PCA normal (oriented by `hint`) and tangent axes of the points `idx`.

@@ -80,9 +80,15 @@ pub fn split_charts(mesh: &Mesh, tris: &[u32], p: &SplitParams) -> Split {
         count += 1;
     }
     merge_small(&nb, &normals, &ids, &mut chart_of, count as usize, p, &mut dropped);
+    Split { charts: collect_charts(&ids, &chart_of), dropped }
+}
+
+/// The triangles of each chart, charts in order of their lowest triangle; triangles that belong to
+/// no chart are left out.
+fn collect_charts(ids: &[u32], chart_of: &[u32]) -> Vec<Vec<u32>> {
     let mut charts: Vec<Vec<u32>> = Vec::new();
     let mut slot: HashMap<u32, usize> = HashMap::new();
-    for &t in &ids {
+    for &t in ids {
         let c = chart_of.get(t as usize).copied().unwrap_or(OUTSIDE);
         if c >= UNASSIGNED {
             continue;
@@ -95,7 +101,7 @@ pub fn split_charts(mesh: &Mesh, tris: &[u32], p: &SplitParams) -> Split {
             list.push(t);
         }
     }
-    Split { charts, dropped }
+    charts
 }
 
 /// Assigns chart `id` to `seed` and to every triangle reachable from it across edges whose normal

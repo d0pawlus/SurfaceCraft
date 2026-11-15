@@ -1,6 +1,6 @@
 //! Noise of a scan: the median-based estimate of its standard deviation from the mesh.
 
-use surfacecraft_geom::{KdTree, Mesh, Point3};
+use surfacecraft_geom::{KdTree, Mesh, Point3, Vec3};
 
 /// Noise estimate of a scan (σ, mm); see [`noise_estimate`].
 #[must_use]
@@ -18,6 +18,48 @@ pub struct NoiseEstimate {
     pub smooth: bool,
 }
 
+/// What the noise estimate needs to probe a vertex of a scan.
+struct Probe<'a> {
+    mesh: &'a Mesh,
+    tree: KdTree,
+    normals: Vec<Vec3>,
+    cos_sharp: f64,
+}
+
+impl Probe<'_> {
+    /// The distance of vertex `p` to the local quadric through its neighbours and whether its
+    /// neighbourhood spans a sharp edge; `None` when the neighbourhood has no usable fit.
+    fn residual(&self, p: &Point3) -> Option<(f64, bool)> {
+        let near = self.tree.knn(p, 17);
+        // neighbours without the point itself (leave-one-out), local quadric height field
+        let nb: Vec<Point3> =
+            near.iter().filter(|(_, d2)| *d2 > 0.0).filter_map(|(i, _)| self.mesh.positions.get(*i).copied()).collect();
+        let f = crate::plane::fit_plane(&nb, None)?;
+        let z = f.normal;
+        let sharp = near
+            .iter()
+            .filter_map(|(i, _)| self.normals.get(*i))
+            .any(|nn| nn.norm() > 0.5 && nn.dot(&z).abs() < self.cos_sharp);
+        let x = surfacecraft_geom::any_perpendicular(&z);
+        let y = z.cross(&x);
+        let o = f.point.coords;
+        let mut ata = nalgebra::Matrix6::<f64>::zeros();
+        let mut atb = nalgebra::Vector6::<f64>::zeros();
+        for q in &nb {
+            let w = q.coords - o;
+            let (u, v, h) = (w.dot(&x), w.dot(&y), w.dot(&z));
+            let row = nalgebra::Vector6::new(u * u, u * v, v * v, u, v, 1.0);
+            ata += row * row.transpose();
+            atb += row * h;
+        }
+        let c = ata.lu().solve(&atb)?;
+        let w = p.coords - o;
+        let (u, v, h) = (w.dot(&x), w.dot(&y), w.dot(&z));
+        let pred = c[0] * u * u + c[1] * u * v + c[2] * v * v + c[3] * u + c[4] * v + c[5];
+        Some(((h - pred).abs(), sharp))
+    }
+}
+
 /// Noise estimate of a scan (σ, mm): median distance of vertices to a local quadric through
 /// their neighbours, scaled to a standard deviation (design doc §10: warn when a tolerance is
 /// below the scanner noise). Samples whose neighbourhood spans a sharp edge (neighbour normals
@@ -33,36 +75,14 @@ pub fn noise_estimate(mesh: &Mesh) -> NoiseEstimate {
     let stride = n.div_ceil(4000).max(1);
     let normals = mesh.vertex_normals();
     let cos_sharp = 30f64.to_radians().cos();
+    let probe = Probe { mesh, tree, normals, cos_sharp };
     let mut d: Vec<f64> = Vec::new();
     let mut d_smooth: Vec<f64> = Vec::new();
     for p in mesh.positions.iter().step_by(stride) {
-        let near = tree.knn(p, 17);
-        // neighbours without the point itself (leave-one-out), local quadric height field
-        let nb: Vec<Point3> =
-            near.iter().filter(|(_, d2)| *d2 > 0.0).filter_map(|(i, _)| mesh.positions.get(*i).copied()).collect();
-        let Some(f) = crate::plane::fit_plane(&nb, None) else { continue };
-        let z = f.normal;
-        let sharp =
-            near.iter().filter_map(|(i, _)| normals.get(*i)).any(|nn| nn.norm() > 0.5 && nn.dot(&z).abs() < cos_sharp);
-        let x = surfacecraft_geom::any_perpendicular(&z);
-        let y = z.cross(&x);
-        let o = f.point.coords;
-        let mut ata = nalgebra::Matrix6::<f64>::zeros();
-        let mut atb = nalgebra::Vector6::<f64>::zeros();
-        for q in &nb {
-            let w = q.coords - o;
-            let (u, v, h) = (w.dot(&x), w.dot(&y), w.dot(&z));
-            let row = nalgebra::Vector6::new(u * u, u * v, v * v, u, v, 1.0);
-            ata += row * row.transpose();
-            atb += row * h;
-        }
-        let Some(c) = ata.lu().solve(&atb) else { continue };
-        let w = p.coords - o;
-        let (u, v, h) = (w.dot(&x), w.dot(&y), w.dot(&z));
-        let pred = c[0] * u * u + c[1] * u * v + c[2] * v * v + c[3] * u + c[4] * v + c[5];
-        d.push((h - pred).abs());
+        let Some((dist, sharp)) = probe.residual(p) else { continue };
+        d.push(dist);
         if !sharp {
-            d_smooth.push((h - pred).abs());
+            d_smooth.push(dist);
         }
     }
     let smooth = d_smooth.len() >= 50 && d_smooth.len() * 5 >= d.len();

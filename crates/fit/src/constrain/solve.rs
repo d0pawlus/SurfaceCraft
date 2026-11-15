@@ -147,10 +147,8 @@ impl Lu {
     }
 }
 
-/// The smallest change `x` of the variables with `A x = rhs` for every row, and the residual of
-/// each row. Rows are grouped by the primitives they couple; each group is solved on its own.
-/// Errors carry a message and the row to blame.
-fn solve_rows(rows: &[Row], nvars: usize) -> Result<(Vec<f64>, Vec<f64>), (String, usize)> {
+/// The rows grouped by the primitives they couple: the row indices of each group, by group root.
+fn group_rows(rows: &[Row], nvars: usize) -> BTreeMap<usize, Vec<usize>> {
     let mut parent: Vec<usize> = (0..nvars / 5 + 1).collect();
     for row in rows {
         let mut prims = row.coef.iter().map(|(v, _)| *v / 5);
@@ -165,58 +163,84 @@ fn solve_rows(rows: &[Row], nvars: usize) -> Result<(Vec<f64>, Vec<f64>), (Strin
         let root = row.coef.first().map_or(0, |(v, _)| find_root(&parent, *v / 5));
         groups.entry(root).or_default().push(ri);
     }
+    groups
+}
+
+/// The regularised Gram matrix `A Aᵀ` (row-major, `k × k`) of the rows `rs`.
+fn gram_matrix(rs: &[&Row]) -> Vec<f64> {
+    let k = rs.len();
+    let mut g = vec![0.0; k * k];
+    for a in 0..k {
+        for b in a..k {
+            let (Some(ra), Some(rb)) = (rs.get(a), rs.get(b)) else { continue };
+            let d = sparse_dot(&ra.coef, &rb.coef);
+            if let Some(v) = g.get_mut(a * k + b) {
+                *v = d;
+            }
+            if let Some(v) = g.get_mut(b * k + a) {
+                *v = d;
+            }
+        }
+    }
+    let mean_diag = (0..k).map(|a| g.get(a * k + a).copied().unwrap_or(0.0)).sum::<f64>() / (k.max(1) as f64);
+    let lambda = 1e-10 * mean_diag.max(1e-12);
+    for a in 0..k {
+        if let Some(v) = g.get_mut(a * k + a) {
+            *v += lambda;
+        }
+    }
+    g
+}
+
+/// Adds the solution of the group `rs` to `x` by up to four rounds of iterative refinement with
+/// `lu`; returns the final residual of each row.
+fn refine_group(rs: &[&Row], lu: &Lu, x: &mut [f64]) -> Vec<f64> {
+    let mut r: Vec<f64> = rs.iter().map(|row| row.rhs).collect();
+    for _ in 0..4 {
+        let y = lu.solve(&r);
+        for (row, yi) in rs.iter().zip(&y) {
+            for (v, c) in &row.coef {
+                if let Some(xv) = x.get_mut(*v) {
+                    *xv += c * yi;
+                }
+            }
+        }
+        let mut worst = 0.0_f64;
+        for (slot, row) in r.iter_mut().zip(rs) {
+            let ax: f64 = row.coef.iter().map(|(v, c)| c * x.get(*v).copied().unwrap_or(0.0)).sum();
+            *slot = row.rhs - ax;
+            worst = worst.max(slot.abs());
+        }
+        if worst < 1e-13 {
+            break;
+        }
+    }
+    r
+}
+
+/// Solves the group of rows `idx` into `x`; returns the final residual of each of its rows.
+fn solve_group(rows: &[Row], idx: &[usize], x: &mut [f64]) -> Result<Vec<f64>, (String, usize)> {
+    let first = idx.first().copied().unwrap_or(0);
+    let rs: Vec<&Row> = idx.iter().filter_map(|&i| rows.get(i)).collect();
+    let k = rs.len();
+    if k > MAX_COMPONENT_ROWS {
+        return Err(("too many relations are coupled to solve them together".into(), first));
+    }
+    let Some(lu) = Lu::new(gram_matrix(&rs), k) else {
+        return Err(("the relations cannot be solved together".into(), first));
+    };
+    Ok(refine_group(&rs, &lu, x))
+}
+
+/// The smallest change `x` of the variables with `A x = rhs` for every row, and the residual of
+/// each row. Rows are grouped by the primitives they couple; each group is solved on its own.
+/// Errors carry a message and the row to blame.
+fn solve_rows(rows: &[Row], nvars: usize) -> Result<(Vec<f64>, Vec<f64>), (String, usize)> {
+    let groups = group_rows(rows, nvars);
     let mut x = vec![0.0; nvars];
     let mut resid = vec![0.0; rows.len()];
     for idx in groups.into_values() {
-        let first = idx.first().copied().unwrap_or(0);
-        let rs: Vec<&Row> = idx.iter().filter_map(|&i| rows.get(i)).collect();
-        let k = rs.len();
-        if k > MAX_COMPONENT_ROWS {
-            return Err(("too many relations are coupled to solve them together".into(), first));
-        }
-        let mut g = vec![0.0; k * k];
-        for a in 0..k {
-            for b in a..k {
-                let (Some(ra), Some(rb)) = (rs.get(a), rs.get(b)) else { continue };
-                let d = sparse_dot(&ra.coef, &rb.coef);
-                if let Some(v) = g.get_mut(a * k + b) {
-                    *v = d;
-                }
-                if let Some(v) = g.get_mut(b * k + a) {
-                    *v = d;
-                }
-            }
-        }
-        let mean_diag = (0..k).map(|a| g.get(a * k + a).copied().unwrap_or(0.0)).sum::<f64>() / (k.max(1) as f64);
-        let lambda = 1e-10 * mean_diag.max(1e-12);
-        for a in 0..k {
-            if let Some(v) = g.get_mut(a * k + a) {
-                *v += lambda;
-            }
-        }
-        let Some(lu) = Lu::new(g, k) else {
-            return Err(("the relations cannot be solved together".into(), first));
-        };
-        let mut r: Vec<f64> = rs.iter().map(|row| row.rhs).collect();
-        for _ in 0..4 {
-            let y = lu.solve(&r);
-            for (row, yi) in rs.iter().zip(&y) {
-                for (v, c) in &row.coef {
-                    if let Some(xv) = x.get_mut(*v) {
-                        *xv += c * yi;
-                    }
-                }
-            }
-            let mut worst = 0.0_f64;
-            for (slot, row) in r.iter_mut().zip(&rs) {
-                let ax: f64 = row.coef.iter().map(|(v, c)| c * x.get(*v).copied().unwrap_or(0.0)).sum();
-                *slot = row.rhs - ax;
-                worst = worst.max(slot.abs());
-            }
-            if worst < 1e-13 {
-                break;
-            }
-        }
+        let r = solve_group(rows, &idx, &mut x)?;
         for (e, &ri) in r.iter().zip(&idx) {
             if let Some(out) = resid.get_mut(ri) {
                 *out = e.abs();

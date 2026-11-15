@@ -143,6 +143,84 @@ pub(super) fn tangent_rows(prims: &[Primitive], a: usize, b: usize) -> Option<(V
     }
 }
 
+/// A pair of primitives `a` and `b` that a mirror maps onto each other, with their anchors.
+struct MirrorPair<'a> {
+    a: usize,
+    b: usize,
+    m: &'a Mirror,
+    pa: &'a Primitive,
+    pb: &'a Primitive,
+    xa: Vec3,
+    xb: Vec3,
+}
+
+impl MirrorPair<'_> {
+    /// The row that mirrors the component of the pair along `e`.
+    fn row(&self, e: &Vec3) -> Row {
+        mirror_row(self.a, self.b, self.m, e, &self.xa, &self.xb)
+    }
+
+    /// The directions of the two primitives.
+    fn dirs(&self) -> Option<(Vec3, Vec3)> {
+        Some((direction(self.pa)?, direction(self.pb)?))
+    }
+}
+
+/// Rows of a mirrored pair of planes; the length error and the angle error.
+fn mirror_planes(pair: &MirrorPair, rows: &mut Vec<Row>) -> Option<(f64, f64)> {
+    let (na, nb) = pair.dirs()?;
+    rows.push(pair.row(&nb));
+    Some((nb.dot(&(pair.xb - pair.m.pt(&pair.xa))).abs(), angle_unsigned(&pair.m.dir(&na), &nb)))
+}
+
+/// Rows of a mirrored pair of cylinders (radii `ra`, `rb`); the length error and the angle error.
+fn mirror_cylinders(pair: &MirrorPair, rows: &mut Vec<Row>, ra: f64, rb: f64) -> Option<(f64, f64)> {
+    let (da, db) = pair.dirs()?;
+    for e in perp_basis(&db) {
+        rows.push(pair.row(&e));
+    }
+    rows.push(radius_row(pair.a, pair.b, 0, ra, rb));
+    let w = pair.m.pt(&pair.xa) - pair.xb;
+    Some(((w - db * w.dot(&db)).norm().max((ra - rb).abs()), angle_unsigned(&pair.m.dir(&da), &db)))
+}
+
+/// Rows of a mirrored pair of spheres (radii `ra`, `rb`); the length error and the angle error.
+fn mirror_spheres(pair: &MirrorPair, rows: &mut Vec<Row>, ra: f64, rb: f64) -> (f64, f64) {
+    for e in xyz() {
+        rows.push(pair.row(&e));
+    }
+    rows.push(radius_row(pair.a, pair.b, 0, ra, rb));
+    ((pair.m.pt(&pair.xa) - pair.xb).norm().max((ra - rb).abs()), 0.0)
+}
+
+/// Rows of a mirrored pair of cones (half angles `ha`, `hb`); the length error and the angle error.
+fn mirror_cones(pair: &MirrorPair, rows: &mut Vec<Row>, ha: f64, hb: f64) -> Option<(f64, f64)> {
+    let (da, db) = pair.dirs()?;
+    for e in xyz() {
+        rows.push(pair.row(&e));
+    }
+    let angle = angle_signed(&pair.m.dir(&da), &db).max((ha - hb).abs().to_degrees());
+    Some(((pair.m.pt(&pair.xa) - pair.xb).norm(), angle))
+}
+
+/// Rows of a mirrored pair of tori (major radii `ma`, `mb`, minor radii `na`, `nb`); the length
+/// error and the angle error.
+fn mirror_tori(
+    pair: &MirrorPair,
+    rows: &mut Vec<Row>,
+    (ma, mb): (f64, f64),
+    (na, nb): (f64, f64),
+) -> Option<(f64, f64)> {
+    let (da, db) = pair.dirs()?;
+    for e in xyz() {
+        rows.push(pair.row(&e));
+    }
+    rows.push(radius_row(pair.a, pair.b, 0, ma, mb));
+    rows.push(radius_row(pair.a, pair.b, 1, na, nb));
+    let len = (pair.m.pt(&pair.xa) - pair.xb).norm().max((ma - mb).abs()).max((na - nb).abs());
+    Some((len, angle_unsigned(&pair.m.dir(&da), &db)))
+}
+
 fn symmetric_rows(
     prims: &[Primitive],
     mirrors: &[Mirror],
@@ -152,50 +230,23 @@ fn symmetric_rows(
 ) -> Option<(Vec<Row>, f64, f64)> {
     let m = mirrors.get(mi)?;
     let (pa, pb) = (prims.get(a)?, prims.get(b)?);
-    let (xa, xb) = (anchor(pa), anchor(pb));
+    let pair = MirrorPair { a, b, m, pa, pb, xa: anchor(pa), xb: anchor(pb) };
     let mut rows: Vec<Row> = Vec::new();
     let (len, angle) = match (pa, pb) {
-        (Primitive::Plane { .. }, Primitive::Plane { .. }) => {
-            let (na, nb) = (direction(pa)?, direction(pb)?);
-            rows.push(mirror_row(a, b, m, &nb, &xa, &xb));
-            (nb.dot(&(xb - m.pt(&xa))).abs(), angle_unsigned(&m.dir(&na), &nb))
-        }
+        (Primitive::Plane { .. }, Primitive::Plane { .. }) => mirror_planes(&pair, &mut rows)?,
         (Primitive::Cylinder { radius: ra, .. }, Primitive::Cylinder { radius: rb, .. }) => {
-            let (da, db) = (direction(pa)?, direction(pb)?);
-            for e in perp_basis(&db) {
-                rows.push(mirror_row(a, b, m, &e, &xa, &xb));
-            }
-            rows.push(radius_row(a, b, 0, *ra, *rb));
-            let w = m.pt(&xa) - xb;
-            ((w - db * w.dot(&db)).norm().max((ra - rb).abs()), angle_unsigned(&m.dir(&da), &db))
+            mirror_cylinders(&pair, &mut rows, *ra, *rb)?
         }
         (Primitive::Sphere { radius: ra, .. }, Primitive::Sphere { radius: rb, .. }) => {
-            for e in xyz() {
-                rows.push(mirror_row(a, b, m, &e, &xa, &xb));
-            }
-            rows.push(radius_row(a, b, 0, *ra, *rb));
-            ((m.pt(&xa) - xb).norm().max((ra - rb).abs()), 0.0)
+            mirror_spheres(&pair, &mut rows, *ra, *rb)
         }
         (Primitive::Cone { half_angle: ha, .. }, Primitive::Cone { half_angle: hb, .. }) => {
-            let (da, db) = (direction(pa)?, direction(pb)?);
-            for e in xyz() {
-                rows.push(mirror_row(a, b, m, &e, &xa, &xb));
-            }
-            ((m.pt(&xa) - xb).norm(), angle_signed(&m.dir(&da), &db).max((ha - hb).abs().to_degrees()))
+            mirror_cones(&pair, &mut rows, *ha, *hb)?
         }
         (
             Primitive::Torus { major_radius: ma, minor_radius: na, .. },
             Primitive::Torus { major_radius: mb, minor_radius: nb, .. },
-        ) => {
-            let (da, db) = (direction(pa)?, direction(pb)?);
-            for e in xyz() {
-                rows.push(mirror_row(a, b, m, &e, &xa, &xb));
-            }
-            rows.push(radius_row(a, b, 0, *ma, *mb));
-            rows.push(radius_row(a, b, 1, *na, *nb));
-            let len = (m.pt(&xa) - xb).norm().max((ma - mb).abs()).max((na - nb).abs());
-            (len, angle_unsigned(&m.dir(&da), &db))
-        }
+        ) => mirror_tori(&pair, &mut rows, (*ma, *mb), (*na, *nb))?,
         _ => return None,
     };
     Some((rows, len, angle))

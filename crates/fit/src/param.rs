@@ -265,6 +265,70 @@ fn add_weight(weights: &mut [Vec<f64>], nbr: &[Vec<usize>], i: usize, j: usize, 
     }
 }
 
+/// The normal and the doubled area of a triangle with corners `p`; an error when it is degenerate.
+fn triangle_normal(p: &[Vec3; 3]) -> Result<(Vec3, f64), String> {
+    let lens2 = [(p[1] - p[0]).norm_squared(), (p[2] - p[1]).norm_squared(), (p[0] - p[2]).norm_squared()];
+    let longest2 = lens2.iter().copied().fold(0.0, f64::max);
+    let normal = (p[1] - p[0]).cross(&(p[2] - p[0]));
+    let doubled = normal.norm();
+    if !(doubled.is_finite() && doubled > DEGENERATE_AREA * longest2) {
+        return Err("a triangle of the region is degenerate (zero area)".to_string());
+    }
+    Ok((normal, doubled))
+}
+
+/// The isometric planar frame of a triangle with corners `p`: first edge along x, counter-clockwise.
+fn triangle_frame(p: &[Vec3; 3], normal: Vec3, doubled: f64) -> [[f64; 2]; 3] {
+    let e1 = p[1] - p[0];
+    let e2 = p[2] - p[0];
+    let ex = e1 / e1.norm();
+    let ey = (normal / doubled).cross(&ex);
+    [[0.0, 0.0], [e1.norm(), 0.0], [e2.dot(&ex), e2.dot(&ey)]]
+}
+
+/// Adds the mean-value and cotangent weights of triangle `t` (corners `p`, doubled area `doubled`)
+/// to `mean_value` and `laplacian`; returns its clamped cotangent weights.
+fn add_triangle_weights(
+    topo: &Topology,
+    t: &[usize; 3],
+    p: &[Vec3; 3],
+    doubled: f64,
+    mean_value: &mut [Vec<f64>],
+    laplacian: &mut [Vec<f64>],
+) -> [f64; 3] {
+    let mut cots = [0.0; 3];
+    for k in 0..3 {
+        let (j, l) = ((k + 1) % 3, (k + 2) % 3);
+        let (d1, d2) = (p[j] - p[k], p[l] - p[k]);
+        let (n1, n2) = (d1.norm(), d2.norm());
+        let dot = d1.dot(&d2);
+        let half_tan = (doubled / (n1 * n2 + dot).max(f64::MIN_POSITIVE)).min(MAX_HALF_TAN);
+        add_weight(mean_value, &topo.nbr, t[k], t[j], half_tan / n1);
+        add_weight(mean_value, &topo.nbr, t[k], t[l], half_tan / n2);
+        let c = (dot / doubled).clamp(COT_RANGE.0, COT_RANGE.1);
+        if let Some(slot) = cots.get_mut(k) {
+            *slot = c;
+        }
+        add_weight(laplacian, &topo.nbr, t[j], t[l], c);
+        add_weight(laplacian, &topo.nbr, t[l], t[j], c);
+    }
+    cots
+}
+
+/// Normalises each row of the mean-value weights to sum 1; an error for a row without usable weights.
+fn normalise_mean_value(mean_value: &mut [Vec<f64>]) -> Result<(), String> {
+    for (i, row) in mean_value.iter_mut().enumerate() {
+        let sum: f64 = row.iter().sum();
+        if !(sum.is_finite() && sum > 0.0) {
+            return Err(format!("vertex {i} of the region has no usable mean-value weights"));
+        }
+        for w in row.iter_mut() {
+            *w /= sum;
+        }
+    }
+    Ok(())
+}
+
 /// Weights and local frames of every triangle.
 fn build_geometry(topo: &Topology, pos: &[Vec3]) -> Result<Geometry, String> {
     let nv = topo.nbr.len();
@@ -275,49 +339,12 @@ fn build_geometry(topo: &Topology, pos: &[Vec3]) -> Result<Geometry, String> {
     let mut area = 0.0;
     for t in &topo.tris {
         let p = [pos[t[0]], pos[t[1]], pos[t[2]]];
-        let lens2 = [(p[1] - p[0]).norm_squared(), (p[2] - p[1]).norm_squared(), (p[0] - p[2]).norm_squared()];
-        let longest2 = lens2.iter().copied().fold(0.0, f64::max);
-        let normal = (p[1] - p[0]).cross(&(p[2] - p[0]));
-        let doubled = normal.norm();
-        if !(doubled.is_finite() && doubled > DEGENERATE_AREA * longest2) {
-            return Err("a triangle of the region is degenerate (zero area)".to_string());
-        }
+        let (normal, doubled) = triangle_normal(&p)?;
         area += doubled / 2.0;
-
-        // isometric planar frame: first edge along x, counter-clockwise
-        let e1 = p[1] - p[0];
-        let e2 = p[2] - p[0];
-        let ex = e1 / e1.norm();
-        let ey = (normal / doubled).cross(&ex);
-        local.push([[0.0, 0.0], [e1.norm(), 0.0], [e2.dot(&ex), e2.dot(&ey)]]);
-
-        let mut cots = [0.0; 3];
-        for k in 0..3 {
-            let (j, l) = ((k + 1) % 3, (k + 2) % 3);
-            let (d1, d2) = (p[j] - p[k], p[l] - p[k]);
-            let (n1, n2) = (d1.norm(), d2.norm());
-            let dot = d1.dot(&d2);
-            let half_tan = (doubled / (n1 * n2 + dot).max(f64::MIN_POSITIVE)).min(MAX_HALF_TAN);
-            add_weight(&mut mean_value, &topo.nbr, t[k], t[j], half_tan / n1);
-            add_weight(&mut mean_value, &topo.nbr, t[k], t[l], half_tan / n2);
-            let c = (dot / doubled).clamp(COT_RANGE.0, COT_RANGE.1);
-            if let Some(slot) = cots.get_mut(k) {
-                *slot = c;
-            }
-            add_weight(&mut laplacian, &topo.nbr, t[j], t[l], c);
-            add_weight(&mut laplacian, &topo.nbr, t[l], t[j], c);
-        }
-        cot.push(cots);
+        local.push(triangle_frame(&p, normal, doubled));
+        cot.push(add_triangle_weights(topo, t, &p, doubled, &mut mean_value, &mut laplacian));
     }
-    for (i, row) in mean_value.iter_mut().enumerate() {
-        let sum: f64 = row.iter().sum();
-        if !(sum.is_finite() && sum > 0.0) {
-            return Err(format!("vertex {i} of the region has no usable mean-value weights"));
-        }
-        for w in row.iter_mut() {
-            *w /= sum;
-        }
-    }
+    normalise_mean_value(&mut mean_value)?;
     let laplacian_diag: Vec<f64> = laplacian.iter().map(|row| row.iter().sum()).collect();
     if laplacian_diag.len() != nv || laplacian_diag.iter().any(|d| !(d.is_finite() && *d > 0.0)) {
         return Err("the region has an isolated vertex".to_string());
@@ -331,6 +358,20 @@ fn dot(a: &[f64], b: &[f64]) -> f64 {
 
 fn norm(a: &[f64]) -> f64 {
     dot(a, a).sqrt()
+}
+
+/// The corners of a boundary loop of `m` vertices at positions `at(k)`: the vertices whose
+/// direction turns by more than [`CORNER_TURN_DEGREES`].
+fn polygon_corners(m: usize, at: &impl Fn(usize) -> Vec3) -> Vec<usize> {
+    let cos_limit = CORNER_TURN_DEGREES.to_radians().cos();
+    (0..m)
+        .filter(|&k| {
+            let d1 = at(k) - at(k + m - 1);
+            let d2 = at(k + 1) - at(k);
+            let (n1, n2) = (d1.norm(), d2.norm());
+            n1 > 1e-12 && n2 > 1e-12 && d1.dot(&d2) / (n1 * n2) < cos_limit
+        })
+        .collect()
 }
 
 /// Positions of the boundary loop on a convex polygon inscribed in the unit circle: the corners
@@ -351,15 +392,7 @@ fn boundary_polygon(lp: &[usize], pos: &[Vec3]) -> Result<Vec<[f64; 2]>, String>
         start.push(acc);
         acc += l;
     }
-    let cos_limit = CORNER_TURN_DEGREES.to_radians().cos();
-    let corners: Vec<usize> = (0..m)
-        .filter(|&k| {
-            let d1 = at(k) - at(k + m - 1);
-            let d2 = at(k + 1) - at(k);
-            let (n1, n2) = (d1.norm(), d2.norm());
-            n1 > 1e-12 && n2 > 1e-12 && d1.dot(&d2) / (n1 * n2) < cos_limit
-        })
-        .collect();
+    let corners = polygon_corners(m, &at);
     let on_circle = |k: usize| {
         let a = TAU * start.get(k).copied().unwrap_or(0.0) / total;
         [a.cos(), a.sin()]

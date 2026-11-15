@@ -108,7 +108,9 @@ fn pca_axes(pts: &[Point3]) -> Vec<Vec3> {
     (0..3).filter_map(|i| normalize(e.eigenvectors.column(i).into_owned())).collect()
 }
 
-fn cone_from_axis(pts: &[Point3], d0: Vec3) -> Option<PrimitiveFit> {
+/// The start of a cone fit from a given axis estimate: the axis oriented so that the radius grows
+/// along it, the apex and the half angle of the line fitted to radius against height.
+fn cone_start(pts: &[Point3], d0: Vec3) -> Option<(Vec3, Vec3, f64)> {
     // radius as a linear function of height along the axis: r(h) = r0 + h·tan(α)
     let c0 = centroid(pts);
     let (u, w) = basis(&d0);
@@ -138,6 +140,12 @@ fn cone_from_axis(pts: &[Point3], d0: Vec3) -> Option<PrimitiveFit> {
     let (d, slope) = if slope > 0.0 { (d0, slope) } else { (-d0, -slope) };
     let apex0 = axis_pt - d * (r0 / slope);
     let alpha0 = slope.atan();
+    Some((d, apex0, alpha0))
+}
+
+/// Cone from a given axis estimate: a line through radius against height, then LM.
+fn cone_from_axis(pts: &[Point3], d0: Vec3) -> Option<PrimitiveFit> {
+    let (d, apex0, alpha0) = cone_start(pts, d0)?;
     let (u, w) = basis(&d);
     let sub = subset(pts);
     let res = lm::minimize(
