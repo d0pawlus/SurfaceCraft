@@ -212,6 +212,27 @@ pub(super) fn check_face(mesh: &Mesh, forward: bool, cloud: &Cloud, face: (&Brep
         for probe in [corner, gauge.closest(middle).unwrap_or(middle)] {
             let (distance, normal) = nearest_over(cloud, body, &mut evals, probe, reach)?;
             if distance > PROXIMITY_SLACK * gap + 1e-6 && on_segments(probe, &open) > ON_BORDER {
+                // DIAGNOSTIC (bisect branch only): what each candidate patch gives for this probe
+                for f in cloud.nearest_faces(probe, NEAREST_PATCHES) {
+                    let got = evals.get(&f).and_then(|e| nearest_on_patch(cloud, e, f, probe, reach));
+                    let pts: Vec<f64> = cloud
+                        .points
+                        .iter()
+                        .zip(&cloud.faces)
+                        .filter(|(_, g)| **g == f)
+                        .map(|(q, _)| norm(sub(*q, probe)))
+                        .collect();
+                    let nearest_sample = pts.iter().copied().fold(f64::INFINITY, f64::min);
+                    eprintln!(
+                        "DIAG check probe ({:.3}, {:.3}, {:.3}) face {f}: projection {:?} nearest cloud sample {:.3} ({} samples)",
+                        probe[0],
+                        probe[1],
+                        probe[2],
+                        got.map(|g| g.0),
+                        nearest_sample,
+                        pts.len()
+                    );
+                }
                 return Err(KernelError::Argument(format!(
                     "the new face leaves the patches it replaced by {distance:.3} mm (limit {:.3}) at ({:.1}, {:.1}, {:.1})",
                     PROXIMITY_SLACK * gap,
