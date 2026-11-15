@@ -139,6 +139,7 @@ fn patch_for(
         }
         count.iter().all(|(e, &n)| if boundary.contains(e) { n == 1 } else { n == 2 && !taken.contains(e) })
     };
+    guard.patch_over_budget = false;
     for p in tries {
         if cancel.is_cancelled() {
             return None;
@@ -147,6 +148,8 @@ fn patch_for(
             return Some(Some(p));
         }
     }
+    // left open where a try could not be judged within the budget: counted once for the loop
+    guard.over_budget += usize::from(guard.patch_over_budget);
     Some(None)
 }
 
@@ -275,17 +278,29 @@ pub(super) fn drop_specks(u: &mut Union, guard: &mut Guard<'_>) -> usize {
 pub const SPECK_SHARE: f64 = 0.01;
 
 /// Does every triangle of `part` have its centre within `tol` of facing surface of the rest of `mesh`?
-fn lies_on_rest(mesh: &Mesh, bvh: &crate::Bvh, part: &[u32], tol: f64) -> bool {
+/// `None` when cancelled (polled every [`CANCEL_EVERY`] triangles).
+fn lies_on_rest(mesh: &Mesh, bvh: &crate::Bvh, part: &[u32], tol: f64, cancel: &crate::Cancel) -> Option<bool> {
     let mine: HashSet<u32> = part.iter().copied().collect();
-    part.iter().all(|&t| {
-        let (Some(c), Some(n)) = (mesh.face_centroid(t as usize), mesh.face_normal(t as usize)) else {
-            return false;
-        };
-        let keep = |o: usize| {
-            !mine.contains(&(o as u32)) && mesh.face_normal(o).is_some_and(|m| m.dot(&n) >= super::overlap::COS_FACING)
-        };
-        bvh.closest_filtered(&c, tol, &keep).is_some()
-    })
+    for chunk in part.chunks(CANCEL_EVERY) {
+        if cancel.is_cancelled() {
+            return None;
+        }
+        if !chunk.iter().all(|&t| on_rest(mesh, bvh, &mine, t, tol)) {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+/// Is the centre of triangle `t` within `tol` of facing surface of `mesh` outside `mine`?
+fn on_rest(mesh: &Mesh, bvh: &crate::Bvh, mine: &HashSet<u32>, t: u32, tol: f64) -> bool {
+    let (Some(c), Some(n)) = (mesh.face_centroid(t as usize), mesh.face_normal(t as usize)) else {
+        return false;
+    };
+    let keep = |o: usize| {
+        !mine.contains(&(o as u32)) && mesh.face_normal(o).is_some_and(|m| m.dot(&n) >= super::overlap::COS_FACING)
+    };
+    bvh.closest_filtered(&c, tol, &keep).is_some()
 }
 
 /// Drops the pieces of the union other than the largest that lie wholly (the centre of every
@@ -309,7 +324,7 @@ pub(super) fn drop_islands(
         if n % CANCEL_EVERY == 0 && cancel.is_cancelled() {
             return None;
         }
-        if lies_on_rest(&mesh, &bvh, part, tol) {
+        if lies_on_rest(&mesh, &bvh, part, tol, cancel)? {
             for &t in part {
                 if let Some(d) = drop.get_mut(t as usize) {
                     *d = true;

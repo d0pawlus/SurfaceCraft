@@ -10,10 +10,14 @@
 //!    surface of the other within [`REACH_TOLERANCES`] tolerances, the distances give the residual
 //!    of the pair (rms, 95th percentile, worst). Scans that disagree there (more than
 //!    [`MISALIGNED_SHARE`] of their shared surface farther apart than the tolerance) are not
-//!    averaged and not stacked: the merge refuses with `Misaligned` and the numbers. Scans whose
-//!    normals oppose where they meet (one is turned inside out) are refused the same way.
-//! 3. Ownership ([`own`]): where several scans cover the surface, the one in which it lies farthest
-//!    from its own border keeps it; the others lose those vertices and every triangle touching
+//!    averaged and not stacked: the merge refuses with `Misaligned` and the numbers. Scans that
+//!    lie over each other beyond the reach and that nothing ties (no agreement of their own or
+//!    through others) are refused as `Displaced`; scans that meet somewhere and also lie over each
+//!    other are reported as `LayersApart` (a shelf over a floor looks the same). Samples whose search
+//!    along the normal ran out of its budget are not judged (`Unjudged`). Scans whose normals oppose
+//!    where they meet (one is turned inside out) are refused.
+//! 3. Ownership ([`own`]), for scans that pass step 2: where several scans cover the surface, the
+//!    one in which it lies farthest from its own border keeps it; the others lose those vertices and every triangle touching
 //!    one. Triangles on the edge of a kept region that still lie wholly on another scan's kept
 //!    surface are eaten back (Turk and Levoy's removal of redundant triangles).
 //! 4. The kept triangles are put together ([`union`]); seam vertices of different scans that
@@ -31,6 +35,7 @@
 mod check;
 mod fill;
 mod guard;
+mod nest;
 mod orient;
 mod overlap;
 mod own;
@@ -49,9 +54,10 @@ mod weld;
 pub use check::{Coverage, DUPLICATE_SHARE, MAX_REMOVED_SAMPLES};
 pub use fill::SMALL_LOOP_EDGES;
 pub use guard::{MAX_CELL_SPAN, SUPPORT_SLOPE};
+pub use nest::INVERTED_MIN_SHARE;
 pub use orient::FLIPPED_REFUSE_SHARE;
 pub use overlap::{PAIR_SAMPLES, PairResidual};
-pub use prep::{INVERTED_MIN_SHARE, Topology, topology};
+pub use prep::{Topology, topology};
 pub use recover::Recovered;
 pub use seam::{RADII_EDGES, SeamReport};
 pub use weld::{AREA_KEEP, WELD_EDGE_SHARE, WELD_SHARE};
@@ -123,11 +129,12 @@ pub enum Issue {
     /// over `b` beyond the reach (median `offset` mm along the normal), `within` agree with it, and
     /// no scan that shares surface with both ties them (refused).
     Displaced { a: usize, b: usize, samples: usize, over: usize, within: usize, offset: f64 },
-    /// Two scans that agree somewhere also lie over each other at one offset, both ways: `over` of
-    /// `samples` samples of each beyond the reach, median `offset` mm along the normals. A copy
-    /// displaced along a face parallel to the displacement looks so, and so does a shelf over a floor
-    /// seen by different scans: not refused, reported.
-    LayersApart { a: usize, b: usize, over: [usize; 2], samples: [usize; 2], offset: f64 },
+    /// Two scans that meet somewhere also lie over each other: `over` of the `related` samples of `a`
+    /// (on `b` within the reach, or over it) lie over `b` beyond the reach, at a median `offset` mm
+    /// along the normals with `spread` mm between the quartiles (`one_offset`: a shift as a whole;
+    /// else a tilt or a curved surface). A scan displaced along a face parallel to the displacement
+    /// looks so, and so does a shelf over a floor seen by different scans: not refused, reported.
+    LayersApart { a: usize, b: usize, over: usize, related: usize, offset: f64, spread: f64, one_offset: bool },
     /// Samples of `a` whose cast toward `b` ran out of its budget (a pile of triangles): not judged.
     Unjudged { a: usize, b: usize, samples: usize },
     /// The normals of two scans oppose where they meet: one is turned inside out (refused).
@@ -147,7 +154,7 @@ pub enum Issue {
     /// with three corners of one scan counts as that scan.
     Stacked { share: f64, triangles: usize },
     /// Closed pieces of a scan with a negative volume that are not refused: inner skins (inside another
-    /// closed piece: the inside of a hollow part) and debris below [`prep::INVERTED_MIN_SHARE`].
+    /// closed piece: the inside of a hollow part) and debris below [`INVERTED_MIN_SHARE`].
     InnerSkins { scan: usize, skins: usize, debris: usize },
     /// A closed piece of a scan has a negative volume: turned inside out (refused).
     Inverted { scan: usize, pieces: usize },
@@ -336,7 +343,7 @@ fn pair_issues(n: usize, pairs: &[PairResidual], tol: f64) -> Vec<Issue> {
     let both = |a: usize, b: usize| [pair(pairs, a, b), pair(pairs, b, a)].into_iter().flatten();
     // scans tied by shared surface, directly or through others: one lying over another displaced is
     // then the part's own shape (a step, a shelf), not a misalignment, since both agree with a third
-    let tied = groups_of(n, |a, b| both(a, b).any(|r| r.near >= MIN_SHARED_SAMPLES));
+    let tied = groups_of(n, |a, b| both(a, b).any(|r| r.agrees(MIN_SHARED_SAMPLES)));
     let mut out = Vec::new();
     for a in 0..n {
         for b in a + 1..n {
@@ -344,7 +351,7 @@ fn pair_issues(n: usize, pairs: &[PairResidual], tol: f64) -> Vec<Issue> {
             let refused = misaligned(a, b, x, y, tied.get(a) == tied.get(b));
             // a pair refused as displaced says it already
             if !matches!(refused, Some(Issue::Displaced { .. })) {
-                out.extend(layers_apart(a, b, x, y, tol));
+                out.extend(layers_apart(x, y, tol));
             }
             out.extend(refused);
             for r in [x, y].into_iter().flatten().filter(|r| r.unknown > 0) {
@@ -422,18 +429,23 @@ fn misaligned(a: usize, b: usize, x: Option<&PairResidual>, y: Option<&PairResid
 /// Do scans `a` and `b` lie over each other at one offset both ways (see [`Issue::LayersApart`])?
 /// Both directions are needed: a shelf partly over a floor, or the steps of a part, give a share one
 /// way or at many offsets; a whole copy displaced gives it both ways at one offset.
-fn layers_apart(a: usize, b: usize, x: Option<&PairResidual>, y: Option<&PairResidual>, tol: f64) -> Option<Issue> {
-    let (x, y) = (x?, y?);
-    let each = |r: &PairResidual| r.lies_over(MIN_SHARED_SAMPLES) && r.one_offset(tol);
-    if !(each(x) && each(y) && (x.over_offset - y.over_offset).abs() <= tol) {
+fn layers_apart(x: Option<&PairResidual>, y: Option<&PairResidual>, tol: f64) -> Option<Issue> {
+    let both = || [x, y].into_iter().flatten();
+    // only scans that meet somewhere: pieces that share nothing and lie over each other are tied by a
+    // third scan (or refused as displaced)
+    if !both().any(|r| r.near >= MIN_SHARED_SAMPLES) {
         return None;
     }
+    let r =
+        both().filter(|r| r.lies_over(MIN_SHARED_SAMPLES)).max_by(|p, q| p.over_share().total_cmp(&q.over_share()))?;
     Some(Issue::LayersApart {
-        a,
-        b,
-        over: [x.over, y.over],
-        samples: [x.samples, y.samples],
-        offset: 0.5 * (x.over_offset + y.over_offset),
+        a: r.a,
+        b: r.b,
+        over: r.over,
+        related: r.related(),
+        offset: r.over_offset,
+        spread: r.over_spread,
+        one_offset: r.one_offset(tol),
     })
 }
 
@@ -554,7 +566,9 @@ fn recover_rounds(
         let before = u.triangles.len();
         let r = recover::recover(u, scans, removed, guard, (tol, cancel))?;
         if r.triangles == 0 {
-            break;
+            // nothing changed since that look: its count is what is still uncovered
+            rep.recovered.uncovered = r.uncovered;
+            return Some(());
         }
         let specks = fill::drop_specks(u, guard);
         if cancel.is_cancelled() {

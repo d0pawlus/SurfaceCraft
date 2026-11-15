@@ -103,7 +103,8 @@ pub(super) fn coverage(
     let split =
         |t: &[Point3; 3]| if each > 0.0 { ((area(t) / each).sqrt().ceil() as usize).clamp(1, MAX_SPLIT) } else { 1 };
     // what the subdivision emits: k² points a triangle
-    let estimate: usize = (0..n).filter_map(gone).map(|t| split(&t).pow(2)).sum();
+    // saturating: a million triangles of 4096 points each overflows a 32-bit usize
+    let estimate = (0..n).filter_map(gone).fold(0usize, |e, t| with_split(e, split(&t)));
     let mut cov = Coverage::default();
     let mut buf: Vec<(Point3, Vec3, f64)> = Vec::with_capacity(CHUNK);
     let mut emit = |p: (Point3, Vec3, f64)| -> Option<()> {
@@ -134,6 +135,12 @@ pub(super) fn coverage(
     }
     measure(r, &buf, tol, &mut cov);
     Some(cov)
+}
+
+/// The point count `e` with a triangle split `k` ways more (k² points), saturating: a million
+/// triangles of 4096 points each overflows a 32-bit `usize` (the browser build).
+pub(super) fn with_split(e: usize, k: usize) -> usize {
+    e.saturating_add(k.saturating_mul(k))
 }
 
 /// One point in every removed triangle and `rest` more by area, handed to `emit` one by one.

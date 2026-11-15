@@ -50,16 +50,15 @@ pub(super) fn uncovered(
         .filter_map(|o| if let Origin::Restored(s, t) | Origin::Recovered(s, t) = o { Some((*s, *t)) } else { None })
         .collect();
     let bvh = Bvh::build(&Mesh { positions: u.positions.clone(), triangles: u.triangles.clone() });
-    let mut out = Vec::new();
+    let (mut out, mut looked) = (Vec::new(), 0usize);
     for (s, scan) in scans.iter().enumerate() {
-        if cancel.is_cancelled() {
-            return None;
-        }
         let gone = removed.get(s).map_or(&[][..], Vec::as_slice);
         for t in (0..scan.mesh.triangles.len()).filter(|&t| gone.get(t).copied().unwrap_or(false)) {
-            if t % UNCOVERED_CANCEL_EVERY == 0 && cancel.is_cancelled() {
+            // polled by the removed triangles looked at, whatever their indices
+            if looked % UNCOVERED_CANCEL_EVERY == 0 && cancel.is_cancelled() {
                 return None;
             }
+            looked += 1;
             if back.contains(&(s as u32, t as u32)) {
                 continue;
             }

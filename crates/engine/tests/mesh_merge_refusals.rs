@@ -82,20 +82,46 @@ fn scans_misaligned_by_several_tolerances_are_refused() {
 #[test]
 fn scans_misaligned_beyond_the_reach_are_refused() {
     let tol = 0.1;
-    let mut displaced = 0;
+    // the blob's halves: where the shifted surfaces cross on the flanks some points are shared
+    // (how many depends on the platform), so either form may fire; both give their numbers
     for times in [10.0, 30.0, 100.0] {
         let mut views = halves();
         views[1] = views[1].transformed(&Transform::translation(Vec3::new(0.0, 0.0, times * tol)));
         let mut s = session(&views);
         let out = merge(&mut s, 2, json!({"tolerance": tol}));
-        let over: Vec<u64> = out["pairs"].as_array().unwrap().iter().map(|p| p["over"].as_u64().unwrap()).collect();
-        eprintln!("{times} tolerances: over {over:?}, issues {:?}", codes(&out));
+        let near: Vec<u64> = out["pairs"].as_array().unwrap().iter().map(|p| p["shared"].as_u64().unwrap()).collect();
+        eprintln!("{times} tolerances: shared {near:?}, issues {:?}", codes(&out));
         assert_refused(&s, &out, "scans_misaligned", 2);
         assert!(!codes(&out).contains(&"scans_disjoint".to_string()));
-        displaced += usize::from(says_what_was_measured(&out));
+        says_what_was_measured(&out);
     }
-    // the nearer offsets may still share points on the blob's flanks (the share form, also checked)
-    assert!(displaced >= 1, "at least the farthest offset is refused as displaced");
+    // flat sheets share nothing within the reach on any platform: always the displaced form
+    for times in [10.0, 30.0, 100.0] {
+        let views = vec![sheet(0.0), sheet(times * tol)];
+        let mut s = session(&views);
+        let out = merge(&mut s, 2, json!({"tolerance": tol}));
+        assert_refused(&s, &out, "scans_misaligned", 2);
+        assert!(says_what_was_measured(&out), "{times} tolerances: the displaced form");
+    }
+}
+
+/// A flat 20 x 20 mm sheet of 1 mm cells at height `z`, facing up.
+fn sheet(z: f64) -> Mesh {
+    let n = 20;
+    let mut m = Mesh::default();
+    for j in 0..=n {
+        for i in 0..=n {
+            m.positions.push(Point3::new(i as f64, j as f64, z));
+        }
+    }
+    let at = |i: usize, j: usize| (j * (n + 1) + i) as u32;
+    for j in 0..n {
+        for i in 0..n {
+            m.triangles.push([at(i, j), at(i + 1, j), at(i + 1, j + 1)]);
+            m.triangles.push([at(i, j), at(i + 1, j + 1), at(i, j + 1)]);
+        }
+    }
+    m
 }
 
 /// Checks that the refusal's text gives the numbers of its pair; true for the displaced form.

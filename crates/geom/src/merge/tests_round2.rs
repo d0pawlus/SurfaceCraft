@@ -31,7 +31,18 @@ fn flipped(m: &Mesh) -> Mesh {
 }
 
 fn report(scans: &[Mesh], tol: f64) -> Report {
-    merge(scans, &Params { tolerance: tol }, &Cancel::new(), &mut |_| {}).unwrap().1
+    let rep = merge(scans, &Params { tolerance: tol }, &Cancel::new(), &mut |_| {}).unwrap().1;
+    let shares: Vec<String> = rep
+        .pairs
+        .iter()
+        .map(|p| format!("{}-{} over_share {:.4} agree_share {:.4}", p.a, p.b, p.over_share(), p.agree_share()))
+        .collect();
+    eprintln!("SHARES {shares:?}");
+    rep
+}
+
+fn warns(rep: &Report) -> bool {
+    rep.issues.iter().any(|i| matches!(i, Issue::LayersApart { .. }))
 }
 
 fn codes(rep: &Report) -> Vec<String> {
@@ -60,7 +71,7 @@ fn opposite_sides_of_a_wall_and_a_hollow_part_are_not_refused() {
     let front = sheet(20, 20, (0.0, 0.0), 1.0);
     let back = flipped(&moved(&sheet(20, 20, (2.0, 2.0), 1.0), Vec3::new(0.0, 0.0, -2.0)));
     let rep = report(&[front, back], tol);
-    assert!(!rep.refused, "{:?}", rep.issues);
+    assert!(!rep.refused && !warns(&rep), "{:?}", rep.issues);
     // a hollow sphere (outer skin and inner skin facing in) with a view of its outer skin
     let mut hollow = synth::sphere(Point3::origin(), 20.0, 40, 20);
     hollow.append(&flipped(&synth::sphere(Point3::origin(), 16.0, 32, 16)));
@@ -73,7 +84,7 @@ fn opposite_sides_of_a_wall_and_a_hollow_part_are_not_refused() {
             .collect(),
     };
     let rep = report(&[hollow, cap], 0.3);
-    assert!(!rep.refused, "{:?}", rep.issues);
+    assert!(!rep.refused && !warns(&rep), "{:?}", rep.issues);
 }
 
 #[test]
@@ -431,13 +442,13 @@ fn small_cavities_are_inner_skins_and_many_small_loose_inverted_pieces_are_inver
     for x in [-8.0, 8.0] {
         solid.append(&inside_out(synth::sphere(Point3::new(x, 0.0, 0.0), 1.55, 12, 6)));
     }
-    assert_eq!(prep::negative_pieces(&solid), (0, 2, 0));
+    assert_eq!(nest::negative_pieces(&solid, &Cancel::new()).unwrap(), (0, 2, 0));
     // the same two inverted pieces loose outside: debris together over 1 %, so inverted
     let mut loose = synth::sphere(Point3::origin(), 20.0, 32, 16);
     for x in [-40.0, 40.0] {
         loose.append(&inside_out(synth::sphere(Point3::new(x, 0.0, 0.0), 1.55, 12, 6)));
     }
-    assert_eq!(prep::negative_pieces(&loose), (2, 0, 0));
+    assert_eq!(nest::negative_pieces(&loose, &Cancel::new()).unwrap(), (2, 0, 0));
 }
 
 #[test]
@@ -604,4 +615,184 @@ fn the_rows_agree_with_a_count_of_the_result_on_a_scan_with_a_duplicate_and_a_fl
     let own: std::collections::HashSet<_> = (0..a.triangle_count()).filter_map(|t| a.triangle(t)).map(key).collect();
     let found = (0..mesh.triangle_count()).filter_map(|t| mesh.triangle(t)).filter(|t| own.contains(&key(*t))).count();
     assert_eq!(found, row.kept + row.restored, "{row:?}");
+}
+
+#[test]
+fn thousands_of_small_inverted_pieces_cost_one_bvh_and_a_bounded_number_of_casts() {
+    // a large sphere and 3000 tiny inverted spheres in the corners of its box (inside its box,
+    // outside the sphere): every one is tested against the large sphere, none against the others
+    let mut m = synth::sphere(Point3::origin(), 50.0, 64, 32);
+    let count = 3000;
+    for k in 0..count {
+        let s = f64::from(k as u32);
+        let c = Point3::new(45.0 - 0.01 * s, 45.0 - 0.003 * (s % 100.0), 45.0);
+        m.append(&inside_out(synth::sphere(c, 0.002, 6, 3)));
+    }
+    let (n, cost) = nest::negative_pieces_costed(&m, &Cancel::new()).unwrap();
+    assert_eq!(n, (0, 0, count));
+    assert_eq!(cost.builds, 1);
+    // per piece three directions, each at most the large sphere's two crossings and a miss
+    assert!(cost.casts <= count * 3 * 3, "{cost:?}");
+    assert!(nest::negative_pieces(&m, &Cancel::after_looks(2)).is_none(), "a cancellation stops the stage");
+}
+
+/// Is the merge of `scans` refused or does it say the scans lie over each other?
+fn flagged(scans: &[Mesh], tol: f64) -> (bool, Vec<Issue>) {
+    let rep = report(scans, tol);
+    let hit = rep.refused || rep.issues.iter().any(|i| matches!(i, Issue::LayersApart { .. }));
+    (hit, rep.issues)
+}
+
+#[test]
+fn a_small_displaced_patch_is_never_merged_silently() {
+    let tol = 0.1;
+    // a 5 mm L patch on a 20 mm L, its wall on the other's wall, its floor 2 mm (20 tol) above
+    let b = moved(&l_part(4, 1.25), Vec3::new(15.0, 0.0, 20.0 * tol));
+    let (hit, issues) = flagged(&[l_part(20, 1.0), b], tol);
+    assert!(hit, "{issues:?}");
+}
+
+#[test]
+fn a_patch_displaced_by_a_small_rotation_is_never_merged_silently() {
+    let tol = 0.1;
+    // turned by 6 degrees about the foot of the wall: the floor rises to 2 mm at its far end
+    let turn = Transform::translation(Vec3::new(20.0, 0.0, 0.0))
+        .then_after(&Transform::rotation_axis_angle(&Vec3::y(), -6.0_f64.to_radians()))
+        .then_after(&Transform::translation(Vec3::new(-20.0, 0.0, 0.0)));
+    let b = l_part(16, 1.25).transformed(&turn);
+    let (hit, issues) = flagged(&[l_part(20, 1.0), b], tol);
+    assert!(hit, "{issues:?}");
+}
+
+#[test]
+fn a_displaced_curved_surface_is_never_merged_silently() {
+    let tol = 0.1;
+    // the top of a sphere and a smaller cap of another tessellation 2 mm higher: they meet near the
+    // rim of the cap (where the shift runs along the surface), not at the top
+    let top = |m: Mesh, z: f64| Mesh {
+        positions: m.positions.clone(),
+        triangles: (0..m.triangle_count())
+            .filter(|&t| m.face_centroid(t).unwrap().z > z)
+            .map(|t| m.triangles[t])
+            .collect(),
+    };
+    let a = top(synth::sphere(Point3::origin(), 20.0, 64, 32), 0.0);
+    let b = moved(&top(synth::sphere(Point3::origin(), 20.0, 56, 28), 12.0), Vec3::new(0.0, 0.0, 20.0 * tol));
+    let (hit, issues) = flagged(&[a, b], tol);
+    assert!(hit, "{issues:?}");
+}
+
+#[test]
+fn a_displaced_scan_seen_from_one_side_only_is_never_merged_silently() {
+    let tol = 0.1;
+    // the second scan sees the wall and only a strip of floor along it (the rest hidden from it)
+    let mut b = sheet(4, 16, (15.0, 0.0), 1.25);
+    let w = sheet(16, 16, (0.0, 0.0), 1.25);
+    b.append(&Mesh {
+        positions: w.positions.iter().map(|p| Point3::new(20.0, p.x, p.y)).collect(),
+        triangles: w.triangles.iter().map(|t| [t[0], t[2], t[1]]).collect(),
+    });
+    let (hit, issues) = flagged(&[l_part(20, 1.0), moved(&b, Vec3::new(0.0, 0.0, 20.0 * tol))], tol);
+    assert!(hit, "{issues:?}");
+}
+
+#[test]
+fn a_weak_tie_does_not_tie_and_a_material_one_does() {
+    let r = |a: usize, b: usize, near: usize, within: usize, over: usize| PairResidual {
+        a,
+        b,
+        samples: 20_000,
+        near,
+        within,
+        over,
+        ..PairResidual::default()
+    };
+    // 0 and 2 lie over each other and share nothing; 1 agrees with 2, and with 0 by `w` of 10 000
+    let pairs = |w: usize| {
+        [
+            r(0, 1, 10_000, w, 0),
+            r(1, 0, 10_000, w, 0),
+            r(1, 2, 8000, 8000, 0),
+            r(2, 1, 8000, 8000, 0),
+            r(0, 2, 0, 0, 3000),
+            r(2, 0, 0, 0, 3000),
+        ]
+    };
+    let displaced = |w: usize| pair_issues(3, &pairs(w), 0.1).iter().any(|i| matches!(i, Issue::Displaced { .. }));
+    // 2000 agreeing samples are 20 % of what relates 0 and 1, below TIE_SHARE: no tie, the displaced
+    // pair is refused
+    assert!(displaced(2000));
+    // 3000 are 30 %: a tie through 1, no refusal
+    assert!(!displaced(3000));
+}
+
+#[test]
+fn the_subdivision_estimate_saturates_instead_of_wrapping() {
+    // on a 32-bit target a million removed triangles at 4096 points each pass usize::MAX
+    let near_max = usize::MAX - 10;
+    assert_eq!(check::with_split(near_max, 64), usize::MAX);
+    assert_eq!(check::with_split(0, usize::MAX), usize::MAX);
+    assert_eq!(check::with_split(5, 3), 14);
+}
+
+#[test]
+fn a_loop_left_open_for_the_budget_is_counted_once() {
+    let k = 6;
+    let d = disc_of(k);
+    let scans = vec![prep::prepare(&d, &Cancel::new()).unwrap()];
+    let removed: Vec<bool> = (0..d.triangle_count()).map(|t| t < k).collect();
+    let mut u = union::assemble(&scans, &[removed]);
+    let mut guard = guard_over(&scans, &u, 0.1);
+    guard.max_near = 0;
+    let (filled, _, left) = fill::fill_small(&mut u, &scans, &mut guard, &Cancel::new()).unwrap();
+    assert_eq!((filled, left.len()), (0, 1));
+    assert_eq!((guard.over_budget, guard.crossing), (1, 0), "one loop, every try over the budget");
+}
+
+#[test]
+fn a_large_candidate_over_the_budget_is_refused_before_any_collection() {
+    let scans = vec![prep::prepare(&sheet(1, 1, (0.0, 0.0), 1.0), &Cancel::new()).unwrap()];
+    let mut pos = Vec::new();
+    for i in 0..5 {
+        let x = 0.01 * f64::from(i);
+        pos.extend([Point3::new(x, 0.0, 0.5), Point3::new(x + 0.005, 0.0, 0.5), Point3::new(x, 0.005, 0.5)]);
+    }
+    pos.extend([Point3::new(-500.0, -500.0, -2.0), Point3::new(500.0, -500.0, -2.0), Point3::new(0.0, 500.0, -2.0)]);
+    let count = pos.len();
+    let u = union_of(pos, vec![0; count], Vec::new());
+    let mut g = guard_over(&scans, &u, 0.01);
+    for i in 0..5u32 {
+        assert!(g.restorable(Pts::of(&u), [3 * i, 3 * i + 1, 3 * i + 2]));
+    }
+    g.max_near = 2;
+    let before = g.collections();
+    assert!(!g.restorable(Pts::of(&u), [15, 16, 17]));
+    assert_eq!((g.over_budget, g.collections()), (1, before), "refused with nothing collected");
+}
+
+#[test]
+fn the_uncovered_pass_polls_by_the_removed_triangles_it_looks_at() {
+    let g = sheet(48, 48, (0.0, 0.0), 1.0);
+    let scans = vec![prep::prepare(&g, &Cancel::new()).unwrap()];
+    // removed: odd indices only (none divisible by 1024), 2304 of them
+    let removed = vec![(0..g.triangle_count()).map(|t| t % 2 == 1).collect::<Vec<bool>>()];
+    let u = union::assemble(&scans, &removed);
+    let counter = Cancel::after_looks(usize::MAX);
+    assert!(recover::uncovered(&u, &scans, &removed, 0.1, &counter).is_some());
+    let looks = usize::MAX - counter.looks_left();
+    assert_eq!(looks, 3, "one look per 1024 removed triangles: 0, 1024, 2048");
+    assert!(recover::uncovered(&u, &scans, &removed, 0.1, &Cancel::after_looks(2)).is_none());
+}
+
+#[test]
+fn unjudged_samples_leave_the_verdict_to_the_judged_ones() {
+    // 19 000 of 20 000 samples unjudged: the share is of the 1000 judged, 60 over is 6 % of them
+    let r = PairResidual { a: 0, b: 1, samples: 20_000, unknown: 19_000, over: 60, ..PairResidual::default() };
+    assert!(r.displaced(MIN_SHARED_SAMPLES));
+    // all but 40 unjudged: fewer than the minimum over, no verdict drawn
+    let none = PairResidual { a: 0, b: 1, samples: 20_000, unknown: 19_960, over: 40, ..PairResidual::default() };
+    assert!(!none.displaced(MIN_SHARED_SAMPLES));
+    let issues =
+        pair_issues(2, &[none.clone(), PairResidual { a: 1, b: 0, samples: 20_000, ..PairResidual::default() }], 0.1);
+    assert!(issues.iter().any(|i| matches!(i, Issue::Unjudged { samples: 19_960, .. })), "{issues:?}");
 }

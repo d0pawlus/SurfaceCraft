@@ -431,7 +431,7 @@ fn removed_surface_the_recovery_could_not_put_back_is_reported_uncovered() {
     assert!(guard.restorable(guard::Pts::of(&u), wall));
     let mut rep = seam::SeamReport::default();
     assert!(recover_rounds(&mut u, &scans, &removed, &mut guard, 0.1, &mut rep, &cancel).is_some());
-    assert!(rep.recovered.uncovered > 0, "{:?}", rep.recovered);
+    assert!(rep.recovered.uncovered > 0 && rep.recovered.triangles > 0, "{:?}", rep.recovered);
     assert!(rep.recovered.uncovered + rep.recovered.triangles <= scans[0].mesh.triangle_count());
 }
 

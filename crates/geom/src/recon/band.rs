@@ -10,9 +10,6 @@ use super::pivot::{Bpa, FrontEdge, ball_center};
 use super::*;
 use crate::{Cancel, tri};
 
-/// Pivots between two looks at the cancellation flag.
-const CANCEL_EVERY: usize = 512;
-
 /// A directed edge `a → b` of the existing triangle `(a, b, c)`, from which the band grows.
 pub(crate) type FrontTriangle = [u32; 3];
 
@@ -72,7 +69,6 @@ pub(crate) fn pivot_band(
     }
     let first_new = bpa.tris.len();
     bpa.accept = Some(accept);
-    let mut pivots = 0usize;
     for &rho in radii.iter().filter(|r| r.is_finite() && **r > 0.0) {
         if cancel.is_cancelled() {
             return None;
@@ -80,8 +76,9 @@ pub(crate) fn pivot_band(
         let grid = Grid::build(input.points, 2.0 * rho);
         let mut front = front_of(&bpa, input.front, first_new, rho);
         while let Some(f) = front.pop_front() {
-            pivots += 1;
-            if pivots.is_multiple_of(CANCEL_EVERY) && cancel.is_cancelled() {
+            // one look per pivot: a pivot's work (its candidates and the accept hook's crossing test)
+            // is bounded, so between two looks there is at most one pivot's worth
+            if cancel.is_cancelled() {
                 return None;
             }
             bpa.pivot(&grid, rho, &f, &mut front);

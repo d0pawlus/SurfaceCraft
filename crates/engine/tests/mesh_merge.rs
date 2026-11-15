@@ -175,6 +175,10 @@ fn assert_clean(label: &str, m: &Measured) {
     let bound = surfacecraft_geom::merge::WELD_SHARE * tol * (1.0 + 1e-9);
     assert!(c["max_vertex_move"].as_f64().unwrap() <= bound, "{label}: welds are bounded");
     assert!(!m.out["refused"].as_bool().unwrap(), "{label}");
+    // correct views: no pair lies over another (largest over share printed with the case)
+    let over = m.out["pairs"].as_array().unwrap().iter().map(|p| p["over_share"].as_f64().unwrap()).fold(0.0, f64::max);
+    eprintln!("{label}: largest over share {over:.4}");
+    assert!(!codes(&m.out).iter().any(|k| k == "layers_apart"), "{label}: {over}");
     let has = |code: &str| codes(&m.out).iter().any(|k| k == code);
     assert_eq!(has("seam_open"), seam["open_edges"].as_u64().unwrap() > 0, "{label}");
     assert_eq!(has("removed_not_covered"), c["removed_within_share"].as_f64().unwrap() < 0.99, "{label}");

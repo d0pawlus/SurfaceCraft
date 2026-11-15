@@ -74,7 +74,7 @@ fn classes(mesh: &Mesh, across: &[[u32; 3]]) -> (Vec<u8>, Vec<u32>) {
 }
 
 /// The triangles wound against the rest of their piece: per piece, the class with the smaller area
-/// (class 1 on a tie). Empty flags when every piece is one class.
+/// (class 1 on a tie), one flag per triangle (all false when every piece is one class).
 pub(super) fn flipped(mesh: &Mesh, across: &[[u32; 3]]) -> Vec<bool> {
     let (class, piece) = classes(mesh, across);
     let mut area: std::collections::BTreeMap<u32, [f64; 2]> = std::collections::BTreeMap::new();

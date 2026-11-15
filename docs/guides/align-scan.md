@@ -296,10 +296,11 @@ Normals, colours and per-vertex data go with the coordinates.
   - `inverted_scan`: a closed piece of a scan has a negative volume. Inner skins (inside another
     closed piece, as the inside of a hollow part or a cavity, whatever their size) and debris (loose
     small pieces below 1 % of the scan's area all together) are not refused; they are reported as `inner_skins` with their counts.
-- Reported, not refused: `layers_apart` (two scans that agree somewhere also lie over each other at
-  one offset, both ways: a shelf over a floor seen by different scans looks so, and so does a scan
-  displaced along a face parallel to the displacement, which the geometry cannot tell apart; check the
-  alignment), `overlap_unjudged` (samples whose search along the normal ran out of its budget in a
+- Reported, not refused: `layers_apart` (two scans that meet somewhere also lie over each other:
+  at least 14 % of the points of one that relate to the other, on it or over it, lie over it beyond
+  the reach, with nothing of their own scan in between; the issue gives the median offset and its
+  spread, and says whether it is one offset, a shift as a whole, or not, a tilt or a curved surface;
+  check the alignment), `overlap_unjudged` (samples whose search along the normal ran out of its budget in a
   pile of triangles), `seam_over_budget` (seam or restored triangles left out because the crossing
   test would have compared too many triangles), `non_manifold_input` (exact duplicate triangles and triangles on edges of
   three or more triangles are left out and counted as removed), `flipped_triangles_dropped`, `scans_disjoint` (groups of scans that share no surface: the result is a
@@ -329,6 +330,12 @@ Normals, colours and per-vertex data go with the coordinates.
   blob merge into one piece that wraps no worse than one full scan of the blob (in a few noise draws a
   small loop stays open where all views meet in a point; it is reported).
 - Limits:
+  - A scan displaced along a face parallel to the displacement (an L part shifted along its floor's
+    normal, whose walls still agree), tilted, or seen over the other from one side only cannot be
+    told from a shelf over a floor seen by different scans: both are reported as `layers_apart`, never
+    refused and never silent. Only a displaced pair that nothing ties (no agreement of its own on at
+    least 25 % of what relates the two, and none through other scans) is refused. Correct input
+    measured at most 8.4 % over (one scan of many small shells), displaced input at least 22 %.
   - Two OPEN scans that are both turned inside out, consistently, cannot be told from right ones (as
     with `align.pair_coarse`).
   - A wall thinner than the tolerance, seen from its two sides by two different scans only, reads as

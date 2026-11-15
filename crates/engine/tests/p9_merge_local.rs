@@ -181,6 +181,24 @@ fn run(number: usize, kind: &str, whole: &Mesh, parts: &[Mesh]) {
         v.iter().map(|st| format!("{} {} ms", st["stage"].as_str().unwrap_or(""), st["ms"])).collect()
     });
     eprintln!("|   | stages: {} |", stages.join(", "));
+    let shares: Vec<String> = out["pairs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| {
+            format!(
+                "{}-{} shared {} within {} over {} over_share {:.4} agree_share {:.4}",
+                p["a"],
+                p["b"],
+                p["shared"],
+                p["within"],
+                p["over"],
+                p["over_share"].as_f64().unwrap_or(0.0),
+                p["agree_share"].as_f64().unwrap_or(0.0)
+            )
+        })
+        .collect();
+    eprintln!("|   | pairs: {} |", shares.join("; "));
 }
 
 #[test]

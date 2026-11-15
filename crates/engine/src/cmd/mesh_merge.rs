@@ -83,7 +83,7 @@ pub struct MergeScanOut {
     pub dropped: usize,
     /// Share of the scan's area within the tolerance of facing surface of another scan (0..1).
     pub overlap_share: f64,
-    /// Area of the scan and the area removed (mm²).
+    /// Area of the scan (mm²).
     pub area: f64,
     /// Area removed (mm²).
     pub removed_area: f64,
@@ -120,6 +120,10 @@ pub struct MergePairOut {
     pub worst: f64,
     /// Share of the shared points farther than the tolerance.
     pub beyond_share: f64,
+    /// Share of the points that relate to `b` (shared or over it) that lie over it beyond the reach.
+    pub over_share: f64,
+    /// Share of the points that relate to `b` within the tolerance of it.
+    pub agree_share: f64,
 }
 
 /// What the seam step did.
@@ -376,17 +380,18 @@ fn scan_notice(i: &Issue) -> Option<MergeIssueOut> {
 /// A notice about a pair of scans that does not refuse, in the form of the command.
 fn pair_notice(i: &Issue) -> Option<MergeIssueOut> {
     Some(match i {
-        Issue::LayersApart { a, b, over, samples, offset } => issue(
+        Issue::LayersApart { a, b, over, related, offset, spread, one_offset } => issue(
             "layers_apart",
             "warning",
             vec![*a, *b],
             format!(
-                "scans {a} and {b} agree in places but also lie over each other at one offset, both ways: {} of {} points of scan {a} and {} of {} of scan {b} lie over the other farther than {} tolerances, median {offset:.4} mm along the normals; either the part has a face there (a shelf over a floor) or one scan is displaced along a face parallel to the displacement: check the alignment",
-                over[0],
-                samples[0],
-                over[1],
-                samples[1],
-                surfacecraft_geom::merge::REACH_TOLERANCES
+                "scans {a} and {b} meet in places but also lie over each other: {over} of the {related} points of scan {a} that relate to scan {b} lie over it farther than {} tolerances, median {offset:.4} mm along the normals, {spread:.4} mm between the quartiles ({}); either the part has a face there (a shelf over a floor) or one scan is displaced: check the alignment",
+                surfacecraft_geom::merge::REACH_TOLERANCES,
+                if *one_offset {
+                    "one offset: a shift as a whole"
+                } else {
+                    "not one offset: a tilt or a curved surface"
+                }
             ),
         ),
         Issue::Unjudged { a, b, samples } => issue(
@@ -546,6 +551,8 @@ fn pair_out(p: &surfacecraft_geom::merge::PairResidual) -> MergePairOut {
         p95: p.p95,
         worst: p.worst,
         beyond_share: p.beyond_share(),
+        over_share: p.over_share(),
+        agree_share: p.agree_share(),
     }
 }
 

@@ -126,6 +126,10 @@ pub(super) struct Guard<'a> {
     pub(super) over_budget: usize,
     /// Comparisons one crossing test may make ([`MAX_NEAR`]; lowered in tests).
     pub(super) max_near: usize,
+    /// Set when a try of `accept_all` was refused for the budget (cleared by its caller).
+    pub(super) patch_over_budget: bool,
+    /// Collections of the new triangles a crossing test made (for a test of the early refusal).
+    collections: std::cell::Cell<usize>,
     pub(super) crossing: usize,
     pub(super) bad_corners: usize,
 }
@@ -160,6 +164,8 @@ impl<'a> Guard<'a> {
             unsupported: 0,
             over_budget: 0,
             max_near: MAX_NEAR,
+            patch_over_budget: false,
+            collections: std::cell::Cell::new(0),
             crossing: 0,
             bad_corners: 0,
         }
@@ -211,12 +217,15 @@ impl<'a> Guard<'a> {
             return Clash::Crossing;
         }
         // the new triangles near it: those of its cells (or all live ones, for a candidate too large
-        // for the grid) and the large ones, each once, within the budget left
-        let mut ids: Vec<u32> = if self.too_large(&bx) {
-            self.index_of.values().copied().collect()
-        } else {
-            self.cells_of(&bx).copied().collect()
-        };
+        // for the grid) and the large ones, each once, within the budget left; a large candidate
+        // over the budget is refused before anything is collected
+        let large = self.too_large(&bx);
+        if large && near.len() + self.index_of.len() > self.max_near {
+            return Clash::Budget;
+        }
+        self.collections.set(self.collections.get() + 1);
+        let mut ids: Vec<u32> =
+            if large { self.index_of.values().copied().collect() } else { self.cells_of(&bx).copied().collect() };
         ids.extend(self.large.iter().copied());
         ids.sort_unstable();
         ids.dedup();
@@ -313,6 +322,12 @@ impl<'a> Guard<'a> {
         }
     }
 
+    /// Collections of new triangles the crossing tests made.
+    #[cfg(test)]
+    pub(super) fn collections(&self) -> usize {
+        self.collections.get()
+    }
+
     /// Comparisons the last crossing test made (or would have made).
     #[cfg(test)]
     pub(super) fn compared(&self) -> usize {
@@ -361,6 +376,8 @@ impl<'a> Guard<'a> {
                 for a in added {
                     self.forget(p, a);
                 }
+                // a try refused for the budget is noted: the loop it was for may stay open unjudged
+                self.patch_over_budget |= self.over_budget > mark.3;
                 (self.unsupported, self.crossing, self.bad_corners, self.over_budget) = mark;
                 return false;
             }
