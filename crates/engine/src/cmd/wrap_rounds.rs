@@ -51,6 +51,12 @@ const MAX_COARSE: f64 = 4.0;
 const UNIFORM_ROUNDS: usize = 3;
 /// Rounds at most of the adaptive layout.
 const ADAPTIVE_ROUNDS: usize = 7;
+/// The adaptive rounds stop (below the cap) once the share within the tolerance reaches
+/// `min_within` plus this share of what `min_within` leaves out (99.5 % for 99 %): the wrap measures
+/// a stride of the scan against a coarse tessellation of the patches, so a network that only just
+/// meets `min_within` there can miss it against the scan. Only the stop uses it; whether the
+/// tolerance is met is still judged by `min_within`.
+const STOP_MARGIN: f64 = 0.5;
 /// A round cut to the cap must raise the best share within the tolerance by this much for the
 /// rounds to go on at the cap (0.1 percentage points of the samples).
 const MIN_GAIN_AT_CAP: f64 = 0.001;
@@ -168,6 +174,8 @@ pub(super) struct Target<'a> {
     samples: Vec<Point3>,
     pub(super) tolerance: f64,
     pub(super) min_within: f64,
+    /// Share at which the adaptive rounds stop below the cap (see [`STOP_MARGIN`]).
+    stop_within: f64,
     max_triangles: usize,
     max_patches: usize,
     /// Start coarser when the first round would not fit the cap (see [`first_round`]).
@@ -195,6 +203,7 @@ impl<'a> Target<'a> {
             samples: scan.positions.iter().step_by(stride).copied().collect(),
             tolerance,
             min_within,
+            stop_within: min_within + STOP_MARGIN * (1.0 - min_within),
             max_triangles: (max_patches / PATCHES_PER_TRIANGLE).max(4),
             coarse_start: false,
             max_patches,
@@ -593,7 +602,8 @@ fn adaptive_rounds(t: &Target, g1: bool) -> CmdResult<Wrapped> {
         let Some((laid, raw_count)) = lay_adaptive(t, &lv, round, &mut budget)? else { break };
         let reason = laid.partial;
         let (d, met) = run.add(t, &laid);
-        if reason == Some(PartialReason::FirstRoundOverCap) || (met && reason.is_none()) {
+        let stop = run.log.last().is_some_and(|l| l.within >= t.stop_within);
+        if reason == Some(PartialReason::FirstRoundOverCap) || (stop && reason.is_none()) {
             break;
         }
         if reason.is_some() {
