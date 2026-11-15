@@ -32,7 +32,8 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
   to the cap. Below the cap the adaptive rounds stop once the share reaches `min_within` plus three
   quarters of what it leaves out (99.75 % for 99 %; `within_tolerance` is still judged by
   `min_within`). The one corpus scan held at `review` by accuracy now passes (97.87 to 99.38 %
-  within 0.2 mm at 60 000 patches; about a quarter more computing time).
+  within 0.2 mm at 60 000 patches), no corpus scan has a lower share, and the corpus takes about a
+  fifth more computing time.
 
 ## [0.2.0] - 2026-11-13
 
