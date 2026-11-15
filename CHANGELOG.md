@@ -35,6 +35,13 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
   parts per call rises from 24 to 128, the cleaning keeps small parts below its default, and small
   parts are never rebuilt.
 
+### Fixed
+
+- `scan.to_solid` on a split scan: a part whose `auto` freeform attempt was refused because the call's
+  two extra attempts were spent, and whose primitives did not pass, is now wrapped once as its own
+  wrap and the better result is kept (twelve small parts of the scan of many parts ended without a
+  pass before; each passes now).
+
 ## [0.2.0] - 2026-11-13
 
 Four days and 60 merged pull requests after 0.1.0. The release is about real scans: one command now takes
