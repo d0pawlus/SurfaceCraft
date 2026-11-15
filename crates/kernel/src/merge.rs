@@ -235,6 +235,94 @@ fn validate_loops(loops: &[(f64, &[[f64; 2]])]) -> Result<()> {
     Ok(())
 }
 
+/// DIAGNOSTIC (bisect branch only): the loops of a merged face in the surface's parameters.
+fn diag_loops(group: &Group, loops: &[(f64, &[[f64; 2]], &Vec<LoopEdge>)], placed: &Placement) {
+    let target = [-7.8, 1.9, 1.4];
+    for (k, (area, pts, edges)) in loops.iter().enumerate() {
+        let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+        for q in pts.iter() {
+            for d in 0..2 {
+                lo[d] = lo[d].min(q[d]);
+                hi[d] = hi[d].max(q[d]);
+            }
+        }
+        let n = pts.len();
+        let seg = |i: usize| (pts[i % n], pts[(i + 1) % n]);
+        let orient =
+            |a: [f64; 2], b: [f64; 2], c: [f64; 2]| (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+        let mut crossings = 0;
+        for i in 0..n {
+            for j in i + 2..n {
+                if i == 0 && j == n - 1 {
+                    continue;
+                }
+                let ((a, b), (c, d)) = (seg(i), seg(j));
+                if orient(a, b, c) * orient(a, b, d) < 0.0 && orient(c, d, a) * orient(c, d, b) < 0.0 {
+                    crossings += 1;
+                    if crossings <= 20 {
+                        let owner = |i: usize| {
+                            let mut acc = 0;
+                            for le in edges.iter() {
+                                let m = group.edge_points(le.edge).map_or(0, Vec::len);
+                                if i < acc + m {
+                                    let pts3 = group.edge_points(le.edge).cloned().unwrap_or_default();
+                                    let q = pts3
+                                        .get(if le.forward { i - acc } else { m - 1 - (i - acc) })
+                                        .copied()
+                                        .unwrap_or([f64::NAN; 3]);
+                                    return (le.edge, q);
+                                }
+                                acc += m;
+                            }
+                            (u32::MAX, [f64::NAN; 3])
+                        };
+                        let ((ei, qi), (ej, qj)) = (owner(i), owner(j));
+                        eprintln!(
+                            "DIAG   crossing: point {i} (edge {ei}, ({:.3}, {:.3}, {:.3}), uv ({:.4}, {:.4})) with point {j} (edge {ej}, ({:.3}, {:.3}, {:.3}), uv ({:.4}, {:.4}))",
+                            qi[0], qi[1], qi[2], a[0], a[1], qj[0], qj[1], qj[2], c[0], c[1]
+                        );
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "DIAG loop {k} of {}: edges {} points {n} signed area {area:.4} uv box ({:.4}, {:.4})-({:.4}, {:.4}) self crossings {crossings} flip {}",
+            loops.len(),
+            edges.len(),
+            lo[0],
+            lo[1],
+            hi[0],
+            hi[1],
+            placed.flip
+        );
+        for le in edges.iter() {
+            let pts3 = group.edge_points(le.edge).cloned().unwrap_or_default();
+            let near = pts3
+                .iter()
+                .map(|q| ((q[0] - target[0]).powi(2) + (q[1] - target[1]).powi(2) + (q[2] - target[2]).powi(2)).sqrt())
+                .fold(f64::INFINITY, f64::min);
+            if near < 1.5 {
+                let uv: Vec<[f64; 2]> = pts3.iter().map(|q| placed.param(*q)).collect();
+                eprintln!(
+                    "DIAG   edge {} forward {} near target {near:.3}: points {:?} uv {:?}",
+                    le.edge,
+                    le.forward,
+                    pts3.iter()
+                        .map(|q| [
+                            (q[0] * 1000.0).round() / 1000.0,
+                            (q[1] * 1000.0).round() / 1000.0,
+                            (q[2] * 1000.0).round() / 1000.0
+                        ])
+                        .collect::<Vec<_>>(),
+                    uv.iter()
+                        .map(|q| [(q[0] * 10000.0).round() / 10000.0, (q[1] * 10000.0).round() / 10000.0])
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+}
+
 /// The loops of the new face, the outer one (the largest) first, each as the face's loop. The outer
 /// loop must run counter-clockwise seen from the side the patches face, the others (holes) the other
 /// way round and inside the outer one.
@@ -249,6 +337,7 @@ fn face_loops(body: &Brep, group: &Group, placed: &Placement) -> Result<Vec<Loop
         sized.push((side * polygon_area(&pts), pts, l));
     }
     sized.sort_by(|a, c| c.0.abs().total_cmp(&a.0.abs()));
+    diag_loops(group, &sized.iter().map(|(a, p, l)| (*a, p.as_slice(), *l)).collect::<Vec<_>>(), placed);
     validate_loops(&sized.iter().map(|(a, p, _)| (*a, p.as_slice())).collect::<Vec<_>>())?;
     let mut out = Vec::with_capacity(sized.len());
     for (_, _, l) in sized {
