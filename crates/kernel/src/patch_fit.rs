@@ -99,7 +99,8 @@ pub struct Request {
     pub tolerance: f64,
     /// Relative stiffness of the bending energy against the data (default 1e-3).
     pub smoothing: Option<f64>,
-    /// Start control net; default from the number of data points.
+    /// Start control net; default from the number of data points, or 6 by 6 when every side is
+    /// soft (the rounds then grow it only until the data are within the tolerance).
     pub control: Option<[usize; 2]>,
     /// Most control points per direction, at most [`crate::vpatch::MAX_CONTROL`].
     pub max_control: usize,
@@ -219,6 +220,8 @@ const HARD_RESIDUAL_REL: f64 = 1e-5;
 /// The default start net of a call with G1/G2 sides (coupled solve) stays at this size; growth goes on
 /// within the cost bound of [`crate::vpatch::MAX_SOLVE_SECONDS`].
 const COUPLED_START_MAX: usize = 16;
+/// Smallest start net per direction; the start net of a patch whose sides are all soft.
+const MIN_START: usize = 6;
 const DEFAULT_SMOOTHING: f64 = 1e-3;
 /// Share of a side's length around a conflicting corner where its G1/G2 rows are relaxed.
 const RELAX_SPAN: f64 = 0.15;
@@ -426,7 +429,13 @@ fn start_net_and_domain(req: &Request, lp: &start::Loop, interior: &start::Inter
     let n_data = interior.data.iter().filter(|p| !p.out).count();
     let coupled = lp.sides.iter().any(|s| s.continuity != Continuity::G0);
     let start_net = req.control.unwrap_or_else(|| {
-        let k = ((n_data as f64 / 12.0).sqrt().round() as usize).max(6);
+        // nothing but the data tolerance asks for a dense net when every side is soft: start
+        // coarse and let the rounds grow it, so the patch does not follow the texture of the scan
+        if lp.sides.iter().all(|s| s.soft) {
+            let k = std::cmp::min(max, MIN_START);
+            return [k, k];
+        }
+        let k = ((n_data as f64 / 12.0).sqrt().round() as usize).max(MIN_START);
         let k = std::cmp::min(max, k);
         let k = if coupled { k.min(COUPLED_START_MAX) } else { k };
         [k, k]

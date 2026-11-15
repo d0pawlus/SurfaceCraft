@@ -23,6 +23,14 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
   `close_handles` uses it. `mesh.close_handles` takes candidates refused for splitting the surface
   back one by one.
 
+### Changed
+
+- `surface.patch`: a patch whose sides are all soft now starts from a 6 by 6 control net and
+  grows it only until the scan data are within `tolerance`; before, the start net came from the
+  number of data points and followed the fine texture of a dense scan, which made its curvature
+  useless as a G2 reference for a neighbouring patch. Such a patch is smoother and its `rms` is
+  larger than before; pass a smaller `tolerance` for a closer fit. [#139]
+
 ## [0.2.0] - 2026-11-13
 
 Four days and 60 merged pull requests after 0.1.0. The release is about real scans: one command now takes
