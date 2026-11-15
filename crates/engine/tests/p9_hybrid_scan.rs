@@ -290,6 +290,8 @@ fn the_hybrid_method_puts_the_plane_cylinder_and_sphere_of_a_smooth_part_on_anal
 }
 
 /// Gate 2: the same part as an open scan (a wedge cut away) gives a sheet with analytic faces, not a failure.
+/// It also guards the wrap's least-squares refit: patches it turned had the wall cylinder refused for
+/// disagreeing normals (only 92 mm2 of the part's own faces left on Windows, against 259 on main).
 #[test]
 fn an_open_scan_gives_a_sheet_with_analytic_faces() {
     let mut part = part_mesh();
