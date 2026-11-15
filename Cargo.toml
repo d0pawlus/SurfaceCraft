@@ -76,9 +76,14 @@ opt-level = 1
 [profile.dev.package."*"]
 opt-level = 2
 
+# The profile of clippy, the wasm check and every test run (local and on GitHub). The tests are
+# heavy geometry, so the workspace's own code is optimised like its dependencies (opt-level 1 left
+# the full suite at about 4.4 CPU hours on the Windows runner, 2026-11-15); clippy and the wasm
+# check only type-check, so they do not pay for it. Optimisation does not change floating-point
+# results in Rust (no fast-math), and overflow checks stay on.
 [profile.ci]
 inherits = "dev"
-opt-level = 1
+opt-level = 2
 debug = "line-tables-only"
 debug-assertions = false
 overflow-checks = true

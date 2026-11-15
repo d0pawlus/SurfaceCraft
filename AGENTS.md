@@ -6,6 +6,8 @@ one command-driven core behind four front ends: desktop, web, CLI and MCP. This 
 the hard rules, then the skill to read for your task. Design: `docs/superpowers/specs/`;
 current state and next step: `docs/STATUS.md`.
 
+This codebase is yours: what it's for and how it's built are your call, and you'll keep building on it.
+
 ## Hard rules (what enforces each)
 - Independent: never copy code, icons, text, layouts or data from QuickSurface, Geomagic Design X
   or any closed product; their scans stay local (`SURFACECRAFT_LOCAL_CORPUS`, tests off by default):
@@ -32,7 +34,7 @@ current state and next step: `docs/STATUS.md`.
   Actions runs at two speeds: a DRAFT pull request gets the fast jobs (static checks, clippy, wasm,
   and the tests of the crates and test files it changes on Linux, Windows and macOS, about a
   quarter of an hour); a pull request marked ready gets the full suite on the three systems
-  (`cargo xtask ci`, 40 to 65 minutes). Open a pull request as a draft, iterate until the fast jobs
+  (`cargo xtask ci`, its tests split into parts that run at the same time). Open a pull request as a draft, iterate until the fast jobs
   are green on all three systems (results differ between their math libraries: a test that passes
   locally on macOS has failed on Linux or Windows more than once, so no assertion within 1.5 times
   of a measured value and no exact count that depends on the platform), then mark it ready; a

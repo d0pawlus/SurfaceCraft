@@ -449,6 +449,11 @@
   "view.iso_hint": "Obróć do widoku izometrycznego.",
   "view.fit_hint": "Pokaż wszystko w widoku.",
   "form.ok": "OK",
+  "form.apply_proposal_hint": "Przenieś skan do proponowanego ułożenia (Enter)",
+  "form.propose": "Zaproponuj",
+  "form.propose_hint": "Wyznacz ułożenie i pokaż w nim skan; nic się jeszcze nie przesuwa (Enter)",
+  "form.proposal_shown": "Skan jest pokazany w proponowanym ułożeniu. Zastosuj przenosi go tam, Anuluj zostawia go na miejscu.",
+  "form.proposal_low_confidence": "Niska pewność: mało ścian zgadza się z tym ułożeniem. Sprawdź je wzrokiem przed zastosowaniem.",
   "form.optional": "Opcjonalne",
   "form.preview_hint": "Pokaż wynik w widoku 3D, zanim zatwierdzisz.",
   "form.failed": "Nie udało się: {error}",
@@ -1018,5 +1023,15 @@
   "cmd.align.pair_coarse": "Wyrównanie dwóch skanów",
   "cmd.align.pair_coarse.hint": "Układa drugi skan tej samej części na pierwszym bez wskazywania punktów: próbuje osi głównych i dopasowania lokalnych kształtów, także gdy skany zachodzą na siebie tylko częściowo. Mówi, kiedy ułożenie jest niejednoznaczne albo skany do siebie nie pasują.",
   "cmd.align.global": "Wyrównanie wielu skanów",
-  "cmd.align.global.hint": "Układa kilka skanów tej samej części we wspólnym położeniu bez wskazywania punktów: wyrównuje pary, ocenia, którym parom można ufać, i poprawia wszystkie położenia razem, tak by błąd wzdłuż pętli się rozłożył. Skany, których nie da się połączyć, zostają na miejscu."
+  "cmd.align.global.hint": "Układa kilka skanów tej samej części we wspólnym położeniu bez wskazywania punktów: wyrównuje pary, ocenia, którym parom można ufać, i poprawia wszystkie położenia razem, tak by błąd wzdłuż pętli się rozłożył. Skany, których nie da się połączyć, zostają na miejscu.",
+  "param.reduce_to": "Redukuj do",
+  "reduce.title": "Duży skan",
+  "reduce.text": "Ten skan ma {triangles} trójkątów.",
+  "reduce.over_limit": "Import w tym miejscu przyjmuje najwyżej {limit} trójkątów, więc skan trzeba zredukować podczas wczytywania.",
+  "reduce.optional": "Możesz go zredukować podczas wczytywania: wczyta się szybciej i każdy kolejny krok będzie krótszy.",
+  "reduce.target": "Redukuj do (trójkątów)",
+  "reduce.confirm": "Zredukuj i importuj",
+  "reduce.full": "Importuj w całości",
+  "reduce.cancel": "Anuluj",
+  "reduce.done": "Zredukowano przy imporcie z {from} do {to} trójkątów (żaden wierzchołek nie przesunął się o więcej niż {error} mm)."
 }
