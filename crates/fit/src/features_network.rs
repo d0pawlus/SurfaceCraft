@@ -501,7 +501,7 @@ impl<'a> Tracer<'a> {
         let (ca, _, last_a) = o.corners[c];
         let (cb, first_b, _) = o.corners[(c + 1) % count];
         let mut pts = vec![self.corners.points[ca as usize]];
-        let end = if (c + 1) % count == 0 { m + first_b } else { first_b };
+        let end = if (c + 1).is_multiple_of(count) { m + first_b } else { first_b };
         let mut between = Vec::new();
         for step in (last_a + 1)..end {
             pts.push(self.sm.sub.positions[o.at(step % m) as usize].coords);
