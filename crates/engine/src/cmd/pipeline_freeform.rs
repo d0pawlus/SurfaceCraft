@@ -135,8 +135,8 @@ pub(super) fn issues_for(
         );
         list.push(issue("out_of_tolerance", msg));
     }
-    if !list.is_empty() && report.holes_left > 0 {
-        list.push(issue("scan_defects", format!("{} holes of the scan were too large to fill", report.holes_left)));
+    if !list.is_empty() {
+        list.extend(super::defects_issue(report.holes_left, report.holes_inward));
     }
     if !list.is_empty() && report.non_manifold_edges > 0 {
         let msg = format!("{} edges are shared by three or more triangles", report.non_manifold_edges);

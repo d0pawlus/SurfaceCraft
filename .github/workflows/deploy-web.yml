@@ -32,7 +32,13 @@ env:
 jobs:
   deploy:
     name: build and deploy the web app
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    # only a `ci` run of a push to this repository's main: a pull request from a fork whose branch
+    # is called main also passes the `branches` filter above, and its code must never run here,
+    # where the deploy token is
+    if: >-
+      github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.event == 'push'
+      && github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
@@ -44,8 +50,9 @@ jobs:
         with:
           # the commit ci tested, not whatever main points at now
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.99.1" # rust-toolchain.toml
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:

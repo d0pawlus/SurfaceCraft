@@ -4,11 +4,16 @@ on:
   push:
     branches: [main]
   pull_request:
-    # ready_for_review: marking a draft ready starts the full suite (see the note on the jobs)
-    types: [opened, synchronize, reopened, ready_for_review]
+    # ready_for_review: marking a draft ready starts the full suite (see the note on the jobs).
+    # closed: a run that only cancels what is still queued or running for a merged or closed pull
+    # request (every job below skips on it), so runners are not spent on it.
+    types: [opened, synchronize, reopened, ready_for_review, closed]
 
+# One run per pull request and one for main: a newer run cancels the older one, queued or running.
+# On main only the newest commit is checked and deployed (deploy-web follows the `ci` run that
+# succeeded and publishes that commit, which already contains every earlier one).
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -24,6 +29,7 @@ jobs:
   # engine (include_str!), so they count as code. A push to main always runs everything.
   changes:
     name: detect docs-only change
+    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     outputs:
       docs_only: ${{ steps.diff.outputs.docs_only }}
@@ -55,7 +61,7 @@ jobs:
   gate:
     name: fast gate (static checks, clippy, wasm)
     needs: changes
-    if: ${{ !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.draft == true && needs.changes.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && github.event.action != 'closed' && github.event_name == 'pull_request' && github.event.pull_request.draft == true && needs.changes.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -69,8 +75,9 @@ jobs:
           apt_get update || echo "::warning::apt-get update failed or timed out"
           apt_get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev \
             || echo "::warning::system libraries not installed; using the runner image as it is"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.99.1" # rust-toolchain.toml
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
@@ -88,7 +95,7 @@ jobs:
   changed-tests:
     name: changed tests (${{ matrix.os }})
     needs: changes
-    if: ${{ !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.draft == true && needs.changes.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && github.event.action != 'closed' && github.event_name == 'pull_request' && github.event.pull_request.draft == true && needs.changes.outputs.docs_only != 'true' }}
     strategy:
       fail-fast: false
       matrix:
@@ -146,8 +153,10 @@ jobs:
           apt_get update || echo "::warning::apt-get update failed or timed out"
           apt_get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev \
             || echo "::warning::system libraries not installed; using the runner image as it is"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         if: steps.select.outputs.any == 'true'
+        with:
+          toolchain: "1.99.1" # rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
         if: steps.select.outputs.any == 'true'
         with:
@@ -185,7 +194,7 @@ jobs:
     needs: changes
     # runs even when detection failed: only an explicit docs_only == 'true' skips steps;
     # not for a draft pull request (the fast jobs above run instead)
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
+    if: ${{ !cancelled() && github.event.action != 'closed' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -205,8 +214,9 @@ jobs:
           apt_get update || echo "::warning::apt-get update failed or timed out"
           apt_get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev \
             || echo "::warning::system libraries not installed; using the runner image as it is"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.99.1" # rust-toolchain.toml
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
@@ -231,8 +241,10 @@ jobs:
         run: cargo xtask assets
 
   # The tests of the full suite on the three systems, each split into parts that run at the same
-  # time (`cargo xtask test --partition count:K/N`: every test runs in exactly one part, part 1
-  # also runs the doc tests). macOS is here because the work is done on macOS and results differ
+  # time (`cargo xtask test --partition balanced:K/N`: every test runs in exactly one part, part 1
+  # also runs the doc tests; the heaviest tests, listed with their measured time in
+  # xtask/src/heavy_tests.rs, are spread over the parts by time, the rest by count, because equal
+  # numbers of tests gave parts of 22 and 46 minutes). macOS is here because the work is done on macOS and results differ
   # between the systems' math libraries: a test that passes on one of the three has failed on
   # another more than once. The number of parts follows the measured times (2026-11-15, one
   # part: Windows 68 min of tests, Linux 48, macOS 45); a public repository pays nothing for the
@@ -241,7 +253,7 @@ jobs:
   tests:
     name: tests (${{ matrix.name }} ${{ matrix.part }}/${{ matrix.parts }})
     needs: changes
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
+    if: ${{ !cancelled() && github.event.action != 'closed' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
     strategy:
       fail-fast: false
       matrix:
@@ -270,8 +282,10 @@ jobs:
           apt_get update || echo "::warning::apt-get update failed or timed out"
           apt_get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev \
             || echo "::warning::system libraries not installed; using the runner image as it is"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         if: env.DOCS_ONLY != 'true'
+        with:
+          toolchain: "1.99.1" # rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
         if: env.DOCS_ONLY != 'true'
         with:
@@ -286,7 +300,7 @@ jobs:
           tool: cargo-nextest
       - name: cargo xtask test (part ${{ matrix.part }} of ${{ matrix.parts }})
         if: env.DOCS_ONLY != 'true'
-        run: cargo xtask test --partition count:${{ matrix.part }}/${{ matrix.parts }}
+        run: cargo xtask test --partition balanced:${{ matrix.part }}/${{ matrix.parts }}
       - name: Nothing to test (documentation-only change)
         if: env.DOCS_ONLY == 'true'
         run: echo "documentation-only change"
@@ -298,7 +312,7 @@ jobs:
   web-threads:
     name: web bundle with threads (type check)
     needs: changes
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
+    if: ${{ !cancelled() && github.event.action != 'closed' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -306,8 +320,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         if: env.DOCS_ONLY != 'true'
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         if: env.DOCS_ONLY != 'true'
+        with:
+          toolchain: "1.99.1" # rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
         if: env.DOCS_ONLY != 'true'
         with:
@@ -327,7 +343,7 @@ jobs:
   deny:
     name: cargo deny (sources, bans, licences)
     needs: changes
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && github.event.action != 'closed' }}
     runs-on: ubuntu-latest
     env:
       DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}

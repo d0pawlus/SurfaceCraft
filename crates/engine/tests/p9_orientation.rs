@@ -140,3 +140,131 @@ fn a_decimation_that_stops_above_its_target_says_so_and_why() {
     assert!(why.starts_with("stopped at"), "{thin}");
     assert!(ball["target_not_reached"].is_null(), "{ball}");
 }
+
+/// Radius of the sphere the dish is cut from, half the side of its square outline, cells per side.
+const DISH_RADIUS: f64 = 30.0;
+const DISH_HALF: f64 = 18.0;
+const DISH_CELLS: usize = 30;
+/// Edges of the dish's rim: well within the default fill limit and the one asked for below.
+const DISH_RIM_EDGES: usize = 4 * DISH_CELLS;
+
+/// A square cap of a sphere seen from outside (normals away from the centre, the convex side) or
+/// from inside (`hollow`: normals into the hollow, as a scanner looking into a dish records it).
+/// Open: its rim is its one boundary loop.
+fn dish(hollow: bool) -> Mesh {
+    let side = 2.0 * DISH_HALF;
+    let corner = Point3::new(-DISH_HALF, -DISH_HALF, 0.0);
+    let mut m = synth::plane(corner, Vec3::x(), Vec3::y(), side, side, DISH_CELLS, DISH_CELLS);
+    for p in &mut m.positions {
+        p.z = (DISH_RADIUS * DISH_RADIUS - p.x * p.x - p.y * p.y).sqrt();
+    }
+    if hollow {
+        m.triangles.iter_mut().for_each(|t| t.swap(1, 2));
+    }
+    m
+}
+
+fn issue_codes(out: &Value) -> Vec<String> {
+    out["issues"].as_array().into_iter().flatten().filter_map(|i| i["code"].as_str().map(str::to_string)).collect()
+}
+
+fn to_solid(scan: Mesh, params: Value) -> Value {
+    let mut s = Session::new();
+    s.doc.add_mesh("scan", scan);
+    let mut p = json!({"scan": "scan", "method": "freeform"});
+    p.as_object_mut().unwrap().extend(params.as_object().unwrap().clone());
+    s.execute("scan.to_solid", p).unwrap()
+}
+
+/// Filling the rim of a dish seen from its hollow side would enclose the space in front of the
+/// scanned face: the kernel turns the closed solid outward, every scan point faces away from it, and
+/// the verdict read `scan_inside_out` and `fail` (scans 5 and 6 with `fill_holes_max_edges: 3000`).
+/// The rim is the open edge of a sheet, not a hole: it stays open and the scan is judged as a sheet.
+#[test]
+fn the_rim_of_a_dish_seen_from_its_hollow_side_is_not_capped_into_an_inside_out_solid() {
+    for params in [json!({}), json!({"fill_holes_max_edges": 10 * DISH_RIM_EDGES})] {
+        // Act
+        let out = to_solid(dish(true), params.clone());
+
+        // Assert
+        let codes = issue_codes(&out);
+        assert!(!codes.iter().any(|c| c == "scan_inside_out"), "{params}: {codes:?}: {out}");
+        assert_ne!(out["verdict"], "fail", "{params}: {out}");
+        assert!(codes.iter().any(|c| c == "open_surface"), "{params}: the rim stays open: {codes:?}");
+        assert!(codes.iter().any(|c| c == "fill_inside_out"), "{params}: and says why: {codes:?}");
+        assert!(!codes.iter().any(|c| c == "scan_defects"), "{params}: a larger fill limit would not help: {codes:?}");
+        assert_eq!(out["scan_report"]["holes_inward"], 1, "{params}: {}", out["scan_report"]);
+    }
+}
+
+/// Control: the same dish seen from its convex side is capped into a solid that faces the scan.
+#[test]
+fn the_rim_of_a_dish_seen_from_its_convex_side_is_still_capped_into_an_outward_solid() {
+    // Act
+    let out = to_solid(dish(false), json!({}));
+
+    // Assert
+    let codes = issue_codes(&out);
+    assert!(!codes.iter().any(|c| c == "scan_inside_out" || c == "open_surface"), "{codes:?}: {out}");
+    assert!(out["body"]["volume"].is_number(), "a closed solid: {out}");
+    assert_ne!(out["verdict"], "fail", "{out}");
+    assert_eq!(out["scan_report"]["holes_left"], 0, "{}", out["scan_report"]);
+}
+
+/// Guard: a closed scan stored inside out, with a small hole, is still told to be inside out (the
+/// hole is filled: its patch is small beside the scan, it repairs a hole, it does not invent a face).
+#[test]
+fn a_closed_scan_stored_inside_out_with_a_small_hole_is_still_reported_inside_out() {
+    // Arrange
+    let mut ball = synth::sphere(Point3::origin(), 15.0, 48, 24);
+    ball.triangles.iter_mut().for_each(|t| t.swap(1, 2));
+    let middle = ball.triangle_count() as u32 / 2;
+    let kept: Vec<u32> = (0..ball.triangle_count() as u32).filter(|&t| t != middle).collect();
+    let ball = ball.submesh(&kept);
+
+    // Act
+    let out = to_solid(ball, json!({}));
+
+    // Assert
+    let codes = issue_codes(&out);
+    assert!(codes.iter().any(|c| c == "scan_inside_out"), "{codes:?}: {out}");
+    assert_eq!(out["scan_report"]["holes_left"], 0, "{}", out["scan_report"]);
+}
+
+/// `mesh.clean` and `mesh.fill_holes` leave the rim of a hollow dish open and say so; `mesh.fill_holes`
+/// caps it when asked (`allow_inward`, e.g. for a mould).
+#[test]
+fn the_fill_commands_report_the_rim_they_leave_open_and_cap_it_on_request() {
+    let large = 10 * DISH_RIM_EDGES;
+    for (command, params) in [
+        ("mesh.clean", json!({"object": "scan", "fill_holes_max_edges": large})),
+        ("mesh.fill_holes", json!({"object": "scan", "max_edges": large})),
+    ] {
+        // Arrange
+        let mut s = Session::new();
+        s.doc.add_mesh("scan", dish(true));
+
+        // Act
+        let out = s.execute(command, params).unwrap();
+
+        // Assert
+        assert_eq!(
+            (out["holes_filled"].as_u64(), out["holes_inward"].as_u64()),
+            (Some(0), Some(1)),
+            "{command}: {out}"
+        );
+        assert_eq!(out["holes_left"], 1, "{command}: {out}");
+    }
+
+    // Arrange
+    let mut s = Session::new();
+    s.doc.add_mesh("scan", dish(true));
+
+    // Act
+    let out =
+        s.execute("mesh.fill_holes", json!({"object": "scan", "max_edges": large, "allow_inward": true})).unwrap();
+
+    // Assert
+    assert_eq!((out["holes_filled"].as_u64(), out["holes_inward"].as_u64()), (Some(1), Some(0)), "{out}");
+    assert_eq!(out["holes_left"], 0, "{out}");
+}

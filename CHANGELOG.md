@@ -11,18 +11,6 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
 
 ## [Unreleased]
 
-### Added
-
-- `mesh.close_handles`: closes the small handles of a scan (tunnels, bridges and the sponge of tiny
-  tunnels where the two sides of a thin wall run together) as a new mesh, keeping the rim and every
-  vertex away from them; `scan.to_solid` takes it as the option `close_handles` (with `handle_size`),
-  wraps the repaired copy, measures the solid against the scan as it was and raises
-  `scan_handles_closed` (#120).
-- `surface.wrap` option `coarse_start`: a first coarse mesh too big for `max_patches` is made coarser
-  and the adaptive rounds spend the rest of the limit where the patches miss; `scan.to_solid` with
-  `close_handles` uses it. `mesh.close_handles` takes candidates refused for splitting the surface
-  back one by one.
-
 ### Changed
 
 - `surface.wrap` fits closer to organic scans: every patch edge and patch is refitted to the scan
@@ -35,6 +23,106 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
   `min_within`). The one corpus scan held at `review` by accuracy now passes (97.87 to 99.38 %
   within 0.2 mm at 60 000 patches), no corpus scan has a lower share, and the corpus takes about a
   fifth more computing time.
+
+## [0.3.0] - 2026-11-15
+
+Two days and twenty merged feature and fix pull requests after 0.2.0. The release is about harder real
+scans: several scans of one part are brought into one pose without picked points, `scan.to_solid`
+can put analytic faces into a freeform wrap, an n-sided opening gets one smooth trimmed patch, and
+scans with small handles, self-crossing folds or thin shells get through to a solid more often.
+
+### Highlights
+
+- **Several scans, one pose.** `align.pair_coarse` aligns two overlapping scans and `align.global`
+  2 to 24 scans of one part, with no picked points and a verdict that says when the pose is not
+  unique (#108, #116, #117).
+- **Hybrid solids from one call.** `scan.to_solid` with `method: hybrid` replaces the patches that
+  lie on a plane, cylinder, cone or sphere by one analytic face each, inside the freeform wrap (#112).
+- **One patch over an n-sided loop.** `surface.patch` fits a single trimmed patch with G0, G1 or G2
+  per side against the neighbouring faces (#114).
+- **Large scans at import.** `mesh.import` with `reduce_to` reduces a scan above the triangle limit
+  while it is read, and the interface offers it when such a file is picked (#136).
+- **Scan repair.** `mesh.close_handles` closes small tunnels and bridges, `mesh.clean` can remove
+  self-crossing folds, thickened shells no longer cross themselves, and hole filling no longer
+  closes an open sheet inside out (#107, #115, #120, #140).
+- **Scans of many parts.** `scan.to_solid` models every small closed part with its own verdict and
+  reports the pieces it leaves out with a reason (#127).
+
+### Added
+
+#### Alignment
+
+- `align.pair_coarse`: brings a scan onto an overlapping scan or body without picked points, then
+  refines with ICP. It returns the motion, the overlap of both scans, the residual, a verdict
+  (`unique`, `ambiguous` with the near-tied `alternatives`, `no_match`) and a confidence. It
+  proposes by default; `apply: true` moves the scan as one undo step only for a `unique` pose, an
+  ambiguous one needs `choose` (#108).
+- `align.global`: 2 to 24 scans of one part into one common pose. Pairs are solved by
+  `align.pair_coarse`, pairs that disagree with the rest are rejected, and all poses are relaxed
+  together. The report gives the pose of every scan, the loop closure error before and after, and a
+  verdict (`aligned`, `partial`, `failed`); scans that cannot be connected are listed and never
+  moved (#116).
+
+#### Scan to solid
+
+- `method: hybrid` of `scan.to_solid`: each group of patches that lies on a protected primitive
+  region (plane, cylinder, cone, sphere) becomes one analytic face that shares its boundary edges
+  with the neighbouring patches. A group that cannot be merged safely stays patches, with the reason
+  in `left_as_patches`; the merged body replaces the wrap only when it is not worse
+  (`hybrid_merge_rejected`, `hybrid_snap_skipped`) (#112).
+- Option `close_handles` (with `handle_size`): wraps a copy of the scan with its small handles
+  closed, measures the solid against the scan as it was and raises `scan_handles_closed` (#120).
+- With `thickness`, self-crossing folds are removed after the holes are filled; the report
+  `thickened.folds` lists what was removed and what was left (#115).
+
+#### Scan preparation and mesh editing
+
+- `mesh.import` option `reduce_to` (1000 to the platform limit): reduces a scan while it is
+  imported. STL and binary PLY are streamed and clustered on a grid, so memory follows the reduced
+  mesh, not the file; the result carries `reduced: {source_triangles, max_error}`. In the desktop
+  and web apps a picked file that declares more than 5 million triangles opens a dialog first:
+  reduce and import, import in full where the platform can hold it, or cancel (#136).
+- `mesh.close_handles`: closes the small handles of a scan (tunnels, bridges and the sponge of tiny
+  tunnels where the two sides of a thin wall run together) as a new mesh, keeping the rim and every
+  vertex away from them. Candidates refused because cutting all of them at once would split the
+  surface are taken back one by one (#120, #122).
+- `mesh.clean` option `remove_folds` (off by default): removes small groups of triangles that face
+  against the surface around them and pass through it, and fills the hole smoothly. Thin ribs, fins
+  and sharp edges are left; a fold that cannot be filled is put back and reported (#115).
+
+#### Surfaces
+
+- `surface.patch`: one trimmed bicubic patch over a closed n-sided loop, with G0, G1 or G2 per side
+  against a neighbouring face, optional interior points and curves, and scan data. It returns a
+  sheet (#114).
+- `surface.from_curves` option `ngon: split | patch`: `patch` covers a region of more than four
+  sides with one trimmed patch instead of splitting it into quads. `split` stays the default (#114).
+- `surface.wrap` option `coarse_start`: a first coarse mesh too big for `max_patches` is made
+  coarser and the adaptive rounds spend the rest of the limit where the patches miss.
+  `scan.to_solid` with `close_handles` uses it (#122).
+
+#### Interface
+
+- Auto-align is the first tool of the Align tab. Propose runs `align.auto` without applying it and
+  draws the scan in the proposed pose, with rotation, translation and confidence; a proposal below
+  the confidence threshold is marked as a guess. Apply moves the scan as one undo step (#132).
+- The back side of a scan is drawn in its own colour (violet), so the inside of an open scan and
+  flipped triangles can be told from the outside (#131).
+
+### Changed
+
+- An import refused for exceeding the triangle limit names `reduce_to` in its error (#136).
+- A tool whose command only proposed (`applied: false`) stays open instead of closing (#132).
+- `align.pair_coarse` answers `ambiguous` instead of `unique` when either scan contradicts the pose
+  (surface of one scan in front of the other); the result carries `conflict_moving` and
+  `conflict_fixed` (#117).
+- `mesh.thicken` and `scan.to_solid` with `thickness` bound the offset by the local feature size and
+  report `self_intersections_local`, `self_intersections` and `limited_vertices`. Only crossings
+  between parts of the scan that are far apart along the surface raise `self_intersection` (#107).
+- Point-cloud reconstruction rounds coordinates to a fine power-of-two lattice (about 1e-9 of the
+  extent) first, so the result no longer depends on the unit the file was saved in or on the
+  platform (#110).
+
 - `scan.to_solid` on a scan of many parts models every piece that is a solid, not only those with
   `part_share` of the largest: a watertight, consistently oriented piece of positive volume with at
   least 100 triangles and 50 tolerances across is a *small part*, modelled with its own verdict
@@ -46,15 +134,81 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
   `open`, `not_oriented`, `inside_out`); the 16 largest are listed in `pieces_left_out`.
   `minor_and_debris_*` now count the pieces left out and `debris_pieces` those with reason `debris`
   only. The cap of parts per call rises from 24 to 128, the cleaning protects small parts below its
-  default by identity, and small parts are never rebuilt.
+  default by identity, and small parts are never rebuilt (#127).
+- `surface.patch`: a patch whose sides are all soft now starts from a 6 by 6 control net and
+  grows it only until the scan data are within `tolerance`; before, the start net came from the
+  number of data points and followed the fine texture of a dense scan, which made its curvature
+  useless as a G2 reference for a neighbouring patch. Such a patch is smoother and its `rms` is
+  larger than before; pass a smaller `tolerance` for a closer fit (#139).
+- `surface.patch` with a G2 side may take up to 18 rounds instead of 6: the curvature conditions
+  are iterated on the same control net until they converge, and only then is the net refined (#139).
+
+### Performance
+
+- `body.compare` and the verdict step of `scan.to_solid` tessellate the body straight into the
+  display mesh and build the search tree on it: a third of the memory per triangle on networks of
+  10 000 to 60 000 patches (#104).
+- Panning the view no longer uploads every mesh to the GPU again in each frame; pan is as smooth as
+  orbit and zoom on large scans (#133).
+- STEP re-import of a large open sheet written by SurfaceCraft is built from the topology the file
+  states instead of being stitched by geometry, which was quadratic in the number of faces (#104).
+- Smooth hole filling solves the three axes in parallel on a compressed operator: a large hole
+  fills about 1.7 times faster with the same result (#156).
+- Changing a parameter in a tool no longer tessellates unchanged bodies or reduces large scans
+  again for the preview; display meshes of deleted objects are dropped, and sketches are not
+  uploaded to the GPU again in every frame (#146).
 
 ### Fixed
 
+- `align.pair_coarse` no longer returns a wrong pose as `unique` (28 of 219 synthetic pairs before,
+  none after) (#117).
+- Thickened shells no longer have crossings between neighbouring offset triangles, between the two
+  sheets of a narrow bead or along the rim strip; what cannot be resolved is counted in
+  `unresolved_vertices` instead of being returned as a crossing shell (#107).
+- Importing or reconstructing a point cloud saved in metres or inches gives the same mesh as the
+  same cloud in millimetres (#110).
+- `surface.patch`, G2 to a neighbouring patch on real scans: the curvature condition is now a Newton
+  step (it was a fixed-point step whose error was of first order in the speed of the
+  parametrisation); a round that halves the miss of the side conditions is kept even when the scan
+  deviation grows within the tolerance (the first round, which has no curvature condition yet, was
+  kept before); a soft side next to a side with a reference face is no longer a corner conflict
+  that relaxes the G1 and G2 conditions near the corner. On the Artec corpus G2 holds its 5 %
+  target at 8 of 12 sites (2 of 11 before), every site where no feature of the part crosses the
+  shared side. Where one does and the side misses its targets, a warning says so and advises to
+  split the side at the feature or to ask for G1 there (#139).
 - `scan.to_solid` on a split scan: a part whose `auto` freeform attempt was refused because the call's
   two extra attempts were spent, and whose primitives did not pass, is now wrapped once as its own
   wrap and the better result is kept (twelve small parts of the scan of many parts ended without a
   pass before; each passes now). The solid kept has the part's name and the losing attempt leaves no
-  object behind.
+  object behind (#127).
+- Hole filling (`mesh.clean`, `mesh.fill_holes`, `scan.to_solid` with a large
+  `fill_holes_max_edges`) no longer closes an open sheet inside out (one scanned from its hollow
+  side, or whose normals are stored inward). When the patches would close a piece of the mesh with
+  the scanned face pointing into the enclosed volume, every opening (a loop, or the loops of a
+  ragged rim that touch at vertices, judged by their patches together) whose patches are a quarter
+  of the piece's area or more stays open (`holes_inward`); smaller holes are filled, so a closed
+  scan stored inside out with small holes is still reported as `scan_inside_out`. `scan.to_solid`
+  raises the new issue `fill_inside_out` instead of failing with `scan_inside_out`, and
+  `mesh.fill_holes` takes `allow_inward: true` to cap such a loop anyway (a mould of a dish)
+  (#140).
+- A body or mesh could be drawn with the display mesh of geometry that undo or a delete had freed,
+  when new geometry took the same place in memory; display caches now hold what they were made
+  from and their keys are never reused (#146).
+
+### Known limitations
+
+- Builds are not code-signed. Windows SmartScreen and macOS Gatekeeper warn on first start; check
+  downloads against `SHA256SUMS.txt`.
+- macOS builds are for Apple silicon only.
+- `method: hybrid` does not merge torus regions, sphere caps of 90 degrees or more, or bores in an
+  open sheet, and takes 4 to 6 times as long as the freeform call.
+- `surface.patch` and `ngon: patch` return sheets; no command yet sews trimmed patches into a solid.
+- A scan with `close_handles` gets `review` at best, because the solid is built from a repaired copy.
+- `reduce_to` clusters vertices: it is coarser than `mesh.decimate`, keeps no sharp edges and can
+  leave non-manifold edges. ASCII PLY and OBJ files above the browser limit are still refused.
+- `mesh.merge` (several aligned scans into one mesh) is not in this release.
+- On real scans `scan.to_solid` often answers `review` rather than `pass`. The verdict lists the
+  reason and the next step.
 
 ## [0.2.0] - 2026-11-13
 
@@ -300,5 +454,6 @@ fitting and freeform patch networks, sketches with a constraint solver, a parame
 history, hybrid solids from primitives and freeform patches, STEP and IGES export, the desktop and
 web applications, the CLI, and the MCP server.
 
+[0.3.0]: https://github.com/d0pawlus/SurfaceCraft/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/d0pawlus/SurfaceCraft/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/d0pawlus/SurfaceCraft/releases/tag/v0.1.0

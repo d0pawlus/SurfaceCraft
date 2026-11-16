@@ -226,7 +226,7 @@ fn candidate_groups(
             }
         }
     }
-    // the largest first: the kernel takes a limited number of groups, and the first are the ones worth most
+    // the largest first: the kernel takes a bounded number of groups (`MAX_GROUPS`), and the first are the ones worth most
     sized.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.2.first().cmp(&b.2.first())));
     sized.into_iter().map(|(_, k, g)| (k, g)).collect()
 }

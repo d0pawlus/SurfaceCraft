@@ -162,8 +162,12 @@ Hybrid (merge the patches that lie on a primitive; `surface.wrap` and the kernel
   sampled points (corners and middles of its triangles), it lies within the gap of them (a corner on
   the face's own boundary is left to the border test), the boundary of the face is the border of the
   group (every point of one within the gap and the chord of the other), holes wind opposite to the outer
-  loop and inside it, and it tessellates to their area. At most 64 groups are merged per call (the largest first; the rest
-  are in `left_as_patches`), and a cancelled call stops between groups.
+  loop and inside it, it tessellates to their area, and the kernel gives it back as its analytic surface (a face
+  the rebuild leaves a spline is refused). The groups are settled 64 at a time (each batch rebuilt with the faces of
+  the batches before it), at most 256 per call (the largest first; the rest are in `left_as_patches`); when more
+  than one batch gave faces, all of them are judged again in the final body, in at most two rounds that drop the
+  faces that no longer hold up (after that the first batch's body is kept and the later batches' groups are given
+  back), so the work stays linear in the groups. A cancelled call stops between groups.
 - A cancelled call stops between the steps; the whole run is one undo step.
 
 Primitives:
@@ -280,6 +284,7 @@ kernel refuses sheets of many faces. Give the wall thickness instead:
 - `low_coverage`: part of the scan has no face (it lies farther than 5 mm from the solid). Look at
   `left_out` and at `unassigned_triangles`.
 - `scan_inside_out`: more than 90 % of the scan points face away from the solid, so the normals of the scan point inward (the solid is turned outward by the kernel). Flip the normals of the scan and run again.
+  The hole filling does not close an open scan inside out: see `fill_inside_out`.
 - `inconsistent_orientation`: at least half of the missing coverage is points that lie on the solid, but a share (`not_facing` in `deviation`) of its points
   face away from it, so the solid is inside out or has faces turned the wrong way. This is a defect
   of the solid, not a part of the scan it misses. It is a verdict of `fail`. A part not much
@@ -339,6 +344,21 @@ kernel refuses sheets of many faces. Give the wall thickness instead:
   points of the file.
 - `scan_defects`: holes too large to fill; `mesh.fill_holes` with a larger `max_edges` (it drops
   the regions), then `scan.to_solid` again without `reuse_regions`.
+- `fill_inside_out`: boundary loops that were not filled because the fill would have closed the
+  scan inside out: the scanned face would point into the volume the patch encloses, so the solid
+  would be the space in front of the scanned surface. Such a loop is the open edge of a sheet, not
+  a hole: the sheet was scanned from its hollow side, or its normals are stored inward (the mesh
+  cannot tell which). Only an opening whose patches are at least a quarter of the scan's area is
+  refused (an opening is a loop, or the loops of a ragged rim that touches itself at vertices);
+  smaller holes are filled, so a closed scan stored inside out with small holes, however many, is
+  still filled and reported as `scan_inside_out`. Separate openings below a quarter each are filled
+  even when together they close a sheet inside out; that scan is then reported `scan_inside_out`. A larger `fill_holes_max_edges` does
+  not change it. With method `freeform` or `hybrid` the scan is then wrapped as a sheet (`review`
+  with `open_surface`); with method `primitives` the solid is built from the fitted primitives as
+  before and the issue is context. Check which way the normals face (flip them if they point into
+  the part) before choosing the sign of `thickness`. To cap such a loop anyway (a mould of a dish),
+  run `mesh.fill_holes` with `allow_inward: true`; by default it refuses it too and counts it in
+  `holes_inward`, which counts loops (a ragged opening of 5 lobes counts 5).
 
 ## Messy scans: parts, handles, shells
 

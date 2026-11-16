@@ -9,6 +9,7 @@
 mod assets;
 mod dist;
 mod file_size;
+mod heavy_tests;
 mod layers;
 mod licences;
 mod partition;
@@ -78,7 +79,7 @@ fn wasm() -> Result<(), String> {
 /// --locked`; CI installs it) the test binaries run in parallel, one process per test, and the
 /// doc tests, which nextest does not run, follow with `cargo test --doc`; without it this is a
 /// plain `cargo test`. Both run the same tests and leave `#[ignore]` tests ignored. With a
-/// `partition` (`--partition count:K/N`, needs nextest) only part K of N runs; CI runs the parts
+/// `partition` (`--partition balanced:K/N`, needs nextest) only part K of N runs; CI runs the parts
 /// on separate machines, and part 1 also runs the doc tests.
 fn test(partition: Option<&partition::Partition>) -> Result<(), String> {
     if !has_nextest() {
@@ -89,25 +90,32 @@ fn test(partition: Option<&partition::Partition>) -> Result<(), String> {
         c.args(["test", "--workspace", "--profile", "ci"]);
         return run(c, "tests (cargo test; install cargo-nextest to run them in parallel)");
     }
-    let nextest = |extra: &[&str]| {
+    let nextest = |extra: &[String]| {
         let mut c = cargo();
         c.args(["nextest", "run", "--workspace", "--cargo-profile", "ci"]).args(extra);
         c
     };
-    run(nextest(&["--no-run"]), "test build")?;
-    // every failure is reported, not only the first one
-    match partition {
-        Some(p) => {
-            run(nextest(&["--no-fail-fast", "--partition", p.spec()]), &format!("tests (nextest, part {})", p.spec()))?
+    let runs = match partition {
+        Some(p) => p.nextest_runs()?,
+        None => vec![partition::NextestRun { label: "tests (nextest)".into(), args: Vec::new() }],
+    };
+    run(nextest(&["--no-run".to_string()]), "test build")?;
+    // every failure is reported, not only the first one: every run goes on after a failed one
+    let mut failures = Vec::new();
+    for r in &runs {
+        let args: Vec<String> = std::iter::once("--no-fail-fast".to_string()).chain(r.args.iter().cloned()).collect();
+        if let Err(e) = run(nextest(&args), &r.label) {
+            failures.push(e);
         }
-        None => run(nextest(&["--no-fail-fast"]), "tests (nextest)")?,
     }
-    if partition.is_some_and(|p| !p.runs_doc_tests()) {
-        return Ok(());
+    if partition.is_none_or(|p| p.runs_doc_tests()) {
+        let mut d = cargo();
+        d.args(["test", "--workspace", "--doc", "--profile", "ci"]);
+        if let Err(e) = run(d, "doc tests") {
+            failures.push(e);
+        }
     }
-    let mut d = cargo();
-    d.args(["test", "--workspace", "--doc", "--profile", "ci"]);
-    run(d, "doc tests")
+    if failures.is_empty() { Ok(()) } else { Err(failures.join("; ")) }
 }
 
 fn has_nextest() -> bool {
@@ -280,7 +288,7 @@ fn main() -> ExitCode {
                 Ok(())
             }
             "dist" => dist::run(&args),
-            _ => Err("tasks: ci, quick [--tests] [packages], fmt, assets, licences [--check], layers, ui-containers, app-geometry, file-size, clippy, wasm, test [--partition count:K/N], web [--no-threads | --check], web-toolchain, dist [--tag vX.Y.Z]"
+            _ => Err("tasks: ci, quick [--tests] [packages], fmt, assets, licences [--check], layers, ui-containers, app-geometry, file-size, clippy, wasm, test [--partition balanced:K/N], web [--no-threads | --check], web-toolchain, dist [--tag vX.Y.Z]"
                 .into()),
         };
     match r {

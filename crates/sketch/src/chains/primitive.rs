@@ -184,6 +184,13 @@ fn fit_line(pts: &[P2]) -> Option<Fit> {
 
 /// Least-squares circle: algebraic start, then Gauss–Newton on the distances.
 fn fit_circle_raw(pts: &[P2]) -> Option<(P2, f64)> {
+    let (c, r) = algebraic_circle(pts)?;
+    let (c, r) = refine_circle(pts, c, r);
+    (c.iter().all(|v| v.is_finite()) && r.is_finite() && r > 0.0).then_some((c, r))
+}
+
+/// The algebraic (Kåsa) circle through the samples: centre and radius.
+fn algebraic_circle(pts: &[P2]) -> Option<(P2, f64)> {
     let n = pts.len();
     if n < 3 {
         return None;
@@ -211,7 +218,12 @@ fn fit_circle_raw(pts: &[P2]) -> Option<(P2, f64)> {
     if !(r2 > 0.0 && r2.is_finite()) {
         return None;
     }
-    let (mut c, mut r) = ([mx + a, my + b], r2.sqrt());
+    Some(([mx + a, my + b], r2.sqrt()))
+}
+
+/// Gauss–Newton on the distances of the samples from the circle (`c`, `r`), at most 15 steps.
+fn refine_circle(pts: &[P2], c0: P2, r0: f64) -> (P2, f64) {
+    let (mut c, mut r) = (c0, r0);
     let cost = |c: P2, r: f64| pts.iter().map(|p| (dist(*p, c) - r).powi(2)).sum::<f64>();
     let mut best = cost(c, r);
     for _ in 0..15 {
@@ -240,7 +252,7 @@ fn fit_circle_raw(pts: &[P2]) -> Option<(P2, f64)> {
             break;
         }
     }
-    (c.iter().all(|v| v.is_finite()) && r.is_finite() && r > 0.0).then_some((c, r))
+    (c, r)
 }
 
 /// Signed angle swept by consecutive samples around `c`, and the sum of the absolute steps.
