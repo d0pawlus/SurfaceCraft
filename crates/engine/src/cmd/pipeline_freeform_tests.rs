@@ -460,3 +460,35 @@ fn a_failed_wrap_of_a_scan_with_many_handles_offers_close_handles() {
     let out = freeform_with(&mut s, &set, empty_report(), |_, _| Err(CmdError::Failed("boom".into()))).unwrap();
     assert!(out.next_steps.iter().all(|st| st.params["close_handles"] != serde_json::json!(true)), "not offered twice");
 }
+
+/// A closed network whose body has no positive volume is not a closed solid (the rule of the
+/// primitives method): `no_solid`, never a pass, however well it lies on the scan.
+#[test]
+fn a_closed_network_without_a_positive_volume_is_not_a_solid_and_never_passes() {
+    // Arrange
+    let (_s, set) = session();
+    let d = DeviationSummary {
+        count: 1000,
+        coverage: 1.0,
+        not_facing: 0.0,
+        within: 1.0,
+        rms: 0.01,
+        max_abs: 0.05,
+        mean: 0.0,
+    };
+    let facts = |solid: bool| NetworkFacts { closed: true, solid, patches: 300, capped: false };
+
+    // Act
+    let inverted = issues_for(&facts(false), &d, &set, &scan_summary());
+    let outward = issues_for(&facts(true), &d, &set, &scan_summary());
+
+    // Assert
+    assert!(inverted.iter().any(|i| i.code == "no_solid"), "{inverted:?}");
+    assert!(!inverted.iter().any(|i| i.code == "open_surface"), "{inverted:?}");
+    assert_ne!(verdict_of(&inverted, &d), Verdict::Pass);
+    assert!(outward.is_empty(), "{outward:?}");
+    assert!(crate::cmd::body::encloses_material(Some(1.0)));
+    for volume in [Some(-9556.0), Some(0.0), Some(f64::NAN), None] {
+        assert!(!crate::cmd::body::encloses_material(volume), "{volume:?}");
+    }
+}

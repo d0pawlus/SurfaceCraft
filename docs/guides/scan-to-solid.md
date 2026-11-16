@@ -276,6 +276,11 @@ kernel refuses sheets of many faces. Give the wall thickness instead:
 
 - `no_solid`: the planner found no closed shape. Run `body.plan_regions` with the primitives and
   read each `role` and `reason`. A missing wall or floor is usually a region that was left out.
+  With the freeform method (and `thickness`) it means the patch network is closed but its body has
+  no positive volume, the same rule as for the primitives: its faces disagree on which side is
+  outside, or the network crosses itself and the kernel turned it inside out. It is never a `pass`.
+  Look at the scan around filled holes and at `inconsistent_orientation`; a smaller `tolerance` or
+  `max_patches` changes the network.
 - `skipped_inputs`: a primitive could not be built in; `modelled[].skipped` says why.
 - `low_coverage`: part of the scan has no face (it lies farther than 5 mm from the solid). Look at
   `left_out` and at `unassigned_triangles`.

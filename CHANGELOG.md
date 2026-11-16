@@ -25,6 +25,9 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
 
 ### Changed
 
+- `scan.to_solid`, freeform method (and `thickness`): a closed patch network whose body has no
+  positive volume is not a closed solid, the same rule as for the primitives method: the issue
+  `no_solid` is raised and the verdict is never `pass` (#158).
 - `scan.to_solid` on a scan of many parts models every piece that is a solid, not only those with
   `part_share` of the largest: a watertight, consistently oriented piece of positive volume with at
   least 100 triangles and 50 tolerances across is a *small part*, modelled with its own verdict
