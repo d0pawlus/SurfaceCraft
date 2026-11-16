@@ -21,9 +21,9 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
   enough to continue with G2: on the Artec corpus G2 holds its 5 % target at 9 of 12 sites with
   errors of 0.03 to 3.5 % (8 of 12 at 0.5 to 4.8 % in 0.3.0). [#167]
 
-## [0.3.0] - 2026-11-15
+## [0.3.0] - 2026-11-16
 
-Two days and twenty merged feature and fix pull requests after 0.2.0. The release is about harder real
+Three days and twenty-one merged feature and fix pull requests after 0.2.0. The release is about harder real
 scans: several scans of one part are brought into one pose without picked points, `scan.to_solid`
 can put analytic faces into a freeform wrap, an n-sided opening gets one smooth trimmed patch, and
 scans with small handles, self-crossing folds or thin shells get through to a solid more often.
@@ -188,6 +188,9 @@ scans with small handles, self-crossing folds or thin shells get through to a so
   raises the new issue `fill_inside_out` instead of failing with `scan_inside_out`, and
   `mesh.fill_holes` takes `allow_inward: true` to cap such a loop anyway (a mould of a dish)
   (#140).
+- `scan.to_solid` with `method: hybrid` merges more than 64 groups of patches into analytic faces:
+  groups are taken in batches of 64, up to 256 per merge (the groups past the first 64 stayed
+  patches before); groups past 256 stay patches and say why (#142).
 - A body or mesh could be drawn with the display mesh of geometry that undo or a delete had freed,
   when new geometry took the same place in memory; display caches now hold what they were made
   from and their keys are never reused (#146).
