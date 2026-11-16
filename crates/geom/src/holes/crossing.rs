@@ -9,8 +9,10 @@
 //! cross (or when the thin-plate patch is not finite).
 //!
 //! Not checked: a patch against the patches of the other holes filled in the same call, or against
-//! a patch accepted before it is made again (the tree holds the mesh as it was); and the patch after
-//! the sharpening, which runs on the patch that was kept.
+//! a patch accepted before it is made again (the tree holds the mesh as it was); a thin-plate patch
+//! that bulges farther than its loop's diagonal from the loop's box, against the mesh beyond that
+//! (the tree holds only the triangles within it); and the patch after the sharpening, which runs on
+//! the patch that was kept.
 use crate::nesting::{crosses, overlap};
 use crate::{Aabb, Bvh, Mesh, Point3, finite, par, tri};
 
@@ -89,6 +91,9 @@ impl Crossings {
         (first_tri, first_new): (usize, usize),
         mut membrane: Vec<Point3>,
     ) {
+        if membrane.is_empty() || first_new >= work.positions.len() {
+            return; // no interior vertices: nothing was faired
+        }
         let thin_finite = work.positions.get(first_new..).is_some_and(|p| p.iter().all(finite));
         let membrane_kept = !(thin_finite && !self.patch_crosses(origin, work, first_tri))
             && self.try_membrane(origin, work, (first_tri, first_new), &mut membrane, thin_finite);
@@ -99,8 +104,8 @@ impl Crossings {
     }
 
     /// Puts the `membrane` positions in place of the patch's own vertices and keeps them unless they
-    /// cross too and the thin-plate patch is finite (then the thin-plate positions go back).
-    /// Returns whether the membrane was kept.
+    /// cross too and the thin-plate patch is finite (then the thin-plate positions go back). A
+    /// membrane that is not finite is never put in. Returns whether the membrane was kept.
     fn try_membrane(
         &self,
         origin: &[u32],
@@ -109,6 +114,9 @@ impl Crossings {
         membrane: &mut [Point3],
         thin_finite: bool,
     ) -> bool {
+        if !membrane.iter().all(finite) {
+            return false;
+        }
         let Some(own) = work.positions.get_mut(first_new..).filter(|p| p.len() == membrane.len()) else { return false };
         own.swap_with_slice(membrane);
         if thin_finite && self.patch_crosses(origin, work, first_tri) {
@@ -417,5 +425,10 @@ mod tests {
         // Assert
         assert_eq!(work.positions.last(), Some(&Point3::new(0.0, 0.0, 0.0)));
         assert_eq!(LAST_FAIRING.with(std::cell::Cell::get), Some(Fairing::Membrane));
+
+        // and a membrane that is not finite is never put in place of a finite thin plate
+        crossings.settle(&origin, &mut work, (first_tri, base as usize), vec![Point3::new(f64::NAN, 0.0, 0.0)]);
+        assert_eq!(work.positions.last(), Some(&Point3::new(0.0, 0.0, 0.0)));
+        assert_eq!(LAST_FAIRING.with(std::cell::Cell::get), Some(Fairing::ThinPlate));
     }
 }

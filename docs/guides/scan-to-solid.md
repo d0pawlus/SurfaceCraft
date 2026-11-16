@@ -282,7 +282,11 @@ kernel refuses sheets of many faces. Give the wall thickness instead:
   read each `role` and `reason`. A missing wall or floor is usually a region that was left out.
   With the freeform method (and `thickness`) it means the patch network is closed but its body has
   no positive volume, the same rule as for the primitives: its faces disagree on which side is
-  outside, or the network crosses itself and the kernel turned it inside out. It is never a `pass`.
+  outside, or the network crosses itself and the kernel turned it inside out. It is never a `pass`;
+  as for an open sheet on this path, the verdict is `review` when the network still covers the scan
+  and `fail` otherwise (with the primitives method a solid that is not closed is a `fail`). Such a
+  body also counts as not closed when a larger patch limit is retried, when the scan is rebuilt and
+  when `auto` compares the methods.
   Look at the scan around filled holes and at `inconsistent_orientation`; a smaller `tolerance` or
   `max_patches` changes the network.
 - `skipped_inputs`: a primitive could not be built in; `modelled[].skipped` says why.

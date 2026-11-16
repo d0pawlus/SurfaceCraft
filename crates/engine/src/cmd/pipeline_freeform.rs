@@ -74,13 +74,14 @@ pub struct CapRetry {
 /// What a retry is judged on.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Attempt {
+    /// A closed solid: a closed network whose body encloses material (`body::encloses_material`).
     pub(super) closed: bool,
     pub(super) within: f64,
 }
 
 impl Attempt {
     fn of(w: &WrapOut) -> Self {
-        Self { closed: w.closed, within: w.deviation.within }
+        Self { closed: w.closed && w.body.is_solid(), within: w.deviation.within }
     }
 }
 

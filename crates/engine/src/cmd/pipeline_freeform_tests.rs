@@ -492,3 +492,59 @@ fn a_closed_network_without_a_positive_volume_is_not_a_solid_and_never_passes() 
         assert!(!crate::cmd::body::encloses_material(volume), "{volume:?}");
     }
 }
+
+/// A closed network whose body is inside out is not a closed solid for the retry either: a retry
+/// with a positive volume at no loss replaces it, and never the other way round.
+#[test]
+fn a_retry_with_a_positive_volume_replaces_an_inside_out_first_network() {
+    // Arrange
+    let (mut s, set) = session();
+    let wrapped = wrap_with(&mut s, &set, Some(300)).unwrap();
+    assert!(wrapped.closed && wrapped.body.is_solid(), "{:?}", wrapped.body);
+    let mut inverted = wrapped.clone();
+    inverted.body.volume = inverted.body.volume.map(|v| -v);
+
+    // Act
+    let forward = judge(Attempt::of(&inverted), Attempt::of(&wrapped));
+    let backward = judge(Attempt::of(&wrapped), Attempt::of(&inverted));
+
+    // Assert
+    assert_eq!(forward, RetryReason::Better);
+    assert_eq!(backward, RetryReason::OpenResult);
+}
+
+/// The judgement of a closed network without a positive volume (negative, absent, not a number),
+/// from the issues to the verdict: `no_solid`, never a pass, `review` when it covers the scan (as for
+/// an open sheet).
+#[test]
+fn a_closed_network_without_a_positive_volume_is_judged_no_solid_end_to_end() {
+    // Arrange
+    let (mut s, set) = session();
+    let wrapped = wrap_with(&mut s, &set, Some(300)).unwrap();
+    let d = DeviationSummary {
+        count: 1000,
+        coverage: 1.0,
+        not_facing: 0.0,
+        within: 1.0,
+        rms: 0.01,
+        max_abs: 0.05,
+        mean: 0.0,
+    };
+
+    for volume in [Some(-1.0), None, Some(f64::NAN)] {
+        let mut w = wrapped.clone();
+        w.body.volume = volume;
+
+        // Act
+        let issues = issues_of(&w, &d, &set, &scan_summary());
+        let out = judge_stage(&mut s, &set, scan_summary(), &w, None).unwrap();
+
+        // Assert
+        assert!(issues.iter().any(|i| i.code == "no_solid"), "{volume:?}: {issues:?}");
+        assert_eq!(verdict_of(&issues, &d), Verdict::Review, "{volume:?}: covers the scan, as an open sheet would");
+        assert!(out.issues.iter().any(|i| i.code == "no_solid"), "{volume:?}: {:?}", out.issues);
+        assert_ne!(out.verdict, Verdict::Pass, "{volume:?}");
+    }
+    let out = judge_stage(&mut s, &set, scan_summary(), &wrapped, None).unwrap();
+    assert!(!out.issues.iter().any(|i| i.code == "no_solid"), "{:?}", out.issues);
+}

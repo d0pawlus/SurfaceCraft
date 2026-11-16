@@ -13,9 +13,15 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
 
 ### Changed
 
+- Ray and segment tests against triangles (`geom::tri::ray_hit`, used by picking, ray casts and the
+  crossing checks) decide that a ray is parallel to a triangle relative to their size, not by an
+  absolute bound: hits on triangles smaller than about 2e-5 units (a part in metres) are now found
+  (#158).
 - `scan.to_solid`, freeform method (and `thickness`): a closed patch network whose body has no
   positive volume is not a closed solid, the same rule as for the primitives method: the issue
-  `no_solid` is raised and the verdict is never `pass` (#158).
+  `no_solid` is raised and the verdict is never `pass` (`review` when the network covers the scan,
+  as for an open sheet); such a body also counts as not closed in the larger-cap retry, the rebuild
+  and the comparison of `auto` (#158).
 
 ### Fixed
 
