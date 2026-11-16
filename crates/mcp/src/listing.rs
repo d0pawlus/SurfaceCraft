@@ -58,6 +58,28 @@ pub(crate) fn general_tools() -> Vec<Value> {
             obj(json!({"width": {"type": "integer"}, "height": {"type": "integer"}}), &[]),
         ),
         general(
+            "camera_get",
+            "The camera of the desktop app: target, distance, yaw_rad, pitch_rad, fov_rad, projection. Bridged mode only; values are exact and camera_set takes them back.",
+            obj(json!({}), &[]),
+        ),
+        general(
+            "camera_set",
+            "Changes the camera of the desktop app (bridged mode only) and returns it as camera_get does. Every field is optional; a partial call changes only those. Applied in the order view, explicit fields, fit.",
+            obj(
+                json!({
+                    "view": {"type": "string", "enum": ["front", "back", "left", "right", "top", "bottom", "iso"], "description": "A standard view: turns the orientation, keeps target, distance and fov."},
+                    "target": {"type": "array", "items": {"type": "number", "minimum": -1e12, "maximum": 1e12}, "minItems": 3, "maxItems": 3, "description": "Point [x, y, z] the camera looks at, in mm; each coordinate within 1e12."},
+                    "distance": {"type": "number", "minimum": 0.001, "maximum": 1e7, "description": "Distance from target to eye in mm, 0.001 to 1e7 (the zoom limits)."},
+                    "yaw_rad": {"type": "number", "minimum": -1e6, "maximum": 1e6, "description": "Azimuth around Z in radians, within 1e6 either way."},
+                    "pitch_rad": {"type": "number", "minimum": -1.569797, "maximum": 1.569797, "description": "Elevation in radians, within the poles (at most 1.5697963 either way)."},
+                    "fov_rad": {"type": "number", "minimum": 0.01, "maximum": 3, "description": "Vertical field of view in radians, 0.01 to 3."},
+                    "projection": {"type": "string", "enum": ["perspective"], "description": "The viewport camera is perspective only."},
+                    "fit": {"type": "boolean", "description": "Frame the document as screenshot draws it, last: replaces target and distance."}
+                }),
+                &[],
+            ),
+        ),
+        general(
             "set_tool_mode",
             "Choose the tool listing from now on: `mode` compact (one tool per area, with verb and params, plus the workflow commands; the default) or full (one tool per command); `areas` limits either to some areas (null or [] for all). Keeps what is not given. Returns the new listing; call tools/list again to read the schemas (no list-changed notification is sent).",
             obj(

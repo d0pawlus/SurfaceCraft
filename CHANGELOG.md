@@ -11,6 +11,17 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
 
 ## [Unreleased]
 
+### Added
+
+- Desktop control channel and bridged MCP: `ui.camera_get` and `ui.camera_set` (MCP tools `camera_get` and
+  `camera_set`) read and set the viewport camera next to `ui.screenshot`, so an agent can take comparable
+  before and after screenshots and put a view back exactly: target, distance, yaw, pitch and field of view
+  (perspective; the viewport has no orthographic camera) in mm and radians. `camera_set` takes any of these
+  fields, a standard view (`front`, `back`, `left`, `right`, `top`, `bottom`, `iso`) and `fit`, applied in that
+  order (view, fields, fit to the document as a screenshot draws it), and refuses bad numbers, unknown fields and unknown views without changing
+  anything. These are requests of the app, not engine commands: the camera is state of the viewport, so they
+  exist in the desktop app only (#153).
+
 ## [0.3.0] - 2026-11-16
 
 Three days and twenty-one merged feature and fix pull requests after 0.2.0. The release is about harder real

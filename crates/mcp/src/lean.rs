@@ -50,6 +50,13 @@ pub fn text_result(v: &Value, is_error: bool) -> Value {
     json!({"content": [{"type": "text", "text": lean.to_string()}], "structuredContent": lean, "isError": is_error})
 }
 
+/// A tool result carrying `v` as it is: compact JSON text with every digit, for a value the agent hands
+/// back to the app (the camera), which rounding to 6 decimals would not restore exactly.
+#[must_use]
+pub fn exact_result(v: &Value, is_error: bool) -> Value {
+    json!({"content": [{"type": "text", "text": v.to_string()}], "structuredContent": v, "isError": is_error})
+}
+
 /// A tool result reporting `message` as an error.
 #[must_use]
 pub fn tool_error(message: &str) -> Value {

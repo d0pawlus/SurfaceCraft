@@ -16,7 +16,9 @@ pub fn instructions(files: Option<bool>) -> String {
         Some(false) => {
             "File paths are off: pass base64 `data` to mesh_import and read `data` from the exports (start the server with --allow-files to use paths)."
         }
-        None => "Bridged to the running app: the user sees every change; file paths follow the app's setting.",
+        None => {
+            "Bridged to the running app: the user sees every change; file paths follow the app's setting. camera_get and camera_set read and restore the viewport camera."
+        }
     };
     format!(
         "SurfaceCraft turns 3D scans into CAD models. Units are mm. \

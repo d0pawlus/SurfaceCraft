@@ -4,6 +4,7 @@
 //! `verb` and `params`) plus the workflow commands in full ([`FEATURED`]); in full mode it is
 //! one tool per command. Generic tools: `list_commands`, `describe_command`, `execute`, `batch` (with
 //! rollback), `undo`, `redo`, `inspect_design`, `screenshot` (when the host can render),
+//! `camera_get` and `camera_set` (the camera of the desktop app, bridged mode only),
 //! `set_tool_mode` (the listing, at run time), and the queue: `job_status`, `job_wait`,
 //! `job_cancel`. A call with `queued: true` returns a job id at once.
 //! Resources: `surfacecraft://design` (the object list), `surfacecraft://commands` and one
@@ -23,7 +24,7 @@
 )]
 
 use jobs::{Jobs, Request, State, View, Wait};
-use lean::{text_result, tool_error, tool_error_with};
+use lean::{exact_result, text_result, tool_error, tool_error_with};
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -47,8 +48,18 @@ pub const ENV_TOOLS: &str = "SURFACECRAFT_MCP_TOOLS";
 pub const ENV_AREAS: &str = "SURFACECRAFT_MCP_AREAS";
 
 /// Tools that are not commands, listed in both modes.
-const GENERAL: &[&str] =
-    &["list_commands", "describe_command", "execute", "batch", "undo", "redo", "inspect_design", "screenshot"];
+const GENERAL: &[&str] = &[
+    "list_commands",
+    "describe_command",
+    "execute",
+    "batch",
+    "undo",
+    "redo",
+    "inspect_design",
+    "screenshot",
+    "camera_get",
+    "camera_set",
+];
 /// The workflow commands: listed with their full input schema in compact mode too, so the short
 /// path (import, scan to solid, compare, export) needs no `describe_command`.
 pub const FEATURED: &[&str] =
@@ -63,6 +74,11 @@ pub trait Backend {
     /// A PNG screenshot of the viewport, if the backend can render.
     fn screenshot(&mut self, _width: u32, _height: u32) -> Option<Vec<u8>> {
         None
+    }
+    /// A request of the host's viewport (`ui.camera_get`, `ui.camera_set`): its result, or the message
+    /// of the error. A host without a window refuses.
+    fn ui_request(&mut self, _method: &str, _params: Value) -> Result<Value, String> {
+        Err("this host has no viewport: run the desktop app and let the server bridge to it (no --local)".into())
     }
 }
 
@@ -307,6 +323,15 @@ fn screenshot<B: Backend>(backend: &mut B, args: &Value) -> Value {
     }
 }
 
+/// `camera_get` and `camera_set`: a request of the app's viewport. The camera is passed on as it is (not
+/// rounded like other results), so that what `camera_get` returned puts the view back exactly.
+fn camera_tool<B: Backend>(backend: &mut B, method: &str, params: Value) -> Value {
+    match backend.ui_request(method, params) {
+        Ok(camera) => exact_result(&camera, false),
+        Err(message) => tool_error(&message),
+    }
+}
+
 /// The verbs of an area, as the compact tool's `verb` takes them.
 fn verbs(area: &str) -> Vec<&'static str> {
     area_commands(area).iter().map(|c| verb_of(c.id)).collect()
@@ -343,6 +368,8 @@ fn dispatch_tool<B: Backend>(backend: &mut B, name: &str, args: Value) -> Value 
         "redo" => run_command(backend, "edit.redo", Value::Null),
         "inspect_design" => run_command(backend, "doc.list", Value::Null),
         "screenshot" => screenshot(backend, &args),
+        "camera_get" => camera_tool(backend, "ui.camera_get", Value::Null),
+        "camera_set" => camera_tool(backend, "ui.camera_set", args),
         other => {
             if let Some(id) = command_id(other) {
                 return run_command(backend, id, args);

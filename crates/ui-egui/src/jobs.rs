@@ -318,6 +318,7 @@ impl SurfaceCraftApp {
                     continue;
                 }
                 "ui.screenshot" => {
+                    crate::camera_control::settle(self);
                     let dim = |k: &str, d: u64| r.params.get(k).and_then(Value::as_u64).unwrap_or(d) as u32;
                     let cam = self.camera.clone();
                     let (w, h) = (dim("width", 800), dim("height", 600));
@@ -327,6 +328,8 @@ impl SurfaceCraftApp {
                         Err(e) => json!({"err": e}),
                     }
                 }
+                "ui.camera_get" => crate::camera_control::camera_get(self, &r.params),
+                "ui.camera_set" => crate::camera_control::camera_set(self, &r.params),
                 other => json!({"err": format!("unknown method {other}")}),
             };
             let _ = r.reply.send(reply);

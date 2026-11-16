@@ -17,6 +17,8 @@ pub mod app;
 pub mod assistant;
 pub mod brep;
 pub mod camera;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod camera_control;
 pub mod command_panel;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod control;
