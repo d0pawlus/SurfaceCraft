@@ -7,7 +7,8 @@
 //!
 //! Run (release, the files are large):
 //! `SURFACECRAFT_LOCAL_CORPUS_NUMBERS=3` (comma-separated file numbers) limits the run;
-//! `SURFACECRAFT_LOCAL_TO_SOLID_PARAMS='{"close_handles": true}'` adds parameters to every call.
+//! `SURFACECRAFT_LOCAL_TO_SOLID_PARAMS='{"close_handles": true}'` adds parameters to every call,
+//! `SURFACECRAFT_LOCAL_IMPORT_PARAMS='{"units": "m"}'` to every import.
 //! `SURFACECRAFT_LOCAL_CORPUS=… cargo test --release -p surfacecraft-engine --test local_to_solid -- --ignored --nocapture`
 use serde_json::{Value, json};
 use std::time::Instant;
@@ -45,7 +46,15 @@ fn codes(out: &Value) -> Vec<String> {
 fn run_one(number: usize, path: &std::path::Path) -> Result<String, String> {
     let mut s = Session::new();
     let e = |x: surfacecraft_engine::EngineError| x.to_string();
-    let info = s.execute("mesh.import", json!({"path": path.to_string_lossy(), "name": "scan"})).map_err(e)?;
+    let mut import = json!({"path": path.to_string_lossy(), "name": "scan"});
+    // extra parameters of the import, e.g. `{"units": "m"}`
+    if let Some(extra) =
+        std::env::var("SURFACECRAFT_LOCAL_IMPORT_PARAMS").ok().and_then(|x| serde_json::from_str::<Value>(&x).ok())
+        && let (Some(p), Some(x)) = (import.as_object_mut(), extra.as_object())
+    {
+        p.extend(x.clone());
+    }
+    let info = s.execute("mesh.import", import).map_err(e)?;
     let started = Instant::now();
     let mut params = json!({"scan": "scan"});
     // extra parameters of every call, e.g. `{"close_handles": true}`
@@ -80,9 +89,17 @@ fn run_one(number: usize, path: &std::path::Path) -> Result<String, String> {
         out["next_steps"].as_array().into_iter().flatten().filter_map(|x| x["command"].as_str()).collect::<Vec<_>>(),
     );
     eprintln!(
-        "C{number:02} within {} patches {} retry {} attempts {}",
-        out["deviation"]["within"], out["patches"], out["retry"], out["attempts"]
+        "C{number:02} within {} not facing {} analytic faces {} patches {} retry {} attempts {}",
+        out["deviation"]["within"],
+        out["deviation"]["not_facing"],
+        out["analytic"]["faces"],
+        out["patches"],
+        out["retry"],
+        out["attempts"]
     );
+    if !out["analytic"].is_null() {
+        eprintln!("C{number:02} analytic {}", out["analytic"]);
+    }
     for p in out["preparation"].as_array().into_iter().flatten() {
         eprintln!("C{number:02} preparation {}: {}", p["step"], p["numbers"]);
     }

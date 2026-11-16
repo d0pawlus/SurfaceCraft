@@ -25,6 +25,7 @@ pub mod param;
 pub mod patch;
 pub mod patch_g1;
 mod patch_jumps;
+mod patch_refit;
 pub mod plane;
 pub mod primitive;
 pub mod resample;

@@ -23,8 +23,8 @@
 //! [`crate::patch::eval`] (the listed APP-GEOMETRY file).
 use crate::mls::ScanSurface;
 use crate::patch::{
-    PatchSet, WRAP_FACING_COS, bern, bezier_tangent, cross_weights, eval, normal, tensor_weights, weighted_sum,
-    wrap_curve, wrap_net,
+    PatchSet, WRAP_FACING_COS, bern, bezier_tangent, chord_curve, cross_weights, eval, interpolated_net, normal,
+    tensor_weights, weighted_sum, wrap_curve, wrap_net,
 };
 pub use crate::patch_jumps::{JumpStats, jump_stats};
 use crate::wrap_normals::{EdgeKey, Layout, LayoutNormals, edge_faces, edge_slot, key, layout_normals};
@@ -333,13 +333,49 @@ struct Layer<'a> {
     /// Coarse edges with fewer or more than two faces: no neighbour to be tangent to.
     free: BTreeSet<EdgeKey>,
     g1: bool,
+    /// Refit the curves and patches of the unconstrained wrap to the scan ([`crate::patch_refit`]).
+    refit: bool,
 }
 
 impl Layer<'_> {
-    /// The scan point nearest to `at` on a side that faces like one of `facing`.
-    fn project(&self, at: Vec3, facing: &[Vec3]) -> Vec3 {
+    /// The scan point nearest to `at` on a side that faces like one of `facing`, `None` when there
+    /// is none within the reach.
+    fn try_project(&self, at: Vec3, facing: &[Vec3]) -> Option<Vec3> {
         let hit = self.scan.closest_facing(&Point3::from(at), self.reach, facing, WRAP_FACING_COS);
-        hit.map_or(at, |h| h.point.coords)
+        hit.map(|h| h.point.coords)
+    }
+
+    /// [`Layer::try_project`], or `at` itself when there is no scan point within the reach.
+    fn project(&self, at: Vec3, facing: &[Vec3]) -> Vec3 {
+        self.try_project(at, facing).unwrap_or(at)
+    }
+
+    /// Does triangle `f` have an edge on the open border of the scan?
+    fn on_rim(&self, f: usize) -> bool {
+        let t = self.coarse.triangles.get(f);
+        (0..3).any(|e| t.is_some_and(|t| self.free.contains(&key(t[e], t[(e + 1) % 3]))))
+    }
+
+    /// Are the curves and patches of the unconstrained wrap refitted at all? Not with tangent patches:
+    /// their construction is tuned to the plain curves (see [`patch_net`]).
+    fn refits(&self) -> bool {
+        self.refit && !self.g1
+    }
+
+    /// Is the curve of coarse edge `(a, b)` refitted? Not on the open border of the scan: samples
+    /// beyond the rim are pulled onto it and would lean the curve. Edges that only end on the rim
+    /// are refitted (their samples lie inside; `on_the_open_rim_patches_stay_close_to_the_plain_ones`
+    /// bounds what that does to the rim patches): leaving them plain too made a band two triangles
+    /// deep along the rim that the rounds refined (431 to 504 faces on the open part of
+    /// `p9_hybrid_scan`), and the hybrid method then refused the wall at the cut on Linux and Windows.
+    fn refits_edge(&self, a: u32, b: u32) -> bool {
+        self.refits() && !self.free.contains(&key(a, b))
+    }
+
+    /// Is the inside of the patches of triangle `f` refitted? Not when the triangle has an edge on the
+    /// open border of the scan (see [`Layer::refits_edge`]); its spokes are.
+    fn refits_patches(&self, f: usize) -> bool {
+        self.refits() && !self.on_rim(f)
     }
 
     fn corner_normal(&self, f: usize, v: u32) -> Vec3 {
@@ -412,6 +448,7 @@ fn edge_curves(l: &Layer, edges: &BTreeMap<EdgeKey, Vec<usize>>, build: &mut Bui
         let (Some(&pa), Some(&pb)) = (build.vertices.get(a as usize), build.vertices.get(b as usize)) else { continue };
         let facing: Vec<Vec3> = faces.iter().filter_map(|&f| l.face_normal.get(f).copied()).collect();
         let on_edge = |at: Vec3| l.project(at, &facing);
+        let try_edge = |at: Vec3| l.try_project(at, &facing);
         let m = build.vertices.len() as u32;
         let pm = on_edge((pa + pb) * 0.5);
         build.vertices.push(pm);
@@ -423,8 +460,10 @@ fn edge_curves(l: &Layer, edges: &BTreeMap<EdgeKey, Vec<usize>>, build: &mut Bui
             None
         };
         let Some(t) = tangents else {
-            build.curves.insert((a, m), wrap_curve(pa, pm, &on_edge));
-            build.curves.insert((b, m), wrap_curve(pb, pm, &on_edge));
+            let refit = l.refits_edge(a, b);
+            let curve = |p: Vec3| if refit { wrap_curve(p, pm, &try_edge) } else { chord_curve(p, pm, &on_edge) };
+            build.curves.insert((a, m), curve(pa));
+            build.curves.insert((b, m), curve(pb));
             continue;
         };
         let [na, nb, nm] = t.normals.map_or([None; 3], |n| n.map(Some));
@@ -462,6 +501,8 @@ struct Triangle {
 /// The centre of the triangle and the three curves from the edge midpoints to it; returns the centre's id.
 fn add_spokes(l: &Layer, tri: &Triangle, nf: Vec3, build: &mut Build) -> u32 {
     let on_face = |at: Vec3| l.project(at, &[nf]);
+    let try_face = |at: Vec3| l.try_project(at, &[nf]);
+    let refit = l.refits();
     let p = |v: u32| build.vertices.get(v as usize).copied().unwrap_or_else(Vec3::zeros);
     let pg = on_face((p(tri.corners[0]) + p(tri.corners[1]) + p(tri.corners[2])) / 3.0);
     let g = build.vertices.len() as u32;
@@ -473,8 +514,10 @@ fn add_spokes(l: &Layer, tri: &Triangle, nf: Vec3, build: &mut Build) -> u32 {
             let nm = l.mid_normal(tri.f, k);
             let (tm, tg) = (tangent_toward(&nm, &(pg - pm)), tangent_toward(&ng, &(pg - pm)));
             tangent_curve(End::new(pm, tm, Some(&nm)), End::new(pg, tg, Some(&ng)), &on_face)
+        } else if refit {
+            wrap_curve(pm, pg, &try_face)
         } else {
-            wrap_curve(pm, pg, &on_face)
+            chord_curve(pm, pg, &on_face)
         });
     }
     for (&m, c) in tri.mids.iter().zip(spokes) {
@@ -511,10 +554,17 @@ fn scan_rms(net: &crate::patch::Net, project: &dyn Fn(Vec3) -> Vec3) -> f64 {
 fn patch_net(l: &Layer, tri: &Triangle, k: usize, curves: [Curve; 4], ng: Vec3, nf: Vec3) -> (crate::patch::Net, bool) {
     let [bot, right, top, left] = curves;
     let on_face = |at: Vec3| l.project(at, &[nf]);
-    let free = wrap_net(&bot, &right, &top, &left, &on_face);
     if !l.g1 {
-        return (free, true);
+        // see [`Layer::refits_patches`] for the patches that are not refitted
+        if l.refits_patches(tri.f) {
+            let try_face = |at: Vec3| l.try_project(at, &[nf]);
+            return (wrap_net(&bot, &right, &top, &left, &try_face), true);
+        }
+        return (interpolated_net(&bot, &right, &top, &left, &on_face), true);
     }
+    // the tangent patches are judged against, and fall back to, the plain interpolating patch: the
+    // least-squares refit of the unconstrained wrap made the tangent ones fail their smoothness gates
+    let free = interpolated_net(&bot, &right, &top, &left, &on_face);
     let (nc, mb, ml) =
         (l.corner_normal(tri.f, tri.corners[k]), l.mid_normal(tri.f, k), l.mid_normal(tri.f, (k + 2) % 3));
     let edge = |e: usize| l.coarse.triangles.get(tri.f).map(|t| key(t[e], t[(e + 1) % 3]));
@@ -560,6 +610,17 @@ fn add_triangle(l: &Layer, tri: &Triangle, build: &mut Build) {
 /// [`crate::patch::wrap_patches`] numbers them.
 #[must_use]
 pub fn wrap_patches_g1(coarse: &Mesh, scan: &Bvh, surface: &ScanSurface, reach: f64, options: &G1Options) -> G1Wrap {
+    wrap_with(coarse, (scan, surface), reach, options, true)
+}
+
+/// [`wrap_patches_g1`] with the least-squares refit on or off (off: the plain construction everywhere).
+fn wrap_with(
+    coarse: &Mesh,
+    (scan, surface): (&Bvh, &ScanSurface),
+    reach: f64,
+    options: &G1Options,
+    refit: bool,
+) -> G1Wrap {
     let face_normal: Vec<Vec3> =
         (0..coarse.triangle_count()).map(|f| coarse.face_normal(f).unwrap_or_else(Vec3::z)).collect();
     let vertices: Vec<Vec3> =
@@ -569,8 +630,8 @@ pub fn wrap_patches_g1(coarse: &Mesh, scan: &Bvh, surface: &ScanSurface, reach: 
         let layout = Layout { coarse, vertices: &vertices, face_normal: &face_normal, surface, edges: &edges };
         layout_normals(&layout, options.crease_deg)
     };
-    let free = edges.iter().filter(|(_, f)| f.len() != 2).map(|(k, _)| *k).collect();
-    let layer = Layer { coarse, scan, reach, face_normal, normals, free, g1: options.g1 };
+    let free: BTreeSet<EdgeKey> = edges.iter().filter(|(_, f)| f.len() != 2).map(|(k, _)| *k).collect();
+    let layer = Layer { coarse, scan, reach, face_normal, normals, free, g1: options.g1, refit };
     let mut build = Build { vertices, curves: Curves::new(), set: PatchSet::default(), fallbacks: 0 };
     let mid = edge_curves(&layer, &edges, &mut build);
     for (f, t) in coarse.triangles.iter().enumerate() {
@@ -596,168 +657,9 @@ pub fn wrap_patches_g1(coarse: &Mesh, scan: &Bvh, surface: &ScanSurface, reach: 
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use surfacecraft_geom::{Rng, synth};
+#[path = "patch_g1_refit_tests.rs"]
+mod refit_tests;
 
-    fn wrap(coarse: &Mesh, scan: &Mesh, g1: bool) -> G1Wrap {
-        let surface = ScanSurface::oriented(&scan.positions, &scan.vertex_normals());
-        let bvh = Bvh::build(scan);
-        wrap_patches_g1(coarse, &bvh, &surface, 4.0, &G1Options { g1, crease_deg: 35.0 })
-    }
-
-    fn sphere_pair() -> (Mesh, Mesh) {
-        let mut scan = synth::sphere(Point3::origin(), 20.0, 120, 60);
-        synth::add_noise(&mut scan, 0.03, &mut Rng::new(5));
-        (synth::sphere(Point3::origin(), 20.0, 16, 8), scan)
-    }
-
-    #[test]
-    fn tangent_patches_on_a_sphere_meet_within_a_degree_and_g0_ones_do_not() {
-        // Arrange
-        let (coarse, scan) = sphere_pair();
-
-        // Act
-        let g1 = wrap(&coarse, &scan, true);
-        let g0 = wrap(&coarse, &scan, false);
-        let (tangent, _) = jump_stats(&g1.set, &g1.creases);
-        let (free, _) = jump_stats(&g0.set, &g0.creases);
-
-        // Assert
-        assert_eq!(g1.crease_edges, 0, "a sphere has no creases");
-        assert_eq!(g1.set.nets.len(), g0.set.nets.len());
-        assert!(tangent.count > 0 && tangent.mean_deg < 1.0, "{tangent:?}");
-        assert!(free.mean_deg > 2.0 * tangent.mean_deg, "g0 {free:?} g1 {tangent:?}");
-    }
-
-    #[test]
-    fn a_box_keeps_its_edges_sharp_and_its_faces_tangent() {
-        // Arrange: a coarse box (two triangles per face) over a dense noisy one
-        let mut scan = synth::cuboid(Point3::origin(), Vec3::new(20.0, 20.0, 20.0), 20);
-        synth::add_noise(&mut scan, 0.02, &mut Rng::new(3));
-        let coarse = synth::cuboid(Point3::origin(), Vec3::new(20.0, 20.0, 20.0), 2);
-
-        // Act
-        let w = wrap(&coarse, &scan, true);
-        let (smooth, sharp) = jump_stats(&w.set, &w.creases);
-
-        // Assert
-        assert!(w.crease_edges >= 12, "the box edges are creases: {}", w.crease_edges);
-        assert!(sharp.count > 0 && (sharp.mean_deg - 90.0).abs() < 3.0, "{sharp:?}");
-        assert!(smooth.mean_deg < 1.0, "{smooth:?}");
-    }
-
-    fn rotated(deg: f64) -> Vec3 {
-        let a = deg.to_radians();
-        Vec3::new(a.sin(), 0.0, a.cos())
-    }
-
-    #[test]
-    fn a_shallow_crease_direction_lies_in_both_side_planes() {
-        // Arrange: sides 5 degrees apart (far above rounding, below the old 11.5 degree cut-off)
-        let (n1, n2) = (rotated(-2.5), rotated(2.5));
-
-        // Act
-        let d = crease_direction(&n1, &n2, &Vec3::y());
-
-        // Assert
-        assert!(d.dot(&n1).abs() < 1e-12 && d.dot(&n2).abs() < 1e-12, "{d:?}");
-        assert!(d.dot(&Vec3::y()) > 0.99, "{d:?}");
-    }
-
-    #[test]
-    fn a_crease_direction_lies_in_both_planes_down_to_parallel_normals() {
-        for deg in [180.0, 90.0, 1.0, 1e-3, 1e-8, 1e-12, 0.0] {
-            let (n1, n2) = (rotated(0.0), rotated(deg));
-            let d = crease_direction(&n1, &n2, &Vec3::y());
-            assert!(d.dot(&n1).abs() < 1e-9 && d.dot(&n2).abs() < 1e-9, "{deg}: {d:?}");
-            assert!((d.norm() - 1.0).abs() < 1e-12, "{deg}: {d:?}");
-        }
-    }
-
-    #[test]
-    fn a_collapsed_patch_corner_does_not_follow_the_face() {
-        // Arrange: the whole side u = 0 collapsed to one point, so the normal is undefined along it
-        let mut net = [[[0.0; 3]; 4]; 4];
-        for (i, row) in net.iter_mut().enumerate() {
-            for (j, p) in row.iter_mut().enumerate() {
-                *p = [i as f64, j as f64, 0.0];
-            }
-        }
-        for p in net[0].iter_mut() {
-            *p = [0.0, 0.0, 0.0];
-        }
-
-        // Act / Assert
-        assert!(normal(&net, 0.0, 0.5).is_none());
-        assert!(!follows(&net, &Vec3::z()), "an undefined normal must not be accepted");
-    }
-
-    /// A height field with a curved crease: `z = SLOPE |x - 1.5 sin(0.4 y)|`, whose two sides meet at
-    /// 5 degrees. `grid(n, step)` has its lines along the crease curve.
-    fn curved_crease_surface(nx: usize, ny: usize, step: f64) -> Mesh {
-        const SLOPE: f64 = 0.043_66;
-        let mut m = Mesh::default();
-        for j in 0..=ny {
-            for i in 0..=nx {
-                let (u, y) = ((i as f64 - nx as f64 / 2.0) * step, j as f64 * step);
-                let x = u + 1.5 * (0.4 * y).sin();
-                m.positions.push(Point3::new(x, y, SLOPE * u.abs()));
-            }
-        }
-        for j in 0..ny {
-            for i in 0..nx {
-                let a = (j * (nx + 1) + i) as u32;
-                let w = (nx + 1) as u32;
-                m.triangles.push([a, a + 1, a + w + 1]);
-                m.triangles.push([a, a + w + 1, a + w]);
-            }
-        }
-        m
-    }
-
-    #[test]
-    fn a_curved_shallow_crease_leaves_the_smooth_edges_beside_it_tangent() {
-        // Arrange: crease_deg 1 makes the 5 degree crease a crease
-        let scan = curved_crease_surface(40, 40, 0.5);
-        let coarse = curved_crease_surface(4, 4, 5.0);
-        let surface = ScanSurface::oriented(&scan.positions, &scan.vertex_normals());
-        let bvh = Bvh::build(&scan);
-
-        // Act
-        let w = wrap_patches_g1(&coarse, &bvh, &surface, 4.0, &G1Options { g1: true, crease_deg: 1.0 });
-        let (smooth, _) = jump_stats(&w.set, &w.creases);
-
-        // Assert
-        assert!(w.crease_edges >= 2, "the 5 degree crease is found: {}", w.crease_edges);
-        assert_eq!((smooth.invalid_samples, smooth.invalid_edges), (0, 0), "{smooth:?}");
-        assert!(
-            smooth.count > 0 && smooth.mean_deg < 1.0 && smooth.p99_deg < 5.0,
-            "smooth edges beside the crease: {smooth:?}"
-        );
-    }
-
-    #[test]
-    fn the_wrap_is_deterministic() {
-        let (coarse, scan) = sphere_pair();
-        let (a, b) = (wrap(&coarse, &scan, true), wrap(&coarse, &scan, true));
-        assert_eq!(a.set.nets, b.set.nets);
-        assert_eq!(a.creases, b.creases);
-    }
-
-    #[test]
-    fn hostile_coarse_meshes_do_not_panic() {
-        let (_, scan) = sphere_pair();
-        let nan = Point3::new(f64::NAN, 0.0, 0.0);
-        let meshes = [
-            Mesh::default(),
-            Mesh { positions: vec![Point3::origin(); 3], triangles: vec![[0, 1, 2]] },
-            Mesh { positions: vec![nan, Point3::origin(), Point3::new(1.0, 0.0, 0.0)], triangles: vec![[0, 1, 2]] },
-            Mesh { positions: vec![Point3::origin()], triangles: vec![[0, 5, 9]] },
-        ];
-        for m in &meshes {
-            let w = wrap(m, &scan, true);
-            assert!(w.set.nets.len() <= 3 * m.triangles.len());
-        }
-    }
-}
+#[cfg(test)]
+#[path = "patch_g1_tests.rs"]
+mod tests;
