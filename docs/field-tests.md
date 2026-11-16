@@ -135,6 +135,68 @@ offsetting. Analytic faces in the file: 31 `PLANE`, 12 `CYLINDRICAL_SURFACE`, 4
 Expected: the edges the merge did not touch keep their cubic curves; a moved border edge is
 re-fitted as a cubic (the guide says Bézier, least squares).
 
+### Manual attempt (same scan, no `scan.to_solid`)
+
+Steps: fit primitives to the large regions, `align.datum` on the two flange planes (55.07 mm
+apart) and the inlet axis, sections and sketches, extrude and revolve, `body.compare`. Result:
+only the inlet pipe could be built by hand (revolve of a typed profile, cut of the bore on its own
+axis): 78.6 % of its nearby scan points within 0.2 mm, RMS 0.26 mm, the misses at the end bead
+whose shape was guessed and where the pipe meets the housing. The housing could not be built at
+all; the blockers are F-11 to F-15.
+
+### F-11 (open, high): `align.datum` puts the origin 68 m away
+
+`align.datum` with primary a plane, secondary an axis lying in a plane parallel to it (the inlet
+axis, `n · d` = 0.0003) and tertiary a point: the result moved the mesh by 67 921.9 mm; the bounding
+box went to x = -68 051 … -67 773. Y and Z came out right (the axis at y = 0, the plane at z = 0).
+The X origin looks taken from the intersection of the secondary axis with the primary plane,
+which runs off to infinity when the axis is parallel to the plane, instead of from the tertiary
+point. Worked around with `mesh.transform` (`translate` x + 67 922.605). Expected: an axis parallel
+to the primary plane fixes Y (and is projected), the tertiary point fixes X.
+
+### F-12 (open, medium): aligning a scan leaves its primitives and bodies behind
+
+`align.datum` (and `mesh.transform`) moves the mesh only (`also` takes meshes). The nine
+primitives fitted before the alignment stayed where they were, drawn across the viewport far
+from the part, and had to be fitted again. The camera was not refitted either. Expected: an
+option to move the objects derived from the scan with it, or a warning that they are now stale.
+
+### F-13 (open, high): an extrude cannot pick profiles, and a failed one does not say which
+
+`sketch.fit_chains` at z = 27.5 gave 14 closed profiles (outer outline, cores, holes), at z = 45
+55 profiles (mostly small circles). `feature.extrude` takes every closed profile of a sketch and
+failed both times with "kernel operation `sweep::extrude (hole)` failed: the result is not a
+closed solid" (`sweep::extrude` at z = 45), without naming the profile. There is no parameter to
+extrude one profile or a chosen set, and no command to delete entities from a sketch. Expected:
+`profiles` (indices) on extrude and revolve, and the failing profile in the error.
+
+### F-14 (open, high for agents): no read-out of sketch or section geometry
+
+`inspect_design` gives a sketch as "120 entities, 4 constraints"; `sketch.fit_chains` returns
+per-chain statistics; `section.stack` returns area, perimeter, size and fitted circles but no
+polyline. An agent therefore cannot see a section outline, cannot copy part of it into its own
+sketch, and cannot check which loop is which. Expected: a `sketch.get` (entities with their
+coordinates, profiles with their loops) and polylines from `section.stack` on request
+(`points: true`, decimated).
+
+### F-15 (open, medium): `sketch.from_section` and `sketch.fit_chains` disagree
+
+Same plane (z = 27.5, tolerance 0.2): `from_section` gave one sketch of 278 entities with 1 closed
+profile, `fit_chains` 120 entities with 14 closed profiles (25 chains, 11 shorter than four
+tolerances and dropped). A user would not know which to trust; the `from_section` profile count
+suggests its chains were not closed.
+
+### F-16 (open, low): small API inconsistencies met on the way
+
+- `body.compare` names the scan `scan`, `body.refit_features` names it `mesh`.
+- `primitive.info` has no extent (bounding box or parameter range of the region on the
+  primitive), so the length of a cylinder had to be found with a stack of 18 sections.
+- `sketch.fit_chains` lists every dropped chain in full (39 KB for the z = 45 section, 9 empty
+  entries).
+- `body.plan_regions` on the casting skipped 6 of 7 primitives (slot profile, boss or step, local
+  plane): the primitives route does not apply to a casting, which is right, but `scan.to_solid`
+  is then the only route an agent has.
+
 ### F-8 (open, info): 60 000 patches are not enough for a complex casting
 
 The maximum cap gives 97.5 % within 0.2 mm, under the 99 % of a pass; there is no further step
