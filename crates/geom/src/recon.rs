@@ -21,6 +21,7 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::ops::Range;
+pub(crate) mod band;
 mod grid;
 mod normals;
 mod pivot;
