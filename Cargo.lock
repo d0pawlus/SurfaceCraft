@@ -3356,7 +3356,7 @@ dependencies = [
 
 [[package]]
 name = "surfacecraft"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "craft-window",
  "eframe",
@@ -3366,7 +3366,7 @@ dependencies = [
 
 [[package]]
 name = "surfacecraft-ai"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3375,7 +3375,7 @@ dependencies = [
 
 [[package]]
 name = "surfacecraft-align"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "nalgebra",
  "rayon",
@@ -3388,7 +3388,7 @@ dependencies = [
 
 [[package]]
 name = "surfacecraft-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde_json",
  "surfacecraft-ai",
@@ -3401,7 +3401,7 @@ dependencies = [
 
 [[package]]
 name = "surfacecraft-deviation"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "nalgebra",
  "schemars",
@@ -3413,7 +3413,7 @@ dependencies = [
 
 [[package]]
 name = "surfacecraft-doc"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "schemars",
  "serde",
@@ -3427,7 +3427,7 @@ dependencies = [
 
 [[package]]
 name = "surfacecraft-engine"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rayon",
  "schemars",
@@ -3446,7 +3446,7 @@ dependencies = [
 
 [[package]]
 name = "surfacecraft-fit"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "nalgebra",
  "rayon",
@@ -3458,7 +3458,7 @@ dependencies = [
 
 [[package]]
 name = "surfacecraft-geom"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "nalgebra",
  "rayon",
@@ -3469,7 +3469,7 @@ dependencies = [
 
 [[package]]
 name = "surfacecraft-io"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rayon",
  "schemars",
@@ -3482,7 +3482,7 @@ dependencies = [
 
 [[package]]
 name = "surfacecraft-kernel"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "nalgebra",
  "rayon",
@@ -3502,7 +3502,7 @@ dependencies = [
 
 [[package]]
 name = "surfacecraft-mcp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde_json",
  "surfacecraft-engine",
@@ -3510,7 +3510,7 @@ dependencies = [
 
 [[package]]
 name = "surfacecraft-sketch"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "nalgebra",
  "schemars",
@@ -3522,7 +3522,7 @@ dependencies = [
 
 [[package]]
 name = "surfacecraft-ui-egui"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytemuck",
  "craft-dialogs",
@@ -3557,7 +3557,7 @@ dependencies = [
 
 [[package]]
 name = "surfacecraft-web"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "eframe",
  "getrandom 0.4.3",

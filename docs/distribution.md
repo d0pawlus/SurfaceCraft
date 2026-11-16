@@ -108,7 +108,7 @@ on `main`, see below). There are two kinds of release (owner's decision, 2026-11
 1. Set `version` under `[workspace.package]` in `Cargo.toml` to the new version, run
    `cargo update --workspace` so `Cargo.lock` follows, add a `## [X.Y.Z] - date` section to
    `CHANGELOG.md`, and merge it to `main`.
-2. From the commit to release: `git tag v0.2.0 && git push origin v0.2.0`.
+2. From the commit to release: `git tag v0.3.0 && git push origin v0.3.0`.
 3. Wait for the run in the Actions tab. The release page then shows the changelog section of that
    version, the packages and `SHA256SUMS.txt`. A version without a section gets a warning in the run
    and notes that list only the files.
