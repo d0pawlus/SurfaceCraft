@@ -6,6 +6,9 @@
 //!
 //! Only imports the user starts from the interface ask; a command (the form, a script, MCP) never
 //! opens the dialog and states `reduce_to` itself.
+//!
+//! Contents picked without a path (the browser) reach `mesh.import` as a picked file of the
+//! session (`surfacecraft_engine::picked`), never as base64 data.
 use crate::SurfaceCraftApp;
 use crate::i18n::{t, tf};
 use serde_json::{Value, json};
@@ -38,8 +41,8 @@ pub enum ImportChoice {
 pub(crate) struct PendingImport {
     /// The import's parameters without the file's contents.
     params: Value,
-    /// The file's contents, when it was not picked by path (the browser).
-    bytes: Option<Vec<u8>>,
+    /// The file's name and contents, when it was not picked by path (the browser).
+    bytes: Option<(String, Vec<u8>)>,
     /// Triangles the header declares.
     triangles: u64,
     /// The reduction the dialog shows.
@@ -111,10 +114,10 @@ impl SurfaceCraftApp {
         let ext = extension_of(name);
         let stem = name.rsplit_once('.').map_or(name, |(s, _)| s);
         let declared = declared_triangles(&bytes, &ext);
-        self.import_or_offer(json!({"format": ext, "name": stem}), Some(bytes), declared);
+        self.import_or_offer(json!({"format": ext, "name": stem}), Some((name.to_string(), bytes)), declared);
     }
 
-    fn import_or_offer(&mut self, params: Value, bytes: Option<Vec<u8>>, declared: Option<u64>) {
+    fn import_or_offer(&mut self, params: Value, bytes: Option<(String, Vec<u8>)>, declared: Option<u64>) {
         // the file already waiting for its answer is never replaced: this one is refused, in words
         if self.pending_import.is_some() {
             self.status = tf("status.busy", &[("name", t("reduce.title"))]);
@@ -133,15 +136,22 @@ impl SurfaceCraftApp {
         }
     }
 
+    /// Runs the import. Picked contents go to the session as a picked file (a `picked:` path),
+    /// not into the parameters as base64: the file is then held once, and the log keeps its path.
     fn start_import(&mut self, pending: PendingImport, reduce_to: Option<usize>) {
         let mut params = pending.params;
-        if let Some(bytes) = pending.bytes {
-            params["data"] = json!(surfacecraft_doc::base64::encode(&bytes));
+        let picked = pending.bytes.map(|(name, bytes)| self.session.picked.put(&name, bytes));
+        if let Some(path) = &picked {
+            params["path"] = json!(path);
         }
         if let Some(target) = reduce_to {
             params["reduce_to"] = json!(target);
         }
-        self.import_mesh_file(params);
+        let started = self.import_mesh_file(params);
+        // a refused import (another command runs) never reads its file: it is not kept
+        if let Some(path) = picked.filter(|_| !started) {
+            self.session.picked.discard(&path);
+        }
     }
 
     /// The offer waiting for an answer, when a large file was picked.

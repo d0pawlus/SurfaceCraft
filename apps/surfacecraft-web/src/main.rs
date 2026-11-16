@@ -29,6 +29,17 @@ fn main() {
     println!("surfacecraft-web is the browser build: cargo xtask web");
 }
 
+/// The page's options: a device with the adapter's largest buffer, so that a scan of tens of
+/// millions of triangles is drawn (wgpu's default stops at 256 MiB).
+#[cfg(target_arch = "wasm32")]
+fn web_options() -> eframe::WebOptions {
+    let defaults = eframe::WebOptions::default();
+    eframe::WebOptions {
+        wgpu_options: surfacecraft_ui_egui::viewport::with_largest_buffers(defaults.wgpu_options.clone()),
+        ..defaults
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 fn main() {
     use wasm_bindgen::JsCast;
@@ -42,11 +53,7 @@ fn main() {
             return;
         };
         let _ = eframe::WebRunner::new()
-            .start(
-                canvas,
-                eframe::WebOptions::default(),
-                Box::new(|cc| Ok(Box::new(surfacecraft_ui_egui::SurfaceCraftApp::new(cc)))),
-            )
+            .start(canvas, web_options(), Box::new(|cc| Ok(Box::new(surfacecraft_ui_egui::SurfaceCraftApp::new(cc)))))
             .await;
     });
     // the app does not wait for the pool: until it runs, heavy commands run in place

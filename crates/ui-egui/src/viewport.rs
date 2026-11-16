@@ -8,6 +8,7 @@ use surfacecraft_geom::Point3;
 use wgpu::util::DeviceExt;
 
 mod callback;
+mod limits;
 #[cfg(not(target_arch = "wasm32"))]
 mod offscreen;
 mod render;
@@ -17,6 +18,7 @@ mod tests;
 mod upload;
 
 pub use callback::{ViewportCallback, install};
+pub use limits::{fits, largest_buffer, with_largest_buffers};
 #[cfg(not(target_arch = "wasm32"))]
 pub use offscreen::{Bench, bench_offscreen, render_offscreen};
 pub use scene::{DrawItem, Frame, Overlay};

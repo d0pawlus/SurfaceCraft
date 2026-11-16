@@ -83,6 +83,10 @@ pub struct SurfaceCraftApp {
     pub tool_footer_rect: Option<egui::Rect>,
     /// Whether a wgpu render state exists (false in headless tests).
     gpu: bool,
+    /// The device's largest buffer, bytes (with a wgpu render state): a larger mesh is not drawn.
+    gpu_max_buffer: Option<u64>,
+    /// Meshes too large for the device last frame (the status line says so when it changes).
+    gpu_oversized: usize,
     pub(crate) fit_pending: bool,
     pub(crate) bvh_cache: HashMap<usize, Bvh>,
     pub(crate) highlights: HashMap<ObjectId, Arc<Vec<u32>>>,
@@ -166,6 +170,8 @@ impl SurfaceCraftApp {
             tool_panel_rect: None,
             tool_footer_rect: None,
             gpu: false,
+            gpu_max_buffer: None,
+            gpu_oversized: 0,
             fit_pending: false,
             bvh_cache: HashMap::new(),
             highlights: HashMap::new(),
@@ -293,6 +299,7 @@ impl SurfaceCraftApp {
         if let Some(rs) = cc.wgpu_render_state.as_ref() {
             viewport::install(rs);
             app.gpu = true;
+            app.gpu_max_buffer = Some(rs.device.limits().max_buffer_size);
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -622,8 +629,21 @@ impl SurfaceCraftApp {
             })
             .collect();
         items.extend(self.cmd_panel.draw_items(&tokens));
+        self.note_oversized(&items);
         let background = tokens.viewport_background().map(f64::from);
         Frame { size, camera: self.camera.clone(), origin: self.camera.target, items, background, overlay }
+    }
+
+    /// Says in the status line when a mesh is too large for the device to draw (the viewport
+    /// leaves it out rather than fail); once per change of their number.
+    fn note_oversized(&mut self, items: &[DrawItem]) {
+        let Some(max) = self.gpu_max_buffer else { return };
+        let over = items.iter().filter(|i| !viewport::fits(&i.mesh, max)).count();
+        if over > 0 && over != self.gpu_oversized {
+            let limit = format!("{}", max / BYTES_PER_MB);
+            self.status = tf("status.too_large_to_draw", &[("limit", &limit)]);
+        }
+        self.gpu_oversized = over;
     }
 
     /// Lays the viewport out as with a GPU (no "no GPU" notice; the tool overlays are painted
@@ -654,6 +674,9 @@ impl SurfaceCraftApp {
 }
 
 /// The order of the kinds in the object tree.
+/// Bytes in a megabyte, for the buffer limit the status line states.
+const BYTES_PER_MB: u64 = 1_000_000;
+
 const KIND_ORDER: [ObjectKind; 8] = [
     ObjectKind::Mesh,
     ObjectKind::Region,

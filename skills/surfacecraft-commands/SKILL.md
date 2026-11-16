@@ -12,6 +12,10 @@ description: Adding or changing a SurfaceCraft command, crate boundaries, the CL
 - A handler never opens a dialog, never blocks on user input, and touches files only through
   `cmd::read_file` / `cmd::write_file` (refused when `Session::allow_files` is false, e.g. web, MCP
   sandbox). Anything that takes a path also accepts inline base64 data or returns it.
+  A `picked:` path is a file the user picked in the interface, held by the session
+  (`Session::picked`, `crates/engine/src/picked.rs`) until `read_file` takes it, also where
+  `allow_files` is false: front ends without a file system pass picked files this way, never as
+  base64 data (that held the file three to four times and kept a copy in the log).
 - Undoable commands are snapshotted by the engine and rolled back on error; do not snapshot yourself.
 - Objects are referenced by `ObjRef` (numeric id or name).
 - Front ends: the desktop/web UI calls `Session::execute` (toolbar, palette, menus); the CLI runs
