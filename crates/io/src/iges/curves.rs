@@ -76,6 +76,74 @@ fn curve_name(c: &Curve) -> &'static str {
     }
 }
 
+/// An ellipse (104) with radii `[ra, rb]` in the plane of its frame, from `la` to `lb` (local
+/// coordinates); the DE pointer.
+fn ellipse_entity(w: &mut W, ei: u32, [ra, rb]: [f64; 2], la: [f64; 2], lb: [f64; 2]) -> Result<i64, IoError> {
+    if !(ra > 0.0 && rb > 0.0) {
+        return Err(bad(format!("edge {ei}: ellipse radii must be positive")));
+    }
+    // A x² + C y² + F = 0 with F = -1: A = 1/ra², C = 1/rb².
+    let p = vec![
+        num(1.0 / (ra * ra))?,
+        real(0.0),
+        num(1.0 / (rb * rb))?,
+        real(0.0),
+        real(0.0),
+        real(-1.0),
+        real(0.0),
+        num(la[0])?,
+        num(la[1])?,
+        num(lb[0])?,
+        num(lb[1])?,
+    ];
+    Ok(w.add(104, 1, p))
+}
+
+/// A circular arc (100) in the plane of its frame, from `la` to `lb` (local coordinates); the DE
+/// pointer.
+fn circle_entity(w: &mut W, la: [f64; 2], lb: [f64; 2]) -> Result<i64, IoError> {
+    let p = vec![real(0.0), real(0.0), real(0.0), num(la[0])?, num(la[1])?, num(lb[0])?, num(lb[1])?];
+    Ok(w.add(100, 0, p))
+}
+
+/// A circle or (with `radii`) an ellipse on the frame `[origin, x, y]`, running from `a` to `b`
+/// (one point when `closed`), under a transformation (124) of that frame; the DE pointer.
+fn conic_curve(
+    w: &mut W,
+    ei: u32,
+    [o, x, y]: [V3; 3],
+    radii: Option<[f64; 2]>,
+    a: V3,
+    b: V3,
+    closed: bool,
+) -> Result<i64, IoError> {
+    let local = |q: V3| {
+        let v = sub(q, o);
+        [dot(v, x), dot(v, y)]
+    };
+    let (la, lb) = (local(a), if closed { local(a) } else { local(b) });
+    let tr = w.frame(o, x, y)?;
+    let de = match radii {
+        Some(r) => ellipse_entity(w, ei, r, la, lb)?,
+        None => circle_entity(w, la, lb)?,
+    };
+    if let Some(ent) = w.get_mut(de) {
+        ent.xform = tr;
+    }
+    Ok(de)
+}
+
+/// A polyline as a degree-1 B-spline (126) over `interval`; the DE pointer.
+fn polyline_curve(w: &mut W, points: &[V3], interval: [f64; 2]) -> Result<i64, IoError> {
+    // Segment i on [i, i + 1]: a degree-1 B-spline on knots 0, 0, 1, …, n − 1, n − 1.
+    let n = points.len();
+    let knots: Vec<f64> = std::iter::once(0.0)
+        .chain((0..n).map(|i| i as f64))
+        .chain(std::iter::once(n.saturating_sub(1) as f64))
+        .collect();
+    bspline_curve(w, &knots, None, points, interval)
+}
+
 /// The edge `ei` as an IGES curve running from `a` to `b` (its vertices at interval min and
 /// max); `closed` when they are one vertex. The DE pointer.
 pub(super) fn curve(w: &mut W, ei: u32, edge: &Edge, a: V3, b: V3, closed: bool) -> Result<i64, IoError> {
@@ -85,54 +153,13 @@ pub(super) fn curve(w: &mut W, ei: u32, edge: &Edge, a: V3, b: V3, closed: bool)
             let (ca, cb) = (w.coords(a)?, w.coords(b)?);
             Ok(w.add(110, 0, ca.into_iter().chain(cb).collect()))
         }
-        Curve::Circle { frame, .. } | Curve::Ellipse { frame, .. } => {
-            let (o, x, y) = (frame.origin, frame.x_axis, frame.y_axis);
-            let local = |q: V3| {
-                let v = sub(q, o);
-                [dot(v, x), dot(v, y)]
-            };
-            let (la, lb) = (local(a), if closed { local(a) } else { local(b) });
-            let tr = w.frame(o, x, y)?;
-            let de = match c {
-                Curve::Ellipse { radii: [ra, rb], .. } => {
-                    if !(*ra > 0.0 && *rb > 0.0) {
-                        return Err(bad(format!("edge {ei}: ellipse radii must be positive")));
-                    }
-                    // A x² + C y² + F = 0 with F = -1: A = 1/ra², C = 1/rb².
-                    let p = vec![
-                        num(1.0 / (ra * ra))?,
-                        real(0.0),
-                        num(1.0 / (rb * rb))?,
-                        real(0.0),
-                        real(0.0),
-                        real(-1.0),
-                        real(0.0),
-                        num(la[0])?,
-                        num(la[1])?,
-                        num(lb[0])?,
-                        num(lb[1])?,
-                    ];
-                    w.add(104, 1, p)
-                }
-                _ => {
-                    let p = vec![real(0.0), real(0.0), real(0.0), num(la[0])?, num(la[1])?, num(lb[0])?, num(lb[1])?];
-                    w.add(100, 0, p)
-                }
-            };
-            if let Some(ent) = w.get_mut(de) {
-                ent.xform = tr;
-            }
-            Ok(de)
+        Curve::Circle { frame, .. } => {
+            conic_curve(w, ei, [frame.origin, frame.x_axis, frame.y_axis], None, a, b, closed)
         }
-        // Segment i on [i, i + 1]: a degree-1 B-spline on knots 0, 0, 1, …, n − 1, n − 1.
-        Curve::Polyline { points } => {
-            let n = points.len();
-            let knots: Vec<f64> = std::iter::once(0.0)
-                .chain((0..n).map(|i| i as f64))
-                .chain(std::iter::once(n.saturating_sub(1) as f64))
-                .collect();
-            bspline_curve(w, &knots, None, points, edge.interval)
+        Curve::Ellipse { frame, radii } => {
+            conic_curve(w, ei, [frame.origin, frame.x_axis, frame.y_axis], Some(*radii), a, b, closed)
         }
+        Curve::Polyline { points } => polyline_curve(w, points, edge.interval),
         Curve::Spline { knots, points } => bspline_curve(w, knots, None, points, edge.interval),
         Curve::RationalSpline { knots, homogeneous } => {
             let (pts, ws) = split_rational(homogeneous)?;

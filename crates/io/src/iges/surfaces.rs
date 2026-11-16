@@ -20,6 +20,44 @@ fn surface_name(s: &Surface) -> &'static str {
     }
 }
 
+/// The weight of control point `(i, j)`, when there are weights and the point has one.
+fn weight_at(weights: Option<&[Vec<f64>]>, i: usize, j: usize) -> Option<f64> {
+    weights.and_then(|w| w.get(i)?.get(j).copied())
+}
+
+/// Appends the weights (u fastest, 1 when absent) and then the control points of a net with `nv`
+/// columns to the parameters of a 128.
+fn push_net(
+    w: &mut W,
+    par: &mut Vec<String>,
+    points: &[Vec<V3>],
+    weights: Option<&[Vec<f64>]>,
+    nv: usize,
+) -> Result<(), IoError> {
+    let nu = points.len();
+    // The first index (u) runs fastest.
+    for j in 0..nv {
+        for i in 0..nu {
+            par.push(num(weight_at(weights, i, j).unwrap_or(1.0))?);
+        }
+    }
+    for j in 0..nv {
+        for row in points {
+            let c = row.get(j).copied().ok_or_else(|| bad("control net is not rectangular"))?;
+            par.extend(w.coords(c)?);
+        }
+    }
+    Ok(())
+}
+
+/// The domain `[k[d], k[n]]` of a spline of degree `d` on `n` control points.
+fn spline_range(k: &[f64], d: usize, n: usize) -> Result<(f64, f64), IoError> {
+    match (k.get(d), k.get(n)) {
+        (Some(a), Some(b)) if a < b => Ok((*a, *b)),
+        _ => Err(bad("empty spline domain")),
+    }
+}
+
 /// A rational or polynomial B-spline surface (128): `points[i][j]`, i along u.
 fn bspline_surface(
     w: &mut W,
@@ -34,11 +72,10 @@ fn bspline_surface(
         return Err(bad("control net is not rectangular"));
     }
     let (p, q) = (degree(u, nu)?, degree(v, nv)?);
-    let wt = |i: usize, j: usize| weights.and_then(|w| w.get(i)?.get(j).copied());
-    if weights.is_some() && (0..nu).any(|i| (0..nv).any(|j| wt(i, j).is_none())) {
+    if weights.is_some() && (0..nu).any(|i| (0..nv).any(|j| weight_at(weights, i, j).is_none())) {
         return Err(bad("weights and control points differ in number"));
     }
-    let rational = (0..nu).any(|i| (0..nv).any(|j| wt(i, j).is_some_and(|x| (x - 1.0).abs() > 1e-12)));
+    let rational = (0..nu).any(|i| (0..nv).any(|j| weight_at(weights, i, j).is_some_and(|x| (x - 1.0).abs() > 1e-12)));
     let mut par = vec![
         (nu - 1).to_string(),
         (nv - 1).to_string(),
@@ -53,25 +90,8 @@ fn bspline_surface(
     for k in u.iter().chain(v) {
         par.push(num(*k)?);
     }
-    // The first index (u) runs fastest.
-    for j in 0..nv {
-        for i in 0..nu {
-            par.push(num(wt(i, j).unwrap_or(1.0))?);
-        }
-    }
-    for j in 0..nv {
-        for row in points {
-            let c = row.get(j).copied().ok_or_else(|| bad("control net is not rectangular"))?;
-            par.extend(w.coords(c)?);
-        }
-    }
-    let range = |k: &[f64], d: usize, n: usize| -> Result<(f64, f64), IoError> {
-        match (k.get(d), k.get(n)) {
-            (Some(a), Some(b)) if a < b => Ok((*a, *b)),
-            _ => Err(bad("empty spline domain")),
-        }
-    };
-    let ((u0, u1), (v0, v1)) = (range(u, p, nu)?, range(v, q, nv)?);
+    push_net(w, &mut par, points, weights, nv)?;
+    let ((u0, u1), (v0, v1)) = (spline_range(u, p, nu)?, spline_range(v, q, nv)?);
     par.extend([num(u0)?, num(u1)?, num(v0)?, num(v1)?]);
     Ok(w.add(128, 0, par))
 }

@@ -165,7 +165,10 @@ pub struct Plan {
     pub contacts: Vec<Contact>,
 }
 
+mod blend;
 mod boss;
+mod emit;
+mod holes;
 mod nodes;
 mod planner;
 mod report;

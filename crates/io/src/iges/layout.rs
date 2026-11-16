@@ -60,18 +60,15 @@ pub(super) fn layout_of(bi: usize, b: &Brep) -> Result<Layout, IoError> {
     Ok(out)
 }
 
-/// The file: start, global, directory and parameter sections and terminator, 80 columns.
-pub(super) fn layout(w: &W, name: &str) -> Result<String, IoError> {
-    if 2 * w.ents.len() > MAX_SEQUENCE {
-        return Err(bad("too many entities for the directory section"));
-    }
-    let mut out = String::new();
-    let line = |out: &mut String, data: &str, sect: char, seq: usize| {
-        let _ = writeln!(out, "{data:<72}{sect}{seq:>7}");
-    };
-    line(&mut out, "SurfaceCraft IGES export", 'S', 1);
+/// One 80-column line: `data` padded to 72 columns, the section letter and the sequence number.
+fn line(out: &mut String, data: &str, sect: char, seq: usize) {
+    let _ = writeln!(out, "{data:<72}{sect}{seq:>7}");
+}
+
+/// The fields of the global section.
+fn global_fields(w: &W, name: &str) -> Vec<String> {
     let stamp = holl("20260101.000000");
-    let g = [
+    vec![
         "1H,".to_string(),
         "1H;".to_string(),
         holl(name),
@@ -97,13 +94,22 @@ pub(super) fn layout(w: &W, name: &str) -> Result<String, IoError> {
         "11".into(),
         "0".into(),
         stamp,
-    ];
+    ]
+}
+
+/// Writes the global section; the number of its lines.
+fn write_global(out: &mut String, w: &W, name: &str) -> usize {
+    let g = global_fields(w, name);
     let mut gseq = 0;
     for chunk in wrap(&g.iter().map(String::as_str).collect::<Vec<_>>(), ',', ';', 72) {
         gseq += 1;
-        line(&mut out, &chunk, 'G', gseq);
+        line(out, &chunk, 'G', gseq);
     }
-    // Parameter lines per entity.
+    gseq
+}
+
+/// The parameter lines of each entity (its type, then its parameters; 64 columns).
+fn parameter_lines(w: &W) -> Result<Vec<Vec<String>>, IoError> {
     let mut pdata: Vec<Vec<String>> = Vec::with_capacity(w.ents.len());
     for e in &w.ents {
         let mut fields = vec![e.typ.to_string()];
@@ -114,44 +120,69 @@ pub(super) fn layout(w: &W, name: &str) -> Result<String, IoError> {
     if total > MAX_SEQUENCE {
         return Err(bad("too many parameter lines"));
     }
-    let f8 = |x: i64| format!("{x:>8}");
+    Ok(pdata)
+}
+
+/// A number right-aligned in a field of 8 columns.
+fn f8(x: i64) -> String {
+    format!("{x:>8}")
+}
+
+/// The first directory line of entity `e`, whose parameters start at parameter line `next`.
+fn directory_first(e: &Ent, next: usize) -> String {
+    let status = if e.dependent { "00010000" } else { "00000000" };
+    format!("{}{}{}{}{}{}{}{}{status}", f8(e.typ), f8(next as i64), f8(0), f8(0), f8(0), f8(0), f8(e.xform), f8(0))
+}
+
+/// The second directory line of entity `e`, whose parameters take `lines` parameter lines.
+fn directory_second(e: &Ent, lines: usize) -> String {
+    format!(
+        "{}{}{}{}{}{}{}{:>8}{}",
+        f8(e.typ),
+        f8(0),
+        f8(0),
+        f8(lines as i64),
+        f8(e.form),
+        f8(0),
+        f8(0),
+        e.label,
+        f8(0)
+    )
+}
+
+/// Writes the directory section: two lines per entity.
+fn write_directory(out: &mut String, w: &W, pdata: &[Vec<String>]) {
     let mut next = 1usize;
-    for (k, (e, p)) in w.ents.iter().zip(&pdata).enumerate() {
-        let status = if e.dependent { "00010000" } else { "00000000" };
-        let a = format!(
-            "{}{}{}{}{}{}{}{}{status}",
-            f8(e.typ),
-            f8(next as i64),
-            f8(0),
-            f8(0),
-            f8(0),
-            f8(0),
-            f8(e.xform),
-            f8(0)
-        );
-        let b = format!(
-            "{}{}{}{}{}{}{}{:>8}{}",
-            f8(e.typ),
-            f8(0),
-            f8(0),
-            f8(p.len() as i64),
-            f8(e.form),
-            f8(0),
-            f8(0),
-            e.label,
-            f8(0)
-        );
-        line(&mut out, &a, 'D', 2 * k + 1);
-        line(&mut out, &b, 'D', 2 * k + 2);
+    for (k, (e, p)) in w.ents.iter().zip(pdata).enumerate() {
+        line(out, &directory_first(e, next), 'D', 2 * k + 1);
+        line(out, &directory_second(e, p.len()), 'D', 2 * k + 2);
         next += p.len();
     }
+}
+
+/// Writes the parameter section; the number of its lines.
+fn write_parameters(out: &mut String, pdata: &[Vec<String>]) -> usize {
     let mut pseq = 0;
     for (k, p) in pdata.iter().enumerate() {
         for l in p {
             pseq += 1;
-            line(&mut out, &format!("{l:<64}{:>8}", 2 * k + 1), 'P', pseq);
+            line(out, &format!("{l:<64}{:>8}", 2 * k + 1), 'P', pseq);
         }
     }
+    pseq
+}
+
+/// The file: start, global, directory and parameter sections and terminator, 80 columns.
+pub(super) fn layout(w: &W, name: &str) -> Result<String, IoError> {
+    if 2 * w.ents.len() > MAX_SEQUENCE {
+        return Err(bad("too many entities for the directory section"));
+    }
+    let mut out = String::new();
+    line(&mut out, "SurfaceCraft IGES export", 'S', 1);
+    let gseq = write_global(&mut out, w, name);
+    let pdata = parameter_lines(w)?;
+    write_directory(&mut out, w, &pdata);
+    let pseq = write_parameters(&mut out, &pdata);
     line(&mut out, &format!("S{:>7}G{:>7}D{:>7}P{:>7}", 1, gseq, 2 * w.ents.len(), pseq), 'T', 1);
     Ok(out)
 }
