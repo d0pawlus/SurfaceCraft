@@ -1,0 +1,58 @@
+name: codeql
+
+# CodeQL code scanning (advanced setup), replacing GitHub's default setup, which scanned every push
+# of every pull request with no way to cancel an older scan and filled the Actions queue
+# (2026-11-15: 13 CodeQL runs of 3 jobs queued at once). Here:
+# - a pull request is scanned once it is ready (marking it ready scans it; a draft is not), and
+#   every push to a ready pull request cancels its older scan; closing it cancels what is left;
+# - main is scanned on every push, a newer push cancelling the older scan, and once a week;
+# - languages: rust, the workflows themselves (actions) and the JavaScript of the web app.
+#
+# Upload switch: GitHub refuses results of this workflow while default setup is on, so the results
+# are uploaded only when the repository variable CODEQL_UPLOAD is `always` (set when default setup
+# is switched off); until then the analysis runs and its results stay in the run.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, closed]
+  schedule:
+    # Mondays 03:17 UTC
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: codeql-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    # not for a draft, and a `closed` run only cancels the scan still queued or running
+    if: >-
+      github.event_name != 'pull_request'
+      || (github.event.action != 'closed' && github.event.pull_request.draft == false)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [rust, actions, javascript-typescript]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:${{ matrix.language }}
+          upload: ${{ vars.CODEQL_UPLOAD == 'always' && 'always' || 'never' }}
