@@ -272,27 +272,36 @@ fn textured_request(tolerance: f64) -> Request {
 
 #[test]
 fn soft_fit_of_a_dense_scan_keeps_the_curvature_of_the_shape() {
-    // a net sized from the number of points (22 by 22 here) follows the texture: its curvature is
-    // off by 0.032 1/mm, more than the cylinder's own 0.025, and useless as a G2 reference. Within
-    // the tolerance the coarse start is kept: measured 0.0009 1/mm (macOS aarch64)
+    // the net comes from the number of points (22 by 22): without the curvature-variation energy
+    // it follows the texture and its curvature is off by 0.032 1/mm, more than the cylinder's own
+    // 0.025, and useless as a G2 reference
     let patch = fit_patch(&textured_request(0.2)).unwrap();
     let rep = &patch.report;
-    assert_eq!(rep.control, [6, 6], "{rep:?}");
+    eprintln!(
+        "MEASURED textured, tolerance 0.2: net {:?} rounds {} rms {:.4} max {:.4} curvature error {:.5}",
+        rep.control,
+        rep.rounds,
+        rep.rms,
+        rep.max,
+        bend_curvature_error(&patch)
+    );
+    // measured with the energy: 0.0013 1/mm at 22 by 22, rms 0.0168 (macOS aarch64)
+    assert_eq!(rep.rounds, 1, "{rep:?}");
     assert!(rep.within_tolerance, "{rep:?}");
     assert!(bend_curvature_error(&patch) <= 0.005, "{:.5} {rep:?}", bend_curvature_error(&patch));
 }
 
 #[test]
-fn soft_fit_grows_the_net_when_the_tolerance_asks_for_the_texture() {
-    // the texture is 0.03 mm high: a tolerance below it cannot be met by the start net
-    let coarse = fit_patch(&textured_request(0.2)).unwrap().report;
-    let fine = fit_patch(&textured_request(0.02)).unwrap().report;
+fn soft_fit_follows_the_texture_when_the_tolerance_asks_for_it() {
+    // the texture is 0.03 mm high: a tolerance below it is met only once the energy is relaxed
+    let smooth = fit_patch(&textured_request(0.2)).unwrap().report;
+    let close = fit_patch(&textured_request(0.02)).unwrap().report;
     eprintln!(
-        "MEASURED textured: start max {:.4}; grown net {:?} rounds {} max {:.4}",
-        coarse.max, fine.control, fine.rounds, fine.max
+        "MEASURED textured, tolerance 0.02: net {:?} rounds {} rms {:.4} max {:.4} (smooth max {:.4})",
+        close.control, close.rounds, close.rms, close.max, smooth.max
     );
-    assert!(fine.control[0] > 6 && fine.control[1] > 6, "{fine:?}");
-    assert!(fine.rounds > 1, "{fine:?}");
-    // measured: max 0.067 at 6 by 6, 0.039 at the grown net; bound at 1.5 times less than the start
-    assert!(fine.max <= coarse.max / 1.5, "{} against {}: {fine:?}", fine.max, coarse.max);
+    // measured: every weight is tried (4 rounds) and the net grows once; rms 0.0096 against 0.0168
+    // (the data's own noise is 0.01): the order is asserted, not the ratio
+    assert!(close.rounds >= 4, "{close:?}");
+    assert!(close.rms < smooth.rms, "{} against {}: {close:?}", close.rms, smooth.rms);
 }
