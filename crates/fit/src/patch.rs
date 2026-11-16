@@ -208,6 +208,15 @@ pub(crate) fn chord_curve(a: Vec3, b: Vec3, project: &dyn Fn(Vec3) -> Vec3) -> [
     [a, (a * -5.0 + q1 * 18.0 - q2 * 9.0 + b * 2.0) / 6.0, (a * 2.0 - q1 * 9.0 + q2 * 18.0 - b * 5.0) / 6.0, b]
 }
 
+/// DIAGNOSTIC (bisect branch only): [`chord_curve`], or the straight chord when its control polygon
+/// turns back along the chord.
+pub(crate) fn unfolded_chord_curve(a: Vec3, b: Vec3, project: &dyn Fn(Vec3) -> Vec3) -> [Vec3; 4] {
+    let c = chord_curve(a, b, project);
+    let d = b - a;
+    let folds = c.windows(2).any(|w| w.get(1).zip(w.first()).is_some_and(|(q, p)| (q - p).dot(&d) < 0.0));
+    if folds { [a, a + d / 3.0, a + d * (2.0 / 3.0), b] } else { c }
+}
+
 /// The wrap curve from `a` to `b`: [`chord_curve`] refitted to the scan by least squares
 /// ([`crate::patch_refit`]). `project` gives `None` where no scan point is within reach: such a
 /// point stays where it is in the plain construction and is left out of the refit.

@@ -210,6 +210,19 @@ fn diag_wall(lookup: &Lookup, body: &Brep, owners: &[Option<(usize, f64)>]) {
             .and_then(|m| lookup.all.closest(&Point3::new(m[0], m[1], m[2]), 4.0 * tol))
             .and_then(|h| lookup.owner.get(h.triangle).copied());
         let admitted = owners.get(f).copied().flatten().is_some_and(|o| o.0 == k);
+        let asked: Vec<usize> = std::env::var("TMP_FACES")
+            .ok()
+            .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+            .unwrap_or_default();
+        if asked.contains(&f) {
+            if let Some(d) = diag.get(f) {
+                eprintln!(
+                    "DIAG asked face {f}: tri {} rim_edge {} rim_vertex {} side_refit {:?} side_gap {:?} inside_refit {} max_dist_dense {worst:.3}",
+                    d.tri, d.rim_edge, d.rim_vertex, d.side_refit, d.side_gap, d.inside_refit
+                );
+                eprintln!("DIAG asked net of face {f}: {:?}", d.net);
+            }
+        }
         if !(admitted || mid_owner == Some(k as u32) || near_target < 2.0) {
             continue;
         }

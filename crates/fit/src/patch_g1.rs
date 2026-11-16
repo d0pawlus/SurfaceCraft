@@ -24,7 +24,7 @@
 use crate::mls::ScanSurface;
 use crate::patch::{
     PatchSet, WRAP_FACING_COS, bern, bezier_tangent, chord_curve, cross_weights, eval, interpolated_net, normal,
-    tensor_weights, weighted_sum, wrap_curve, wrap_net,
+    tensor_weights, unfolded_chord_curve, weighted_sum, wrap_curve, wrap_net,
 };
 pub use crate::patch_jumps::{JumpStats, jump_stats};
 use crate::wrap_normals::{EdgeKey, Layout, LayoutNormals, edge_faces, edge_slot, key, layout_normals};
@@ -462,7 +462,16 @@ fn edge_curves(l: &Layer, edges: &BTreeMap<EdgeKey, Vec<usize>>, build: &mut Bui
         };
         let Some(t) = tangents else {
             let refit = l.refits_edge(a, b);
-            let curve = |p: Vec3| if refit { wrap_curve(p, pm, &try_edge) } else { chord_curve(p, pm, &on_edge) };
+            let rim = l.free.contains(&(a, b)) && std::env::var("TMP_UNFOLD").is_ok_and(|v| v == "1");
+            let curve = |p: Vec3| {
+                if refit {
+                    wrap_curve(p, pm, &try_edge)
+                } else if rim {
+                    unfolded_chord_curve(p, pm, &on_edge)
+                } else {
+                    chord_curve(p, pm, &on_edge)
+                }
+            };
             build.curves.insert((a, m), curve(pa));
             build.curves.insert((b, m), curve(pb));
             continue;

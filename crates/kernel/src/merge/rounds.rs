@@ -115,6 +115,11 @@ fn snap_for(ctx: &Ctx, taken_back: &Reasons, snapping: bool) -> Snap {
 
 /// `why` with the group's own note of why it was not snapped.
 fn noted(snap: &Snap, k: usize, why: &str) -> String {
+    eprintln!(
+        "DIAG noted group {k}: moved {:?}; {why}; not snapped because {:?}",
+        snap.moved.get(k),
+        snap.why_not.get(k).and_then(Option::as_ref)
+    );
     match snap.why_not.get(k).and_then(Option::as_ref) {
         Some(n) => format!("{why} (not snapped: {n})"),
         None => why.to_string(),

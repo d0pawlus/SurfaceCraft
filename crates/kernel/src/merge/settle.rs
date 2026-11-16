@@ -176,6 +176,27 @@ fn face_verdict(
             return Ok(Err(format!("the mesher cannot triangulate the new face at the {at}")));
         };
         let ratio = topo.mesh.area() / p.area.max(1e-12);
+        // DIAGNOSTIC (bisect branch only)
+        let offset = p
+            .cloud
+            .border_points()
+            .iter()
+            .flatten()
+            .filter_map(|q| {
+                p.gauge
+                    .closest(*q)
+                    .map(|s| ((s[0] - q[0]).powi(2) + (s[1] - q[1]).powi(2) + (s[2] - q[2]).powi(2)).sqrt())
+            })
+            .fold(0.0, f64::max);
+        eprintln!(
+            "DIAG tess face {face} at {at}: triangles {} area {:.3} patch area {:.3} ratio {ratio:.3}; group patches {}; boundary offset from the surface max {offset:.4}; gap {:.4} limit {:.4}",
+            topo.mesh.triangle_count(),
+            topo.mesh.area(),
+            p.area,
+            p.faces.len(),
+            p.gap,
+            p.limit
+        );
         if ratio < 1.0 - MAX_AREA_LOSS || ratio > 1.0 + MAX_AREA_EXCESS {
             return Ok(Err(format!("the new face tessellates to {ratio:.3} of its patches' area at the {at}")));
         }

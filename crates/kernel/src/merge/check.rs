@@ -119,6 +119,11 @@ impl Cloud {
     /// The `n` patches nearest `p` by the box of their samples (a corner over a patch has distance 0 to
     /// its box; of the patches that hold it, the smaller come first). The distance to the centre of a box
     /// would put the small patches round a corner before the large one it lies over.
+    /// DIAGNOSTIC (bisect branch only): the points along the group's boundary edges.
+    pub(super) fn border_points(&self) -> &[Vec<V>] {
+        &self.border
+    }
+
     fn nearest_faces(&self, p: V, n: usize) -> Vec<usize> {
         let mut boxes: BTreeMap<usize, (V, V)> = BTreeMap::new();
         for (q, f) in self.points.iter().zip(&self.faces) {

@@ -563,6 +563,41 @@ fn width(points: &[V]) -> f64 {
 
 /// A patch that moved: no point of it farther than `max_move` from where it was, still facing the way it did,
 /// and its borders along its changed edges.
+/// DIAGNOSTIC (bisect branch only): why a neighbouring patch refuses a snap, and whether it was folded before.
+fn diag_refused_neighbour(before: &Brep, after: &Brep, changed: &Changed, max_move: f64) {
+    use super::samples::face_samples;
+    let face = changed.face;
+    let (Some(a), Some(b)) = (face_samples(before, face, MOVED_GRID), face_samples(after, face, MOVED_GRID)) else {
+        eprintln!("DIAG snap refused by patch {face}: no samples");
+        return;
+    };
+    let far = a.iter().zip(&b).map(|(p, q)| norm(sub(*p, *q))).fold(0.0_f64, f64::max);
+    let (n0, n1) = (normals_at_grid(before, face, MOVED_GRID), normals_at_grid(after, face, MOVED_GRID));
+    let pairs: Vec<(V, V)> = match (&n0, &n1) {
+        (Some(n0), Some(n1)) => n0.iter().zip(n1).filter_map(|(a, b)| Some(((*a)?, (*b)?))).collect(),
+        _ => Vec::new(),
+    };
+    let turned = pairs.iter().filter(|(a, b)| dot(*a, *b) < MIN_TURN_DOT).count();
+    let worst = pairs.iter().map(|(a, b)| dot(*a, *b)).fold(1.0_f64, f64::min);
+    // folded before: the normals of the patch before the snap disagree among themselves
+    let before_spread = n0.as_ref().map_or(f64::NAN, |n| {
+        let v: Vec<V> = n.iter().flatten().copied().collect();
+        let mut w: f64 = 1.0;
+        for x in &v {
+            for y in &v {
+                w = w.min(dot(*x, *y));
+            }
+        }
+        w
+    });
+    eprintln!(
+        "DIAG snap refused by patch {face}: moved max {far:.4} (limit {max_move:.4}) normals judged {} turned {turned} worst dot {worst:.3}; before the snap its own normals agree to dot {before_spread:.3}; borders follow {}; asked by groups {:?}",
+        pairs.len(),
+        borders_follow_edges(after, face, &changed.edges),
+        changed.asked
+    );
+}
+
 fn moved_patch_ok(before: &Brep, after: &Brep, changed: &Changed, max_move: f64) -> bool {
     use super::samples::face_samples;
     let face = changed.face;
@@ -611,6 +646,7 @@ fn check_moved(
     }
     for c in changed {
         if !own.contains(&c.face) && !moved_patch_ok(before, after, c, max_move) {
+            diag_refused_neighbour(before, after, c, max_move);
             blame(
                 &mut refused,
                 c.asked.iter().copied(),
