@@ -26,7 +26,7 @@ pub(super) struct Outcome {
 
 impl Outcome {
     pub(super) fn closed(&self) -> bool {
-        self.body.as_ref().is_some_and(|b| b.volume.is_some_and(|v| v.is_finite() && v > 0.0))
+        self.body.as_ref().is_some_and(BodyOut::is_solid)
     }
 
     pub(super) fn skipped(&self) -> usize {

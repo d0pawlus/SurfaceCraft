@@ -124,10 +124,12 @@ fn rebuild_can_help(base: &ToSolidOut, soft: bool) -> bool {
     !closed_and_short || soft
 }
 
-/// What the rule of the retry sees of a result: whether the solid is closed and the share within the tolerance.
+/// What the rule of the retry sees of a result: whether the solid is closed (a body that encloses
+/// material, `body::encloses_material`) and the share within the tolerance.
 fn attempt(o: &ToSolidOut) -> Attempt {
     Attempt {
-        closed: o.body.is_some() && !o.issues.iter().any(|i| i.code == "open_surface"),
+        closed: o.body.as_ref().is_some_and(crate::cmd::body::BodyOut::is_solid)
+            && !o.issues.iter().any(|i| i.code == "open_surface"),
         within: o.deviation.as_ref().map_or(0.0, |d| d.within),
     }
 }

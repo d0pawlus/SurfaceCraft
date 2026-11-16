@@ -13,15 +13,19 @@ const CG_MAX_ITERATIONS: usize = 4000;
 /// Squared residual, relative to the first one, at which a solve stops.
 const CG_TOLERANCE: f64 = 1e-20;
 
-/// Fairs the vertices from `first_vertex` on (the patch's own), the rest of the mesh fixed.
-pub(super) fn fair_patch(mesh: &mut Mesh, first_tri: usize, first_vertex: usize) {
+/// Fairs the vertices from `first_vertex` on (the patch's own), the rest of the mesh fixed, and
+/// returns their positions after the membrane sweeps, before the thin plate: the membrane patch
+/// (every vertex the mean of its neighbours) stays within the convex hull of its loop, which the
+/// thin plate, following the curvature around the loop, may leave (`holes::crossing`).
+pub(super) fn fair_patch(mesh: &mut Mesh, first_tri: usize, first_vertex: usize) -> Vec<Point3> {
     let nv = mesh.positions.len();
     if first_vertex >= nv {
-        return;
+        return Vec::new();
     }
     let (ring, touched) = rings(mesh, first_tri);
     let free: Vec<u32> = (first_vertex as u32..nv as u32).collect();
     membrane(&mut mesh.positions, &ring, &free);
+    let membrane_patch = mesh.positions.get(first_vertex..).unwrap_or_default().to_vec();
     let mut rows: Vec<u32> = touched.into_iter().collect();
     rows.sort_unstable();
     let plate = Plate::new(ring, rows, free, first_vertex);
@@ -34,6 +38,7 @@ pub(super) fn fair_patch(mesh: &mut Mesh, first_tri: usize, first_vertex: usize)
             }
         }
     }
+    membrane_patch
 }
 
 /// Rings of the patch vertices and of the vertices around the hole they touch (from the patch
