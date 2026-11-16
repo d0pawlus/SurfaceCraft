@@ -1,6 +1,6 @@
-//! The open test corpus: six scans published by Artec Group inc. (www.artec3d.com) under a
+//! The open test corpus: seven scans published by Artec Group inc. (www.artec3d.com) under a
 //! Creative Commons Attribution licence (ATTRIBUTION.md, "External test models"). The files are
-//! 75 to 270 MB each, so they stay outside the repository: `xtask/fetch-artec-corpus.sh <dir>`
+//! 57 to 270 MB each, so they stay outside the repository: `xtask/fetch-artec-corpus.sh <dir>`
 //! downloads them and checks their SHA-256, `SURFACECRAFT_ARTEC_CORPUS` names that directory.
 //! Unlike the scans of `SURFACECRAFT_LOCAL_CORPUS`, these may be named and their figures committed.
 //! The same directory also works as `SURFACECRAFT_LOCAL_CORPUS` for the `local_*` tests.
@@ -24,9 +24,11 @@ const MODELS: &[Model] = &[
     // 2 500 000 faces in the file, four of them with a repeated vertex index
     Model { file: "industrial-part.obj", triangles: 2_499_996 },
     Model { file: "water-pump.ply", triangles: 8_146_012 },
-    // the two prismatic parts: a cast housing with bores, ribs and sharp edges, and a bracket
+    // the three prismatic parts: a cast housing with bores, ribs and sharp edges, a bracket,
+    // and a machined fork clamp with planes and bores of several diameters
     Model { file: "motorcycle-crankcase.ply", triangles: 3_998_642 },
     Model { file: "suspension-bracket.obj", triangles: 6_101_564 },
+    Model { file: "motorcycle-upper-triple-clamp.ply", triangles: 2_994_924 },
 ];
 
 /// The corpus directory, or `None` when the variable is not set.

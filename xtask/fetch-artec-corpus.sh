@@ -1,6 +1,6 @@
 #!/bin/sh
-# Downloads the open test corpus: six 3D scans published by Artec Group inc. (www.artec3d.com)
-# under a Creative Commons Attribution licence. The files are large (30 to 90 MB packed, 75 to
+# Downloads the open test corpus: seven 3D scans published by Artec Group inc. (www.artec3d.com)
+# under a Creative Commons Attribution licence. The files are large (28 to 90 MB packed, 57 to
 # 270 MB unpacked), so they stay outside the repository; only this script and the checksums are
 # committed. See ATTRIBUTION.md, "External test models".
 #
@@ -20,7 +20,8 @@ four-cylinder-engine|four-cylinder-engine.zip|1oixxzc4qoUKKagUTKHe2SBXUN6pm8lB|4
 industrial-part|industrialpart.zip|4bMdTU8ZM72EWuOiWvzWrd7V0rEo_wmR|e2f244a817cbd95212660aabffc880a41244b19dffdb121344a6b9bf39b2e6c3|IndustrialPart/Industrial Part.obj|industrial-part.obj
 water-pump|water-pump.zip|gIkl6w7q27EOyC9xNUVQ_nci5BOc2bZp|03f01eca815b6cfda259433c595427e277c3b64268323e0399a349cc3e3b9e39|Water pump SP2.ply|water-pump.ply
 motorcycle-crankcase|motorcycle-crankcase-ply.zip|Fn6soq6bEUvVEFyQ8i9gL1R1b_0Yb0_H|a366a181c88b80373ce3eb5bf17cb82b8f7ebc59f9dfa724ba66a2ef89641876|Motorcycle Crankcase.ply|motorcycle-crankcase.ply
-suspension-bracket|metal-part-2_0.zip|tQ0eRCMPFqF87.9mhJ1ihjjsjZ8t.KYq|2f4fa54cd72989253bb3ba0b63b17c543d41a330ade7206c5ffbdbbe3fcd0f58|source/Metal part_2.zip!Metal part_2.obj|suspension-bracket.obj'
+suspension-bracket|metal-part-2_0.zip|tQ0eRCMPFqF87.9mhJ1ihjjsjZ8t.KYq|2f4fa54cd72989253bb3ba0b63b17c543d41a330ade7206c5ffbdbbe3fcd0f58|source/Metal part_2.zip!Metal part_2.obj|suspension-bracket.obj
+motorcycle-upper-triple-clamp|motorcycle-upper-triple-clamp-ply.zip|r.cFf6Tp.1PLWFuIaUg2cxWw.1gYDu37|30cdbb1d1a4abf75463fb2169bacc2b13a073f9bb96f02b30c8a5448c2685cab|Motorcycle Upper Triple Clamp.ply|motorcycle-upper-triple-clamp.ply'
 
 sha256_of() {
     if command -v sha256sum >/dev/null 2>&1; then
