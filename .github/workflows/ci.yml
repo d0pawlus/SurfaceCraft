@@ -69,8 +69,9 @@ jobs:
           apt_get update || echo "::warning::apt-get update failed or timed out"
           apt_get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev \
             || echo "::warning::system libraries not installed; using the runner image as it is"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.99.1" # rust-toolchain.toml
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
@@ -146,8 +147,10 @@ jobs:
           apt_get update || echo "::warning::apt-get update failed or timed out"
           apt_get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev \
             || echo "::warning::system libraries not installed; using the runner image as it is"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         if: steps.select.outputs.any == 'true'
+        with:
+          toolchain: "1.99.1" # rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
         if: steps.select.outputs.any == 'true'
         with:
@@ -205,8 +208,9 @@ jobs:
           apt_get update || echo "::warning::apt-get update failed or timed out"
           apt_get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev \
             || echo "::warning::system libraries not installed; using the runner image as it is"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.99.1" # rust-toolchain.toml
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
@@ -272,8 +276,10 @@ jobs:
           apt_get update || echo "::warning::apt-get update failed or timed out"
           apt_get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev \
             || echo "::warning::system libraries not installed; using the runner image as it is"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         if: env.DOCS_ONLY != 'true'
+        with:
+          toolchain: "1.99.1" # rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
         if: env.DOCS_ONLY != 'true'
         with:
@@ -308,8 +314,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         if: env.DOCS_ONLY != 'true'
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         if: env.DOCS_ONLY != 'true'
+        with:
+          toolchain: "1.99.1" # rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
         if: env.DOCS_ONLY != 'true'
         with:
