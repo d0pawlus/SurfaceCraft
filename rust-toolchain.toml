@@ -1,4 +1,6 @@
 [toolchain]
-channel = "stable"
+# pinned: newer clippy lints must not break CI unannounced; bump deliberately (here and in the
+# `toolchain:` of every dtolnay/rust-toolchain step in .github/workflows)
+channel = "1.99.1"
 components = ["rustfmt", "clippy"]
 targets = ["wasm32-unknown-unknown"]
