@@ -99,8 +99,7 @@ pub struct Request {
     pub tolerance: f64,
     /// Relative stiffness of the bending energy against the data (default 1e-3).
     pub smoothing: Option<f64>,
-    /// Start control net; default from the number of data points, or 6 by 6 when every side is
-    /// soft (the rounds then grow it only until the data are within the tolerance).
+    /// Start control net; default from the number of data points.
     pub control: Option<[usize; 2]>,
     /// Most control points per direction, at most [`crate::vpatch::MAX_CONTROL`].
     pub max_control: usize,
@@ -213,8 +212,8 @@ pub const G0_TARGET: f64 = 1e-3;
 pub const G1_TARGET_DEG: f64 = 0.05;
 /// Spread (standard deviation along a side) of the reference face's normal curvature across the
 /// side, in units of `1 / (4 diag)`, above which a feature of the face is taken to cross the side.
-/// Measured on four real scans: at most 0.82 on the sides where G2 held, at least 3.2 where it did not.
-pub const FEATURE_SPREAD: f64 = 1.6;
+/// Measured on four real scans: at most 0.2 on the sides where G2 held, at least 2.1 where it did not.
+pub const FEATURE_SPREAD: f64 = 0.65;
 /// Target of the relative normal curvature error along a G2 side.
 pub const G2_TARGET_REL: f64 = 0.05;
 /// Corners whose tangent planes differ by more than this (degrees) are in conflict.
@@ -230,8 +229,13 @@ const HARD_RESIDUAL_REL: f64 = 1e-5;
 /// The default start net of a call with G1/G2 sides (coupled solve) stays at this size; growth goes on
 /// within the cost bound of [`crate::vpatch::MAX_SOLVE_SECONDS`].
 const COUPLED_START_MAX: usize = 16;
-/// Smallest start net per direction; the start net of a patch whose sides are all soft.
+/// Smallest start net per direction.
 const MIN_START: usize = 6;
+/// Weights of the curvature-variation energy a patch whose sides are all soft is tried with, in
+/// order: the first one that brings the scan data within the tolerance is kept. Measured on four
+/// real scans at 16 by 16: with 10 the curvature of the patch varies 4 to 10 times less along a
+/// line than without, at an rms 5 to 50 % higher; with 0 the patch follows the texture of the scan.
+const FAIRNESS_STEPS: [f64; 4] = [10.0, 1.0, 0.1, 0.0];
 const DEFAULT_SMOOTHING: f64 = 1e-3;
 /// Share of a side's length around a conflicting corner where its G1/G2 rows are relaxed.
 const RELAX_SPAN: f64 = 0.15;
@@ -447,12 +451,6 @@ fn start_net_and_domain(req: &Request, lp: &start::Loop, interior: &start::Inter
     let n_data = interior.data.iter().filter(|p| !p.out).count();
     let coupled = lp.sides.iter().any(|s| s.continuity != Continuity::G0);
     let start_net = req.control.unwrap_or_else(|| {
-        // nothing but the data tolerance asks for a dense net when every side is soft: start
-        // coarse and let the rounds grow it, so the patch does not follow the texture of the scan
-        if lp.sides.iter().all(|s| s.soft) {
-            let k = std::cmp::min(max, MIN_START);
-            return [k, k];
-        }
         let k = ((n_data as f64 / 12.0).sqrt().round() as usize).max(MIN_START);
         let k = std::cmp::min(max, k);
         let k = if coupled { k.min(COUPLED_START_MAX) } else { k };

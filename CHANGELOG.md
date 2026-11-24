@@ -25,6 +25,16 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
   seam, the topology before and after, how far the removed surface lies from the result and whether
   two layers were left (#123).
 
+### Changed
+
+- `surface.patch`: a patch whose sides are all soft is fitted with a curvature-variation energy
+  (third derivatives) that damps the fine texture of a scan without flattening the curvature of
+  the shape. The energy is relaxed in steps only as far as the scan data need to come within
+  `tolerance`, and the control net starts from the number of data points again (the 6 by 6 start
+  of 0.3.0 is gone). Such a patch is closer to the scan than in 0.3.0 and its curvature is smooth
+  enough to continue with G2: on the Artec corpus G2 holds its 5 % target at 9 of 12 sites with
+  errors of 0.03 to 3.5 % (8 of 12 at 0.5 to 4.8 % in 0.3.0). [#167]
+
 ## [0.3.0] - 2026-11-16
 
 Three days and twenty-one merged feature and fix pull requests after 0.2.0. The release is about harder real
