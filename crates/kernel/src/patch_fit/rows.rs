@@ -172,6 +172,8 @@ pub(super) struct Inputs<'a> {
     /// The previous round's surface (curvature rows of G2 sides are linearised about it).
     pub prev: Option<&'a Surface>,
     pub smoothing: f64,
+    /// Weight of the curvature-variation energy.
+    pub fairness: f64,
 }
 
 /// The hard and the soft rows of a round.
@@ -385,5 +387,6 @@ pub(super) fn build_problem(inp: &Inputs) -> Result<Problem> {
         data,
         outline: outline_polygon(inp.sides),
         smoothing: inp.smoothing,
+        fairness: inp.fairness,
     })
 }

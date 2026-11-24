@@ -144,7 +144,7 @@ pub struct PatchIn {
     /// Relative stiffness of the bending energy against the data (default 0.001); higher is smoother.
     #[serde(default)]
     pub smoothing: Option<f64>,
-    /// Start control net `[u, v]`, 4 to `max_control` per direction; omitted: from the number of data points, or 6 by 6 when every side is soft (the net then grows only until the data are within `tolerance`, so a smaller tolerance gives a closer fit).
+    /// Start control net `[u, v]`, 4 to `max_control` per direction; omitted: from the number of data points.
     #[serde(default)]
     pub control: Option<[usize; 2]>,
     /// Most control points per direction (4 to 24, default 16).
