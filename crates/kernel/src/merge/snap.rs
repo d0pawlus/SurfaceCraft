@@ -22,7 +22,7 @@
 //! that does not take the move is left as it was and says why; the others are snapped, and the step is
 //! repeated without the refused groups until nothing is refused. The result is checked: the topology is
 //! the one it had, the borders of the patches that moved follow their edges, and none moved farther than
-//! the limit or turned over.
+//! the limit or turned over (a patch already folded or collapsed before the snap: none was made worse).
 //!
 //! The projection is the kernel's (`SurfaceEval`, in [`Gauge`]); the least-squares fit of a Bézier curve and
 //! the edit of the borders of the patches' control nets are made here.
@@ -561,6 +561,14 @@ fn width(points: &[V]) -> f64 {
     sides[1]
 }
 
+/// Was a patch sound before the snap: its normal read at [`MIN_JUDGED`] points of the grid or more, all of them on the
+/// side of their mean? A sound patch is held to the absolute test of [`moved_patch_ok`]: no move may turn it anywhere.
+fn sound_before(normals: &[Option<V>]) -> bool {
+    let read: Vec<V> = normals.iter().flatten().copied().collect();
+    let Some(mean) = unit(read.iter().fold([0.0; 3], |s, n| add(s, *n))) else { return false };
+    read.len() >= MIN_JUDGED && read.iter().all(|n| dot(*n, mean) >= MIN_TURN_DOT)
+}
+
 /// A patch that moved: no point of it farther than `max_move` from where it was, still facing the way it did,
 /// and its borders along its changed edges.
 fn moved_patch_ok(before: &Brep, after: &Brep, changed: &Changed, max_move: f64) -> bool {
@@ -573,16 +581,61 @@ fn moved_patch_ok(before: &Brep, after: &Brep, changed: &Changed, max_move: f64)
     // (a NaN displacement is no displacement `max` would see: every one is checked)
     let near = a.len() == b.len() && a.iter().zip(&b).all(|(p, q)| norm(sub(*p, *q)) <= max_move * (1.0 + 1e-9));
     let facing = match (normals_at_grid(before, face, MOVED_GRID), normals_at_grid(after, face, MOVED_GRID)) {
-        (Some(n0), Some(n1)) => {
-            let pairs: Vec<(V, V)> = n0.iter().zip(&n1).filter_map(|(a, b)| Some(((*a)?, (*b)?))).collect();
-            // a patch whose normal can be read at too few points of the grid (a sliver, a collapsed side) cannot be
-            // shown not to have turned over: it passes only when it moved too little to turn
-            let judged = pairs.len() >= MIN_JUDGED || far <= MAX_UNJUDGED_MOVE * width(&a);
-            judged && pairs.iter().all(|(a, b)| dot(*a, *b) >= MIN_TURN_DOT)
-        }
+        // A patch that was already broken before the snap (its normal unreadable or disagreeing with itself) cannot
+        // be judged by whether each normal kept its sign: where it can be read at all, it flips for a move of
+        // hundredths of a millimetre, and where it cannot, the absolute test refuses any move of more than a quarter
+        // of the patch's width. Measured on scans 4, 6 and 10: every neighbour that refused a snap had at most one
+        // readable normal of 25, moved 0.30 to 1.13 of its width, and its area vector never turned (dot 0.42 to
+        // 1.00). Such a patch is also taken when the snap does not make it worse ([`no_worse`]); a sound patch keeps
+        // the absolute test alone, so a snap never turns a sound patch over.
+        (Some(n0), Some(n1)) => turned_nowhere(&n0, &n1, far, &a) || (!sound_before(&n0) && no_worse(&n0, &n1, &a, &b)),
         _ => false,
     };
     near && facing && borders_follow_edges(after, face, &changed.edges)
+}
+
+/// The absolute test of a moved patch: its normal kept its sign at every point of the grid read before and after. A
+/// patch whose normal can be read at too few points of the grid (a sliver, a collapsed side) cannot be shown not to
+/// have turned over: it passes only when it moved too little to turn.
+fn turned_nowhere(n0: &[Option<V>], n1: &[Option<V>], far: f64, before: &[V]) -> bool {
+    let pairs: Vec<(V, V)> = n0.iter().zip(n1).filter_map(|(a, b)| Some(((*a)?, (*b)?))).collect();
+    let judged = pairs.len() >= MIN_JUDGED || far <= MAX_UNJUDGED_MOVE * width(before);
+    judged && pairs.iter().all(|(a, b)| dot(*a, *b) >= MIN_TURN_DOT)
+}
+
+/// The vectors of the cells of a `(MOVED_GRID + 1)^2` grid of samples laid out row by row: half the cross product of
+/// each cell's diagonals, which sum to the area vector of the patch. Unlike the normal at a point, these can be read
+/// on a sliver or a patch whose sides meet at a shallow angle.
+fn cell_vectors(points: &[V]) -> Vec<V> {
+    let n = MOVED_GRID + 1;
+    let at = |i: usize, j: usize| points.get(i * n + j).copied();
+    let mut out = Vec::with_capacity(MOVED_GRID * MOVED_GRID);
+    for i in 0..MOVED_GRID {
+        for j in 0..MOVED_GRID {
+            if let (Some(p00), Some(p10), Some(p01), Some(p11)) =
+                (at(i, j), at(i + 1, j), at(i, j + 1), at(i + 1, j + 1))
+            {
+                out.push(scale(cross(sub(p11, p00), sub(p01, p10)), 0.5));
+            }
+        }
+    }
+    out
+}
+
+/// The cells and the readable normals of a patch that face against `reference`.
+fn against(cells: &[V], normals: &[Option<V>], reference: V) -> usize {
+    cells.iter().chain(normals.iter().flatten()).filter(|v| dot(**v, reference) < MIN_TURN_DOT).count()
+}
+
+/// Does a move leave a patch that was broken before it no worse? Judged against the patch as it was, so a patch that
+/// the move turns over as a whole cannot pass as "equally folded": the reference is the area vector of its samples
+/// before (`a`); after the move (`b`) the patch as a whole still faces along it, and no more of its cells and readable
+/// normals face against it than before.
+fn no_worse(n0: &[Option<V>], n1: &[Option<V>], a: &[V], b: &[V]) -> bool {
+    let (c0, c1) = (cell_vectors(a), cell_vectors(b));
+    let sum = |c: &[V]| c.iter().fold([0.0; 3], |s, v| add(s, *v));
+    let (Some(reference), Some(whole)) = (unit(sum(&c0)), unit(sum(&c1))) else { return false };
+    dot(whole, reference) >= MIN_TURN_DOT && against(&c1, n1, reference) <= against(&c0, n0, reference)
 }
 
 /// Every edge of `after` is used as often as it was (once on an open border, twice inside), nothing was added

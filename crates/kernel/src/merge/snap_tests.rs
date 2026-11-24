@@ -188,3 +188,74 @@ fn a_cancelled_snap_snaps_nothing() {
     assert!(!cancelled.snapped[0]);
     assert_eq!(cancelled.body, body);
 }
+
+/// One bilinear patch with the corners `[p00, p10, p11, p01]` (rows of its net `u`, columns `v`).
+fn one_patch(c: [V; 4]) -> Brep {
+    let [p00, p10, p11, p01] = c;
+    crate::nurbs::sheet_from_bezier_network(&[vec![vec![p00, p01], vec![p10, p11]]], &[[0, 1, 2, 3]]).unwrap()
+}
+
+/// A parallelogram 20 mm long and 1 mm wide whose sides meet at a sine of 0.0995: its normal can be read nowhere
+/// (the bound is 0.4), as on the long thin patches along the border of an open scan.
+fn skewed() -> [V; 4] {
+    [p(0.0, 0.0, 0.0), p(10.0, 0.0, 0.0), p(20.0, 1.0, 0.0), p(10.0, 1.0, 0.0)]
+}
+
+fn patch_ok(before: &Brep, after: &Brep, max_move: f64) -> bool {
+    moved_patch_ok(before, after, &Changed { face: 0, edges: Vec::new(), asked: Groups::new() }, max_move)
+}
+
+/// The neighbours that refused snaps on real scans: no readable normal before the snap, a move of 0.30 to 1.13 of
+/// their width, and the patch as a whole not turned (measured on scans 4, 6 and 10). A move of 0.3 of the width that
+/// tilts the patch without folding it does not make it worse, so it is taken.
+#[test]
+fn a_neighbour_whose_normal_cannot_be_read_takes_a_move_that_does_not_make_it_worse() {
+    let before = one_patch(skewed());
+    assert_eq!(normals_at_grid(&before, 0, MOVED_GRID).unwrap().iter().flatten().count(), 0, "unreadable");
+    let mut c = skewed();
+    c[2][2] = 0.3;
+    let after = one_patch(c);
+    assert!(patch_ok(&before, &after, 0.5), "a corner lifted by 0.3 of the width");
+}
+
+/// The same patch is still refused where the move turns it over as a whole or folds it, whatever its normals.
+#[test]
+fn a_neighbour_whose_normal_cannot_be_read_is_refused_when_the_move_turns_or_folds_it() {
+    let before = one_patch(skewed());
+    let mirrored = one_patch([p(0.0, 0.0, 0.0), p(10.0, 0.0, 0.0), p(20.0, -1.0, 0.0), p(10.0, -1.0, 0.0)]);
+    assert!(!patch_ok(&before, &mirrored, 100.0), "turned over as a whole");
+    let bow_tie = one_patch([p(0.0, 0.0, 0.0), p(10.0, 0.0, 0.0), p(0.0, 1.0, 0.0), p(10.0, 1.0, 0.0)]);
+    assert!(!patch_ok(&before, &bow_tie, 100.0), "folded across itself");
+}
+
+/// A neighbour that is sound before the snap (its normal read at every point, all one way) keeps the absolute test:
+/// a move that turns its normal at any point of the grid is refused.
+#[test]
+fn a_sound_neighbour_keeps_the_absolute_test() {
+    let flat = [p(0.0, 0.0, 0.0), p(1.0, 0.0, 0.0), p(1.0, 1.0, 0.0), p(0.0, 1.0, 0.0)];
+    let before = one_patch(flat);
+    let n0 = normals_at_grid(&before, 0, MOVED_GRID).unwrap();
+    assert!(sound_before(&n0), "read everywhere, all one way");
+    // one corner pulled across the patch, past the opposite diagonal: its corner of the patch turns over
+    let mut c = flat;
+    c[2] = p(0.2, 0.2, 0.0);
+    let after = one_patch(c);
+    assert!(!patch_ok(&before, &after, 100.0), "turned over at a corner");
+}
+
+/// A group whose border meets a long thin patch with no readable normal (the border of an open scan) is snapped: the
+/// patch is tilted by the move (0.2 mm, two thirds of its 0.3 mm width) but not folded or turned over.
+#[test]
+fn a_group_next_to_a_neighbour_whose_normal_cannot_be_read_is_snapped() {
+    use super::super::geometry::group_of;
+    let group = vec![vec![p(0.0, 0.0, 0.0), p(0.0, 1.0, 0.0)], vec![p(1.0, 0.0, 0.2), p(1.0, 1.0, 0.2)]];
+    let thin = vec![vec![p(1.0, 0.0, 0.2), p(1.0, 1.0, 0.2)], vec![p(1.3, 3.0, 0.2), p(1.3, 4.0, 0.2)]];
+    let body = crate::nurbs::sheet_from_bezier_network(&[group, thin], &[[0, 1, 2, 3], [1, 4, 5, 2]]).unwrap();
+    assert_eq!(normals_at_grid(&body, 1, MOVED_GRID).unwrap().iter().flatten().count(), 0, "unreadable");
+    let g = group_of(&body, &[0]).unwrap();
+    let gauge = plane_gauge([0.0, 0.0, 1.0], 0.0);
+    let done = snap_boundaries(&body, &[Target { faces: &[0], group: &g, gauge: &gauge }], 0.5, &|| false);
+    assert!(done.snapped[0], "{:?}", done.why_not);
+    let shared = done.body.vertices.get(1).unwrap().point;
+    assert!(shared[2].abs() < 1e-6, "the shared border is on the plane: {shared:?}");
+}
