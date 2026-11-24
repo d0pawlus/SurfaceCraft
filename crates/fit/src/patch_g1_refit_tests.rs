@@ -84,6 +84,54 @@ fn on_the_open_rim_patches_stay_close_to_the_plain_ones() {
     assert_ne!(refitted.set.nets, plain.set.nets, "the refit changes the patches");
 }
 
+/// The control points along the side of a patch that runs on coarse edge `e` of its triangle:
+/// patch `k` has edge `k` as its bottom row and edge `k + 2` (mod 3) as its left column.
+fn side_on_edge(net: &crate::patch::Net, k: usize, e: usize) -> Option<[[f64; 3]; 4]> {
+    if e == k {
+        Some([net[0][0], net[1][0], net[2][0], net[3][0]])
+    } else if e == (k + 2) % 3 {
+        Some(net[0])
+    } else {
+        None
+    }
+}
+
+#[test]
+fn curves_on_the_open_rim_stay_plain_and_edges_that_only_end_on_it_are_refitted() {
+    // Arrange
+    let (coarse, scan) = dome_pair();
+    let edges = edge_faces(&coarse);
+    let free: BTreeSet<EdgeKey> = edges.iter().filter(|(_, f)| f.len() != 2).map(|(k, _)| *k).collect();
+    let rim: BTreeSet<u32> = free.iter().flat_map(|&(a, b)| [a, b]).collect();
+
+    // Act
+    let refitted = run(&coarse, &scan, false, true);
+    let plain = run(&coarse, &scan, false, false);
+
+    // Assert: every patch side on a free edge is bit-equal to the plain construction; at least one
+    // side on an interior edge that ends on the rim differs (it is refitted)
+    let (mut rim_sides, mut ending_refitted) = (0, 0);
+    for (f, t) in coarse.triangles.iter().enumerate() {
+        for k in 0..3 {
+            let (Some(a), Some(b)) = (refitted.set.nets.get(3 * f + k), plain.set.nets.get(3 * f + k)) else {
+                continue;
+            };
+            for e in [k, (k + 2) % 3] {
+                let (u, v) = (t[e], t[(e + 1) % 3]);
+                let (Some(sa), Some(sb)) = (side_on_edge(a, k, e), side_on_edge(b, k, e)) else { continue };
+                if free.contains(&key(u, v)) {
+                    rim_sides += 1;
+                    assert_eq!(sa, sb, "triangle {f} patch {k}: the curve on rim edge ({u}, {v}) was refitted");
+                } else if (rim.contains(&u) || rim.contains(&v)) && sa != sb {
+                    ending_refitted += 1;
+                }
+            }
+        }
+    }
+    assert!(rim_sides > 0, "the dome has rim edges");
+    assert!(ending_refitted > 0, "no edge that only ends on the rim was refitted");
+}
+
 #[test]
 fn tangent_patches_are_built_without_the_refit() {
     // Arrange

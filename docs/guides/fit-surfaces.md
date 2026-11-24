@@ -8,10 +8,14 @@ patch network over a whole scan.
 - `surface.wrap` with `mesh`: a watertight network of bicubic patches over the whole scan, for
   castings, body panels and organic shapes. `tolerance` (default 0.2 mm), `min_within` (default
   0.99) and `max_patches` (default 12000, at most 60000). The result is a solid when the scan is
-  closed, else a sheet; `deviation` gives `within`, `rms`, `p99` and `max`. Every patch edge
-  and every patch is refitted to the scan by least squares (sampled, projected onto the scan, its
-  inner control points fitted to those points, kept only when it lies closer), so a patch follows
-  a curved or noisy scan more closely than the few points it was first laid through.
+  closed, else a sheet; `deviation` gives `within`, `rms`, `p99` and `max`. The patch edges and
+  patches are refitted to the scan by least squares (sampled, projected onto the scan, their inner
+  control points fitted to those points), so a patch follows a curved or noisy scan more closely
+  than the few points it was first laid through. Not refitted: the curves on the open border of a
+  scan and the inside of the patches of a triangle on it, everything with `continuity: g1`, and any
+  refit that would not lie closer to the scan, would lose a point that reached the scan, would move
+  a control point by more than half the size of its curve or patch, or would turn a patch against
+  the one it replaces.
 - `refine` (default `adaptive`): the layout is refined only around the scan points the patches
   miss, so smooth areas keep large patches; `uniform` halves the budget of the whole scan each
   round (more patches for the same tolerance). `levels` lists the patches and the share within

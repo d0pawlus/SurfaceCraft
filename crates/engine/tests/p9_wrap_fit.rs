@@ -74,8 +74,11 @@ fn patches(w: &Value) -> usize {
 }
 
 /// Rounds of the wrap cut to the cap.
-fn rounds_at_cap(w: &Value) -> usize {
-    w["levels"].as_array().unwrap().iter().filter(|l| l["partial"] == "next_round_over_cap").count()
+/// Rounds cut to the cap by the decimation: partial for the cap, with no reduction spent searching
+/// (the searched round of a capped wrap reports its `probes`).
+fn rounds_cut_to_cap(w: &Value) -> usize {
+    let levels = w["levels"].as_array().unwrap();
+    levels.iter().filter(|l| l["partial"] == "next_round_over_cap" && l["probes"].as_u64().unwrap_or(0) == 0).count()
 }
 
 /// Cap of the gate: the body needs more patches than this (main stopped at 99.03 % of the samples
@@ -108,17 +111,19 @@ fn rounds_at_the_cap_go_on_while_they_gain_and_never_lose_the_best() {
     // Arrange / Act
     let w = gate_wrap();
 
-    // Assert: the rounds went on after the first round cut to the cap (measured: three rounds cut
-    // to it, the first gaining 1.6 points; the rule needs only that one more round followed), and
-    // the result is the best round
+    // Assert: the rounds went on after the first round cut to the cap, and the result is the best
+    // round. Before this change a capped wrap had exactly one round cut to the cap: the trimmed
+    // round, then the searched round (which reports its probes), then the end of the rounds; so a
+    // second cut round is what the new rule makes (measured: three, the first gaining 1.6 points).
     let levels = w["levels"].as_array().unwrap();
     let best = levels.iter().map(|l| l["within"].as_f64().unwrap()).fold(0.0, f64::max);
-    assert!(rounds_at_cap(w) >= 2, "{levels:?}");
+    assert!(rounds_cut_to_cap(w) >= 2, "{levels:?}");
     assert_eq!(within(w), best, "{levels:?}");
 }
 
 /// Share of the samples out of the tolerance on main for the body at the default cap (1614 patches,
-/// 99.66 % within).
+/// 99.66 % within). The bound of the test below is this over 1.5 (0.227 %); measured with this
+/// change: 0.054 % at 1560 patches.
 const MAIN_DEFAULT_MISSED: f64 = 0.0034;
 
 #[test]

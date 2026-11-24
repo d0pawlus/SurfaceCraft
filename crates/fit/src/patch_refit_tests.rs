@@ -80,6 +80,10 @@ fn a_curve_over_a_strongly_curved_arc_is_refitted_much_closer_to_it() {
     // Assert
     let (before, after) = (curve_gap(&chord), curve_gap(&refit));
     eprintln!("largest gap from the arc: chord interpolant {before:.4} mm, refitted {after:.4} mm");
+    let thirds = [a + (b - a) / 3.0, a + (b - a) * (2.0 / 3.0)];
+    let shift = (refit[1] - thirds[0]).norm().max((refit[2] - thirds[1]).norm()) / (b - a).norm();
+    eprintln!("inner control points lie at most {shift:.3} of the chord off the chord's thirds");
+    assert!(shift < MAX_SHIFT_SHARE, "{shift}");
     assert_ne!(refit, chord, "the refit changes the curve");
     assert!(after < 0.25 * before, "{before} -> {after}");
     assert_eq!((refit[0], refit[3]), (a, b), "the ends stay where they are");
@@ -194,7 +198,8 @@ fn a_projection_that_gives_nothing_usable_leaves_the_curve_and_the_patch_as_they
 
 #[test]
 fn a_refit_never_puts_its_samples_farther_from_the_scan_and_changes_noisy_curves() {
-    for (deg, sigma) in [(20.0, 0.0), (90.0, 0.02), (150.0, 0.1)] {
+    // a coarse edge over more than about 120 degrees of a surface does not occur at the wrap's budgets
+    for (deg, sigma) in [(20.0, 0.0), (90.0, 0.02), (120.0, 0.1)] {
         // Arrange
         let project = |p: Vec3| Some(on_noisy_sphere(p, sigma));
         let c = chord_curve(sphere_corner(0.0, 0.0), sphere_corner(10.0, deg), &|p| on_noisy_sphere(p, sigma));
@@ -209,4 +214,53 @@ fn a_refit_never_puts_its_samples_farther_from_the_scan_and_changes_noisy_curves
             assert_ne!(refit, c, "{deg} {sigma}: a noisy curve is refitted");
         }
     }
+}
+
+#[test]
+fn a_refit_that_loses_a_sample_is_not_taken_however_well_the_rest_fit() {
+    // Arrange: before, all six samples reach the scan; after, five fit far better and one is lost
+    let before: Vec<Sample> = (0..6).map(|_| Some((Vec3::zeros(), 0.04))).collect();
+    let mut after: Vec<Sample> = (0..6).map(|_| Some((Vec3::zeros(), 0.0001))).collect();
+    let keeps_all = after.clone();
+    after[5] = None;
+
+    // Act / Assert
+    assert!(!closer(&before, &after, MIN_CURVE_SAMPLES), "a lost sample refuses the refit");
+    assert!(closer(&before, &keeps_all, MIN_CURVE_SAMPLES), "one that keeps them all is taken as before");
+}
+
+#[test]
+fn a_refit_that_would_slide_a_curve_off_the_scan_is_refused() {
+    // Arrange: the scan ends at 60 degrees of the arc; points beyond it have no scan point within
+    // reach. A refit that kept fitting the near samples but slid the far ones off the scan would lose
+    // them, so whatever the refit returns keeps every sample the chord interpolant had.
+    let (_, _, chord) = arc();
+    let project = |p: Vec3| (p.y.atan2(p.x).to_degrees() < 60.0).then(|| on_cylinder(p));
+    let before = curve_samples(&chord, &project);
+
+    // Act
+    let refit = refit_curve(chord, &project);
+
+    // Assert
+    let after = curve_samples(&refit, &project);
+    let lost = before.iter().zip(&after).filter(|(a, b)| a.is_some() && b.is_none()).count();
+    assert_eq!(lost, 0, "{before:?} -> {after:?}");
+}
+
+#[test]
+fn a_fit_on_samples_at_one_end_that_swings_the_far_control_point_is_refused() {
+    // Arrange: a straight curve 10 mm long; only its first 4.5 mm reach a "scan" that rises steeply
+    // (12 mm over the curve's length), so the least-squares cubic through those samples swings its far
+    // inner control point far away to come back to the fixed end
+    let (a, b) = (Vec3::zeros(), Vec3::new(10.0, 0.0, 0.0));
+    let c = [a, a + (b - a) / 3.0, a + (b - a) * (2.0 / 3.0), b];
+    let project = |p: Vec3| (p.x < 4.5).then(|| Vec3::new(p.x, p.y, 1.2 * p.x));
+    let s = curve_samples(&c, &project);
+    let unguarded = curve_through(&c, &s).unwrap();
+    assert!(!within_shift(&[c[1], c[2]], &[unguarded[1], unguarded[2]], 10.0), "{unguarded:?}");
+    let far = (unguarded[2] - c[2]).norm() / 10.0;
+    eprintln!("the unguarded fit moves the far control point by {far:.2} of the chord (bound {MAX_SHIFT_SHARE})");
+
+    // Act / Assert
+    assert_eq!(refit_curve(c, &project), c);
 }

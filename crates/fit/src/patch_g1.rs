@@ -330,7 +330,9 @@ struct Layer<'a> {
     reach: f64,
     face_normal: Vec<Vec3>,
     normals: LayoutNormals,
-    /// Coarse edges with fewer or more than two faces: no neighbour to be tangent to.
+    /// Coarse edges with fewer or more than two faces: no neighbour to be tangent to. One face: the
+    /// open border (rim) of the scan; three or more: a non-manifold edge (none after the wrap's repair
+    /// of the scan, but the rules below treat it like the rim).
     free: BTreeSet<EdgeKey>,
     g1: bool,
     /// Refit the curves and patches of the unconstrained wrap to the scan ([`crate::patch_refit`]).
@@ -350,7 +352,7 @@ impl Layer<'_> {
         self.try_project(at, facing).unwrap_or(at)
     }
 
-    /// Does triangle `f` have an edge on the open border of the scan?
+    /// Does triangle `f` have a free edge (on the open border of the scan, or non-manifold)?
     fn on_rim(&self, f: usize) -> bool {
         let t = self.coarse.triangles.get(f);
         (0..3).any(|e| t.is_some_and(|t| self.free.contains(&key(t[e], t[(e + 1) % 3]))))
@@ -362,7 +364,8 @@ impl Layer<'_> {
         self.refit && !self.g1
     }
 
-    /// Is the curve of coarse edge `(a, b)` refitted? Not on the open border of the scan: samples
+    /// Is the curve of coarse edge `(a, b)` refitted? Not on a free edge (the open border of the scan,
+    /// or a non-manifold edge): samples
     /// beyond the rim are pulled onto it and would lean the curve. Edges that only end on the rim
     /// are refitted (their samples lie inside; `on_the_open_rim_patches_stay_close_to_the_plain_ones`
     /// bounds what that does to the rim patches): leaving them plain too made a band two triangles
@@ -372,8 +375,8 @@ impl Layer<'_> {
         self.refits() && !self.free.contains(&key(a, b))
     }
 
-    /// Is the inside of the patches of triangle `f` refitted? Not when the triangle has an edge on the
-    /// open border of the scan (see [`Layer::refits_edge`]); its spokes are.
+    /// Is the inside of the patches of triangle `f` refitted? Not when the triangle has a free edge
+    /// (see [`Layer::refits_edge`]); its spokes are.
     fn refits_patches(&self, f: usize) -> bool {
         self.refits() && !self.on_rim(f)
     }

@@ -15,7 +15,10 @@
 //!
 //! A sample with no scan point within the reach is left out, of the fit and of the measurement;
 //! too few valid samples leave the input as it is. Each refit is measured against the best so far
-//! over the samples valid in both, and kept only when its samples lie closer to the scan there. So
+//! over the samples valid in both, and kept only when its samples lie closer to the scan there, it
+//! loses no sample that reached the scan, and its inner control points stay within half the size of
+//! the curve or patch of where a straight chord, or the patch before the refit, has them (a fit on
+//! samples clustered at one end extrapolates the far ones). So
 //! the claim is about the samples only: between them nothing is measured, which is why a refitted
 //! patch must also face like its input everywhere on a grid that includes its border (no fold, no
 //! patch turned against the scan). On a real organic scan held at 60 000 patches the refit about
@@ -51,6 +54,15 @@ const MIN_NET_SAMPLES: usize = 18;
 /// of `p9_hybrid_scan` and cost scan 2 of the local corpus 0.15 points of its share within the
 /// tolerance.
 const MIN_TURN_COS: f64 = 0.3;
+/// A refitted curve's inner control points must lie within this share of its chord of the chord's
+/// thirds (the control points of the straight chord), and a refitted patch's inner control points
+/// within this share of its longer diagonal of the patch's own before the refit. The cubic that
+/// follows a circular arc of 120 degrees has its inner control points about 0.39 of the chord off
+/// the thirds (the refit of the 100 degree arc of the tests: 0.32); a fit
+/// on samples clustered at one end extrapolates the far control point past the chord's length.
+/// The curve is held to the straight chord, not to its plain interpolant, because that interpolant
+/// is itself wild where the scan points under the chord are (a refit must be free to repair it).
+const MAX_SHIFT_SHARE: f64 = 0.5;
 /// Where (in u and in v) a refitted patch's normals are checked against its input, borders included.
 const GUARD_T: [f64; 7] = [0.0, 1.0 / 6.0, 1.0 / 3.0, 0.5, 2.0 / 3.0, 5.0 / 6.0, 1.0];
 
@@ -72,11 +84,20 @@ fn valid(s: &[Sample]) -> usize {
     s.iter().flatten().count()
 }
 
-/// Is `new` closer to the scan than `old` over the samples valid in both (at least `min` of them)?
+/// Is `new` closer to the scan than `old` over the samples valid in both (at least `min` of them),
+/// with no sample that reached the scan in `old` lost in `new`? A lost sample is a part of the curve
+/// or patch that left the reach of the scan (or turned from it); nothing measures it there, so a refit
+/// that loses one is not taken, however well the samples left fit.
 fn closer(old: &[Sample], new: &[Sample], min: usize) -> bool {
+    let lost = old.iter().zip(new).any(|(a, b)| a.is_some() && b.is_none());
     let both: Vec<(f64, f64)> = old.iter().zip(new).filter_map(|(a, b)| Some(((*a)?.1, (*b)?.1))).collect();
     let (o, n) = both.iter().fold((0.0, 0.0), |(o, n), (a, b)| (o + a, n + b));
-    both.len() >= min && n < o
+    !lost && both.len() >= min && n < o
+}
+
+/// Did no inner control point move from `old` to `new` by more than [`MAX_SHIFT_SHARE`] of `size`?
+fn within_shift(old: &[Vec3], new: &[Vec3], size: f64) -> bool {
+    old.iter().zip(new).all(|(a, b)| (b - a).norm() <= MAX_SHIFT_SHARE * size)
 }
 
 fn curve_point(c: &[Vec3; 4], t: f64) -> Vec3 {
@@ -135,7 +156,8 @@ fn curve_through(c: &[Vec3; 4], s: &[Sample]) -> Option<[Vec3; 4]> {
 }
 
 /// `c` refitted to the scan (see the module documentation); `c` itself when fewer than
-/// [`MIN_CURVE_SAMPLES`] samples reach the scan or no refit lies closer.
+/// [`MIN_CURVE_SAMPLES`] samples reach the scan or no refit lies closer without losing a sample and
+/// with its inner control points within [`MAX_SHIFT_SHARE`] of its chord of the chord's thirds.
 pub(crate) fn refit_curve(c: [Vec3; 4], project: Project) -> [Vec3; 4] {
     let first = curve_samples(&c, project);
     if valid(&first) < MIN_CURVE_SAMPLES {
@@ -146,7 +168,9 @@ pub(crate) fn refit_curve(c: [Vec3; 4], project: Project) -> [Vec3; 4] {
     for _ in 0..PASSES {
         let Some(next) = curve_through(&cur, &cur_s) else { break };
         let next_s = curve_samples(&next, project);
-        if closer(&best_s, &next_s, MIN_CURVE_SAMPLES) {
+        let thirds = [c[0] + (c[3] - c[0]) / 3.0, c[0] + (c[3] - c[0]) * (2.0 / 3.0)];
+        let shift_ok = within_shift(&thirds, &[next[1], next[2]], (c[3] - c[0]).norm());
+        if closer(&best_s, &next_s, MIN_CURVE_SAMPLES) && shift_ok {
             (best, best_s) = (next, next_s.clone());
         }
         (cur, cur_s) = (next, next_s);
@@ -223,9 +247,19 @@ fn keeps_facing(old: &Net, new: &Net) -> bool {
     })
 }
 
+/// Did no inner control point of `new` move from `old` by more than [`MAX_SHIFT_SHARE`] of the longer
+/// diagonal of `old`'s corners?
+fn inner_within_shift(old: &Net, new: &Net) -> bool {
+    let corner = |i: usize, j: usize| old.get(i).and_then(|r| r.get(j)).map_or_else(Vec3::zeros, |p| v3(*p));
+    let size = (corner(0, 0) - corner(3, 3)).norm().max((corner(3, 0) - corner(0, 3)).norm());
+    let inner = |n: &Net| INNER.map(|(i, j)| n.get(i).and_then(|r| r.get(j)).map_or_else(Vec3::zeros, |p| v3(*p)));
+    within_shift(&inner(old), &inner(new), size)
+}
+
 /// `net` with its inner control points refitted to the scan like [`refit_curve`] refits a curve
-/// (its boundary is left as it is), keeping only refits that face like `net` ([`keeps_facing`]);
-/// `net` itself when fewer than [`MIN_NET_SAMPLES`] samples reach the scan or no refit qualifies.
+/// (its boundary is left as it is), keeping only refits that lose no sample, move no inner point by
+/// more than [`MAX_SHIFT_SHARE`] of the patch's size and face like `net` ([`keeps_facing`]); `net`
+/// itself when fewer than [`MIN_NET_SAMPLES`] samples reach the scan or no refit qualifies.
 pub(crate) fn refit_net(net: Net, project: Project) -> Net {
     let first = net_samples(&net, project);
     if valid(&first) < MIN_NET_SAMPLES {
@@ -236,7 +270,7 @@ pub(crate) fn refit_net(net: Net, project: Project) -> Net {
     for _ in 0..PASSES {
         let Some(next) = net_through(&cur, &cur_s) else { break };
         let next_s = net_samples(&next, project);
-        if closer(&best_s, &next_s, MIN_NET_SAMPLES) && keeps_facing(&net, &next) {
+        if closer(&best_s, &next_s, MIN_NET_SAMPLES) && inner_within_shift(&net, &next) && keeps_facing(&net, &next) {
             (best, best_s) = (next, next_s.clone());
         }
         (cur, cur_s) = (next, next_s);
