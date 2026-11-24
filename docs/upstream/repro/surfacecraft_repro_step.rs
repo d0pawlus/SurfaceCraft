@@ -1,3 +1,6 @@
+// OBSOLETE since P9-O8 (solidcore pin c02c5c51c): `step-brep`, `step-import` and `step-export` are not in
+// solidcore's workspace any more; STEP goes through `solidcore-step`. Kept for the record of what was
+// reproduced on 4f2da85; the narrowing cone it shows round trips on c02c5c51c (draft 01).
 //! Kernel-only reproduction for solidcore's STEP writer and reader.
 //! Copy to `crates/solidcore-step/tests/surfacecraft_repro_step.rs` of a solidcore checkout and run:
 //!   cargo test -p solidcore-step --test surfacecraft_repro_step

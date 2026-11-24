@@ -1,5 +1,7 @@
 # Draft 01: STEP round trip of a cone that narrows along +z returns one body per face
 
+Update 2026-11-16 (P9-O8): resolved on the pin `c02c5c51c`: a cone that narrows along +z round trips through `solidcore-step` as one body with its volume (`upstream_repro::cone_narrowing_along_z_survives_step_round_trip` runs as a regression; `kernel::step` test of the narrowing cone and torus). Nothing to file.
+
 Status: draft, not filed. Filing needs the owner's consent. Per the upstream rule, solidcore is
 developed inside tangency-labs/solidcraft at `solidcore/`; open it there as kernel-only work
 (template: Bug report, labels `bug`, `area:io`). Re-verified on `b9c02da` earlier; the run on

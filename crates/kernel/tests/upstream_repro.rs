@@ -168,7 +168,7 @@ fn turned_box_reads_back_from_its_record() {
 /// copy after the other with `boolean`, reads back; four bars at 60 degrees and four bars at 30
 /// degrees fail the same way when chained.
 #[test]
-#[ignore = "solidcore c02c5c5 (and 4f2da85): union_all of three chained rotated copies does not read back from its record (status 1007)"]
+#[ignore = "solidcore c02c5c5 (and 4f2da85): union_all of three chained rotated copies does not read back from its record (now refused by name: the plane's axes are not square, tangency-labs/solidcraft#13737)"]
 fn union_of_three_chained_rotated_copies_reads_back() {
     fixes_from_env();
     let (s, c) = 60.0_f64.to_radians().sin_cos();
@@ -230,7 +230,7 @@ fn top_face(rec: &Brep) -> Option<usize> {
 /// (`SM_ERR_INVALID_INPUT`). The same plate with outline coordinates 40.0 and 20.0 exactly reads
 /// back (volume 2335.8); the failure is sensitive to round-off at that level.
 #[test]
-#[ignore = "solidcore c02c5c5 (and 4f2da85): shell of a filleted, pocketed plate does not read back from its record (status 1007)"]
+#[ignore = "solidcore c02c5c5 (and 4f2da85): shell of a filleted, pocketed plate does not read back from its record (now refused by name: the plane's axes are not square, tangency-labs/solidcraft#13737)"]
 fn shell_of_filleted_pocketed_plate_reads_back() {
     fixes_from_env();
     let corner = [
@@ -287,7 +287,7 @@ fn shell_of_filleted_pocketed_plate_reads_back() {
 /// normal is not a fix: with the direction tilted by 1e-12 about 65 of 98 pseudo-random turned
 /// plates (where the plate itself reads back) fail, with 1e-3 still 6 of 98.
 #[test]
-#[ignore = "solidcore c02c5c5 (and 4f2da85): plate turned about a general axis minus a prism along its normal does not read back (status 1007)"]
+#[ignore = "solidcore c02c5c5 (and 4f2da85): plate turned about a general axis minus a prism along its normal does not read back (now refused by name: the plane's axes are not square, tangency-labs/solidcraft#13737)"]
 fn window_along_a_plane_normal_reads_back() {
     fixes_from_env();
     let axis = [0.26162006230833446, -0.20491162934367935, -0.3720612130285178];
