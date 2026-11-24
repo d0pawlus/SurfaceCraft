@@ -24,7 +24,8 @@ pub enum LineError {
 }
 
 /// Reads the next line (without its `\n` or `\r\n`), holding at most `max` bytes of it plus the
-/// newline. `Ok(None)` when the connection closed between lines.
+/// `\n` (a `\r` before it counts towards `max`). `Ok(None)` when the connection closed between
+/// lines; a last line without its `\n` is [`LineError::Unterminated`].
 ///
 /// # Errors
 /// [`LineError::TooLong`] when more than `max` bytes come before a newline, [`LineError::Unterminated`]
