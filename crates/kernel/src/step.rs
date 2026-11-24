@@ -41,30 +41,55 @@ impl Trims for KernelTrims {
     }
 }
 
+/// What a STEP file gave: the bodies read, and why each other body of the file was refused.
+#[derive(Clone, Debug, Default)]
+pub struct Imported {
+    /// The bodies read, each a record that passed the record's checks.
+    pub bodies: Vec<Brep>,
+    /// One line per body refused: the file entity and the reason.
+    pub refused: Vec<String>,
+}
+
 /// Every body of a STEP file, as records: each solid and surface model the file states, built
-/// from the file's own topology. Bodies the reader refuses are left out; a file of which no body
-/// reads is an error naming why.
+/// from the file's own topology ([`import_report`]). A file of which no body reads is an error
+/// naming why.
 pub fn import(text: &[u8]) -> Result<Vec<Brep>> {
+    import_report(text).map(|i| i.bodies)
+}
+
+/// [`import`] with the bodies the file holds that were refused, and why.
+///
+/// The file is hostile input: the parser bounds its size and entity counts, the reader its faces
+/// (`solidcore_step::topology`'s caps) and refuses a body whose references, loops or geometry do
+/// not hold together, and every record it builds is checked again here (`Brep::validate_built`:
+/// every structural check of the record; the item budget of `Brep::validate` is left to the
+/// reader's caps, since it refuses real closed shells of tens of thousands of patches,
+/// `docs/upstream/08-validate-item-budget-large-bspline-shell.md`). A record that fails is refused
+/// with its reason, never returned.
+pub fn import_report(text: &[u8]) -> Result<Imported> {
     check_size(text)?;
     // Part 21 is ASCII (other characters are escaped); a stray byte of another code page can only
     // sit in a string, and is replaced there rather than refusing the file.
     let text = String::from_utf8_lossy(text);
     let exchange = solidcore_step::p21::parse(&text).map_err(|e| op_err("STEP parse", e.to_string()))?;
     let read = solidcore_step::topology::read_solids_with(&exchange, &KernelTrims);
-    if read.solids.is_empty()
-        && let Some(first) = read.failures.first()
+    let mut out = Imported::default();
+    out.refused.extend(read.failures.iter().map(|f| format!("#{}: {}", f.item, f.message)));
+    for solid in read.solids {
+        match solid.brep.validate_built() {
+            Ok(()) => out.bodies.push(solid.brep),
+            Err(e) => out.refused.push(format!("#{}: {e}", solid.item)),
+        }
+    }
+    if out.bodies.is_empty()
+        && let Some(first) = out.refused.first()
     {
         return Err(op_err(
             "STEP import",
-            format!(
-                "no body could be read ({} refused; first, #{}: {})",
-                read.failures.len(),
-                first.item,
-                first.message
-            ),
+            format!("no body could be read ({} refused; first, {first})", out.refused.len()),
         ));
     }
-    Ok(read.solids.into_iter().map(|s| s.brep).collect())
+    Ok(out)
 }
 
 /// Writes solid and sheet records as one STEP file (AP242): each bounded material region as a
@@ -234,6 +259,68 @@ mod tests {
         assert!((frame.origin[2] - 1.0 / 0.25f64.tan()).abs() < 1e-12);
         let fine = Surface::Cone { frame: frame.clone(), radius_at_origin: 1.0, half_angle: 0.25 };
         assert!(step_label(&fine).is_none());
+    }
+
+    fn plate_text() -> String {
+        let b = crate::solid::make_box([0.0; 3], [20.0, 10.0, 8.0]).unwrap();
+        let rec = crate::solid::fillet(&b, &[0], 2.0).unwrap();
+        export_solids(&[("plate", &rec)]).unwrap()
+    }
+
+    /// Every body a hostile file gives passes the record's checks.
+    fn sound(r: &Result<Vec<Brep>>) {
+        if let Ok(bodies) = r {
+            for b in bodies {
+                assert!(b.validate_built().is_ok(), "an invalid record was returned");
+            }
+        }
+    }
+
+    /// A file whose topology does not hold together (an edge's vertex that does not exist, a loop
+    /// that names another face's edge) is refused or read as a valid record, never returned broken.
+    #[test]
+    fn a_file_with_broken_topology_is_refused() {
+        let text = plate_text();
+        let curve = text.lines().find(|l| l.contains("=EDGE_CURVE(")).unwrap();
+        let v = curve.split(',').nth(1).unwrap();
+        let dangling = text.replacen(curve, &curve.replacen(v, "#99999999", 1), 1);
+        let r = import(dangling.as_bytes());
+        assert!(r.is_err(), "a dangling vertex refuses the only body");
+        let edges: Vec<&str> = text.lines().filter(|l| l.contains("=ORIENTED_EDGE(")).collect();
+        let edge_of = |l: &str| l.rsplit(',').nth(1).unwrap().to_string();
+        let (a, b) = (edge_of(edges[0]), edge_of(edges[edges.len() - 1]));
+        assert_ne!(a, b);
+        let crossed = text.replacen(edges[0], &edges[0].replacen(&a, &b, 1), 1);
+        let r = import(crossed.as_bytes());
+        sound(&r);
+        let report = import_report(crossed.as_bytes());
+        if let Ok(i) = &report {
+            eprintln!("crossed loop: {} read, refused {:?}", i.bodies.len(), i.refused);
+        }
+    }
+
+    /// Bytes of a valid file flipped and cut at random: every call returns, and what reads is valid.
+    #[test]
+    fn hostile_step_bytes_never_panic() {
+        let base = plate_text().into_bytes();
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..200 {
+            let mut bytes = base.clone();
+            for _ in 0..1 + next() % 8 {
+                let i = (next() % bytes.len() as u64) as usize;
+                bytes[i] = next() as u8;
+            }
+            if round % 3 == 0 {
+                bytes.truncate((next() % (bytes.len() as u64 + 1)) as usize);
+            }
+            sound(&import(&bytes));
+        }
     }
 
     #[test]
