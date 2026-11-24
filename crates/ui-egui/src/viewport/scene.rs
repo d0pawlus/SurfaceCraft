@@ -1,6 +1,7 @@
 //! What a frame draws: the objects, the camera and the overlay, and the colour state that tells when a
 //! colour buffer must be rewritten.
 use crate::camera::Camera;
+use std::borrow::Cow;
 use std::sync::Arc;
 use surfacecraft_geom::{Mesh, Point3};
 
@@ -118,8 +119,13 @@ fn vertex_colors(item: &DrawItem) -> Option<&Vec<[f32; 4]>> {
     item.colors.as_deref().filter(|c| c.len() == item.mesh.positions.len())
 }
 
-pub(super) fn colors_of(item: &DrawItem) -> Vec<[f32; 4]> {
-    vertex_colors(item).map_or_else(|| vec![item.color; item.mesh.positions.len()], Clone::clone)
+/// The colours to upload: the item's own per-vertex colours as they are (no copy of a
+/// multi-megabyte array per upload), or its one colour on every vertex.
+pub(super) fn colors_of(item: &DrawItem) -> Cow<'_, [[f32; 4]]> {
+    match vertex_colors(item) {
+        Some(c) => Cow::Borrowed(c.as_slice()),
+        None => Cow::Owned(vec![item.color; item.mesh.positions.len()]),
+    }
 }
 
 /// The back colour the shader gets: the item's, unless per-vertex colours are drawn (they are
