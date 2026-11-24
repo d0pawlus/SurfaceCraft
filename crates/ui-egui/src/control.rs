@@ -4,10 +4,18 @@
 //! (`{command, params}`) and `ui.screenshot` (`{width, height}`). Requests are executed on the
 //! UI thread between frames, so the agent sees exactly what the user sees.
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use surfacecraft_engine::json_lines::{LineError, read_line_bounded};
+
+/// Longest request line read from a client that has sent the right token; requests name commands
+/// and their parameters. A longer line ends the connection.
+const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+/// Longest request line read before the client has sent the right token: any local process can
+/// connect, and a client's first request (the bridge asks for `app.commands`) is short.
+const MAX_UNVERIFIED_REQUEST_BYTES: usize = 64 * 1024;
 
 /// A request waiting for the UI thread.
 pub struct Request {
@@ -38,16 +46,27 @@ fn token() -> String {
 fn serve(stream: TcpStream, token: &str, tx: &Sender<Request>, wake: &(dyn Fn() + Send + Sync)) {
     let Ok(read) = stream.try_clone() else { return };
     let mut out = stream;
-    for line in BufReader::new(read).lines() {
-        let Ok(line) = line else { break };
-        if line.len() > 64 * 1024 * 1024 {
-            break;
-        }
+    let mut reader = BufReader::new(read);
+    let mut verified = false;
+    loop {
+        let max = if verified { MAX_REQUEST_BYTES } else { MAX_UNVERIFIED_REQUEST_BYTES };
+        let line = match read_line_bounded(&mut reader, max) {
+            Ok(Some(line)) => line,
+            // a last request without its newline is not answered: clients end every request with one
+            Ok(None) | Err(LineError::Unterminated | LineError::Io(_)) => break,
+            Err(e) => {
+                // the line cannot be answered by its id; the connection ends (a too long line is
+                // still partly unread)
+                let _ = writeln!(out, "{}", json!({"id": Value::Null, "error": e.to_string()}));
+                break;
+            }
+        };
         let msg: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
         let id = msg.get("id").cloned().unwrap_or(Value::Null);
         let reply = if msg.get("token").and_then(Value::as_str) != Some(token) {
             json!({"id": id, "error": "bad token"})
         } else {
+            verified = true;
             let (rtx, rrx) = channel();
             let req = Request {
                 method: msg.get("method").and_then(Value::as_str).unwrap_or("").to_string(),
