@@ -695,6 +695,39 @@ fn a_single_group_whose_snap_does_not_hold_is_merged_as_it_was() {
     assert_eq!(kinds(&batch.brep), vec!["cylinder"]);
 }
 
+/// A group that cannot be snapped is judged at a chord its boundary allows. The fixture of the test above with a
+/// sagitta of 0.1 mm (four ruled patches of 0.2838 rad on a cylinder of radius 10): the straight borders cannot be put
+/// on the cylinder, so the face is merged with its boundary 0.1 mm off its surface. At the display chord (about 0.015
+/// mm for this face) the kernel's mesher refines such a face to its cap of triangles (tangency-labs/solidcraft#17431,
+/// upstream draft 13: offset 0.1 at chord 0.05 and finer); the normal check then tessellates at twice the offset
+/// instead, where the mesh stays small.
+#[test]
+fn a_group_left_unsnapped_is_judged_at_a_chord_its_boundary_allows() {
+    use surfacecraft_kernel::merge::{GroupSpec, merge_faces_onto_shapes};
+    let (r, step) = (10.0_f64, 2.0 * 0.99_f64.acos());
+    let pt = |i: usize, j: usize| {
+        let a = 1.0 + step * i as f64;
+        [r * a.cos(), r * a.sin(), 10.0 * j as f64]
+    };
+    let nets: Vec<Vec<Vec<[f64; 3]>>> =
+        (0..4).map(|i| vec![vec![pt(i, 0), pt(i, 1)], vec![pt(i + 1, 0), pt(i + 1, 1)]]).collect();
+    let id = |i: usize, j: usize| (2 * i + j) as u32;
+    let corners: Vec<[u32; 4]> = (0..4).map(|i| [id(i, 0), id(i + 1, 0), id(i + 1, 1), id(i, 1)]).collect();
+    let body = sheet_from_bezier_network(&nets, &corners).unwrap();
+    let shape = Shape::Cylinder { point: [0.0; 3], axis: [0.0, 0.0, 1.0], radius: r };
+    let faces = [0usize, 1, 2, 3];
+    let batch = merge_faces_onto_shapes(&body, &[GroupSpec { faces: &faces, shape: &shape }], 0.15, &|| false).unwrap();
+    let g = batch.groups[0].as_ref().unwrap_or_else(|e| panic!("the unsnapped group is merged: {e}"));
+    assert!(g.gap > 0.08 && g.gap < 0.12, "the border is a sagitta off the cylinder: {}", g.gap);
+    assert_eq!(kinds(&batch.brep), vec!["cylinder"]);
+    // the defect the chord avoids: the face at the display chord against the chord of the normal check (bounds far from
+    // the measured counts, against the mesher's cap of 20 000 refinements)
+    let fine = tess::tessellate_all(&batch.brep, None).unwrap().triangle_count();
+    let coarse = tess::tessellate_all(&batch.brep, Some(2.0 * g.gap)).unwrap().triangle_count();
+    println!("triangles: {fine} at the display chord, {coarse} at twice the offset");
+    assert!(coarse < 5_000, "{coarse} triangles at twice the offset");
+}
+
 /// A group whose border is a little farther from its plane than the gap (the border samples of the caller's grid are
 /// within it, the edges between them are not: 1.1 times here, 1.008 on a real plane of 1 342 patches) is snapped and
 /// merged, not lost by rounding; one that is far beyond the slack (1.9 times) is refused. The factors are the fixture's
