@@ -1,6 +1,6 @@
 //! Methods of [`PolyMesh`] and [`QuadMesh`]: relaxation, splitting and topology queries.
 use super::{PolyMesh, QuadMesh};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use surfacecraft_geom::{Point3, Vec3, normalize};
 
 impl PolyMesh {
@@ -19,7 +19,20 @@ impl PolyMesh {
         if self.normals.len() != nv {
             return; // a vertex without a normal cannot be relaxed
         }
-        let mut nb: Vec<std::collections::BTreeSet<u32>> = vec![Default::default(); nv];
+        let nb = self.vertex_neighbours();
+        let fixed = self.boundary_vertices();
+        for _ in 0..iterations {
+            let moved = self.relaxed_step(&nb, &fixed, project);
+            for (i, (p, n)) in moved.into_iter().enumerate() {
+                self.vertices[i] = p;
+                self.normals[i] = n;
+            }
+        }
+    }
+
+    /// The edge neighbours of every vertex (one set per vertex, ascending).
+    fn vertex_neighbours(&self) -> Vec<BTreeSet<u32>> {
+        let mut nb: Vec<BTreeSet<u32>> = vec![Default::default(); self.vertices.len()];
         for f in &self.faces {
             for k in 0..f.len() {
                 let (a, b) = (f[k], f[(k + 1) % f.len()]);
@@ -31,7 +44,12 @@ impl PolyMesh {
                 }
             }
         }
-        let mut fixed = vec![false; nv];
+        nb
+    }
+
+    /// Flags the vertices on an edge used by one face only (they stay fixed while relaxing).
+    fn boundary_vertices(&self) -> Vec<bool> {
+        let mut fixed = vec![false; self.vertices.len()];
         let mut uses: BTreeMap<(u32, u32), u32> = BTreeMap::new();
         for f in &self.faces {
             for k in 0..f.len() {
@@ -48,83 +66,124 @@ impl PolyMesh {
                 }
             }
         }
-        for _ in 0..iterations {
-            let mut moved: Vec<(Point3, Vec3)> = Vec::with_capacity(nv);
-            for i in 0..nv {
-                let (p, n) = (self.vertices[i], self.normals[i]);
-                if fixed[i] || nb[i].len() < 3 {
-                    moved.push((p, n));
-                    continue;
-                }
-                let avg: Vec3 =
-                    nb[i].iter().filter_map(|&j| self.vertices.get(j as usize)).map(|q| q.coords).sum::<Vec3>()
-                        / nb[i].len() as f64;
-                let d = avg - p.coords;
-                let target = Point3::from(p.coords + (d - n * d.dot(&n)) * 0.5);
-                moved.push(project(&target, &n).unwrap_or((p, n)));
+        fixed
+    }
+
+    /// The new position and normal of every vertex after one relaxation sweep (computed from the
+    /// positions before the sweep).
+    fn relaxed_step(
+        &self,
+        nb: &[BTreeSet<u32>],
+        fixed: &[bool],
+        project: &dyn Fn(&Point3, &Vec3) -> Option<(Point3, Vec3)>,
+    ) -> Vec<(Point3, Vec3)> {
+        let nv = self.vertices.len();
+        let mut moved: Vec<(Point3, Vec3)> = Vec::with_capacity(nv);
+        for i in 0..nv {
+            let (p, n) = (self.vertices[i], self.normals[i]);
+            if fixed[i] || nb[i].len() < 3 {
+                moved.push((p, n));
+                continue;
             }
-            for (i, (p, n)) in moved.into_iter().enumerate() {
-                self.vertices[i] = p;
-                self.normals[i] = n;
-            }
+            let avg: Vec3 = nb[i].iter().filter_map(|&j| self.vertices.get(j as usize)).map(|q| q.coords).sum::<Vec3>()
+                / nb[i].len() as f64;
+            let d = avg - p.coords;
+            let target = Point3::from(p.coords + (d - n * d.dot(&n)) * 0.5);
+            moved.push(project(&target, &n).unwrap_or((p, n)));
         }
+        moved
     }
 
     /// One Catmull–Clark-style topological split of every face into quads (edge midpoints and a
     /// face centre); `project` moves each new point onto the scan and returns its normal.
     #[must_use]
     pub fn split_to_quads(&self, project: &dyn Fn(&Point3, &Vec3) -> Option<(Point3, Vec3)>) -> QuadMesh {
-        let mut vertices = self.vertices.clone();
-        let mut normals = self.normals.clone();
-        let mut mid: HashMap<(u32, u32), u32> = HashMap::new();
-        let mut faces: Vec<[u32; 4]> = Vec::with_capacity(self.faces.len() * 4);
+        let mut split = QuadSplitter {
+            vertices: self.vertices.clone(),
+            normals: self.normals.clone(),
+            mid: HashMap::new(),
+            faces: Vec::with_capacity(self.faces.len() * 4),
+        };
         for f in &self.faces {
-            let n = f.len();
-            if n < 3 {
+            if f.len() < 3 {
                 continue;
             }
-            let pts: Vec<(Point3, Vec3)> = f
-                .iter()
-                .map(|&i| {
-                    (
-                        vertices.get(i as usize).copied().unwrap_or_else(Point3::origin),
-                        normals.get(i as usize).copied().unwrap_or_else(Vec3::z),
-                    )
-                })
-                .collect();
-            let centre: Vec3 = pts.iter().map(|p| p.0.coords).sum::<Vec3>() / n as f64;
-            let nsum: Vec3 = pts.iter().map(|p| p.1).sum();
-            let nrm = normalize(nsum).unwrap_or_else(Vec3::z);
-            let (cp, cn) = project(&Point3::from(centre), &nrm).unwrap_or((Point3::from(centre), nrm));
-            let c = vertices.len() as u32;
-            vertices.push(cp);
-            normals.push(cn);
-            let mut edge_ids = Vec::with_capacity(n);
-            for k in 0..n {
-                let (a, b) = (f[k], f[(k + 1) % n]);
-                let key = (a.min(b), a.max(b));
-                let id = match mid.get(&key) {
-                    Some(&id) => id,
-                    None => {
-                        let (pa, na) = (pts[k].0, pts[k].1);
-                        let (pb, nb) = (pts[(k + 1) % n].0, pts[(k + 1) % n].1);
-                        let mp = Point3::from((pa.coords + pb.coords) * 0.5);
-                        let mn = normalize(na + nb).unwrap_or(na);
-                        let (p, nn) = project(&mp, &mn).unwrap_or((mp, mn));
-                        let id = vertices.len() as u32;
-                        vertices.push(p);
-                        normals.push(nn);
-                        mid.insert(key, id);
-                        id
-                    }
-                };
-                edge_ids.push(id);
-            }
-            for k in 0..n {
-                faces.push([f[k], edge_ids[k], c, edge_ids[(k + n - 1) % n]]);
-            }
+            split.split_face(f, project);
         }
-        QuadMesh { vertices, normals, faces }
+        QuadMesh { vertices: split.vertices, normals: split.normals, faces: split.faces }
+    }
+}
+
+/// The mesh under construction while [`PolyMesh::split_to_quads`] runs.
+struct QuadSplitter {
+    /// Vertices so far (the original ones, then the added centres and edge midpoints).
+    vertices: Vec<Point3>,
+    /// Normals of `vertices`.
+    normals: Vec<Vec3>,
+    /// The midpoint vertex of every split edge, keyed by its ordered end vertices.
+    mid: HashMap<(u32, u32), u32>,
+    /// The quads so far.
+    faces: Vec<[u32; 4]>,
+}
+
+impl QuadSplitter {
+    /// Splits the face `f` (3 or more vertices) into one quad per corner.
+    fn split_face(&mut self, f: &[u32], project: &dyn Fn(&Point3, &Vec3) -> Option<(Point3, Vec3)>) {
+        let n = f.len();
+        let pts: Vec<(Point3, Vec3)> = f
+            .iter()
+            .map(|&i| {
+                (
+                    self.vertices.get(i as usize).copied().unwrap_or_else(Point3::origin),
+                    self.normals.get(i as usize).copied().unwrap_or_else(Vec3::z),
+                )
+            })
+            .collect();
+        let centre: Vec3 = pts.iter().map(|p| p.0.coords).sum::<Vec3>() / n as f64;
+        let nsum: Vec3 = pts.iter().map(|p| p.1).sum();
+        let nrm = normalize(nsum).unwrap_or_else(Vec3::z);
+        let (cp, cn) = project(&Point3::from(centre), &nrm).unwrap_or((Point3::from(centre), nrm));
+        let c = self.push_vertex(cp, cn);
+        let mut edge_ids = Vec::with_capacity(n);
+        for k in 0..n {
+            edge_ids.push(self.edge_vertex(f, &pts, k, project));
+        }
+        for k in 0..n {
+            self.faces.push([f[k], edge_ids[k], c, edge_ids[(k + n - 1) % n]]);
+        }
+    }
+
+    /// Appends a vertex with its normal and returns its id.
+    fn push_vertex(&mut self, p: Point3, n: Vec3) -> u32 {
+        let id = self.vertices.len() as u32;
+        self.vertices.push(p);
+        self.normals.push(n);
+        id
+    }
+
+    /// The midpoint vertex of edge `k` (to corner `k + 1`) of the face `f` with corners `pts`,
+    /// created on first use.
+    fn edge_vertex(
+        &mut self,
+        f: &[u32],
+        pts: &[(Point3, Vec3)],
+        k: usize,
+        project: &dyn Fn(&Point3, &Vec3) -> Option<(Point3, Vec3)>,
+    ) -> u32 {
+        let n = f.len();
+        let (a, b) = (f[k], f[(k + 1) % n]);
+        let key = (a.min(b), a.max(b));
+        if let Some(&id) = self.mid.get(&key) {
+            return id;
+        }
+        let (pa, na) = (pts[k].0, pts[k].1);
+        let (pb, nb) = (pts[(k + 1) % n].0, pts[(k + 1) % n].1);
+        let mp = Point3::from((pa.coords + pb.coords) * 0.5);
+        let mn = normalize(na + nb).unwrap_or(na);
+        let (p, nn) = project(&mp, &mn).unwrap_or((mp, mn));
+        let id = self.push_vertex(p, nn);
+        self.mid.insert(key, id);
+        id
     }
 }
 

@@ -552,7 +552,7 @@
   "Split parameters.": "Ustawienia dzielenia.",
   "Stanford PLY (binary little endian on write).": "Plik PLY (zapis w postaci binarnej).",
   "Largest region (triangles) that is flattened to give the data their parameters (default 100000, at most 400000); a larger one is fitted on the plane of the outline.": "Największy obszar (w trójkątach), który jest spłaszczany, aby nadać danym parametry (domyślnie 100000, najwyżej 400000); większy jest dopasowywany na płaszczyźnie konturu.",
-  "Start control net `[u, v]`, 4 to `max_control` per direction; omitted: from the number of data points, or 6 by 6 when every side is soft (the net then grows only until the data are within `tolerance`, so a smaller tolerance gives a closer fit).": "Początkowa siatka kontrolna [u, v]: od 4 punktów do największej dozwolonej siatki w każdym kierunku; puste pole: z liczby punktów danych, a gdy wszystkie boki są miękkie: 6 na 6 (siatka gęstnieje wtedy tylko do momentu, gdy dane mieszczą się w tolerancji, więc mniejsza tolerancja daje ciaśniejsze dopasowanie).",
+  "Start control net `[u, v]`, 4 to `max_control` per direction; omitted: from the number of data points.": "Początkowa siatka kontrolna [u, v]: od 4 punktów do największej dozwolonej siatki w każdym kierunku; puste pole: z liczby punktów danych.",
   "Start point.": "Punkt początkowy.",
   "Start.": "Początek.",
   "Stereolithography (binary on write).": "Plik STL (zapis w postaci binarnej).",

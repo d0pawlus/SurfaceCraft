@@ -88,8 +88,14 @@ fn perf_scan_scale() {
             work.seed_fits, work.grow_refits, work.final_fits, work.lm_runs, work.lm_iterations
         );
         let phases = surfacecraft_fit::stats::phase_seconds();
+        // the phase stopwatches run on the worker threads and add up, so their sum is work time
+        // over all threads and can exceed the wall clock: the two are printed side by side, and
+        // no remainder is derived from them
         let timed: f64 = phases.iter().map(|(_, s)| s).sum();
         let list: Vec<String> = phases.iter().map(|(n, s)| format!("{n} {s:.1}")).collect();
-        eprintln!("perf {m} M segment phases (s): {}, patches+growth {:.1}", list.join(", "), segment - timed);
+        eprintln!(
+            "perf {m} M segment phases (s, summed over threads): {}; total {timed:.1} over threads, {segment:.1} wall clock",
+            list.join(", ")
+        );
     }
 }
