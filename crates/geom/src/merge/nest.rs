@@ -7,8 +7,13 @@
 //!
 //! The whole stage has one budget of work (nodes visited, boxes listed, triangles tested),
 //! proportional to the triangles of the closed pieces: a pile of coincident pieces or many
-//! concentric shells cannot make it quadratic. Pieces left when it runs out, and pieces whose test
-//! ran out, are unjudged: counted and reported, taken as inner skins (never refused on that ground).
+//! concentric shells cannot make it quadratic. The pieces are judged largest first, and a piece whose
+//! point no other piece's box holds is decided by that box listing alone (it cannot be an inner
+//! skin), so the large pieces that decide the verdict are judged before a pile of small ones can
+//! spend the budget. Pieces left unjudged (the budget ran
+//! out, or no two directions agreed) are inner skins with a warning while their area stays below
+//! [`INVERTED_MIN_SHARE`] of the scan's; above it the scan is refused, as for loose inverted pieces:
+//! running out never accepts a material inside-out surface.
 use crate::bvh::RayCast;
 use crate::nesting::{DIRECTIONS, MAX_CROSSINGS};
 use crate::{Aabb, Bvh, Cancel, Mesh, Point3, Vec3, pieces};
@@ -55,9 +60,12 @@ pub(super) struct Negative {
     pub(super) skins: usize,
     /// Small loose pieces below [`INVERTED_MIN_SHARE`] of the area all together.
     pub(super) debris: usize,
-    /// Of the inner skins, pieces whose inside test could not be completed within the budget (no two
-    /// directions agreed): taken as inner skins, reported.
+    /// Pieces whose inside test could not be completed within the budget (no two directions
+    /// agreed). Below [`INVERTED_MIN_SHARE`] of the area together they are counted among the inner
+    /// skins (a warning); above it they refuse the scan (`unjudged_refuses`).
     pub(super) unjudged: usize,
+    /// The unjudged pieces cover at least [`INVERTED_MIN_SHARE`] of the scan's area: refused.
+    pub(super) unjudged_refuses: bool,
 }
 
 impl Negative {
@@ -111,9 +119,16 @@ impl Closed<'_> {
         self.cancelled.get()
     }
 
+    /// The point of piece `k` its test starts from (its first triangle's first corner).
+    fn probe(&self, mesh: &Mesh, k: usize) -> Option<Point3> {
+        let t = self.pieces.get(k).and_then(|p| p.triangles.first()).and_then(|&t| mesh.triangles.get(t as usize))?;
+        mesh.positions.get(t[0] as usize).copied()
+    }
+
     /// The pieces other than `k` whose box holds `p`, ascending; `None` when the budget ran out.
     fn holding(&self, k: usize, p: &Point3, cost: &mut Cost) -> Option<Vec<usize>> {
-        let (found, work, out) = self.boxes.candidates_counted(&|b| contains(b, p), cost.left());
+        // capped like a cast: a listing of a pile of coincident boxes costs at most MAX_CAST_WORK
+        let (found, work, out) = self.boxes.candidates_counted(&|b| contains(b, p), cost.left().min(MAX_CAST_WORK));
         cost.work += work;
         if out {
             return None;
@@ -131,8 +146,10 @@ impl Closed<'_> {
     /// along three directions; the verdict of at least two judged directions that agree, else
     /// unknown.
     fn nested(&self, mesh: &Mesh, k: usize, cost: &mut Cost) -> Inside {
-        let probe = self.pieces.get(k).and_then(|p| p.triangles.first()).and_then(|&t| mesh.triangles.get(t as usize));
-        let Some(p) = probe.and_then(|t| mesh.positions.get(t[0] as usize)).copied() else { return Inside::No };
+        let Some(p) = self.probe(mesh, k) else { return Inside::No };
+        if self.polled(cost) {
+            return Inside::Unknown;
+        }
         let Some(holders) = self.holding(k, &p, cost) else { return Inside::Unknown };
         if holders.is_empty() {
             return Inside::No;
@@ -218,8 +235,11 @@ fn closed_set<'p>(mesh: &Mesh, closed: Vec<&'p pieces::Piece>, cancel: &'p Cance
 pub(super) fn negative_pieces_costed(mesh: &Mesh, cancel: &Cancel) -> Option<(Negative, Cost)> {
     let all = pieces::pieces(mesh);
     let closed: Vec<&pieces::Piece> = all.iter().filter(|p| p.closed()).collect();
-    let negative: Vec<usize> =
+    // largest first (ties by order): the pieces that decide the verdict are judged first
+    let mut negative: Vec<usize> =
         (0..closed.len()).filter(|&k| closed.get(k).is_some_and(|p| volume(mesh, p) < 0.0)).collect();
+    let area_of = |k: usize| closed.get(k).map_or(0.0, |p| p.area);
+    negative.sort_by(|&a, &b| area_of(b).total_cmp(&area_of(a)).then(a.cmp(&b)));
     let triangles: usize = closed.iter().map(|p| p.triangles.len()).sum();
     let mut cost =
         Cost { budget: WORK_BASE.saturating_add(WORK_PER_TRIANGLE.saturating_mul(triangles)), ..Cost::default() };
@@ -228,28 +248,43 @@ pub(super) fn negative_pieces_costed(mesh: &Mesh, cancel: &Cancel) -> Option<(Ne
     }
     cost.builds += 1;
     let set = closed_set(mesh, closed, cancel);
-    let area = mesh.area();
-    let (mut out, mut debris_area) = (Negative::default(), 0.0);
-    for &k in &negative {
-        // polled by the work done since the last look (also inside the casts)
-        if set.polled(&mut cost) {
+    let verdicts = judge(&set, mesh, &negative, &mut cost)?;
+    Some((sort_out(&set, mesh.area(), &verdicts), cost))
+}
+
+/// The verdict of every negative piece (`(piece, verdict)`), largest first, within the budget: a
+/// piece no other piece's box holds is decided by its box listing alone (no cast). `None` when
+/// cancelled.
+fn judge(set: &Closed<'_>, mesh: &Mesh, negative: &[usize], cost: &mut Cost) -> Option<Vec<(usize, Inside)>> {
+    let mut verdicts: Vec<(usize, Inside)> = Vec::with_capacity(negative.len());
+    for &k in negative {
+        if set.polled(cost) {
             return None;
         }
-        let Some(p) = set.pieces.get(k) else { continue };
         // once the budget is spent the rest are unjudged without any more work
-        let inside = if cost.left() == 0 { Inside::Unknown } else { set.nested(mesh, k, &mut cost) };
+        let inside = if cost.left() == 0 { Inside::Unknown } else { set.nested(mesh, k, cost) };
         if set.cancelled.get() {
             return None;
         }
+        verdicts.push((k, inside));
+    }
+    Some(verdicts)
+}
+
+/// The verdicts sorted into turned inside out, inner skins, debris and unjudged (see [`Negative`]).
+fn sort_out(set: &Closed<'_>, area: f64, verdicts: &[(usize, Inside)]) -> Negative {
+    let (mut out, mut debris_area, mut unjudged_area) = (Negative::default(), 0.0, 0.0);
+    for &(k, inside) in verdicts {
+        let a = set.pieces.get(k).map_or(0.0, |p| p.area);
         match inside {
             Inside::Yes => out.skins += 1,
             Inside::Unknown => {
-                out.skins += 1;
                 out.unjudged += 1;
+                unjudged_area += a;
             }
-            Inside::No if p.area < INVERTED_MIN_SHARE * area => {
+            Inside::No if a < INVERTED_MIN_SHARE * area => {
                 out.debris += 1;
-                debris_area += p.area;
+                debris_area += a;
             }
             Inside::No => out.inverted += 1,
         }
@@ -258,5 +293,10 @@ pub(super) fn negative_pieces_costed(mesh: &Mesh, cancel: &Cancel) -> Option<(Ne
         out.inverted += out.debris;
         out.debris = 0;
     }
-    Some((out, cost))
+    if unjudged_area >= INVERTED_MIN_SHARE * area {
+        out.unjudged_refuses = true;
+    } else {
+        out.skins += out.unjudged;
+    }
+    out
 }

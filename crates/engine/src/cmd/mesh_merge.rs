@@ -231,7 +231,7 @@ pub struct MergeChecksOut {
 /// Something to know, with its numbers.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 pub struct MergeIssueOut {
-    /// `scans_misaligned`, `opposed_normals`, `inconsistent_winding`, `inverted_scan` (these refuse), `layers_apart`, `overlap_unjudged`, `overlap_too_small`, `non_manifold_input`, `flipped_triangles_dropped`, `inner_skins`, `scans_disjoint`, `scan_fully_covered`, `seam_open`, `seam_over_budget`, `removed_not_covered`, `layers_stacked`, `unwelded_vertices`, `unoriented_edges`, `pinched_vertices`, `other` (an issue without a form of its own).
+    /// `opposed_normals`, `inconsistent_winding`, `inverted_scan` (these refuse), `scans_misaligned` (refuses, a warning under `alignment` "warn"), `layers_apart`, `overlap_unjudged`, `overlap_too_small`, `non_manifold_input`, `flipped_triangles_dropped`, `inner_skins`, `scans_disjoint`, `scan_fully_covered`, `seam_open`, `seam_over_budget`, `removed_not_covered`, `layers_stacked`, `unwelded_vertices`, `unoriented_edges`, `pinched_vertices`, `other` (an issue without a form of its own).
     pub code: String,
     /// `refusal`, `warning` or `info`.
     pub severity: String,

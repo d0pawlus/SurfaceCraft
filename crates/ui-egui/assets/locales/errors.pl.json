@@ -622,6 +622,7 @@
   "{} (unite {})": "{} (łączenie: {})",
   "{} ({} {})": "{} ({} {})",
   "{} `from` points but {} `to` points": "{} w polu „Punkty źródłowe”, ale {} w polu „Punkty docelowe”",
+  "{} closed piece(s) of scan {} have a negative volume and the test whether they lie inside another piece ran out of its budget (a pile of pieces or many nested shells); together they are at least {} % of its area, so they may be turned inside out: repair the scan (mesh.clean) and merge again": "{} zamkniętych kawałków skanu {} ma ujemną objętość, a sprawdzenie, czy leżą wewnątrz innego kawałka, wyczerpało limit (stos kawałków albo wiele zagnieżdżonych powłok); razem obejmują co najmniej {} % jego powierzchni, więc mogą być wywinięte na lewą stronę: napraw skan (mesh.clean) i scal ponownie",
   "{} closed piece(s) of scan {} have a negative volume: turned inside out; orient it outward and merge again": "{} zamkniętych kawałków skanu {} ma ujemną objętość: są wywinięte na lewą stronę; skieruj je na zewnątrz i scal ponownie",
   "{} cut edges ({} mm) stayed open: no triangle there lay on scanned surface without crossing another": "{} przeciętych krawędzi ({} mm) pozostało otwartych: żaden trójkąt nie leżał tam na zeskanowanej powierzchni bez przecinania innego",
   "{} degrees of freedom left": "pozostałe stopnie swobody: {}",

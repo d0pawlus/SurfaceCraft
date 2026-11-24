@@ -182,6 +182,10 @@ pub enum Issue {
     InnerSkins { scan: usize, skins: usize, debris: usize, unjudged: usize },
     /// A closed piece of a scan has a negative volume: turned inside out (refused).
     Inverted { scan: usize, pieces: usize },
+    /// Closed pieces of a scan with a negative volume whose inside test ran out of its budget (a pile
+    /// of pieces, many nested shells) cover at least [`INVERTED_MIN_SHARE`] of its area together:
+    /// they may be turned inside out, so the scan is refused (not lifted by [`Alignment::Warn`]).
+    InvertedUnjudged { scan: usize, pieces: usize },
     /// Exact duplicate triangles and triangles on edges of three or more triangles were left out of a
     /// scan (and count as removed).
     NonManifold { scan: usize, dropped: usize },
@@ -224,6 +228,7 @@ impl Issue {
                 | Issue::Opposed { .. }
                 | Issue::Winding { .. }
                 | Issue::Inverted { .. }
+                | Issue::InvertedUnjudged { .. }
         )
     }
 }
@@ -363,8 +368,12 @@ fn scan_issues(scans: &[Scan]) -> Vec<Issue> {
         if inverted > 0 {
             out.push(Issue::Inverted { scan: k, pieces: inverted });
         }
+        if s.negative.unjudged_refuses {
+            out.push(Issue::InvertedUnjudged { scan: k, pieces: s.negative.unjudged });
+        }
         if skins + debris > 0 {
-            out.push(Issue::InnerSkins { scan: k, skins, debris, unjudged: s.negative.unjudged });
+            let unjudged = if s.negative.unjudged_refuses { 0 } else { s.negative.unjudged };
+            out.push(Issue::InnerSkins { scan: k, skins, debris, unjudged });
         }
     }
     out

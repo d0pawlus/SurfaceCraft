@@ -366,6 +366,11 @@ Normals, colours and per-vertex data go with the coordinates.
       tolerance covers Gaussian noise only). Remedy: a larger tolerance, or `alignment: "warn"`;
     - pairs that touch by too little for a verdict (fewer than 50 points either way) are reported as
       `overlap_too_small`, not judged.
+  - The test whether a closed piece with a negative volume lies inside another (an inner skin) has
+    a work budget proportional to the scan's closed triangles; the largest pieces are judged first.
+    Pieces it cannot judge (a pile of coincident pieces, many nested shells) are reported as
+    unjudged in `inner_skins` (a warning) while they stay under 1 % of the scan's area together,
+    and refuse the scan (`inverted_scan`) above it. `alignment` does not change this.
   - Two OPEN scans that are both turned inside out, consistently, cannot be told from right ones (as
     with `align.pair_coarse`).
   - A wall thinner than the tolerance, seen from its two sides by two different scans only, reads as

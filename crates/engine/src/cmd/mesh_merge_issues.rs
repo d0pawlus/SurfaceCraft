@@ -74,6 +74,15 @@ fn refusal_out(i: &Issue) -> Option<MergeIssueOut> {
                 "{pieces} closed piece(s) of scan {scan} have a negative volume: turned inside out; orient it outward and merge again"
             ),
         ),
+        Issue::InvertedUnjudged { scan, pieces } => issue(
+            "inverted_scan",
+            "refusal",
+            vec![*scan],
+            format!(
+                "{pieces} closed piece(s) of scan {scan} have a negative volume and the test whether they lie inside another piece ran out of its budget (a pile of pieces or many nested shells); together they are at least {:.0} % of its area, so they may be turned inside out: repair the scan (mesh.clean) and merge again",
+                100.0 * surfacecraft_geom::merge::INVERTED_MIN_SHARE
+            ),
+        ),
         _ => return None,
     })
 }
@@ -244,6 +253,7 @@ fn check_notice(i: &Issue) -> MergeIssueOut {
         | Issue::Opposed { .. }
         | Issue::Winding { .. }
         | Issue::Inverted { .. }
+        | Issue::InvertedUnjudged { .. }
         | Issue::InnerSkins { .. }
         | Issue::NonManifold { .. }
         | Issue::Disjoint { .. }

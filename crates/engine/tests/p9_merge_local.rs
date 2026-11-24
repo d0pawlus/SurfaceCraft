@@ -181,6 +181,11 @@ fn run(number: usize, kind: &str, whole: &Mesh, parts: &[Mesh]) {
         v.iter().map(|st| format!("{} {} ms", st["stage"].as_str().unwrap_or(""), st["ms"])).collect()
     });
     eprintln!("|   | stages: {} |", stages.join(", "));
+    // inner skins: `info` when every negative piece was judged, `warning` when some ran out of the
+    // nesting budget
+    for i in out["issues"].as_array().into_iter().flatten().filter(|i| i["code"] == "inner_skins") {
+        eprintln!("|   | inner_skins: {} |", i["severity"]);
+    }
     let shares: Vec<String> = out["pairs"]
         .as_array()
         .into_iter()
