@@ -1,8 +1,14 @@
 //! Bridged mode: commands go to a running desktop app over its localhost control channel.
 use crate::Backend;
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
+use std::io::{BufReader, Write};
+use std::net::{Shutdown, TcpStream};
+use surfacecraft_engine::json_lines::{LineError, read_line_bounded};
+
+/// Longest reply line read from the app. The largest reply is a screenshot: the bridge clamps it
+/// to 4096 x 4096, whose PNG is at most about 64 MiB (RGBA that does not compress) and about
+/// 86 MiB in base64; 128 MiB leaves room for that and for large command results.
+const MAX_REPLY_BYTES: usize = 128 * 1024 * 1024;
 
 /// A connection to a running app.
 pub struct BridgeBackend {
@@ -33,8 +39,18 @@ impl BridgeBackend {
         self.next += 1;
         let msg = json!({"token": self.token, "id": id, "method": method, "params": params});
         writeln!(self.stream, "{msg}").map_err(|e| json!({"kind": "failed", "message": e.to_string()}))?;
-        let mut line = String::new();
-        self.reader.read_line(&mut line).map_err(|e| json!({"kind": "failed", "message": e.to_string()}))?;
+        let line = match read_line_bounded(&mut self.reader, MAX_REPLY_BYTES) {
+            Ok(Some(line)) => line,
+            Ok(None) => return Err(json!({"kind": "failed", "message": "the app closed the connection"})),
+            Err(e) => {
+                if matches!(e, LineError::TooLong(_)) {
+                    // the rest of that reply is still unread: later replies would be misread
+                    let _ = self.stream.shutdown(Shutdown::Both);
+                }
+                return Err(json!({"kind": "failed", "message": format!("reply from the app: {e}")}));
+            }
+        };
+        // a plain JSON value (no typed deserialisation), from a line of bounded length
         let v: Value = serde_json::from_str(&line).map_err(|e| json!({"kind": "failed", "message": e.to_string()}))?;
         match (v.get("result"), v.get("error")) {
             (Some(r), _) => Ok(r.clone()),

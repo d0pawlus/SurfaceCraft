@@ -16,6 +16,7 @@
 pub mod cmd;
 pub mod display;
 pub mod job;
+pub mod json_lines;
 pub mod replay;
 pub mod session;
 
