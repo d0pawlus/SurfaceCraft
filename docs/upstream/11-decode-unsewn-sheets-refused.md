@@ -1,5 +1,7 @@
 # Draft 11: decoding a record of separate (unsewn) sheets fails, so separate sheets cannot be sewn
 
+Update 2026-11-16 (P9-O8, pin `c02c5c51c`): the application sews separate sheets with `solidcore_ops::stitch::sew` on sheets decoded one by one (`surface.sew`); six one-face sheets of a block and of a domed block close into solids of the exact volume. Nothing to file.
+
 Status: not filed (2026-11-15). It does not reproduce as a defect on the current head (`74300b3`). Kernel-only test
 `crates/solidcore-ops/tests/record_sheets_repro.rs` (`unsewn_*`) on the branch `repro/surfacecraft-kernel-limits` of d0pawlus/solidcore: a record of
 six separate sheets (a 40 x 30 x 20 mm block, bilinear faces; and bicubic Bezier faces with a flat and a 6 mm domed top), own edges and

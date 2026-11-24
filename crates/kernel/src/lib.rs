@@ -25,6 +25,7 @@ pub mod nurbs;
 pub mod patch_fit;
 pub mod pcurve;
 pub mod refit;
+pub mod sew;
 pub mod solid;
 pub mod step;
 pub mod tess;
