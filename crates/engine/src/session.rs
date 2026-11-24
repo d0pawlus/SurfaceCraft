@@ -92,10 +92,23 @@ const LOG_CAP: usize = 1000;
 /// Nothing else is run by `query`.
 const QUERY_COMMANDS: &[&str] = &["deviation.at"];
 
+/// The kernel's upstream fixes, off unless `SURFACECRAFT_UPSTREAM_FIXES=1` (a measurement switch of
+/// the solidcore pin migration; which fixes the application runs with is an owner decision). Read
+/// once per process.
+fn upstream_fixes_from_env() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if let Err(e) = surfacecraft_kernel::fixes::apply_from_env() {
+            eprintln!("{}: {e}", surfacecraft_kernel::fixes::ENV);
+        }
+    });
+}
+
 impl Session {
     /// A new, empty session; file access allowed except on wasm.
     #[must_use]
     pub fn new() -> Self {
+        upstream_fixes_from_env();
         Self { allow_files: !cfg!(target_arch = "wasm32"), ..Self::default() }
     }
 

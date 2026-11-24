@@ -3,79 +3,41 @@
 //! its loops, are the kernel's, not computed here.
 //!
 //! The boundary edges of the group, as the record has them (their curves and vertices), and the
-//! primitive go to the kernel's topology builder as a one-face sheet of the neutral model the STEP
-//! importer builds from (`step_brep::build_from_topology`). The builder projects the edges onto the
-//! surface, chooses the parameter box and the seam, and orients the loops; its record of the face is
+//! primitive go to the kernel's assembly of loose faces, edges and vertices as a one-face sheet (the
+//! stage the STEP reader builds its bodies with, `solidcore_step::assembly`). The assembly makes the
+//! pcurves, chooses the parameter box and the seam, and checks the loops; its record of the face is
 //! read back, and its loops are mapped to the edges of the body by their end points.
-use super::boundary::Boundary;
-use crate::record::brep::{Brep, Curve, Curve2, Edge, Face, Loop, OrientedEdge, Surface};
+use super::boundary::{Boundary, LoopEdge};
+use crate::record::brep::{Brep, Curve, Curve2, Face, Loop, OrientedEdge, Surface};
+use crate::step::KernelTrims;
 use crate::{KernelError, Result, op_err};
+use solidcore_step::assembly::{Assembly, Bound, Kind};
 use std::collections::BTreeMap;
-use step_import::model as m;
 
 /// End points closer than this (mm) are the same point when the kernel's edges are mapped back.
 const SAME_POINT: f64 = 1e-6;
+
+/// The least tolerance the face is assembled at (mm).
+const MIN_TOLERANCE: f64 = 1e-7;
 
 fn refuse(what: impl Into<String>) -> KernelError {
     KernelError::Argument(what.into())
 }
 
-/// The distinct knots of a clamped knot vector and their multiplicities.
-fn distinct(knots: &[f64]) -> (Vec<f64>, Vec<u32>) {
-    let mut values: Vec<f64> = Vec::new();
-    let mut mults: Vec<u32> = Vec::new();
-    for &k in knots {
-        if values.last() == Some(&k) {
-            if let Some(last) = mults.last_mut() {
-                *last += 1;
-            }
-        } else {
-            values.push(k);
-            mults.push(1);
+/// The record surface the kernel's assembly is given for the face: a plane, cylinder, cone (opening
+/// along its axis) or sphere, as the hybrid merge places groups on.
+fn checked_surface(s: &Surface) -> Result<Surface> {
+    match s {
+        Surface::Plane { .. } | Surface::Cylinder { .. } | Surface::Sphere { .. } => Ok(s.clone()),
+        Surface::Cone { half_angle, radius_at_origin, .. } if *half_angle > 0.0 && *radius_at_origin >= 0.0 => {
+            Ok(s.clone())
         }
+        _ => Err(refuse("the kernel's assembly is given a plane, cylinder, cone (opening along its axis) or sphere")),
     }
-    (values, mults)
-}
-
-fn model_curve(e: &Edge) -> Result<m::Curve> {
-    let Curve::Spline { knots, points } = &e.curve else { return Err(refuse("a boundary edge is not a spline")) };
-    let degree =
-        knots.len().checked_sub(points.len() + 1).ok_or_else(|| refuse("a boundary edge has a bad knot vector"))?;
-    let (knots, mults) = distinct(knots);
-    Ok(m::Curve::BSpline(m::BSplineCurve {
-        degree: u32::try_from(degree).map_err(|_| refuse("degree"))?,
-        points: points.clone(),
-        weights: None,
-        knots,
-        mults,
-    }))
-}
-
-fn frame(f: &crate::record::brep::Frame) -> m::Frame {
-    let z = crate::hybrid::cross(f.x_axis, f.y_axis);
-    m::Frame { origin: f.origin, x: f.x_axis, y: f.y_axis, z }
-}
-
-fn model_surface(s: &Surface) -> Result<m::Surface> {
-    Ok(match s {
-        Surface::Plane { origin, u_axis, v_axis } => m::Surface::Plane {
-            frame: frame(&crate::record::brep::Frame { origin: *origin, x_axis: *u_axis, y_axis: *v_axis }),
-        },
-        Surface::Cylinder { frame: f, radius } => m::Surface::Cylinder { frame: frame(f), radius: *radius },
-        Surface::Cone { frame: f, radius_at_origin, half_angle } if *half_angle > 0.0 && *radius_at_origin >= 0.0 => {
-            m::Surface::Cone { frame: frame(f), radius: *radius_at_origin, semi_angle_deg: half_angle.to_degrees() }
-        }
-        Surface::Sphere { frame: f, radius } => m::Surface::Sphere { frame: frame(f), radius: *radius },
-        _ => {
-            return Err(refuse(
-                "the kernel's builder takes a plane, cylinder, cone (opening along its axis) or sphere",
-            ));
-        }
-    })
 }
 
 /// The extent of a loop: the diagonal of the box of its edges' control points (mm).
-fn extent(body: &Brep, l: &[super::boundary::LoopEdge]) -> f64 {
+fn extent(body: &Brep, l: &[LoopEdge]) -> f64 {
     let mut lo = [f64::INFINITY; 3];
     let mut hi = [f64::NEG_INFINITY; 3];
     for le in l {
@@ -93,81 +55,84 @@ fn extent(body: &Brep, l: &[super::boundary::LoopEdge]) -> f64 {
 
 /// The loops of a boundary, the largest first: it is the outer one, a hole is inside it and smaller (the
 /// boundary lists its loops by edge number, which says nothing of which is outer).
-fn by_size<'a>(body: &Brep, loops: &'a [Vec<super::boundary::LoopEdge>]) -> Vec<&'a Vec<super::boundary::LoopEdge>> {
-    let mut sized: Vec<(f64, &Vec<super::boundary::LoopEdge>)> = loops.iter().map(|l| (extent(body, l), l)).collect();
+fn by_size<'a>(body: &Brep, loops: &'a [Vec<LoopEdge>]) -> Vec<&'a Vec<LoopEdge>> {
+    let mut sized: Vec<(f64, &Vec<LoopEdge>)> = loops.iter().map(|l| (extent(body, l), l)).collect();
     sized.sort_by(|a, b| b.0.total_cmp(&a.0));
     sized.into_iter().map(|(_, l)| l).collect()
 }
 
-/// The vertices and edges of the model as they are first used, and the body's edge each model edge is.
-#[derive(Default)]
-struct Parts {
-    vertex_of: BTreeMap<u32, usize>,
-    edge_of: BTreeMap<u32, usize>,
-    vertices: Vec<m::Vertex>,
-    edges: Vec<m::Edge>,
+/// The vertices and edges handed to the assembly as they are first used, and the body's edges in
+/// that order.
+struct Parts<'t> {
+    assembly: Assembly<'t>,
+    vertex_of: BTreeMap<u32, u32>,
+    edge_of: BTreeMap<u32, (u32, bool)>,
     source: Vec<u32>,
 }
 
-impl Parts {
-    fn vertex(&mut self, body: &Brep, v: u32) -> Result<usize> {
+impl Parts<'_> {
+    fn vertex(&mut self, body: &Brep, v: u32) -> Result<u32> {
         if let Some(&i) = self.vertex_of.get(&v) {
             return Ok(i);
         }
         let point = body.vertices.get(v as usize).ok_or_else(|| refuse("vertex index"))?.point;
-        self.vertices.push(m::Vertex { step_id: self.vertices.len() as u64 + 1, point });
-        self.vertex_of.insert(v, self.vertices.len() - 1);
-        Ok(self.vertices.len() - 1)
+        let i = self.assembly.add_vertex(point).map_err(|e| op_err("assembly vertex", e))?;
+        self.vertex_of.insert(v, i);
+        Ok(i)
     }
 
-    /// The model edge of the body's edge `edge` (made when it is first used).
-    fn edge(&mut self, body: &Brep, edge: u32) -> Result<usize> {
+    /// The assembly edge of the body's edge `edge` (made when it is first used), and whether it runs
+    /// the way the body's edge does.
+    fn edge(&mut self, body: &Brep, edge: u32) -> Result<(u32, bool)> {
         if let Some(&i) = self.edge_of.get(&edge) {
             return Ok(i);
         }
         let e = body.edges.get(edge as usize).ok_or_else(|| refuse("edge index"))?;
-        let (start, end) = (self.vertex(body, e.vertices[0])?, self.vertex(body, e.vertices[1])?);
-        self.edges.push(m::Edge {
-            step_id: self.edges.len() as u64 + 1,
-            start,
-            end,
-            curve: model_curve(e)?,
-            same_sense: true,
-            t_start: e.interval[0],
-            t_end: e.interval[1],
-        });
+        if !matches!(e.curve, Curve::Spline { .. }) {
+            return Err(refuse("a boundary edge is not a spline"));
+        }
+        let ends = [self.vertex(body, e.vertices[0])?, self.vertex(body, e.vertices[1])?];
+        let added = self
+            .assembly
+            .add_edge(u64::from(edge) + 1, e.curve.clone(), e.interval, ends)
+            .map_err(|m| op_err("assembly edge", m))?;
         self.source.push(edge);
-        self.edge_of.insert(edge, self.edges.len() - 1);
-        Ok(self.edges.len() - 1)
+        self.edge_of.insert(edge, added);
+        Ok(added)
     }
 }
 
-/// The neutral model of the group's boundary on `surface`: one face, its edges and vertices numbered as
-/// they first appear, and the body's edge each model edge is.
-fn model_of(body: &Brep, b: &Boundary, surface: &Surface, same_sense: bool) -> Result<(m::Body, Vec<u32>)> {
-    let mut parts = Parts::default();
-    let mut loops: Vec<m::Loop> = Vec::new();
+/// The group's boundary on `surface` as one face the kernel assembles into a one-face sheet record,
+/// and the body's edges that went into it. Each loop is given relative to the surface's natural
+/// normal: reversed where the face's side is not that normal.
+fn assembled(body: &Brep, b: &Boundary, surface: &Surface, same_sense: bool) -> Result<(Brep, Vec<u32>)> {
+    let trims = KernelTrims;
+    let assembly = Assembly::new(body.tolerance.max(MIN_TOLERANCE), Some(&trims));
+    let mut parts = Parts { assembly, vertex_of: BTreeMap::new(), edge_of: BTreeMap::new(), source: Vec::new() };
+    let mut bounds = Vec::new();
     for l in by_size(body, &b.loops) {
         let mut uses = Vec::with_capacity(l.len());
         for le in l {
-            uses.push(m::OrientedEdge { edge: parts.edge(body, le.edge)?, forward: le.forward });
+            let (e, along) = parts.edge(body, le.edge)?;
+            uses.push((e, le.forward == along));
         }
-        loops.push(m::Loop { outer: loops.is_empty(), orientation: true, bound: m::Bound::Edges(uses) });
+        if !same_sense {
+            uses.reverse();
+            for u in &mut uses {
+                u.1 = !u.1;
+            }
+        }
+        bounds.push(Bound::Edges(uses));
     }
-    let face = m::Face { step_id: 1, surface: model_surface(surface)?, same_sense, loops };
-    let shell = m::Shell { step_id: 1, closed: false, orientation: true, faces: vec![0] };
-    let model = m::Body {
-        step_id: 1,
-        name: None,
-        kind: m::BodyKind::ShellModel,
-        unit_mm: 1.0,
-        uncertainty_mm: None,
-        shells: vec![shell],
-        faces: vec![face],
-        edges: parts.edges,
-        vertices: parts.vertices,
-    };
-    Ok((model, parts.source))
+    let face = parts
+        .assembly
+        .add_face(1, checked_surface(surface)?, bounds, Some(0), same_sense)
+        .map_err(|m| op_err("assembly face", m))?;
+    let solid = parts
+        .assembly
+        .finish(1, String::new(), vec![vec![(face, true)]], Kind::Model)
+        .map_err(|m| op_err("assembly", m))?;
+    Ok((solid.brep, parts.source))
 }
 
 /// A pcurve of the kernel's edge as it runs along the body's edge: reversed where the two run opposite
@@ -236,18 +201,9 @@ fn face_over(body: &Brep, rec: &Brep, source: &[u32]) -> Result<Face> {
 /// of the record), built by the kernel; its loops are over the edges of `body`.
 ///
 /// # Errors
-/// A boundary the kernel's builder does not take, or whose face needs an edge the body has not (a
+/// A boundary the kernel's assembly does not take, or whose face needs an edge the body has not (a
 /// seam).
 pub(super) fn built_face(body: &Brep, b: &Boundary, surface: &Surface, same_sense: bool) -> Result<Face> {
-    let (model, source) = model_of(body, b, surface, same_sense)?;
-    let built = step_brep::build_from_topology(&model, step_brep::BuildOptions::default())
-        .map_err(|e| op_err("step_brep::build_from_topology", format!("{e:?}")))?;
-    if let Some(f) = built.face_failures.first() {
-        return Err(refuse(format!("the kernel could not build the face: {f:?}")));
-    }
-    let mut brep = built.brep;
-    let mut k = solidcore::kernel::Kernel::new(&solidcore::kernel::KernelOptions::default());
-    let (rec, _) =
-        solidcore_convert::brep::to_record(&mut k, &mut brep).map_err(|e| op_err("to_record", format!("{e:?}")))?;
+    let (rec, source) = assembled(body, b, surface, same_sense)?;
     face_over(body, &rec, &source)
 }

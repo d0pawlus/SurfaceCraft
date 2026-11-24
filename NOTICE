@@ -9,11 +9,11 @@ Third-party material
 
 - solidcore (https://github.com/tangency-labs/solidcore), Apache-2.0: the B-rep kernel, used as a
   dependency (crates solidcore, solidcore-ops, solidcore-record, solidcore-convert, solidcore-tess,
-  step-brep, step-export), pinned by git revision. Only crates/kernel depends on it.
+  solidcore-step), pinned by git revision. Only crates/kernel depends on it.
 
 - SolidCraft (https://github.com/tangency-labs/solidcraft), MIT OR Apache-2.0, Copyright (c) 2026 SolidCraft
-  contributors: the STEP open-shell writer in crates/io/src/step/ is adapted from its crates/step, and
-  the IGES writer crates/io/src/iges.rs from its crates/kernel/src/iges_out.rs (both modified).
+  contributors: the IGES writer crates/io/src/iges.rs is adapted from its crates/kernel/src/iges_out.rs
+  (modified).
 
 - Instant Meshes (https://github.com/wjakob/instant-meshes; permissive licence, see its LICENSE.txt: design doc §10
   records it as MIT, the repository file reads BSD-3-Clause; re-check before any source is adapted), Copyright (c)

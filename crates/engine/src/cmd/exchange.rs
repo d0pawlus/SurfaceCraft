@@ -71,18 +71,11 @@ fn finish(s: &Session, text: String, path: Option<String>, bodies: usize, conten
     }
 }
 
-/// The STEP text of solid bodies: our compact writer (shared vertices, edge curves and control
-/// points; a few KB per spline patch) for what it supports, the solidcore exporter (about 24 KB
-/// per patch) for the rest. A record the compact writer rejects as invalid stays an error.
+/// The STEP text of solid bodies (solidcore's writer: vertices, edge curves and control points
+/// written once and shared).
 fn solids_text(name: &str, items: &[(String, Brep)]) -> CmdResult<String> {
     let bodies: Vec<&Brep> = items.iter().map(|(_, b)| b).collect();
-    match surfacecraft_io::step::write_solids(name, &bodies) {
-        Err(surfacecraft_io::IoError::Unsupported(_)) => {
-            let refs: Vec<(&str, &Brep)> = items.iter().map(|(n, b)| (n.as_str(), b)).collect();
-            Ok(surfacecraft_kernel::step::export_solids(&refs)?)
-        }
-        other => Ok(other?),
-    }
+    Ok(surfacecraft_io::step::write_solids(name, &bodies)?)
 }
 
 fn export_step(s: &mut Session, i: ExportIn) -> CmdResult<ExportOut> {

@@ -1304,6 +1304,10 @@ solidcore-record 0.1.0
     licence: Apache-2.0
     source: https://github.com/tangency-labs/solidcore
 
+solidcore-step 0.1.0
+    licence: Apache-2.0
+    source: 
+
 solidcore-tess 0.1.0
     licence: Apache-2.0
     source: https://github.com/tangency-labs/solidcore
@@ -1323,18 +1327,6 @@ spirv 0.4.0+sdk-1.4.341.0
 static_assertions 1.1.0
     licence: MIT OR Apache-2.0
     source: https://github.com/nvzqz/static-assertions-rs
-
-step-brep 0.1.0
-    licence: Apache-2.0
-    source: 
-
-step-export 0.1.0
-    licence: Apache-2.0
-    source: 
-
-step-import 0.1.0
-    licence: Apache-2.0
-    source: 
 
 strict-num 0.1.1
     licence: MIT

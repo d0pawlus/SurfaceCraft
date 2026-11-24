@@ -17,6 +17,7 @@ fn surface_name(s: &Surface) -> &'static str {
         Surface::Spline { .. } => "spline",
         Surface::RationalSpline { .. } => "rational spline",
         Surface::PlacedRevolution { .. } => "placed revolution",
+        Surface::Blend { .. } => "blend",
     }
 }
 

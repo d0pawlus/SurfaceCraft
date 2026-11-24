@@ -160,6 +160,7 @@ impl<'a> Ctx<'a> {
             Surface::BallPatch { center, .. } => ("sphere", [0.0; 3], Some((*center, [0.0; 3]))),
             Surface::PlacedRevolution { origin, axis, .. } => ("revolution", unit(*axis), Some((*origin, unit(*axis)))),
             Surface::Spline { .. } | Surface::RationalSpline { .. } => ("spline", [0.0; 3], None),
+            Surface::Blend { .. } => ("blend", [0.0; 3], None),
         };
         // centroid: mean of the distinct edges of the outer loop
         let mut pts: Vec<V3> = Vec::new();

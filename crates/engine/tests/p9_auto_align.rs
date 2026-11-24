@@ -144,6 +144,11 @@ fn scanned_block(sigma: f64) -> Mesh {
         .map(|(i, _)| i)
         .collect();
     s.execute("body.fillet", json!({"object": "block", "edges": edges, "size": 5.0})).unwrap();
+    // the CAD base is z = 0 (the scan's own box holds its debris, wherever the defects put it)
+    let cad =
+        surfacecraft_kernel::tess::tessellate(&s.doc.bodies.iter().find(|b| b.name == "block").unwrap().brep, None);
+    let b = cad.unwrap().bbox();
+    assert!(b.min.z.abs() < 1e-6, "the CAD base is z = 0: {b:?}");
     scanify_body(&mut s, "block", sigma, 11)
 }
 
@@ -221,8 +226,6 @@ fn gate_p9_auto_scanned_bracket_five_poses() {
 #[test]
 fn gate_p9_auto_scanned_block_five_poses() {
     let mesh = scanned_block(0.03);
-    let b = mesh.bbox();
-    assert!((b.min.z).abs() < 0.2, "the CAD base is z = 0: {b:?}");
     let truth = Truth {
         bases: vec![(Point3::new(20.0, 15.0, 0.0), -Vec3::z()), (Point3::new(20.0, 15.0, 15.0), Vec3::z())],
         long_dir: Vec3::x(),

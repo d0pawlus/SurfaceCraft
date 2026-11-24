@@ -71,3 +71,28 @@ fn tessellation_is_bit_identical_on_one_and_on_eight_threads_and_between_runs() 
         assert_eq!(one.tri_face, other.tri_face);
     }
 }
+
+/// A box with its four vertical edges rounded (r 5) tessellates within the box: no triangle of a
+/// round leaves it.
+#[test]
+fn a_box_with_rounded_vertical_edges_tessellates_within_the_box() {
+    let size = [40.0, 30.0, 15.0];
+    let b = surfacecraft_kernel::solid::make_box([0.0; 3], size).unwrap();
+    let vertical: Vec<usize> = b
+        .edges
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| {
+            let (p, q) = (b.vertices[e.vertices[0] as usize].point, b.vertices[e.vertices[1] as usize].point);
+            (p[0] - q[0]).abs() < 1e-9 && (p[1] - q[1]).abs() < 1e-9
+        })
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(vertical.len(), 4);
+    let r = surfacecraft_kernel::solid::fillet(&b, &vertical, 5.0).unwrap();
+    let m = surfacecraft_kernel::tess::tessellate(&r, Some(0.01)).unwrap();
+    let bb = m.bbox();
+    let tol = 1e-3;
+    assert!(bb.min.x > -tol && bb.min.y > -tol && bb.min.z > -tol, "{bb:?}");
+    assert!(bb.max.x < size[0] + tol && bb.max.y < size[1] + tol && bb.max.z < size[2] + tol, "{bb:?}");
+}

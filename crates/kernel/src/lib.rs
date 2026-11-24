@@ -1,5 +1,5 @@
 //! SurfaceCraft kernel adapter (layer L1): the one place that talks to solidcore
-//! (`solidcore-ops`, `solidcore-record`, `solidcore-tess`, `step-*`), design doc §5/§9.
+//! (`solidcore-ops`, `solidcore-record`, `solidcore-tess`, `solidcore-step`), design doc §5/§9.
 //!
 //! Bodies cross this boundary as the neutral record ([`record::Brep`]): it is plain data
 //! (`Clone`, `Send`, serde), so the document can snapshot it for undo and save it in a
@@ -16,6 +16,7 @@
 
 mod blends;
 pub mod feature;
+pub mod fixes;
 pub mod hybrid;
 pub mod local;
 pub mod merge;

@@ -396,7 +396,10 @@ fn gate_p8_b2_l_window_with_a_reflex_round() {
     let v_cad = solid::volume(&cad).unwrap();
     eprintln!("CAD: {} faces, {v_cad:.3} mm3 (closed form {:.3})", cad.faces.len(), 20000.0 - area * 10.0);
     assert!((v_cad - (20000.0 - area * 10.0)).abs() < 1e-3);
-    let mut s = scanned_session(&cad, 131);
+    // seed 131 until the solidcore pin of P9-O8: its scan on the new tessellation has a filled hole
+    // over the plate's corner 0.435 mm off the CAD part (printed: scan to CAD), and the gate cannot be
+    // better than its scan
+    let mut s = scanned_session(&cad, 132);
     let mut prims = planes(
         &mut s,
         &[

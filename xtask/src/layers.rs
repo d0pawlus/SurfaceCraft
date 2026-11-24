@@ -50,16 +50,8 @@ const UI_CRATES: &[&str] = &[
 ];
 
 /// solidcore crates, allowed only in the kernel adapter.
-const SOLIDCORE: &[&str] = &[
-    "solidcore",
-    "solidcore-ops",
-    "solidcore-record",
-    "solidcore-convert",
-    "solidcore-tess",
-    "step-brep",
-    "step-export",
-    "step-import",
-];
+const SOLIDCORE: &[&str] =
+    &["solidcore", "solidcore-ops", "solidcore-record", "solidcore-convert", "solidcore-tess", "solidcore-step"];
 
 fn layer(name: &str) -> Option<u8> {
     LAYERS.iter().find(|(n, _)| *n == name).map(|(_, l)| *l)
