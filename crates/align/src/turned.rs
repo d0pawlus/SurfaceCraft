@@ -28,8 +28,11 @@ const SECTORS: usize = 12;
 const MAX_RADIUS_SPREAD: f64 = 0.03;
 /// Every sector holds at least this share of the sampled vertices.
 const MIN_SECTOR_SHARE: f64 = 0.005;
-/// The outer radius of a sector: this quantile of its vertices' distances from the axis.
-const OUTER_QUANTILE: f64 = 0.99;
+/// The outer radius of a sector: this quantile of its vertices' distances from the axis. A scan's
+/// floating debris patch on the side (a few vertices a few spacings out) holds more than 1 % of a
+/// sector's vertices and once moved one sector's 0.99 quantile out by 2 mm, so a pin was not
+/// turned; the side of a turned part holds far more than 5 % of every sector's outer vertices.
+const OUTER_QUANTILE: f64 = 0.95;
 
 /// The axis of a turned part.
 pub(crate) struct Turned {

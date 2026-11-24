@@ -162,7 +162,7 @@ fn scanify_body(s: &mut Session, body: &str, sigma: f64, seed: u64) -> Mesh {
 }
 
 /// The scan-corpus pin: cylinder r = 12, h = 30, 3 mm chamfer on the top edge, through hole r = 4.
-fn scanned_pin_with_hole(sigma: f64) -> Mesh {
+fn scanned_pin_with_hole(sigma: f64, seed: u64) -> Mesh {
     let mut s = Session::new();
     s.execute("body.cylinder", json!({"radius": 12.0, "height": 30.0, "name": "pin"})).unwrap();
     let b = s.doc.bodies.iter().find(|b| b.name == "pin").unwrap();
@@ -177,7 +177,7 @@ fn scanned_pin_with_hole(sigma: f64) -> Mesh {
     let pin = (*s.doc.body(s.doc.find_by_name("pin").unwrap().0).unwrap().brep).clone();
     let part = boolean(&pin, &hole, BoolKind::Subtract).unwrap();
     s.doc.add_body("part", part);
-    scanify_body(&mut s, "part", sigma, 8)
+    scanify_body(&mut s, "part", sigma, seed)
 }
 
 fn bracket_without_bottom(sigma: f64, seed: u64) -> (Mesh, Mesh) {
@@ -238,7 +238,7 @@ fn gate_p9_auto_scanned_block_five_poses() {
 /// z = 0 within 0.05 mm.
 #[test]
 fn gate_p9_auto_turned_part() {
-    let mesh = scanned_pin_with_hole(0.03);
+    let mesh = scanned_pin_with_hole(0.03, 8);
     for (k, pose) in poses().iter().take(3).enumerate() {
         let mut s = session_with(&mesh, pose);
         let out = s.execute("align.auto", json!({"object": "part", "apply": true})).unwrap();
@@ -779,4 +779,14 @@ fn perf_auto_align_large_mesh() {
     let t = std::time::Instant::now();
     let out = s.execute("align.auto", json!({"object": "part"})).unwrap();
     eprintln!("align.auto on {} triangles: {:?} ({})", m.triangle_count(), t.elapsed(), out["method"]);
+}
+
+/// The pin scanned with seed 3 has a floating debris patch on its side, 2 mm out (it moved one
+/// sector's outer radius by 2 mm when that was the 0.99 quantile): still a turned part.
+#[test]
+fn a_turned_part_with_debris_on_its_side_is_turned() {
+    let mesh = scanned_pin_with_hole(0.03, 3);
+    let mut s = session_with(&mesh, &poses()[0]);
+    let out = s.execute("align.auto", json!({"object": "part", "apply": true})).unwrap();
+    assert_eq!(out["method"], "turned", "{out}");
 }

@@ -2,8 +2,9 @@
 //! and the parametric features (P5).
 //!
 //! Every test asserts the EXPECTED, correct behaviour and is `#[ignore]`d while it fails on the pinned
-//! solidcore (`c02c5c5` since P9-O8) and is meant to pass once upstream fixes the problem; the two that
-//! pass on `c02c5c5` (the narrowing cone's STEP round trip, the turned box's record) run as regressions.
+//! solidcore (`c02c5c5` since P9-O8) and is meant to pass once upstream fixes the problem; the narrowing
+//! cone's STEP round trip passes on `c02c5c5` and runs as a regression; the turned box's record reads
+//! back on macOS and Linux but not on Windows, so it stays ignored.
 //! With `SURFACECRAFT_UPSTREAM_FIXES=1` every opt-in upstream fix is on: on `c02c5c5` the filleted,
 //! pocketed plate's shell then reads back too, and the near-coaxial cylinders fail with `NotSolid`
 //! instead of status 1001. Run them with
@@ -144,6 +145,7 @@ fn round_trip(body: &ops::Body, what: &str) -> Result<ops::Body, String> {
 /// not. Of 200 pseudo-random rotations of this box 27 fail; the same box turned about z in whole
 /// degrees (360 of them) or translated (100 of them) never does.
 #[test]
+#[ignore = "solidcore c02c5c5: passes on macOS and Linux; on Windows the turned box's record is refused (the plane's axes are not square)"]
 fn turned_box_reads_back_from_its_record() {
     fixes_from_env();
     let b = ops::make_box([0.0; 3], [50.0, 40.0, 10.0]).expect("make_box");
