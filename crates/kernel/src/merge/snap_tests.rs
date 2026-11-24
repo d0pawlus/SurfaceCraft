@@ -259,3 +259,34 @@ fn a_group_next_to_a_neighbour_whose_normal_cannot_be_read_is_snapped() {
     let shared = done.body.vertices.get(1).unwrap().point;
     assert!(shared[2].abs() < 1e-6, "the shared border is on the plane: {shared:?}");
 }
+
+/// A quadratic patch whose rows (in `u`) run at x = 0, 1 and `x2`, 1 mm deep in `y`: with `x2` under 1 it folds back
+/// past u = 1 / (2 - x2), so its normal faces against the rest of the patch at the far rows of the grid. Its normal can
+/// be read everywhere (the two tangents are perpendicular).
+fn folded(x2: f64) -> Brep {
+    let row = |x: f64| vec![p(x, 0.0, 0.0), p(x, 0.5, 0.0), p(x, 1.0, 0.0)];
+    crate::nurbs::sheet_from_bezier_network(&[vec![row(0.0), row(1.0), row(x2)]], &[[0, 1, 2, 3]]).unwrap()
+}
+
+/// A neighbour folded before the snap (readable normals that disagree: the rows at u = 0.75 and 1 face back) takes a
+/// move that unfolds part of it: the row at u = 0.75 turns back to the side of the rest, which the absolute test calls
+/// turning over, while fewer of its cells and normals face against the patch as it was.
+#[test]
+fn a_neighbour_folded_before_the_snap_takes_a_move_that_shrinks_the_fold() {
+    let before = folded(0.2);
+    let n0 = normals_at_grid(&before, 0, MOVED_GRID).unwrap();
+    assert_eq!(n0.iter().flatten().count(), 25, "read everywhere");
+    assert!(!sound_before(&n0), "folded: its normals disagree");
+    let after = folded(0.8);
+    let n1 = normals_at_grid(&after, 0, MOVED_GRID).unwrap();
+    let a = super::super::samples::face_samples(&before, 0, MOVED_GRID).unwrap();
+    assert!(!turned_nowhere(&n0, &n1, 0.0, &a), "the absolute test alone (the rule before) refuses it");
+    assert!(patch_ok(&before, &after, 100.0), "the fold moved from u = 0.56 to u = 0.83");
+}
+
+/// The same neighbour is refused where the move spreads the fold over the patch (here past its middle, which turns the
+/// patch over as a whole).
+#[test]
+fn a_neighbour_folded_before_the_snap_is_refused_when_the_move_spreads_the_fold() {
+    assert!(!patch_ok(&folded(0.2), &folded(-0.4), 100.0), "the fold moved from u = 0.56 to u = 0.42");
+}
