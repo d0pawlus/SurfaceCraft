@@ -32,7 +32,7 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 use surfacecraft_fit::mls::ScanSurface;
 use surfacecraft_fit::patch::{PatchSet, tessellate};
-use surfacecraft_fit::patch_g1::{G1Options, wrap_patches_g1};
+use surfacecraft_fit::patch_g1::{G1Options, wrap_patches_g1_refit};
 use surfacecraft_geom::reduce::{ToleranceOptions, raise_levels, reduce_to_tolerance_scaled};
 use surfacecraft_geom::{Bvh, Mesh, Point3, Vec3};
 
@@ -51,8 +51,9 @@ const MAX_COARSE: f64 = 4.0;
 const UNIFORM_ROUNDS: usize = 3;
 /// Rounds at most of the adaptive layout.
 const ADAPTIVE_ROUNDS: usize = 7;
-/// The adaptive rounds stop (below the cap) once the share within the tolerance reaches
-/// `min_within` plus this share of what `min_within` leaves out (99.75 % for 99 %): the wrap measures
+/// The adaptive rounds of an unconstrained network (`continuity: g0`) stop (below the cap) once the
+/// share within the tolerance reaches `min_within` plus this share of what `min_within` leaves out
+/// (99.75 % for 99 %; a network asked to be tangent stops at `min_within`): the wrap measures
 /// a stride of the scan against a coarse tessellation of the patches, so a network that only just
 /// meets `min_within` there can miss it against the scan. Only the stop uses it; whether the
 /// tolerance is met is still judged by `min_within`.
@@ -203,7 +204,8 @@ impl<'a> Target<'a> {
             samples: scan.positions.iter().step_by(stride).copied().collect(),
             tolerance,
             min_within,
-            stop_within: min_within + STOP_MARGIN * (1.0 - min_within),
+            // a network asked to be tangent keeps the plain search (see `build_round`): no margin either
+            stop_within: if options.g1 { min_within } else { min_within + STOP_MARGIN * (1.0 - min_within) },
             max_triangles: (max_patches / PATCHES_PER_TRIANGLE).max(4),
             coarse_start: false,
             max_patches,
@@ -276,7 +278,10 @@ fn over_the_cap() -> CmdError {
 /// Lays the patches on `coarse` and measures them; also returns the distance of every sample.
 fn build_round(t: &Target, coarse: &Mesh, budget: f64, g1: bool) -> (Round, Vec<f64>) {
     let options = G1Options { g1, ..t.options };
-    let wrap = wrap_patches_g1(coarse, &t.bvh, &t.surface, REACH_BUDGETS * budget, &options);
+    // a network asked to be tangent is searched with the plain construction too (see
+    // `wrap_patches_g1_refit`); only the unconstrained network is refitted
+    let refit = !t.options.g1;
+    let wrap = wrap_patches_g1_refit(coarse, &t.bvh, &t.surface, REACH_BUDGETS * budget, &options, refit);
     let d = distances(&wrap.set, &t.samples);
     let deviation = deviation_of(&d, t.tolerance);
     let (crease_edges, smooth_edges, g0_patches) = (wrap.crease_edges, wrap.smooth_edges, wrap.fallbacks);

@@ -616,6 +616,22 @@ pub fn wrap_patches_g1(coarse: &Mesh, scan: &Bvh, surface: &ScanSurface, reach: 
     wrap_with(coarse, (scan, surface), reach, options, true)
 }
 
+/// [`wrap_patches_g1`] with the least-squares refit of the unconstrained patches on or off. The
+/// wrap turns it off for the whole layout search of a network that is to be tangent (`continuity:
+/// g1`): the tangent patches are laid on the layout that search finds, and their smoothness gates
+/// were measured on layouts found with the plain construction.
+#[must_use]
+pub fn wrap_patches_g1_refit(
+    coarse: &Mesh,
+    scan: &Bvh,
+    surface: &ScanSurface,
+    reach: f64,
+    options: &G1Options,
+    refit: bool,
+) -> G1Wrap {
+    wrap_with(coarse, (scan, surface), reach, options, refit)
+}
+
 /// [`wrap_patches_g1`] with the least-squares refit on or off (off: the plain construction everywhere).
 fn wrap_with(
     coarse: &Mesh,

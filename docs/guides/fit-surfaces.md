@@ -12,7 +12,8 @@ patch network over a whole scan.
   patches are refitted to the scan by least squares (sampled, projected onto the scan, their inner
   control points fitted to those points), so a patch follows a curved or noisy scan more closely
   than the few points it was first laid through. Not refitted: the curves on the open border of a
-  scan and the inside of the patches of a triangle on it, everything with `continuity: g1`, and any
+  scan and the inside of the patches of a triangle on it, everything with `continuity: g1` (whose
+  layout is searched with the plain construction and without the stop margin below), and any
   refit that would not lie closer to the scan, would lose a point that reached the scan, would move
   a control point by more than half the size of its curve or patch, or would turn a patch against
   the one it replaces.
