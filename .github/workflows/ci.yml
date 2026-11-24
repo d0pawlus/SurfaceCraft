@@ -9,11 +9,16 @@ on:
     # request (every job below skips on it), so runners are not spent on it.
     types: [opened, synchronize, reopened, ready_for_review, closed]
 
-# One run per pull request and one for main: a newer run cancels the older one, queued or running.
-# On main only the newest commit is checked and deployed (deploy-web follows the `ci` run that
-# succeeded and publishes that commit, which already contains every earlier one).
+# One run per pull request and state (draft: the fast jobs, ready: the full suite) and one for
+# main: a newer run cancels the older one of its group, queued or running. Draft and ready runs are
+# in separate groups because a push just before `gh pr ready` starts both events in the same second
+# and GitHub may take the push (whose payload still says draft) last: in one group it cancelled the
+# full suite (2026-11-24, #175). A `closed` run joins the group of the state the pull request was
+# closed in, which is the group of every run still worth cancelling. On main only the newest commit
+# is checked and deployed (deploy-web follows the `ci` run that succeeded and publishes that commit,
+# which already contains every earlier one).
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.event.pull_request.number || github.ref }}-${{ github.event.pull_request.draft && 'draft' || 'full' }}
   cancel-in-progress: true
 
 permissions:

@@ -22,8 +22,10 @@ on:
     - cron: '17 3 * * 1'
   workflow_dispatch:
 
+# draft and ready runs in separate groups, as in ci.yml: a push just before `gh pr ready` must not
+# cancel the scan that marking the pull request ready starts
 concurrency:
-  group: codeql-${{ github.event.pull_request.number || github.ref }}
+  group: codeql-${{ github.event.pull_request.number || github.ref }}-${{ github.event.pull_request.draft && 'draft' || 'full' }}
   cancel-in-progress: true
 
 permissions:
