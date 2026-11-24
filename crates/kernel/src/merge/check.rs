@@ -116,6 +116,13 @@ pub(super) fn cloud(body: &Brep, faces: &[usize], border: Vec<Vec<V>>) -> Result
 }
 
 impl Cloud {
+    /// How far the group's border stands off the primitive of `gauge` (mm): the farthest point along its boundary
+    /// edges from the surface (about a micrometre after a snap, up to the gap without one). Points the gauge cannot
+    /// project are left out.
+    pub(super) fn border_offset(&self, gauge: &Gauge) -> f64 {
+        self.border.iter().flatten().filter_map(|q| gauge.distance(*q)).filter(|d| d.is_finite()).fold(0.0, f64::max)
+    }
+
     /// The `n` patches nearest `p` by the box of their samples (a corner over a patch has distance 0 to
     /// its box; of the patches that hold it, the smaller come first). The distance to the centre of a box
     /// would put the small patches round a corner before the large one it lies over.

@@ -41,6 +41,12 @@ pub struct TopoMesh {
     pub edges: Vec<Vec<Point3>>,
 }
 
+/// The chord (mm) the default (`None`) of [`tessellate`] and [`tessellate_topo`] meshes `body` at.
+#[must_use]
+pub fn display_chord(body: &Brep) -> f64 {
+    solidcore_tess::MeshTolerance::display_of(bbox_size(body).max(1e-3)).chord
+}
+
 /// Like [`tessellate`], and keeps which face each triangle belongs to and the edge polylines, so
 /// the viewport can pick faces and edges of the body and hand their indices to commands.
 pub fn tessellate_topo(body: &Brep, chord: Option<f64>) -> Result<TopoMesh> {
