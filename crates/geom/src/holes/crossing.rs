@@ -401,9 +401,10 @@ mod tests {
         assert!(!pair_crosses((&knife, edge), (&flat, keys)));
     }
 
-    #[test]
-    fn a_thin_plate_patch_that_is_not_finite_is_never_kept() {
-        // Arrange: the membrane of the crossing case (it crosses as well), the thin plate made NaN
+    /// The crossing case (a flat sheet with a hole, a closed box standing through it) with a fan
+    /// patch over the hole whose one interior vertex is at `apex`: the tree, the workspace and where
+    /// the patch starts (`(first_tri, first_new)`).
+    fn fan_over_the_crossing_hole(apex: Point3) -> (Crossings, Vec<u32>, Mesh, (usize, usize)) {
         let mut m = sheet_with_hole(12, 4, |_, _| 0.0);
         m.append(&closed_box(Point3::new(-0.1, -0.1, -1.0), Point3::new(0.1, 0.1, 1.0)));
         let lp = boundary_loops(&m).into_iter().min_by_key(Vec::len).unwrap();
@@ -412,23 +413,53 @@ mod tests {
         let first_tri = work.triangles.len();
         let base = work.positions.len() as u32;
         let a = lp.iter().map(|&v| origin.binary_search(&v).unwrap() as u32).collect::<Vec<_>>();
-        work.positions.push(Point3::new(f64::NAN, 0.0, 0.0));
+        work.positions.push(apex);
         for k in 0..a.len() {
             work.triangles.push([a[k], a[(k + 1) % a.len()], base]);
         }
-        let membrane = vec![Point3::new(0.0, 0.0, 0.0)];
+        (crossings, origin, work, (first_tri, base as usize))
+    }
+
+    #[test]
+    fn a_thin_plate_patch_that_is_not_finite_gives_way_to_a_finite_membrane_even_one_that_crosses() {
+        // Arrange: the thin plate not finite; the membrane at the middle of the hole crosses the box
+        let (crossings, origin, mut work, at) = fan_over_the_crossing_hole(Point3::new(f64::NAN, 0.0, 0.0));
+        let membrane = Point3::new(0.0, 0.0, 0.0);
 
         // Act
-        assert!(crossings.patch_crosses(&origin, &work, first_tri), "a NaN corner counts as crossing");
-        crossings.settle(&origin, &mut work, (first_tri, base as usize), membrane);
+        assert!(crossings.patch_crosses(&origin, &work, at.0), "a NaN corner counts as crossing");
+        crossings.settle(&origin, &mut work, at, vec![membrane]);
 
         // Assert
-        assert_eq!(work.positions.last(), Some(&Point3::new(0.0, 0.0, 0.0)));
+        assert_eq!(work.positions.last(), Some(&membrane));
         assert_eq!(LAST_FAIRING.with(std::cell::Cell::get), Some(Fairing::Membrane));
+    }
 
-        // and a membrane that is not finite is never put in place of a finite thin plate
-        crossings.settle(&origin, &mut work, (first_tri, base as usize), vec![Point3::new(f64::NAN, 0.0, 0.0)]);
-        assert_eq!(work.positions.last(), Some(&Point3::new(0.0, 0.0, 0.0)));
+    #[test]
+    fn a_membrane_that_is_not_finite_never_replaces_the_thin_plate() {
+        // Arrange: a finite thin plate that crosses the box
+        let thin = Point3::new(0.0, 0.0, 0.0);
+        let (crossings, origin, mut work, at) = fan_over_the_crossing_hole(thin);
+        assert!(crossings.patch_crosses(&origin, &work, at.0));
+
+        // Act
+        crossings.settle(&origin, &mut work, at, vec![Point3::new(f64::NAN, 0.0, 0.0)]);
+
+        // Assert
+        assert_eq!(work.positions.last(), Some(&thin));
+        assert_eq!(LAST_FAIRING.with(std::cell::Cell::get), Some(Fairing::ThinPlate));
+    }
+
+    #[test]
+    fn when_neither_patch_is_finite_the_thin_plate_stays_and_says_so() {
+        // Arrange: both not finite, told apart by their finite coordinates
+        let (crossings, origin, mut work, at) = fan_over_the_crossing_hole(Point3::new(f64::NAN, 1.0, 0.0));
+
+        // Act
+        crossings.settle(&origin, &mut work, at, vec![Point3::new(f64::NAN, 2.0, 0.0)]);
+
+        // Assert: the patch is left as the fairing gave it (the caller's checks see a NaN patch)
+        assert_eq!(work.positions.last().map(|p| p.y), Some(1.0));
         assert_eq!(LAST_FAIRING.with(std::cell::Cell::get), Some(Fairing::ThinPlate));
     }
 }

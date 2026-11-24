@@ -120,7 +120,8 @@ fn refused(reason: &str, why: &str, figures: Value, ms: u64) -> PrepStep {
 /// (`soft`), rebuilding it only costs time. An open or failed result, or one with other issues, may
 /// be a victim of the topology.
 fn rebuild_can_help(base: &ToSolidOut, soft: bool) -> bool {
-    let closed_and_short = base.body.is_some() && base.issues.iter().all(|i| i.code == "out_of_tolerance");
+    let closed_and_short = base.body.as_ref().is_some_and(crate::cmd::body::BodyOut::is_solid)
+        && base.issues.iter().all(|i| i.code == "out_of_tolerance");
     !closed_and_short || soft
 }
 
