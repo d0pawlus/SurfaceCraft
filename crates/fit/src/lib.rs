@@ -15,6 +15,7 @@ pub mod charts;
 pub mod constrain;
 pub mod coverage;
 pub mod features;
+mod features_network;
 mod features_ngon;
 pub mod lm;
 pub mod mls;

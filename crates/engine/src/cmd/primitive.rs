@@ -5,8 +5,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use surfacecraft_doc::{ObjectId, ObjectKind};
 use surfacecraft_fit::segment::region_points;
-use surfacecraft_fit::{Primitive, PrimitiveKind, fit_auto, primitive::fit};
-use surfacecraft_geom::Point3;
+use surfacecraft_fit::{AutoFit, Primitive, PrimitiveKind, fit_auto, primitive::fit};
+use surfacecraft_geom::{Point3, Vec3};
 
 mod auto;
 mod relations;
@@ -75,59 +75,98 @@ pub struct FitOut {
     pub warning: Option<String>,
 }
 
-pub(crate) fn fit_cmd(s: &mut Session, i: FitIn) -> CmdResult<FitOut> {
-    let (mesh, tris, region) = match (&i.region, &i.mesh, &i.triangles) {
+/// Where the points of a fit come from: a mesh and triangles, and the region they form, if any.
+struct FitSource {
+    /// The mesh.
+    mesh: ObjectId,
+    /// Its triangles to fit.
+    tris: Vec<u32>,
+    /// The region, when the fit is of a region.
+    region: Option<ObjectId>,
+}
+
+/// The mesh and triangles to fit: from `region`, or from `mesh` and `triangles`.
+fn fit_source(s: &Session, i: &FitIn) -> CmdResult<FitSource> {
+    match (&i.region, &i.mesh, &i.triangles) {
         (Some(r), None, None) => {
             let rid = r.resolve(s, ObjectKind::Region)?;
             let reg = s.doc.region(rid).ok_or_else(|| CmdError::Params(format!("no region {rid}")))?;
-            (reg.mesh, reg.triangles.to_vec(), Some(rid))
+            Ok(FitSource { mesh: reg.mesh, tris: reg.triangles.to_vec(), region: Some(rid) })
         }
-        (None, Some(m), Some(t)) => (m.resolve(s, ObjectKind::Mesh)?, t.clone(), None),
-        _ => return Err(CmdError::Params("give `region`, or `mesh` and `triangles`".into())),
-    };
-    let m = s.doc.mesh(mesh).map(|m| m.mesh.clone()).ok_or_else(|| CmdError::Params(format!("no mesh {mesh}")))?;
-    if let Some(t) = tris.iter().find(|&&t| t as usize >= m.triangle_count()) {
+        (None, Some(m), Some(t)) => {
+            Ok(FitSource { mesh: m.resolve(s, ObjectKind::Mesh)?, tris: t.clone(), region: None })
+        }
+        _ => Err(CmdError::Params("give `region`, or `mesh` and `triangles`".into())),
+    }
+}
+
+/// Rejects a triangle index that is not one of the `count` triangles of the mesh.
+fn check_in_range(tris: &[u32], count: usize) -> CmdResult<()> {
+    if let Some(t) = tris.iter().find(|&&t| t as usize >= count) {
         return Err(CmdError::Params(format!("triangle {t} out of range")));
     }
-    let normals = m.vertex_normals();
-    let (p, n) = region_points(&m, &normals, &tris);
-    if p.len() < 3 {
-        return Err(CmdError::Params("too few points to fit".into()));
-    }
-    let kind = match i.kind {
+    Ok(())
+}
+
+/// The kind a request asks for, `None` for automatic.
+fn requested_kind(choice: KindChoice) -> Option<PrimitiveKind> {
+    match choice {
         KindChoice::Auto => None,
         KindChoice::Plane => Some(PrimitiveKind::Plane),
         KindChoice::Sphere => Some(PrimitiveKind::Sphere),
         KindChoice::Cylinder => Some(PrimitiveKind::Cylinder),
         KindChoice::Cone => Some(PrimitiveKind::Cone),
         KindChoice::Torus => Some(PrimitiveKind::Torus),
-    };
-    let (best, candidates, note) = match kind {
-        None => {
-            let a = fit_auto(&p, &n).ok_or_else(|| CmdError::Failed("no primitive could be fitted".into()))?;
-            (a.best, a.candidates, a.note)
-        }
+    }
+}
+
+/// Fits the requested kind, or every kind and keeps the best by residual when there is none.
+fn fit_best(kind: Option<PrimitiveKind>, p: &[Point3], n: &[Vec3]) -> CmdResult<AutoFit> {
+    match kind {
+        None => fit_auto(p, n).ok_or_else(|| CmdError::Failed("no primitive could be fitted".into())),
         Some(k) => {
-            let f = fit(k, &p, &n).ok_or_else(|| CmdError::Failed(format!("failed to fit a {k:?} to these points")))?;
-            (f, Vec::new(), None)
+            let f = fit(k, p, n).ok_or_else(|| CmdError::Failed(format!("failed to fit a {k:?} to these points")))?;
+            Ok(AutoFit { best: f, candidates: Vec::new(), note: None })
         }
-    };
-    let warning = (best.rms > 0.05).then(|| {
+    }
+}
+
+/// The warning for a fit whose RMS is above the 0.05 mm warning level.
+fn rms_warning(rms: f64) -> Option<String> {
+    (rms > 0.05).then(|| {
         format!(
             "RMS {:.4} mm is above {} mm",
-            best.rms,
-            if best.rms > 0.1 { "the 0.1 mm tolerance" } else { "the 0.05 mm warning level" }
+            rms,
+            if rms > 0.1 { "the 0.1 mm tolerance" } else { "the 0.05 mm warning level" }
         )
-    });
-    let patch = best.primitive.patch_mesh(&p, 32);
-    let name = i.name.unwrap_or_else(|| format!("{:?}", best.primitive.kind()).to_lowercase());
-    let id = s.doc.add_primitive(&name, best.primitive.clone(), region, best.rms, best.max, patch);
+    })
+}
+
+/// Marks a region that a primitive was fitted to as a primitive region of that kind and RMS.
+fn mark_region(s: &mut Session, region: Option<ObjectId>, kind: PrimitiveKind, rms: f64) {
     if let Some(rid) = region
         && let Some(r) = s.doc.region_mut(rid)
     {
         // a region a primitive was fitted to is a primitive region, whatever segmentation said
-        (r.kind, r.rms, r.freeform) = (Some(best.primitive.kind()), Some(best.rms), false);
+        (r.kind, r.rms, r.freeform) = (Some(kind), Some(rms), false);
     }
+}
+
+pub(crate) fn fit_cmd(s: &mut Session, i: FitIn) -> CmdResult<FitOut> {
+    let FitSource { mesh, tris, region } = fit_source(s, &i)?;
+    let m = s.doc.mesh(mesh).map(|m| m.mesh.clone()).ok_or_else(|| CmdError::Params(format!("no mesh {mesh}")))?;
+    check_in_range(&tris, m.triangle_count())?;
+    let normals = m.vertex_normals();
+    let (p, n) = region_points(&m, &normals, &tris);
+    if p.len() < 3 {
+        return Err(CmdError::Params("too few points to fit".into()));
+    }
+    let AutoFit { best, candidates, note } = fit_best(requested_kind(i.kind), &p, &n)?;
+    let warning = rms_warning(best.rms);
+    let patch = best.primitive.patch_mesh(&p, 32);
+    let name = i.name.unwrap_or_else(|| format!("{:?}", best.primitive.kind()).to_lowercase());
+    let id = s.doc.add_primitive(&name, best.primitive.clone(), region, best.rms, best.max, patch);
+    mark_region(s, region, best.primitive.kind(), best.rms);
     Ok(FitOut {
         id,
         primitive: best.primitive,

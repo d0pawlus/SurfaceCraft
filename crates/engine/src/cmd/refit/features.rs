@@ -1,6 +1,7 @@
 //! The `body.refit_features` command: optimise the dimensions of a body's feature history against a scan.
 
 use super::*;
+use surfacecraft_fit::lm::BoundedResult;
 
 // ---------------------------------------------------------------------------------------------
 // body.refit_features
@@ -210,6 +211,49 @@ pub(super) fn bounds(old: f64, angle: bool, mc: f64, mca: f64) -> (f64, f64) {
     }
 }
 
+/// The parameters of the dimension constraints of sketch `input` (named `name`), appended to `out`.
+fn sketch_params(input: ObjectId, name: &str, sketch: &Sketch, mc: f64, mca: f64, out: &mut Vec<Param>) {
+    for (i, c) in sketch.constraints.iter().enumerate() {
+        if let Some((kind, default, v)) = constraint_dim(c)
+            && v.is_finite()
+        {
+            let angle = kind == "angle";
+            let (lo, hi) = bounds(v, angle, mc, mca);
+            out.push(Param {
+                id: format!("sketch/{}/{i}", input.0),
+                label: format!("sketch '{name}': {kind} (constraint {i})"),
+                owner: Owner::Constraint { sketch: input, index: i },
+                old: v,
+                lo,
+                hi,
+                step: if angle { 0.05 } else { 0.02 },
+                default,
+            });
+        }
+    }
+}
+
+/// The parameters of the numeric fields of feature `fid` (named `fname`, operation `op`), appended to `out`.
+fn field_params(fid: ObjectId, fname: &str, op: &FeatureOp, mc: f64, mca: f64, out: &mut Vec<Param>) {
+    for (name, default, v) in feature_fields(op) {
+        if !v.is_finite() {
+            continue;
+        }
+        let angle = name.ends_with("_deg");
+        let (lo, hi) = bounds(v, angle, mc, mca);
+        out.push(Param {
+            id: format!("feature/{}/{name}", fid.0),
+            label: format!("feature {} '{fname}' ({}): {name}", fid.0, op.label()),
+            owner: Owner::Field { feature: fid, name },
+            old: v,
+            lo,
+            hi,
+            step: if angle { 0.05 } else { 0.02 },
+            default,
+        });
+    }
+}
+
 fn discover(doc: &Document, features: &[ObjectId], mc: f64, mca: f64) -> Vec<Param> {
     let mut out = Vec::new();
     let mut seen: Vec<ObjectId> = Vec::new();
@@ -221,43 +265,10 @@ fn discover(doc: &Document, features: &[ObjectId], mc: f64, mca: f64) -> Vec<Par
                 && let Some(sk) = doc.sketch(input)
             {
                 seen.push(input);
-                for (i, c) in sk.sketch.constraints.iter().enumerate() {
-                    if let Some((kind, default, v)) = constraint_dim(c)
-                        && v.is_finite()
-                    {
-                        let angle = kind == "angle";
-                        let (lo, hi) = bounds(v, angle, mc, mca);
-                        out.push(Param {
-                            id: format!("sketch/{}/{i}", input.0),
-                            label: format!("sketch '{}': {kind} (constraint {i})", sk.name),
-                            owner: Owner::Constraint { sketch: input, index: i },
-                            old: v,
-                            lo,
-                            hi,
-                            step: if angle { 0.05 } else { 0.02 },
-                            default,
-                        });
-                    }
-                }
+                sketch_params(input, &sk.name, &sk.sketch, mc, mca, &mut out);
             }
         }
-        for (name, default, v) in feature_fields(&f.op) {
-            if !v.is_finite() {
-                continue;
-            }
-            let angle = name.ends_with("_deg");
-            let (lo, hi) = bounds(v, angle, mc, mca);
-            out.push(Param {
-                id: format!("feature/{}/{name}", fid.0),
-                label: format!("feature {} '{}' ({}): {name}", fid.0, f.name, f.op.label()),
-                owner: Owner::Field { feature: *fid, name },
-                old: v,
-                lo,
-                hi,
-                step: if angle { 0.05 } else { 0.02 },
-                default,
-            });
-        }
+        field_params(*fid, &f.name, &f.op, mc, mca, &mut out);
     }
     out
 }
@@ -292,16 +303,8 @@ fn select(all: Vec<Param>, wanted: Option<&[String]>) -> CmdResult<Vec<Param>> {
     Ok(picked)
 }
 
-/// Writes parameter `values` into `doc` (from the pristine `sketches` and `ops`) and re-solves
-/// the sketches they touch.
-fn write_values(
-    doc: &mut Document,
-    params: &[Param],
-    sketches: &[(ObjectId, Sketch)],
-    ops: &[(ObjectId, FeatureOp)],
-    values: &[f64],
-    keep_report: bool,
-) -> Result<(), String> {
+/// Puts the pristine `sketches` and `ops` back into `doc`.
+fn restore_pristine(doc: &mut Document, sketches: &[(ObjectId, Sketch)], ops: &[(ObjectId, FeatureOp)]) {
     for (id, sk) in sketches {
         if let Some(o) = doc.sketch_mut(*id) {
             o.sketch = sk.clone();
@@ -312,31 +315,36 @@ fn write_values(
             f.op = op.clone();
         }
     }
-    let mut touched: Vec<ObjectId> = Vec::new();
-    for (p, v) in params.iter().zip(values) {
-        match &p.owner {
-            Owner::Constraint { sketch, index } => {
-                let o = doc.sketch_mut(*sketch).ok_or_else(|| format!("{}: the constraint is gone", p.id))?;
-                let c =
-                    o.sketch.constraints.get_mut(*index).ok_or_else(|| format!("{}: the constraint is gone", p.id))?;
-                if !set_constraint(c, *v) {
-                    return Err(format!("{}: not a dimension", p.id));
-                }
-                // the fitted value is a plain number: it no longer follows an expression
-                o.sketch.dim_exprs.remove(index);
-                if !touched.contains(sketch) {
-                    touched.push(*sketch);
-                }
+}
+
+/// Writes value `v` of parameter `p` into `doc`, noting the sketch it touches in `touched`.
+fn set_param(doc: &mut Document, p: &Param, v: f64, touched: &mut Vec<ObjectId>) -> Result<(), String> {
+    match &p.owner {
+        Owner::Constraint { sketch, index } => {
+            let o = doc.sketch_mut(*sketch).ok_or_else(|| format!("{}: the constraint is gone", p.id))?;
+            let c = o.sketch.constraints.get_mut(*index).ok_or_else(|| format!("{}: the constraint is gone", p.id))?;
+            if !set_constraint(c, v) {
+                return Err(format!("{}: not a dimension", p.id));
             }
-            Owner::Field { feature, name } => {
-                let f = doc.feature_mut(*feature).ok_or_else(|| format!("{}: the feature is gone", p.id))?;
-                if !set_field(&mut f.op, name, *v) {
-                    return Err(format!("{}: not a parameter", p.id));
-                }
-                f.exprs.remove(*name);
+            // the fitted value is a plain number: it no longer follows an expression
+            o.sketch.dim_exprs.remove(index);
+            if !touched.contains(sketch) {
+                touched.push(*sketch);
             }
         }
+        Owner::Field { feature, name } => {
+            let f = doc.feature_mut(*feature).ok_or_else(|| format!("{}: the feature is gone", p.id))?;
+            if !set_field(&mut f.op, name, v) {
+                return Err(format!("{}: not a parameter", p.id));
+            }
+            f.exprs.remove(*name);
+        }
     }
+    Ok(())
+}
+
+/// Re-solves the `touched` sketches of `doc` and refuses a solution that misses its dimensions.
+fn resolve_touched(doc: &mut Document, touched: Vec<ObjectId>, keep_report: bool) -> Result<(), String> {
     for id in touched {
         let o = doc.sketch_mut(id).ok_or("a sketch is gone")?;
         let mut sk = o.sketch.clone();
@@ -350,6 +358,24 @@ fn write_values(
         }
     }
     Ok(())
+}
+
+/// Writes parameter `values` into `doc` (from the pristine `sketches` and `ops`) and re-solves
+/// the sketches they touch.
+fn write_values(
+    doc: &mut Document,
+    params: &[Param],
+    sketches: &[(ObjectId, Sketch)],
+    ops: &[(ObjectId, FeatureOp)],
+    values: &[f64],
+    keep_report: bool,
+) -> Result<(), String> {
+    restore_pristine(doc, sketches, ops);
+    let mut touched: Vec<ObjectId> = Vec::new();
+    for (p, v) in params.iter().zip(values) {
+        set_param(doc, p, *v, &mut touched)?;
+    }
+    resolve_touched(doc, touched, keep_report)
 }
 
 /// Replays trial parameters on a scratch document and measures the scan against the body.
@@ -366,6 +392,35 @@ struct Evaluator {
 }
 
 impl Evaluator {
+    /// A scratch copy of the document with the history's pristine sketches and operations, ready to replay trials.
+    fn new(
+        s: &Session,
+        body: ObjectId,
+        params: &[Param],
+        features: &[ObjectId],
+        sketch_ids: &[ObjectId],
+        points: Vec<Point3>,
+        max_distance: f64,
+    ) -> CmdResult<Self> {
+        let b0 = s.doc.body(body).ok_or_else(|| CmdError::Params(format!("no body {body}")))?;
+        let chord = (bbox_diagonal(&b0.brep) * 1e-4).clamp(0.002, 0.02);
+        let sketches: Vec<(ObjectId, Sketch)> =
+            sketch_ids.iter().filter_map(|id| s.doc.sketch(*id).map(|o| (*id, o.sketch.clone()))).collect();
+        let ops: Vec<(ObjectId, FeatureOp)> =
+            features.iter().filter_map(|id| s.doc.feature(*id).map(|f| (*id, f.op.clone()))).collect();
+        Ok(Evaluator {
+            scratch: s.doc.clone(),
+            params: params.to_vec(),
+            sketches,
+            ops,
+            features: features.to_vec(),
+            target: body,
+            points,
+            chord,
+            max_distance,
+        })
+    }
+
     pub(super) fn body(&mut self, values: &[f64]) -> Result<Arc<Brep>, String> {
         write_values(&mut self.scratch, &self.params, &self.sketches, &self.ops, values, false)?;
         crate::replay::replay_doc(&mut self.scratch);
@@ -389,14 +444,27 @@ impl Evaluator {
     }
 }
 
-pub(super) fn refit_features(s: &mut Session, i: RefitFeaturesIn) -> CmdResult<RefitFeaturesOut> {
-    let body = i.body.resolve(s, ObjectKind::Body)?;
+/// Validated numeric options of `body.refit_features`.
+struct FeatOpts {
+    mc: f64,
+    mca: f64,
+    max_distance: f64,
+    robust: f64,
+    max_iter: usize,
+}
+
+/// Reads and checks the numeric options of the command, in the order of their error messages.
+fn feat_opts(i: &RefitFeaturesIn) -> CmdResult<FeatOpts> {
     let mc = positive(i.max_change, 2.0, "max_change")?;
     let mca = positive(i.max_angle_change, 5.0, "max_angle_change")?;
     let max_distance = positive(i.max_distance, 3.0 * mc, "max_distance")?;
     let robust = positive(i.robust_scale, (mc / 4.0).max(0.05), "robust_scale")?;
     let max_iter = i.max_iterations.unwrap_or(20).clamp(1, 100);
-    let (points, _) = scan_points(s, &i.mesh, i.max_points.unwrap_or(20_000))?;
+    Ok(FeatOpts { mc, mca, max_distance, robust, max_iter })
+}
+
+/// The features and sketches that make `body`; refused when the body has no feature besides its base.
+fn history_scope(s: &Session, body: ObjectId) -> CmdResult<(Vec<ObjectId>, Vec<ObjectId>)> {
     let (features, sketch_ids) = scope(&s.doc, body);
     let has_history =
         features.iter().any(|f| s.doc.feature(*f).is_some_and(|f| !matches!(f.op, FeatureOp::Base { .. })));
@@ -405,34 +473,26 @@ pub(super) fn refit_features(s: &mut Session, i: RefitFeaturesIn) -> CmdResult<R
             "this body has no feature history to refit; use body.refit_faces to move its faces".into(),
         ));
     }
-    let all = discover(&s.doc, &features, mc, mca);
-    let params = select(all, i.params.as_deref())?;
+    Ok((features, sketch_ids))
+}
+
+/// The parameters to refit: discovered in the history, selected by `wanted`, and checked in number.
+fn refit_params(s: &Session, features: &[ObjectId], fo: &FeatOpts, wanted: Option<&[String]>) -> CmdResult<Vec<Param>> {
+    let all = discover(&s.doc, features, fo.mc, fo.mca);
+    let params = select(all, wanted)?;
     if params.is_empty() {
         return Err(CmdError::Failed("the history has no numeric parameters to refit".into()));
     }
     if params.len() > 64 {
         return Err(CmdError::Params(format!("{} parameters: name at most 64 in `params`", params.len())));
     }
-    let b0 = s.doc.body(body).ok_or_else(|| CmdError::Params(format!("no body {body}")))?;
-    let chord = (bbox_diagonal(&b0.brep) * 1e-4).clamp(0.002, 0.02);
-    let sketches: Vec<(ObjectId, Sketch)> =
-        sketch_ids.iter().filter_map(|id| s.doc.sketch(*id).map(|o| (*id, o.sketch.clone()))).collect();
-    let ops: Vec<(ObjectId, FeatureOp)> =
-        features.iter().filter_map(|id| s.doc.feature(*id).map(|f| (*id, f.op.clone()))).collect();
-    let mut ev = Evaluator {
-        scratch: s.doc.clone(),
-        params: params.clone(),
-        sketches: sketches.clone(),
-        ops: ops.clone(),
-        features: features.clone(),
-        target: body,
-        points,
-        chord,
-        max_distance,
-    };
-    let p0: Vec<f64> = params.iter().map(|p| p.old).collect();
+    Ok(params)
+}
+
+/// The RMS scan-to-body distance and the number of points inside `max_distance` at the start values `p0`.
+fn baseline_rms(ev: &mut Evaluator, p0: &[f64]) -> CmdResult<(f64, usize)> {
     let d0 = ev
-        .distances(&p0)
+        .distances(p0)
         .ok_or_else(|| CmdError::Failed("the history does not replay into a body before the refit".into()))?;
     let (rms_before, points_before) = rms(&d0);
     if points_before == 0 {
@@ -440,18 +500,24 @@ pub(super) fn refit_features(s: &mut Session, i: RefitFeaturesIn) -> CmdResult<R
             "no scan point lies within `max_distance` of the body: is the scan aligned to it?".into(),
         ));
     }
+    Ok((rms_before, points_before))
+}
+
+/// Runs the bounded least-squares optimiser over the replayed history from the start values `p0`.
+fn optimise(ev: &mut Evaluator, p0: &[f64], fo: &FeatOpts) -> CmdResult<BoundedResult> {
     let m = ev.points.len();
     let opts = BoundedOptions {
-        lower: params.iter().map(|p| p.lo).collect(),
-        upper: params.iter().map(|p| p.hi).collect(),
-        step: params.iter().map(|p| p.step).collect(),
-        max_iter,
+        lower: ev.params.iter().map(|p| p.lo).collect(),
+        upper: ev.params.iter().map(|p| p.hi).collect(),
+        step: ev.params.iter().map(|p| p.step).collect(),
+        max_iter: fo.max_iter,
         max_trials: 10,
         central: false,
         tol_step: 1e-5,
         tol_cost: 1e-7,
     };
-    let result = minimize_bounded(&p0, m, &opts, |p, out| match ev.distances(p) {
+    let robust = fo.robust;
+    minimize_bounded(p0, m, &opts, |p, out| match ev.distances(p) {
         Some(d) => {
             for (o, v) in out.iter_mut().zip(&d) {
                 *o = if v.is_finite() { robust_residual(*v, robust) } else { 0.0 };
@@ -459,56 +525,81 @@ pub(super) fn refit_features(s: &mut Session, i: RefitFeaturesIn) -> CmdResult<R
         }
         None => out.fill(f64::NAN),
     })
-    .ok_or_else(|| CmdError::Failed("the optimiser could not start".into()))?;
-    let mut values = result.params.clone();
-    let d1 = ev.distances(&values).ok_or_else(|| CmdError::Failed("the refitted history does not replay".into()))?;
-    let (mut rms_after, mut points_after) = rms(&d1);
+    .ok_or_else(|| CmdError::Failed("the optimiser could not start".into()))
+}
+
+/// The parameter values to keep and their RMS scan-to-body distance.
+struct Fit {
+    values: Vec<f64>,
+    rms_after: f64,
+    points_after: usize,
+}
+
+/// Measures the optimiser's values `found` and keeps them unless the start values `p0` are better.
+fn pick_better(ev: &mut Evaluator, found: &[f64], p0: &[f64], rms_before: f64, points_before: usize) -> CmdResult<Fit> {
+    let d1 = ev.distances(found).ok_or_else(|| CmdError::Failed("the refitted history does not replay".into()))?;
+    let (rms_after, points_after) = rms(&d1);
     // keep the better of the two (the start is always a candidate)
     if rms_after > rms_before {
-        values = p0.clone();
-        rms_after = rms_before;
-        points_after = points_before;
+        return Ok(Fit { values: p0.to_vec(), rms_after: rms_before, points_after: points_before });
     }
-    // a parameter whose change the scan cannot see (a cut deeper than the part is thick) is put
-    // back: it only moved on the noise of the finite differences
-    let mut reverted: Vec<bool> = vec![false; params.len()];
-    for k in 0..params.len() {
-        let (Some(v), Some(o)) = (values.get(k).copied(), p0.get(k).copied()) else { continue };
-        if (v - o).abs() < 1e-12 {
-            continue;
-        }
-        let mut trial = values.clone();
-        if let Some(t) = trial.get_mut(k) {
-            *t = o;
-        }
-        if let Some(d) = ev.distances(&trial) {
-            let (r, n) = rms(&d);
-            if r - rms_after < 2e-4 {
-                values = trial;
-                rms_after = r;
-                points_after = n;
-                if let Some(x) = reverted.get_mut(k) {
-                    *x = true;
-                }
-            }
+    Ok(Fit { values: found.to_vec(), rms_after, points_after })
+}
+
+/// Puts parameter `k` back to its start value when that costs less than the scan can resolve.
+fn try_revert(ev: &mut Evaluator, p0: &[f64], fit: &mut Fit, k: usize) -> bool {
+    let (Some(v), Some(o)) = (fit.values.get(k).copied(), p0.get(k).copied()) else { return false };
+    if (v - o).abs() < 1e-12 {
+        return false;
+    }
+    let mut trial = fit.values.clone();
+    if let Some(t) = trial.get_mut(k) {
+        *t = o;
+    }
+    if let Some(d) = ev.distances(&trial) {
+        let (r, n) = rms(&d);
+        if r - fit.rms_after < 2e-4 {
+            fit.values = trial;
+            fit.rms_after = r;
+            fit.points_after = n;
+            return true;
         }
     }
-    let outs: Vec<ParamOut> = params
+    false
+}
+
+/// A parameter whose change the scan cannot see (a cut deeper than the part is thick) is put
+/// back: it only moved on the noise of the finite differences. Returns which were put back.
+fn revert_unseen(ev: &mut Evaluator, p0: &[f64], fit: &mut Fit) -> Vec<bool> {
+    let mut reverted: Vec<bool> = vec![false; p0.len()];
+    for (k, flag) in reverted.iter_mut().enumerate() {
+        *flag = try_revert(ev, p0, fit, k);
+    }
+    reverted
+}
+
+/// The remark on one refitted parameter, if it needs one.
+fn param_note(reverted: bool, sensitivity: f64, at_bound: bool) -> Option<String> {
+    if reverted {
+        Some("the scan shows no change worth making here (below its resolution); left as it was".to_string())
+    } else if sensitivity < 1e-6 {
+        Some("the scan does not constrain this parameter; left as it was".to_string())
+    } else if at_bound {
+        Some("stopped at its bound: raise max_change if the part changed more".to_string())
+    } else {
+        None
+    }
+}
+
+/// The result line of every parameter, old to new.
+fn param_outs(params: &[Param], values: &[f64], sensitivity: &[f64], reverted: &[bool]) -> Vec<ParamOut> {
+    params
         .iter()
-        .zip(&values)
-        .zip(&result.sensitivity)
-        .zip(&reverted)
+        .zip(values)
+        .zip(sensitivity)
+        .zip(reverted)
         .map(|(((p, v), sens), rev)| {
             let at_bound = (*v - p.lo).abs() < 1e-9 || (*v - p.hi).abs() < 1e-9;
-            let note = if *rev {
-                Some("the scan shows no change worth making here (below its resolution); left as it was".to_string())
-            } else if *sens < 1e-6 {
-                Some("the scan does not constrain this parameter; left as it was".to_string())
-            } else if at_bound {
-                Some("stopped at its bound: raise max_change if the part changed more".to_string())
-            } else {
-                None
-            };
             ParamOut {
                 id: p.id.clone(),
                 label: p.label.clone(),
@@ -519,28 +610,46 @@ pub(super) fn refit_features(s: &mut Session, i: RefitFeaturesIn) -> CmdResult<R
                 upper: p.hi,
                 at_bound,
                 sensitivity: *sens,
-                note,
+                note: param_note(*rev, *sens, at_bound),
             }
         })
-        .collect();
-    let apply = i.apply.unwrap_or(true);
-    let mut failed = 0;
-    if apply {
-        write_values(&mut s.doc, &params, &sketches, &ops, &values, true).map_err(CmdError::Failed)?;
-        failed = crate::replay::replay(s);
-        for fid in &features {
-            if let Some(e) = s.doc.feature(*fid).and_then(|f| f.error.clone()) {
-                return Err(CmdError::Failed(format!("the refitted history fails: {e}")));
-            }
+        .collect()
+}
+
+/// Writes the refitted values into the document and replays it; returns the number of failed features.
+fn apply_fit(s: &mut Session, ev: &Evaluator, values: &[f64]) -> CmdResult<usize> {
+    write_values(&mut s.doc, &ev.params, &ev.sketches, &ev.ops, values, true).map_err(CmdError::Failed)?;
+    let failed = crate::replay::replay(s);
+    for fid in &ev.features {
+        if let Some(e) = s.doc.feature(*fid).and_then(|f| f.error.clone()) {
+            return Err(CmdError::Failed(format!("the refitted history fails: {e}")));
         }
     }
+    Ok(failed)
+}
+
+pub(super) fn refit_features(s: &mut Session, i: RefitFeaturesIn) -> CmdResult<RefitFeaturesOut> {
+    let body = i.body.resolve(s, ObjectKind::Body)?;
+    let fo = feat_opts(&i)?;
+    let (points, _) = scan_points(s, &i.mesh, i.max_points.unwrap_or(20_000))?;
+    let (features, sketch_ids) = history_scope(s, body)?;
+    let params = refit_params(s, &features, &fo, i.params.as_deref())?;
+    let mut ev = Evaluator::new(s, body, &params, &features, &sketch_ids, points, fo.max_distance)?;
+    let p0: Vec<f64> = params.iter().map(|p| p.old).collect();
+    let (rms_before, points_before) = baseline_rms(&mut ev, &p0)?;
+    let result = optimise(&mut ev, &p0, &fo)?;
+    let mut fit = pick_better(&mut ev, &result.params, &p0, rms_before, points_before)?;
+    let reverted = revert_unseen(&mut ev, &p0, &mut fit);
+    let outs = param_outs(&params, &fit.values, &result.sensitivity, &reverted);
+    let apply = i.apply.unwrap_or(true);
+    let failed = if apply { apply_fit(s, &ev, &fit.values)? } else { 0 };
     Ok(RefitFeaturesOut {
         body,
         params: outs,
         rms_before,
-        rms_after,
+        rms_after: fit.rms_after,
         points_before,
-        points_after,
+        points_after: fit.points_after,
         iterations: result.iterations,
         evaluations: result.evaluations,
         converged: result.converged,

@@ -144,6 +144,47 @@ pub fn retopo(mesh: &Mesh, opts: &RetopoOptions) -> Result<(PolyMesh, RetopoRepo
 
 /// The layout of the fields (or the fallback), before it is conformed to the region outline.
 fn lay_out(mesh: &Mesh, opts: &RetopoOptions) -> Result<(PolyMesh, RetopoReport), String> {
+    let (work, rho, target) = prepare_work(mesh, opts)?;
+    let closed = is_closed(&work);
+    let chi = euler_of_mesh(&work);
+    let bvh = Bvh::build(&work);
+    if opts.force_fallback {
+        return Ok(forced_fallback(&work, &bvh, (rho, target), (closed, chi)));
+    }
+    let meshes = build_levels(&work);
+    let levels: Vec<Level> = meshes.iter().map(level_of).collect();
+    let (o, p) = solve_fields(&levels, rho, opts);
+    let finest = levels.first().ok_or("no level")?;
+    let mut report = RetopoReport {
+        layout: Layout::Field,
+        edge_length: rho,
+        work_triangles: work.triangle_count(),
+        quads: 0,
+        other_polygons: 0,
+        irregular_fraction: 0.0,
+        euler_ok: true,
+        note: None,
+        boundary: ConformReport::default(),
+    };
+    let extracted = extract(finest, &o, &p, rho, &bvh);
+    let poly = match accept_extracted(extracted, &mut report, target, (closed, chi)) {
+        Ok(poly) => poly,
+        Err(why) => {
+            report.layout = Layout::Fallback;
+            let f = fallback(&work, target, &bvh);
+            report.quads = 0;
+            report.other_polygons = f.faces.len();
+            report.irregular_fraction = irregular_fraction(&f);
+            report.euler_ok = !closed || euler_of(&f) == chi;
+            report.note = Some(why);
+            f
+        }
+    };
+    Ok((poly, report))
+}
+
+/// Validates `mesh` and returns the working mesh with the edge length ρ and the face target.
+fn prepare_work(mesh: &Mesh, opts: &RetopoOptions) -> Result<(Mesh, f64, usize), String> {
     mesh.validate().map_err(|e| e.to_string())?;
     if mesh.triangle_count() < 4 {
         return Err("the mesh has too few triangles".into());
@@ -158,27 +199,33 @@ fn lay_out(mesh: &Mesh, opts: &RetopoOptions) -> Result<(PolyMesh, RetopoReport)
     if work.triangle_count() < 4 {
         return Err("the mesh collapsed while preparing it".into());
     }
-    let closed = is_closed(&work);
-    let chi = euler_of_mesh(&work);
-    let bvh = Bvh::build(&work);
-    if opts.force_fallback {
-        let f = fallback(&work, target, &bvh);
-        let report = RetopoReport {
-            layout: Layout::Fallback,
-            edge_length: rho,
-            work_triangles: work.triangle_count(),
-            quads: 0,
-            other_polygons: f.faces.len(),
-            irregular_fraction: irregular_fraction(&f),
-            euler_ok: !closed || euler_of(&f) == chi,
-            note: Some("fallback layout requested".into()),
-            boundary: ConformReport::default(),
-        };
-        return Ok((f, report));
-    }
-    let meshes = build_levels(&work);
-    let levels: Vec<Level> = meshes.iter().map(level_of).collect();
-    // solve coarse to fine
+    Ok((work, rho, target))
+}
+
+/// The fallback layout asked for with `force_fallback`, and its report.
+fn forced_fallback(
+    work: &Mesh,
+    bvh: &Bvh,
+    (rho, target): (f64, usize),
+    (closed, chi): (bool, i64),
+) -> (PolyMesh, RetopoReport) {
+    let f = fallback(work, target, bvh);
+    let report = RetopoReport {
+        layout: Layout::Fallback,
+        edge_length: rho,
+        work_triangles: work.triangle_count(),
+        quads: 0,
+        other_polygons: f.faces.len(),
+        irregular_fraction: irregular_fraction(&f),
+        euler_ok: !closed || euler_of(&f) == chi,
+        note: Some("fallback layout requested".into()),
+        boundary: ConformReport::default(),
+    };
+    (f, report)
+}
+
+/// Solves the orientation and position fields from the coarsest level to the finest.
+fn solve_fields(levels: &[Level], rho: f64, opts: &RetopoOptions) -> (Vec<Vec3>, Vec<Vec3>) {
     let mut o: Vec<Vec3> = Vec::new();
     let mut p: Vec<Vec3> = Vec::new();
     for k in (0..levels.len()).rev() {
@@ -197,55 +244,35 @@ fn lay_out(mesh: &Mesh, opts: &RetopoOptions) -> Result<(PolyMesh, RetopoReport)
             smooth_positions(lv, &o, &mut p, rho, opts.position_sweeps / fine);
         }
     }
-    let finest = levels.first().ok_or("no level")?;
-    let mut report = RetopoReport {
-        layout: Layout::Field,
-        edge_length: rho,
-        work_triangles: work.triangle_count(),
-        quads: 0,
-        other_polygons: 0,
-        irregular_fraction: 0.0,
-        euler_ok: true,
-        note: None,
-        boundary: ConformReport::default(),
+    (o, p)
+}
+
+/// The extracted polygons when they are good enough (their counts go into `report`), else why
+/// the field extraction is rejected.
+fn accept_extracted(
+    extracted: Option<PolyMesh>,
+    report: &mut RetopoReport,
+    target: usize,
+    (closed, chi): (bool, i64),
+) -> Result<PolyMesh, String> {
+    let Some(poly) = extracted else {
+        return Err("field extraction found no faces".into());
     };
-    let extracted = extract(finest, &o, &p, rho, &bvh);
-    let mut chosen: Option<PolyMesh> = None;
-    let mut why = String::new();
-    match extracted {
-        Some(poly) => {
-            let quads = poly.faces.iter().filter(|f| f.len() == 4).count();
-            let share = quads as f64 / poly.faces.len().max(1) as f64;
-            let euler_ok = !closed || euler_of(&poly) == chi;
-            let size_ok = poly.faces.len() * 3 > target && poly.faces.len() < target * 3;
-            if share >= 0.5 && euler_ok && size_ok {
-                report.quads = quads;
-                report.other_polygons = poly.faces.len() - quads;
-                report.irregular_fraction = irregular_fraction(&poly);
-                chosen = Some(poly);
-            } else {
-                why = format!(
-                    "field extraction gave {} faces, {:.0} % quads, Euler {}",
-                    poly.faces.len(),
-                    share * 100.0,
-                    if euler_ok { "ok" } else { "wrong" }
-                );
-            }
-        }
-        None => why = "field extraction found no faces".into(),
+    let quads = poly.faces.iter().filter(|f| f.len() == 4).count();
+    let share = quads as f64 / poly.faces.len().max(1) as f64;
+    let euler_ok = !closed || euler_of(&poly) == chi;
+    let size_ok = poly.faces.len() * 3 > target && poly.faces.len() < target * 3;
+    if share >= 0.5 && euler_ok && size_ok {
+        report.quads = quads;
+        report.other_polygons = poly.faces.len() - quads;
+        report.irregular_fraction = irregular_fraction(&poly);
+        Ok(poly)
+    } else {
+        Err(format!(
+            "field extraction gave {} faces, {:.0} % quads, Euler {}",
+            poly.faces.len(),
+            share * 100.0,
+            if euler_ok { "ok" } else { "wrong" }
+        ))
     }
-    let poly = match chosen {
-        Some(p) => p,
-        None => {
-            report.layout = Layout::Fallback;
-            let f = fallback(&work, target, &bvh);
-            report.quads = 0;
-            report.other_polygons = f.faces.len();
-            report.irregular_fraction = irregular_fraction(&f);
-            report.euler_ok = !closed || euler_of(&f) == chi;
-            report.note = Some(why);
-            f
-        }
-    };
-    Ok((poly, report))
 }

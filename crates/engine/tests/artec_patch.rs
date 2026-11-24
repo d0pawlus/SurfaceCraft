@@ -37,11 +37,12 @@ const EDGE_SAMPLE: usize = 20_000;
 const COVER_GRID: usize = 15;
 const NEIGHBOUR_MAX_CONTROL: u64 = 24;
 /// A neighbour whose normal curvature across the shared side varies along it by less than this
-/// (standard deviation, 1/mm) is a usable G2 reference. Measured 2026-11-15: the eight sites where G2
-/// held had at most 0.019, the four where a feature of the part crosses the side at least 0.048.
-const SMOOTH_NEIGHBOUR: f64 = 0.03;
+/// (standard deviation, 1/mm) is a usable G2 reference. Measured 2026-11-15 with the
+/// curvature-variation energy: the nine sites where G2 held had at most 0.0065, the three where a
+/// feature of the part crosses the side at least 0.0152.
+const SMOOTH_NEIGHBOUR: f64 = 0.01;
 /// Bounds of the gate on smooth neighbours, 1.5 times the targets of the command (5 % and 0.05
-/// degrees; measured at most 4.8 % and 0.046 degrees).
+/// degrees; measured at most 3.5 % and 0.032 degrees).
 const G2_GATE: f64 = 0.075;
 const G1_GATE_DEG: f64 = 0.075;
 
@@ -413,6 +414,9 @@ fn measure_site(session: &mut Session, tag: &str, case: &Case, shapes: &Outlines
     let spread = rows.last().and_then(|r| r.surface).and_then(|id| curvature_spread(session, id, &case.pentagon[0]));
     if let Some(octagon) = rows.last_mut() {
         octagon.spread = spread;
+    }
+    if std::env::var("ARTEC_SOFT_ONLY").is_ok() {
+        return rows;
     }
     let pentagon = data(&shapes.pentagon);
     rows.push(patch(
