@@ -16,7 +16,12 @@ impl Renderer {
             m.used = false;
         }
         self.draw_list.clear();
+        let max_buffer = device.limits().max_buffer_size;
         for item in &f.items {
+            // a buffer larger than the device allows would end the app: such a mesh is not drawn
+            if !fits(&item.mesh, max_buffer) {
+                continue;
+            }
             let k = item.key;
             let fresh = self
                 .meshes

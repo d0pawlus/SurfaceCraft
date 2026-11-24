@@ -232,10 +232,18 @@ fn load(s: &Session, path: &Option<String>, data: &Option<String>, format: Optio
     Ok((bytes, default_name, fmt))
 }
 
+/// Most triangles (and vertices) of a mesh imported in the browser. Its memory is one wasm32 heap
+/// of at most 4 GiB that never shrinks, so the import may take about half of it and leave the rest
+/// to the commands that follow. Measured (`crates/ui-egui/tests/import_memory.rs`, binary STL picked
+/// in the interface): about 110 bytes per triangle at the peak, so 20 million take about 2.2 GB.
+/// The viewport draws a scan through its display level of detail (2 million triangles), so the
+/// GPU buffers of a scan do not grow with it.
+const WEB_MAX_TRIANGLES: usize = 20_000_000;
+
 /// The browser has far less memory (design doc section 11): smaller meshes on the web.
 fn read_limits() -> Limits {
     if cfg!(target_arch = "wasm32") {
-        Limits { max_triangles: 5_000_000, max_vertices: 5_000_000, ..Limits::default() }
+        Limits { max_triangles: WEB_MAX_TRIANGLES, max_vertices: WEB_MAX_TRIANGLES, ..Limits::default() }
     } else {
         Limits::default()
     }

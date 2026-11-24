@@ -336,8 +336,15 @@ pub fn require_files(s: &Session) -> CmdResult<()> {
     }
 }
 
-/// Reads a file, refusing when the session has no file access.
+/// Reads a file, refusing when the session has no file access. A `picked:` path is a file the
+/// user picked in the interface ([`crate::picked`]): it is taken out of the session's store, with
+/// or without file access, and a second read of it fails.
 pub fn read_file(s: &Session, path: &str) -> CmdResult<Vec<u8>> {
+    if crate::PickedFiles::is_picked(path) {
+        return s.picked.take(path).ok_or_else(|| {
+            CmdError::Failed(format!("{path} is not held (already read or never picked); pick the file again"))
+        });
+    }
     if !s.allow_files {
         return Err(CmdError::Unavailable("file paths are not available here; pass the data inline".into()));
     }

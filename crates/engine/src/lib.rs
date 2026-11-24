@@ -16,12 +16,14 @@
 pub mod cmd;
 pub mod display;
 pub mod job;
+pub mod picked;
 pub mod replay;
 pub mod session;
 
 pub use cmd::{CmdError, CommandSpec, registry};
 pub use display::DisplayItem;
 pub use job::{Finished, Job, JobPoll};
+pub use picked::PickedFiles;
 pub use session::{LogEntry, ScriptReport, ScriptStep, Session};
 
 /// An error from executing a command, as reported to every front end.

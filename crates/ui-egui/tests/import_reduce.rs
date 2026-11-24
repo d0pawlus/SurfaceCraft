@@ -37,6 +37,36 @@ fn a_small_file_is_imported_without_a_question() {
 }
 
 #[test]
+fn picked_contents_reach_the_import_as_a_picked_file_and_are_not_kept() {
+    let mut app = SurfaceCraftApp::headless();
+    app.session.allow_files = false; // as in the browser
+    let file = small_file();
+    app.import_picked_bytes("ball.stl", file.clone());
+    let entry = app.session.log.last().unwrap();
+    assert!(entry.ok, "{}", entry.outcome);
+    assert!(entry.params.get("data").is_none(), "no base64 copy of the file in the parameters or the log");
+    let path = entry.params["path"].as_str().unwrap();
+    assert!(path.starts_with("picked:") && path.ends_with("/ball.stl"), "{path}");
+    assert!(entry.params.to_string().len() < 200, "the log keeps the path, not the file");
+    assert_eq!(app.session.picked.held_bytes(), 0, "the import took the file");
+    assert_eq!(app.session.doc.meshes.len(), 1);
+    assert_eq!(app.session.doc.meshes[0].name, "ball");
+}
+
+#[test]
+fn a_picked_file_is_released_when_its_import_fails_or_is_cancelled() {
+    let mut app = SurfaceCraftApp::headless();
+    // an extension no reader knows fails before the file is read
+    app.import_picked_bytes("scan.zip", small_file());
+    assert!(!app.session.log.last().unwrap().ok);
+    assert_eq!(app.session.picked.held_bytes(), 0, "a failed import leaves nothing held");
+    // a command cancelled before it ran (a run in place still waiting) releases its file
+    let path = app.session.picked.put("ball.stl", small_file());
+    app.session.note_cancelled("mesh.import", json!({"path": path}));
+    assert_eq!(app.session.picked.held_bytes(), 0, "a cancelled import leaves nothing held");
+}
+
+#[test]
 fn a_large_file_waits_for_the_answer_and_cancel_drops_it() {
     assert!(u64::from(DECLARED) > OFFER_ABOVE);
     let mut app = SurfaceCraftApp::headless();

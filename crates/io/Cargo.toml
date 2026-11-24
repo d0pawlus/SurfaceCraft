@@ -12,6 +12,8 @@ publish.workspace = true
 surfacecraft-geom.workspace = true
 surfacecraft-kernel.workspace = true
 surfacecraft-doc.workspace = true
+# the seed of the STL reader's corner table (a file cannot choose coordinates that collide)
+getrandom.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 schemars.workspace = true

@@ -3471,6 +3471,7 @@ dependencies = [
 name = "surfacecraft-io"
 version = "0.3.0"
 dependencies = [
+ "getrandom 0.4.3",
  "rayon",
  "schemars",
  "serde",

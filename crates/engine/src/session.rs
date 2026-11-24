@@ -71,6 +71,9 @@ pub struct Session {
     pub log: Vec<Arc<LogEntry>>,
     /// Whether commands may touch the file system (false on the web and in sandboxed MCP).
     pub allow_files: bool,
+    /// Files the user picked, held until their command reads them (`picked:` paths, also where
+    /// `allow_files` is false). Shared with every fork.
+    pub picked: crate::PickedFiles,
     /// Body display meshes.
     pub tess: crate::display::TessCache,
     /// Deviation maps by mesh id. Only valid ones are kept: see [`Session::live_map`].
@@ -111,6 +114,8 @@ impl Session {
         let before = spec.undoable.then(|| self.doc.clone());
         self.unchanged = false;
         let result = run_guarded(spec, self, params.clone());
+        // a picked file the command did not read (it failed first) is not held any longer
+        self.picked.release_named_in(&params);
         let mapped = match result {
             Ok(v) => {
                 if let Some(b) = before.filter(|_| !self.unchanged) {
@@ -162,6 +167,7 @@ impl Session {
             history: self.history.clone(),
             log: self.log.clone(),
             allow_files: self.allow_files,
+            picked: self.picked.clone(),
             tess: self.tess.clone(),
             maps: self.maps.clone(),
             cancel: Cancel::new(),
@@ -171,8 +177,10 @@ impl Session {
     }
 
     /// Records that command `id` was started with `params` and cancelled before it finished: a
-    /// failed entry in the log and nothing else (the document and the history are untouched).
+    /// failed entry in the log and nothing else (the document and the history are untouched). A
+    /// picked file it names is released.
     pub fn note_cancelled(&mut self, id: &str, params: Value) {
+        self.picked.release_named_in(&params);
         let outcome = serde_json::to_value(EngineError::Failed(cmd::CANCELLED.into())).unwrap_or(Value::Null);
         self.push_log(LogEntry { command: id.to_string(), params, ok: false, outcome });
     }

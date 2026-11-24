@@ -24,12 +24,15 @@ fn main() -> eframe::Result {
     let choice = craft_window::Choice::probe(craft_window::Prefix::new("SURFACECRAFT"));
     let viewport =
         if choice.frame().decorations() { craft_window::decorate(viewport, choice.frame()) } else { viewport };
+    let defaults = eframe::NativeOptions::default();
     let options = eframe::NativeOptions {
         viewport,
         renderer: eframe::Renderer::Wgpu,
         // the window's size and place are remembered between runs
         persist_window: true,
-        ..Default::default()
+        // the adapter's largest buffer, so that a scan of tens of millions of triangles is drawn
+        wgpu_options: surfacecraft_ui_egui::viewport::with_largest_buffers(defaults.wgpu_options.clone()),
+        ..defaults
     };
     eframe::run_native(
         "SurfaceCraft",
