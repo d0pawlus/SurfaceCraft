@@ -79,7 +79,8 @@ fn region_area(mesh: &Mesh, seg: &Segment) -> f64 {
 }
 
 /// Does `seg` (a `share` of the scan's area) span enough of its primitive: a curved one at least a
-/// radius, or [`DOMINANT_SHARE`] of the scan (a large gentle patch of a big cylinder or sphere); a
+/// radius of curvature, or (a cylinder, sphere or torus) [`DOMINANT_SHARE`] of the scan (a large
+/// gentle patch of a big cylinder or sphere); a
 /// plane [`PLANE_EXTENT_TOLERANCES`] tolerances or [`PLANE_EXTENT_DIAGONAL`] of the scan, whichever
 /// is less.
 fn spans(mesh: &Mesh, seg: &Segment, tolerance: f64, scene: &Scene, share: f64) -> bool {
@@ -88,6 +89,10 @@ fn spans(mesh: &Mesh, seg: &Segment, tolerance: f64, scene: &Scene, share: f64) 
             let least = (PLANE_EXTENT_TOLERANCES * tolerance).min(PLANE_EXTENT_DIAGONAL * scene.diagonal);
             extent(&sample_corners(mesh, &seg.triangles), None) >= least
         }
+        // the waiver of the span is for a large gentle patch of a big cylinder or sphere; a cone
+        // that holds a twentieth of a wavy top around one crest (half angle 82 degrees, spanning
+        // half a radius of curvature) is no design cone, so a cone always needs its span
+        PrimitiveKind::Cone => curvature_support(mesh, seg) >= 1.0,
         _ => share >= DOMINANT_SHARE || curvature_support(mesh, seg) >= 1.0,
     }
 }

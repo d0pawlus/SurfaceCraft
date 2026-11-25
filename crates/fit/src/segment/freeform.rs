@@ -187,7 +187,7 @@ pub(super) fn extent(pts: &[Point3], axis: Option<Vec3>) -> f64 {
 }
 
 /// How far a curved region reaches around its primitive: the extent over which the surface
-/// curves, in radii (`INFINITY` for a plane, which has no curvature to support). A region that
+/// curves, in radii of curvature (`INFINITY` for a plane, which has no curvature to support). A region that
 /// spans a fraction of a radius is a gentle patch of some surface that a curved primitive fits
 /// by chance.
 pub(super) fn curvature_support(mesh: &Mesh, seg: &Segment) -> f64 {
@@ -198,11 +198,14 @@ pub(super) fn curvature_support(mesh: &Mesh, seg: &Segment) -> f64 {
         Primitive::Sphere { radius, .. } => (extent(&pts, None), radius.abs()),
         Primitive::Torus { minor_radius, .. } => (extent(&pts, None), minor_radius.abs()),
         Primitive::Cylinder { axis, radius, .. } => (extent(&pts, Some(v(axis))), radius.abs()),
-        Primitive::Cone { apex, axis, .. } => {
-            // the local radius: the mean distance of the region's points from the axis
+        Primitive::Cone { apex, axis, half_angle } => {
+            // the local radius of curvature: a cone curves across its rulings by cos(half angle)
+            // over the distance from its axis (a cylinder at 0, a plane at a right angle), so a
+            // nearly flat cone around a crest of a wavy surface spans a fraction of it
             let (a, x) = (v(axis).normalize(), v(apex));
             let r: f64 = pts.iter().map(|p| (p.coords - x - a * (p.coords - x).dot(&a)).norm()).sum::<f64>();
-            (extent(&pts, Some(a)), r / pts.len().max(1) as f64)
+            let rho = r / pts.len().max(1) as f64;
+            (extent(&pts, Some(a)), rho / half_angle.cos().max(f64::MIN_POSITIVE))
         }
     };
     if radius > 0.0 { chord / radius } else { 0.0 }
