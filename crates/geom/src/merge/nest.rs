@@ -30,6 +30,9 @@ pub(super) const WORK_PER_TRIANGLE: usize = 64;
 pub(super) const WORK_BASE: usize = 1 << 16;
 /// Work of one cast at most (a share of the budget, so that one pile cannot eat it all at once).
 const MAX_CAST_WORK: usize = 1 << 14;
+/// Pieces of at most this many triangles are tested triangle by triangle: no BVH is built or kept
+/// for them (a pile of tiny pieces costs no memory beyond the input).
+pub(super) const DIRECT_TRIANGLES: usize = 64;
 /// Work between two looks at the cancellation flag (plus one cast at most).
 pub(super) const CANCEL_WORK: usize = 4096;
 
@@ -100,7 +103,8 @@ enum Inside {
 struct Closed<'p> {
     mesh: &'p Mesh,
     pieces: Vec<&'p pieces::Piece>,
-    own: Vec<std::cell::OnceCell<Bvh>>,
+    /// BVHs of the pieces with more than [`DIRECT_TRIANGLES`] triangles, built on first use.
+    own: std::cell::RefCell<std::collections::HashMap<usize, std::rc::Rc<Bvh>>>,
     boxes: Bvh,
     eps: f64,
     cancel: &'p Cancel,
@@ -174,41 +178,86 @@ impl Closed<'_> {
         }
     }
 
-    /// The BVH of piece `j`, built on first use (its triangles count as work then).
-    fn bvh_of(&self, j: usize, cost: &mut Cost) -> Option<&Bvh> {
-        let (cell, piece) = (self.own.get(j)?, self.pieces.get(j)?);
-        if cell.get().is_none() {
-            cost.work = cost.work.saturating_add(piece.triangles.len());
-            cost.builds += 1;
+    /// The BVH of piece `j`, built on first use (its triangles count as work then); `None` when
+    /// building it would take more than the budget has left (the probe is then unjudged).
+    fn bvh_of(&self, j: usize, cost: &mut Cost) -> Option<std::rc::Rc<Bvh>> {
+        if let Some(b) = self.own.borrow().get(&j) {
+            return Some(b.clone());
         }
-        Some(cell.get_or_init(|| Bvh::build(&self.mesh.submesh(&piece.triangles))))
+        let piece = self.pieces.get(j)?;
+        if piece.triangles.len() > cost.left() {
+            return None;
+        }
+        cost.work = cost.work.saturating_add(piece.triangles.len());
+        cost.builds += 1;
+        let b = std::rc::Rc::new(Bvh::build(&self.mesh.submesh(&piece.triangles)));
+        self.own.borrow_mut().insert(j, b.clone());
+        Some(b)
     }
 
-    /// Crossings of the ray from `p` along `dir` with the pieces `holders`, each through its own
-    /// BVH; `None` when the budget ran out or the ray met [`MAX_CROSSINGS`] surfaces.
+    /// Crossings of the ray from `p` along `dir` with the pieces `holders` (a piece of at most
+    /// [`DIRECT_TRIANGLES`] triangles tested triangle by triangle, a larger one through its BVH);
+    /// `None` when the budget ran out or the ray met [`MAX_CROSSINGS`] surfaces.
     fn crossings(&self, p: &Point3, dir: &Vec3, holders: &[usize], cost: &mut Cost) -> Option<usize> {
         let mut n = 0;
         for &j in holders {
-            let bvh = self.bvh_of(j, cost)?;
-            let mut o = *p;
-            loop {
-                if n >= MAX_CROSSINGS || self.polled(cost) {
-                    return None;
-                }
-                let (cast, work) =
-                    bvh.ray_cast_counted(&o, dir, f64::INFINITY, &|_| true, cost.left().min(MAX_CAST_WORK));
-                cost.work += work;
-                match cast {
-                    RayCast::Hit(_, t) => {
-                        n += 1;
-                        o += dir * (t + self.eps);
-                    }
-                    RayCast::Miss => break,
-                    RayCast::Exhausted => return None,
-                }
+            if self.polled(cost) {
+                return None;
+            }
+            let small = self.pieces.get(j).is_some_and(|q| q.triangles.len() <= DIRECT_TRIANGLES);
+            n += if small { self.crossings_direct(p, dir, j, cost)? } else { self.crossings_bvh(p, dir, j, cost)? };
+            if n >= MAX_CROSSINGS {
+                return None;
             }
         }
         Some(n)
+    }
+
+    /// Crossings of the ray with the triangles of piece `j`, each tested (hits closer than the
+    /// stepping distance count once); no BVH, nothing kept.
+    fn crossings_direct(&self, p: &Point3, dir: &Vec3, j: usize, cost: &mut Cost) -> Option<usize> {
+        let piece = self.pieces.get(j)?;
+        if piece.triangles.len() > cost.left() {
+            return None;
+        }
+        cost.work = cost.work.saturating_add(piece.triangles.len());
+        let mut ts: Vec<f64> = piece
+            .triangles
+            .iter()
+            .filter_map(|&t| self.mesh.triangle(t as usize))
+            .filter_map(|[a, b, c]| crate::tri::ray_hit(p, dir, &a, &b, &c))
+            .collect();
+        ts.sort_by(f64::total_cmp);
+        let mut last = f64::NEG_INFINITY;
+        let mut n = 0;
+        for t in ts {
+            if t > last + self.eps {
+                n += 1;
+                last = t;
+            }
+        }
+        Some(n)
+    }
+
+    /// Crossings of the ray with piece `j` through its BVH, stepping past each hit.
+    fn crossings_bvh(&self, p: &Point3, dir: &Vec3, j: usize, cost: &mut Cost) -> Option<usize> {
+        let bvh = self.bvh_of(j, cost)?;
+        let (mut o, mut n) = (*p, 0);
+        loop {
+            if n >= MAX_CROSSINGS || self.polled(cost) {
+                return None;
+            }
+            let (cast, work) = bvh.ray_cast_counted(&o, dir, f64::INFINITY, &|_| true, cost.left().min(MAX_CAST_WORK));
+            cost.work += work;
+            match cast {
+                RayCast::Hit(_, t) => {
+                    n += 1;
+                    o += dir * (t + self.eps);
+                }
+                RayCast::Miss => return Some(n),
+                RayCast::Exhausted => return None,
+            }
+        }
     }
 }
 
@@ -236,7 +285,7 @@ fn closed_set<'p>(mesh: &'p Mesh, closed: Vec<&'p pieces::Piece>, cancel: &'p Ca
     let eps = NEST_EPS_SHARE * mesh.bbox().diagonal().max(f64::MIN_POSITIVE);
     Closed {
         mesh,
-        own: (0..closed.len()).map(|_| std::cell::OnceCell::new()).collect(),
+        own: std::cell::RefCell::new(std::collections::HashMap::new()),
         pieces: closed,
         boxes: Bvh::build(&boxes),
         eps,
@@ -247,6 +296,16 @@ fn closed_set<'p>(mesh: &'p Mesh, closed: Vec<&'p pieces::Piece>, cancel: &'p Ca
 
 /// [`negative_pieces`] and what its nesting tests cost.
 pub(super) fn negative_pieces_costed(mesh: &Mesh, cancel: &Cancel) -> Option<(Negative, Cost)> {
+    negative_pieces_within(mesh, cancel, None)
+}
+
+/// [`negative_pieces_costed`] with the stage's budget set to `budget` (a test of the budget's end).
+#[cfg(test)]
+pub(super) fn negative_pieces_budgeted(mesh: &Mesh, cancel: &Cancel, budget: usize) -> Option<(Negative, Cost)> {
+    negative_pieces_within(mesh, cancel, Some(budget))
+}
+
+fn negative_pieces_within(mesh: &Mesh, cancel: &Cancel, budget: Option<usize>) -> Option<(Negative, Cost)> {
     let all = pieces::pieces(mesh);
     let closed: Vec<&pieces::Piece> = all.iter().filter(|p| p.closed()).collect();
     // largest first (ties by order): the pieces that decide the verdict are judged first
@@ -255,8 +314,8 @@ pub(super) fn negative_pieces_costed(mesh: &Mesh, cancel: &Cancel) -> Option<(Ne
     let area_of = |k: usize| closed.get(k).map_or(0.0, |p| p.area);
     negative.sort_by(|&a, &b| area_of(b).total_cmp(&area_of(a)).then(a.cmp(&b)));
     let triangles: usize = closed.iter().map(|p| p.triangles.len()).sum();
-    let mut cost =
-        Cost { budget: WORK_BASE.saturating_add(WORK_PER_TRIANGLE.saturating_mul(triangles)), ..Cost::default() };
+    let budget = budget.unwrap_or_else(|| WORK_BASE.saturating_add(WORK_PER_TRIANGLE.saturating_mul(triangles)));
+    let mut cost = Cost { budget, ..Cost::default() };
     if negative.is_empty() {
         return Some((Negative::default(), cost));
     }

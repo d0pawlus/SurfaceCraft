@@ -43,8 +43,9 @@ fn pile() -> Mesh {
 }
 
 fn within_budget(cost: &nest::Cost, m: &Mesh) {
-    // at most one capped cast or listing past the budget
-    assert!(cost.work <= cost.budget + (1 << 14), "{cost:?}");
+    // every cast, listing and build is bounded by what is left; a cast or a listing may overshoot
+    // by a node or a leaf
+    assert!(cost.work <= cost.budget + 64, "{cost:?}");
     assert!(cost.budget <= nest::WORK_BASE + nest::WORK_PER_TRIANGLE * m.triangle_count());
 }
 
@@ -104,6 +105,8 @@ fn a_pile_of_coincident_tetrahedra_stays_within_the_budget_and_refuses() {
     }
     let (n, cost) = nest::negative_pieces_costed(&m, &Cancel::new()).unwrap();
     within_budget(&cost, &m);
+    // tiny pieces are tested triangle by triangle: no BVH built for any of them
+    assert_eq!(cost.builds, 0, "{cost:?}");
     // the pile is most of the area: refused, as turned inside out (pieces judged alone, debris
     // together over 1 %) or as unjudged; never accepted
     assert!(n.inverted > 0 || n.unjudged_refuses, "{n:?}");
@@ -195,6 +198,7 @@ fn a_part_with_thousands_of_voids_is_accepted_with_every_void_judged() {
     assert_eq!((n.skins, n.unjudged, n.inverted, n.unjudged_refuses), (3000, 0, 0, false), "{n:?}");
     // measured about 20 times below the budget; bound: 1.5 times
     assert!(cost.work as f64 * 1.5 <= cost.budget as f64, "{cost:?}");
+    // the cube (768 triangles) has its BVH, built once; the voids are tested directly
     assert_eq!(cost.builds, 1, "the cube's BVH, once");
 }
 
@@ -208,7 +212,7 @@ fn scans_far_from_the_origin_are_refused_and_a_sphere_at_a_million_merges() {
     let far = inverted_sphere(Point3::new(1e120, 0.0, 0.0), 10.0);
     assert!(matches!(go(&[near.clone(), far]), Err(MergeError::Params(_))));
     let million = synth::sphere(Point3::new(1e6, 0.0, 0.0), 10.0, 32, 16);
-    let (mesh, rep) = go(&[near.clone(), million]).unwrap();
+    let (mesh, rep) = go(&[near, million]).unwrap();
     assert!(mesh.is_some() && !rep.refused, "{:?}", rep.issues);
 }
 
@@ -218,4 +222,22 @@ fn more_scans_than_the_cap_are_refused() {
     let many = vec![one; MAX_SCANS + 1];
     let r = merge(&many, &Params { tolerance: 0.1, ..Params::default() }, &Cancel::new(), &mut |_| {});
     assert!(matches!(r, Err(MergeError::Params(_))), "{r:?}");
+}
+
+#[test]
+fn a_large_holder_is_not_built_when_the_budget_has_not_room_for_it() {
+    // a hollow sphere: its inner skin needs the outer shell (4096 triangles) built; with a budget of
+    // 1000 the build is not started and the skin is unjudged, and the work stays within the budget
+    let mut m = synth::sphere(Point3::origin(), 10.0, 64, 32);
+    let inner = synth::sphere(Point3::origin(), 8.0, 24, 12);
+    m.append(&Mesh {
+        positions: inner.positions.clone(),
+        triangles: inner.triangles.iter().map(|t| [t[0], t[2], t[1]]).collect(),
+    });
+    let (n, cost) = nest::negative_pieces_budgeted(&m, &Cancel::new(), 1000).unwrap();
+    assert_eq!((n.unjudged, cost.builds), (1, 0), "{n:?} {cost:?}");
+    assert!(cost.work <= cost.budget + 64, "{cost:?}");
+    // with the full budget it is judged an inner skin
+    let (full, _) = nest::negative_pieces_costed(&m, &Cancel::new()).unwrap();
+    assert_eq!((full.skins, full.unjudged), (1, 0), "{full:?}");
 }
