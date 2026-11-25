@@ -116,6 +116,14 @@ pub(super) fn cloud(body: &Brep, faces: &[usize], border: Vec<Vec<V>>) -> Result
 }
 
 impl Cloud {
+    /// How far the group's border stands off the primitive of `gauge` (mm): the farthest point along its boundary
+    /// edges from the surface (about a micrometre after a snap, up to the gap without one). Points the gauge cannot
+    /// measure are left out; with none, the offset is 0 and the face keeps the fine display chord (the safe side for
+    /// the checks: a border that cannot be measured is not given a coarser mesh).
+    pub(super) fn border_offset(&self, gauge: &Gauge) -> f64 {
+        self.border.iter().flatten().filter_map(|q| gauge.distance(*q)).filter(|d| d.is_finite()).fold(0.0, f64::max)
+    }
+
     /// The `n` patches nearest `p` by the box of their samples (a corner over a patch has distance 0 to
     /// its box; of the patches that hold it, the smaller come first). The distance to the centre of a box
     /// would put the small patches round a corner before the large one it lies over.
@@ -337,6 +345,18 @@ mod tests {
 
     fn flat() -> Gauge {
         Gauge::new(&crate::hybrid::Shape::Plane { point: [0.0; 3], normal: [0.0, 0.0, 1.0] }).unwrap()
+    }
+
+    /// The offset of a border is its farthest point from the primitive; a point that cannot be measured (not finite) is
+    /// left out, and a border with no measurable point stands 0 off (the face keeps the fine chord).
+    #[test]
+    fn the_offset_of_a_border_is_its_farthest_measurable_point_from_the_primitive() {
+        let (body, _) = sheet();
+        let offset = |border: Vec<Vec<V>>| cloud(&body, &[0], border).unwrap().border_offset(&flat());
+        assert!((offset(vec![vec![[0.0, 0.0, 0.0], [5.0, 0.0, 0.1], [10.0, 0.0, -0.04]]]) - 0.1).abs() < 1e-12);
+        assert!((offset(vec![vec![[0.0, 0.0, 0.03], [f64::NAN, 0.0, 0.0]]]) - 0.03).abs() < 1e-12, "NaN left out");
+        assert_eq!(offset(vec![vec![[f64::NAN; 3]]]), 0.0, "nothing measurable");
+        assert_eq!(offset(Vec::new()), 0.0, "no border");
     }
 
     #[test]

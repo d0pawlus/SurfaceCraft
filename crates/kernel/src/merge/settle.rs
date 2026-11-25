@@ -24,6 +24,11 @@ const MAX_AREA_LOSS: f64 = 0.025;
 const MAX_AREA_EXCESS: f64 = 0.1;
 /// The chord the judge tessellates the body at, as a share of the tolerance (half the chord of the area check).
 const JUDGE_CHORD_SHARE: f64 = 0.05;
+/// The least chord of the display tessellation of a new face as a multiple of how far its boundary stands off its
+/// surface (see `display_chord_of`): the mesher's refinement reaches its cap at a chord of about half the offset and
+/// finer (upstream draft 13: offset 0.1 mm at chord 0.05, offset 0.05 at chord 0.02), so twice the offset stays four
+/// times clear of it.
+const BOUNDARY_CHORD_PER_OFFSET: f64 = 2.0;
 
 /// The most groups settled together: the groups are put into the body a batch at a time, each batch rebuilt with the
 /// faces the batches before it gave. Where the kernel refuses a whole batch, its groups go one by one, and those it
@@ -205,9 +210,12 @@ pub(super) fn face_verdict(
         ));
     }
     let sheet = face_sheet(brep, face)?;
-    // the display chord, the chord of the area check and the chord of the judge (a twentieth of the gap)
+    // the display chord (no finer than the face's boundary allows), the chord of the area check and the chord of the
+    // judge (a twentieth of the gap)
     let judge_chord = JUDGE_CHORD_SHARE * (chord / 2.0);
-    for c in [None, Some(chord), Some(judge_chord)] {
+    let display = display_chord_of(&sheet, p.cloud.border_offset(&p.gauge));
+    for (c, normals, border) in [(display, true, false), (Some(chord), false, false), (Some(judge_chord), false, true)]
+    {
         let at = c.map_or_else(|| "display chord".to_string(), |c| format!("chord {c:.3}"));
         let Ok(topo) = crate::tess::tessellate_topo(&sheet, c) else {
             return Ok(Err(format!("the mesher cannot triangulate the new face at the {at}")));
@@ -216,19 +224,30 @@ pub(super) fn face_verdict(
         if ratio < 1.0 - MAX_AREA_LOSS || ratio > 1.0 + MAX_AREA_EXCESS {
             return Ok(Err(format!("the new face tessellates to {ratio:.3} of its patches' area at the {at}")));
         }
-        if c.is_none()
-            && let Err(e) = check::check_face(&topo.mesh, p.forward, &p.cloud, (body, &p.gauge), p.limit)
-        {
+        if normals && let Err(e) = check::check_face(&topo.mesh, p.forward, &p.cloud, (body, &p.gauge), p.limit) {
             return Ok(Err(e.to_string()));
         }
         // the border is compared with the group's on the finest tessellation, whose chord is the stated slack
-        if c == Some(judge_chord)
-            && let Err(e) = check::check_border(&p.cloud, &topo.mesh, p.limit, judge_chord)
-        {
+        if border && let Err(e) = check::check_border(&p.cloud, &topo.mesh, p.limit, judge_chord) {
             return Ok(Err(e.to_string()));
         }
     }
     Ok(Ok(()))
+}
+
+/// The chord of the display tessellation of a new face (`sheet`), on which its area and normals are checked: the display
+/// chord (`None`), or, where the face's boundary stands `offset` (mm) off its surface by more than half of that,
+/// [`BOUNDARY_CHORD_PER_OFFSET`] times the offset. The rule is the same for every face, snapped or not; in practice it
+/// coarsens the faces of groups whose boundary could not be snapped. Such a group keeps the wrap's edges, up
+/// to the gap off the primitive, and the kernel's mesher refines such a face to its cap of triangles at any chord finer
+/// than about the offset (tangency-labs/solidcraft#17431, `docs/upstream/13-tess-refine-cap-offset-boundary.md`:
+/// measured 40 093 to 40 816 triangles at the display chord for faces that give 242 at a chord of 0.4 mm, a wrong area,
+/// and slivers that leave the normal check a handful of usable probes). A mesh cannot follow the surface more closely
+/// than its boundary does, so the coarser chord hides nothing the checks could see. A snapped boundary (measured 1.1
+/// micrometres off) keeps the display chord (a thousandth of the face's size) on every face larger than about 2 mm.
+fn display_chord_of(sheet: &Brep, offset: f64) -> Option<f64> {
+    let floor = BOUNDARY_CHORD_PER_OFFSET * offset;
+    (floor.is_finite() && floor > crate::tess::display_chord(sheet)).then_some(floor)
 }
 
 /// For each prepared group (its new face is in `brep` as `map` says) the verdict of [`face_verdict`]. `run.cancel`
@@ -490,6 +509,21 @@ fn one_by_one(
 mod tests {
     use super::*;
     use crate::nurbs::sheet_from_bezier_network;
+
+    /// The display tessellation of a new face is no finer than twice the offset of its boundary: a snapped boundary
+    /// (a micrometre off) keeps the display chord (`None`, about 0.014 mm for this 10 mm sheet), one 0.1 mm off is
+    /// meshed at 0.2 mm, and an offset that is not finite keeps the display chord.
+    #[test]
+    fn the_display_chord_of_a_new_face_is_no_finer_than_twice_its_boundary_offset() {
+        let net = vec![vec![[0.0, 0.0, 0.0], [0.0, 10.0, 0.0]], vec![[10.0, 0.0, 0.0], [10.0, 10.0, 0.0]]];
+        let sheet = sheet_from_bezier_network(&[net], &[[0, 1, 2, 3]]).unwrap();
+        assert!(crate::tess::display_chord(&sheet) > 0.01 && crate::tess::display_chord(&sheet) < 0.02);
+        assert_eq!(display_chord_of(&sheet, 1e-6), None, "a snapped face keeps the display chord");
+        assert_eq!(display_chord_of(&sheet, 1e-3), None, "2e-3 is finer than the display chord");
+        assert_eq!(display_chord_of(&sheet, 0.1), Some(0.2));
+        assert_eq!(display_chord_of(&sheet, f64::NAN), None);
+        assert_eq!(display_chord_of(&sheet, f64::INFINITY), None);
+    }
 
     /// The finding behind the refusal of a face that looks against its natural normal in an open sheet: the
     /// kernel keeps the `same` use of a sheet's face, whatever the record said, so such a face comes back
