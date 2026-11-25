@@ -68,6 +68,8 @@ const ALIGN: &[Entry] = &[
     Gap,
     Cmd("align.icp"),
     Cmd("align.center"),
+    Gap,
+    Act(AppAction::MultiScan),
 ];
 const SEGMENT: &[Entry] = &[
     Cmd("region.auto_segment"),

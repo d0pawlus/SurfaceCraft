@@ -33,6 +33,8 @@ pub mod icons;
 pub mod import_reduce;
 pub mod import_units;
 pub mod jobs;
+pub mod multiscan;
+pub mod multiscan_panel;
 pub mod navbar;
 pub mod ribbon;
 pub mod sectionview;

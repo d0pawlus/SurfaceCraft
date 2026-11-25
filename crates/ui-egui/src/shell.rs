@@ -38,6 +38,8 @@ pub enum AppAction {
     ResetLayout,
     /// Load a small sample part to try the tools on.
     SampleScan,
+    /// Open the wizard that aligns several scans of one part and merges them.
+    MultiScan,
     /// Put the keyboard in the ribbon's search field.
     SearchTools,
     /// Close the open tool and show the guide.
@@ -63,6 +65,7 @@ impl AppAction {
             AppAction::FitAll => "action.fit_all",
             AppAction::ResetLayout => "action.reset_layout",
             AppAction::SampleScan => "action.sample_scan",
+            AppAction::MultiScan => "action.multi_scan",
             AppAction::SearchTools => "action.search_tools",
             AppAction::ShowGuide => "action.show_guide",
             AppAction::ToggleLog => "action.toggle_log",
@@ -70,7 +73,7 @@ impl AppAction {
     }
 
     /// Every action (catalogue checks).
-    pub const ALL: [AppAction; 15] = [
+    pub const ALL: [AppAction; 16] = [
         AppAction::New,
         AppAction::Open,
         AppAction::Save,
@@ -83,6 +86,7 @@ impl AppAction {
         AppAction::FitAll,
         AppAction::ResetLayout,
         AppAction::SampleScan,
+        AppAction::MultiScan,
         AppAction::SearchTools,
         AppAction::ShowGuide,
         AppAction::ToggleLog,
@@ -118,6 +122,7 @@ impl AppAction {
             AppAction::FitAll => "action.fit_all.hint",
             AppAction::ResetLayout => "action.reset_layout.hint",
             AppAction::SampleScan => "action.sample_scan.hint",
+            AppAction::MultiScan => "action.multi_scan.hint",
             AppAction::SearchTools => "action.search_tools.hint",
             AppAction::ShowGuide => "action.show_guide.hint",
             AppAction::ToggleLog => "action.toggle_log.hint",
@@ -137,6 +142,7 @@ impl AppAction {
             AppAction::Redo => Some("redo"),
             AppAction::FitAll => Some("fit"),
             AppAction::SampleScan => Some("sample"),
+            AppAction::MultiScan => Some("align-fine"),
             AppAction::SearchTools => Some("search"),
             AppAction::ShowGuide => Some("guide"),
             AppAction::ToggleLog => Some("log"),
@@ -204,6 +210,7 @@ impl SurfaceCraftApp {
         // a finished background command is taken over before anything reads the session
         let now = ui.input(|i| i.time);
         self.advance_job(now);
+        self.wizard_housekeeping();
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.poll_control();
@@ -299,6 +306,7 @@ impl SurfaceCraftApp {
                 let _ = self.run_command("mesh.synth", serde_json::json!({"shape": SAMPLE_SHAPE, "name": "sample"}));
                 self.fit_pending = true;
             }
+            AppAction::MultiScan => self.open_multiscan(),
             AppAction::SearchTools => self.focus_search = true,
             AppAction::ShowGuide => self.close_tool(),
             AppAction::ToggleLog => {
@@ -447,6 +455,7 @@ impl SurfaceCraftApp {
     /// (what the ribbon shows, in list form).
     fn tools_menu(&mut self, ui: &mut egui::Ui) {
         self.action_item(ui, AppAction::SearchTools);
+        self.action_item(ui, AppAction::MultiScan);
         ui.separator();
         for stage in crate::workflow::Stage::ALL {
             ui.menu_button(t(stage.title_key()), |ui| {

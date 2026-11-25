@@ -73,7 +73,7 @@ impl SurfaceCraftApp {
 
     /// The round badge of a guide step: a check when done, its number otherwise (in the accent
     /// for the step to do now).
-    fn step_badge(&self, ui: &mut egui::Ui, number: usize, done: bool, current: bool) {
+    pub(crate) fn step_badge(&self, ui: &mut egui::Ui, number: usize, done: bool, current: bool) {
         let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(20.0), egui::Sense::hover());
         let c = |token| self.tokens.color(token);
         let painter = ui.painter();
