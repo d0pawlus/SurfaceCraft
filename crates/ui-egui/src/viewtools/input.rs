@@ -78,7 +78,7 @@ impl SurfaceCraftApp {
         let pos = resp.interact_pointer_pos().map(local);
         // a proposed alignment draws the scan where it is not: the tools that work on what is
         // under the pointer wait until it is applied or dropped
-        let previewing = crate::align_proposal::current(self).is_some();
+        let previewing = crate::align_proposal::current(self).is_some() || !self.wizard_preview().is_empty();
         let tool = if alt || picking || previewing { Tool::Navigate } else { self.tools.tool };
 
         // hover feedback

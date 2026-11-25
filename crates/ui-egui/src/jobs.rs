@@ -34,6 +34,8 @@ const BUSY_WIDTH: f32 = 320.0;
 pub(crate) enum After {
     /// Nothing besides the status line.
     Nothing,
+    /// Hand the outcome to the "Many scans" wizard, which started the command for this purpose.
+    Wizard(crate::multiscan::Purpose),
     /// Close the open tool when the command changed the document (the tool panel's OK).
     CloseTool,
     /// Frame the document in the viewport (an import).
@@ -272,6 +274,7 @@ impl SurfaceCraftApp {
         }
         match after {
             After::Nothing => {}
+            After::Wizard(purpose) => self.wizard_result(purpose, result),
             After::CloseTool => {
                 let changed = result.as_ref().is_ok_and(|v| !only_proposed(v));
                 if changed && cmd::find(id).is_some_and(|c| c.undoable) {

@@ -34,6 +34,8 @@ pub struct SurfaceCraftApp {
     /// The camera from before it framed a proposed alignment: where the view returns when the
     /// proposal is cancelled (the scan is then drawn where it was, which may be out of that frame).
     pub(crate) camera_before_proposal: Option<Camera>,
+    /// The "Many scans" wizard, while it is open (see [`crate::multiscan`]).
+    pub(crate) multiscan: Option<crate::multiscan_panel::ActiveWizard>,
     /// The stage whose tools the ribbon shows.
     pub stage: crate::workflow::Stage,
     /// The text of the ribbon's tool search.
@@ -143,6 +145,7 @@ impl SurfaceCraftApp {
             palette_params: "{}".into(),
             tool_opened_on: None,
             camera_before_proposal: None,
+            multiscan: None,
             stage: crate::workflow::Stage::default(),
             tool_search: String::new(),
             focus_search: false,
@@ -187,7 +190,7 @@ impl SurfaceCraftApp {
 
     /// The nearest object hit by the ray through viewport pixel `(x, y)` of a `w × h` viewport.
     pub(crate) fn ray_hit(&mut self, x: f64, y: f64, w: f64, h: f64) -> Option<Pick> {
-        if crate::align_proposal::current(self).is_some() {
+        if crate::align_proposal::current(self).is_some() || !self.wizard_preview().is_empty() {
             // the scan is drawn in a proposed pose it is not in: a click on the picture would
             // hit something else in the document
             return None;
@@ -511,6 +514,10 @@ impl SurfaceCraftApp {
     pub(crate) fn palette_panel(&mut self, ui: &mut egui::Ui) {
         if let Some(id) = self.palette_command {
             crate::command_panel::command_body(self, ui, id);
+            return;
+        }
+        if self.multiscan.is_some() {
+            self.multiscan_panel(ui);
             return;
         }
         egui::ScrollArea::vertical().id_salt("dock-guide").auto_shrink([false, false]).show(ui, |ui| {

@@ -41,6 +41,10 @@ impl SurfaceCraftApp {
             // the scan in the pose auto-align proposes, until it is applied or dropped
             o.models.extend(items.iter().filter(|d| p.objects.contains(&d.id)).map(|d| (d.key, p.matrix)));
         }
+        // the scans in the pose the "Many scans" wizard proposes, until it is accepted or dropped
+        for (id, matrix) in self.wizard_preview() {
+            o.models.extend(items.iter().filter(|d| d.id == id).map(|d| (d.key, matrix)));
+        }
         o
     }
 

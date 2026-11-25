@@ -93,7 +93,7 @@ pub fn current(app: &SurfaceCraftApp) -> Option<Proposal> {
 }
 
 /// The box around `bbox` moved by `motion` (its eight corners, moved).
-fn moved_box(bbox: &Aabb, motion: &Transform) -> Aabb {
+pub(crate) fn moved_box(bbox: &Aabb, motion: &Transform) -> Aabb {
     let (lo, hi) = (bbox.min, bbox.max);
     let corners: Vec<Point3> = (0..8u8)
         .map(|i| {

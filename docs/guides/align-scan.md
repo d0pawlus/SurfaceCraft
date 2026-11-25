@@ -391,6 +391,32 @@ Normals, colours and per-vertex data go with the coordinates.
   - The work is O(T log T) in the triangles of all scans (20 million at most natively, 2 million in the browser); the pair statistics
     use 20 000 points per scan.
 
+## The "Many scans" wizard (desktop and web)
+
+The GUI walks through the commands above in order (Align stage, "Many scans…", also in the Tools
+menu). It is only state and command calls: every step runs the same command with the same
+parameters a script or MCP client would send (the log shows them), heavy ones in the background with
+the usual Cancel, and it adds no geometry. Each step shows its proposal in the viewport before it
+changes the document.
+
+1. Choose the meshes (two or more, in the order they were scanned).
+2. `align.pair_coarse` for each scan onto the one before it, proposed (`apply: false`) with the scan
+   drawn in the proposed pose. Accept applies it (`apply: true`, with `choose` for an alternative of
+   an `ambiguous` pair); Reject leaves the scan where it is. A `no_match` can only be rejected.
+3. `align.global`, proposed first: verdict, issues, the loop error before and after relaxing, and
+   per scan whether it is held by a loop. It starts from the current poses when every pair was
+   accepted, from a full search otherwise (changeable). A weakly held scan moves only when ticked
+   (`accept_weak`), after reading its pair's evidence. Next without applying skips the step.
+4. `mesh.merge`, with the tolerance, the name and the `alignment` option. A refusal is shown with its
+   findings; "merge anyway" (`alignment: "warn"`) is offered only when every refusal is
+   `scans_misaligned`, and the refusals it cannot lift (`inverted_scan`, `opposed_normals`,
+   `inconsistent_winding`) show their remedy.
+
+Back undoes the undo steps of the step left; Cancel undoes all of them. The wizard counts the undo
+steps its own commands made and undoes only those, and only while the history still ends with them:
+if the document was changed meanwhile it says so and offers to close without undoing. A failed or
+cancelled command shows its message and keeps the wizard on its step.
+
 ## Parameters common to all align commands
 
 - `object`: the mesh to move.
