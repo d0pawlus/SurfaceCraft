@@ -208,6 +208,8 @@ fn a_file_whose_faces_would_hold_too_many_control_points_is_refused_before_readi
     for f in 0..faces {
         text += &format!("#{}=ADVANCED_FACE('',(),#2,.T.);\n", 100_000 + f);
     }
+    let list: Vec<String> = (0..faces).map(|f| format!("#{}", 100_000 + f)).collect();
+    text += &format!("#5=OPEN_SHELL('',({}));\n#6=SHELL_BASED_SURFACE_MODEL('',(#5));\n", list.join(","));
     text += "ENDSEC;\nEND-ISO-10303-21;\n";
     let e = import(text.as_bytes()).unwrap_err().to_string();
     assert!(e.contains("geometry"), "{e}");
@@ -296,7 +298,8 @@ fn a_closed_shell_that_is_not_one_is_not_written() {
 }
 
 /// A file of `points` points `#10..`, the shared geometry `#2`, the `extra` entities, then `copies`
-/// entities `user` (`#G` names the shared geometry), each with its own id.
+/// entities `user` (`#G` names the shared geometry), each with its own id, put in one sheet body:
+/// faces in an open shell, edges in one loop of one plane face of an open shell.
 fn shared_geometry_file(points: usize, geometry: &str, extra: &str, user: &str, copies: usize) -> String {
     let mut text = String::from("ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\n");
     for k in 0..points {
@@ -304,9 +307,23 @@ fn shared_geometry_file(points: usize, geometry: &str, extra: &str, user: &str, 
     }
     text += &format!("#2={geometry};\n");
     text += extra;
-    for c in 0..copies {
-        text += &format!("#{}={};\n", 1_000_000 + c, user.replace("#G", "#2"));
+    let ids: Vec<String> = (0..copies).map(|c| format!("#{}", 1_000_000 + c)).collect();
+    for id in &ids {
+        text += &format!("{id}={};\n", user.replace("#G", "#2"));
     }
+    let faces = if user.starts_with("EDGE_CURVE") {
+        let oriented: Vec<String> = (0..copies).map(|c| format!("#{}", 3_000_000 + c)).collect();
+        for (o, e) in oriented.iter().zip(&ids) {
+            text += &format!("{o}=ORIENTED_EDGE('',*,*,{e},.T.);\n");
+        }
+        text += &format!("#900001=EDGE_LOOP('',({}));\n#900002=FACE_BOUND('',#900001,.T.);\n", oriented.join(","));
+        text += "#900003=PLANE('',#900004);\n#900004=AXIS2_PLACEMENT_3D('',#900005,$,$);\n#900005=CARTESIAN_POINT('',(0.,0.,0.));\n";
+        text += "#900006=ADVANCED_FACE('',(#900002),#900003,.T.);\n";
+        "#900006".to_string()
+    } else {
+        ids.join(",")
+    };
+    text += &format!("#900010=OPEN_SHELL('',({faces}));\n#900011=SHELL_BASED_SURFACE_MODEL('',(#900010));\n");
     text + "ENDSEC;\nEND-ISO-10303-21;\n"
 }
 
@@ -350,7 +367,10 @@ fn shared_or_deep_geometry_is_refused_before_reading() {
         "ADVANCED_FACE('',(),#500019,.T.)",
         1,
     );
-    assert_refused_before_reading(&deep, "a deep chain of trimmed surfaces");
+    // the estimate counts the whole chain (it follows deeper than the reader); the reader refuses
+    // a chain past its own depth without building it
+    let e = import(deep.as_bytes()).map(|b| b.len()).expect_err("a deep chain").to_string();
+    assert!(e.contains("nested more than"), "{e}");
     let curve = format!(
         "B_SPLINE_CURVE_WITH_KNOTS('',1,({}),.UNSPECIFIED.,.F.,.F.,({}),({}),.UNSPECIFIED.)",
         point_list(n * n),
@@ -370,4 +390,9 @@ fn shared_or_deep_geometry_is_refused_before_reading() {
         &shared_geometry_file(n * n, &curve, "#7=VERTEX_POINT('',#10);\n", "EDGE_CURVE('',#7,#7,#G,.T.)", faces),
         "a curve shared by many edges",
     );
+    // one heavy shell (one face on the Bezier surface) that many solids reuse
+    let shell = "#3=ADVANCED_FACE('',(),#2,.T.);\n#4=CLOSED_SHELL('',(#3));\n";
+    let mut reused = shared_geometry_file(n * n, &bezier, shell, "MANIFOLD_SOLID_BREP('',#4)", faces);
+    reused = reused.replace("#900010=OPEN_SHELL('',(", "#900010=OPEN_SHELL('',(#3));\n#900012=X('',(");
+    assert_refused_before_reading(&reused, "a shell reused by many solids");
 }

@@ -4,10 +4,10 @@
 //! opposite directions; no edge of any shell used more than twice or twice the same way). The
 //! structural checks cannot see a face turned the wrong way round: the edge directions can.
 //!
-//! Before a file is read, the geometry its faces and edges would hold is estimated from the file
-//! (every entity under a face's surface or an edge's curve, once per face or edge): a large
-//! surface or curve that many faces or edges share is copied into each record, so a small file
-//! could otherwise ask for a great deal of memory.
+//! Before a file is read, what its bodies would hold is estimated from the file: every body item
+//! walked down to its points, each shell, face, edge, surface and curve counted once per use. The
+//! reader copies a shared shell, face, surface or curve into every record that uses it, so a small
+//! file could otherwise ask for a great deal of memory.
 use crate::record::brep::{Brep, Curve, Loop, Shell, Surface};
 use solidcore_step::p21::{Exchange, Param};
 use std::collections::HashMap;
@@ -129,16 +129,21 @@ fn refs_of(params: &[Param], out: &mut Vec<u64>) {
     }
 }
 
-/// The size of the geometry entity `id`: itself and, once per reference, everything it refers
-/// to (control points, a swept profile, a trimmed surface's basis, …), so a shared entity costs as
-/// much as the records that copy it. A chain deeper than the reader follows
-/// (`solidcore_step::read::MAX_GEOM_DEPTH`), a reference cycle or a missing entity counts as
-/// [`MAX_FACE_POINTS`]: the estimate fails closed.
-fn geometry_size(ex: &Exchange, id: u64, depth: usize, memo: &mut HashMap<u64, usize>, open: &mut Vec<u64>) -> usize {
+/// Deepest chain of references followed from a body item: the topology (solid, shell, oriented
+/// face, face, bound, loop, oriented edges nested, edge, vertex) above the deepest geometry the
+/// reader follows (`solidcore_step::read::MAX_GEOM_DEPTH`).
+const MAX_WALK_DEPTH: usize = solidcore_step::read::MAX_GEOM_DEPTH + 36;
+
+/// The size of the entity `id`: itself and, once per reference, everything it refers to (shells,
+/// faces, loops, edges, their surfaces and curves, control points, a swept profile, a trimmed
+/// surface's basis, …), so a shell, face, surface or curve that several others share costs as much
+/// as the records that copy it. A chain deeper than [`MAX_WALK_DEPTH`], a reference cycle or a
+/// missing entity counts as [`MAX_FACE_POINTS`]: the estimate fails closed.
+fn size(ex: &Exchange, id: u64, depth: usize, memo: &mut HashMap<u64, usize>, open: &mut Vec<u64>) -> usize {
     if let Some(&n) = memo.get(&id) {
         return n;
     }
-    if depth > solidcore_step::read::MAX_GEOM_DEPTH + 2 || open.contains(&id) {
+    if depth > MAX_WALK_DEPTH || open.contains(&id) {
         return MAX_FACE_POINTS;
     }
     let Some(e) = ex.get(id) else { return MAX_FACE_POINTS };
@@ -149,30 +154,26 @@ fn geometry_size(ex: &Exchange, id: u64, depth: usize, memo: &mut HashMap<u64, u
     open.push(id);
     let mut n = 1usize;
     for c in children {
-        n = n.saturating_add(geometry_size(ex, c, depth + 1, memo, open)).min(MAX_FACE_POINTS);
+        n = n.saturating_add(size(ex, c, depth + 1, memo, open)).min(MAX_FACE_POINTS);
     }
     open.pop();
     memo.insert(id, n);
     n
 }
 
-/// The geometry the records of the file's faces and edges would hold: each face's surface and
-/// each edge's curve counted once per face or edge on it (the reader copies a shared surface or
-/// curve into every record that uses it), whatever kind it is.
+/// The body items the reader reads (`solidcore_step::topology`'s solid items).
+const BODY_ITEMS: [&str; 4] = ["MANIFOLD_SOLID_BREP", "BREP_WITH_VOIDS", "SHELL_BASED_SURFACE_MODEL", "FACETED_BREP"];
+
+/// What the records of the file's bodies would hold: every body item walked down through its
+/// shells, faces, loops and edges to their surfaces, curves and points, each counted once per use
+/// (a shell several solids share, a face several shells share, a surface several faces share).
 pub(super) fn face_points(ex: &Exchange) -> usize {
     let mut memo = HashMap::new();
     let mut open = Vec::new();
     let mut total = 0usize;
-    for e in ex.entities.values() {
-        // ADVANCED_FACE / FACE_SURFACE (name, bounds, surface, sense); EDGE_CURVE (name, start,
-        // end, curve, sense)
-        let geometry = match e.name() {
-            "ADVANCED_FACE" | "FACE_SURFACE" => e.params().get(2),
-            "EDGE_CURVE" => e.params().get(3),
-            _ => continue,
-        };
-        if let Some(id) = geometry.and_then(Param::as_ref_id) {
-            total = total.saturating_add(geometry_size(ex, id, 0, &mut memo, &mut open));
+    for (id, e) in &ex.entities {
+        if e.records.iter().any(|r| BODY_ITEMS.contains(&r.name.as_str())) {
+            total = total.saturating_add(size(ex, *id, 0, &mut memo, &mut open));
         }
     }
     total
@@ -227,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn a_shared_spline_surface_counts_once_per_face() {
+    fn a_shared_spline_surface_counts_once_per_face_and_a_shared_shell_once_per_solid() {
         let mut text = String::from("ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\n");
         let rows: Vec<String> = (0..8)
             .map(|i| format!("({})", (0..8).map(|j| format!("#{}", 10 + i * 8 + j)).collect::<Vec<_>>().join(",")))
@@ -239,13 +240,17 @@ mod tests {
         for k in 0..64 {
             text += &format!("#{}=CARTESIAN_POINT('',({}.,0.,0.));\n", 10 + k, k);
         }
-        text += "#3=RECTANGULAR_TRIMMED_SURFACE('',#2,0.,1.,0.,1.,.T.,.T.);\n";
         for f in 0..5 {
-            text += &format!("#{}=ADVANCED_FACE('',(),#{},.T.);\n", 1000 + f, if f == 4 { 3 } else { 2 });
+            text += &format!("#{}=ADVANCED_FACE('',(),#2,.T.);\n", 1000 + f);
         }
+        text += "#3=CLOSED_SHELL('',(#1000,#1001,#1002,#1003,#1004));\n";
+        text += "#4=MANIFOLD_SOLID_BREP('',#3);\n#5=MANIFOLD_SOLID_BREP('',#3);\n";
         text += "ENDSEC;\nEND-ISO-10303-21;\n";
         let ex = solidcore_step::p21::parse(&text).unwrap();
-        // the spline: itself and its 64 points; the trimmed surface: itself and the spline
-        assert_eq!(face_points(&ex), 4 * 65 + 66);
+        // a face: itself, the spline (itself and 64 points); a shell: itself and 5 faces; a solid:
+        // itself and the shell; two solids
+        let face = 1 + 65;
+        let solid = 1 + (1 + 5 * face);
+        assert_eq!(face_points(&ex), 2 * solid);
     }
 }
