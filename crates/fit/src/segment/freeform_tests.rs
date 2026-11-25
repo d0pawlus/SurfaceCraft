@@ -350,7 +350,7 @@ fn a_nearly_flat_cone_spans_a_fraction_of_its_radius_of_curvature() {
             rms: 0.0,
             freeform: false,
         };
-        super::freeform::curvature_support(&m, &seg)
+        super::freeform::cone_bending_support(&m, &seg).unwrap()
     };
     let (flat, steep) = (support(82f64.to_radians()), support(45f64.to_radians()));
     // about 0.52 and 2.6 (chord 56.6 over a mean distance of 15.3 from the axis); 1 is the limit

@@ -105,3 +105,20 @@ fn hostile_input_is_refused_not_a_panic() {
     nan.vertices[0].point[0] = f64::NAN;
     let _ = sew(&[&nan, all[1]], 1e-3);
 }
+
+/// Every sheet given twice (a doubled shell): whatever the kernel makes of it, `closed` means a
+/// solid of positive, finite volume.
+#[test]
+fn a_doubled_shell_is_closed_only_with_a_positive_volume() {
+    let mut sheets = six_sheets(DOME);
+    sheets.extend(six_sheets(DOME));
+    match sew(&refs(&sheets), 1e-3) {
+        Ok(s) => {
+            eprintln!("doubled: closed {}, volume {:?}, open edges {}", s.closed, s.volume, s.open_edges);
+            assert_eq!(s.closed, s.volume.is_some_and(|v| v.is_finite() && v > 0.0));
+        }
+        Err(e) => eprintln!("doubled: refused ({e})"),
+    }
+    let single = sew(&refs(&six_sheets(DOME)), 1e-3).unwrap();
+    assert!(single.closed && single.volume.is_some_and(|v| v > 0.0));
+}

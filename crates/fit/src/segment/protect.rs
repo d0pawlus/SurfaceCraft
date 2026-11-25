@@ -25,7 +25,7 @@
 //! `options.freeform: false`.
 use super::Segment;
 use super::bow::region_bow;
-use super::freeform::{curvature_support, extent, residual_spread, sample_corners};
+use super::freeform::{cone_bending_support, curvature_support, extent, residual_spread, sample_corners};
 use crate::primitive::PrimitiveKind;
 use surfacecraft_geom::{Aabb, Mesh};
 
@@ -55,6 +55,15 @@ const BOW_SLOPE: f64 = 5e-4;
 /// span of a radius and the bow may be this large.
 const DOMINANT_SHARE: f64 = 0.05;
 const DOMINANT_BOW_SLOPE: f64 = 2e-3;
+/// A cone with a half angle above this (degrees) is nearly flat: it spans by its radius of
+/// curvature, never by its share of the scan. Design cones are steeper (chamfers 45, countersinks
+/// 30 to 60, drill points 59 to 70 degrees).
+const FLAT_CONE_DEG: f64 = 70.0;
+
+fn flat_cone(seg: &Segment) -> bool {
+    matches!(seg.primitive, crate::primitive::Primitive::Cone { half_angle, .. } if half_angle > FLAT_CONE_DEG.to_radians())
+}
+
 /// A plane spans enough when its extent is at least this many tolerances, or ...
 const PLANE_EXTENT_TOLERANCES: f64 = 50.0;
 /// ... this fraction of the scan's diagonal, whichever is less.
@@ -79,8 +88,8 @@ fn region_area(mesh: &Mesh, seg: &Segment) -> f64 {
 }
 
 /// Does `seg` (a `share` of the scan's area) span enough of its primitive: a curved one at least a
-/// radius of curvature, or (a cylinder, sphere or torus) [`DOMINANT_SHARE`] of the scan (a large
-/// gentle patch of a big cylinder or sphere); a
+/// radius, or [`DOMINANT_SHARE`] of the scan (a large gentle patch of a big cylinder or sphere); a
+/// nearly flat cone ([`FLAT_CONE_DEG`]) a radius of curvature; a
 /// plane [`PLANE_EXTENT_TOLERANCES`] tolerances or [`PLANE_EXTENT_DIAGONAL`] of the scan, whichever
 /// is less.
 fn spans(mesh: &Mesh, seg: &Segment, tolerance: f64, scene: &Scene, share: f64) -> bool {
@@ -89,10 +98,11 @@ fn spans(mesh: &Mesh, seg: &Segment, tolerance: f64, scene: &Scene, share: f64) 
             let least = (PLANE_EXTENT_TOLERANCES * tolerance).min(PLANE_EXTENT_DIAGONAL * scene.diagonal);
             extent(&sample_corners(mesh, &seg.triangles), None) >= least
         }
-        // the waiver of the span is for a large gentle patch of a big cylinder or sphere; a cone
-        // that holds a twentieth of a wavy top around one crest (half angle 82 degrees, spanning
-        // half a radius of curvature) is no design cone, so a cone always needs its span
-        PrimitiveKind::Cone => curvature_support(mesh, seg) >= 1.0,
+        // a cone flatter than FLAT_CONE_DEG curves little across its rulings: it spans by its
+        // radius of curvature and gets no waiver (one of 82 degrees held a twentieth of a wavy top
+        // around one crest, spanning half a radius of curvature); a steeper cone (a chamfer, a
+        // countersink, a drill point) is judged as before
+        PrimitiveKind::Cone if flat_cone(seg) => cone_bending_support(mesh, seg).is_some_and(|s| s >= 1.0),
         _ => share >= DOMINANT_SHARE || curvature_support(mesh, seg) >= 1.0,
     }
 }

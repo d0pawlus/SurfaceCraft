@@ -15,8 +15,12 @@ pub const MAX_FACES: usize = 200_000;
 pub struct Sewn {
     /// The body: one record of every sheet's faces.
     pub brep: Brep,
-    /// The faces close into a solid (no edge used by one face only, and a manifold solid).
+    /// The faces close into a solid: no edge used by one face only, a manifold solid, and a
+    /// positive, finite volume (a shell the kernel calls closed that encloses no volume, or one
+    /// turned inside out, is no solid).
     pub closed: bool,
+    /// The solid's volume, mm³ (only when closed).
+    pub volume: Option<f64>,
     /// Edges still used by one face only.
     pub open_edges: usize,
 }
@@ -47,7 +51,10 @@ pub fn sew(sheets: &[&Brep], tolerance: f64) -> Result<Sewn> {
     }
     let refs: Vec<&solidcore_ops::Body> = bodies.iter().collect();
     let sewn = solidcore_ops::stitch::sew(&refs, tolerance).map_err(|e| op_err("sew", e))?;
-    Ok(Sewn { brep: crate::solid::encode(&sewn.body)?, closed: sewn.closed, open_edges: sewn.open_edges.len() })
+    let brep = crate::solid::encode(&sewn.body)?;
+    let volume =
+        if sewn.closed { crate::solid::volume(&brep).ok().filter(|v| v.is_finite() && *v > 0.0) } else { None };
+    Ok(Sewn { brep, closed: volume.is_some(), volume, open_edges: sewn.open_edges.len() })
 }
 
 #[cfg(test)]

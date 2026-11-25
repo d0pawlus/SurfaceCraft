@@ -187,3 +187,63 @@ fn a_region_under_five_percent_of_the_scan_is_judged_by_the_tight_slope() {
     assert!(case(0.05), "slope 5e-4 x 0.8: the patch should be protected");
     assert!(!case(0.14), "slope well over 5e-4: the patch should not be protected");
 }
+
+/// The cone of `half_deg` about +z (apex at the origin) between distances `rho` from its axis,
+/// over the azimuths `0..arc_deg`, as an exact mesh, and its region.
+fn cone_region(half_deg: f64, rho: [f64; 2], arc_deg: f64) -> (Mesh, Segment) {
+    let (n_r, n_a) = (12usize, 60usize);
+    let slope = half_deg.to_radians().tan();
+    let mut positions = Vec::new();
+    for i in 0..=n_r {
+        let r = rho[0] + (rho[1] - rho[0]) * i as f64 / n_r as f64;
+        for j in 0..=n_a {
+            let a = arc_deg.to_radians() * j as f64 / n_a as f64;
+            positions.push(Point3::new(r * a.cos(), r * a.sin(), r / slope));
+        }
+    }
+    let cols = n_a + 1;
+    let mut triangles = Vec::new();
+    for i in 0..n_r {
+        for j in 0..n_a {
+            let (a, b) = ((i * cols + j) as u32, (i * cols + j + 1) as u32);
+            let (c, d) = (((i + 1) * cols + j + 1) as u32, ((i + 1) * cols + j) as u32);
+            triangles.push([a, b, c]);
+            triangles.push([a, c, d]);
+        }
+    }
+    let mesh = Mesh { positions, triangles };
+    let seg = Segment {
+        triangles: (0..mesh.triangle_count() as u32).collect(),
+        primitive: crate::primitive::Primitive::Cone {
+            apex: [0.0; 3],
+            axis: [0.0, 0.0, 1.0],
+            half_angle: half_deg.to_radians(),
+        },
+        rms: 0.0,
+        freeform: false,
+    };
+    (mesh, seg)
+}
+
+fn protected(half_deg: f64, rho: [f64; 2], arc_deg: f64) -> bool {
+    let (mesh, seg) = cone_region(half_deg, rho, arc_deg);
+    protected_by_tolerance(&mesh, &seg, TOLERANCE, 0.0)
+}
+
+/// Design cones stay protected, whole and as a partial arc: a 45 degree chamfer, a 90 degree
+/// countersink (half angle 45), a 118 and 120 degree drill point (59 and 60), a 65 degree cone.
+#[test]
+fn design_cones_whole_and_partial_are_protected() {
+    for half in [45.0, 59.0, 60.0, 65.0] {
+        assert!(protected(half, [4.0, 8.0], 360.0), "{half} degrees, whole ring");
+        assert!(protected(half, [4.0, 8.0], 90.0), "{half} degrees, a quarter arc");
+        assert!(protected(half, [10.0, 11.0], 60.0), "{half} degrees, a narrow band of 60 degrees");
+    }
+}
+
+/// A nearly flat cone around a crest (82 degrees, the apex inside the region) spans half a
+/// radius of curvature: not protected, however large a share of the scan it holds.
+#[test]
+fn a_nearly_flat_cone_around_its_apex_is_not_protected() {
+    assert!(!protected(82.0, [0.5, 23.0], 360.0));
+}

@@ -5,6 +5,7 @@ use super::{CmdError, CmdResult, CommandSpec, ObjRef};
 use crate::{Session, command};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::Arc;
 use surfacecraft_doc::{ObjectId, ObjectKind};
 use surfacecraft_kernel::record::brep::Brep;
@@ -34,7 +35,7 @@ pub struct SewIn {
 pub struct SewOut {
     /// New body.
     pub id: ObjectId,
-    /// The sheets close into a solid.
+    /// The sheets close into a solid of positive volume.
     pub closed: bool,
     /// Edges still used by one face only (where the sheets did not meet within the tolerance).
     pub open_edges: usize,
@@ -54,14 +55,13 @@ fn sheets(s: &Session, objects: &[ObjRef]) -> CmdResult<Vec<Arc<Brep>>> {
     if objects.len() > MAX_OBJECTS {
         return Err(CmdError::Params(format!("{} objects to sew; at most {MAX_OBJECTS}", objects.len())));
     }
-    let mut seen = Vec::with_capacity(objects.len());
+    let mut seen = HashSet::with_capacity(objects.len());
     let mut out = Vec::with_capacity(objects.len());
     for o in objects {
         let (id, kind) = o.resolve_any(s)?;
-        if seen.contains(&id) {
+        if !seen.insert(id) {
             continue;
         }
-        seen.push(id);
         let sheet = match kind {
             ObjectKind::Surface => s.doc.surface(id).map(|x| x.sheet.clone()),
             ObjectKind::Body => match s.doc.body(id) {
@@ -85,10 +85,9 @@ fn sew_cmd(s: &mut Session, i: SewIn) -> CmdResult<SewOut> {
     let sheets = sheets(s, &i.objects)?;
     let refs: Vec<&Brep> = sheets.iter().map(|b| &**b).collect();
     let sewn = surfacecraft_kernel::sew::sew(&refs, tolerance)?;
-    let volume = if sewn.closed { surfacecraft_kernel::solid::volume(&sewn.brep).ok() } else { None };
     let faces = sewn.brep.faces.len();
     let id = s.doc.add_body(i.name.as_deref().unwrap_or("sewn"), sewn.brep);
-    Ok(SewOut { id, closed: sewn.closed, open_edges: sewn.open_edges, faces, volume, tolerance })
+    Ok(SewOut { id, closed: sewn.closed, open_edges: sewn.open_edges, faces, volume: sewn.volume, tolerance })
 }
 
 /// The commands of this file.

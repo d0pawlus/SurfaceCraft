@@ -387,8 +387,8 @@ fn l_window(z: f64) -> Vec<ProfileCurve> {
     ]
 }
 
-#[test]
-fn gate_p8_b2_l_window_with_a_reflex_round() {
+/// The L-window gate on the scan of `seed`.
+fn l_window_with_a_reflex_round(seed: u64) {
     let plate = solid::make_box([0.0; 3], [50.0, 40.0, 10.0]).unwrap();
     let window = extrude(&[l_window(-1.0)], [0.0, 0.0, 1.0], 12.0, 0.0).unwrap();
     let cad = boolean(&plate, &window, BoolKind::Subtract).unwrap();
@@ -396,10 +396,7 @@ fn gate_p8_b2_l_window_with_a_reflex_round() {
     let v_cad = solid::volume(&cad).unwrap();
     eprintln!("CAD: {} faces, {v_cad:.3} mm3 (closed form {:.3})", cad.faces.len(), 20000.0 - area * 10.0);
     assert!((v_cad - (20000.0 - area * 10.0)).abs() < 1e-3);
-    // seed 131 until the solidcore pin of P9-O8: its scan on the new tessellation has a filled hole
-    // over the plate's corner 0.435 mm off the CAD part (printed: scan to CAD), and the gate cannot be
-    // better than its scan
-    let mut s = scanned_session(&cad, 132);
+    let mut s = scanned_session(&cad, seed);
     let mut prims = planes(
         &mut s,
         &[
@@ -423,7 +420,27 @@ fn gate_p8_b2_l_window_with_a_reflex_round() {
     let plan = s.execute("body.plan_regions", json!({"primitives": prims})).unwrap();
     assert!(plan["tools"][0]["detail"].as_str().unwrap().contains("closed window"), "{plan}");
     let (vol, max) = plan_and_check(&mut s, &prims, &cad, &["through_slot"]);
-    eprintln!("GATE p8-b2 L window: volume {vol:.3} (CAD {v_cad:.3}), max deviation {max:.4}");
+    eprintln!("GATE p8-b2 L window, seed {seed}: volume {vol:.3} (CAD {v_cad:.3}), max deviation {max:.4}");
+}
+
+/// Gate P8-B2: an L-shaped window with a reflex round, on two scans. Until the solidcore pin of
+/// P9-O8 the gate ran on seed 131 alone; on the new tessellation `synth::scanify` puts one of its
+/// holes on the plate's corner with that seed, and `mesh.clean` fills it 0.435 mm off the CAD part
+/// (printed as "scan to CAD"): the scan, not the planner, misses the 0.2 mm bound there (see
+/// `l_window_on_the_scan_with_a_hole_over_the_corner`).
+#[test]
+fn gate_p8_b2_l_window_with_a_reflex_round() {
+    for seed in [132, 133] {
+        l_window_with_a_reflex_round(seed);
+    }
+}
+
+/// Seed 131's scan on the new tessellation: a hole over the plate's corner, filled 0.435 mm off
+/// the CAD part, so the gate's 0.2 mm cannot be met (the scan's own deviation is the floor).
+#[test]
+#[ignore = "recorded: seed 131's scan has a hole fill 0.435 mm off the CAD part over the plate's corner (scanify on the P9-O8 tessellation)"]
+fn l_window_on_the_scan_with_a_hole_over_the_corner() {
+    l_window_with_a_reflex_round(131);
 }
 
 // ---------------------------------------------------------------------------------------------
