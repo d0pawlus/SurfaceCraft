@@ -74,13 +74,14 @@ pub struct CapRetry {
 /// What a retry is judged on.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Attempt {
+    /// A closed solid: a closed network whose body encloses material (`body::encloses_material`).
     pub(super) closed: bool,
     pub(super) within: f64,
 }
 
 impl Attempt {
     fn of(w: &WrapOut) -> Self {
-        Self { closed: w.closed, within: w.deviation.within }
+        Self { closed: w.closed && w.body.is_solid(), within: w.deviation.within }
     }
 }
 
@@ -98,13 +99,17 @@ pub(super) fn judge(first: Attempt, second: Attempt) -> RetryReason {
 
 /// What keeps a wrapped scan from a pass.
 pub(super) fn issues_of(w: &WrapOut, d: &DeviationSummary, set: &Settings, report: &ScanSummary) -> Vec<super::Issue> {
-    issues_for(&NetworkFacts { closed: w.closed, patches: w.patches, capped: w.capped }, d, set, report)
+    let facts = NetworkFacts { closed: w.closed, solid: w.body.is_solid(), patches: w.patches, capped: w.capped };
+    issues_for(&facts, d, set, report)
 }
 
 /// What the issues of a network of patches are read from (the hybrid method's stock has the same
 /// facts and the same issues).
 pub(super) struct NetworkFacts {
     pub(super) closed: bool,
+    /// The body encloses material (`body::encloses_material`): a closed network without it is not
+    /// a closed solid, as for the primitives method.
+    pub(super) solid: bool,
     pub(super) patches: usize,
     pub(super) capped: bool,
 }
@@ -120,6 +125,9 @@ pub(super) fn issues_for(
     if !w.closed {
         let msg = "the patch network is not closed (the scan has open boundaries): the result is a sheet, not a solid";
         list.push(issue("open_surface", msg.to_string()));
+    } else if !w.solid {
+        let msg = "the patch network is closed but the body has no positive volume (its faces disagree on which side is outside, or the kernel turned it inside out): it is not a closed solid";
+        list.push(issue("no_solid", msg.to_string()));
     }
     list.extend(coverage_issue(d, "the patches"));
     if d.count > 0 && d.within < set.min_within {

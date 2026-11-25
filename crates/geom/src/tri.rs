@@ -70,8 +70,10 @@ pub fn closest_point(p: &Point3, a: &Point3, b: &Point3, c: &Point3) -> Point3 {
     a + ab * v + ac * w
 }
 
-/// Sine of the angle between a ray and a triangle's plane below which they are parallel.
-const RAY_PARALLEL: f64 = 1e-14;
+/// A ray and a triangle are parallel when the determinant of Möller–Trumbore is below this share
+/// of its scale (the ray direction's length times the two edges'), so the test does not depend on
+/// the units: an absolute bound missed every hit of a ray on triangles about 2e-5 units across.
+const PARALLEL_RELATIVE: f64 = 1e-14;
 
 /// Ray/triangle intersection (Möller–Trumbore): the ray parameter `t ≥ 0` of the hit.
 #[must_use]
@@ -80,9 +82,8 @@ pub fn ray_hit(origin: &Point3, dir: &Vec3, a: &Point3, b: &Point3, c: &Point3) 
     let e2 = c - a;
     let pv = dir.cross(&e2);
     let det = e1.dot(&pv);
-    // parallel when the determinant is small against its own scale (a fixed bound would miss every
-    // triangle under about 1e-7 mm across)
-    if !(det.abs() > RAY_PARALLEL * e1.norm() * e2.norm() * dir.norm()) {
+    let scale = dir.norm() * e1.norm() * e2.norm();
+    if !(det.abs() > PARALLEL_RELATIVE * scale) {
         return None;
     }
     let inv = 1.0 / det;
@@ -111,6 +112,22 @@ mod tests {
         let o = Point3::new(0.25 * s, 0.25 * s, 1.0);
         assert!((ray_hit(&o, &-Vec3::z(), &a, &b, &c).unwrap() - 1.0).abs() < 1e-12);
         assert_eq!(ray_hit(&o, &Vec3::x(), &a, &b, &c), None);
+    }
+
+    #[test]
+    fn a_ray_hits_a_triangle_a_few_micrometres_across_in_metre_units() {
+        // Arrange: a triangle 1e-5 across and a segment of that length through it
+        let k = 1e-5;
+        let (a, b, c) = (Point3::new(0.0, 0.0, 0.0), Point3::new(k, 0.0, 0.0), Point3::new(0.0, k, 0.0));
+        let origin = Point3::new(0.25 * k, 0.25 * k, -0.5 * k);
+        let dir = Vec3::new(0.0, 0.0, k);
+
+        // Act
+        let hit = ray_hit(&origin, &dir, &a, &b, &c);
+
+        // Assert
+        assert!(hit.is_some_and(|t| (t - 0.5).abs() < 1e-9), "{hit:?}");
+        assert_eq!(ray_hit(&origin, &Vec3::new(k, 0.0, 0.0), &a, &b, &c), None, "parallel to the plane");
     }
 
     #[test]

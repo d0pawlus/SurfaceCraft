@@ -34,6 +34,23 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
   of 0.3.0 is gone). Such a patch is closer to the scan than in 0.3.0 and its curvature is smooth
   enough to continue with G2: on the Artec corpus G2 holds its 5 % target at 9 of 12 sites with
   errors of 0.03 to 3.5 % (8 of 12 at 0.5 to 4.8 % in 0.3.0). [#167]
+- Ray and segment tests against triangles (`geom::tri::ray_hit`, used by picking, ray casts and the
+  crossing checks) decide that a ray is parallel to a triangle relative to their size, not by an
+  absolute bound: hits on triangles smaller than about 2e-5 units (a part in metres) are now found
+  (#158).
+- `scan.to_solid`, freeform method (and `thickness`): a closed patch network whose body has no
+  positive volume is not a closed solid, the same rule as for the primitives method: the issue
+  `no_solid` is raised and the verdict is never `pass` (`review` when the network covers the scan,
+  as for an open sheet); such a body also counts as not closed in the larger-cap retry, the rebuild
+  and the comparison of `auto` (#158).
+
+### Fixed
+
+- `mesh.fill_holes` and `mesh.clean` (smooth fill), and so `scan.to_solid`: a smooth patch that
+  would pass through the mesh or through itself (the thin-plate fairing continued a curved rim past
+  itself) is faired again as a membrane, which stays within its loop's convex hull, when that one
+  does not cross. On the square cap of a sphere the crossing cap made the wrapped solid read a
+  negative `body.volume` (the kernel's healer turned the self-crossing solid inside out) (#158).
 
 ## [0.3.0] - 2026-11-16
 

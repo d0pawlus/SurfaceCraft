@@ -22,6 +22,20 @@ pub struct BodyOut {
     pub volume: Option<f64>,
 }
 
+/// Does a body with this volume enclose material: a finite positive volume? A closed body without
+/// one (a patch network whose faces disagree, or one turned inside out) is not a closed solid; the
+/// judges of `scan.to_solid` share this rule.
+pub(crate) fn encloses_material(volume: Option<f64>) -> bool {
+    volume.is_some_and(|v| v.is_finite() && v > 0.0)
+}
+
+impl BodyOut {
+    /// [`encloses_material`] of this body.
+    pub(crate) fn is_solid(&self) -> bool {
+        encloses_material(self.volume)
+    }
+}
+
 pub(crate) fn body_out(s: &Session, id: ObjectId) -> CmdResult<BodyOut> {
     let b = s.doc.body(id).ok_or_else(|| CmdError::Params(format!("no body {id}")))?;
     let BodyInfo { counts, volume } = surfacecraft_kernel::solid::info(&b.brep);

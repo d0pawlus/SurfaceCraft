@@ -127,9 +127,10 @@ fn explained(r: &ToSolidOut) -> f64 {
     r.deviation.as_ref().map_or(0.0, |d| d.within * d.coverage)
 }
 
-/// 2 for a closed solid, 1 for a sheet, 0 for no body.
+/// 2 for a closed solid (a body that encloses material, `body::encloses_material`), 1 for a sheet or
+/// a closed body without a positive volume, 0 for no body.
 fn closedness(r: &ToSolidOut) -> u8 {
-    r.body.as_ref().map_or(0, |b| if b.volume.is_some() { 2 } else { 1 })
+    r.body.as_ref().map_or(0, |b| if b.is_solid() { 2 } else { 1 })
 }
 
 /// Share of the body's area on analytic faces: all of it for a primitives solid, what the result
