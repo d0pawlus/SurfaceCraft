@@ -73,7 +73,6 @@ fn patches(w: &Value) -> usize {
     w["patches"].as_u64().unwrap() as usize
 }
 
-/// Rounds of the wrap cut to the cap.
 /// Rounds cut to the cap by the decimation: partial for the cap, with no reduction spent searching
 /// (the searched round of a capped wrap reports its `probes`).
 fn rounds_cut_to_cap(w: &Value) -> usize {

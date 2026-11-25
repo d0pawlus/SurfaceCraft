@@ -663,3 +663,7 @@ pub(super) fn wrap_rounds(t: &Target, refine: Refine) -> CmdResult<Wrapped> {
     found.levels.push(level_of(found.rounds + 1, &tangent, refined));
     Ok(Wrapped { best: tangent, rounds: found.rounds + 1, levels: found.levels })
 }
+
+#[cfg(test)]
+#[path = "wrap_rounds_tests.rs"]
+mod tests;

@@ -198,8 +198,9 @@ fn a_projection_that_gives_nothing_usable_leaves_the_curve_and_the_patch_as_they
 
 #[test]
 fn a_refit_never_puts_its_samples_farther_from_the_scan_and_changes_noisy_curves() {
-    // a coarse edge over more than about 120 degrees of a surface does not occur at the wrap's budgets
-    for (deg, sigma) in [(20.0, 0.0), (90.0, 0.02), (120.0, 0.1)] {
+    // measured: the refitted inner control points lie 0.065, 0.286 and 0.320 of the chord off its
+    // thirds, within the bound of 0.5 by at least 1.5 times
+    for (deg, sigma) in [(20.0, 0.0), (90.0, 0.02), (100.0, 0.1)] {
         // Arrange
         let project = |p: Vec3| Some(on_noisy_sphere(p, sigma));
         let c = chord_curve(sphere_corner(0.0, 0.0), sphere_corner(10.0, deg), &|p| on_noisy_sphere(p, sigma));
@@ -210,6 +211,10 @@ fn a_refit_never_puts_its_samples_farther_from_the_scan_and_changes_noisy_curves
         // Assert
         let (before, after) = (curve_samples(&c, &project), curve_samples(&refit, &project));
         assert!(refit == c || closer(&before, &after, MIN_CURVE_SAMPLES), "{deg} {sigma}");
+        let (a, b) = (c[0], c[3]);
+        let thirds = [a + (b - a) / 3.0, a + (b - a) * (2.0 / 3.0)];
+        let shift = (refit[1] - thirds[0]).norm().max((refit[2] - thirds[1]).norm()) / (b - a).norm();
+        eprintln!("{deg} degrees, noise {sigma}: inner control points {shift:.3} of the chord off its thirds");
         if sigma > 0.0 {
             assert_ne!(refit, c, "{deg} {sigma}: a noisy curve is refitted");
         }
@@ -232,8 +237,9 @@ fn a_refit_that_loses_a_sample_is_not_taken_however_well_the_rest_fit() {
 #[test]
 fn a_refit_that_would_slide_a_curve_off_the_scan_is_refused() {
     // Arrange: the scan ends at 60 degrees of the arc; points beyond it have no scan point within
-    // reach. A refit that kept fitting the near samples but slid the far ones off the scan would lose
-    // them, so whatever the refit returns keeps every sample the chord interpolant had.
+    // reach. Whatever the refit returns keeps every sample the chord interpolant had. (On this arc
+    // the refit may keep them without the rule as well: the rule itself is held by
+    // `a_refit_that_loses_a_sample_is_not_taken_however_well_the_rest_fit`.)
     let (_, _, chord) = arc();
     let project = |p: Vec3| (p.y.atan2(p.x).to_degrees() < 60.0).then(|| on_cylinder(p));
     let before = curve_samples(&chord, &project);
@@ -263,4 +269,27 @@ fn a_fit_on_samples_at_one_end_that_swings_the_far_control_point_is_refused() {
 
     // Act / Assert
     assert_eq!(refit_curve(c, &project), c);
+}
+
+#[test]
+fn a_patch_refit_that_moves_its_inner_points_too_far_is_refused_though_it_still_faces() {
+    // Arrange: a flat square patch 13.7 mm a side and a "scan" 5 mm above it. Fitting it lifts the
+    // inner control points by about 15 mm, more than half the diagonal (9.7 mm), while every normal on
+    // the guard's grid still faces within the limit (worst cosine about 0.37 against 0.3): only the
+    // shift bound stops it
+    const SIDE: f64 = 13.7;
+    let mut flat: Net = [[[0.0; 3]; 4]; 4];
+    for (i, row) in flat.iter_mut().enumerate() {
+        for (j, p) in row.iter_mut().enumerate() {
+            *p = [SIDE * i as f64 / 3.0, SIDE * j as f64 / 3.0, 0.0];
+        }
+    }
+    let project = |p: Vec3| Some(Vec3::new(p.x, p.y, 5.0));
+    let unguarded = net_through(&flat, &net_samples(&flat, &project)).unwrap();
+    assert!(keeps_facing(&flat, &unguarded), "the fit must face, so that only the shift bound refuses it");
+    assert!(!inner_within_shift(&flat, &unguarded), "{unguarded:?}");
+    assert!(closer(&net_samples(&flat, &project), &net_samples(&unguarded, &project), MIN_NET_SAMPLES));
+
+    // Act / Assert
+    assert_eq!(refit_net(flat, &project), flat);
 }
