@@ -134,30 +134,51 @@ fn refs_of(params: &[Param], out: &mut Vec<u64>) {
 /// reader follows (`solidcore_step::read::MAX_GEOM_DEPTH`).
 const MAX_WALK_DEPTH: usize = solidcore_step::read::MAX_GEOM_DEPTH + 36;
 
+/// The walk of [`size`]: the totals so far, the chain being walked, and the first reason the
+/// estimate failed closed.
+#[derive(Default)]
+struct Walk {
+    memo: HashMap<u64, usize>,
+    open: Vec<u64>,
+    problem: Option<String>,
+}
+
+impl Walk {
+    fn fail(&mut self, why: impl FnOnce() -> String) -> usize {
+        if self.problem.is_none() {
+            self.problem = Some(why());
+        }
+        MAX_FACE_POINTS
+    }
+}
+
 /// The size of the entity `id`: itself and, once per reference, everything it refers to (shells,
 /// faces, loops, edges, their surfaces and curves, control points, a swept profile, a trimmed
 /// surface's basis, …), so a shell, face, surface or curve that several others share costs as much
 /// as the records that copy it. A chain deeper than [`MAX_WALK_DEPTH`], a reference cycle or a
-/// missing entity counts as [`MAX_FACE_POINTS`]: the estimate fails closed.
-fn size(ex: &Exchange, id: u64, depth: usize, memo: &mut HashMap<u64, usize>, open: &mut Vec<u64>) -> usize {
-    if let Some(&n) = memo.get(&id) {
+/// missing entity counts as [`MAX_FACE_POINTS`]: the estimate fails closed, saying why.
+fn size(ex: &Exchange, id: u64, depth: usize, walk: &mut Walk) -> usize {
+    if let Some(&n) = walk.memo.get(&id) {
         return n;
     }
-    if depth > MAX_WALK_DEPTH || open.contains(&id) {
-        return MAX_FACE_POINTS;
+    if depth > MAX_WALK_DEPTH {
+        return walk.fail(|| format!("references nested more than {MAX_WALK_DEPTH} deep at #{id}"));
     }
-    let Some(e) = ex.get(id) else { return MAX_FACE_POINTS };
+    if walk.open.contains(&id) {
+        return walk.fail(|| format!("#{id} refers to itself"));
+    }
+    let Some(e) = ex.get(id) else { return walk.fail(|| format!("missing entity #{id}")) };
     let mut children = Vec::new();
     for r in &e.records {
         refs_of(&r.params, &mut children);
     }
-    open.push(id);
+    walk.open.push(id);
     let mut n = 1usize;
     for c in children {
-        n = n.saturating_add(size(ex, c, depth + 1, memo, open)).min(MAX_FACE_POINTS);
+        n = n.saturating_add(size(ex, c, depth + 1, walk)).min(MAX_FACE_POINTS);
     }
-    open.pop();
-    memo.insert(id, n);
+    walk.open.pop();
+    walk.memo.insert(id, n);
     n
 }
 
@@ -167,16 +188,22 @@ const BODY_ITEMS: [&str; 4] = ["MANIFOLD_SOLID_BREP", "BREP_WITH_VOIDS", "SHELL_
 /// What the records of the file's bodies would hold: every body item walked down through its
 /// shells, faces, loops and edges to their surfaces, curves and points, each counted once per use
 /// (a shell several solids share, a face several shells share, a surface several faces share).
-pub(super) fn face_points(ex: &Exchange) -> usize {
-    let mut memo = HashMap::new();
-    let mut open = Vec::new();
+/// Past [`MAX_FACE_POINTS`], why (the total, or the reference the walk could not follow).
+pub(super) fn face_points(ex: &Exchange) -> Result<usize, String> {
+    let mut walk = Walk::default();
     let mut total = 0usize;
     for (id, e) in &ex.entities {
         if e.records.iter().any(|r| BODY_ITEMS.contains(&r.name.as_str())) {
-            total = total.saturating_add(size(ex, *id, 0, &mut memo, &mut open));
+            total = total.saturating_add(size(ex, *id, 0, &mut walk));
         }
     }
-    total
+    match walk.problem {
+        Some(why) => Err(why),
+        None if total >= MAX_FACE_POINTS => {
+            Err(format!("the file's bodies would hold {total} items of geometry, at least {MAX_FACE_POINTS}"))
+        }
+        None => Ok(total),
+    }
 }
 
 #[cfg(test)]
@@ -251,6 +278,6 @@ mod tests {
         // itself and the shell; two solids
         let face = 1 + 65;
         let solid = 1 + (1 + 5 * face);
-        assert_eq!(face_points(&ex), 2 * solid);
+        assert_eq!(face_points(&ex), Ok(2 * solid));
     }
 }

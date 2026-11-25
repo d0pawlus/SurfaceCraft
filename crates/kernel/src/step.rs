@@ -83,16 +83,7 @@ pub fn import_report(text: &[u8]) -> Result<Imported> {
     // sit in a string, and is replaced there rather than refusing the file.
     let text = String::from_utf8_lossy(text);
     let exchange = solidcore_step::p21::parse(&text).map_err(|e| op_err("STEP parse", e.to_string()))?;
-    let points = check::face_points(&exchange);
-    if points >= check::MAX_FACE_POINTS {
-        return Err(op_err(
-            "STEP import",
-            format!(
-                "the file's faces and edges would hold {points} items of geometry, at least {}",
-                check::MAX_FACE_POINTS
-            ),
-        ));
-    }
+    check::face_points(&exchange).map_err(|why| op_err("STEP import", format!("refused before reading: {why}")))?;
     let read = solidcore_step::topology::read_solids_with(&exchange, &KernelTrims::new());
     let mut out = Imported::default();
     out.refused.extend(read.failures.iter().map(|f| format!("#{}: {}", f.item, f.message)));
