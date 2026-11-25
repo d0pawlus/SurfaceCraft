@@ -106,6 +106,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_ray_hits_a_tiny_triangle_and_misses_a_parallel_one() {
+        let s = 1e-9;
+        let (a, b, c) = (Point3::new(0.0, 0.0, 0.0), Point3::new(s, 0.0, 0.0), Point3::new(0.0, s, 0.0));
+        let o = Point3::new(0.25 * s, 0.25 * s, 1.0);
+        assert!((ray_hit(&o, &-Vec3::z(), &a, &b, &c).unwrap() - 1.0).abs() < 1e-12);
+        assert_eq!(ray_hit(&o, &Vec3::x(), &a, &b, &c), None);
+    }
+
+    #[test]
     fn a_ray_hits_a_triangle_a_few_micrometres_across_in_metre_units() {
         // Arrange: a triangle 1e-5 across and a segment of that length through it
         let k = 1e-5;

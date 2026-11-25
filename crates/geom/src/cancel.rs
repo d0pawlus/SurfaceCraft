@@ -1,11 +1,18 @@
 //! A cancellation flag shared between whoever started a long computation and the loops doing it.
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A flag a long computation checks between steps. Clones share the flag; a new token is not
 /// cancelled, and one that was cancelled stays so.
 #[derive(Clone, Debug, Default)]
-pub struct Cancel(Arc<AtomicBool>);
+pub struct Cancel {
+    flag: Arc<AtomicBool>,
+    /// Looks left before a test token cancels itself (0: never).
+    #[cfg(test)]
+    countdown: Arc<AtomicUsize>,
+}
 
 impl Cancel {
     /// A token nobody has cancelled.
@@ -16,13 +23,41 @@ impl Cancel {
 
     /// Asks the computation holding a clone of this token to stop.
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
+        self.flag.store(true, Ordering::Release);
     }
 
-    /// Was the computation asked to stop?
+    /// Was the computation asked to stop? (In this crate's tests each look also counts down a token
+    /// made by `Cancel::after_looks`.)
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        #[cfg(test)]
+        self.count_down();
+        self.flag.load(Ordering::Acquire)
+    }
+
+    /// One look at a test token: cancels it at its last one (a countdown that loses a race to another
+    /// thread just counts that look later).
+    #[cfg(test)]
+    fn count_down(&self) {
+        let left = self.countdown.load(Ordering::Acquire);
+        if left > 0 && self.countdown.compare_exchange(left, left - 1, Ordering::AcqRel, Ordering::Acquire) == Ok(1) {
+            self.flag.store(true, Ordering::Release);
+        }
+    }
+
+    /// A token that cancels itself at its `n`-th look (`n` ≥ 1): for testing that a computation
+    /// polls and stops wherever the flag is set.
+    #[cfg(test)]
+    #[must_use]
+    pub fn after_looks(n: usize) -> Self {
+        Cancel { flag: Arc::new(AtomicBool::new(false)), countdown: Arc::new(AtomicUsize::new(n)) }
+    }
+
+    /// Looks taken at a token from [`Cancel::after_looks`] that are still to come (0 once it fired).
+    #[cfg(test)]
+    #[must_use]
+    pub fn looks_left(&self) -> usize {
+        self.countdown.load(Ordering::Acquire)
     }
 }
 

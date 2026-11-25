@@ -191,3 +191,37 @@ fn lattice_step_ignores_noise_at_a_power_of_two_extent_and_caps_outliers() {
     let moved = snap::snapped(&with_outlier).iter().zip(&with_outlier).map(|(a, b)| (a - b).norm()).fold(0.0, f64::max);
     assert!(moved <= 1e-6, "{moved}");
 }
+
+/// A paraboloid cloud with given normals, built from `+ - * /` and `sqrt` only (the same on every platform).
+fn golden_cloud() -> PointCloud {
+    let mut rng = Rng::new(4242);
+    let (mut pts, mut nrm) = (Vec::new(), Vec::new());
+    for j in 0..60 {
+        for i in 0..60 {
+            let x = -15.0 + 0.5 * f64::from(i) + rng.range(-0.15, 0.15);
+            let y = -15.0 + 0.5 * f64::from(j) + rng.range(-0.15, 0.15);
+            pts.push(Point3::new(x, y, 0.01 * (x * x + y * y)));
+            let n = Vec3::new(-0.02 * x, -0.02 * y, 1.0);
+            nrm.push(n / n.norm());
+        }
+    }
+    PointCloud { positions: pts, normals: Some(nrm) }
+}
+
+fn golden_hash(m: &Mesh) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for t in &m.triangles {
+        for &v in t {
+            h = (h ^ u64::from(v)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// The band mode of the pivoting (`merge`) changed nothing for reconstruction: the same triangles as
+/// on main before it (measured there: 7069 triangles over 3600 points, this hash).
+#[test]
+fn reconstruction_output_is_unchanged_by_the_band_mode() {
+    let (m, _) = reconstruct(&golden_cloud(), &ReconParams::default()).unwrap();
+    assert_eq!((m.triangles.len(), m.positions.len(), golden_hash(&m)), (7069, 3600, 0x058f_dba2_8a0b_910f));
+}

@@ -243,6 +243,154 @@ Normals, colours and per-vertex data go with the coordinates.
   only drop them while enough right pairs exist; the cap on pairs can leave a scan unconnected
   (`pairs_capped`).
 
+## Merge scans into one mesh
+
+- `mesh.merge`: `objects` (2 to 64 meshes, each once) that are already aligned in one frame
+  (`align.global` with `apply`) become one new mesh. The scans stay as they are; the new mesh is one
+  undo step. It is a heavy command (cancellable, run in the background from the GUI).
+- `tolerance`: surface of two scans closer than this is one surface. The default is 4 standard
+  deviations of the noise of the two noisiest scans together (each scan's own noise estimate, in
+  `scans[].noise`) plus 5 % of the median edge of the coarsest scan (two tessellations of one curved
+  surface differ by part of an edge even without noise). `tolerance_source` says `noise` or `given`.
+- Where scans overlap, one layer is kept, never two and never an average. The scan in which that
+  surface lies farthest from its own border keeps it (distance along the edges; a closed scan has no
+  border and keeps what it covers). The border of a scan is its least reliable part: the scanner sees
+  the surface at a grazing angle there, and the edge is ragged. So the seam falls midway between the
+  borders. Distances within one median edge count as equal and the scan listed first keeps the surface,
+  so two scans that see the same surface with the same border (a boss seen whole by both) do not hand
+  it back and forth. A triangle with a corner another scan keeps is removed. Triangles on the edge of
+  a kept region that still lie wholly on another scan's kept surface are removed too.
+- The seam is closed by ball pivoting from the edges the removal cut. A seam triangle is built only on
+  surface some scan saw: its centre and the middles of its edges lie within the tolerance (or a tenth
+  of its longest edge, if that is larger) of a scan, facing the same way. It also crosses or covers no
+  triangle already there. So no surface is made up over an opening nobody scanned, and the rims of two
+  separate pieces are never joined. Small holes the pivoting leaves (up to 64 edges, with no edge of a
+  scan's own border) are filled by ear clipping or a fan through the same checks, the corner rule
+  included. Where the band has a twisted corner (a hole of a few edges no triangle can fill facing the right way), the seam triangles
+  around it are taken back once and the larger hole is filled. Seam triangles that meet another fan
+  at one vertex only (a pinch) are taken back the same way. No vertex is added to the scans' vertices
+  and kept vertices stay where they are, except that a seam vertex of a later scan moves onto a
+  coinciding seam vertex of an earlier scan, by at most a quarter of the tolerance (and a tenth of
+  the median edge), measured from its own position (welds never chain). A weld that would flip,
+  fold or double a triangle is undone (`checks.welds_undone`). Removed triangles whose corners all exist in
+  the result at exactly their places are put back: pieces cut from one scan share their tessellation,
+  and there the seam is a re-weld (a restored triangle must cross and cover nothing either). Removed
+  triangles whose centre the seam leaves without result surface within the tolerance come back on their
+  own scan's vertices (`seam.recovered`).
+- `alignment`: `"refuse"` (the default) or `"warn"`. With `"warn"` the alignment findings below
+  (`scans_misaligned`) are warnings with the same numbers and the merge proceeds (one undo step);
+  the other refusals still refuse.
+- Refused, with the numbers and nothing made (`refused` true, no undo step):
+  - `scans_misaligned`: more than 10 % of the surface two scans share (where one lies on facing surface
+    of the other, up to 8 tolerances away) lies farther apart than the tolerance. Merging them would
+    either stack two layers or average them into a surface neither scan saw. Align better
+    (`align.icp`, `align.global`) or give a larger tolerance knowingly. Also refused: scans offset by
+    more than 8 tolerances, which share no surface within that reach but lie over each other (flat
+    scans too, whose boxes do not overlap within the reach). They are found along each sample's
+    normal: the first surface of the other scan faces the same way (`pairs[].over`, median distance
+    `pairs[].over_offset`), at least 5 % of the samples lie over it, fewer than 50 agree with it,
+    and no chain of scans that share surface ties the two (pieces of a part that lie over each
+    other, a step, are not a misalignment). Scans that are apart
+    in space are no refusal: they give a union of pieces and the notice `scans_disjoint`.
+  - `opposed_normals`: the normals of two scans oppose where they meet. One is turned inside out.
+  - `inconsistent_winding`: triangles wound against the rest of their piece cover more than 0.1 % of a
+    scan's area (a patch turned inside out). Fewer are left out and reported as
+    `flipped_triangles_dropped`, so the result never has a flipped part.
+  - `inverted_scan`: a closed piece of a scan has a negative volume. Inner skins (inside another
+    closed piece, as the inside of a hollow part or a cavity, whatever their size) and debris (loose
+    small pieces below 1 % of the scan's area all together) are not refused; they are reported as
+    `inner_skins` with their counts. Negative pieces the inside test could not judge within its
+    budget refuse the scan too when, with the loose small ones, they reach 1 % of its area (one
+    allowance for both); below that they are counted in `inner_skins` (a warning).
+  - Input: at most 64 scans, and no point farther than 1e9 mm from the origin along an axis (beyond
+    that the volumes and areas of the checks lose their precision).
+- Reported, not refused: `layers_apart` (two scans that meet somewhere also lie over each other:
+  at least 14 % of the points of one that relate to the other, on it or over it, lie over it beyond
+  the reach, with nothing of their own scan in between; the issue gives the median offset and its
+  spread, and says whether it is one offset, a shift as a whole, or not, a tilt or a curved surface;
+  check the alignment), `overlap_unjudged` (samples whose search along the normal ran out of its budget in a
+  pile of triangles), `overlap_too_small` (two scans that touch by fewer than 50 points either way:
+  not judged), `seam_over_budget` (seam or restored triangles left out because the crossing
+  test would have compared too many triangles), `non_manifold_input` (exact duplicate triangles and triangles on edges of
+  three or more triangles are left out and counted as removed), `flipped_triangles_dropped`, `scans_disjoint` (groups of scans that share no surface: the result is a
+  union of separate pieces), `scan_fully_covered` (a scan lies wholly on others and adds nothing),
+  `seam_open` (cut edges no triangle could close), `removed_not_covered` (less than 99 % of the removed
+  area within the tolerance of the result), `layers_stacked` (more than 0.5 % of the scans' area in the
+  result lies on another scan's surface: two layers left; with their triangle count), `unwelded_vertices` (vertices of different
+  scans closer than 0.01 median edges with no edge between them), `unoriented_edges` and
+  `pinched_vertices`.
+- The report:
+  - per scan: triangles `kept`, `removed`, `restored`, `collapsed` (two corners welded into one),
+    `dropped`, `overlap_share`, `noise` (absent when the tolerance was given);
+  - per pair: the residual where one lies on the other (`shared`, `within`, `rms`, `p95`, `worst`,
+    `beyond_share`), the points over the other beyond the reach (`over`, their median distance
+    `over_offset` and spread `over_spread`, `one_offset`), `unjudged` points, and the shares of the
+    points that relate the two that lie over the other (`over_share`) and agree (`agree_share`);
+  - `seam`: cut edges, length, triangles created, refusals by reason (`refused_unsupported`,
+    `refused_crossing`, `refused_corners`, `refused_budget`), recovered triangles and the specks taken back again, what is still uncovered
+    after the recovery (`uncovered_after_seam`),
+    open edges and their length;
+  - `before` (the scans together) and `after`: pieces, boundary loops, genus, non-manifold and
+    unoriented edges, pinched vertices;
+  - `checks`: the removed triangles are sampled by area (up to 2 million points; every triangle at
+    least once) and measured against the result (`removed_within_share`, `removed_worst`). Also the
+    vertices that moved and by how much, the triangles the merge added that cross another (0 by
+    construction), `unwelded_vertices` and `stacked_share` (the share of the scans' area in the result
+    within the tolerance of facing surface of another scan: two layers);
+  - `stages` in milliseconds.
+- The result is what `scan.to_solid` (method `freeform`) wraps: four noisy views of the organic test
+  blob merge into one piece that wraps no worse than one full scan of the blob (in a few noise draws a
+  small loop stays open where all views meet in a point; it is reported).
+- Limits:
+  - `mesh.merge` expects scans that are already aligned (`align.global`); its checks of the
+    alignment are a best-effort safety net, not a proof. Correct input is refused only in the cases
+    marked "refused" below, each with its remedy; every alignment refusal (`scans_misaligned`) can be
+    turned into a warning with `alignment: "warn"` (the merge then proceeds with the same numbers in
+    the issue). What the checks do not see, see only as a warning, or refuse although correct:
+    - a scan slid along a flat or cylindrical surface (distances along it do not change);
+    - a displacement along the normals larger than the other scan's diagonal: it comes out as
+      `scans_disjoint`, not as a misalignment;
+    - a displaced pair that both overlap a third scan agreeing with each: it cannot be told from a
+      real step of the part, and is not refused;
+    - a slender part slid along its own axis: only its end caps lie over the other (a share of
+      about its radius over its length), under the 14 % that `layers_apart` needs: not seen;
+    - a scan displaced along a face parallel to the displacement, tilted, or seen over the other from
+      one side only: reported as `layers_apart` (at least 14 % of the related points over the
+      other), never refused;
+    - a shelf over a floor seen by different scans is the same geometry: it warns although correct;
+    - refused: a stepped part whose levels share nothing reads as one scan displaced over the other.
+      Remedy: a scan that sees both levels (a close-up of the step), or `alignment: "warn"`;
+    - refused: a hollow part whose outside is seen by one scan and whose bore by another that share
+      nothing: the bore's points look across the bore at the outside wall, which faces the same way.
+      Remedy: a scan that sees both, or `alignment: "warn"`;
+    - refused: a feature 1 to 8 tolerances high that only one of two scans resolves over more than
+      10 % of their shared points (a floor under a low shelf, an emboss) reads as `scans_misaligned`.
+      Remedy: a larger tolerance, or `alignment: "warn"`;
+    - refused: a correct pair whose noise has heavy tails, or a ragged or curled border in a narrow
+      overlap, once more than 10 % of its shared points lie beyond the tolerance (the default
+      tolerance covers Gaussian noise only). Remedy: a larger tolerance, or `alignment: "warn"`;
+    - pairs that touch by too little for a verdict (fewer than 50 points either way) are reported as
+      `overlap_too_small`, not judged.
+  - The test whether a closed piece with a negative volume lies inside another (an inner skin) has
+    a work budget proportional to the scan's closed triangles; the largest pieces are judged first.
+    Pieces it cannot judge (a pile of coincident pieces, many nested shells) are reported as
+    unjudged in `inner_skins` (a warning) while they, with the loose small inverted pieces, stay
+    under 1 % of the scan's area together, and refuse the scan (`inverted_scan`) above it. `alignment` does not change this.
+  - Two OPEN scans that are both turned inside out, consistently, cannot be told from right ones (as
+    with `align.pair_coarse`).
+  - A wall thinner than the tolerance, seen from its two sides by two different scans only, reads as
+    opposed normals and is refused.
+  - Where a seam runs into the rim of a separate piece (the test bracket is a box, a boss and a half
+    sphere whose rims touch without sharing vertices) part of it can stay open. It is reported as
+    `seam_open`, never closed by bridging the rims.
+  - A small patch scanned at a finer resolution inside a large scan loses to the large scan (it is
+    nearer its own border everywhere).
+  - Meshes with triangles far longer than their median edge (CAD exports, heavy decimation): where such
+    a triangle was removed the gap can be wider than the pivoting reaches, and the seam stays partly
+    open (`seam_open`, `removed_not_covered`). A uniform tessellation first helps.
+  - The work is O(T log T) in the triangles of all scans (20 million at most natively, 2 million in the browser); the pair statistics
+    use 20 000 points per scan.
+
 ## Parameters common to all align commands
 
 - `object`: the mesh to move.

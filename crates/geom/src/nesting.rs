@@ -5,13 +5,13 @@
 use crate::{Aabb, Bvh, Mesh, Point3, Vec3, tri};
 
 /// Probe directions: irrational-looking, so that rays do not run along mesh edges of grid-like scans.
-const DIRECTIONS: [[f64; 3]; 3] = [
+pub(crate) const DIRECTIONS: [[f64; 3]; 3] = [
     [0.577_350_3, 0.311_283_5, 0.754_866_2],
     [-0.412_393_1, 0.801_938_5, 0.434_122_7],
     [0.283_561_9, -0.527_714_6, 0.801_287_4],
 ];
 /// Crossings counted along one ray before it is given up.
-const MAX_CROSSINGS: usize = 512;
+pub(crate) const MAX_CROSSINGS: usize = 512;
 /// Sample points of the inner piece that are tested.
 pub const NEST_SAMPLES: usize = 5;
 

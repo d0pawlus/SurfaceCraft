@@ -28,17 +28,17 @@ impl Hasher for Mix {
 
 type EdgeMap = HashMap<u64, u32, BuildHasherDefault<Mix>>;
 
-fn key(a: u32, b: u32) -> u64 {
+pub(super) fn key(a: u32, b: u32) -> u64 {
     (u64::from(a) << 32) | u64::from(b)
 }
 
 /// An edge of the front: the triangle `(a, b, c)` was built, the ball (centre `center`) rests on
 /// it and the edge `a → b` has no neighbour yet.
-struct FrontEdge {
-    a: u32,
-    b: u32,
-    c: u32,
-    center: Point3,
+pub(super) struct FrontEdge {
+    pub(super) a: u32,
+    pub(super) b: u32,
+    pub(super) c: u32,
+    pub(super) center: Point3,
 }
 
 pub(super) struct Bpa<'a> {
@@ -51,12 +51,15 @@ pub(super) struct Bpa<'a> {
     pub(super) edges: EdgeMap,
     pub(super) tris: Vec<[u32; 3]>,
     pub(super) scratch: Vec<(f64, u32, Point3)>,
+    /// A last test of a triangle `(b, a, d)` a pivot would build (band mode, [`super::band`]); every
+    /// candidate is accepted without it. A candidate it refuses is passed over for the next one.
+    pub(super) accept: Option<&'a mut dyn FnMut([u32; 3]) -> bool>,
 }
 
 /// Centre of the ball of radius `rho` resting on the triangle `(p0, p1, p2)` on the side of its
 /// geometric normal, and that normal; `None` for degenerate triangles or a circumcircle larger
 /// than the ball.
-fn ball_center(p0: &Point3, p1: &Point3, p2: &Point3, rho: f64) -> Option<(Point3, Vec3)> {
+pub(super) fn ball_center(p0: &Point3, p1: &Point3, p2: &Point3, rho: f64) -> Option<(Point3, Vec3)> {
     let e1 = p1 - p0;
     let e2 = p2 - p0;
     let nrm = e1.cross(&e2);
@@ -74,6 +77,10 @@ fn ball_center(p0: &Point3, p1: &Point3, p2: &Point3, rho: f64) -> Option<(Point
     let nhat = nrm / den.sqrt();
     Some((cc + nhat * h2.sqrt(), nhat))
 }
+
+/// In band mode a point counts for the empty-ball test only when its normal and the triangle's make
+/// at least this cosine.
+const BAND_FACING: f64 = 0.5;
 
 /// Tolerance of the pivot angle below zero, 1e-7 rad (near zero the pseudo angle equals the angle).
 const PSEUDO_EPS: f64 = 1e-7;
@@ -105,6 +112,7 @@ impl<'a> Bpa<'a> {
             edges: EdgeMap::default(),
             tris: Vec::new(),
             scratch: Vec::new(),
+            accept: None,
         }
     }
 
@@ -125,10 +133,21 @@ impl<'a> Bpa<'a> {
     /// Is the ball (almost) free of points other than `skip`? The test ball is a little smaller
     /// than the real one so noise does not leave holes.
     fn ball_empty(&self, grid: &Grid, center: &Point3, rho: f64, skip: [u32; 3]) -> bool {
+        self.ball_empty_facing(grid, center, rho, skip, None)
+    }
+
+    /// [`Bpa::ball_empty`] where, with `facing` (band mode), only points on the border of what is
+    /// built (the band's own points) whose normal faces like it (cosine at least one half) count:
+    /// the surface the band joins is all there, its inner vertices are no candidates and must not
+    /// keep the ball out (the caller tests that a triangle covers none), and neither must a wall
+    /// standing on it (a boss on a face).
+    fn ball_empty_facing(&self, grid: &Grid, center: &Point3, rho: f64, skip: [u32; 3], facing: Option<Vec3>) -> bool {
         let r2 = (rho * 0.97) * (rho * 0.97);
         let mut empty = true;
         grid.visit(center, rho, |q| {
-            if !skip.contains(&q) && (self.p(q) - center).norm_squared() < r2 {
+            let counts = facing
+                .is_none_or(|f| self.n(q).dot(&f) >= BAND_FACING && self.open.get(q as usize).is_some_and(|&o| o > 0));
+            if counts && !skip.contains(&q) && (self.p(q) - center).norm_squared() < r2 {
                 empty = false;
                 return true;
             }
@@ -137,7 +156,7 @@ impl<'a> Bpa<'a> {
         empty
     }
 
-    fn add_triangle(&mut self, t: [u32; 3]) {
+    pub(super) fn add_triangle(&mut self, t: [u32; 3]) {
         let id = self.tris.len() as u32;
         self.tris.push(t);
         for k in 0..3 {
@@ -155,7 +174,7 @@ impl<'a> Bpa<'a> {
         }
     }
 
-    fn push_open_edges(&self, t: [u32; 3], center: Point3, front: &mut VecDeque<FrontEdge>) {
+    pub(super) fn push_open_edges(&self, t: [u32; 3], center: Point3, front: &mut VecDeque<FrontEdge>) {
         for k in 0..3 {
             let (a, b, c) = (t[k], t[(k + 1) % 3], t[(k + 2) % 3]);
             if !self.edges.contains_key(&key(b, a)) {
@@ -232,19 +251,16 @@ impl<'a> Bpa<'a> {
         false
     }
 
-    /// Pivots the ball around the front edge `a → b` to the next point it touches.
-    fn pivot(&mut self, grid: &Grid, rho: f64, f: &FrontEdge, front: &mut VecDeque<FrontEdge>) {
+    /// The points the ball pivoting around the front edge `f` can reach, with the pivot angle and the
+    /// ball centre, in `out` (cleared first), sorted by angle.
+    fn candidates(&self, grid: &Grid, rho: f64, f: &FrontEdge, out: &mut Vec<(f64, u32, Point3)>) {
+        out.clear();
         let (a, b, c) = (f.a, f.b, f.c);
-        if self.edges.contains_key(&key(b, a)) {
-            return;
-        }
         let (pa, pb) = (self.p(a), self.p(b));
         let m = Point3::from((pa.coords + pb.coords) * 0.5);
         let Some(u) = crate::normalize(pb - pa) else { return };
         let v0 = f.center - m;
         let lim2 = 4.0 * rho * rho;
-        let mut cands = std::mem::take(&mut self.scratch);
-        cands.clear();
         grid.visit(&m, 2.0 * rho, |d| {
             if d == a || d == b || d == c {
                 return false;
@@ -264,27 +280,44 @@ impl<'a> Bpa<'a> {
                 ang += 4.0;
             }
             if ang <= 2.0 {
-                cands.push((ang.max(0.0), d, cen));
+                out.push((ang.max(0.0), d, cen));
             }
             false
         });
-        cands.sort_by(|x, y| x.0.total_cmp(&y.0));
-        let mut found: Option<(u32, Point3)> = None;
-        for &(_, d, cen) in &cands {
-            if self.used.get(d as usize).copied().unwrap_or(true)
-                && self.open.get(d as usize).copied().unwrap_or(0) == 0
-            {
-                continue; // an interior vertex
-            }
-            if self.edges.contains_key(&key(a, d)) || self.edges.contains_key(&key(d, b)) {
-                continue;
-            }
-            if !self.ball_empty(grid, &cen, rho, [a, b, d]) {
-                continue;
-            }
-            found = Some((d, cen));
-            break;
+        out.sort_by(|x, y| x.0.total_cmp(&y.0));
+    }
+
+    /// May the pivot over `a → b` end at `d` with the ball at `cen`? Not at an inner vertex (nor, in
+    /// band mode, at a point no triangle uses), not on an edge that exists, with the ball empty and
+    /// the caller's test passed.
+    fn takes(&mut self, grid: &Grid, rho: f64, (a, b, d): (u32, u32, u32), cen: &Point3) -> bool {
+        let used = self.used.get(d as usize).copied().unwrap_or(true);
+        if used && self.open.get(d as usize).copied().unwrap_or(0) == 0 {
+            return false; // an inner vertex
         }
+        if self.accept.is_some() && !used {
+            return false; // band mode: only points of the surface that is there
+        }
+        if self.edges.contains_key(&key(a, d)) || self.edges.contains_key(&key(d, b)) {
+            return false;
+        }
+        let facing = if self.accept.is_some() { crate::tri::normal(&self.p(b), &self.p(a), &self.p(d)) } else { None };
+        if !self.ball_empty_facing(grid, cen, rho, [a, b, d], facing) {
+            return false;
+        }
+        self.accept.as_mut().is_none_or(|accept| accept([b, a, d]))
+    }
+
+    /// Pivots the ball around the front edge `a → b` to the next point it touches.
+    pub(super) fn pivot(&mut self, grid: &Grid, rho: f64, f: &FrontEdge, front: &mut VecDeque<FrontEdge>) {
+        let (a, b) = (f.a, f.b);
+        if self.edges.contains_key(&key(b, a)) {
+            return;
+        }
+        let mut cands = std::mem::take(&mut self.scratch);
+        self.candidates(grid, rho, f, &mut cands);
+        let found =
+            cands.iter().find(|&&(_, d, cen)| self.takes(grid, rho, (a, b, d), &cen)).map(|&(_, d, cen)| (d, cen));
         self.scratch = cands;
         if let Some((d, cen)) = found {
             let t = [b, a, d];
