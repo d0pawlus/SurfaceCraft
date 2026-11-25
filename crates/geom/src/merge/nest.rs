@@ -1,9 +1,10 @@
 //! Closed pieces of a scan with a negative volume: turned inside out, inner skins (inside another
-//! closed piece: the inside of a hollow part, a cavity) or debris. One BVH over the closed pieces'
-//! triangles and one over their boxes are built once; each negative piece finds the pieces whose box
-//! holds one of its vertices through the box BVH, then casts rays from that vertex that count only
-//! the crossings with those pieces (a closed surface whose box does not contain a point is crossed
-//! an even number of times).
+//! closed piece: the inside of a hollow part, a cavity) or debris. A BVH over the closed pieces'
+//! boxes is built once; each negative piece finds the pieces whose box holds one of its vertices
+//! through it, then casts rays from that vertex against those pieces only, each through its own BVH
+//! (built on first use, once), and sums their crossings (a closed surface whose box does not contain
+//! a point is crossed an even number of times). A void among ten thousand others costs about what a
+//! void alone costs: the rays never walk through the other voids.
 //!
 //! The whole stage has one budget of work (nodes visited, boxes listed, triangles tested),
 //! proportional to the triangles of the closed pieces: a pile of coincident pieces or many
@@ -32,7 +33,8 @@ const MAX_CAST_WORK: usize = 1 << 14;
 /// Work between two looks at the cancellation flag (plus one cast at most).
 pub(super) const CANCEL_WORK: usize = 4096;
 
-/// What the nesting test cost: BVH builds and work (nodes visited, boxes listed, triangles tested).
+/// What the nesting test cost: BVHs of pieces built (each once, besides the one of the boxes) and
+/// work (nodes visited, boxes listed, triangles tested, triangles of the pieces built).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Cost {
     pub(super) builds: usize,
@@ -93,12 +95,12 @@ enum Inside {
     Unknown,
 }
 
-/// The closed pieces of a mesh in one BVH, with the piece of every triangle in it, and their boxes
-/// in another (one degenerate triangle per piece whose box is the piece's).
+/// The closed pieces of a mesh, a BVH of each built on first use, and a BVH of their boxes (one
+/// degenerate triangle per piece whose box is the piece's).
 struct Closed<'p> {
+    mesh: &'p Mesh,
     pieces: Vec<&'p pieces::Piece>,
-    bvh: Bvh,
-    piece_of: Vec<usize>,
+    own: Vec<std::cell::OnceCell<Bvh>>,
     boxes: Bvh,
     eps: f64,
     cancel: &'p Cancel,
@@ -154,11 +156,10 @@ impl Closed<'_> {
         if holders.is_empty() {
             return Inside::No;
         }
-        let keep = |t: usize| self.piece_of.get(t).is_some_and(|j| holders.binary_search(j).is_ok());
         let (mut odd, mut even) = (0, 0);
         for d in &DIRECTIONS {
             let dir = Vec3::new(d[0], d[1], d[2]).normalize();
-            match self.crossings(&p, &dir, &keep, cost) {
+            match self.crossings(&p, &dir, &holders, cost) {
                 Some(n) if n % 2 == 1 => odd += 1,
                 Some(_) => even += 1,
                 None => {}
@@ -173,25 +174,41 @@ impl Closed<'_> {
         }
     }
 
-    /// Crossings of the ray from `p` along `dir` with the triangles `keep` passes; `None` when the
-    /// budget ran out or the ray met [`MAX_CROSSINGS`] surfaces.
-    fn crossings(&self, p: &Point3, dir: &Vec3, keep: &dyn Fn(usize) -> bool, cost: &mut Cost) -> Option<usize> {
-        let (mut o, mut n) = (*p, 0);
-        loop {
-            if n >= MAX_CROSSINGS || self.polled(cost) {
-                return None;
-            }
-            let (cast, work) = self.bvh.ray_cast_counted(&o, dir, f64::INFINITY, keep, cost.left().min(MAX_CAST_WORK));
-            cost.work += work;
-            match cast {
-                RayCast::Hit(_, t) => {
-                    n += 1;
-                    o += dir * (t + self.eps);
+    /// The BVH of piece `j`, built on first use (its triangles count as work then).
+    fn bvh_of(&self, j: usize, cost: &mut Cost) -> Option<&Bvh> {
+        let (cell, piece) = (self.own.get(j)?, self.pieces.get(j)?);
+        if cell.get().is_none() {
+            cost.work = cost.work.saturating_add(piece.triangles.len());
+            cost.builds += 1;
+        }
+        Some(cell.get_or_init(|| Bvh::build(&self.mesh.submesh(&piece.triangles))))
+    }
+
+    /// Crossings of the ray from `p` along `dir` with the pieces `holders`, each through its own
+    /// BVH; `None` when the budget ran out or the ray met [`MAX_CROSSINGS`] surfaces.
+    fn crossings(&self, p: &Point3, dir: &Vec3, holders: &[usize], cost: &mut Cost) -> Option<usize> {
+        let mut n = 0;
+        for &j in holders {
+            let bvh = self.bvh_of(j, cost)?;
+            let mut o = *p;
+            loop {
+                if n >= MAX_CROSSINGS || self.polled(cost) {
+                    return None;
                 }
-                RayCast::Miss => return Some(n),
-                RayCast::Exhausted => return None,
+                let (cast, work) =
+                    bvh.ray_cast_counted(&o, dir, f64::INFINITY, &|_| true, cost.left().min(MAX_CAST_WORK));
+                cost.work += work;
+                match cast {
+                    RayCast::Hit(_, t) => {
+                        n += 1;
+                        o += dir * (t + self.eps);
+                    }
+                    RayCast::Miss => break,
+                    RayCast::Exhausted => return None,
+                }
             }
         }
+        Some(n)
     }
 }
 
@@ -210,20 +227,17 @@ pub(super) fn negative_pieces(mesh: &Mesh, cancel: &Cancel) -> Option<Negative> 
     negative_pieces_costed(mesh, cancel).map(|(n, _)| n)
 }
 
-/// The two BVHs of the closed pieces (see [`Closed`]).
-fn closed_set<'p>(mesh: &Mesh, closed: Vec<&'p pieces::Piece>, cancel: &'p Cancel) -> Closed<'p> {
-    let ids: Vec<u32> = closed.iter().flat_map(|p| p.triangles.iter().copied()).collect();
-    let piece_of: Vec<usize> =
-        closed.iter().enumerate().flat_map(|(j, p)| std::iter::repeat_n(j, p.triangles.len())).collect();
+/// The closed pieces with the BVH of their boxes (see [`Closed`]).
+fn closed_set<'p>(mesh: &'p Mesh, closed: Vec<&'p pieces::Piece>, cancel: &'p Cancel) -> Closed<'p> {
     let boxes = Mesh {
         positions: closed.iter().flat_map(|p| [p.bbox.min, p.bbox.max]).collect(),
         triangles: (0..closed.len() as u32).map(|j| [2 * j, 2 * j + 1, 2 * j]).collect(),
     };
     let eps = NEST_EPS_SHARE * mesh.bbox().diagonal().max(f64::MIN_POSITIVE);
     Closed {
-        bvh: Bvh::build(&mesh.submesh(&ids)),
+        mesh,
+        own: (0..closed.len()).map(|_| std::cell::OnceCell::new()).collect(),
         pieces: closed,
-        piece_of,
         boxes: Bvh::build(&boxes),
         eps,
         cancel,
@@ -246,7 +260,6 @@ pub(super) fn negative_pieces_costed(mesh: &Mesh, cancel: &Cancel) -> Option<(Ne
     if negative.is_empty() {
         return Some((Negative::default(), cost));
     }
-    cost.builds += 1;
     let set = closed_set(mesh, closed, cancel);
     let verdicts = judge(&set, mesh, &negative, &mut cost)?;
     Some((sort_out(&set, mesh.area(), &verdicts), cost))
@@ -289,13 +302,13 @@ fn sort_out(set: &Closed<'_>, area: f64, verdicts: &[(usize, Inside)]) -> Negati
             Inside::No => out.inverted += 1,
         }
     }
-    if debris_area >= INVERTED_MIN_SHARE * area {
+    // the loose inverted pieces and the unjudged ones share one allowance of INVERTED_MIN_SHARE
+    if debris_area + unjudged_area >= INVERTED_MIN_SHARE * area {
         out.inverted += out.debris;
         out.debris = 0;
+        out.unjudged_refuses = out.unjudged > 0;
     }
-    if unjudged_area >= INVERTED_MIN_SHARE * area {
-        out.unjudged_refuses = true;
-    } else {
+    if !out.unjudged_refuses {
         out.skins += out.unjudged;
     }
     out

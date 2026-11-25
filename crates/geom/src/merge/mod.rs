@@ -31,7 +31,8 @@
 //! Kept vertices stay where they are, except that a seam vertex of a later scan moves onto a
 //! coinciding seam vertex of an earlier scan (see [`weld`]: by at most a quarter of the tolerance and a tenth of the median
 //! edge). Scans that share nothing are a union of pieces, reported as such. The work is
-//! O(T log T) in the triangles of all scans; nothing is quadratic in them.
+//! O(T log T) in the triangles of all scans; nothing is quadratic in them (the pair statistics are
+//! quadratic in the number of scans, at most [`MAX_SCANS`]).
 mod check;
 mod fill;
 mod guard;
@@ -83,6 +84,10 @@ pub const COVERED_SHARE: f64 = 0.99;
 /// Above this share of the scans' area in the result lying on another scan's surface,
 /// `Stacked` is raised.
 pub const STACKED_SHARE: f64 = 0.005;
+/// Scans merged at once at most (the pair statistics are quadratic in them).
+pub const MAX_SCANS: usize = 64;
+/// Coordinates of the scans at most this far from the origin along an axis (mm).
+pub const MAX_COORDINATE: f64 = 1e9;
 /// Rounds of recovery and refill at most.
 pub const RECOVER_ROUNDS: usize = 3;
 /// The guard's grid cell, in largest ball diameters (two radii).
@@ -324,6 +329,13 @@ fn check_input(scans: &[Mesh], p: &Params) -> Result<(), MergeError> {
     if scans.len() < 2 {
         return Err(MergeError::Params(format!("merging needs at least two scans, not {}", scans.len())));
     }
+    // the pair statistics are quadratic in the scans and the grouping cubic: bounded here
+    if scans.len() > MAX_SCANS {
+        return Err(MergeError::Params(format!(
+            "at most {MAX_SCANS} scans can be merged at once, not {}",
+            scans.len()
+        )));
+    }
     if !(p.tolerance.is_finite() && p.tolerance > 0.0) {
         return Err(MergeError::Params(format!("tolerance must be a positive number of mm, not {}", p.tolerance)));
     }
@@ -335,6 +347,14 @@ fn check_input(scans: &[Mesh], p: &Params) -> Result<(), MergeError> {
         m.validate().map_err(|e| MergeError::Invalid(k, e.to_string()))?;
         if m.triangles.is_empty() {
             return Err(MergeError::Params(format!("scan {k} has no triangles")));
+        }
+        // beyond this distance from the origin the volumes and areas of the checks lose their
+        // precision (a part far out collapses to points, an inverted piece reads as flat) or
+        // overflow: refused, not merged blind
+        if m.positions.iter().any(|q| q.coords.amax() > MAX_COORDINATE) {
+            return Err(MergeError::Params(format!(
+                "scan {k} has points farther than {MAX_COORDINATE:e} mm from the origin along an axis: move it nearer the origin"
+            )));
         }
     }
     Ok(())

@@ -298,7 +298,12 @@ Normals, colours and per-vertex data go with the coordinates.
     `flipped_triangles_dropped`, so the result never has a flipped part.
   - `inverted_scan`: a closed piece of a scan has a negative volume. Inner skins (inside another
     closed piece, as the inside of a hollow part or a cavity, whatever their size) and debris (loose
-    small pieces below 1 % of the scan's area all together) are not refused; they are reported as `inner_skins` with their counts.
+    small pieces below 1 % of the scan's area all together) are not refused; they are reported as
+    `inner_skins` with their counts. Negative pieces the inside test could not judge within its
+    budget refuse the scan too when, with the loose small ones, they reach 1 % of its area (one
+    allowance for both); below that they are counted in `inner_skins` (a warning).
+  - Input: at most 64 scans, and no point farther than 1e9 mm from the origin along an axis (beyond
+    that the volumes and areas of the checks lose their precision).
 - Reported, not refused: `layers_apart` (two scans that meet somewhere also lie over each other:
   at least 14 % of the points of one that relate to the other, on it or over it, lie over it beyond
   the reach, with nothing of their own scan in between; the issue gives the median offset and its
@@ -369,8 +374,8 @@ Normals, colours and per-vertex data go with the coordinates.
   - The test whether a closed piece with a negative volume lies inside another (an inner skin) has
     a work budget proportional to the scan's closed triangles; the largest pieces are judged first.
     Pieces it cannot judge (a pile of coincident pieces, many nested shells) are reported as
-    unjudged in `inner_skins` (a warning) while they stay under 1 % of the scan's area together,
-    and refuse the scan (`inverted_scan`) above it. `alignment` does not change this.
+    unjudged in `inner_skins` (a warning) while they, with the loose small inverted pieces, stay
+    under 1 % of the scan's area together, and refuse the scan (`inverted_scan`) above it. `alignment` does not change this.
   - Two OPEN scans that are both turned inside out, consistently, cannot be told from right ones (as
     with `align.pair_coarse`).
   - A wall thinner than the tolerance, seen from its two sides by two different scans only, reads as

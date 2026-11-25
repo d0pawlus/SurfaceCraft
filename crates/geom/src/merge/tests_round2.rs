@@ -492,7 +492,7 @@ fn thousands_of_small_inverted_pieces_cost_one_bvh_and_a_bounded_number_of_casts
     let (n, cost) = nest::negative_pieces_costed(&m, &Cancel::new()).unwrap();
     assert_eq!(n.counts(), (0, 0, count));
     assert_eq!(n.unjudged, 0);
-    // two BVHs (triangles and boxes) built once; the holding boxes found through the box BVH and
+    // the large sphere's BVH built once (the boxes' BVH besides); the holding boxes found through it and
     // three short casts a piece: a few hundred units of work a piece, not one box per piece (3000 x
     // 3001), and within the stage's budget
     assert_eq!(cost.builds, 1);
