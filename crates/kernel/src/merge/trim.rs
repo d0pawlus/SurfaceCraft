@@ -106,7 +106,7 @@ impl Parts<'_> {
 /// and the body's edges that went into it. Each loop is given relative to the surface's natural
 /// normal: reversed where the face's side is not that normal.
 fn assembled(body: &Brep, b: &Boundary, surface: &Surface, same_sense: bool) -> Result<(Brep, Vec<u32>)> {
-    let trims = KernelTrims;
+    let trims = KernelTrims::new();
     let assembly = Assembly::new(body.tolerance.max(MIN_TOLERANCE), Some(&trims));
     let mut parts = Parts { assembly, vertex_of: BTreeMap::new(), edge_of: BTreeMap::new(), source: Vec::new() };
     let mut bounds = Vec::new();

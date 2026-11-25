@@ -114,6 +114,40 @@ fn gate_m3_sheet_step_roundtrip() {
     assert!(max < 1e-6, "{max}");
 }
 
+/// The `#id=…;` line of the entity `id`.
+fn entity(text: &str, id: &str) -> String {
+    let key = format!("#{id}=");
+    text.lines().find(|l| l.starts_with(&key)).unwrap_or_default().to_string()
+}
+
+/// The numbers of a parameter list.
+fn numbers(list: &str) -> Vec<f64> {
+    list.split(|c: char| !(c.is_ascii_digit() || matches!(c, '.' | '-' | 'E' | '+')))
+        .filter(|t| t.chars().any(|c| c.is_ascii_digit()))
+        .filter_map(|t| t.parse().ok())
+        .collect()
+}
+
+/// The 2-D control points of every PCURVE of the file: PCURVE -> DEFINITIONAL_REPRESENTATION ->
+/// B_SPLINE_CURVE_WITH_KNOTS -> CARTESIAN_POINTs.
+fn written_pcurve_points(text: &str) -> Vec<Vec<[f64; 2]>> {
+    let last_ref = |s: &str| s.rsplit('#').next().unwrap().trim_matches(|c: char| !c.is_ascii_digit()).to_string();
+    text.lines()
+        .filter(|l| l.contains("=PCURVE("))
+        .map(|line| {
+            let rep = entity(text, &last_ref(line));
+            let curve = entity(text, &last_ref(rep.split(",#").next().unwrap()));
+            let ids = curve.split("(#").nth(1).unwrap().split(')').next().unwrap().to_string();
+            ids.split(",#")
+                .map(|id| {
+                    let v = numbers(entity(text, id.trim_start_matches('#')).split("',(").nth(1).unwrap());
+                    [v[0], v[1]]
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// A fitted sheet's four edges are SURFACE_CURVEs with one PCURVE each, and the sheet read back
 /// has pcurves on their edges.
 #[test]
@@ -123,6 +157,21 @@ fn spline_sheet_edges_are_surface_curves_with_pcurves() {
     assert_eq!(count(&text, "=SURFACE_CURVE("), 4);
     assert_eq!(count(&text, "=SEAM_CURVE("), 0);
     assert_eq!(count(&text, "=PCURVE("), 4);
+    // the file's pcurves are the record's (a face on a spline keeps its (u, v)): each PCURVE's
+    // control points are those of one of the record's pcurves
+    let mut written = written_pcurve_points(&text);
+    let Loop::Edges { edges } = &b.faces[0].loops[0] else { panic!("an edge loop") };
+    let mut ours: Vec<Vec<[f64; 2]>> = edges
+        .iter()
+        .map(|u| match &u.pcurve {
+            surfacecraft_kernel::record::brep::Curve2::Spline { points, .. } => points.clone(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    let key = |p: &Vec<[f64; 2]>| format!("{p:?}");
+    written.sort_by_key(key);
+    ours.sort_by_key(key);
+    assert_eq!(written, ours);
     let back = surfacecraft_kernel::step::import(text.as_bytes()).unwrap();
     let gaps = pcurve_gaps(&back[0]);
     eprintln!("h1 spline sheet: {} pcurves read back, worst gap {:e} mm", gaps.len(), worst(&gaps));
@@ -218,9 +267,13 @@ mod hostile {
         f(knots);
     }
 
-    fn refused(b: &Brep, what: &str) {
+    /// The writer refuses `b`, saying `why` (the record check that fails).
+    fn refused(b: &Brep, why: &str) {
         let r = write_sheets("bad", &[b]);
-        assert!(r.is_err(), "the writer must refuse {what}, got a file of {} bytes", r.map_or(0, |t| t.len()));
+        let Err(e) = r else {
+            panic!("the writer must refuse ({why}), got a file of {} bytes", r.map_or(0, |t| t.len()))
+        };
+        assert!(e.to_string().contains(why), "{e}");
     }
 
     #[test]
@@ -228,7 +281,7 @@ mod hostile {
         for radius in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
             let mut b = wave();
             b.edges[0].curve = circle(radius);
-            refused(&b, "CIRCLE");
+            refused(&b, "radius");
         }
     }
 
@@ -239,7 +292,7 @@ mod hostile {
             frame: Frame { origin: [0.0; 3], x_axis: [1.0, 0.0, 0.0], y_axis: [0.0, 1.0, 0.0] },
             radii: [1.0, 0.0],
         };
-        refused(&b, "ELLIPSE");
+        refused(&b, "radius");
     }
 
     #[test]
@@ -253,17 +306,17 @@ mod hostile {
     fn nan_pcurve_knot_is_refused() {
         let mut b = wave();
         set_pcurve_knots(&mut b, |k| k[1] = f64::NAN);
-        refused(&b, "B_SPLINE_CURVE");
+        refused(&b, "non-finite");
     }
 
     #[test]
     fn decreasing_knots_and_one_distinct_knot_are_refused() {
         let mut b = wave();
         set_pcurve_knots(&mut b, |k| *k = vec![1.0, 1.0, 0.0, 0.0]);
-        refused(&b, "B_SPLINE_CURVE");
+        refused(&b, "unordered knots");
         let mut b = wave();
         set_pcurve_knots(&mut b, |k| *k = vec![0.5; 4]);
-        refused(&b, "B_SPLINE_CURVE");
+        refused(&b, "empty spline domain");
     }
 
     #[test]
@@ -271,7 +324,7 @@ mod hostile {
         let mut b = wave();
         let t = b.edges[0].interval[0];
         b.edges[0].interval = [t, t];
-        refused(&b, "edge 0");
+        refused(&b, "empty parameter interval");
     }
 
     #[test]
@@ -288,12 +341,12 @@ mod hostile {
             frame: Frame { origin: [0.0; 3], x_axis: [1.0, 0.0, 0.0], y_axis: [1.0, 1.0, 0.0] },
             radius: 1.0,
         };
-        refused(&b, "frame");
+        refused(&b, "without its NURBS form");
     }
 
     /// A slit (one planar face using an edge twice).
     #[test]
-    fn an_edge_used_twice_by_a_plane_never_panics() {
+    fn a_slit_record_that_lost_its_neighbours_is_refused() {
         let mut b = surfacecraft_kernel::solid::make_box([0.0; 3], [1.0, 1.0, 1.0]).unwrap();
         // one planar face, its loop run once more along its first edge back and forth
         let face = 0;
@@ -315,10 +368,8 @@ mod hostile {
             wires: vec![],
         }];
         b.regions = vec![Region { shells: vec![0], void: false }];
-        // the writer may refuse the record or write it; neither the writer nor the reader panics
-        if let Ok(text) = write_sheets("slit", &[&b]) {
-            let back = surfacecraft_kernel::step::import(text.as_bytes());
-            eprintln!("slit: written, SEAM_CURVE {}, read back: {}", count(&text, "=SEAM_CURVE("), back.is_ok());
-        }
+        // the slit's record no longer lists the box's other faces on that edge: the record check
+        // refuses it before anything is written
+        refused(&b, "oriented faces");
     }
 }

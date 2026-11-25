@@ -1306,7 +1306,7 @@ solidcore-record 0.1.0
 
 solidcore-step 0.1.0
     licence: Apache-2.0
-    source: 
+    source: https://github.com/tangency-labs/solidcore
 
 solidcore-tess 0.1.0
     licence: Apache-2.0

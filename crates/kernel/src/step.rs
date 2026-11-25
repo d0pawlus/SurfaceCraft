@@ -15,7 +15,9 @@ use solidcore::surface::face_surface::analytic_label;
 use solidcore_ops::pcurve::{TrimFace, Trims};
 use solidcore_step::write::product::{ExportBody, Header};
 use std::borrow::Cow;
+use std::cell::RefCell;
 
+mod check;
 mod trims;
 
 /// Largest STEP text accepted (bytes).
@@ -32,12 +34,21 @@ fn check_size(text: &[u8]) -> Result<()> {
 }
 
 /// The pcurves a face's uses have no closed form for, made by the kernel ([`trims`]); the closed
-/// forms the reader found are kept as they are.
-pub(crate) struct KernelTrims;
+/// forms the reader found are kept as they are. One kernel serves every face of an import, and the
+/// work it may do is bounded ([`trims::MAX_TRIM_USES`]).
+pub(crate) struct KernelTrims(RefCell<trims::TrimKernel>);
+
+impl KernelTrims {
+    pub(crate) fn new() -> Self {
+        Self(RefCell::new(trims::TrimKernel::new()))
+    }
+}
 
 impl Trims for KernelTrims {
     fn trims(&self, face: &TrimFace<'_>) -> std::result::Result<Vec<Vec<Curve2>>, String> {
-        trims::kernel_trims(face).map_err(|e| e.to_string())
+        let mut kernel =
+            self.0.try_borrow_mut().map_err(|_| "the trims were asked for from inside a trim".to_string())?;
+        kernel.trims(face).map_err(|e| e.to_string())
     }
 }
 
@@ -59,24 +70,31 @@ pub fn import(text: &[u8]) -> Result<Vec<Brep>> {
 
 /// [`import`] with the bodies the file holds that were refused, and why.
 ///
-/// The file is hostile input: the parser bounds its size and entity counts, the reader its faces
-/// (`solidcore_step::topology`'s caps) and refuses a body whose references, loops or geometry do
-/// not hold together, and every record it builds is checked again here (`Brep::validate_built`:
-/// every structural check of the record; the item budget of `Brep::validate` is left to the
-/// reader's caps, since it refuses real closed shells of tens of thousands of patches,
-/// `docs/upstream/08-validate-item-budget-large-bspline-shell.md`). A record that fails is refused
-/// with its reason, never returned.
+/// The file is hostile input: the parser bounds its size and entity counts; the control points its
+/// faces would hold are estimated before anything is built ([`check::MAX_FACE_POINTS`]); the reader
+/// bounds its faces (`solidcore_step::topology`'s caps), refuses a body whose references, loops or
+/// geometry do not hold together, and the kernel's trims are bounded too; every record it builds is
+/// checked again here ([`check::record`]: an item cap, the record's structural and geometric checks,
+/// and faces that agree on their sides). A record that fails is refused with its reason, never
+/// returned.
 pub fn import_report(text: &[u8]) -> Result<Imported> {
     check_size(text)?;
     // Part 21 is ASCII (other characters are escaped); a stray byte of another code page can only
     // sit in a string, and is replaced there rather than refusing the file.
     let text = String::from_utf8_lossy(text);
     let exchange = solidcore_step::p21::parse(&text).map_err(|e| op_err("STEP parse", e.to_string()))?;
-    let read = solidcore_step::topology::read_solids_with(&exchange, &KernelTrims);
+    let points = check::face_points(&exchange);
+    if points > check::MAX_FACE_POINTS {
+        return Err(op_err(
+            "STEP import",
+            format!("the file's faces would hold {points} control points, more than {}", check::MAX_FACE_POINTS),
+        ));
+    }
+    let read = solidcore_step::topology::read_solids_with(&exchange, &KernelTrims::new());
     let mut out = Imported::default();
     out.refused.extend(read.failures.iter().map(|f| format!("#{}: {}", f.item, f.message)));
     for solid in read.solids {
-        match solid.brep.validate_built() {
+        match check::record(&solid.brep) {
             Ok(()) => out.bodies.push(solid.brep),
             Err(e) => out.refused.push(format!("#{}: {e}", solid.item)),
         }
@@ -102,7 +120,9 @@ pub fn export(name: &str, bodies: &[(&str, &Brep)]) -> Result<String> {
     // the writer writes what the record says; a record that breaks the schema is refused here
     // rather than written as a file that says something else
     for (n, record) in bodies {
-        record.validate_built().map_err(|e| KernelError::Argument(format!("STEP export of '{n}': {e}")))?;
+        check::record(record)
+            .and_then(|()| check::agreement(record))
+            .map_err(|e| KernelError::Argument(format!("STEP export of '{n}': {e}")))?;
     }
     let ready: Vec<Cow<'_, Brep>> = bodies.iter().map(|(_, record)| cones_from_their_apex(record)).collect();
     let list = bodies
@@ -164,6 +184,9 @@ fn step_label(s: &Surface) -> Option<Surface> {
 /// This covers the cones the record labels and the rational faces the writer would label as cones;
 /// a face with a NURBS form has its parameters on the form, so its label is free to change.
 fn cones_from_their_apex(b: &Brep) -> Cow<'_, Brep> {
+    // the kernel the writer labels such faces with: the fixes the session runs with, and no others
+    // (`session::fixes` names those the application turned on, none by default; this turns none on
+    // by itself), so the labels here are the writer's own
     let mut k = Kernel::new(&KernelOptions::default());
     for name in solidcore_ops::session::fixes() {
         if let Some(on) = k.fixes.flag_mut(name) {
@@ -204,136 +227,4 @@ pub fn export_solids(bodies: &[(&str, &Brep)]) -> Result<String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_box_round_trips_with_its_volume() {
-        let b = crate::solid::make_box([0.0; 3], [2.0, 3.0, 4.0]).unwrap();
-        let text = export_solids(&[("box", &b)]).unwrap();
-        assert!(text.contains("MANIFOLD_SOLID_BREP") && text.contains("'SurfaceCraft'"));
-        let back = import(text.as_bytes()).unwrap();
-        assert_eq!(back.len(), 1);
-        assert_eq!(back[0].faces.len(), 6);
-        let v = crate::solid::volume(&back[0]).unwrap();
-        assert!((v - 24.0).abs() < 1e-6, "{v}");
-    }
-
-    /// A cone narrowing along its axis and a torus, as the kernel makes them, round trip as one
-    /// body each with their volume (the narrowing cone split into several bodies on the old pin).
-    #[test]
-    fn a_narrowing_cone_and_a_torus_round_trip_with_their_volume() {
-        let cone = solidcore_ops::make_cone([0.0; 3], 5.0, 1.0, 10.0).unwrap();
-        let torus = solidcore_ops::make_torus([1.0, 2.0, 3.0], 6.0, 1.5).unwrap();
-        for (name, body) in [("cone", cone), ("torus", torus)] {
-            let rec = crate::solid::encode(&body).unwrap();
-            let text = export_solids(&[(name, &rec)]).unwrap();
-            let back = import(text.as_bytes()).unwrap();
-            assert_eq!(back.len(), 1, "{name}");
-            let (before, after) = (crate::solid::volume(&rec).unwrap(), crate::solid::volume(&back[0]).unwrap());
-            eprintln!("{name}: volume {before} -> {after}");
-            assert!((before - after).abs() <= 1e-6 * before, "{name}: {before} vs {after}");
-        }
-    }
-
-    /// A box with a filleted edge (the kernel labels the round a cone of half angle 0) round trips
-    /// with its volume.
-    #[test]
-    fn a_filleted_box_round_trips_with_its_volume() {
-        let b = crate::solid::make_box([0.0; 3], [20.0, 10.0, 8.0]).unwrap();
-        let rec = crate::solid::fillet(&b, &[0], 2.0).unwrap();
-        let text = export_solids(&[("plate", &rec)]).unwrap();
-        let back = import(text.as_bytes()).unwrap();
-        let (before, after) = (crate::solid::volume(&rec).unwrap(), crate::solid::volume(&back[0]).unwrap());
-        assert!((before - after).abs() <= 1e-6 * before, "{before} vs {after}");
-    }
-
-    #[test]
-    fn a_cone_of_half_angle_0_is_a_cylinder_and_one_past_its_apex_starts_there() {
-        let frame = crate::record::brep::Frame { origin: [0.0; 3], x_axis: [1.0, 0.0, 0.0], y_axis: [0.0, 1.0, 0.0] };
-        let flat = Surface::Cone { frame: frame.clone(), radius_at_origin: 2.0, half_angle: 0.0 };
-        assert!(matches!(step_label(&flat), Some(Surface::Cylinder { radius, .. }) if radius == 2.0));
-        let past = Surface::Cone { frame, radius_at_origin: -1.0, half_angle: 0.25 };
-        let Some(Surface::Cone { frame, radius_at_origin, .. }) = step_label(&past) else { panic!("moved") };
-        assert_eq!(radius_at_origin, 0.0);
-        assert!((frame.origin[2] - 1.0 / 0.25f64.tan()).abs() < 1e-12);
-        let fine = Surface::Cone { frame: frame.clone(), radius_at_origin: 1.0, half_angle: 0.25 };
-        assert!(step_label(&fine).is_none());
-    }
-
-    fn plate_text() -> String {
-        let b = crate::solid::make_box([0.0; 3], [20.0, 10.0, 8.0]).unwrap();
-        let rec = crate::solid::fillet(&b, &[0], 2.0).unwrap();
-        export_solids(&[("plate", &rec)]).unwrap()
-    }
-
-    /// Every body a hostile file gives passes the record's checks.
-    fn sound(r: &Result<Vec<Brep>>) {
-        if let Ok(bodies) = r {
-            for b in bodies {
-                assert!(b.validate_built().is_ok(), "an invalid record was returned");
-            }
-        }
-    }
-
-    /// A file whose topology does not hold together (an edge's vertex that does not exist, a loop
-    /// that names another face's edge) is refused or read as a valid record, never returned broken.
-    #[test]
-    fn a_file_with_broken_topology_is_refused() {
-        let text = plate_text();
-        let curve = text.lines().find(|l| l.contains("=EDGE_CURVE(")).unwrap();
-        let v = curve.split(',').nth(1).unwrap();
-        let dangling = text.replacen(curve, &curve.replacen(v, "#99999999", 1), 1);
-        let r = import(dangling.as_bytes());
-        assert!(r.is_err(), "a dangling vertex refuses the only body");
-        let edges: Vec<&str> = text.lines().filter(|l| l.contains("=ORIENTED_EDGE(")).collect();
-        let edge_of = |l: &str| l.rsplit(',').nth(1).unwrap().to_string();
-        let (a, b) = (edge_of(edges[0]), edge_of(edges[edges.len() - 1]));
-        assert_ne!(a, b);
-        let crossed = text.replacen(edges[0], &edges[0].replacen(&a, &b, 1), 1);
-        let r = import(crossed.as_bytes());
-        sound(&r);
-        let report = import_report(crossed.as_bytes());
-        if let Ok(i) = &report {
-            eprintln!("crossed loop: {} read, refused {:?}", i.bodies.len(), i.refused);
-        }
-    }
-
-    /// Bytes of a valid file flipped and cut at random: every call returns, and what reads is valid.
-    #[test]
-    fn hostile_step_bytes_never_panic() {
-        let base = plate_text().into_bytes();
-        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
-        let mut next = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-        for round in 0..200 {
-            let mut bytes = base.clone();
-            for _ in 0..1 + next() % 8 {
-                let i = (next() % bytes.len() as u64) as usize;
-                bytes[i] = next() as u8;
-            }
-            if round % 3 == 0 {
-                bytes.truncate((next() % (bytes.len() as u64 + 1)) as usize);
-            }
-            sound(&import(&bytes));
-        }
-    }
-
-    #[test]
-    fn nothing_to_export_and_garbage_are_errors() {
-        assert!(export("x", &[]).is_err());
-        assert!(import(b"").is_err());
-        assert!(import(b"ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\n#1=FOO(;\nENDSEC;\nEND-ISO-10303-21;\n").is_err());
-        assert!(import(&[0xff, 0xfe, 0x00, 0x80]).is_err());
-    }
-
-    #[test]
-    fn a_file_over_the_size_limit_is_refused_before_parsing() {
-        let big = vec![b' '; MAX_STEP_BYTES + 1];
-        assert!(matches!(import(&big), Err(KernelError::Argument(_))));
-    }
-}
+mod tests;

@@ -418,34 +418,41 @@ fn mutated(text: &str, from: &str, to: &str) -> Vec<u8> {
     text.replacen(from, to, 1).into_bytes()
 }
 
-/// A defective file: the answer is `Ok` or `Err` without a panic, and what reads is a valid record.
-fn assert_reads_or_refuses(file: &[u8], what: &str) {
-    match surfacecraft_kernel::step::import(file) {
-        Ok(bodies) => {
-            for b in &bodies {
-                assert!(b.validate().is_ok(), "{what}: an invalid record");
-            }
-            eprintln!("{what}: {} bodies read", bodies.len());
-        }
-        Err(e) => eprintln!("{what}: refused ({e})"),
-    }
+/// The sheet a defective file still gives: one body of `faces` faces, a valid record whose shared
+/// edges are all run in opposite directions by their two faces.
+fn assert_reads_whole(file: &[u8], faces: usize, what: &str) {
+    let bodies = surfacecraft_kernel::step::import(file).unwrap_or_else(|e| panic!("{what}: {e}"));
+    assert_eq!(bodies.len(), 1, "{what}");
+    let b = &bodies[0];
+    assert!(b.validate_built().is_ok(), "{what}: an invalid record");
+    assert_eq!(b.faces.len(), faces, "{what}");
+    assert_eq!(same_direction_edges(&signature(b)), 0, "{what}: the sides agree");
+}
+
+/// A defective file is refused, the reason naming what is wrong.
+fn assert_refused(file: &[u8], why: &str, what: &str) {
+    let e = surfacecraft_kernel::step::import(file).map(|b| b.len()).unwrap_err().to_string();
+    assert!(e.contains(why), "{what}: {e}");
 }
 
 #[test]
-fn defective_own_sheets_read_or_are_refused_never_panic() {
+fn defective_own_sheets_are_refused_or_read_with_their_sides_agreeing() {
     let (data, faces) = sheet_step(400);
     assert!(faces >= 300);
     let text = String::from_utf8(decode(&data)).unwrap();
     // a face of reversed sense
     let face_line = text.lines().find(|l| l.contains("ADVANCED_FACE(")).unwrap().to_string();
-    assert_reads_or_refuses(
+    // the reader turns a face whose outer loop runs against its side back over
+    assert_reads_whole(
         &mutated(&text, &face_line, &face_line.replace(".T.);", ".F.);")),
+        faces,
         "face of reversed sense",
     );
     // a face without its loop
     let bound = face_line.split("(#").nth(1).and_then(|r| r.split(')').next()).unwrap().to_string();
-    assert_reads_or_refuses(
+    assert_refused(
         &mutated(&text, &face_line, &face_line.replace(&format!("(#{bound})"), "()")),
+        "without an edge loop",
         "face without a loop",
     );
     // an edge used by three faces: the first loop edge points at the edge of the second one
@@ -453,12 +460,13 @@ fn defective_own_sheets_read_or_are_refused_never_panic() {
     let edge_of = |l: &str| l.split(",*,*,").nth(1).and_then(|r| r.split(',').next()).unwrap().to_string();
     let (e0, e1) = (edge_of(oriented[0]), edge_of(oriented[7]));
     assert_ne!(e0, e1);
-    assert_reads_or_refuses(
+    assert_refused(
         &mutated(&text, oriented[0], &oriented[0].replace(&format!(",*,*,{e0},"), &format!(",*,*,{e1},"))),
+        "not connected",
         "edge of three faces",
     );
     // a dangling vertex reference
     let curve = text.lines().find(|l| l.contains("EDGE_CURVE(")).unwrap().to_string();
     let v = curve.split(',').nth(1).unwrap().to_string();
-    assert_reads_or_refuses(&mutated(&text, &curve, &curve.replacen(&v, "#99999999", 1)), "dangling vertex");
+    assert_refused(&mutated(&text, &curve, &curve.replacen(&v, "#99999999", 1)), "missing entity", "dangling vertex");
 }

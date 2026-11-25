@@ -11,6 +11,7 @@ use crate::record::brep::{
 use crate::{KernelError, Result, op_err};
 use solidcore::kernel::{Kernel, KernelOptions};
 use solidcore_ops::pcurve::{TrimEdge, TrimFace};
+use std::collections::HashMap;
 
 fn refuse(what: impl Into<String>) -> KernelError {
     KernelError::Argument(what.into())
@@ -137,24 +138,57 @@ fn on_our_interval(pc: Curve2, edge: &TrimEdge<'_>, theirs: [f64; 2]) -> Result<
     })
 }
 
+/// Edge uses one import may hand the kernel for trims: past it the remaining faces that need trims
+/// are refused (their bodies with them), so a hostile file cannot make the import run unbounded.
+pub(super) const MAX_TRIM_USES: usize = 4_000_000;
+
+/// The kernel that makes the trims of one import, and the work done so far.
+pub(super) struct TrimKernel {
+    kernel: Kernel,
+    uses: usize,
+}
+
+impl TrimKernel {
+    pub(super) fn new() -> Self {
+        Self { kernel: Kernel::new(&KernelOptions::default()), uses: 0 }
+    }
+
+    #[cfg(test)]
+    pub(super) fn uses(&self) -> usize {
+        self.uses
+    }
+
+    /// Every use's pcurve of `face`, the kernel's where the face has none.
+    pub(super) fn trims(&mut self, face: &TrimFace<'_>) -> Result<Vec<Vec<Curve2>>> {
+        let count: usize = face.loops.iter().map(Vec::len).sum();
+        self.uses = self.uses.saturating_add(count);
+        if self.uses > MAX_TRIM_USES {
+            return Err(refuse(format!(
+                "more than {MAX_TRIM_USES} edge uses of this file need the kernel's trims; the rest is refused"
+            )));
+        }
+        kernel_trims(&mut self.kernel, face)
+    }
+}
+
 /// Every use's pcurve of `face`, the kernel's where the face has none.
-pub(super) fn kernel_trims(face: &TrimFace<'_>) -> Result<Vec<Vec<Curve2>>> {
+fn kernel_trims(k: &mut Kernel, face: &TrimFace<'_>) -> Result<Vec<Vec<Curve2>>> {
     let Sheet { record, edge_of, bare } = sheet(face)?;
-    let mut k = Kernel::new(&KernelOptions::default());
-    let (mut body, into) = solidcore_convert::brep::to_kernel_with_bare_uses(&mut k, &record, true, &bare)
+    let (mut body, into) = solidcore_convert::brep::to_kernel_with_bare_uses(k, &record, true, &bare)
         .map_err(|e| op_err("to_kernel_with_bare_uses", e))?;
-    let (out, from) = solidcore_convert::brep::to_record(&mut k, &mut body).map_err(|e| op_err("to_record", e))?;
+    let (out, from) = solidcore_convert::brep::to_record(k, &mut body).map_err(|e| op_err("to_record", e))?;
     let [made] = out.faces.as_slice() else {
         return Err(refuse(format!("the kernel made {} faces of one", out.faces.len())));
     };
-    let made_uses: Vec<&OrientedEdge> = made
-        .loops
-        .iter()
-        .flat_map(|l| match l {
-            Loop::Edges { edges } => edges.as_slice(),
-            Loop::Vertex { .. } => &[],
-        })
-        .collect();
+    // each use the kernel made, by its edge and direction (a seam's two uses run opposite ways)
+    let mut made_uses: HashMap<(u32, bool), &Curve2> = HashMap::new();
+    for l in &made.loops {
+        if let Loop::Edges { edges } = l {
+            for m in edges {
+                made_uses.entry((m.edge, m.forward)).or_insert(&m.pcurve);
+            }
+        }
+    }
     let back = from.record_edges();
     // the record edge the kernel gave each of our edges
     let out_edge = |e: u32| -> Result<u32> {
@@ -165,27 +199,36 @@ pub(super) fn kernel_trims(face: &TrimFace<'_>) -> Result<Vec<Vec<Curve2>>> {
     // A sheet's loops may come back the way the kernel runs them, against ours: a use's pcurve is
     // the same either way (on its edge's interval in its curve's direction); the way round is read
     // from an edge the face uses once.
-    let ours = face.loops.iter().flatten();
-    let once = ours
-        .clone()
-        .find(|u| ours.clone().filter(|v| v.edge == u.edge).count() == 1)
+    let mut uses_of: HashMap<u32, usize> = HashMap::new();
+    for u in face.loops.iter().flatten() {
+        *uses_of.entry(u.edge).or_default() += 1;
+    }
+    let once = face
+        .loops
+        .iter()
+        .flatten()
+        .find(|u| uses_of.get(&u.edge) == Some(&1))
         .ok_or_else(|| refuse("a face of seam edges only"))?;
     let at = out_edge(once.edge)?;
-    let reversed =
-        made_uses.iter().find(|m| m.edge == at).ok_or_else(|| refuse("a use the kernel did not keep"))?.forward
-            != once.forward;
+    let reversed = if made_uses.contains_key(&(at, once.forward)) {
+        false
+    } else if made_uses.contains_key(&(at, !once.forward)) {
+        true
+    } else {
+        return Err(refuse("a use the kernel did not keep"));
+    };
     let mut result = Vec::with_capacity(face.loops.len());
     for l in &face.loops {
         let mut pcs = Vec::with_capacity(l.len());
         for u in l {
-            let e = out_edge(u.edge)?;
-            let theirs = out.edges.get(e as usize).ok_or_else(|| refuse("an edge the kernel lost"))?.interval;
-            let edge = face.edges.get(u.edge as usize).ok_or_else(|| refuse("edge reference"))?;
             let pc = match &u.pcurve {
                 Some(given) => given.clone(),
                 None => {
-                    let found = made_uses.iter().find(|m| m.edge == e && m.forward == (u.forward != reversed));
-                    let pc = found.ok_or_else(|| refuse("a use the kernel did not keep"))?.pcurve.clone();
+                    let e = out_edge(u.edge)?;
+                    let theirs = out.edges.get(e as usize).ok_or_else(|| refuse("an edge the kernel lost"))?.interval;
+                    let edge = face.edges.get(u.edge as usize).ok_or_else(|| refuse("edge reference"))?;
+                    let found = made_uses.get(&(e, u.forward != reversed));
+                    let pc = (*found.ok_or_else(|| refuse("a use the kernel did not keep"))?).clone();
                     on_our_interval(pc, edge, theirs)?
                 }
             };
@@ -195,3 +238,6 @@ pub(super) fn kernel_trims(face: &TrimFace<'_>) -> Result<Vec<Vec<Curve2>>> {
     }
     Ok(result)
 }
+
+#[cfg(test)]
+mod tests;

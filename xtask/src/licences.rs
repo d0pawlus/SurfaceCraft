@@ -65,7 +65,9 @@ pub(crate) fn run(check: bool) -> Result<(), String> {
             .as_str()
             .map(str::to_string)
             .or_else(|| KNOWN.iter().find(|(n, _)| *n == name).map(|(_, l)| (*l).to_string()));
-        let repo = pkg["repository"].as_str().unwrap_or("");
+        // a git dependency without a `repository` field (solidcore-step) names its source by its git URL
+        let git = pkg["source"].as_str().and_then(git_url);
+        let repo = pkg["repository"].as_str().filter(|r| !r.is_empty()).or(git).unwrap_or("");
         match lic {
             Some(l) if accepted(&l) => rows.push(format!("{name} {version}\n    licence: {l}\n    source: {repo}\n")),
             Some(l) => errors.push(format!("{name} {version}: licence `{l}` is not on the allowlist")),
@@ -91,6 +93,12 @@ pub(crate) fn run(check: bool) -> Result<(), String> {
         std::fs::write(&path, &text).map_err(|e| format!("write {}: {e}", path.display()))?;
     }
     Ok(())
+}
+
+/// The repository URL of a git package source (`git+https://host/repo?rev=…#sha`).
+fn git_url(source: &str) -> Option<&str> {
+    let url = source.strip_prefix("git+")?;
+    Some(url.split(['?', '#']).next().unwrap_or(url))
 }
 
 #[cfg(test)]
