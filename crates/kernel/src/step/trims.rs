@@ -138,37 +138,63 @@ fn on_our_interval(pc: Curve2, edge: &TrimEdge<'_>, theirs: [f64; 2]) -> Result<
     })
 }
 
-/// Edge uses one import may hand the kernel for trims: past it the remaining faces that need trims
-/// are refused (their bodies with them), so a hostile file cannot make the import run unbounded.
-pub(super) const MAX_TRIM_USES: usize = 4_000_000;
+/// The work one import may hand the kernel for trims, as the control points it projects: each
+/// use without a pcurve costs its edge's curve and its face's surface (the kernel projects the one
+/// onto the other). Past it the remaining faces that need trims are refused (their bodies with
+/// them), so a hostile file cannot make the import run unbounded (it has no cancellation).
+pub(super) const MAX_TRIM_COST: usize = 64_000_000;
+
+/// Faces one kernel makes trims for before a fresh one replaces it: the kernel memoises its curve
+/// analyses by content and never forgets them, so its memory would grow with the import.
+const FACES_PER_KERNEL: usize = 2000;
 
 /// The kernel that makes the trims of one import, and the work done so far.
 pub(super) struct TrimKernel {
     kernel: Kernel,
-    uses: usize,
+    faces: usize,
+    cost: usize,
 }
 
 impl TrimKernel {
     pub(super) fn new() -> Self {
-        Self { kernel: Kernel::new(&KernelOptions::default()), uses: 0 }
+        Self { kernel: Kernel::new(&KernelOptions::default()), faces: 0, cost: 0 }
     }
 
     #[cfg(test)]
-    pub(super) fn uses(&self) -> usize {
-        self.uses
+    pub(super) fn cost(&self) -> usize {
+        self.cost
     }
 
     /// Every use's pcurve of `face`, the kernel's where the face has none.
     pub(super) fn trims(&mut self, face: &TrimFace<'_>) -> Result<Vec<Vec<Curve2>>> {
-        let count: usize = face.loops.iter().map(Vec::len).sum();
-        self.uses = self.uses.saturating_add(count);
-        if self.uses > MAX_TRIM_USES {
+        self.cost = self.cost.saturating_add(cost_of(face));
+        if self.cost > MAX_TRIM_COST {
             return Err(refuse(format!(
-                "more than {MAX_TRIM_USES} edge uses of this file need the kernel's trims; the rest is refused"
+                "the kernel's trims of this file would project more than {MAX_TRIM_COST} control points; the rest is refused"
             )));
+        }
+        self.faces += 1;
+        if self.faces.is_multiple_of(FACES_PER_KERNEL) {
+            self.kernel = Kernel::new(&KernelOptions::default());
         }
         kernel_trims(&mut self.kernel, face)
     }
+}
+
+/// The control points the kernel projects for `face`: for each use without a pcurve, its edge's
+/// curve and the face's surface.
+fn cost_of(face: &TrimFace<'_>) -> usize {
+    let surface = super::check::surface_points(face.nurbs.unwrap_or(face.surface));
+    face.loops
+        .iter()
+        .flatten()
+        .filter(|u| u.pcurve.is_none())
+        .map(|u| {
+            let curve =
+                face.edges.get(u.edge as usize).map_or(1, |e| super::check::curve_points(e.nurbs.unwrap_or(e.curve)));
+            curve.saturating_add(surface)
+        })
+        .fold(0usize, usize::saturating_add)
 }
 
 /// Every use's pcurve of `face`, the kernel's where the face has none.

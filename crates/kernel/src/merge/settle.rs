@@ -228,8 +228,10 @@ pub(super) fn face_verdict(
         if normals && let Err(e) = check::check_face(&topo.mesh, p.forward, &p.cloud, (body, &p.gauge), p.limit) {
             return Ok(Err(e.to_string()));
         }
-        // the border is compared with the group's on the finest tessellation, whose chord is the stated slack
-        if border && let Err(e) = check::check_border(&p.cloud, &topo.mesh, p.limit, judge_chord) {
+        // the border is compared with the group's on the finest tessellation, whose chord is the stated slack;
+        // where the display mesh stood in for a capped one, at the finer of the two chords
+        let slack = c.unwrap_or_else(|| judge_chord.min(crate::tess::display_chord(&sheet)));
+        if border && let Err(e) = check::check_border(&p.cloud, &topo.mesh, p.limit, slack) {
             return Ok(Err(e.to_string()));
         }
     }

@@ -45,6 +45,9 @@ pub struct SewOut {
     pub volume: Option<f64>,
     /// Tolerance used, mm.
     pub tolerance: f64,
+    /// Why sheets that close are not reported as a solid (no positive volume), if so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// The sheet of each object, each object once; a solid, a mesh or any other kind is refused.
@@ -87,7 +90,15 @@ fn sew_cmd(s: &mut Session, i: SewIn) -> CmdResult<SewOut> {
     let sewn = surfacecraft_kernel::sew::sew(&refs, tolerance)?;
     let faces = sewn.brep.faces.len();
     let id = s.doc.add_body(i.name.as_deref().unwrap_or("sewn"), sewn.brep);
-    Ok(SewOut { id, closed: sewn.closed, open_edges: sewn.open_edges, faces, volume: sewn.volume, tolerance })
+    Ok(SewOut {
+        id,
+        closed: sewn.closed,
+        open_edges: sewn.open_edges,
+        faces,
+        volume: sewn.volume,
+        tolerance,
+        note: sewn.note,
+    })
 }
 
 /// The commands of this file.

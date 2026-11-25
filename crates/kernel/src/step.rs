@@ -35,7 +35,7 @@ fn check_size(text: &[u8]) -> Result<()> {
 
 /// The pcurves a face's uses have no closed form for, made by the kernel ([`trims`]); the closed
 /// forms the reader found are kept as they are. One kernel serves every face of an import, and the
-/// work it may do is bounded ([`trims::MAX_TRIM_USES`]).
+/// work it may do is bounded ([`trims::MAX_TRIM_COST`]).
 pub(crate) struct KernelTrims(RefCell<trims::TrimKernel>);
 
 impl KernelTrims {
@@ -73,7 +73,7 @@ pub fn import(text: &[u8]) -> Result<Vec<Brep>> {
 /// The file is hostile input: the parser bounds its size and entity counts; the control points its
 /// faces would hold are estimated before anything is built ([`check::MAX_FACE_POINTS`]); the reader
 /// bounds its faces (`solidcore_step::topology`'s caps), refuses a body whose references, loops or
-/// geometry do not hold together, and the kernel's trims are bounded too; every record it builds is
+/// geometry do not hold together, and the kernel's trims are bounded by the control points they project; every record it builds is
 /// checked again here ([`check::record`]: an item cap, the record's structural and geometric checks,
 /// and faces that agree on their sides). A record that fails is refused with its reason, never
 /// returned.

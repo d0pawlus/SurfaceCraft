@@ -153,7 +153,7 @@ fn a_spline_face_cut_by_planes_reads_back_through_the_kernels_trims() {
     let trims = KernelTrims::new();
     let read = solidcore_step::topology::read_solids_with(&ex, &trims);
     assert!(read.failures.is_empty(), "{:?}", read.failures.first().map(|f| &f.message));
-    assert!(trims.0.borrow().uses() > 0, "the kernel's trims were used");
+    assert!(trims.0.borrow().cost() > 0, "the kernel's trims were used");
     let back = import(text.as_bytes()).unwrap();
     let (before, after) = (crate::solid::volume(&b).unwrap(), crate::solid::volume(&back[0]).unwrap());
     assert!((before - after).abs() <= 1e-6 * before, "{before} vs {after}");

@@ -26,9 +26,11 @@ fn past_the_budget_the_kernel_is_not_asked() {
         tolerance: 1e-6,
     };
     let mut k = TrimKernel::new();
-    k.uses = MAX_TRIM_USES;
+    k.cost = MAX_TRIM_COST;
     let e = k.trims(&face).unwrap_err().to_string();
-    assert!(e.contains("edge uses"), "{e}");
+    assert!(e.contains("control points"), "{e}");
+    // a use without a pcurve costs its curve (a line: 1) and its surface (a plane: 1)
+    assert_eq!(cost_of(&face), 2);
 }
 
 #[test]

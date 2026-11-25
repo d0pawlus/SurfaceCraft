@@ -247,3 +247,28 @@ fn design_cones_whole_and_partial_are_protected() {
 fn a_nearly_flat_cone_around_its_apex_is_not_protected() {
     assert!(!protected(82.0, [0.5, 23.0], 360.0));
 }
+
+/// The cone region of [`cone_region`] in a scene `background` times its area: a flat sheet far away
+/// makes the cone a small share of the scan, below the 5 % waiver of the span.
+fn protected_at_share(half_deg: f64, rho: [f64; 2], arc_deg: f64, background: f64) -> bool {
+    let (mut mesh, seg) = cone_region(half_deg, rho, arc_deg);
+    let area: f64 = (0..mesh.triangle_count()).map(|t| mesh.face_area(t)).sum();
+    let side = (area * background).sqrt();
+    let far = sheet(side, side, 20, |x, y| Point3::new(x + 500.0, y, 0.0));
+    let offset = mesh.positions.len() as u32;
+    mesh.positions.extend(far.positions);
+    mesh.triangles.extend(far.triangles.iter().map(|t| t.map(|i| i + offset)));
+    protected_by_tolerance(&mesh, &seg, TOLERANCE, 0.0)
+}
+
+/// At a small share of the scan (about 2.5 %, under the waiver of the span) a steep cone (66
+/// degrees) is protected by its span in radii, whole and as a quarter arc, and a nearly flat one
+/// (75 degrees) is not: it spans 0.7 of its radius of curvature even as a whole ring. At a large
+/// share the flat one gets no waiver either.
+#[test]
+fn small_share_cones_are_judged_by_their_span_on_both_sides_of_seventy_degrees() {
+    assert!(protected_at_share(66.0, [4.0, 8.0], 360.0, 40.0), "66 degrees, whole ring");
+    assert!(protected_at_share(66.0, [4.0, 8.0], 90.0, 40.0), "66 degrees, a quarter arc");
+    assert!(!protected_at_share(75.0, [4.0, 8.0], 360.0, 40.0), "75 degrees, whole ring");
+    assert!(!protected_at_share(75.0, [4.0, 8.0], 360.0, 1.0), "75 degrees, half of the scan");
+}

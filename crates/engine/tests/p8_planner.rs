@@ -435,6 +435,20 @@ fn gate_p8_b2_l_window_with_a_reflex_round() {
     }
 }
 
+/// The cause of leaving seed 131 out of the gate, kept checked: its cleaned scan stands more than
+/// the gate's 0.2 mm off the CAD part (measured 0.435 mm on macOS, over the plate's corner, where
+/// `mesh.clean` filled a hole of `synth::scanify`), so no solid could meet the gate on it.
+#[test]
+fn seed_131_scan_is_off_the_cad_part_by_more_than_the_gate() {
+    let plate = solid::make_box([0.0; 3], [50.0, 40.0, 10.0]).unwrap();
+    let window = extrude(&[l_window(-1.0)], [0.0, 0.0, 1.0], 12.0, 0.0).unwrap();
+    let cad = boolean(&plate, &window, BoolKind::Subtract).unwrap();
+    let mut s = scanned_session(&cad, 131);
+    let part = s.doc.find_by_name("part").unwrap().0;
+    let own = deviation(&mut s, part.0).iter().map(|d| d.0).fold(0.0, f64::max);
+    assert!(own > 1.25 * MAX_DEVIATION, "scan to CAD {own} mm");
+}
+
 /// Seed 131's scan on the new tessellation: a hole over the plate's corner, filled 0.435 mm off
 /// the CAD part, so the gate's 0.2 mm cannot be met (the scan's own deviation is the floor).
 #[test]

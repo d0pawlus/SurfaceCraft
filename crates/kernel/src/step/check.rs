@@ -22,7 +22,7 @@ pub(super) const MAX_ITEMS: usize = 64_000_000;
 /// hold, counting a shared surface or curve once per face or edge on it.
 pub(super) const MAX_FACE_POINTS: usize = 64_000_000;
 
-fn curve_points(c: &Curve) -> usize {
+pub(super) fn curve_points(c: &Curve) -> usize {
     match c {
         Curve::Spline { points, .. } | Curve::Polyline { points } => points.len(),
         Curve::RationalSpline { homogeneous, .. } => homogeneous.len(),
@@ -33,7 +33,7 @@ fn curve_points(c: &Curve) -> usize {
     }
 }
 
-fn surface_points(s: &Surface) -> usize {
+pub(super) fn surface_points(s: &Surface) -> usize {
     match s {
         Surface::Spline { points, .. } => points.iter().map(Vec::len).sum(),
         Surface::RationalSpline { homogeneous, .. } => homogeneous.iter().map(Vec::len).sum(),
@@ -121,10 +121,12 @@ pub(super) fn agreement(b: &Brep) -> Result<(), String> {
 /// Every entity reference among `params`, nested lists included.
 fn refs_of(params: &[Param], out: &mut Vec<u64>) {
     for p in params {
-        if let Some(id) = p.as_ref_id() {
-            out.push(id);
-        } else if let Some(list) = p.as_list() {
-            refs_of(list, out);
+        match p {
+            Param::Ref(id) => out.push(*id),
+            // a typed value (`NAME(params)`) holds references the way a list does, as the reader
+            // follows them
+            Param::List(items) | Param::Typed(_, items) => refs_of(items, out),
+            _ => {}
         }
     }
 }
@@ -192,10 +194,16 @@ const BODY_ITEMS: [&str; 4] = ["MANIFOLD_SOLID_BREP", "BREP_WITH_VOIDS", "SHELL_
 pub(super) fn face_points(ex: &Exchange) -> Result<usize, String> {
     let mut walk = Walk::default();
     let mut total = 0usize;
-    for (id, e) in &ex.entities {
-        if e.records.iter().any(|r| BODY_ITEMS.contains(&r.name.as_str())) {
-            total = total.saturating_add(size(ex, *id, 0, &mut walk));
-        }
+    // the entities in id order, so the first reason the walk reports is the same on every run
+    let mut items: Vec<u64> = ex
+        .entities
+        .iter()
+        .filter(|(_, e)| e.records.iter().any(|r| BODY_ITEMS.contains(&r.name.as_str())))
+        .map(|(id, _)| *id)
+        .collect();
+    items.sort_unstable();
+    for id in items {
+        total = total.saturating_add(size(ex, id, 0, &mut walk));
     }
     match walk.problem {
         Some(why) => Err(why),
@@ -252,6 +260,29 @@ mod tests {
             edges[0].edge = target;
         }
         assert!(shells_agree(&b).is_err());
+    }
+
+    /// A dangling reference outside every body (a presentation style, a product's context) does
+    /// not refuse the file: only what the reader would build is walked. Inside a body it does.
+    #[test]
+    fn a_dangling_reference_refuses_only_inside_a_body() {
+        let body = "#1=CARTESIAN_POINT('',(0.,0.,0.));\n#2=VERTEX_POINT('',#1);\n#3=VERTEX_LOOP('',#2);\n\
+                    #4=FACE_BOUND('',#3,.T.);\n#5=PLANE('',#6);\n#6=AXIS2_PLACEMENT_3D('',#1,$,$);\n\
+                    #7=ADVANCED_FACE('',(#4),#5,.T.);\n#8=OPEN_SHELL('',(#7));\n#9=SHELL_BASED_SURFACE_MODEL('',(#8));\n";
+        let file =
+            |extra: &str| format!("ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\n{body}{extra}ENDSEC;\nEND-ISO-10303-21;\n");
+        let outside = file("#20=STYLED_ITEM('',(#99999),#7);\n#21=PRODUCT_CONTEXT('',#99998,'');\n");
+        assert!(face_points(&solidcore_step::p21::parse(&outside).unwrap()).is_ok());
+        let inside = file("").replace("#8=OPEN_SHELL('',(#7));", "#8=OPEN_SHELL('',(#7,#99999));");
+        let e = face_points(&solidcore_step::p21::parse(&inside).unwrap()).unwrap_err();
+        assert!(e.contains("#99999"), "{e}");
+    }
+
+    #[test]
+    fn a_typed_value_holding_a_reference_is_followed() {
+        let mut out = Vec::new();
+        refs_of(&[Param::Typed("X".into(), vec![Param::Ref(7), Param::List(vec![Param::Ref(8)])])], &mut out);
+        assert_eq!(out, vec![7, 8]);
     }
 
     #[test]

@@ -120,5 +120,5 @@ fn a_doubled_shell_is_closed_only_with_a_positive_volume() {
         Err(e) => eprintln!("doubled: refused ({e})"),
     }
     let single = sew(&refs(&six_sheets(DOME)), 1e-3).unwrap();
-    assert!(single.closed && single.volume.is_some_and(|v| v > 0.0));
+    assert!(single.closed && single.volume.is_some_and(|v| v > 0.0) && single.note.is_none());
 }

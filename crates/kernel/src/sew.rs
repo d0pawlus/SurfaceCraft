@@ -21,6 +21,9 @@ pub struct Sewn {
     pub closed: bool,
     /// The solid's volume, mm³ (only when closed).
     pub volume: Option<f64>,
+    /// Why faces the kernel sewed into a closed shell are no solid (its volume could not be
+    /// measured, or is not a positive number).
+    pub note: Option<String>,
     /// Edges still used by one face only.
     pub open_edges: usize,
 }
@@ -52,9 +55,16 @@ pub fn sew(sheets: &[&Brep], tolerance: f64) -> Result<Sewn> {
     let refs: Vec<&solidcore_ops::Body> = bodies.iter().collect();
     let sewn = solidcore_ops::stitch::sew(&refs, tolerance).map_err(|e| op_err("sew", e))?;
     let brep = crate::solid::encode(&sewn.body)?;
-    let volume =
-        if sewn.closed { crate::solid::volume(&brep).ok().filter(|v| v.is_finite() && *v > 0.0) } else { None };
-    Ok(Sewn { brep, closed: volume.is_some(), volume, open_edges: sewn.open_edges.len() })
+    let (volume, note) = if sewn.closed {
+        match crate::solid::volume(&brep) {
+            Ok(v) if v.is_finite() && v > 0.0 => (Some(v), None),
+            Ok(v) => (None, Some(format!("the faces close, but enclose no positive volume ({v} mm³)"))),
+            Err(e) => (None, Some(format!("the faces close, but their volume could not be measured: {e}"))),
+        }
+    } else {
+        (None, None)
+    };
+    Ok(Sewn { brep, closed: volume.is_some(), volume, note, open_edges: sewn.open_edges.len() })
 }
 
 #[cfg(test)]
