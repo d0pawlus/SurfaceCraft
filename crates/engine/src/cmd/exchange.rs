@@ -71,18 +71,11 @@ fn finish(s: &Session, text: String, path: Option<String>, bodies: usize, conten
     }
 }
 
-/// The STEP text of solid bodies: our compact writer (shared vertices, edge curves and control
-/// points; a few KB per spline patch) for what it supports, the solidcore exporter (about 24 KB
-/// per patch) for the rest. A record the compact writer rejects as invalid stays an error.
+/// The STEP text of solid bodies (solidcore's writer: vertices, edge curves and control points
+/// written once and shared).
 fn solids_text(name: &str, items: &[(String, Brep)]) -> CmdResult<String> {
     let bodies: Vec<&Brep> = items.iter().map(|(_, b)| b).collect();
-    match surfacecraft_io::step::write_solids(name, &bodies) {
-        Err(surfacecraft_io::IoError::Unsupported(_)) => {
-            let refs: Vec<(&str, &Brep)> = items.iter().map(|(n, b)| (n.as_str(), b)).collect();
-            Ok(surfacecraft_kernel::step::export_solids(&refs)?)
-        }
-        other => Ok(other?),
-    }
+    Ok(surfacecraft_io::step::write_solids(name, &bodies)?)
 }
 
 fn export_step(s: &mut Session, i: ExportIn) -> CmdResult<ExportOut> {
@@ -123,6 +116,9 @@ pub struct ImportOut {
     pub bodies: Vec<ObjectId>,
     /// Faces per body.
     pub faces: Vec<usize>,
+    /// Bodies of the file that were refused, each with its file entity and the reason.
+    #[serde(default)]
+    pub refused: Vec<String>,
 }
 
 fn import_step(s: &mut Session, i: ImportIn) -> CmdResult<ImportOut> {
@@ -131,7 +127,8 @@ fn import_step(s: &mut Session, i: ImportIn) -> CmdResult<ImportOut> {
         (None, Some(d)) => base64::decode(d).map_err(CmdError::Params)?,
         _ => return Err(CmdError::Params("give exactly one of `path` or `data`".into())),
     };
-    let recs = surfacecraft_kernel::step::import(&bytes)?;
+    let surfacecraft_kernel::step::Imported { bodies: recs, refused } =
+        surfacecraft_kernel::step::import_report(&bytes)?;
     if recs.is_empty() {
         return Err(CmdError::Failed("the file has no bodies".into()));
     }
@@ -142,7 +139,7 @@ fn import_step(s: &mut Session, i: ImportIn) -> CmdResult<ImportOut> {
         faces.push(r.faces.len());
         bodies.push(s.doc.add_body(&name, r));
     }
-    Ok(ImportOut { bodies, faces })
+    Ok(ImportOut { bodies, faces, refused })
 }
 
 fn export_iges(s: &mut Session, i: ExportIn) -> CmdResult<ExportOut> {

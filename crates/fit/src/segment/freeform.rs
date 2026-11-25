@@ -189,7 +189,8 @@ pub(super) fn extent(pts: &[Point3], axis: Option<Vec3>) -> f64 {
 /// How far a curved region reaches around its primitive: the extent over which the surface
 /// curves, in radii (`INFINITY` for a plane, which has no curvature to support). A region that
 /// spans a fraction of a radius is a gentle patch of some surface that a curved primitive fits
-/// by chance.
+/// by chance. A cone's radius here is the distance from its axis (its section's radius); see
+/// [`cone_bending_support`] for the radius it curves by.
 pub(super) fn curvature_support(mesh: &Mesh, seg: &Segment) -> f64 {
     let pts = sample_corners(mesh, &seg.triangles);
     let v = |x: &[f64; 3]| Vec3::new(x[0], x[1], x[2]);
@@ -206,6 +207,15 @@ pub(super) fn curvature_support(mesh: &Mesh, seg: &Segment) -> f64 {
         }
     };
     if radius > 0.0 { chord / radius } else { 0.0 }
+}
+
+/// [`curvature_support`] of a cone in radii of curvature: a cone curves across its rulings by
+/// cos(half angle) over the distance from its axis (a cylinder at 0, a plane at a right angle), so
+/// a nearly flat cone around a crest of a wavy surface spans a fraction of it. `None` for a region
+/// that is not a cone.
+pub(super) fn cone_bending_support(mesh: &Mesh, seg: &Segment) -> Option<f64> {
+    let Primitive::Cone { half_angle, .. } = seg.primitive else { return None };
+    Some(curvature_support(mesh, seg) * half_angle.cos().max(0.0))
 }
 
 /// Region index of every triangle ([`NONE`] when in none).

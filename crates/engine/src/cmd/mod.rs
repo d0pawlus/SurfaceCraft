@@ -47,6 +47,7 @@ mod surface_mask;
 mod surface_patch;
 mod surface_pieces;
 mod surface_report;
+mod surface_sew;
 pub mod working;
 pub mod wrap;
 mod wrap_cap;
@@ -199,6 +200,7 @@ static REGISTRY: LazyLock<Vec<CommandSpec>> = LazyLock::new(|| {
     v.extend_from_slice(stream::COMMANDS);
     v.extend_from_slice(surface::COMMANDS);
     v.extend_from_slice(surface_patch::COMMANDS);
+    v.extend_from_slice(surface_sew::COMMANDS);
     v.extend_from_slice(working::COMMANDS);
     v.sort_by_key(|c| c.id);
     v
@@ -267,6 +269,7 @@ const HEAVY: &[&str] = &[
     "surface.auto",
     "surface.fit",
     "surface.patch",
+    "surface.sew",
     "surface.thicken",
     "surface.trim_to_region",
     "surface.wrap",

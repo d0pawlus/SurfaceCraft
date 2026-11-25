@@ -739,6 +739,8 @@
   "cmd.surface.info": "Informacje o powierzchni",
   "cmd.surface.patch": "Płat z warunkami",
   "cmd.surface.patch.hint": "Wypełnia zamknięty obrys jednym gładkim płatem, który łączy się z sąsiednimi ścianami, punktami i skanem.",
+  "cmd.surface.sew": "Zszyj powierzchnie",
+  "cmd.surface.sew.hint": "Łączy osobne powierzchnie wzdłuż wspólnych krawędzi w jedną bryłę, jeśli się zamykają.",
   "cmd.surface.thicken": "Pogrub",
   "cmd.surface.thicken.hint": "Nadaje powierzchni grubość, zamieniając ją w bryłę.",
   "cmd.surface.trim_to_region": "Przytnij do regionu",

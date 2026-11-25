@@ -1,12 +1,30 @@
-//! STEP through solidcore: import of any STEP file into records (`step_brep::import`, used for
-//! round-trip checks), and export of solid bodies (`step-brep::brep_to_model` +
-//! `step-export`, design doc §10 milestone M5).
-use crate::record::brep::Brep;
+//! STEP through solidcore's `solidcore-step`: import of any STEP file into records (the file's
+//! topology read as it is, `topology::read_solids_with`) and export of solid and sheet records as
+//! one AP242 file (`write::product::bodies`), design doc §10 milestones M3 and M5.
+//!
+//! The reader builds every body from the vertices, edges and faces the file states; it does not
+//! stitch faces by geometry, and it does not use the file's PCURVE entities (each use's pcurve is
+//! its closed form on the surface, or the kernel's, [`KernelTrims`]). The writer writes each edge
+//! as a SURFACE_CURVE (SEAM_CURVE where a face uses it twice) with the PCURVEs of its uses on
+//! planes and splines; a face on a cylinder, cone, sphere or torus is written as that surface with
+//! no PCURVEs on this pin (STEP's are in the angle; upstream: tangency-labs/solidcraft#13797).
+use crate::record::brep::{Brep, Curve2, Face, Surface};
 use crate::{KernelError, Result, op_err};
 use solidcore::kernel::{Kernel, KernelOptions};
+use solidcore::surface::face_surface::analytic_label;
+use solidcore_ops::pcurve::{TrimFace, Trims};
+use solidcore_step::write::product::{ExportBody, Header};
+use std::borrow::Cow;
+use std::cell::RefCell;
+
+mod check;
+mod trims;
 
 /// Largest STEP text accepted (bytes).
 pub const MAX_STEP_BYTES: usize = 256 * 1024 * 1024;
+
+/// What this application writes in the originating-system and preprocessor fields of a header.
+const SYSTEM: &str = "SurfaceCraft";
 
 fn check_size(text: &[u8]) -> Result<()> {
     if text.len() > MAX_STEP_BYTES {
@@ -15,234 +33,192 @@ fn check_size(text: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn to_records(breps: Vec<solidcore::topology::Brep>) -> Result<Vec<Brep>> {
-    let mut out = Vec::with_capacity(breps.len());
-    let mut k = Kernel::new(&KernelOptions::default());
-    for mut b in breps {
-        let (rec, _) =
-            solidcore_convert::brep::to_record(&mut k, &mut b).map_err(|e| op_err("to_record", format!("{e:?}")))?;
-        out.push(rec);
+/// The pcurves a face's uses have no closed form for, made by the kernel ([`trims`]); the closed
+/// forms the reader found are kept as they are. One kernel serves every face of an import, and the
+/// work it may do is bounded ([`trims::MAX_TRIM_COST`]).
+pub(crate) struct KernelTrims(RefCell<trims::TrimKernel>);
+
+impl KernelTrims {
+    pub(crate) fn new() -> Self {
+        Self(RefCell::new(trims::TrimKernel::new()))
+    }
+}
+
+impl Trims for KernelTrims {
+    fn trims(&self, face: &TrimFace<'_>) -> std::result::Result<Vec<Vec<Curve2>>, String> {
+        let mut kernel =
+            self.0.try_borrow_mut().map_err(|_| "the trims were asked for from inside a trim".to_string())?;
+        kernel.trims(face).map_err(|e| e.to_string())
+    }
+}
+
+/// What a STEP file gave: the bodies read, and why each other body of the file was refused.
+#[derive(Clone, Debug, Default)]
+pub struct Imported {
+    /// The bodies read, each a record that passed the record's checks.
+    pub bodies: Vec<Brep>,
+    /// One line per body refused: the file entity and the reason.
+    pub refused: Vec<String>,
+}
+
+/// Every body of a STEP file, as records: each solid and surface model the file states, built
+/// from the file's own topology ([`import_report`]). A file of which no body reads is an error
+/// naming why.
+pub fn import(text: &[u8]) -> Result<Vec<Brep>> {
+    import_report(text).map(|i| i.bodies)
+}
+
+/// [`import`] with the bodies the file holds that were refused, and why.
+///
+/// The file is hostile input: the parser bounds its size and entity counts; the control points its
+/// faces would hold are estimated before anything is built ([`check::MAX_FACE_POINTS`]); the reader
+/// bounds its faces (`solidcore_step::topology`'s caps), refuses a body whose references, loops or
+/// geometry do not hold together, and the kernel's trims are bounded by the control points they project; every record it builds is
+/// checked again here ([`check::record`]: an item cap, the record's structural and geometric checks,
+/// and faces that agree on their sides). A record that fails is refused with its reason, never
+/// returned.
+pub fn import_report(text: &[u8]) -> Result<Imported> {
+    check_size(text)?;
+    // Part 21 is ASCII (other characters are escaped); a stray byte of another code page can only
+    // sit in a string, and is replaced there rather than refusing the file.
+    let text = String::from_utf8_lossy(text);
+    let exchange = solidcore_step::p21::parse(&text).map_err(|e| op_err("STEP parse", e.to_string()))?;
+    check::face_points(&exchange).map_err(|why| op_err("STEP import", format!("refused before reading: {why}")))?;
+    let read = solidcore_step::topology::read_solids_with(&exchange, &KernelTrims::new());
+    let mut out = Imported::default();
+    out.refused.extend(read.failures.iter().map(|f| format!("#{}: {}", f.item, f.message)));
+    for solid in read.solids {
+        match check::record(&solid.brep) {
+            Ok(()) => out.bodies.push(solid.brep),
+            Err(e) => out.refused.push(format!("#{}: {e}", solid.item)),
+        }
+    }
+    if out.bodies.is_empty()
+        && let Some(first) = out.refused.first()
+    {
+        return Err(op_err(
+            "STEP import",
+            format!("no body could be read ({} refused; first, {first})", out.refused.len()),
+        ));
     }
     Ok(out)
 }
 
-/// Every body of a STEP file, as records.
-///
-/// A sheet this application wrote ([`FILE_MARK`] in the header) of [`OWN_SHEET_FACES`] faces or
-/// more is built from the topology the file states (every edge and vertex shared as the writer
-/// shared them) instead of being stitched by geometry, which takes time quadratic in the faces
-/// (80 s at 4 000 patches, measured). The topology build is kept only when it passes
-/// [`topology_is_sound`]; otherwise the sheet is stitched, as every other file is.
-///
-/// The mark is a byte search in the first [`HEADER_BYTES`] bytes, not a parse, and it is not
-/// authentication: any file can carry it. It only chooses which of two builds is tried first; the
-/// parser's limits are the default ones for every file (a file of the writer's average 69 bytes
-/// an entity has under 4 million entities at the 256 MiB size limit, so no raised limit is
-/// needed; measured: the whole import takes about 1.3 KB an entity).
-pub fn import(text: &[u8]) -> Result<Vec<Brep>> {
-    check_size(text)?;
-    if is_own_file(text) { import_own(text) } else { to_records(stitched(text)?) }
-}
-
-fn stitched(text: &[u8]) -> Result<Vec<solidcore::topology::Brep>> {
-    step_brep::import(text, &Default::default()).map_err(|e| op_err("step_brep::import", format!("{e:?}")))
-}
-
-/// [`import`] with every body stitched by geometry, as the importer does by default: the reference
-/// of the faster build of this application's own sheets.
-pub fn import_stitched(text: &[u8]) -> Result<Vec<Brep>> {
-    check_size(text)?;
-    to_records(stitched(text)?)
-}
-
-/// What the file header of this application's writer says in its originating-system fields.
-const FILE_MARK: &[u8] = b"'SurfaceCraft','SurfaceCraft'";
-
-/// Sheets with at least this many faces are built from the file's topology.
-const OWN_SHEET_FACES: usize = 300;
-
-/// Bytes of the file searched for [`FILE_MARK`]: the header comes first.
-const HEADER_BYTES: usize = 2048;
-
-fn is_own_file(text: &[u8]) -> bool {
-    let head = text.get(..HEADER_BYTES.min(text.len())).unwrap_or_default();
-    head.windows(FILE_MARK.len()).any(|w| w == FILE_MARK)
-}
-
-fn import_own(text: &[u8]) -> Result<Vec<Brep>> {
-    let model =
-        step_import::import(text, &Default::default()).map_err(|e| op_err("step_import::import", e.to_string()))?;
-    model.bodies.iter().map(build_own).collect()
-}
-
-fn build_own(body: &step_import::model::Body) -> Result<Brep> {
-    let sheet = body.kind == step_import::model::BodyKind::ShellModel;
-    if sheet && body.faces.len() >= OWN_SHEET_FACES {
-        let topology = step_brep::build_from_topology(body, step_brep::BuildOptions::default());
-        if let Ok(built) = topology
-            && built.face_failures.is_empty()
-            && step_brep::validate_for_display(&built.brep).is_ok()
-            && let Ok(mut records) = to_records(vec![built.brep])
-            && let Some(record) = records.pop()
-            && topology_is_sound(&record, body.faces.len())
-        {
-            return Ok(record);
-        }
-    }
-    // the stitched build alone: the topology build was tried above (or is not wanted)
-    let options = step_brep::BuildOptions { mode: step_brep::BuildMode::StitchOnly, ..Default::default() };
-    let built =
-        step_brep::build_with_options(body, options).map_err(|e| op_err("step_brep::build", format!("{e:?}")))?;
-    to_records(vec![built])?.pop().ok_or_else(|| op_err("step_brep::build", "no body"))
-}
-
-/// Is the topology build a sheet the stitched build would have agreed to? Every face of the file
-/// is there, and every edge is used once or twice, by two faces that run along it in opposite
-/// directions (face sense and loop direction together).
-fn topology_is_sound(r: &Brep, faces: usize) -> bool {
-    use crate::record::brep::{Loop, Shell};
-    use std::collections::HashMap;
-    if r.faces.len() != faces {
-        return false;
-    }
-    // per edge: the directions of its uses (true = along the edge)
-    let mut uses: HashMap<u32, Vec<bool>> = HashMap::new();
-    for shell in &r.shells {
-        let Shell::Faces { faces: oriented, .. } = shell else { return false };
-        for of in oriented {
-            let Some(face) = r.faces.get(of.face as usize) else { return false };
-            for lp in &face.loops {
-                let Loop::Edges { edges } = lp else { return false };
-                for oe in edges {
-                    uses.entry(oe.edge).or_default().push(oe.forward == of.forward);
-                }
-            }
-        }
-    }
-    r.edges.len() == uses.len()
-        && uses.values().all(|d| match d.as_slice() {
-            [_] => true,
-            [a, b] => a != b,
-            _ => false,
-        })
-}
-
-/// What the importer made of a file's PCURVEs when asked to build the faces' UV trims from them
-/// (the importer takes a face's pcurves only when every edge use of it checks out against its 3-D
-/// curve, and never on a B-spline face).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct PcurveReport {
-    /// Faces offered the file's pcurves.
-    pub faces: usize,
-    /// Edge uses that took their file pcurve.
-    pub uses: usize,
-    /// Of those, uses on a curved (not plane, not B-spline) face.
-    pub curved_uses: usize,
-    /// Seam edge uses, left to the importer's own projection by design.
-    pub seam_uses: usize,
-    /// Non-seam uses the importer projected instead of taking the file's pcurve.
-    pub uses_projected: usize,
-    /// Faces left to the importer's projection altogether.
-    pub fallback_faces: usize,
-}
-
-/// [`import`] with the file's pcurves offered to the importer, and what became of them.
-pub fn import_with_pcurves(text: &[u8]) -> Result<(Vec<Brep>, PcurveReport)> {
-    check_size(text)?;
-    let options =
-        step_brep::BuildOptions { file_pcurves: true, mode: step_brep::BuildMode::StitchOnly, ..Default::default() };
-    let report = step_brep::import_with_report_options(text, &Default::default(), options)
-        .map_err(|e| op_err("step_brep::import_with_report_options", format!("{e:?}")))?;
-    let s = &report.pcurves;
-    let summary = PcurveReport {
-        faces: s.faces,
-        uses: s.uses,
-        curved_uses: s.curved_uses,
-        seam_uses: s.seam_uses,
-        uses_projected: s.uses_projected,
-        fallback_faces: s.fallbacks.values().sum(),
-    };
-    Ok((to_records(report.bodies)?, summary))
-}
-
-/// Writes solid bodies as one STEP file (AP214 with names).
-pub fn export_solids(bodies: &[(&str, &Brep)]) -> Result<String> {
+/// Writes solid and sheet records as one STEP file (AP242): each bounded material region as a
+/// MANIFOLD_SOLID_BREP (BREP_WITH_VOIDS with voids), the open shells of each body as a
+/// SHELL_BASED_SURFACE_MODEL of OPEN_SHELLs, all in millimetres, named `name`.
+pub fn export(name: &str, bodies: &[(&str, &Brep)]) -> Result<String> {
     if bodies.is_empty() {
         return Err(KernelError::Argument("nothing to export".into()));
     }
+    // the writer writes what the record says; a record that breaks the schema is refused here
+    // rather than written as a file that says something else
+    for (n, record) in bodies {
+        check::record(record)
+            .and_then(|()| check::agreement(record))
+            .map_err(|e| KernelError::Argument(format!("STEP export of '{n}': {e}")))?;
+    }
+    let ready: Vec<Cow<'_, Brep>> = bodies.iter().map(|(_, record)| cones_from_their_apex(record)).collect();
+    let list = bodies
+        .iter()
+        .zip(&ready)
+        .map(|((n, _), record)| ExportBody {
+            name: (*n).to_string(),
+            record: record.as_ref(),
+            color: None,
+            faces: Vec::new(),
+        })
+        .collect();
+    let header = Header {
+        file_name: name.to_string(),
+        preprocessor_version: SYSTEM.into(),
+        originating_system: SYSTEM.into(),
+        ..Header::default()
+    };
+    solidcore_step::write::product::bodies(list, &header).map_err(|e| op_err("STEP export", e.to_string()))
+}
+
+/// The cone the kernel proves a rational face without a label to be (as the writer labels such faces
+/// itself, `solidcore::surface::face_surface::analytic_label`), when it is a cone.
+fn proved_cone(k: &Kernel, f: &Face) -> Option<Surface> {
+    if f.nurbs.is_some() || !matches!(f.surface, Surface::RationalSpline { .. }) {
+        return None;
+    }
+    let net = solidcore_convert::surface(&f.surface).ok()?;
+    let label = analytic_label(k, &net, f.domain).ok()??;
+    let label = solidcore_convert::record_surface(label).ok()?;
+    matches!(label, Surface::Cone { .. }).then_some(label)
+}
+
+/// The label STEP can hold for a cone label it cannot: a cone of half angle 0 (the kernel's fillet
+/// gives a round of a box edge so, `docs/upstream/02-blend-cylinder-as-cone.md`) is the cylinder it
+/// is, and a cone whose radius at its frame's origin is negative is moved along its axis to its apex
+/// (radius 0): the same surface either way. `None` when the label needs no change.
+fn step_label(s: &Surface) -> Option<Surface> {
+    let Surface::Cone { frame, radius_at_origin, half_angle } = s else { return None };
+    if *half_angle == 0.0 {
+        return (*radius_at_origin > 0.0)
+            .then(|| Surface::Cylinder { frame: frame.clone(), radius: *radius_at_origin });
+    }
+    let slope = half_angle.tan();
+    if !(*radius_at_origin < 0.0 && slope.is_finite() && slope != 0.0) {
+        return None;
+    }
+    let [x, y] = [frame.x_axis, frame.y_axis];
+    let z = [x[1] * y[2] - x[2] * y[1], x[2] * y[0] - x[0] * y[2], x[0] * y[1] - x[1] * y[0]];
+    let t = -*radius_at_origin / slope;
+    let mut frame = frame.clone();
+    frame.origin = std::array::from_fn(|k| frame.origin[k] + t * z[k]);
+    Some(Surface::Cone { frame, radius_at_origin: 0.0, half_angle: *half_angle })
+}
+
+/// `b` with every cone face STEP cannot hold relabelled ([`step_label`]): the writer writes a
+/// cone's radius and half angle as they are, and STEP's cone has neither a radius below 0 nor a
+/// half angle of 0, so the reader refuses such a face (`docs/upstream/19-step-cone-labels.md`).
+/// This covers the cones the record labels and the rational faces the writer would label as cones;
+/// a face with a NURBS form has its parameters on the form, so its label is free to change.
+fn cones_from_their_apex(b: &Brep) -> Cow<'_, Brep> {
+    // the kernel the writer labels such faces with: the fixes the session runs with, and no others
+    // (`session::fixes` names those the application turned on, none by default; this turns none on
+    // by itself), so the labels here are the writer's own
     let mut k = Kernel::new(&KernelOptions::default());
-    let mut models = Vec::with_capacity(bodies.len());
-    for (_, rec) in bodies {
-        let kb = solidcore_convert::brep::to_kernel_body(&mut k, rec, true)
-            .map_err(|e| op_err("to_kernel_body", format!("{e:?}")))?;
-        let m = step_brep::brep_to_model::brep_to_model(&kb).map_err(|e| op_err("brep_to_model", format!("{e:?}")))?;
-        models.push(m);
+    for name in solidcore_ops::session::fixes() {
+        if let Some(on) = k.fixes.flag_mut(name) {
+            *on = true;
+        }
     }
-    let mut it = models.into_iter();
-    let mut m = it.next().ok_or_else(|| KernelError::Argument("nothing to export".into()))?;
-    for more in it {
-        m.bodies.extend(more.bodies);
+    let mut changed: Vec<(usize, Surface, Option<Surface>)> = Vec::new();
+    for (i, f) in b.faces.iter().enumerate() {
+        if f.nurbs.is_some()
+            && let Some(label) = step_label(&f.surface)
+        {
+            changed.push((i, label, None));
+        } else if let Some(cone) = proved_cone(&k, f)
+            && let Some(label) = step_label(&cone)
+        {
+            changed.push((i, label, Some(f.surface.clone())));
+        }
     }
-    step_export::write(&m).map_err(|e| op_err("step_export::write", e.message))
+    if changed.is_empty() {
+        return Cow::Borrowed(b);
+    }
+    let mut out = b.clone();
+    for (i, label, form) in changed {
+        if let Some(f) = out.faces.get_mut(i) {
+            f.surface = label;
+            if form.is_some() {
+                f.nurbs = form;
+            }
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// [`export`] of solid bodies, the file named after the first body.
+pub fn export_solids(bodies: &[(&str, &Brep)]) -> Result<String> {
+    let name = bodies.first().map_or("surfacecraft", |(n, _)| *n);
+    export(name, bodies)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::record::brep::{Loop, Shell};
-
-    fn boxed() -> (Brep, usize) {
-        let b = crate::solid::make_box([0.0; 3], [2.0, 3.0, 4.0]).unwrap();
-        let n = b.faces.len();
-        (b, n)
-    }
-
-    #[test]
-    fn a_consistently_oriented_closed_body_is_sound() {
-        let (b, n) = boxed();
-        assert!(topology_is_sound(&b, n));
-    }
-
-    #[test]
-    fn a_missing_face_is_not_sound() {
-        let (b, n) = boxed();
-        assert!(!topology_is_sound(&b, n + 1));
-        assert!(!topology_is_sound(&b, n - 1));
-    }
-
-    #[test]
-    fn a_face_of_reversed_sense_is_not_sound() {
-        let (mut b, n) = boxed();
-        if let Some(Shell::Faces { faces, .. }) = b.shells.first_mut() {
-            faces[0].forward = !faces[0].forward;
-        }
-        assert!(!topology_is_sound(&b, n));
-    }
-
-    #[test]
-    fn an_edge_used_three_times_or_not_at_all_is_not_sound() {
-        let (b, n) = boxed();
-        // one loop edge redirected to the edge of another face: that edge now has three uses
-        let mut three = b.clone();
-        let target = match three.faces[1].loops.first() {
-            Some(Loop::Edges { edges }) => edges[0].edge,
-            _ => panic!("edge loop"),
-        };
-        if let Some(Loop::Edges { edges }) = three.faces[0].loops.first_mut() {
-            edges[0].edge = target;
-        }
-        assert!(!topology_is_sound(&three, n));
-        // the edge the redirected loop edge no longer names has one use less: still sound by
-        // use count alone, but the edge list no longer matches the uses
-        let mut dropped = b.clone();
-        dropped.edges.push(dropped.edges[0].clone());
-        assert!(!topology_is_sound(&dropped, n));
-    }
-
-    #[test]
-    fn a_vertex_loop_is_not_a_sheet_the_topology_build_may_keep() {
-        let (mut b, n) = boxed();
-        b.faces[0].loops = vec![Loop::Vertex { vertex: 0 }];
-        assert!(!topology_is_sound(&b, n));
-    }
-}
+mod tests;

@@ -273,6 +273,16 @@ parameters were used.
   (`repaired_patches`); if one cannot be, the command fails instead of returning a network with
   a flipped patch.
 
+## Sew separate surfaces
+
+- `surface.sew` with `objects` (surfaces and sheet bodies, for example the patches of
+  `surface.patch` or of `surface.from_curves` with `ngon: "patch"`), `tolerance` (default 0.02 mm,
+  at most 1) and `name` makes one new body: the sheets are joined along the edges that meet within
+  the tolerance and turned to agree. Where they enclose a volume the body is a closed solid
+  (`closed`, `volume`); otherwise it is a sheet and `open_edges` counts the edges that found no
+  partner (a patch missing, or a gap wider than the tolerance). The input surfaces stay; the sewn
+  body can be sewn again with more patches.
+
 ## Trim and thicken
 
 - `surface.trim_to_region` with `object` (the surface) and `body` (a body with a face on it):

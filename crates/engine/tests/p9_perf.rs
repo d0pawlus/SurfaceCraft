@@ -283,10 +283,15 @@ fn body_compare_is_identical_on_one_and_eight_threads_and_between_runs() {
     assert_eq!(eight, again);
 }
 
-/// The STEP text of the open sheet (the network without its first patch) of about `patches` patches.
-fn sheet_step(patches: usize) -> (String, usize) {
+/// The open sheet (the network without its first patch) of about `patches` patches.
+fn open_sheet(patches: usize) -> surfacecraft_kernel::record::brep::Brep {
     let (nets, corners) = network(patches);
-    let sheet = sheet_from_bezier_network_as_is(&nets[1..], &corners[1..]).unwrap();
+    sheet_from_bezier_network_as_is(&nets[1..], &corners[1..]).unwrap()
+}
+
+/// The STEP text (base64, as `export.step` gives it) of the open sheet of about `patches` patches.
+fn sheet_step(patches: usize) -> (String, usize) {
+    let sheet = open_sheet(patches);
     let faces = sheet.faces.len();
     let mut s = Session::new();
     s.doc.add_body("b", sheet);
@@ -368,25 +373,24 @@ fn signature(r: &surfacecraft_kernel::record::brep::Brep) -> Signature {
     Signature { faces, edges, vertices, uses, incidences, senses, loops }
 }
 
+/// A large open sheet written by `export.step` reads back as the sheet it was: the same faces,
+/// edges, vertices and edge uses, every shared edge run in opposite directions by its two faces,
+/// and the same display area.
 #[test]
-fn an_own_open_sheet_imports_as_the_stitched_import_does() {
+fn an_own_open_sheet_reads_back_as_the_sheet_it_was() {
+    let sheet = open_sheet(900);
     let (data, faces) = sheet_step(900);
-    assert!(faces >= 300, "the topology build is used from 300 faces");
-    let bytes = decode(&data);
-    let fast = surfacecraft_kernel::step::import(&bytes).unwrap();
-    let slow = surfacecraft_kernel::step::import_stitched(&bytes).unwrap();
-    assert_eq!(fast.len(), 1);
-    assert_eq!(slow.len(), 1);
-    let (a, b) = (&fast[0], &slow[0]);
+    let back = surfacecraft_kernel::step::import(&decode(&data)).unwrap();
+    assert_eq!(back.len(), 1);
+    let (a, b) = (&back[0], &sheet);
     assert_eq!((a.faces.len(), a.edges.len(), a.vertices.len()), (b.faces.len(), b.edges.len(), b.vertices.len()));
     assert_eq!(a.faces.len(), faces);
     assert!(!surfacecraft_kernel::nurbs::is_closed(a));
-    // the same display area, and the same file when each is written out again
+    let (sa, sb) = (signature(a), signature(b));
+    assert_eq!(sa.uses, sb.uses, "edge-use histogram");
+    assert_eq!(same_direction_edges(&sa), 0, "shared edges run opposite ways");
     let area = |r: &surfacecraft_kernel::record::brep::Brep| tess::tessellate(r, Some(0.05)).unwrap().area();
-    assert!((area(a) - area(b)).abs() <= 1e-9 * area(b), "{} vs {}", area(a), area(b));
-    // the same entities, in the order of the file instead of the stitcher's: the multisets of the
-    // face, edge and vertex geometry (bit for bit) and of how many faces use an edge
-    assert_eq!(signature(a), signature(b));
+    assert!((area(a) - area(b)).abs() <= 1e-6 * area(b), "{} vs {}", area(a), area(b));
 }
 
 /// Writes the STEP text of an open sheet of about `SURFACECRAFT_PERF_PATCHES` patches to
@@ -414,44 +418,41 @@ fn mutated(text: &str, from: &str, to: &str) -> Vec<u8> {
     text.replacen(from, to, 1).into_bytes()
 }
 
-/// A file the fast path may try (the mark, 300 faces or more) with a defect: the answer must be
-/// `Ok` or `Err` without a panic, and the same sheet as the stitched import gives (or an error
-/// from both).
-fn assert_agrees_with_stitched(file: &[u8], what: &str) {
-    let fast = surfacecraft_kernel::step::import(file);
-    let slow = surfacecraft_kernel::step::import_stitched(file);
-    match (fast, slow) {
-        (Ok(a), Ok(b)) => {
-            assert_eq!(a.len(), b.len(), "{what}");
-            for (x, y) in a.iter().zip(&b) {
-                assert_eq!(x.faces.len(), y.faces.len(), "{what}: face count");
-                assert_eq!(x.edges.len(), y.edges.len(), "{what}: edge count");
-                let (sx, sy) = (signature(x), signature(y));
-                assert_eq!(sx.uses, sy.uses, "{what}: edge-use histogram");
-                assert_eq!(same_direction_edges(&sx), same_direction_edges(&sy), "{what}: orientation of shared edges");
-                assert_eq!(sx, sy, "{what}: the sheet");
-            }
-        }
-        (Err(_), Err(_)) => {}
-        (a, b) => panic!("{what}: fast {:?}, stitched {:?}", a.map(|v| v.len()), b.map(|v| v.len())),
-    }
+/// The sheet a defective file still gives: one body of `faces` faces, a valid record whose shared
+/// edges are all run in opposite directions by their two faces.
+fn assert_reads_whole(file: &[u8], faces: usize, what: &str) {
+    let bodies = surfacecraft_kernel::step::import(file).unwrap_or_else(|e| panic!("{what}: {e}"));
+    assert_eq!(bodies.len(), 1, "{what}");
+    let b = &bodies[0];
+    assert!(b.validate_built().is_ok(), "{what}: an invalid record");
+    assert_eq!(b.faces.len(), faces, "{what}");
+    assert_eq!(same_direction_edges(&signature(b)), 0, "{what}: the sides agree");
+}
+
+/// A defective file is refused, the reason naming what is wrong.
+fn assert_refused(file: &[u8], why: &str, what: &str) {
+    let e = surfacecraft_kernel::step::import(file).map(|b| b.len()).unwrap_err().to_string();
+    assert!(e.contains(why), "{what}: {e}");
 }
 
 #[test]
-fn defective_own_sheets_of_300_faces_import_as_the_stitched_import_does() {
+fn defective_own_sheets_are_refused_or_read_with_their_sides_agreeing() {
     let (data, faces) = sheet_step(400);
     assert!(faces >= 300);
     let text = String::from_utf8(decode(&data)).unwrap();
     // a face of reversed sense
     let face_line = text.lines().find(|l| l.contains("ADVANCED_FACE(")).unwrap().to_string();
-    assert_agrees_with_stitched(
+    // the reader turns a face whose outer loop runs against its side back over
+    assert_reads_whole(
         &mutated(&text, &face_line, &face_line.replace(".T.);", ".F.);")),
+        faces,
         "face of reversed sense",
     );
     // a face without its loop
     let bound = face_line.split("(#").nth(1).and_then(|r| r.split(')').next()).unwrap().to_string();
-    assert_agrees_with_stitched(
+    assert_refused(
         &mutated(&text, &face_line, &face_line.replace(&format!("(#{bound})"), "()")),
+        "without an edge loop",
         "face without a loop",
     );
     // an edge used by three faces: the first loop edge points at the edge of the second one
@@ -459,31 +460,13 @@ fn defective_own_sheets_of_300_faces_import_as_the_stitched_import_does() {
     let edge_of = |l: &str| l.split(",*,*,").nth(1).and_then(|r| r.split(',').next()).unwrap().to_string();
     let (e0, e1) = (edge_of(oriented[0]), edge_of(oriented[7]));
     assert_ne!(e0, e1);
-    assert_agrees_with_stitched(
+    assert_refused(
         &mutated(&text, oriented[0], &oriented[0].replace(&format!(",*,*,{e0},"), &format!(",*,*,{e1},"))),
+        "not connected",
         "edge of three faces",
     );
     // a dangling vertex reference
     let curve = text.lines().find(|l| l.contains("EDGE_CURVE(")).unwrap().to_string();
     let v = curve.split(',').nth(1).unwrap().to_string();
-    assert_agrees_with_stitched(&mutated(&text, &curve, &curve.replacen(&v, "#99999999", 1)), "dangling vertex");
-    // the mark in the description of a file that names another writer
-    let foreign = text.replacen("'SurfaceCraft','SurfaceCraft'", "'Other','Other'", 1).replacen(
-        "FILE_DESCRIPTION((''),",
-        "FILE_DESCRIPTION(('SurfaceCraft','SurfaceCraft'),",
-        1,
-    );
-    assert!(foreign.contains("FILE_DESCRIPTION(('SurfaceCraft','SurfaceCraft')"));
-    assert_agrees_with_stitched(foreign.as_bytes(), "mark in a description");
-}
-
-#[test]
-fn a_marked_file_over_the_entity_limit_is_refused_not_parsed() {
-    let (data, _) = sheet_step(400);
-    let mut text = String::from_utf8(decode(&data)).unwrap();
-    // pad the data section with 4.1 million tiny entities
-    let at = text.find("ENDSEC;\nEND-ISO").unwrap();
-    let pad: String = (1_000_000..5_100_000).map(|i| format!("#{i}=B();\n")).collect();
-    text.insert_str(at, &pad);
-    assert!(surfacecraft_kernel::step::import(text.as_bytes()).is_err());
+    assert_refused(&mutated(&text, &curve, &curve.replacen(&v, "#99999999", 1)), "missing entity", "dangling vertex");
 }

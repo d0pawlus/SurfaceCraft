@@ -1,5 +1,7 @@
 # Draft 14: an exact rational cylinder face stays a spline after the rebuild at one placement
 
+Update 2026-11-16 (P9-O8, pin `c02c5c51c`): the application's path moved from `step_brep::build_from_topology` to `solidcore_step::assembly`; on it every partial cylinder face of the merge comes back a spline after the rebuild (draft 18), so cylinders are now placed by the application with the kernel's full form, as cones and spheres were. `face_verdict` stays.
+
 Status: not filed (2026-11-15). It does not reproduce on the current solidcore head (`f02d13e9c`). Kernel-only test
 `crates/solidcore/tests/rational_cylinder_analytics.rs` on the branch `repro/surfacecraft-tess-recognise` of d0pawlus/solidcore (`971b413`):
 `BSplineSurface::copy_and_add_analytics` (which calls `recognise_analytic`, `Cone::is_nurb_surface_cone`) on the exact two-patch rational

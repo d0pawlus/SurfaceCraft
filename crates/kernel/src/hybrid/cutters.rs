@@ -55,8 +55,8 @@ pub(super) fn shape_solid(shape: &Shape, lo: V, hi: V) -> Result<ops::Body> {
             }
             let depth = depth + 0.1 * diag + 1.0;
             let wide = depth * half_angle.tan();
-            // the cone widens along +z (a record cone that narrows along z does not survive a
-            // STEP round trip in solidcore), so it starts from a tiny disc of radius `tip`
+            // the cone widens along +z from its apex (the kernel's cone needs a radius at each end),
+            // so it starts from a tiny disc of radius `tip`
             let tip = 0.01;
             let start = tip / half_angle.tan();
             let b = ops::make_cone([0.0; 3], tip, wide, depth - start).map_err(|e| op_err("make_cone", e))?;

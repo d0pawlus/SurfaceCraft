@@ -216,10 +216,11 @@ pub(super) fn face_verdict(
     let display = display_chord_of(&sheet, p.cloud.border_offset(&p.gauge));
     for (c, normals, border) in [(display, true, false), (Some(chord), false, false), (Some(judge_chord), false, true)]
     {
-        let at = c.map_or_else(|| "display chord".to_string(), |c| format!("chord {c:.3}"));
-        let Ok(topo) = crate::tess::tessellate_topo(&sheet, c) else {
+        let Some((topo, c)) = judged_mesh(&sheet, c) else {
+            let at = c.map_or_else(|| "display chord".to_string(), |c| format!("chord {c:.3}"));
             return Ok(Err(format!("the mesher cannot triangulate the new face at the {at}")));
         };
+        let at = c.map_or_else(|| "display chord".to_string(), |c| format!("chord {c:.3}"));
         let ratio = topo.mesh.area() / p.area.max(1e-12);
         if ratio < 1.0 - MAX_AREA_LOSS || ratio > 1.0 + MAX_AREA_EXCESS {
             return Ok(Err(format!("the new face tessellates to {ratio:.3} of its patches' area at the {at}")));
@@ -227,12 +228,32 @@ pub(super) fn face_verdict(
         if normals && let Err(e) = check::check_face(&topo.mesh, p.forward, &p.cloud, (body, &p.gauge), p.limit) {
             return Ok(Err(e.to_string()));
         }
-        // the border is compared with the group's on the finest tessellation, whose chord is the stated slack
-        if border && let Err(e) = check::check_border(&p.cloud, &topo.mesh, p.limit, judge_chord) {
+        // the border is compared with the group's on the finest tessellation, whose chord is the stated slack;
+        // where the display mesh stood in for a capped one, at the finer of the two chords
+        let slack = c.unwrap_or_else(|| judge_chord.min(crate::tess::display_chord(&sheet)));
+        if border && let Err(e) = check::check_border(&p.cloud, &topo.mesh, p.limit, slack) {
             return Ok(Err(e.to_string()));
         }
     }
     Ok(Ok(()))
+}
+
+/// The tessellation of a new face to judge it by, at `chord`, and the chord it was made at. A mesh
+/// whose sag refinement stopped at the mesher's cap does not follow its face (on the solidcore pin of
+/// P9-O8 a cylinder face whose boundary stands off its surface caps at every chord from 0.1 mm up and
+/// covers half its area, while the display chord meshes it in 640 triangles; the floored chord of
+/// [`display_chord_of`] was measured on the old pin, where the cap came at the finer chords): then
+/// the display chord is taken where it does not cap, else `chord`'s mesh.
+/// `None` when the mesher refuses the face.
+fn judged_mesh(sheet: &Brep, chord: Option<f64>) -> Option<(crate::tess::TopoMesh, Option<f64>)> {
+    let (first, capped) = crate::tess::tessellate_topo_capped(sheet, chord).ok()?;
+    if !capped || chord.is_none() {
+        return Some((first, chord));
+    }
+    match crate::tess::tessellate_topo_capped(sheet, None) {
+        Ok((second, false)) => Some((second, None)),
+        _ => Some((first, chord)),
+    }
 }
 
 /// The chord of the display tessellation of a new face (`sheet`), on which its area and normals are checked: the display

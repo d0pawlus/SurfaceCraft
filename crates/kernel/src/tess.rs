@@ -50,12 +50,20 @@ pub fn display_chord(body: &Brep) -> f64 {
 /// Like [`tessellate`], and keeps which face each triangle belongs to and the edge polylines, so
 /// the viewport can pick faces and edges of the body and hand their indices to commands.
 pub fn tessellate_topo(body: &Brep, chord: Option<f64>) -> Result<TopoMesh> {
+    tessellate_topo_capped(body, chord).map(|(t, _)| t)
+}
+
+/// [`tessellate_topo`], and whether the mesher's sag refinement stopped at its cap of points on a
+/// face with triangles still off the surface (`solidcore_tess::Cap::Refine`): such a mesh does not
+/// follow its face (measured: half a cylinder face's area at the cap of 40 000 triangles).
+pub fn tessellate_topo_capped(body: &Brep, chord: Option<f64>) -> Result<(TopoMesh, bool)> {
     let size = bbox_size(body).max(1e-3);
     let tol = match chord {
         Some(c) if c.is_finite() && c > 0.0 => solidcore_tess::MeshTolerance::display(c),
         _ => solidcore_tess::MeshTolerance::display_of(size),
     };
-    let (plan, _stats) = solidcore_tess::plan(body, &tol, size).map_err(|e| op_err("tess::plan", e))?;
+    let (plan, stats) = solidcore_tess::plan(body, &tol, size).map_err(|e| op_err("tess::plan", e))?;
+    let capped = stats.over_tolerance.iter().any(|o| o.caps.iter().any(|c| matches!(c, solidcore_tess::Cap::Refine)));
     let (mut mesh, mut tri_face) = evaluate_plan(&plan);
     // the mesher never emits bad indices, but the record came from outside: validate anyway
     if mesh.validate().is_err() {
@@ -65,7 +73,7 @@ pub fn tessellate_topo(body: &Brep, chord: Option<f64>) -> Result<TopoMesh> {
         tri_face.clear();
     }
     let edges = plan.edges.iter().map(|e| e.iter().map(|p| Point3::new(p.x, p.y, p.z)).collect()).collect();
-    Ok(TopoMesh { mesh, tri_face, edges })
+    Ok((TopoMesh { mesh, tri_face, edges }, capped))
 }
 
 /// Faces evaluated per block: the temporary vectors of a block are dropped before the next one

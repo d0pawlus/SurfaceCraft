@@ -1,8 +1,13 @@
 //! Minimal reproductions of solidcore problems found while building `kernel::hybrid` (plan P3b Z5)
 //! and the parametric features (P5).
 //!
-//! Every test asserts the EXPECTED, correct behaviour and is `#[ignore]`d: it fails on the pinned
-//! solidcore (`4f2da85`) and is meant to pass once upstream fixes the problem. Run them with
+//! Every test asserts the EXPECTED, correct behaviour and is `#[ignore]`d while it fails on the pinned
+//! solidcore (`c02c5c5` since P9-O8) and is meant to pass once upstream fixes the problem; the narrowing
+//! cone's STEP round trip passes on `c02c5c5` and runs as a regression; the turned box's record reads
+//! back on macOS and Linux but not on Windows, so it stays ignored.
+//! With `SURFACECRAFT_UPSTREAM_FIXES=1` every opt-in upstream fix is on: on `c02c5c5` the filleted,
+//! pocketed plate's shell then reads back too, and the near-coaxial cylinders fail with `NotSolid`
+//! instead of status 1001. Run them with
 //! `cargo test -p surfacecraft-kernel --profile ci --test upstream_repro -- --ignored`.
 //! The draft issue texts are in `docs/upstream/` (`solidcore-p3.md` and the files it names).
 //! Problems 1 to 3 were first seen on `b9c02da`; all of them were re-checked on `4f2da85`.
@@ -13,16 +18,21 @@ use solidcore_ops as ops;
 use solidcore_record::brep::{Brep, Surface};
 use surfacecraft_kernel::{solid, step};
 
+/// Every upstream fix on when `SURFACECRAFT_UPSTREAM_FIXES=1` (to measure them; off otherwise).
+fn fixes_from_env() {
+    surfacecraft_kernel::fixes::apply_from_env().unwrap();
+}
+
 /// Problem a: a cone that narrows along +z (radius 5 at the base, 1 at the top, height 10)
 /// is exported to STEP and read back as ONE body.
 ///
 /// Input: `ops::make_cone([0;3], 5, 1, 10)` as a record, `step::export_solids`, `step::import`.
 /// Expected: one body back (the same solid as before).
 /// Actual: the STEP import splits the solid into several bodies, one per face (the negative
-/// half-angle conical face does not survive `step_brep::import`).
+/// half-angle conical face did not survive `step_brep::import`).
 #[test]
-#[ignore = "solidcore 4f2da85: narrowing cone (negative half angle) splits into several bodies after STEP round trip"]
 fn cone_narrowing_along_z_survives_step_round_trip() {
+    fixes_from_env();
     let cone = ops::make_cone([0.0; 3], 5.0, 1.0, 10.0).expect("make_cone");
     let (rec, _) = cone.to_record().expect("to_record");
     let text = step::export_solids(&[("cone", &rec)]).expect("export_solids");
@@ -37,8 +47,9 @@ fn cone_narrowing_along_z_survives_step_round_trip() {
 /// Actual: the round comes back as a `Surface::Cone` with half angle 0 (SMLib's own form of a
 /// cylinder from `ops::blend`), so every consumer must special-case it.
 #[test]
-#[ignore = "solidcore 4f2da85: ops::blend returns a fillet cylinder as Cone with half angle 0"]
+#[ignore = "solidcore c02c5c5 (and 4f2da85): ops::blend returns a fillet cylinder as Cone with half angle 0"]
 fn fillet_of_box_edge_is_a_cylinder_face() {
+    fixes_from_env();
     let b = solid::make_box([0.0; 3], [20.0, 10.0, 5.0]).expect("make_box");
     let f = solid::fillet(&b, &[0], 2.0).expect("fillet");
     let kinds: Vec<&str> = f
@@ -64,8 +75,9 @@ fn fillet_of_box_edge_is_a_cylinder_face() {
 /// (The same pair turned 0.5° intersects fine, volume ≈ 1551.9 mm³, so the failure needs a
 /// near-coincident axis, as the fit noise of scanned revolved surfaces gives.)
 #[test]
-#[ignore = "solidcore 4f2da85: boolean of near-coaxial revolved surfaces (axes 0.01 deg apart) fails with status 1001"]
+#[ignore = "solidcore c02c5c5 (and 4f2da85): boolean of near-coaxial revolved surfaces (axes 0.01 deg apart) fails with status 1001"]
 fn near_coaxial_cylinders_intersect() {
+    fixes_from_env();
     let a = solid::make_cylinder([0.0; 3], 5.0, 20.0).expect("make_cylinder");
     let c = 0.01_f64.to_radians().cos();
     let s = 0.01_f64.to_radians().sin();
@@ -133,8 +145,9 @@ fn round_trip(body: &ops::Body, what: &str) -> Result<ops::Body, String> {
 /// not. Of 200 pseudo-random rotations of this box 27 fail; the same box turned about z in whole
 /// degrees (360 of them) or translated (100 of them) never does.
 #[test]
-#[ignore = "solidcore 4f2da85: a box turned about a general axis does not read back from its own record (status 1007)"]
+#[ignore = "solidcore c02c5c5: passes on macOS and Linux; on Windows the turned box's record is refused (the plane's axes are not square)"]
 fn turned_box_reads_back_from_its_record() {
+    fixes_from_env();
     let b = ops::make_box([0.0; 3], [50.0, 40.0, 10.0]).expect("make_box");
     b.transform(&turn([-0.3902044387637371, 0.4445854841071728, 0.26358792709436607], 2.4184066553326042))
         .expect("transform");
@@ -155,8 +168,9 @@ fn turned_box_reads_back_from_its_record() {
 /// copy after the other with `boolean`, reads back; four bars at 60 degrees and four bars at 30
 /// degrees fail the same way when chained.
 #[test]
-#[ignore = "solidcore 4f2da85: union_all of three chained rotated copies does not read back from its record (status 1007)"]
+#[ignore = "solidcore c02c5c5 (and 4f2da85): union_all of three chained rotated copies does not read back from its record (now refused by name: the plane's axes are not square, tangency-labs/solidcraft#13737)"]
 fn union_of_three_chained_rotated_copies_reads_back() {
+    fixes_from_env();
     let (s, c) = 60.0_f64.to_radians().sin_cos();
     let step = [[c, s, 0.0, 0.0], [-s, c, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
     let base = ops::make_box([-10.0, -1.0, -1.0], [20.0, 2.0, 2.0]).expect("make_box");
@@ -216,8 +230,9 @@ fn top_face(rec: &Brep) -> Option<usize> {
 /// (`SM_ERR_INVALID_INPUT`). The same plate with outline coordinates 40.0 and 20.0 exactly reads
 /// back (volume 2335.8); the failure is sensitive to round-off at that level.
 #[test]
-#[ignore = "solidcore 4f2da85: shell of a filleted, pocketed plate does not read back from its record (status 1007)"]
+#[ignore = "solidcore c02c5c5 (and 4f2da85): shell of a filleted, pocketed plate does not read back from its record (now refused by name: the plane's axes are not square, tangency-labs/solidcraft#13737)"]
 fn shell_of_filleted_pocketed_plate_reads_back() {
+    fixes_from_env();
     let corner = [
         [2.787812552530594e-16, 7.107075885548428e-15, 0.0],
         [40.0, 1.3354580823781616e-14, 0.0],
@@ -272,8 +287,9 @@ fn shell_of_filleted_pocketed_plate_reads_back() {
 /// normal is not a fix: with the direction tilted by 1e-12 about 65 of 98 pseudo-random turned
 /// plates (where the plate itself reads back) fail, with 1e-3 still 6 of 98.
 #[test]
-#[ignore = "solidcore 4f2da85: plate turned about a general axis minus a prism along its normal does not read back (status 1007)"]
+#[ignore = "solidcore c02c5c5 (and 4f2da85): plate turned about a general axis minus a prism along its normal does not read back (now refused by name: the plane's axes are not square, tangency-labs/solidcraft#13737)"]
 fn window_along_a_plane_normal_reads_back() {
+    fixes_from_env();
     let axis = [0.26162006230833446, -0.20491162934367935, -0.3720612130285178];
     let m = turn(axis, 1.38734577002826);
     let plate = ops::make_box([0.0; 3], [50.0, 40.0, 10.0]).expect("make_box");
@@ -327,8 +343,9 @@ fn window_along_a_plane_normal_reads_back() {
 /// Actual: `validate()` returns `item budget` between 39 366 (ok) and 40 344 (refused) bicubic patches (MAX_ITEMS = 4 000 000,
 /// about 100 items per patch); `validate_built()` and `Body::from_record` accept the record.
 #[test]
-#[ignore = "solidcore 4f2da85: Brep::validate refuses a 45 000 patch B-spline shell with `item budget`"]
+#[ignore = "solidcore c02c5c5 (and 4f2da85): Brep::validate refuses a 45 000 patch B-spline shell with `item budget`"]
 fn record_of_a_large_closed_bspline_shell_validates() {
+    fixes_from_env();
     let net = common::cube_sphere(87, 50.0);
     let record = common::record_of(&net);
     assert!(record.validate_built().is_ok(), "validate_built must accept the record");
@@ -346,8 +363,9 @@ fn record_of_a_large_closed_bspline_shell_validates() {
 /// Actual: 2.7 s and 30.0 s, a factor of 11 (measured: 600 faces 1.4 s, 2 166 faces 8.9 s,
 /// 8 214 faces 91.4 s, `ci` profile).
 #[test]
-#[ignore = "solidcore 4f2da85: the healer of from_record(.., false) is super-linear in the face count (about n^1.6 to n^2)"]
+#[ignore = "solidcore c02c5c5 (and 4f2da85): the healer of from_record(.., false) is super-linear in the face count (about n^1.6 to n^2)"]
 fn healer_time_is_close_to_linear_in_the_face_count() {
+    fixes_from_env();
     let time = |n: usize| {
         let record = common::record_of(&common::cube_sphere(n, 50.0));
         let start = std::time::Instant::now();
@@ -367,8 +385,9 @@ fn healer_time_is_close_to_linear_in_the_face_count() {
 /// 6.4 s at 120 984 faces). Read in the sources, not profiled: `fill_shells` inserts every face with
 /// `post_insert_faceuse`, which checks `shell.faces.contains(&f)` before each push (a linear scan).
 #[test]
-#[ignore = "solidcore 4f2da85: from_record(.., true) of a 240 000 face shell is super-linear (about 25 s)"]
+#[ignore = "solidcore c02c5c5 (and 4f2da85): from_record(.., true) of a 240 000 face shell is super-linear (about 25 s)"]
 fn trusted_from_record_time_is_close_to_linear_in_the_face_count() {
+    fixes_from_env();
     let time = |n: usize| {
         let record = common::record_of(&common::cube_sphere(n, 50.0));
         let start = std::time::Instant::now();

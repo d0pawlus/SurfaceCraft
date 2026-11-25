@@ -45,11 +45,12 @@ pub(super) struct RefProbe {
 }
 
 impl RefProbe {
-    /// The evaluator of the face's surface; a ball patch or a placed revolution (which solidcore
-    /// does not evaluate to second order by its label) is evaluated on its NURBS form.
+    /// The evaluator of the face's surface; a ball patch, a placed revolution (which solidcore
+    /// does not evaluate to second order by its label) or a blend (no parameters of its own) is
+    /// evaluated on its NURBS form.
     pub fn new(face: &Face) -> Result<Self> {
         let own: &Surface = match (&face.surface, &face.nurbs) {
-            (Surface::BallPatch { .. } | Surface::PlacedRevolution { .. }, Some(n)) => n,
+            (Surface::BallPatch { .. } | Surface::PlacedRevolution { .. } | Surface::Blend { .. }, Some(n)) => n,
             (s, _) => s,
         };
         let k = solidcore_convert::surface(own).map_err(|e| op_err("convert surface", e))?;

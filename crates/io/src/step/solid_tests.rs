@@ -1,12 +1,12 @@
-//! Gates of the compact solid writer (P9-O5): size per patch, shared entities, round trip through
-//! solidcore's importer, hostile records.
+//! Gates of the compact solid file (P9-O5), now written by solidcore's STEP writer: size per patch,
+//! shared entities, round trip through solidcore's importer, hostile records.
 use super::network_fixture::closed_network;
-use super::{IoError, write_sheets, write_solids};
+use super::{write_sheets, write_solids};
 use std::collections::BTreeMap;
 use surfacecraft_kernel::record::brep::{Brep, Surface};
 use surfacecraft_kernel::solid;
 
-/// Bytes allowed per bicubic patch (design: at most 6 KB; the solidcore exporter needs ~24 KB).
+/// Bytes allowed per bicubic patch (P9-O5 design: at most 6 KB; solidcore's old `step-export` needed ~24 KB).
 const MAX_BYTES_PER_PATCH: usize = 6 * 1024;
 /// Relative volume error allowed after the round trip.
 const VOLUME_TOLERANCE: f64 = 1e-6;
@@ -84,23 +84,11 @@ fn analytic_solids_round_trip_through_the_compact_writer() {
 }
 
 #[test]
-fn bodies_the_writer_cannot_say_are_unsupported_not_failures() {
-    let sheet = {
-        let b = closed_network(1);
-        let mut s = b.clone();
-        // a sheet: no bounded region
-        s.regions.truncate(1);
-        s
-    };
-    assert!(matches!(write_solids("x", &[&sheet]), Err(IoError::Unsupported(_))));
-    let mut nurbs_form = closed_network(1);
-    nurbs_form.faces[0].nurbs = Some(nurbs_form.faces[0].surface.clone());
-    assert!(matches!(write_solids("x", &[&nurbs_form]), Err(IoError::Unsupported(_))));
-    let mut other = closed_network(1);
-    other.faces[0].surface =
-        Surface::PlaneThrough { origin: [0.0; 3], u_point: [1.0, 0.0, 0.0], v_point: [0.0, 1.0, 0.0] };
-    assert!(matches!(write_solids("x", &[&other]), Err(IoError::Unsupported(_))));
-    // and a closed solid is not a sheet
+fn sheets_and_solids_go_to_separate_files() {
+    let mut sheet = closed_network(1);
+    // a sheet: no bounded region
+    sheet.regions.truncate(1);
+    assert!(write_solids("x", &[&sheet]).is_err());
     assert!(write_sheets("x", &[&closed_network(1)]).is_err());
 }
 
@@ -176,31 +164,29 @@ fn hostile_solids_are_errors_never_panics() {
     }
 }
 
-/// Measurement for the pull request: bytes per patch of both exporters at two sizes.
+/// Measurement for the pull request: bytes per patch and time of the writer at two sizes.
 #[test]
 #[ignore = "measurement, run with --ignored --nocapture"]
 fn measure_exporters() {
     for n in [7, 18] {
         let b = closed_network(n);
         let patches = b.faces.len();
-        for (label, kernel) in [("kernel solid", true), ("compact solid", false)] {
-            let t = std::time::Instant::now();
-            let text = if kernel {
-                surfacecraft_kernel::step::export_solids(&[("net", &b)]).unwrap()
-            } else {
-                write_solids("net", &[&b]).unwrap()
-            };
-            eprintln!(
-                "{label}: {patches} patches, {} bytes, {} B/patch, {:?}",
-                text.len(),
-                text.len() / patches,
-                t.elapsed()
-            );
-            let mut h: Vec<_> = histogram(&text).into_iter().collect();
-            h.sort_by_key(|x| std::cmp::Reverse(x.1.1));
-            for (k, (c, by)) in h.iter().take(8) {
-                eprintln!("  {k}: {c} entities, {by} bytes");
-            }
+        let t = std::time::Instant::now();
+        let text = write_solids("net", &[&b]).unwrap();
+        let written = t.elapsed();
+        let t = std::time::Instant::now();
+        let back = surfacecraft_kernel::step::import(text.as_bytes()).unwrap();
+        eprintln!(
+            "solid: {patches} patches, {} bytes, {} B/patch, written in {written:?}, read back ({} faces) in {:?}",
+            text.len(),
+            text.len() / patches,
+            back.first().map_or(0, |r| r.faces.len()),
+            t.elapsed()
+        );
+        let mut h: Vec<_> = histogram(&text).into_iter().collect();
+        h.sort_by_key(|x| std::cmp::Reverse(x.1.1));
+        for (k, (c, by)) in h.iter().take(8) {
+            eprintln!("  {k}: {c} entities, {by} bytes");
         }
     }
 }

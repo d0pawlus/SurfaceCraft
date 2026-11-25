@@ -426,13 +426,15 @@ mod patch_tests {
         // interior edges are shared by two faces
         let shared = sheet.edges.iter().filter(|e| e.uses.len() == 2).count();
         assert_eq!(shared, 3 * 3 + 4 * 2);
-        // the multi-face network does not thicken in solidcore yet (offset units partial); the
-        // patches come from one spline, so its single-face sheet is the same geometry
-        assert!(crate::solid::thicken(&sheet, 2.0, false).is_err());
-        let solid = crate::solid::thicken(&sheet_from_spline(&s).unwrap(), 2.0, false).unwrap();
-        let v = crate::solid::volume(&solid).unwrap();
-        // ≈ area × thickness (the wave adds a few percent of area)
-        assert!(v > 60.0 * 40.0 * 2.0 * 0.99 && v < 60.0 * 40.0 * 2.0 * 1.2, "volume {v}");
+        // the patches come from one spline, so its single-face sheet is the same geometry; since the
+        // solidcore pin of P9-O8 the multi-face network thickens too (it did not on 4f2da85)
+        let single = crate::solid::thicken(&sheet_from_spline(&s).unwrap(), 2.0, false).unwrap();
+        let network = crate::solid::thicken(&sheet, 2.0, false).unwrap();
+        for solid in [single, network] {
+            let v = crate::solid::volume(&solid).unwrap();
+            // ≈ area × thickness (the wave adds a few percent of area)
+            assert!(v > 60.0 * 40.0 * 2.0 * 0.99 && v < 60.0 * 40.0 * 2.0 * 1.2, "volume {v}");
+        }
     }
 }
 

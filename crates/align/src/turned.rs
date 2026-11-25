@@ -28,8 +28,11 @@ const SECTORS: usize = 12;
 const MAX_RADIUS_SPREAD: f64 = 0.03;
 /// Every sector holds at least this share of the sampled vertices.
 const MIN_SECTOR_SHARE: f64 = 0.005;
-/// The outer radius of a sector: this quantile of its vertices' distances from the axis.
-const OUTER_QUANTILE: f64 = 0.99;
+/// The outer radius of a sector: this quantile of its vertices' distances from the axis. A scan's
+/// floating debris patch on the side (a few vertices a few spacings out) holds more than 1 % of a
+/// sector's vertices and once moved one sector's 0.99 quantile out by 2 mm, so a pin was not
+/// turned; the side of a turned part holds far more than 5 % of every sector's outer vertices.
+const OUTER_QUANTILE: f64 = 0.95;
 
 /// The axis of a turned part.
 pub(crate) struct Turned {
@@ -163,5 +166,52 @@ mod tests {
         assert!(detect(&set_of(&b), &sample_of(&b)).is_none());
         let s = synth::sphere(Point3::origin(), 20.0, 48, 24);
         assert!(detect(&set_of(&s), &sample_of(&s)).is_none(), "a sphere's side is only a tenth of its area");
+    }
+
+    /// Points on the side of a cylinder of radius 12 about z, `n` around by `m` along.
+    fn side(n: usize, m: usize) -> Vec<Point3> {
+        (0..n)
+            .flat_map(|i| {
+                let a = std::f64::consts::TAU * i as f64 / n as f64;
+                (0..m).map(move |j| Point3::new(12.0 * a.cos(), 12.0 * a.sin(), 30.0 * j as f64 / m as f64))
+            })
+            .collect()
+    }
+
+    /// A flat 1 mm deep (8 % of the radius) across about a sector and a half is no turned part,
+    /// with the outer radius taken at the 0.95 quantile of each sector.
+    #[test]
+    fn a_shaft_with_a_flat_is_not_revolved() {
+        let pts: Vec<Point3> =
+            side(240, 30).into_iter().map(|p| if p.x > 11.0 { Point3::new(11.0, p.y, p.z) } else { p }).collect();
+        assert!(is_revolved(&side(240, 30), &Vec3::z()));
+        assert!(!is_revolved(&pts, &Vec3::z()));
+    }
+
+    /// A boss 2 mm proud holding 8 % of one sector's points moves that sector's outer radius: no
+    /// turned part. A debris patch of 2 % of a sector does not.
+    #[test]
+    fn a_boss_on_one_sector_breaks_the_symmetry_and_debris_does_not() {
+        let base = side(240, 30);
+        // the sectors as `is_revolved` cuts them (its frame about the axis; the sample is centred)
+        let (u, v) = (any_perpendicular(&Vec3::z()), Vec3::z().cross(&any_perpendicular(&Vec3::z())));
+        let phi = |p: &Point3| p.coords.dot(&v).atan2(p.coords.dot(&u)) + std::f64::consts::PI;
+        let width = std::f64::consts::TAU / SECTORS as f64;
+        let in_sector = |p: &Point3| ((phi(p) / width) as usize).min(SECTORS - 1) == 3;
+        let mid = |p: &Point3| (phi(p) - 3.5 * width).abs();
+        let mut sector: Vec<usize> = (0..base.len()).filter(|&k| in_sector(&base[k])).collect();
+        sector.sort_by(|&a, &b| mid(&base[a]).total_cmp(&mid(&base[b])));
+        let proud = |share: f64| {
+            let take = (sector.len() as f64 * share).ceil() as usize;
+            let mut pts = base.clone();
+            for &k in sector.iter().take(take) {
+                let p = pts[k];
+                let r = p.x.hypot(p.y);
+                pts[k] = Point3::new(p.x * (r + 2.0) / r, p.y * (r + 2.0) / r, p.z);
+            }
+            pts
+        };
+        assert!(!is_revolved(&proud(0.08), &Vec3::z()));
+        assert!(is_revolved(&proud(0.02), &Vec3::z()));
     }
 }

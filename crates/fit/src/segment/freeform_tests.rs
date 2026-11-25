@@ -332,3 +332,28 @@ fn a_piece_is_kept_when_only_the_model_auto_does_not_prefer_fits_the_tolerance()
     assert_eq!(piece.primitive.kind(), PrimitiveKind::Cylinder);
     assert!(piece.rms <= 0.2);
 }
+
+/// A cone curves across its rulings by cos(half angle) over the distance from its axis: a nearly
+/// flat cone (82 degrees) fitted around a crest spans a fraction of its radius of curvature, a 45
+/// degree cone over the same footprint spans several (seed 22 of the wavy-top gate: such a flat
+/// cone once kept a twentieth of the top out of its freeform region).
+#[test]
+fn a_nearly_flat_cone_spans_a_fraction_of_its_radius_of_curvature() {
+    let support = |half: f64| {
+        let m = sheet(40.0, 40.0, 40, 40, |x, y| {
+            let (u, v) = (x - 20.0, y - 20.0);
+            Point3::new(u, v, -(u * u + v * v).sqrt() / half.tan())
+        });
+        let seg = Segment {
+            triangles: (0..m.triangle_count() as u32).collect(),
+            primitive: Primitive::Cone { apex: [0.0; 3], axis: [0.0, 0.0, -1.0], half_angle: half },
+            rms: 0.0,
+            freeform: false,
+        };
+        super::freeform::cone_bending_support(&m, &seg).unwrap()
+    };
+    let (flat, steep) = (support(82f64.to_radians()), support(45f64.to_radians()));
+    // about 0.52 and 2.6 (chord 56.6 over a mean distance of 15.3 from the axis); 1 is the limit
+    assert!(flat < 0.8, "{flat}");
+    assert!(steep > 1.7, "{steep}");
+}

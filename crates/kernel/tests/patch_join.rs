@@ -16,7 +16,8 @@
 //! `fit_patch` returns it (one edge per outline corner, hundreds of them); route A2 first merges the
 //! cap's edges into one edge per side. Route B cuts a taller block by the untrimmed patch surface
 //! (`hybrid::cut_by_spline`), route C replaces the top face of the box (`hybrid::replace_face`); both
-//! let the kernel make the common edges, so no stitching is involved.
+//! let the kernel make the common edges, so no stitching is involved. Route D (P9-O8) hands the open box
+//! and the cap to `sew::sew` as they are, each decoded alone, which is what `surface.sew` does.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::fmt::Display;
@@ -27,6 +28,7 @@ use surfacecraft_kernel::patch_fit::{Conflicts, Continuity, Request, Side, fit_p
 use surfacecraft_kernel::record::brep::{
     Brep, Curve, Curve2, Edge, EdgeUseRef, Face, Loop, OrientedEdge, OrientedFace, Region, Shell, Surface, Vertex,
 };
+use surfacecraft_kernel::sew::sew;
 use surfacecraft_kernel::{solid, step};
 
 const SIZE: [f64; 3] = [40.0, 30.0, 20.0];
@@ -633,6 +635,18 @@ fn run_variant(v: &Variant) {
             join_rows("A2", &open, &merged, up, exp, exp_cut);
         }
         Err(e) => eprintln!("  A2: FAILED merging the cap's edges: {e}"),
+    }
+    eprintln!("  route D (the open box and the cap as they are, each decoded alone, then sew::sew):");
+    for tol in TOLERANCES {
+        match guard(|| sew(&[&open, &patch.sheet], tol).map_err(msg)) {
+            Ok(sewn) => eprintln!(
+                "    D sew {tol:e}: closed {}, open edges {}, {}",
+                sewn.closed,
+                sewn.open_edges,
+                inspect(&sewn.brep, exp, exp_cut)
+            ),
+            Err(e) => eprintln!("    D sew {tol:e}: FAILED: {e}"),
+        }
     }
     let b = guard(|| {
         let tall = solid::make_box([0.0; 3], [SIZE[0], SIZE[1], 25.0]).map_err(msg)?;

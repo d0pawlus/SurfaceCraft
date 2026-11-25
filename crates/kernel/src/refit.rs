@@ -416,6 +416,7 @@ pub fn face_shapes(body: &Brep) -> Result<Vec<std::result::Result<FaceShape, Str
                 Err("a freeform (spline) surface has no analytic parameters".to_string())
             }
             Surface::PlacedRevolution { .. } => Err("a swept profile is a freeform surface".to_string()),
+            Surface::Blend { .. } => Err("a blend surface has no analytic parameters".to_string()),
         };
         out.push(shape);
     }

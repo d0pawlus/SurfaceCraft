@@ -6,8 +6,8 @@
 //! refused, and the snap of a group that is refused after it is taken back: `rounds`). Then the faces of the group go; their interior edges and vertices
 //! go with them; the group's boundary loops (the edges it shares with the patches around it, or the open
 //! border of a sheet) become the loops of one new face on the primitive's surface, so the boundary edges
-//! stay shared with the neighbours. A plane or cylinder face is built by the kernel (`trim`: its trims, NURBS
-//! form and parameter box); a cone or sphere face is placed here (`place`). The result is rebuilt by the
+//! stay shared with the neighbours. A plane face is built by the kernel (`trim`: its trims and parameter box);
+//! a cylinder, cone or sphere face is placed here (`place`). The result is rebuilt by the
 //! kernel and refused, group by group with the reason, when the kernel does not take it, when its volume or
 //! topology class changed, when the kernel changed the use of the new face, or when the new face does not
 //! tessellate to the area of the patches it replaced or does not agree with them (`check`, `settle`).
@@ -21,13 +21,16 @@
 //! than 10 chords plus the edge's tolerance), and their end vertices keep theirs. A cone or sphere needs its
 //! NURBS form in the record, and that form must be the kernel's own (the full revolution with its arcs, the
 //! face being a sub-box of it; any other parameterisation loses the label). The healer is not run on the
-//! edited record (it changes the topology of such a body and the record order is lost).
+//! edited record (it changes the topology of such a body and the record order is lost). Since the solidcore
+//! pin c02c5c5 (P9-O8) the same holds for a cylinder: the kernel's assembly (`solidcore_step::assembly`,
+//! the successor of the topology builder) gives a partial round face a form of its own, and the rebuild
+//! gives such a cylinder back as a spline, so cylinders are placed here too.
 //!
 //! APP-GEOMETRY: stands in for the kernel making the pcurves (the face's trims in its own parameters)
-//! of the edges of a face on a cone or a sphere: `through` chains cubic Béziers through the parameters
-//! of the edge's samples (the parameters themselves are the kernel's `SurfaceEval::project`). Plane and
-//! cylinder faces are built by the kernel (`trim`); its builder gives a partial cone or sphere as an
-//! unlabelled rational spline, which this application does not take as an analytic face.
+//! of the edges of a face on a cylinder, a cone or a sphere: `through` chains cubic Béziers through the
+//! parameters of the edge's samples (the parameters themselves are the kernel's `SurfaceEval::project`).
+//! Plane faces are built by the kernel (`trim`); its assembly gives a partial cylinder, cone or sphere a
+//! form the kernel does not keep the label of, which this application does not take as an analytic face.
 use crate::hybrid::{Shape, V, cross, scale, sub, unit};
 use crate::nurbs::{SurfaceProbe, domain, is_closed};
 use crate::record::brep::{Brep, Curve2, Face, Loop, OrientedEdge, Shell, Surface};
@@ -293,11 +296,11 @@ fn prepare(body: &Brep, spec: &GroupSpec, group: &Group, limits: (f64, f64)) -> 
                 .into(),
         ));
     }
-    let face = if matches!(spec.shape, Shape::Plane { .. } | Shape::Cylinder { .. }) {
+    let face = if matches!(spec.shape, Shape::Plane { .. }) {
         trim::built_face(body, b, &placed.surface, !placed.flip)?
     } else {
-        // the kernel's builder gives a partial cone or sphere as an unlabelled rational spline: these two
-        // are placed here, with their own pcurves (see the header)
+        // the kernel keeps the label of a cylinder, cone or sphere only on its own full form, which its
+        // assembly does not give a partial face: these are placed here, with their own pcurves (see the header)
         let loops = face_loops(body, group, &placed)?;
         Face { surface: placed.surface, nurbs: placed.nurbs, domain: placed.domain, loops }
     };
