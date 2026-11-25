@@ -86,6 +86,19 @@ fn a_closed_solid_beats_a_sheet_within_the_band() {
     assert!(is_better(&far, &result(Verdict::Review, SOLID, 0.80, 1.0)));
 }
 
+/// A closed body without a positive volume is not a closed solid: of two results alike in all else,
+/// the one whose body encloses material wins, and a closed body turned inside out ranks with a sheet.
+#[test]
+fn a_closed_body_without_a_positive_volume_ranks_with_a_sheet() {
+    for volume in [-1000.0, 0.0, f64::NAN] {
+        let inverted = result(Verdict::Review, Some(Some(volume)), 0.99, 1.0);
+        let solid = result(Verdict::Review, SOLID, 0.99, 1.0);
+        let sheet = result(Verdict::Review, SHEET, 0.99, 1.0);
+        assert!(is_better(&solid, &inverted) && !is_better(&inverted, &solid), "{volume}");
+        assert!(!is_better(&inverted, &sheet) && !is_better(&sheet, &inverted), "{volume}: a tie with a sheet");
+    }
+}
+
 #[test]
 fn a_missing_body_ranks_last_within_its_verdict() {
     let none = result(Verdict::Fail, None, 0.0, 0.0);

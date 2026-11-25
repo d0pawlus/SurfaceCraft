@@ -316,7 +316,11 @@ pub(super) fn rejection(merged: &ToSolidOut, wrap: &ToSolidOut, tol: f64) -> Opt
                 r.verdict,
                 100.0 * d.map_or(0.0, |d| d.within),
                 100.0 * d.map_or(0.0, |d| d.coverage),
-                if r.body.as_ref().is_some_and(|b| b.volume.is_some()) { "closed" } else { "a sheet" }
+                if r.body.as_ref().is_some_and(crate::cmd::body::BodyOut::is_solid) {
+                    "closed"
+                } else {
+                    "not a closed solid"
+                }
             )
         };
         return Some(format!(

@@ -460,6 +460,62 @@ fn next_steps(
 mod tests {
     use super::*;
 
+    /// With `thickness` the shell is judged by the freeform rule too: a closed body without a
+    /// positive volume is `no_solid`.
+    #[test]
+    fn a_thickened_shell_without_a_positive_volume_is_no_solid() {
+        // Arrange
+        let mut s = Session::new();
+        let scan =
+            s.doc.add_mesh("scan", surfacecraft_geom::synth::sphere(surfacecraft_geom::Point3::origin(), 10.0, 24, 12));
+        let input: WrapIn = serde_json::from_value(serde_json::json!({"mesh": "scan", "max_patches": 200})).unwrap();
+        let mut w = wrap(&mut s, input).unwrap();
+        w.body.volume = Some(-1.0);
+        let set = super::super::Settings {
+            scan,
+            tolerance: 0.2,
+            min_within: 0.99,
+            min_triangles: None,
+            max_patches: None,
+            allow_retry: false,
+            budget: super::super::budget::CallBudget::default(),
+            rebuild: false,
+            close_handles: false,
+            handle_size: None,
+            name: "w".into(),
+        };
+        let d = DeviationSummary {
+            count: 1000,
+            coverage: 1.0,
+            not_facing: 0.0,
+            within: 1.0,
+            rms: 0.01,
+            max_abs: 0.05,
+            mean: 0.0,
+        };
+        let report: super::super::ScanSummary = serde_json::from_value(serde_json::json!({
+            "triangles_before": 0, "triangles": 0, "holes_before": 0, "holes_filled": 0, "holes_left": 0,
+            "holes_inward": 0, "non_manifold_edges": 0, "noise_above_tolerance": false, "findings": []
+        }))
+        .unwrap();
+        let t: ThickenedInfo = serde_json::from_value(serde_json::json!({
+            "thickness": 2.0, "symmetric": false, "clamped_vertices": 0, "limited_vertices": 0,
+            "repaired_vertices": 0, "repair_largest_shift": 0.0, "largest_reduction": 0.0,
+            "median_reduction": 0.0, "folded_vertices": 0, "boundary_loops": 0, "windows": 0,
+            "rim_edges": 0, "min_wall": 2.0, "median_wall": 2.0, "unresolved_vertices": 0,
+            "removed_non_manifold": 0, "flipped_triangles": 0, "self_intersection_checked": true,
+            "self_intersection_samples": 0, "self_intersections_local": 0, "self_intersections": 0,
+            "self_intersections_exhaustive": 0, "triangles": 1000
+        }))
+        .unwrap();
+
+        // Act
+        let issues = issues_of(&w, &d, &set, &report, &t, 500);
+
+        // Assert
+        assert!(issues.iter().any(|i| i.code == "no_solid"), "{issues:?}");
+    }
+
     #[test]
     fn crossings_that_stay_at_the_floor_are_refused_with_a_code_of_their_own() {
         // Arrange

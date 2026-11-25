@@ -270,7 +270,7 @@ pub(crate) fn scale_warning(tolerance: f64, diagonal: f64) -> Option<String> {
 
 /// Advice when a closed network has no positive volume: its faces are not consistently oriented.
 fn orientation_warning(closed: bool, volume: Option<f64>) -> Option<String> {
-    (closed && !volume.is_some_and(|v| v.is_finite() && v > 0.0)).then(|| {
+    (closed && !crate::cmd::body::encloses_material(volume)).then(|| {
         "the network is closed but the body has no positive volume: its faces are not consistently oriented".into()
     })
 }

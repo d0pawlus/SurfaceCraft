@@ -197,18 +197,29 @@ fn the_rim_of_a_dish_seen_from_its_hollow_side_is_not_capped_into_an_inside_out_
     }
 }
 
-/// Control: the same dish seen from its convex side is capped into a solid that faces the scan.
+/// Control: the same dish seen from its convex side is capped into a solid that faces the scan and
+/// encloses what the capped scan encloses. The smooth cap once continued the dome past the rim and
+/// passed through it near the corners; the kernel's healer then turned the whole solid inside out
+/// (`body.volume` −9556 against +9558 of the capped scan).
 #[test]
 fn the_rim_of_a_dish_seen_from_its_convex_side_is_still_capped_into_an_outward_solid() {
+    // Arrange
+    let mut s = Session::new();
+    s.doc.add_mesh("scan", dish(false));
+
     // Act
-    let out = to_solid(dish(false), json!({}));
+    let out = s.execute("scan.to_solid", json!({"scan": "scan", "method": "freeform"})).unwrap();
 
     // Assert
     let codes = issue_codes(&out);
     assert!(!codes.iter().any(|c| c == "scan_inside_out" || c == "open_surface"), "{codes:?}: {out}");
-    assert!(out["body"]["volume"].is_number(), "a closed solid: {out}");
     assert_ne!(out["verdict"], "fail", "{out}");
     assert_eq!(out["scan_report"]["holes_left"], 0, "{}", out["scan_report"]);
+    // the scan was capped in place: its closed mesh is what the solid must enclose
+    let capped = s.doc.find_by_name("scan").and_then(|(id, _)| s.doc.mesh(id)).map(|m| mesh_volume(&m.mesh)).unwrap();
+    let volume = out["body"]["volume"].as_f64().expect("a closed solid has a volume");
+    assert!(capped > 0.0, "the capped scan encloses {capped}");
+    assert!((volume - capped).abs() <= VOLUME_TOLERANCE * capped, "volume {volume} vs the capped scan's {capped}");
 }
 
 /// Guard: a closed scan stored inside out, with a small hole, is still told to be inside out (the
