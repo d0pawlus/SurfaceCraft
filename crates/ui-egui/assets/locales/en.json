@@ -462,6 +462,7 @@
   "wizard.global.applied": "Applied: {n} scans moved.",
   "wizard.merge.tolerance": "Tolerance (mm, empty: automatic)",
   "wizard.merge.name": "Name of the new mesh",
+  "wizard.merge.name_hint": "default: merged",
   "wizard.merge.warn": "Merge anyway when the scans look misaligned",
   "wizard.merge.warn.hint": "Turns the misalignment findings into warnings. Findings that protect the merge itself still refuse.",
   "wizard.merge.run": "Merge",

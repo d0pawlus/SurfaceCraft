@@ -462,6 +462,7 @@
   "wizard.global.applied": "Zastosowano: przesunięte skany: {n}.",
   "wizard.merge.tolerance": "Tolerancja (mm, puste: automatyczna)",
   "wizard.merge.name": "Nazwa nowej siatki",
+  "wizard.merge.name_hint": "domyślnie: merged",
   "wizard.merge.warn": "Połącz mimo to, gdy skany wyglądają na źle wyrównane",
   "wizard.merge.warn.hint": "Zamienia ustalenia o złym wyrównaniu w ostrzeżenia. Ustalenia chroniące samo łączenie nadal odrzucają.",
   "wizard.merge.run": "Połącz",

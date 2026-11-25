@@ -300,7 +300,14 @@ impl SurfaceCraftApp {
             let mut name = options.name.clone();
             ui.horizontal(|ui| {
                 ui.label(t("wizard.merge.name"));
-                if ui.add(egui::TextEdit::singleline(&mut name).hint_text("merged").desired_width(120.0)).changed() {
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut name)
+                            .hint_text(t("wizard.merge.name_hint"))
+                            .desired_width(120.0),
+                    )
+                    .changed()
+                {
                     action = Some(Action::SetName(name.clone()));
                 }
             });
