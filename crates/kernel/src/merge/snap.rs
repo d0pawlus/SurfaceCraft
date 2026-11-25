@@ -81,6 +81,9 @@ const MIN_WHOLE_DOT: f64 = 0.25;
 /// it to a sliver makes it worse whatever its cells do. Measured on scans 4, 6 and 10: the length of the area vector of
 /// those neighbours went from 0.93 to 2.7 times what it was (3.7 times this at the least).
 const MIN_AREA_KEPT: f64 = 0.25;
+/// A cell of the sample grid shorter than this share of the mean cell of the patch before the snap is degenerate (it
+/// has no direction worth reading): a row squeezed to a thousandth of the patch's mean cell has collapsed.
+const DEGENERATE_CELL_SHARE: f64 = 1e-3;
 /// Cells a side of the grid a moved patch is compared with itself on.
 const MOVED_GRID: usize = 4;
 
@@ -630,9 +633,17 @@ fn cell_vectors(points: &[V]) -> Vec<V> {
     out
 }
 
-/// The cells of a patch that do not face along `reference` (a cell of no area faces nowhere, so it counts).
-fn cells_against(cells: &[V], reference: V) -> usize {
-    cells.iter().filter(|c| dot(**c, reference) <= MIN_TURN_DOT).count()
+/// The cells of a patch that face against `reference`, and those that are degenerate (shorter than `floor`): a cell
+/// with no area faces nowhere, so it is counted apart, not as facing either way. Normals are read only where the
+/// patch's tangents are well apart (see [`normals_at_grid`]), so for them the sign of the dot product is enough.
+fn cell_counts(cells: &[V], reference: V, floor: f64) -> (usize, usize) {
+    cells.iter().fold((0, 0), |(against, degenerate), c| {
+        if norm(*c) < floor {
+            (against, degenerate + 1)
+        } else {
+            (against + usize::from(dot(*c, reference) < MIN_TURN_DOT), degenerate)
+        }
+    })
 }
 
 /// Of the points of the grid where the normal is read both before (`n0`) and after (`n1`), those where it faces
@@ -647,9 +658,10 @@ fn normals_against(n0: &[Option<V>], n1: &[Option<V>], reference: V) -> (usize, 
 /// Does a move leave a patch that was broken before it no worse? Judged against the patch as it was, so a patch that
 /// the move turns over as a whole cannot pass as "equally folded": the reference is the area vector of its samples
 /// before (`a`). After the move (`b`) the patch as a whole still faces within [`MIN_WHOLE_DOT`] of it and keeps
-/// [`MIN_AREA_KEPT`] of that area, no more of its cells face against it than before, and no more of its normals (where
-/// they are read both before and after). The cells and the normals are counted apart, so normals that can no longer be
-/// read do not hide cells that turned. The reference is always the patch as the wrap left it: every round of a merge
+/// [`MIN_AREA_KEPT`] of that area, and none of three counts grows: its cells that face against the reference, its
+/// degenerate cells, and its normals that face against it (where they are read both before and after). The three are
+/// counted apart, so neither a normal that can no longer be read nor a degenerate cell that opens up pays for a cell
+/// that turned. The reference is always the patch as the wrap left it: every round of a merge
 /// snaps from the original body (`rounds.rs`), and the rounds within [`snap_boundaries`] start from it too, so a patch
 /// is never judged against a version an earlier snap had already moved.
 fn no_worse(n0: &[Option<V>], n1: &[Option<V>], a: &[V], b: &[V]) -> bool {
@@ -658,9 +670,14 @@ fn no_worse(n0: &[Option<V>], n1: &[Option<V>], a: &[V], b: &[V]) -> bool {
     let (s0, s1) = (sum(&c0), sum(&c1));
     let (Some(reference), Some(whole)) = (unit(s0), unit(s1)) else { return false };
     let (normals_before, normals_after) = normals_against(n0, n1, reference);
+    // the floor of a degenerate cell is read from the patch as it was, like the reference
+    let floor = DEGENERATE_CELL_SHARE * c0.iter().map(|c| norm(*c)).sum::<f64>() / c0.len().max(1) as f64;
+    let (against_before, degenerate_before) = cell_counts(&c0, reference, floor);
+    let (against_after, degenerate_after) = cell_counts(&c1, reference, floor);
     dot(whole, reference) >= MIN_WHOLE_DOT
         && norm(s1) >= MIN_AREA_KEPT * norm(s0)
-        && cells_against(&c1, reference) <= cells_against(&c0, reference)
+        && against_after <= against_before
+        && degenerate_after <= degenerate_before
         && normals_after <= normals_before
 }
 

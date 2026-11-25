@@ -319,11 +319,12 @@ fn normals_that_become_unreadable_do_not_hide_cells_that_turned() {
     let xs = [0.0, 0.6, 0.5, 0.4, 0.35];
     let b = grid(|u, v| p(xs[(u * MOVED_GRID as f64).round() as usize], v, 0.0));
     let reference = unit(cell_vectors(&a).iter().fold([0.0; 3], |s, c| add(s, *c))).unwrap();
-    assert_eq!((cells_against(&cell_vectors(&a), reference), cells_against(&cell_vectors(&b), reference)), (8, 12));
+    let counts = |g: &[V]| cell_counts(&cell_vectors(g), reference, 1e-9);
+    assert_eq!((counts(&a), counts(&b)), ((8, 0), (12, 0)), "(cells against, degenerate) before and after");
     assert!(!no_worse(&n0, &unreadable(), &a, &b));
 }
 
-/// A patch that was broken before the snap is refused when the move tilts it as a whole past dot 0.25 (80 degrees
+/// A patch that was broken before the snap is refused when the move tilts it as a whole past dot 0.25 (85 degrees
 /// here), and taken at 60 degrees.
 #[test]
 fn a_broken_neighbour_tilted_far_by_the_move_is_refused() {
@@ -332,7 +333,7 @@ fn a_broken_neighbour_tilted_far_by_the_move_is_refused() {
         let (s, c) = deg.to_radians().sin_cos();
         grid(move |u, v| p(u, v * c, v * s))
     };
-    assert!(!no_worse(&unreadable(), &unreadable(), &flat, &tilted(80.0)), "dot 0.17");
+    assert!(!no_worse(&unreadable(), &unreadable(), &flat, &tilted(85.0)), "dot 0.087");
     assert!(no_worse(&unreadable(), &unreadable(), &flat, &tilted(60.0)), "dot 0.5");
 }
 
@@ -346,4 +347,24 @@ fn a_broken_neighbour_squeezed_or_collapsed_by_the_move_is_refused() {
     assert!(no_worse(&unreadable(), &unreadable(), &flat, &squeezed(0.5)), "half of its area");
     let collapsed = grid(|u, v| p(u.min(0.75), v, 0.0));
     assert!(!no_worse(&unreadable(), &unreadable(), &flat, &collapsed), "its last row of cells has no area");
+}
+
+/// Cells of no area before the move are no budget for cells that turn: a patch with its first two rows of cells
+/// collapsed (8 cells of no area) and the other 8 facing along; the move opens the collapsed rows into large cells along
+/// and turns the 8 others back. The whole patch still faces along and grew, but cells that face back appeared.
+#[test]
+fn collapsed_cells_before_the_move_are_no_budget_for_cells_that_turn() {
+    let rows = |xs: [f64; 5]| grid(move |u, v| p(xs[(u * MOVED_GRID as f64).round() as usize], v, 0.0));
+    let before = rows([0.0, 0.0, 0.0, 0.5, 1.0]);
+    let after = rows([0.0, 2.0, 4.0, 3.5, 3.0]);
+    assert!(!no_worse(&unreadable(), &unreadable(), &before, &after));
+}
+
+/// A row of cells squeezed to a millionth of a millionth of its area by the move is degenerate, not a cell that still
+/// faces along: the move is refused.
+#[test]
+fn a_row_of_cells_squeezed_to_almost_nothing_counts_as_degenerate() {
+    let flat = grid(|u, v| p(u, v, 0.0));
+    let squeezed = grid(|u, v| p(if u > 0.8 { 0.75 + 0.25e-12 } else { u }, v, 0.0));
+    assert!(!no_worse(&unreadable(), &unreadable(), &flat, &squeezed));
 }
