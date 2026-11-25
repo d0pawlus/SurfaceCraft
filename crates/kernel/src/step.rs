@@ -84,10 +84,13 @@ pub fn import_report(text: &[u8]) -> Result<Imported> {
     let text = String::from_utf8_lossy(text);
     let exchange = solidcore_step::p21::parse(&text).map_err(|e| op_err("STEP parse", e.to_string()))?;
     let points = check::face_points(&exchange);
-    if points > check::MAX_FACE_POINTS {
+    if points >= check::MAX_FACE_POINTS {
         return Err(op_err(
             "STEP import",
-            format!("the file's faces would hold {points} control points, more than {}", check::MAX_FACE_POINTS),
+            format!(
+                "the file's faces and edges would hold {points} items of geometry, at least {}",
+                check::MAX_FACE_POINTS
+            ),
         ));
     }
     let read = solidcore_step::topology::read_solids_with(&exchange, &KernelTrims::new());

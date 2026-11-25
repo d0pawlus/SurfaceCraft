@@ -210,7 +210,7 @@ fn a_file_whose_faces_would_hold_too_many_control_points_is_refused_before_readi
     }
     text += "ENDSEC;\nEND-ISO-10303-21;\n";
     let e = import(text.as_bytes()).unwrap_err().to_string();
-    assert!(e.contains("control points"), "{e}");
+    assert!(e.contains("geometry"), "{e}");
 }
 
 /// The faces of a narrowing cone and a hemisphere (and of a torus where one is a sheet), each written
@@ -293,4 +293,81 @@ fn a_closed_shell_that_is_not_one_is_not_written() {
         faces.pop();
     }
     assert!(export_solids(&[("open", &open)]).is_err());
+}
+
+/// A file of `points` points `#10..`, the shared geometry `#2`, the `extra` entities, then `copies`
+/// entities `user` (`#G` names the shared geometry), each with its own id.
+fn shared_geometry_file(points: usize, geometry: &str, extra: &str, user: &str, copies: usize) -> String {
+    let mut text = String::from("ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\n");
+    for k in 0..points {
+        text += &format!("#{}=CARTESIAN_POINT('',({}.,{}.,0.));\n", 10 + k, k / 64, k % 64);
+    }
+    text += &format!("#2={geometry};\n");
+    text += extra;
+    for c in 0..copies {
+        text += &format!("#{}={};\n", 1_000_000 + c, user.replace("#G", "#2"));
+    }
+    text + "ENDSEC;\nEND-ISO-10303-21;\n"
+}
+
+fn point_grid(rows: usize, cols: usize) -> String {
+    (0..rows)
+        .map(|i| format!("({})", (0..cols).map(|j| format!("#{}", 10 + i * cols + j)).collect::<Vec<_>>().join(",")))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn point_list(n: usize) -> String {
+    (0..n).map(|k| format!("#{}", 10 + k)).collect::<Vec<_>>().join(",")
+}
+
+fn assert_refused_before_reading(text: &str, what: &str) {
+    let e = import(text.as_bytes()).map(|b| b.len()).expect_err(what).to_string();
+    assert!(e.contains("geometry"), "{what}: {e}");
+}
+
+/// The estimate counts whatever geometry a face or an edge refers to: a Bézier surface shared by
+/// many faces, a deep chain of trimmed surfaces, a large B-spline profile swept and shared, and a
+/// large curve shared by many edges are each refused before the reader builds anything.
+#[test]
+fn shared_or_deep_geometry_is_refused_before_reading() {
+    let (n, faces) = (64usize, check::MAX_FACE_POINTS / (64 * 64) + 2);
+    let bezier = format!("BEZIER_SURFACE('',3,3,({}),.UNSPECIFIED.,.F.,.F.,.F.)", point_grid(n, n));
+    assert_refused_before_reading(
+        &shared_geometry_file(n * n, &bezier, "", "ADVANCED_FACE('',(),#G,.T.)", faces),
+        "a shared Bezier surface",
+    );
+    let mut chain = String::new();
+    for k in 0..20 {
+        let basis = if k == 0 { 2 } else { 500_000 + k - 1 };
+        chain += &format!("#{}=RECTANGULAR_TRIMMED_SURFACE('',#{basis},0.,1.,0.,1.,.T.,.T.);\n", 500_000 + k);
+    }
+    let plane = "PLANE('',#3)";
+    let deep = shared_geometry_file(
+        0,
+        plane,
+        &(chain + "#3=AXIS2_PLACEMENT_3D('',#4,$,$);\n#4=CARTESIAN_POINT('',(0.,0.,0.));\n"),
+        "ADVANCED_FACE('',(),#500019,.T.)",
+        1,
+    );
+    assert_refused_before_reading(&deep, "a deep chain of trimmed surfaces");
+    let curve = format!(
+        "B_SPLINE_CURVE_WITH_KNOTS('',1,({}),.UNSPECIFIED.,.F.,.F.,({}),({}),.UNSPECIFIED.)",
+        point_list(n * n),
+        std::iter::once("2".to_string())
+            .chain(std::iter::repeat_n("1".to_string(), n * n - 2))
+            .chain(std::iter::once("2".to_string()))
+            .collect::<Vec<_>>()
+            .join(","),
+        (0..n * n - 1).map(|k| format!("{k}.")).collect::<Vec<_>>().join(",")
+    );
+    let sweep = "#3=SURFACE_OF_LINEAR_EXTRUSION('',#2,#5);\n#5=VECTOR('',#6,1.);\n#6=DIRECTION('',(0.,0.,1.));\n";
+    assert_refused_before_reading(
+        &shared_geometry_file(n * n, &curve, sweep, "ADVANCED_FACE('',(),#3,.T.)", faces),
+        "a swept profile",
+    );
+    assert_refused_before_reading(
+        &shared_geometry_file(n * n, &curve, "#7=VERTEX_POINT('',#10);\n", "EDGE_CURVE('',#7,#7,#G,.T.)", faces),
+        "a curve shared by many edges",
+    );
 }

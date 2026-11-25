@@ -4,11 +4,12 @@
 //! opposite directions; no edge of any shell used more than twice or twice the same way). The
 //! structural checks cannot see a face turned the wrong way round: the edge directions can.
 //!
-//! Before a file is read, the control points its faces would hold are estimated from the file: a
-//! large spline surface that many faces share is copied into each face's record, so a small file
+//! Before a file is read, the geometry its faces and edges would hold is estimated from the file
+//! (every entity under a face's surface or an edge's curve, once per face or edge): a large
+//! surface or curve that many faces or edges share is copied into each record, so a small file
 //! could otherwise ask for a great deal of memory.
 use crate::record::brep::{Brep, Curve, Loop, Shell, Surface};
-use solidcore_step::p21::{Entity, Exchange, Param};
+use solidcore_step::p21::{Exchange, Param};
 use std::collections::HashMap;
 
 /// Most items (vertices, edges, edge uses, faces, loops, control points) of one record: the
@@ -17,11 +18,9 @@ use std::collections::HashMap;
 /// rather than accepted and unusable later.
 pub(super) const MAX_ITEMS: usize = 64_000_000;
 
-/// Most control points the faces of one file may hold, counting a shared surface once per face.
+/// Most geometry items (entities, control points among them) the faces and edges of one file may
+/// hold, counting a shared surface or curve once per face or edge on it.
 pub(super) const MAX_FACE_POINTS: usize = 64_000_000;
-
-/// Deepest chain of surfaces followed to a face's spline (a trimmed surface of a trimmed one).
-const MAX_SURFACE_DEPTH: usize = 4;
 
 fn curve_points(c: &Curve) -> usize {
     match c {
@@ -119,54 +118,61 @@ pub(super) fn agreement(b: &Brep) -> Result<(), String> {
         .map_err(|m| format!("the record's geometry does not agree with its topology: {m:?}"))
 }
 
-/// The first parameter of `e` that is a list of lists (a spline surface's control points), and
-/// how many entries it holds.
-fn grid_size(e: &Entity) -> usize {
-    for r in &e.records {
-        for p in &r.params {
-            if let Some(rows) = p.as_list()
-                && rows.first().is_some_and(|row| row.as_list().is_some())
-            {
-                return rows.iter().filter_map(Param::as_list).map(<[Param]>::len).sum();
-            }
+/// Every entity reference among `params`, nested lists included.
+fn refs_of(params: &[Param], out: &mut Vec<u64>) {
+    for p in params {
+        if let Some(id) = p.as_ref_id() {
+            out.push(id);
+        } else if let Some(list) = p.as_list() {
+            refs_of(list, out);
         }
     }
-    0
 }
 
-/// The control points of the surface entity `id` (1 for a surface without them), following a
-/// trimmed or offset surface to its basis.
-fn surface_size(ex: &Exchange, id: u64, memo: &mut HashMap<u64, usize>) -> usize {
+/// The size of the geometry entity `id`: itself and, once per reference, everything it refers
+/// to (control points, a swept profile, a trimmed surface's basis, …), so a shared entity costs as
+/// much as the records that copy it. A chain deeper than the reader follows
+/// (`solidcore_step::read::MAX_GEOM_DEPTH`), a reference cycle or a missing entity counts as
+/// [`MAX_FACE_POINTS`]: the estimate fails closed.
+fn geometry_size(ex: &Exchange, id: u64, depth: usize, memo: &mut HashMap<u64, usize>, open: &mut Vec<u64>) -> usize {
     if let Some(&n) = memo.get(&id) {
         return n;
     }
-    let mut at = id;
-    let mut n = 1;
-    for _ in 0..MAX_SURFACE_DEPTH {
-        let Some(e) = ex.get(at) else { break };
-        if e.records.iter().any(|r| r.name.starts_with("B_SPLINE_SURFACE")) {
-            n = grid_size(e).max(1);
-            break;
-        }
-        // a trimmed, offset or rectangular composite surface names its basis first
-        let Some(next) = e.params().iter().find_map(Param::as_ref_id) else { break };
-        at = next;
+    if depth > solidcore_step::read::MAX_GEOM_DEPTH + 2 || open.contains(&id) {
+        return MAX_FACE_POINTS;
     }
+    let Some(e) = ex.get(id) else { return MAX_FACE_POINTS };
+    let mut children = Vec::new();
+    for r in &e.records {
+        refs_of(&r.params, &mut children);
+    }
+    open.push(id);
+    let mut n = 1usize;
+    for c in children {
+        n = n.saturating_add(geometry_size(ex, c, depth + 1, memo, open)).min(MAX_FACE_POINTS);
+    }
+    open.pop();
     memo.insert(id, n);
     n
 }
 
-/// The control points the faces of the file would hold, a surface counted once for each face on
-/// it.
+/// The geometry the records of the file's faces and edges would hold: each face's surface and
+/// each edge's curve counted once per face or edge on it (the reader copies a shared surface or
+/// curve into every record that uses it), whatever kind it is.
 pub(super) fn face_points(ex: &Exchange) -> usize {
     let mut memo = HashMap::new();
+    let mut open = Vec::new();
     let mut total = 0usize;
     for e in ex.entities.values() {
-        if !matches!(e.name(), "ADVANCED_FACE" | "FACE_SURFACE") {
-            continue;
-        }
-        if let Some(surface) = e.params().get(2).and_then(Param::as_ref_id) {
-            total = total.saturating_add(surface_size(ex, surface, &mut memo));
+        // ADVANCED_FACE / FACE_SURFACE (name, bounds, surface, sense); EDGE_CURVE (name, start,
+        // end, curve, sense)
+        let geometry = match e.name() {
+            "ADVANCED_FACE" | "FACE_SURFACE" => e.params().get(2),
+            "EDGE_CURVE" => e.params().get(3),
+            _ => continue,
+        };
+        if let Some(id) = geometry.and_then(Param::as_ref_id) {
+            total = total.saturating_add(geometry_size(ex, id, 0, &mut memo, &mut open));
         }
     }
     total
@@ -239,6 +245,7 @@ mod tests {
         }
         text += "ENDSEC;\nEND-ISO-10303-21;\n";
         let ex = solidcore_step::p21::parse(&text).unwrap();
-        assert_eq!(face_points(&ex), 5 * 64);
+        // the spline: itself and its 64 points; the trimmed surface: itself and the spline
+        assert_eq!(face_points(&ex), 4 * 65 + 66);
     }
 }
