@@ -13,6 +13,18 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
 
 ### Changed
 
+- `surface.wrap` fits closer to organic scans: every patch edge and patch is refitted to the scan by
+  least squares (edges with the parameters of their spacing along the curve; not on the open rim of
+  a scan, not with `continuity: g1` (which keeps the plain search, without the stop margin below),
+  and only when it lies closer to the scan, loses no point that reached it, stays within half its
+  size of the straight chord or the plain patch and faces like the plain patch), and the adaptive
+  rounds held at `max_patches` go on at the cap while each raises the share within the tolerance by
+  at least 0.1 percentage point, past `min_within` too, instead of stopping at the first round cut
+  to the cap. Below the cap the adaptive rounds stop once the share reaches `min_within` plus three
+  quarters of what it leaves out (99.75 % for 99 %; `within_tolerance` is still judged by
+  `min_within`). The one corpus scan held at `review` by accuracy now passes (97.87 to 99.34 %
+  within 0.2 mm at 60 000 patches), no corpus scan has a lower share, and the corpus takes about a
+  fifth more computing time.
 - `surface.patch`: a patch whose sides are all soft is fitted with a curvature-variation energy
   (third derivatives) that damps the fine texture of a scan without flattening the curvature of
   the shape. The energy is relaxed in steps only as far as the scan data need to come within

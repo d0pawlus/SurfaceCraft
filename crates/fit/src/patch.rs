@@ -202,16 +202,38 @@ pub(crate) const WRAP_FACING_COS: f64 = 0.3;
 const INNER_INVERSE: [[f64; 2]; 2] = [[3.0, -1.5], [-1.5, 3.0]];
 
 /// The cubic from `a` to `b` through the scan points under the chord at 1/3 and 2/3.
-pub(crate) fn wrap_curve(a: Vec3, b: Vec3, project: &dyn Fn(Vec3) -> Vec3) -> [Vec3; 4] {
+pub(crate) fn chord_curve(a: Vec3, b: Vec3, project: &dyn Fn(Vec3) -> Vec3) -> [Vec3; 4] {
     let q1 = project(a + (b - a) / 3.0);
     let q2 = project(a + (b - a) * (2.0 / 3.0));
     [a, (a * -5.0 + q1 * 18.0 - q2 * 9.0 + b * 2.0) / 6.0, (a * 2.0 - q1 * 9.0 + q2 * 18.0 - b * 5.0) / 6.0, b]
 }
 
+/// The wrap curve from `a` to `b`: [`chord_curve`] refitted to the scan by least squares
+/// ([`crate::patch_refit`]). `project` gives `None` where no scan point is within reach: such a
+/// point stays where it is in the plain construction and is left out of the refit.
+pub(crate) fn wrap_curve(a: Vec3, b: Vec3, project: &dyn Fn(Vec3) -> Option<Vec3>) -> [Vec3; 4] {
+    let c = chord_curve(a, b, &|p| project(p).unwrap_or(p));
+    crate::patch_refit::refit_curve(c, project)
+}
+
+/// The wrap patch with the boundary curves `bot` (c0 → c1), `right` (c1 → c2), `top` (c3 → c2),
+/// `left` (c0 → c3): [`interpolated_net`] with its inner points refitted to the scan by least squares
+/// ([`crate::patch_refit`]); `project` as in [`wrap_curve`].
+pub(crate) fn wrap_net(
+    bot: &[Vec3; 4],
+    right: &[Vec3; 4],
+    top: &[Vec3; 4],
+    left: &[Vec3; 4],
+    project: &dyn Fn(Vec3) -> Option<Vec3>,
+) -> Net {
+    let net = interpolated_net(bot, right, top, left, &|p| project(p).unwrap_or(p));
+    crate::patch_refit::refit_net(net, project)
+}
+
 /// The net with the boundary curves `bot` (c0 → c1), `right` (c1 → c2), `top` (c3 → c2), `left`
 /// (c0 → c3); its four inner points are set so the patch passes through the scan points under its
 /// samples at 1/3 and 2/3.
-pub(crate) fn wrap_net(
+pub(crate) fn interpolated_net(
     bot: &[Vec3; 4],
     right: &[Vec3; 4],
     top: &[Vec3; 4],
@@ -298,8 +320,8 @@ pub fn wrap_patches(coarse: &Mesh, scan: &Bvh, reach: f64) -> PatchSet {
         let pm = on_edge((pa + pb) * 0.5);
         vertices.push(pm);
         mid.insert((a, b), m);
-        curves.insert((a, m), wrap_curve(pa, pm, &on_edge));
-        curves.insert((b, m), wrap_curve(pb, pm, &on_edge));
+        curves.insert((a, m), chord_curve(pa, pm, &on_edge));
+        curves.insert((b, m), chord_curve(pb, pm, &on_edge));
     }
     let side = |curves: &BTreeMap<(u32, u32), [Vec3; 4]>, a: u32, b: u32| -> Option<[Vec3; 4]> {
         let c = curves.get(&(a.min(b), a.max(b)))?;
@@ -319,7 +341,7 @@ pub fn wrap_patches(coarse: &Mesh, scan: &Bvh, reach: f64) -> PatchSet {
         vertices.push(pg);
         for &mk in &[m0, m1, m2] {
             if let Some(&pm) = vertices.get(mk as usize) {
-                curves.insert((mk, g), wrap_curve(pm, pg, &on_face));
+                curves.insert((mk, g), chord_curve(pm, pg, &on_face));
             }
         }
         // quad k: corner k, the midpoint after it, the centre, the midpoint before it
@@ -329,7 +351,7 @@ pub fn wrap_patches(coarse: &Mesh, scan: &Bvh, reach: f64) -> PatchSet {
             else {
                 continue;
             };
-            set.nets.push(wrap_net(&bot, &right, &top, &left, &on_face));
+            set.nets.push(interpolated_net(&bot, &right, &top, &left, &on_face));
             set.corners.push([c0, c1, g, c3]);
         }
     }

@@ -509,7 +509,7 @@
   "Shapes `mesh.synth` can sample.": "Kształty, z których można zrobić przykładowy skan.",
   "Share of the measured scan points that must lie within `tolerance` for a pass (0..1,\ndefault 0.99).": "Jaka część zmierzonych punktów skanu musi mieścić się w tolerancji, aby wynik był zaliczony (od 0 do 1, domyślnie 0.99).",
   "Share of the samples that must be within `tolerance`, (0, 1] (default 0.999).": "Jaka część próbek musi mieścić się w polu „Tolerancja”, w zakresie (0, 1] (domyślnie 0.999).",
-  "Share of the scan points that must lie within `tolerance` (0..1, default 0.99).": "Udział punktów skanu, które muszą leżeć w tolerancji (0..1, domyślnie 0,99).",
+  "Share of the scan points that must lie within `tolerance` (0..1, default 0.99). Below `max_patches` the adaptive rounds refine on to that share plus three quarters of what it leaves out (0.9975 for 0.99, 0.875 for 0.5, 0.75 for 0).": "Udział punktów skanu, które muszą leżeć w tolerancji (0..1, domyślnie 0,99). Poniżej `max_patches` rundy adaptacyjne zagęszczają dalej, do tego udziału powiększonego o trzy czwarte tego, co on pomija (0,9975 dla 0,99, 0,875 dla 0,5, 0,75 dla 0).",
   "Share of the scan's triangles (0 to 1) below which a region is small (default 0.005;\nat least 10 seed patches).": "Udział trójkątów skanu (od 0 do 1), poniżej którego region jest mały (domyślnie 0,005; co najmniej 10 płatów początkowych).",
   "Sharpest crease a freeform region crosses (degrees, default 40).": "Najostrzejsza krawędź, przez którą przechodzi region swobodny (w stopniach, domyślnie 40).",
   "Shell parameters.": "Ustawienia skorupy.",

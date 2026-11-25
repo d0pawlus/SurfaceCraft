@@ -48,7 +48,7 @@ pub struct WrapIn {
     /// Tolerance the patches are held to against the scan (mm, default 0.2).
     #[serde(default)]
     pub tolerance: Option<f64>,
-    /// Share of the scan points that must lie within `tolerance` (0..1, default 0.99).
+    /// Share of the scan points that must lie within `tolerance` (0..1, default 0.99). Below `max_patches` the adaptive rounds refine on to that share plus three quarters of what it leaves out (0.9975 for 0.99, 0.875 for 0.5, 0.75 for 0).
     #[serde(default)]
     pub min_within: Option<f64>,
     /// Most patches the network may have (default 12000, at most 60000).
