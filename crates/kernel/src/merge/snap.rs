@@ -73,6 +73,14 @@ const MIN_JUDGED: usize = 4;
 /// A patch with fewer judged points passes if no point moved more than this share of the patch's width: a patch
 /// turns over only when it moves by about its own size.
 const MAX_UNJUDGED_MOVE: f64 = 0.25;
+/// The least dot product of the area vectors of a patch that was broken before the snap, before and after it: a
+/// patch tilted further than about 75 degrees by a move of a fraction of a millimetre is no longer the surface it was.
+/// Measured on scans 4, 6 and 10: the neighbours that refused snaps turned by dot 0.42 at worst (1.7 times this).
+const MIN_WHOLE_DOT: f64 = 0.25;
+/// The least share of its area vector a patch that was broken before the snap keeps through it: a move that squeezes
+/// it to a sliver makes it worse whatever its cells do. Measured on scans 4, 6 and 10: the length of the area vector of
+/// those neighbours went from 0.93 to 2.7 times what it was (3.7 times this at the least).
+const MIN_AREA_KEPT: f64 = 0.25;
 /// Cells a side of the grid a moved patch is compared with itself on.
 const MOVED_GRID: usize = 4;
 
@@ -622,20 +630,38 @@ fn cell_vectors(points: &[V]) -> Vec<V> {
     out
 }
 
-/// The cells and the readable normals of a patch that face against `reference`.
-fn against(cells: &[V], normals: &[Option<V>], reference: V) -> usize {
-    cells.iter().chain(normals.iter().flatten()).filter(|v| dot(**v, reference) < MIN_TURN_DOT).count()
+/// The cells of a patch that do not face along `reference` (a cell of no area faces nowhere, so it counts).
+fn cells_against(cells: &[V], reference: V) -> usize {
+    cells.iter().filter(|c| dot(**c, reference) <= MIN_TURN_DOT).count()
+}
+
+/// Of the points of the grid where the normal is read both before (`n0`) and after (`n1`), those where it faces
+/// against `reference`, before and after: a normal that cannot be read after the move neither hides nor adds a fold.
+fn normals_against(n0: &[Option<V>], n1: &[Option<V>], reference: V) -> (usize, usize) {
+    let pairs = n0.iter().zip(n1).filter_map(|(a, b)| Some(((*a)?, (*b)?)));
+    pairs.fold((0, 0), |(x, y), (a, b)| {
+        (x + usize::from(dot(a, reference) < MIN_TURN_DOT), y + usize::from(dot(b, reference) < MIN_TURN_DOT))
+    })
 }
 
 /// Does a move leave a patch that was broken before it no worse? Judged against the patch as it was, so a patch that
 /// the move turns over as a whole cannot pass as "equally folded": the reference is the area vector of its samples
-/// before (`a`); after the move (`b`) the patch as a whole still faces along it, and no more of its cells and readable
-/// normals face against it than before.
+/// before (`a`). After the move (`b`) the patch as a whole still faces within [`MIN_WHOLE_DOT`] of it and keeps
+/// [`MIN_AREA_KEPT`] of that area, no more of its cells face against it than before, and no more of its normals (where
+/// they are read both before and after). The cells and the normals are counted apart, so normals that can no longer be
+/// read do not hide cells that turned. The reference is always the patch as the wrap left it: every round of a merge
+/// snaps from the original body (`rounds.rs`), and the rounds within [`snap_boundaries`] start from it too, so a patch
+/// is never judged against a version an earlier snap had already moved.
 fn no_worse(n0: &[Option<V>], n1: &[Option<V>], a: &[V], b: &[V]) -> bool {
     let (c0, c1) = (cell_vectors(a), cell_vectors(b));
     let sum = |c: &[V]| c.iter().fold([0.0; 3], |s, v| add(s, *v));
-    let (Some(reference), Some(whole)) = (unit(sum(&c0)), unit(sum(&c1))) else { return false };
-    dot(whole, reference) >= MIN_TURN_DOT && against(&c1, n1, reference) <= against(&c0, n0, reference)
+    let (s0, s1) = (sum(&c0), sum(&c1));
+    let (Some(reference), Some(whole)) = (unit(s0), unit(s1)) else { return false };
+    let (normals_before, normals_after) = normals_against(n0, n1, reference);
+    dot(whole, reference) >= MIN_WHOLE_DOT
+        && norm(s1) >= MIN_AREA_KEPT * norm(s0)
+        && cells_against(&c1, reference) <= cells_against(&c0, reference)
+        && normals_after <= normals_before
 }
 
 /// Every edge of `after` is used as often as it was (once on an open border, twice inside), nothing was added

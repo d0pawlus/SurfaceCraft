@@ -290,3 +290,60 @@ fn a_neighbour_folded_before_the_snap_takes_a_move_that_shrinks_the_fold() {
 fn a_neighbour_folded_before_the_snap_is_refused_when_the_move_spreads_the_fold() {
     assert!(!patch_ok(&folded(0.2), &folded(-0.4), 100.0), "the fold moved from u = 0.56 to u = 0.42");
 }
+
+/// The `(MOVED_GRID + 1)^2` grid of `f(u, v)`, row by row in `u`, as `face_samples` lays it out.
+fn grid(f: impl Fn(f64, f64) -> V) -> Vec<V> {
+    let n = MOVED_GRID as f64;
+    let mut out = Vec::new();
+    for i in 0..=MOVED_GRID {
+        for j in 0..=MOVED_GRID {
+            out.push(f(i as f64 / n, j as f64 / n));
+        }
+    }
+    out
+}
+
+fn unreadable() -> Vec<Option<V>> {
+    vec![None; (MOVED_GRID + 1) * (MOVED_GRID + 1)]
+}
+
+/// Normals that can no longer be read after the move do not hide cells that turned: the folded patch has 10 normals
+/// and 8 cells against itself before; after, 12 cells face back and no normal can be read. Counted together (18
+/// before, 12 after) the move would pass; counted apart, the cells grew and it is refused.
+#[test]
+fn normals_that_become_unreadable_do_not_hide_cells_that_turned() {
+    let before = folded(0.2);
+    let n0 = normals_at_grid(&before, 0, MOVED_GRID).unwrap();
+    let a = super::super::samples::face_samples(&before, 0, MOVED_GRID).unwrap();
+    // rows at x = 0, 0.6, 0.5, 0.4, 0.35: the first row of cells faces along, the other three back
+    let xs = [0.0, 0.6, 0.5, 0.4, 0.35];
+    let b = grid(|u, v| p(xs[(u * MOVED_GRID as f64).round() as usize], v, 0.0));
+    let reference = unit(cell_vectors(&a).iter().fold([0.0; 3], |s, c| add(s, *c))).unwrap();
+    assert_eq!((cells_against(&cell_vectors(&a), reference), cells_against(&cell_vectors(&b), reference)), (8, 12));
+    assert!(!no_worse(&n0, &unreadable(), &a, &b));
+}
+
+/// A patch that was broken before the snap is refused when the move tilts it as a whole past dot 0.25 (80 degrees
+/// here), and taken at 60 degrees.
+#[test]
+fn a_broken_neighbour_tilted_far_by_the_move_is_refused() {
+    let flat = grid(|u, v| p(u, v, 0.0));
+    let tilted = |deg: f64| {
+        let (s, c) = deg.to_radians().sin_cos();
+        grid(move |u, v| p(u, v * c, v * s))
+    };
+    assert!(!no_worse(&unreadable(), &unreadable(), &flat, &tilted(80.0)), "dot 0.17");
+    assert!(no_worse(&unreadable(), &unreadable(), &flat, &tilted(60.0)), "dot 0.5");
+}
+
+/// A patch that was broken before the snap is refused when the move squeezes it to under a quarter of its area, or
+/// collapses a row of its cells to nothing (a cell of no area counts as facing back).
+#[test]
+fn a_broken_neighbour_squeezed_or_collapsed_by_the_move_is_refused() {
+    let flat = grid(|u, v| p(u, v, 0.0));
+    let squeezed = |k: f64| grid(move |u, v| p(u, k * v, 0.0));
+    assert!(!no_worse(&unreadable(), &unreadable(), &flat, &squeezed(0.1)), "a tenth of its area");
+    assert!(no_worse(&unreadable(), &unreadable(), &flat, &squeezed(0.5)), "half of its area");
+    let collapsed = grid(|u, v| p(u.min(0.75), v, 0.0));
+    assert!(!no_worse(&unreadable(), &unreadable(), &flat, &collapsed), "its last row of cells has no area");
+}

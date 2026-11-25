@@ -237,13 +237,14 @@ pub(super) fn face_verdict(
 
 /// The chord of the display tessellation of a new face (`sheet`), on which its area and normals are checked: the display
 /// chord (`None`), or, where the face's boundary stands `offset` (mm) off its surface by more than half of that,
-/// [`BOUNDARY_CHORD_PER_OFFSET`] times the offset. A group whose boundary could not be snapped keeps the wrap's edges, up
+/// [`BOUNDARY_CHORD_PER_OFFSET`] times the offset. The rule is the same for every face, snapped or not; in practice it
+/// coarsens the faces of groups whose boundary could not be snapped. Such a group keeps the wrap's edges, up
 /// to the gap off the primitive, and the kernel's mesher refines such a face to its cap of triangles at any chord finer
 /// than about the offset (tangency-labs/solidcraft#17431, `docs/upstream/13-tess-refine-cap-offset-boundary.md`:
 /// measured 40 093 to 40 816 triangles at the display chord for faces that give 242 at a chord of 0.4 mm, a wrong area,
 /// and slivers that leave the normal check a handful of usable probes). A mesh cannot follow the surface more closely
-/// than its boundary does, so the coarser chord hides nothing the checks could see; a snapped boundary (about a
-/// micrometre off) keeps the display chord.
+/// than its boundary does, so the coarser chord hides nothing the checks could see. A snapped boundary (measured 1.1
+/// micrometres off) keeps the display chord (a thousandth of the face's size) on every face larger than about 2 mm.
 fn display_chord_of(sheet: &Brep, offset: f64) -> Option<f64> {
     let floor = BOUNDARY_CHORD_PER_OFFSET * offset;
     (floor.is_finite() && floor > crate::tess::display_chord(sheet)).then_some(floor)
@@ -508,6 +509,21 @@ fn one_by_one(
 mod tests {
     use super::*;
     use crate::nurbs::sheet_from_bezier_network;
+
+    /// The display tessellation of a new face is no finer than twice the offset of its boundary: a snapped boundary
+    /// (a micrometre off) keeps the display chord (`None`, about 0.014 mm for this 10 mm sheet), one 0.1 mm off is
+    /// meshed at 0.2 mm, and an offset that is not finite keeps the display chord.
+    #[test]
+    fn the_display_chord_of_a_new_face_is_no_finer_than_twice_its_boundary_offset() {
+        let net = vec![vec![[0.0, 0.0, 0.0], [0.0, 10.0, 0.0]], vec![[10.0, 0.0, 0.0], [10.0, 10.0, 0.0]]];
+        let sheet = sheet_from_bezier_network(&[net], &[[0, 1, 2, 3]]).unwrap();
+        assert!(crate::tess::display_chord(&sheet) > 0.01 && crate::tess::display_chord(&sheet) < 0.02);
+        assert_eq!(display_chord_of(&sheet, 1e-6), None, "a snapped face keeps the display chord");
+        assert_eq!(display_chord_of(&sheet, 1e-3), None, "2e-3 is finer than the display chord");
+        assert_eq!(display_chord_of(&sheet, 0.1), Some(0.2));
+        assert_eq!(display_chord_of(&sheet, f64::NAN), None);
+        assert_eq!(display_chord_of(&sheet, f64::INFINITY), None);
+    }
 
     /// The finding behind the refusal of a face that looks against its natural normal in an open sheet: the
     /// kernel keeps the `same` use of a sheet's face, whatever the record said, so such a face comes back
