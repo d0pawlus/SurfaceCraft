@@ -22,7 +22,7 @@
 //! that does not take the move is left as it was and says why; the others are snapped, and the step is
 //! repeated without the refused groups until nothing is refused. The result is checked: the topology is
 //! the one it had, the borders of the patches that moved follow their edges, and none moved farther than
-//! the limit or turned over.
+//! the limit or turned over (a patch already folded or collapsed before the snap: none was made worse).
 //!
 //! The projection is the kernel's (`SurfaceEval`, in [`Gauge`]); the least-squares fit of a Bézier curve and
 //! the edit of the borders of the patches' control nets are made here.
@@ -73,6 +73,17 @@ const MIN_JUDGED: usize = 4;
 /// A patch with fewer judged points passes if no point moved more than this share of the patch's width: a patch
 /// turns over only when it moves by about its own size.
 const MAX_UNJUDGED_MOVE: f64 = 0.25;
+/// The least dot product of the area vectors of a patch that was broken before the snap, before and after it: a
+/// patch tilted further than about 75 degrees by a move of a fraction of a millimetre is no longer the surface it was.
+/// Measured on scans 4, 6 and 10: the neighbours that refused snaps turned by dot 0.42 at worst (1.7 times this).
+const MIN_WHOLE_DOT: f64 = 0.25;
+/// The least share of its area vector a patch that was broken before the snap keeps through it: a move that squeezes
+/// it to a sliver makes it worse whatever its cells do. Measured on scans 4, 6 and 10: the length of the area vector of
+/// those neighbours went from 0.93 to 2.7 times what it was (3.7 times this at the least).
+const MIN_AREA_KEPT: f64 = 0.25;
+/// A cell of the sample grid shorter than this share of the mean cell of the patch before the snap is degenerate (it
+/// has no direction worth reading): a row squeezed to a thousandth of the patch's mean cell has collapsed.
+const DEGENERATE_CELL_SHARE: f64 = 1e-3;
 /// Cells a side of the grid a moved patch is compared with itself on.
 const MOVED_GRID: usize = 4;
 
@@ -561,6 +572,14 @@ fn width(points: &[V]) -> f64 {
     sides[1]
 }
 
+/// Was a patch sound before the snap: its normal read at [`MIN_JUDGED`] points of the grid or more, all of them on the
+/// side of their mean? A sound patch is held to the absolute test of [`moved_patch_ok`]: no move may turn it anywhere.
+fn sound_before(normals: &[Option<V>]) -> bool {
+    let read: Vec<V> = normals.iter().flatten().copied().collect();
+    let Some(mean) = unit(read.iter().fold([0.0; 3], |s, n| add(s, *n))) else { return false };
+    read.len() >= MIN_JUDGED && read.iter().all(|n| dot(*n, mean) >= MIN_TURN_DOT)
+}
+
 /// A patch that moved: no point of it farther than `max_move` from where it was, still facing the way it did,
 /// and its borders along its changed edges.
 fn moved_patch_ok(before: &Brep, after: &Brep, changed: &Changed, max_move: f64) -> bool {
@@ -573,16 +592,93 @@ fn moved_patch_ok(before: &Brep, after: &Brep, changed: &Changed, max_move: f64)
     // (a NaN displacement is no displacement `max` would see: every one is checked)
     let near = a.len() == b.len() && a.iter().zip(&b).all(|(p, q)| norm(sub(*p, *q)) <= max_move * (1.0 + 1e-9));
     let facing = match (normals_at_grid(before, face, MOVED_GRID), normals_at_grid(after, face, MOVED_GRID)) {
-        (Some(n0), Some(n1)) => {
-            let pairs: Vec<(V, V)> = n0.iter().zip(&n1).filter_map(|(a, b)| Some(((*a)?, (*b)?))).collect();
-            // a patch whose normal can be read at too few points of the grid (a sliver, a collapsed side) cannot be
-            // shown not to have turned over: it passes only when it moved too little to turn
-            let judged = pairs.len() >= MIN_JUDGED || far <= MAX_UNJUDGED_MOVE * width(&a);
-            judged && pairs.iter().all(|(a, b)| dot(*a, *b) >= MIN_TURN_DOT)
-        }
+        // A patch that was already broken before the snap (its normal unreadable or disagreeing with itself) cannot
+        // be judged by whether each normal kept its sign: where it can be read at all, it flips for a move of
+        // hundredths of a millimetre, and where it cannot, the absolute test refuses any move of more than a quarter
+        // of the patch's width. Measured on scans 4, 6 and 10: every neighbour that refused a snap had at most one
+        // readable normal of 25, moved 0.30 to 1.13 of its width, and its area vector never turned (dot 0.42 to
+        // 1.00). Such a patch is also taken when the snap does not make it worse ([`no_worse`]); a sound patch keeps
+        // the absolute test alone, so a snap never turns a sound patch over.
+        (Some(n0), Some(n1)) => turned_nowhere(&n0, &n1, far, &a) || (!sound_before(&n0) && no_worse(&n0, &n1, &a, &b)),
         _ => false,
     };
     near && facing && borders_follow_edges(after, face, &changed.edges)
+}
+
+/// The absolute test of a moved patch: its normal kept its sign at every point of the grid read before and after. A
+/// patch whose normal can be read at too few points of the grid (a sliver, a collapsed side) cannot be shown not to
+/// have turned over: it passes only when it moved too little to turn.
+fn turned_nowhere(n0: &[Option<V>], n1: &[Option<V>], far: f64, before: &[V]) -> bool {
+    let pairs: Vec<(V, V)> = n0.iter().zip(n1).filter_map(|(a, b)| Some(((*a)?, (*b)?))).collect();
+    let judged = pairs.len() >= MIN_JUDGED || far <= MAX_UNJUDGED_MOVE * width(before);
+    judged && pairs.iter().all(|(a, b)| dot(*a, *b) >= MIN_TURN_DOT)
+}
+
+/// The vectors of the cells of a `(MOVED_GRID + 1)^2` grid of samples laid out row by row: half the cross product of
+/// each cell's diagonals, which sum to the area vector of the patch. Unlike the normal at a point, these can be read
+/// on a sliver or a patch whose sides meet at a shallow angle.
+fn cell_vectors(points: &[V]) -> Vec<V> {
+    let n = MOVED_GRID + 1;
+    let at = |i: usize, j: usize| points.get(i * n + j).copied();
+    let mut out = Vec::with_capacity(MOVED_GRID * MOVED_GRID);
+    for i in 0..MOVED_GRID {
+        for j in 0..MOVED_GRID {
+            if let (Some(p00), Some(p10), Some(p01), Some(p11)) =
+                (at(i, j), at(i + 1, j), at(i, j + 1), at(i + 1, j + 1))
+            {
+                out.push(scale(cross(sub(p11, p00), sub(p01, p10)), 0.5));
+            }
+        }
+    }
+    out
+}
+
+/// The cells of a patch that face against `reference`, and those that are degenerate (shorter than `floor`): a cell
+/// with no area faces nowhere, so it is counted apart, not as facing either way. Normals are read only where the
+/// patch's tangents are well apart (see [`normals_at_grid`]), so for them the sign of the dot product is enough.
+fn cell_counts(cells: &[V], reference: V, floor: f64) -> (usize, usize) {
+    cells.iter().fold((0, 0), |(against, degenerate), c| {
+        if norm(*c) < floor {
+            (against, degenerate + 1)
+        } else {
+            (against + usize::from(dot(*c, reference) < MIN_TURN_DOT), degenerate)
+        }
+    })
+}
+
+/// Of the points of the grid where the normal is read both before (`n0`) and after (`n1`), those where it faces
+/// against `reference`, before and after: a normal that cannot be read after the move neither hides nor adds a fold.
+fn normals_against(n0: &[Option<V>], n1: &[Option<V>], reference: V) -> (usize, usize) {
+    let pairs = n0.iter().zip(n1).filter_map(|(a, b)| Some(((*a)?, (*b)?)));
+    pairs.fold((0, 0), |(x, y), (a, b)| {
+        (x + usize::from(dot(a, reference) < MIN_TURN_DOT), y + usize::from(dot(b, reference) < MIN_TURN_DOT))
+    })
+}
+
+/// Does a move leave a patch that was broken before it no worse? Judged against the patch as it was, so a patch that
+/// the move turns over as a whole cannot pass as "equally folded": the reference is the area vector of its samples
+/// before (`a`). After the move (`b`) the patch as a whole still faces within [`MIN_WHOLE_DOT`] of it and keeps
+/// [`MIN_AREA_KEPT`] of that area, and none of three counts grows: its cells that face against the reference, its
+/// degenerate cells, and its normals that face against it (where they are read both before and after). The three are
+/// counted apart, so neither a normal that can no longer be read nor a degenerate cell that opens up pays for a cell
+/// that turned. The reference is always the patch as the wrap left it: every round of a merge
+/// snaps from the original body (`rounds.rs`), and the rounds within [`snap_boundaries`] start from it too, so a patch
+/// is never judged against a version an earlier snap had already moved.
+fn no_worse(n0: &[Option<V>], n1: &[Option<V>], a: &[V], b: &[V]) -> bool {
+    let (c0, c1) = (cell_vectors(a), cell_vectors(b));
+    let sum = |c: &[V]| c.iter().fold([0.0; 3], |s, v| add(s, *v));
+    let (s0, s1) = (sum(&c0), sum(&c1));
+    let (Some(reference), Some(whole)) = (unit(s0), unit(s1)) else { return false };
+    let (normals_before, normals_after) = normals_against(n0, n1, reference);
+    // the floor of a degenerate cell is read from the patch as it was, like the reference
+    let floor = DEGENERATE_CELL_SHARE * c0.iter().map(|c| norm(*c)).sum::<f64>() / c0.len().max(1) as f64;
+    let (against_before, degenerate_before) = cell_counts(&c0, reference, floor);
+    let (against_after, degenerate_after) = cell_counts(&c1, reference, floor);
+    dot(whole, reference) >= MIN_WHOLE_DOT
+        && norm(s1) >= MIN_AREA_KEPT * norm(s0)
+        && against_after <= against_before
+        && degenerate_after <= degenerate_before
+        && normals_after <= normals_before
 }
 
 /// Every edge of `after` is used as often as it was (once on an open border, twice inside), nothing was added

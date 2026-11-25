@@ -48,7 +48,7 @@ pub struct WrapIn {
     /// Tolerance the patches are held to against the scan (mm, default 0.2).
     #[serde(default)]
     pub tolerance: Option<f64>,
-    /// Share of the scan points that must lie within `tolerance` (0..1, default 0.99).
+    /// Share of the scan points that must lie within `tolerance` (0..1, default 0.99). Below `max_patches` the adaptive rounds refine on to that share plus three quarters of what it leaves out (0.9975 for 0.99, 0.875 for 0.5, 0.75 for 0).
     #[serde(default)]
     pub min_within: Option<f64>,
     /// Most patches the network may have (default 12000, at most 60000).
@@ -270,7 +270,7 @@ pub(crate) fn scale_warning(tolerance: f64, diagonal: f64) -> Option<String> {
 
 /// Advice when a closed network has no positive volume: its faces are not consistently oriented.
 fn orientation_warning(closed: bool, volume: Option<f64>) -> Option<String> {
-    (closed && !volume.is_some_and(|v| v.is_finite() && v > 0.0)).then(|| {
+    (closed && !crate::cmd::body::encloses_material(volume)).then(|| {
         "the network is closed but the body has no positive volume: its faces are not consistently oriented".into()
     })
 }

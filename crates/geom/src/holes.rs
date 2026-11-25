@@ -5,9 +5,11 @@ use crate::ear::{ear_clip_avoiding, fan_fill};
 use crate::{Mesh, Point3, par, tri};
 use std::collections::{HashMap, HashSet};
 
+mod crossing;
 mod fair;
 mod inward;
 mod patch;
+use crossing::Crossings;
 use fair::fair_patch;
 use patch::Patch;
 
@@ -152,7 +154,10 @@ pub(crate) fn fill_holes_filtered(
     let faces = VertexFaces::new(mesh);
     let mut uses = EdgeUses::new(mesh, &todo);
     let source: &Mesh = mesh;
-    let fill = |lp: &Vec<u32>| fill_in_workspace(source, &faces, &uses, lp, smooth, sharpen);
+    // only a smooth patch is checked for crossings (a flat one lies in its loop's mean plane); the
+    // tree holds the triangles near the loops, and serves the refills below as well
+    let crossings = smooth.then(|| Crossings::new(source, &todo));
+    let fill = |lp: &Vec<u32>| fill_in_workspace(source, &faces, &uses, lp, smooth, sharpen, crossings.as_ref());
     // a single hole stays on this thread (the crease tests read a thread-local reason)
     let patches: Vec<Patch> =
         if todo.len() < 2 { todo.iter().map(fill).collect() } else { par::map_slice(&todo, fill) };
@@ -175,7 +180,7 @@ pub(crate) fn fill_holes_filtered(
             if added.is_some() {
                 break;
             }
-            let again = fill_in_workspace(mesh, &faces, &uses, lp, smooth, sharpen);
+            let again = fill_in_workspace(mesh, &faces, &uses, lp, smooth, sharpen, crossings.as_ref());
             added = append_if_admitted(mesh, &mut uses, again);
         }
         match added {
@@ -363,7 +368,9 @@ fn workspace(mesh: &Mesh, faces: &VertexFaces, lp: &[u32]) -> (Vec<u32>, Mesh) {
 
 /// Fills the loop `lp` in a copy of the triangles around it, which is all the fairing and the
 /// sharpening read; the copy numbers its vertices in the order of the mesh's, so the patch is the
-/// one the whole mesh would give.
+/// one the whole mesh would give. A smooth patch that would pass through the mesh or itself is
+/// faired as a membrane instead, when that one does not (see `holes::crossing`); the sharpening
+/// then works on the patch that was kept.
 fn fill_in_workspace(
     mesh: &Mesh,
     faces: &VertexFaces,
@@ -371,6 +378,7 @@ fn fill_in_workspace(
     lp: &[u32],
     smooth: bool,
     sharpen: bool,
+    crossings: Option<&Crossings>,
 ) -> Patch {
     let (origin, mut work) = workspace(mesh, faces, lp);
     let local = |v: u32| origin.binary_search(&v).map_or(0, |k| k as u32);
@@ -387,7 +395,12 @@ fn fill_in_workspace(
         fan_fill(&mut work, &rev);
     }
     if smooth {
-        refine_and_fair(&mut work, first_tri, &lp);
+        if let Some(first_new) = refine_patch(&mut work, first_tri, &lp) {
+            let membrane = fair_patch(&mut work, first_tri, first_new);
+            if let Some(crossings) = crossings {
+                crossings.settle(&origin, &mut work, (first_tri, first_new), membrane);
+            }
+        }
         if let Some(around) = &around {
             crate::crease::sharpen_patch(&mut work, around, first_tri, first_vertex, &lp);
         }
@@ -396,17 +409,19 @@ fn fill_in_workspace(
 }
 
 /// Refines the triangles from `first` on (centroid splits until edges are about the loop's mean
-/// edge, Delaunay flips) and fairs their interior vertices with the loop held fixed.
-fn refine_and_fair(mesh: &mut Mesh, first: usize, lp: &[u32]) {
+/// edge, Delaunay flips) for the fairing of their interior vertices with the loop held fixed;
+/// returns the first vertex the refinement added, or `None` for a loop too short or too small to
+/// refine (nothing to fair).
+fn refine_patch(mesh: &mut Mesh, first: usize, lp: &[u32]) -> Option<usize> {
     let n = lp.len();
     if n < 3 {
-        return;
+        return None;
     }
     let target: f64 =
         (0..n).map(|k| (mesh.positions[lp[k] as usize] - mesh.positions[lp[(k + 1) % n] as usize]).norm()).sum::<f64>()
             / n as f64;
     if !(target > 0.0) {
-        return;
+        return None;
     }
     let outside = outside_edges(mesh, first);
     let first_vertex = mesh.positions.len();
@@ -436,7 +451,7 @@ fn refine_and_fair(mesh: &mut Mesh, first: usize, lp: &[u32]) {
         }
     }
     flip_patch(mesh, first, &outside);
-    fair_patch(mesh, first, first_vertex);
+    Some(first_vertex)
 }
 
 /// The undirected edges of the triangles before `first`: the mesh around a patch, which a flip of

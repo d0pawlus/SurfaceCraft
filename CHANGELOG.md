@@ -11,8 +11,34 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
 
 ## [Unreleased]
 
+### Added
+
+- `mesh.merge`: merges aligned scans of one part into one new mesh. Where scans overlap one layer is
+  kept (the scan in which the surface lies farthest from its own border), the seam is closed by ball
+  pivoting on scanned surface only, and kept vertices stay where they are (seam vertices of later
+  scans move onto coinciding ones of earlier scans by at most a quarter of the tolerance). Scans that
+  disagree in their overlap by more than the tolerance, or that lie over each other farther apart with
+  nothing tying them, are refused with the numbers unless `alignment` is `"warn"`; scans whose normals
+  oppose or that have a patch turned inside out are always refused; scans that meet and also lie over
+  each other are reported (`layers_apart`); scans apart in space are merged as a union of pieces with
+  a notice. The report gives per scan what was kept and removed, the residual of every pair, the
+  seam, the topology before and after, how far the removed surface lies from the result and whether
+  two layers were left (#123).
+
 ### Changed
 
+- `surface.wrap` fits closer to organic scans: every patch edge and patch is refitted to the scan by
+  least squares (edges with the parameters of their spacing along the curve; not on the open rim of
+  a scan, not with `continuity: g1` (which keeps the plain search, without the stop margin below),
+  and only when it lies closer to the scan, loses no point that reached it, stays within half its
+  size of the straight chord or the plain patch and faces like the plain patch), and the adaptive
+  rounds held at `max_patches` go on at the cap while each raises the share within the tolerance by
+  at least 0.1 percentage point, past `min_within` too, instead of stopping at the first round cut
+  to the cap. Below the cap the adaptive rounds stop once the share reaches `min_within` plus three
+  quarters of what it leaves out (99.75 % for 99 %; `within_tolerance` is still judged by
+  `min_within`). The one corpus scan held at `review` by accuracy now passes (97.87 to 99.34 %
+  within 0.2 mm at 60 000 patches), no corpus scan has a lower share, and the corpus takes about a
+  fifth more computing time.
 - `surface.patch`: a patch whose sides are all soft is fitted with a curvature-variation energy
   (third derivatives) that damps the fine texture of a scan without flattening the curvature of
   the shape. The energy is relaxed in steps only as far as the scan data need to come within
@@ -20,6 +46,23 @@ are pull requests in <https://github.com/d0pawlus/SurfaceCraft>.
   of 0.3.0 is gone). Such a patch is closer to the scan than in 0.3.0 and its curvature is smooth
   enough to continue with G2: on the Artec corpus G2 holds its 5 % target at 9 of 12 sites with
   errors of 0.03 to 3.5 % (8 of 12 at 0.5 to 4.8 % in 0.3.0). [#167]
+- Ray and segment tests against triangles (`geom::tri::ray_hit`, used by picking, ray casts and the
+  crossing checks) decide that a ray is parallel to a triangle relative to their size, not by an
+  absolute bound: hits on triangles smaller than about 2e-5 units (a part in metres) are now found
+  (#158).
+- `scan.to_solid`, freeform method (and `thickness`): a closed patch network whose body has no
+  positive volume is not a closed solid, the same rule as for the primitives method: the issue
+  `no_solid` is raised and the verdict is never `pass` (`review` when the network covers the scan,
+  as for an open sheet); such a body also counts as not closed in the larger-cap retry, the rebuild
+  and the comparison of `auto` (#158).
+
+### Fixed
+
+- `mesh.fill_holes` and `mesh.clean` (smooth fill), and so `scan.to_solid`: a smooth patch that
+  would pass through the mesh or through itself (the thin-plate fairing continued a curved rim past
+  itself) is faired again as a membrane, which stays within its loop's convex hull, when that one
+  does not cross. On the square cap of a sphere the crossing cap made the wrapped solid read a
+  negative `body.volume` (the kernel's healer turned the self-crossing solid inside out) (#158).
 
 ## [0.3.0] - 2026-11-16
 

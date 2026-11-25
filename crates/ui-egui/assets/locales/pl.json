@@ -658,6 +658,8 @@
   "cmd.mesh.clean.hint": "Usuwa za jednym razem zdublowane punkty, błędne trójkąty i drobne luźne okruchy.",
   "cmd.mesh.close_handles": "Zamknij małe uchwyty",
   "cmd.mesh.close_handles.hint": "Zamyka drobne tunele i mostki skanu (np. tam, gdzie dwie strony cienkiej ścianki zlewają się w skanie) jako nową siatkę; brzeg i reszta powierzchni zostają.",
+  "cmd.mesh.merge": "Scal skany",
+  "cmd.mesh.merge.hint": "Łączy wyrównane skany jednej części w jedną nową siatkę: tam, gdzie się nakładają, zostaje jedna warstwa, a szew jest zamykany; skany, które się nie zgadzają, są odrzucane z liczbami.",
   "cmd.mesh.decimate": "Uprość",
   "cmd.mesh.decimate.hint": "Zmniejsza liczbę trójkątów, żeby skan był lżejszy w pracy.",
   "cmd.mesh.export": "Eksportuj siatkę",
